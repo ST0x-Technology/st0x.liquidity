@@ -3,6 +3,10 @@
 mod equity;
 mod usdc;
 
+#[cfg(test)]
+pub(crate) use equity::InProgressGuard;
+pub(crate) use equity::{GuardState, claim_guard_for_recovery_or_orphan};
+
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -471,7 +475,7 @@ pub(crate) struct RebalancingService {
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
-    pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+    pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pending_offchain_order_symbols: Arc<RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     wrapper: Arc<dyn Wrapper>,
@@ -579,7 +583,7 @@ impl RebalancingService {
             orderbook,
             order_owner,
             inventory,
-            equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             pending_offchain_order_symbols: Arc::new(RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             wrapper,
@@ -705,9 +709,61 @@ impl RebalancingService {
         };
 
         for id in timed_out_ids {
+            let Some(symbol) = self
+                .mint_tracking
+                .read()
+                .await
+                .get(&id)
+                .map(|t| t.symbol.clone())
+            else {
+                debug!(
+                    target: "rebalance",
+                    ?id,
+                    "Skipping timed-out mint: tracking entry already removed"
+                );
+                continue;
+            };
+
+            // Steady-state skip: if recovery already owns the slot, leave the
+            // mint untouched -- recovery drives it to terminal, and removing its
+            // tracking or failing it would clear the guard and allow a
+            // double-mint while the tokens are still unwrapped in the wallet. A
+            // concurrent flip to `HeldForRecovery` AFTER this read is closed
+            // atomically at the clear below.
+            let held_for_recovery = {
+                let guard = match self.equity_in_progress.read() {
+                    Ok(guard) => guard,
+                    Err(poison) => poison.into_inner(),
+                };
+                guard.get(&symbol) == Some(&equity::GuardState::HeldForRecovery)
+            };
+            if held_for_recovery {
+                continue;
+            }
+
             let Some((tracking, elapsed)) = self.cleanup_timed_out_mint(&id, now).await? else {
                 continue;
             };
+
+            // Atomically clear the guard UNLESS recovery claimed the slot during
+            // the async cleanup above. Holding the write lock across the re-check
+            // and the clear closes the TOCTOU race: a concurrent
+            // `mark_held_for_recovery` can flip `ActiveTransfer` ->
+            // `HeldForRecovery` after the steady-state check, and a non-atomic
+            // clear would then drop a recovery-owned guard and fail a mint whose
+            // tokens are still in the wallet -- re-opening the double-mint window
+            // this guard exists to close. If recovery now owns the slot, leave
+            // the guard and skip the failure event.
+            if !self.clear_equity_in_progress_unless_held_for_recovery(&symbol) {
+                debug!(
+                    target: "rebalance",
+                    aggregate_id = %id,
+                    %symbol,
+                    "Timed-out mint flipped to HeldForRecovery during cleanup; \
+                     recovery now owns it -- leaving guard and skipping failure event"
+                );
+                continue;
+            }
 
             let elapsed_secs = elapsed.as_secs();
             error!(
@@ -719,8 +775,6 @@ impl RebalancingService {
                 outcome = "timeout",
                 "Mint transfer timed out; clearing trigger guard and inventory inflight"
             );
-
-            self.clear_equity_in_progress(&tracking.symbol);
 
             if let Some(store) = self.mint_store.read().await.as_ref() {
                 let reason = format!(
@@ -2099,8 +2153,14 @@ impl RebalancingService {
         }
     }
 
-    fn try_claim_equity_guard(&self, symbol: &Symbol) -> Option<equity::InProgressGuard> {
-        equity::InProgressGuard::try_claim(symbol.clone(), Arc::clone(&self.equity_in_progress))
+    fn try_claim_equity_guard_for_transfer(
+        &self,
+        symbol: &Symbol,
+    ) -> Option<equity::InProgressGuard> {
+        equity::InProgressGuard::try_claim_for_transfer(
+            symbol.clone(),
+            Arc::clone(&self.equity_in_progress),
+        )
     }
 
     async fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
@@ -2384,7 +2444,7 @@ impl RebalancingService {
             return Ok(());
         }
 
-        let Some(guard) = self.try_claim_equity_guard(symbol) else {
+        let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
         };
@@ -2431,7 +2491,7 @@ impl RebalancingService {
 
         let dispatched = match operation {
             TriggeredOperation::Mint { symbol, quantity } => {
-                self.enqueue_transfer_equity_to_market_making(symbol, quantity)
+                self.enqueue_transfer_equity_to_market_making(symbol, quantity, guard.generation())
                     .await
             }
             TriggeredOperation::Redemption {
@@ -2750,6 +2810,7 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
+        generation: u64,
     ) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age)
@@ -2805,6 +2866,7 @@ impl RebalancingService {
                 issuer_request_id: issuer_request_id.clone(),
                 symbol: symbol.clone(),
                 quantity,
+                generation,
             })
             .await;
 
@@ -2921,6 +2983,10 @@ impl RebalancingService {
     }
 
     /// Clears the in-progress flag for an equity symbol.
+    ///
+    /// Removes the entry regardless of its current `GuardState`. Called by
+    /// `on_mint`/`on_redemption` terminal event arms and by guard-drop in all
+    /// transfer and recovery job paths.
     pub(crate) fn clear_equity_in_progress(&self, symbol: &Symbol) {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
@@ -2929,12 +2995,60 @@ impl RebalancingService {
         guard.remove(symbol);
     }
 
-    fn mark_equity_in_progress(&self, symbol: &Symbol) {
+    /// Clears the in-progress guard for a timed-out mint unless recovery owns
+    /// the slot, in a single write-lock acquisition.
+    ///
+    /// Returns `true` after removing an `ActiveTransfer` (or absent) guard so
+    /// the caller can fail the mint and free the symbol for a fresh rebalance.
+    /// Returns `false` without touching a `HeldForRecovery` slot: recovery owns
+    /// the mint and will drive it to terminal. Holding the lock across the
+    /// check and the clear closes the TOCTOU race where a concurrent
+    /// `mark_held_for_recovery` flips `ActiveTransfer` -> `HeldForRecovery`
+    /// between a separate check and clear.
+    pub(crate) fn clear_equity_in_progress_unless_held_for_recovery(
+        &self,
+        symbol: &Symbol,
+    ) -> bool {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
-        guard.insert(symbol.clone());
+        match guard.get(symbol) {
+            Some(equity::GuardState::HeldForRecovery) => false,
+            Some(equity::GuardState::ActiveTransfer { .. }) | None => {
+                guard.remove(symbol);
+                true
+            }
+        }
+    }
+
+    /// Marks the slot as `ActiveTransfer` (startup recovery and tracking-rebuild
+    /// paths that re-establish a live transfer's guard on restart).
+    fn mark_equity_active_transfer(&self, symbol: &Symbol) {
+        let mut guard = match self.equity_in_progress.write() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        guard.insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::next_generation(),
+            },
+        );
+    }
+
+    /// Sets the in-progress guard to `HeldForRecovery` for a symbol.
+    ///
+    /// Used during startup reconstruction for post-receipt mint states when
+    /// recovery is enabled: instead of `ActiveTransfer` (which would block
+    /// the recovery job), we set `HeldForRecovery` so `claim_guard_for_recovery_or_orphan`
+    /// can claim the slot and resume.
+    fn mark_equity_held_for_recovery(&self, symbol: &Symbol) {
+        let mut guard = match self.equity_in_progress.write() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
     }
 
     /// Releases the in-progress guard and tracking for a mint whose recovery
@@ -3306,7 +3420,30 @@ impl RebalancingService {
                         last_progress_at,
                     },
                 );
-                self.mark_equity_in_progress(symbol);
+
+                // For pre-wrap post-receipt states (TokensReceived, WrapSubmitted),
+                // the transfer job may have already handed off to recovery via
+                // HeldForRecovery and returned Ok(()) — the apalis job is Done and
+                // will never be re-picked. On restart, reconstructing these states as
+                // ActiveTransfer would block UnwrappedEquityRecovery from claiming.
+                //
+                // When recovery is enabled, reconstruct as HeldForRecovery so
+                // claim_guard_for_recovery_or_orphan can claim the slot. When recovery
+                // is disabled, ActiveTransfer is correct — resume_interrupted_transfers
+                // will call resume_mint and the transfer job retries normally.
+                //
+                // TokensWrapped and VaultDepositSubmitted are always reconstructed as
+                // ActiveTransfer: the deposit is idempotent and resume_interrupted_transfers
+                // drives them to completion. WrappedEquityRecovery is orphan-only.
+                let is_pre_wrap_post_receipt_state =
+                    matches!(entity, TokensReceived { .. } | WrapSubmitted { .. });
+
+                if is_pre_wrap_post_receipt_state && self.is_wrapped_equity_recovery_enabled(symbol)
+                {
+                    self.mark_equity_held_for_recovery(symbol);
+                } else {
+                    self.mark_equity_active_transfer(symbol);
+                }
 
                 let mut inventory = self.inventory.write().await;
                 let mut updated = inventory.clone();
@@ -3450,7 +3587,7 @@ impl RebalancingService {
                 last_progress_at: Utc::now(),
             },
         );
-        self.mark_equity_in_progress(symbol);
+        self.mark_equity_active_transfer(symbol);
         Ok(RecoveryClaim::Claimed(rollback))
     }
 
@@ -3605,7 +3742,7 @@ impl RebalancingService {
                 last_progress_at: Utc::now(),
             },
         );
-        self.mark_equity_in_progress(symbol);
+        self.mark_equity_active_transfer(symbol);
         Ok(RecoveryClaim::Claimed(rollback))
     }
 
@@ -3763,7 +3900,7 @@ impl RebalancingService {
                         last_progress_at,
                     },
                 );
-                self.mark_equity_in_progress(symbol);
+                self.mark_equity_active_transfer(symbol);
 
                 let mut inventory = self.inventory.write().await;
                 let updated = inventory.clone().update_equity(
@@ -4332,7 +4469,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         let tracking = trigger
             .mint_tracking
@@ -4365,6 +4508,236 @@ mod tests {
         assert_eq!(inflight, Some(FractionalShares::new(float!(10))));
     }
 
+    /// Builds a `RebalancingService` with `wrapped_equity_recovery = Enabled` for `symbol`.
+    async fn make_trigger_with_recovery_enabled(symbol: &Symbol) -> Arc<RebalancingService> {
+        let config = RebalancingServiceConfig {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols: HashMap::from([(
+                        symbol.clone(),
+                        EquityAssetConfig {
+                            tokenized_equity: Address::ZERO,
+                            tokenized_equity_derivative: Address::ZERO,
+                            pyth_feed_id: None,
+                            vault_ids: Vec::new(),
+                            trading: OperationMode::Disabled,
+                            rebalancing: OperationMode::Enabled,
+                            wrapped_equity_recovery: OperationMode::Enabled,
+                            operational_limit: None,
+                        },
+                    )]),
+                },
+                cash: None,
+            },
+            ..test_config()
+        };
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wrapper = Arc::new(MockWrapper::new());
+        Arc::new(RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            wrapper,
+            RebalancingSchedulers::new(&apalis_pool),
+        ))
+    }
+
+    /// `recover_mint_state` startup guard reconstruction: all four post-receipt
+    /// states produce the correct `GuardState`.
+    ///
+    /// - `TokensReceived` / `WrapSubmitted` (pre-wrap, recovery enabled):
+    ///   `HeldForRecovery` — `UnwrappedEquityRecovery` owns the slot; a new
+    ///   transfer cannot start until recovery completes.
+    /// - `TokensWrapped` / `VaultDepositSubmitted` (post-wrap, recovery
+    ///   enabled): `ActiveTransfer` — deposit is idempotent;
+    ///   `resume_interrupted_transfers` drives them via `resume_mint`.
+    /// - `TokensReceived` (recovery disabled): `ActiveTransfer` — no recovery
+    ///   job will run; the transfer job retries normally via apalis.
+    #[tokio::test]
+    async fn recover_mint_state_reconstructs_all_post_receipt_states() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let trigger_enabled = make_trigger_with_recovery_enabled(&symbol).await;
+        let trigger_disabled = make_trigger().await;
+
+        async fn check(
+            trigger: &RebalancingService,
+            symbol: &Symbol,
+            mint_id_str: &str,
+            entity: TokenizedEquityMint,
+            expected: equity::GuardState,
+            label: &str,
+        ) {
+            // Clear any prior guard state so each case starts clean.
+            trigger.equity_in_progress.write().unwrap().remove(symbol);
+            let mint_id = issuer_request_id(mint_id_str);
+            trigger.recover_mint_state(&mint_id, &entity).await.unwrap();
+            assert_eq!(
+                trigger
+                    .equity_in_progress
+                    .read()
+                    .unwrap()
+                    .get(symbol)
+                    .cloned(),
+                Some(expected),
+                "{label}"
+            );
+        }
+
+        check(
+            &trigger_enabled,
+            &symbol,
+            "startup-tokens-received",
+            TokenizedEquityMint::TokensReceived {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-tokens-received"),
+                tokenization_request_id: TokenizationRequestId("TOK-TR".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+            },
+            equity::GuardState::HeldForRecovery,
+            "TokensReceived + recovery enabled must reconstruct as HeldForRecovery",
+        )
+        .await;
+
+        check(
+            &trigger_enabled,
+            &symbol,
+            "startup-wrap-submitted",
+            TokenizedEquityMint::WrapSubmitted {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-wrap-submitted"),
+                tokenization_request_id: TokenizationRequestId("TOK-WS".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::ZERO,
+            },
+            equity::GuardState::HeldForRecovery,
+            "WrapSubmitted + recovery enabled must reconstruct as HeldForRecovery",
+        )
+        .await;
+
+        // For ActiveTransfer cases the generation counter is opaque so we use
+        // matches! rather than assert_eq! to verify the variant without pinning
+        // the generation value.
+        async fn check_active_transfer(
+            trigger: &RebalancingService,
+            symbol: &Symbol,
+            mint_id_str: &str,
+            entity: TokenizedEquityMint,
+            label: &str,
+        ) {
+            trigger.equity_in_progress.write().unwrap().remove(symbol);
+            let mint_id = issuer_request_id(mint_id_str);
+            trigger.recover_mint_state(&mint_id, &entity).await.unwrap();
+            assert!(
+                matches!(
+                    trigger
+                        .equity_in_progress
+                        .read()
+                        .unwrap()
+                        .get(symbol)
+                        .cloned(),
+                    Some(equity::GuardState::ActiveTransfer { .. })
+                ),
+                "{label}"
+            );
+        }
+
+        check_active_transfer(
+            &trigger_enabled,
+            &symbol,
+            "startup-tokens-wrapped",
+            TokenizedEquityMint::TokensWrapped {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-tokens-wrapped"),
+                tokenization_request_id: TokenizationRequestId("TOK-TW".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::ZERO,
+                wrapped_shares: U256::from(5u64),
+                wrap_block: None,
+                wrapped_at: now,
+            },
+            "TokensWrapped must always reconstruct as ActiveTransfer \
+             (deposit idempotent; WrappedEquityRecovery is orphan-only)",
+        )
+        .await;
+
+        check_active_transfer(
+            &trigger_enabled,
+            &symbol,
+            "startup-vault-deposit-submitted",
+            TokenizedEquityMint::VaultDepositSubmitted {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-vault-deposit-submitted"),
+                tokenization_request_id: TokenizationRequestId("TOK-VDS".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::ZERO,
+                wrapped_shares: U256::from(5u64),
+                wrapped_at: now,
+                vault_deposit_tx_hash: TxHash::ZERO,
+            },
+            "VaultDepositSubmitted must always reconstruct as ActiveTransfer \
+             (deposit tx on-chain; resume_mint confirms idempotently)",
+        )
+        .await;
+
+        check_active_transfer(
+            &trigger_disabled,
+            &symbol,
+            "startup-tokens-received-disabled",
+            TokenizedEquityMint::TokensReceived {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-tokens-received-disabled"),
+                tokenization_request_id: TokenizationRequestId("TOK-TR-D".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+            },
+            "TokensReceived + recovery disabled must reconstruct as ActiveTransfer \
+             (apalis transfer job retries normally)",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn recover_redemption_state_restores_tracking_and_inflight() {
         let trigger = make_trigger().await;
@@ -4388,7 +4761,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         let tracking = trigger
             .redemption_tracking
@@ -4710,7 +5089,13 @@ mod tests {
 
         assert_eq!(trigger.inventory.read().await.active_mint(&symbol), None);
         assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -4751,7 +5136,13 @@ mod tests {
         assert_eq!(inventory.active_mint(&symbol), Some(&other));
         drop(inventory);
         assert!(!trigger.mint_tracking.read().await.contains_key(&recovering));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -4851,7 +5242,13 @@ mod tests {
                 .await
                 .contains_key(&recovering)
         );
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -4982,7 +5379,13 @@ mod tests {
         assert_eq!(inventory.active_mint(&symbol), None);
         drop(inventory);
         assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -5066,7 +5469,13 @@ mod tests {
         );
         drop(inventory);
         assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -5153,7 +5562,13 @@ mod tests {
                 .await
                 .contains_key(&redemption_id)
         );
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -5212,7 +5627,13 @@ mod tests {
                 .await
                 .contains_key(&redemption_id)
         );
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -5673,7 +6094,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         tokio::time::timeout(
@@ -5875,14 +6299,66 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         trigger.clear_equity_in_progress(&symbol);
 
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_equity_in_progress_removes_both_active_and_held_for_recovery_states() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Verify clear works on ActiveTransfer.
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer { generation: 0 },
+        );
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "clear must remove ActiveTransfer entry"
+        );
+
+        // Verify clear works on HeldForRecovery.
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "clear must remove HeldForRecovery entry"
+        );
     }
 
     #[tokio::test]
@@ -6973,9 +7449,18 @@ mod tests {
         // Mark symbol as in-progress.
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         // Check that DepositedIntoRaindex is detected as terminal.
         assert!(RebalancingService::is_terminal_mint_event(
@@ -6984,7 +7469,13 @@ mod tests {
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -6997,7 +7488,10 @@ mod tests {
         // Mark symbol as in-progress.
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         assert!(RebalancingService::is_terminal_mint_event(
@@ -7005,7 +7499,13 @@ mod tests {
         ));
 
         trigger.clear_equity_in_progress(&symbol);
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[test]
@@ -7055,7 +7555,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let harness = ReactorHarness::new(Arc::clone(&trigger));
@@ -7072,7 +7575,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal MintRejected"
         );
     }
@@ -7092,7 +7599,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let harness = ReactorHarness::new(Arc::clone(&trigger));
@@ -7112,7 +7622,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal Completed"
         );
     }
@@ -7302,7 +7816,10 @@ mod tests {
         // Set in-progress flag to verify terminal event clears it
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let id = issuer_request_id("mint-deposit");
@@ -7329,7 +7846,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal DepositedIntoRaindex"
         );
     }
@@ -7358,7 +7879,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let id = issuer_request_id("mint-wrapping-fail");
@@ -7374,7 +7898,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal WrappingFailed"
         );
     }
@@ -7403,7 +7931,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let id = issuer_request_id("mint-deposit-fail");
@@ -7419,7 +7950,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal RaindexDepositFailed"
         );
     }
@@ -7442,7 +7977,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let id = redemption_aggregate_id("redemption-transfer-fail");
@@ -7461,7 +7999,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal TransferFailed"
         );
     }
@@ -7484,7 +8026,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let id = redemption_aggregate_id("redemption-detection-fail");
@@ -7503,7 +8048,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal DetectionFailed"
         );
     }
@@ -7526,7 +8075,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let id = redemption_aggregate_id("redemption-rejected");
@@ -7545,7 +8097,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal RedemptionRejected"
         );
     }
@@ -9640,9 +10196,18 @@ mod tests {
         // Mark symbol as in-progress.
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         // Check that Completed is detected as terminal.
         assert!(RebalancingService::is_terminal_redemption_event(
@@ -9651,7 +10216,13 @@ mod tests {
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[test]
@@ -14884,7 +15455,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         trigger.redemption_tracking.write().await.insert(
@@ -14902,7 +15476,11 @@ mod tests {
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "equity timeout should clear the symbol in-progress guard"
         );
         assert!(
@@ -15041,7 +15619,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         trigger.redemption_tracking.write().await.insert(
@@ -16235,7 +16816,7 @@ mod tests {
 
         // A different symbol is not suppressed by AAPL's pending row.
         let enqueued = trigger
-            .enqueue_transfer_equity_to_market_making(Symbol::new("TSLA").unwrap(), shares(30))
+            .enqueue_transfer_equity_to_market_making(Symbol::new("TSLA").unwrap(), shares(30), 0)
             .await;
         assert!(
             enqueued,
@@ -16330,7 +16911,10 @@ mod tests {
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         EquityRebalancingCheck {
@@ -16918,6 +17502,154 @@ mod tests {
             inflight,
             Some(usdc(400)),
             "replayed Initiated must not double-count inflight"
+        );
+    }
+
+    /// `expire_stuck_mints` must skip mints whose symbol's in-progress guard is
+    /// `HeldForRecovery`. The recovery job owns those mints and is responsible for
+    /// driving them to a terminal state; timing them out would clear the guard and
+    /// allow a double-mint while the original tokens are still in the wallet.
+    #[tokio::test]
+    async fn expire_stuck_mints_skips_held_for_recovery_mints() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Use a very short timeout so the mint would normally be cleaned up.
+        let config = test_config_with_timeout(Duration::from_secs(60));
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = Arc::new(RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            wrapper,
+            RebalancingSchedulers::new(&apalis_pool),
+        ));
+
+        let id = issuer_request_id("held-for-recovery-timeout");
+
+        // Seed a mint tracking entry at a post-receipt stage with a stale
+        // last_progress_at so the timeout sweep would normally pick it up.
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::TokensReceived,
+                last_progress_at: now - ChronoDuration::hours(2),
+            },
+        );
+
+        // Set the guard to HeldForRecovery for this symbol (simulating the
+        // PostReceipt handoff from the transfer job).
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+
+        // Run expire_stuck_mints with a far-future now so the mint is well past
+        // the timeout threshold.
+        trigger
+            .expire_stuck_mints(now + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        // The mint tracking entry must NOT have been removed.
+        assert!(
+            trigger.mint_tracking.read().await.contains_key(&id),
+            "expire_stuck_mints must not clean up a HeldForRecovery mint"
+        );
+
+        // The guard must still be HeldForRecovery.
+        assert_eq!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol)
+                .cloned(),
+            Some(equity::GuardState::HeldForRecovery),
+            "expire_stuck_mints must not clear a HeldForRecovery guard"
+        );
+    }
+
+    /// `clear_equity_in_progress_unless_held_for_recovery` is the single-lock
+    /// check-and-clear that closes the timeout-sweep TOCTOU race: a concurrent
+    /// `mark_held_for_recovery` can flip `ActiveTransfer` -> `HeldForRecovery`
+    /// after the steady-state check but before the clear, and a non-atomic clear
+    /// would drop the recovery-owned guard and fail a mint whose tokens are still
+    /// in the wallet -- the double-mint this guard exists to prevent. This
+    /// verifies the invariant the race hinges on: a `HeldForRecovery` slot is
+    /// never cleared (caller skips the failure event), while an `ActiveTransfer`
+    /// or absent slot is cleared so a fresh rebalance can proceed.
+    #[tokio::test]
+    async fn clear_equity_in_progress_unless_held_for_recovery_preserves_recovery_ownership() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let config = test_config_with_timeout(Duration::from_secs(60));
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = Arc::new(RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            wrapper,
+            RebalancingSchedulers::new(&apalis_pool),
+        ));
+
+        // HeldForRecovery: recovery owns the slot -- must be left untouched and
+        // signal the caller (returns false) to skip the failure event.
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        assert!(
+            !trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            "a HeldForRecovery slot must not be cleared by the timeout path",
+        );
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery),
+            "the HeldForRecovery guard must remain after a refused clear",
+        );
+
+        // ActiveTransfer: a live transfer that genuinely timed out -- clear it so
+        // a fresh rebalance can proceed.
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer { generation: 0 },
+        );
+        assert!(
+            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            "an ActiveTransfer slot must be cleared so a fresh rebalance can proceed",
+        );
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            None,
+            "the ActiveTransfer guard must be removed after a successful clear",
+        );
+
+        // Absent: clearing is a no-op that still reports success.
+        assert!(
+            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            "an absent slot must report a successful (no-op) clear",
         );
     }
 }

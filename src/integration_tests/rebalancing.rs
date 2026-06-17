@@ -14,10 +14,11 @@ use httpmock::Mock;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use rain_math_float::Float;
 use st0x_config::{
@@ -32,7 +33,7 @@ use st0x_execution::{
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexVaultId};
-use st0x_wrapper::MockWrapper;
+use st0x_wrapper::{MockWrapper, Wrapper};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
@@ -40,6 +41,7 @@ use crate::conductor::job::Job;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
 };
+use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
@@ -49,6 +51,7 @@ use crate::rebalancing::equity::{
     TransferEquityToHedgingCtx, TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobError,
 };
+use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
     RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
@@ -60,9 +63,23 @@ use crate::tokenization::alpaca::tests::{
     tokenization_requests_path,
 };
 use crate::tokenization::mock::MockTokenizer;
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
+use crate::tokenized_equity_mint::{
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
+};
+use crate::unwrapped_equity_recovery::aggregate::{
+    UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
+};
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
+};
 use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+use crate::wrapped_equity_recovery::aggregate::{
+    WrappedEquityRecovery, WrappedEquityRecoveryId, WrappedEquityRecoveryServices,
+};
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue,
+};
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
@@ -732,8 +749,20 @@ async fn equity_offchain_imbalance_triggers_mint() {
             )]));
     });
 
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
+        equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+        mint_store,
+        equities_config: EquitiesConfig::default(),
     };
     Job::perform(&job, &ctx).await.unwrap();
 
@@ -1641,8 +1670,20 @@ async fn mint_api_failure_produces_rejected_event() {
     drain_pending_jobs(&service).await.unwrap();
 
     let job = fetch_pending_equity_mint_job(&apalis_pool).await;
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
+        equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+        mint_store,
+        equities_config: EquitiesConfig::default(),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
     assert!(
@@ -2189,11 +2230,24 @@ async fn mint_accepted_sets_offchain_inflight() {
     // The poll will return pending, so the mint aggregate will time out or loop,
     // but MintAccepted has already fired by then. We spawn and cancel to
     // get just the MintAccepted event through.
+    let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
     let transfer_handle = tokio::spawn({
         let equity_transfer = Arc::clone(&equity_transfer);
+        let mint_store = Arc::clone(&mint_store_for_spawn);
         async move {
             let ctx = TransferEquityToMarketMakingCtx {
                 transfer: equity_transfer,
+                equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+                mint_store,
+                equities_config: EquitiesConfig::default(),
             };
             let _ = Job::perform(&job, &ctx).await;
         }
@@ -2390,8 +2444,20 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     };
 
     // Execute the full mint lifecycle through the job's perform
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: Arc::clone(&equity_transfer) as _,
+        equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+        mint_store,
+        equities_config: EquitiesConfig::default(),
     };
     Job::perform(&job, &ctx).await.unwrap();
 
@@ -2550,5 +2616,528 @@ async fn transfer_failed_cancels_redemption_inflight() {
     assert!(
         available_after_fail.inner().eq(float!("80")).unwrap(),
         "Available should be restored to 80 after TransferFailed, got {available_after_fail:?}"
+    );
+}
+
+/// WrappedEquityRecovery claims a `HeldForRecovery` slot (the wrap-landed-but-
+/// unconfirmed handoff), but when inventory shows NO wrapped balance yet it
+/// must RESCHEDULE itself rather than drop the slot: the inventory reactor only
+/// re-dispatches recovery on a positive balance, so dropping here would restore
+/// `HeldForRecovery` with no job left to drain it -- wedging the symbol. The
+/// guard is restored to `HeldForRecovery` and a delayed job keeps polling.
+///
+/// For the case where the wrapped balance IS present, see
+/// `recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery`.
+#[tokio::test]
+async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
+    let symbol = Symbol::new("AAPL").unwrap();
+
+    // Guard is HeldForRecovery: set by the transfer job when PostReceipt fired.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        WrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+        },
+    ));
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
+
+    let ctx = WrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+    let job = WrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job claims HeldForRecovery, finds no wrapped balance, and reschedules
+    // (returns Ok(())) to keep polling -- the guard is restored on drop.
+    job.perform(&ctx)
+        .await
+        .expect("wrapped recovery must return Ok(()) when rescheduling");
+
+    // The guard must be restored to HeldForRecovery after the no-balance drop.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        Some(&GuardState::HeldForRecovery),
+        "equity_in_progress must be restored to HeldForRecovery after a no-balance reschedule; \
+         the slot must not be cleared so recovery retries can still claim it",
+    );
+
+    // No work was done past the no-balance skip, so the aggregate is absent.
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        state.is_none(),
+        "wrapped recovery must not create the aggregate when it reschedules; got {state:?}",
+    );
+
+    // A rescheduled job must have been enqueued so polling continues.
+    let (rescheduled,): (i64,) =
+        sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rescheduled, 1,
+        "a HeldForRecovery claim with no balance must enqueue a delayed job to keep polling",
+    );
+}
+
+/// LANDED-BUT-UNCONFIRMED SCENARIO: the transfer job got a `PostReceipt` error
+/// in `WrapSubmitted` and handed the slot to recovery as `HeldForRecovery`, but
+/// the wrap tx actually LANDED -- only its confirmation read failed under a
+/// stale RPC. The tokens are therefore WRAPPED in the base wallet (inventory:
+/// `BaseWalletWrapped`), and `WrappedEquityRecovery` is the job the reactor
+/// dispatches. It must:
+/// 1. Claim the `HeldForRecovery` slot (not reschedule -- the old orphan-only
+///    claim refused it, wedging the slot with no job able to drain it).
+/// 2. Drive the orphan deposit sequence to `OrphanDeposited`.
+/// 3. Release the guard (map empty after completion).
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery() {
+    let symbol = Symbol::new("AAPL").unwrap();
+
+    // Guard is HeldForRecovery: set by the transfer job after a PostReceipt
+    // error in WrapSubmitted. The wrap tx landed, so tokens are WRAPPED.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO)),
+    );
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        WrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+        },
+    ));
+
+    // Inventory reports WRAPPED balance: the wrap landed, tokens are wtSTOCK
+    // in the base wallet outside Raindex.
+    let shares = FractionalShares::new(float!(5));
+    let mut balances = BTreeMap::new();
+    balances.insert(symbol.clone(), shares);
+    let now = Utc::now();
+    let view = InventoryView::default().set_inflight_equity_at_location(
+        InFlightEquityLocation::BaseWalletWrapped,
+        &balances,
+        now,
+        now,
+    );
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+    let ctx = WrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+    let job = WrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job must claim HeldForRecovery and run to completion.
+    job.perform(&ctx)
+        .await
+        .expect("WrappedEquityRecovery must run to completion when guard is HeldForRecovery");
+
+    // Verify the aggregate reached a terminal state (orphan deposit path).
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(state, Some(WrappedEquityRecovery::OrphanDeposited { .. })),
+        "WrappedEquityRecovery must drive orphan path to OrphanDeposited, got {state:?}",
+    );
+
+    // Verify the guard was released: the slot must be absent after completion.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "equity_in_progress must be empty after WrappedEquityRecovery completes; \
+         a stuck guard would block future transfers for {symbol}",
+    );
+
+    // Verify no rescheduled jobs were enqueued.
+    let (rescheduled,): (i64,) =
+        sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rescheduled, 0,
+        "WrappedEquityRecovery must NOT reschedule when it can claim HeldForRecovery and drain \
+         the wrapped balance; a reschedule count > 0 means the deadlock-break failed",
+    );
+}
+
+/// ORPHAN-DISPATCH VARIANT (RAI-1070): the ERC-4626 wrap reverted, so tokens
+/// are still UNWRAPPED in the base wallet (inventory: `BaseWalletUnwrapped`),
+/// and there is NO active mint in the inventory view, so `decide_dispatch`
+/// resolves to `Orphan`. `UnwrappedEquityRecovery` must:
+/// 1. Claim the `HeldForRecovery` slot (not reschedule).
+/// 2. Drive the orphan wrap+deposit sequence to `OrphanDeposited`.
+/// 3. Release the guard (map empty after completion).
+///
+/// The prod path usually carries an active mint (see
+/// `recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint` for
+/// the `ActiveMint` -> `DispatchToMint` variant); this test isolates the
+/// orphan branch.
+///
+/// Before this fix, `mark_held_for_recovery` only fired for `TokensWrapped`,
+/// so the prod (wrap-failed) path left the guard as `ActiveTransfer` after
+/// apalis retry exhaustion, deadlocking all future mints for the symbol.
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery() {
+    let symbol = Symbol::new("AAPL").unwrap();
+
+    // Guard is HeldForRecovery: set by the transfer job when it got a
+    // PostReceipt error with the aggregate in TokensReceived/WrapSubmitted.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO)),
+    );
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+            wallet: Address::ZERO,
+        },
+    ));
+
+    // Inventory reports UNWRAPPED balance: wrap failed, tokens are raw tSTOCK
+    // in the base wallet.
+    let shares = FractionalShares::new(float!(5));
+    let mut balances = BTreeMap::new();
+    balances.insert(symbol.clone(), shares);
+    let now = Utc::now();
+    let view = InventoryView::default().set_inflight_equity_at_location(
+        InFlightEquityLocation::BaseWalletUnwrapped,
+        &balances,
+        now,
+        now,
+    );
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+    let ctx = UnwrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+    let job = UnwrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job must claim HeldForRecovery and run to completion.
+    job.perform(&ctx)
+        .await
+        .expect("UnwrappedEquityRecovery must run to completion when guard is HeldForRecovery");
+
+    // Verify the aggregate reached a terminal state (orphan wrap+deposit path).
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(state, Some(UnwrappedEquityRecovery::OrphanDeposited { .. })),
+        "UnwrappedEquityRecovery must drive orphan path to OrphanDeposited, got {state:?}",
+    );
+
+    // Verify the guard was released: the slot must be absent after completion.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "equity_in_progress must be empty after UnwrappedEquityRecovery completes; \
+         a stuck guard would block future transfers for {symbol}",
+    );
+
+    // Verify no rescheduled jobs were enqueued.
+    let (rescheduled,): (i64,) =
+        sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rescheduled, 0,
+        "UnwrappedEquityRecovery must NOT reschedule when it can claim HeldForRecovery; \
+         a reschedule count > 0 means the job incorrectly treated it as contention",
+    );
+}
+
+/// ACTIVE-MINT VARIANT (RAI-1070): the path prod actually takes. A wrap-failed
+/// mint is in `TokensReceived`/`WrapSubmitted`, and the snapshot reactor's
+/// `update_active_mint` has populated `active_mint`, so `decide_dispatch`
+/// resolves to `ActiveMint` -- recovery dispatches `DispatchToMint`, which
+/// `resume_mint`s the persisted mint from its pre-wrap state, reaching
+/// `DispatchedToMint`. The orphan variant above covers only the
+/// no-active-mint branch, which is not what prod hits for a wrap-failed mint.
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() {
+    let symbol = Symbol::new("AAPL").unwrap();
+    let mint_id = issuer_request_id("active-mint-deadlock");
+
+    // Guard is HeldForRecovery: handed off by the transfer job after PostReceipt.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO)),
+    );
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+            wallet: Address::ZERO,
+        },
+    ));
+
+    // Seed the mint aggregate in TokensReceived (the persisted pre-wrap state)
+    // with quantity matching the unwrapped wallet balance, so resume_mint can
+    // re-drive it and validate_active_aggregate_quantity passes.
+    mint_store
+        .send(
+            &mint_id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+            },
+        )
+        .await
+        .expect("RequestMint must persist");
+    mint_store
+        .send(&mint_id, TokenizedEquityMintCommand::Poll)
+        .await
+        .expect("Poll must transition the mint to TokensReceived");
+
+    // Inventory reports UNWRAPPED balance AND an active mint, so decide_dispatch
+    // resolves to ActiveMint (the prod path) instead of Orphan.
+    let shares = FractionalShares::new(float!(5));
+    let mut balances = BTreeMap::new();
+    balances.insert(symbol.clone(), shares);
+    let now = Utc::now();
+    let view = InventoryView::default()
+        .set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletUnwrapped,
+            &balances,
+            now,
+            now,
+        )
+        .set_active_mint(symbol.clone(), mint_id.clone());
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+    let ctx = UnwrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+    let job = UnwrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job must claim HeldForRecovery and dispatch through the ActiveMint path.
+    job.perform(&ctx)
+        .await
+        .expect("UnwrappedEquityRecovery must run to completion on the ActiveMint path");
+
+    // Verify the recovery aggregate dispatched via DispatchToMint (NOT the orphan
+    // wrap path), reaching the DispatchedToMint terminal state.
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(
+            state,
+            Some(UnwrappedEquityRecovery::DispatchedToMint { .. })
+        ),
+        "recovery must drive the ActiveMint path to DispatchedToMint, got {state:?}",
+    );
+
+    // Verify the guard was released after completion.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "equity_in_progress must be empty after recovery dispatches the active mint; \
+         a stuck guard would block future transfers for {symbol}",
     );
 }
