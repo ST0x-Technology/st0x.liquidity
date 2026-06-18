@@ -537,6 +537,7 @@ mod tests {
                 wrapped_amount: alloy::primitives::U256::from(20),
                 actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::ZERO,
+                raindex_withdraw_block: None,
                 withdrawn_at: two_days_ago,
             })
             .unwrap(),
@@ -572,6 +573,7 @@ mod tests {
                 wrapped_amount: alloy::primitives::U256::from(15),
                 actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::ZERO,
+                raindex_withdraw_block: None,
                 withdrawn_at: now,
             })
             .unwrap(),

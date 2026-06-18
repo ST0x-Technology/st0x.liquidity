@@ -12,6 +12,7 @@ pub(crate) mod mock;
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, Symbol};
 
 pub(crate) use alpaca::{
@@ -92,6 +93,13 @@ pub(crate) trait Tokenizer: Send + Sync {
     /// Returns the redemption wallet address where tokens should be sent,
     /// if configured.
     fn redemption_wallet(&self) -> Option<Address>;
+
+    /// Wait for the tokenizer's RPC node to reach `block` before issuing the
+    /// dependent redemption transfer. The wait must run on the same provider
+    /// that performs the transfer (`send_for_redemption`), so it lives on the
+    /// tokenizer rather than the wrapper -- a load-balanced wrapper provider
+    /// catching up gives no guarantee about the tokenizer's provider.
+    async fn wait_for_block(&self, block: u64) -> Result<(), EvmError>;
 
     /// Send tokens to the redemption wallet to initiate redemption.
     async fn send_for_redemption(

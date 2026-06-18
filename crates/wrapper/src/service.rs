@@ -9,12 +9,19 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::info;
 
-use st0x_evm::{IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{
+    IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL, OpenChainErrorRegistry,
+    Wallet, wait_for_node_sync,
+};
 use st0x_execution::Symbol;
 
-use crate::{UnderlyingPerWrapped, WrappedEquity, Wrapper, WrapperError};
+use crate::{
+    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, WrappedEquity, Wrapper,
+    WrapperError,
+};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -36,11 +43,36 @@ const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0,
 pub struct WrapperService<W: Wallet> {
     wallet: W,
     config: HashMap<Symbol, WrappedEquity>,
+    /// Poll interval used by node-sync waits (`wait_for_block` and the
+    /// post-approval deposit gate). Production always uses
+    /// [`NODE_SYNC_POLL_INTERVAL`]; tests override it to avoid sleeping
+    /// through the full production budget.
+    node_sync_poll_interval: Duration,
 }
 
 impl<W: Wallet> WrapperService<W> {
     pub fn new(wallet: W, config: HashMap<Symbol, WrappedEquity>) -> Self {
-        Self { wallet, config }
+        Self {
+            wallet,
+            config,
+            node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
+        }
+    }
+
+    /// Constructs a service with a custom node-sync poll interval. Test-only:
+    /// lets node-sync exhaustion paths run without sleeping at the production
+    /// one-second cadence.
+    #[cfg(test)]
+    fn with_node_sync_poll_interval(
+        wallet: W,
+        config: HashMap<Symbol, WrappedEquity>,
+        node_sync_poll_interval: Duration,
+    ) -> Self {
+        Self {
+            wallet,
+            config,
+            node_sync_poll_interval,
+        }
     }
 
     /// Fetches the current conversion ratio for a wrapped token.
@@ -107,9 +139,9 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .submit_wrap(wrapped_token, underlying_amount, receiver)
             .await?;
 
-        let actual_shares = self.confirm_wrap(wrapped_token, tx_hash).await?;
+        let WrapConfirmation { shares, .. } = self.confirm_wrap(wrapped_token, tx_hash).await?;
 
-        Ok((tx_hash, actual_shares))
+        Ok((tx_hash, shares))
     }
 
     async fn to_underlying(
@@ -123,9 +155,9 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .submit_unwrap(wrapped_token, wrapped_amount, receiver, owner)
             .await?;
 
-        let actual_assets = self.confirm_unwrap(wrapped_token, tx_hash).await?;
+        let UnwrapConfirmation { assets, .. } = self.confirm_unwrap(wrapped_token, tx_hash).await?;
 
-        Ok((tx_hash, actual_assets))
+        Ok((tx_hash, assets))
     }
 
     async fn submit_wrap(
@@ -161,7 +193,8 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 "Approving ERC-4626 vault to spend underlying tokens"
             );
 
-            self.wallet
+            let approval_receipt = self
+                .wallet
                 .submit::<OpenChainErrorRegistry, _>(
                     underlying_token,
                     IERC20::approveCall {
@@ -171,6 +204,25 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                     "ERC20 approve for ERC4626 deposit",
                 )
                 .await?;
+
+            // The deposit's pre-flight simulation reads the freshly granted
+            // allowance. A load-balanced backend that has not yet indexed the
+            // approval would see a zero allowance and revert the deposit, so
+            // wait for the node to reach the approval block before submitting.
+            let approval_block =
+                approval_receipt
+                    .block_number
+                    .ok_or(WrapperError::MissingBlockNumber {
+                        tx_hash: approval_receipt.transaction_hash,
+                    })?;
+
+            wait_for_node_sync(
+                self.wallet.provider(),
+                approval_block,
+                self.node_sync_poll_interval,
+                NODE_SYNC_MAX_ATTEMPTS,
+            )
+            .await?;
         }
 
         info!(target: "orderbook", %wrapped_token, %underlying_amount, "Sending ERC4626 deposit");
@@ -195,13 +247,17 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         &self,
         wrapped_token: Address,
         tx_hash: TxHash,
-    ) -> Result<U256, WrapperError> {
+    ) -> Result<WrapConfirmation, WrapperError> {
         let receipt = self
             .wallet
             .confirm::<OpenChainErrorRegistry>(tx_hash)
             .await?;
 
-        let actual_shares = receipt
+        let block = receipt
+            .block_number
+            .ok_or(WrapperError::MissingBlockNumber { tx_hash })?;
+
+        let shares = receipt
             .inner
             .logs()
             .iter()
@@ -213,7 +269,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             })
             .ok_or(WrapperError::MissingDepositEvent)?;
 
-        Ok(actual_shares)
+        Ok(WrapConfirmation { shares, block })
     }
 
     async fn submit_unwrap(
@@ -253,13 +309,17 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         &self,
         wrapped_token: Address,
         tx_hash: TxHash,
-    ) -> Result<U256, WrapperError> {
+    ) -> Result<UnwrapConfirmation, WrapperError> {
         let receipt = self
             .wallet
             .confirm::<OpenChainErrorRegistry>(tx_hash)
             .await?;
 
-        let actual_assets = receipt
+        let block = receipt
+            .block_number
+            .ok_or(WrapperError::MissingBlockNumber { tx_hash })?;
+
+        let assets = receipt
             .inner
             .logs()
             .iter()
@@ -271,7 +331,18 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             })
             .ok_or(WrapperError::MissingWithdrawEvent)?;
 
-        Ok(actual_assets)
+        Ok(UnwrapConfirmation { assets, block })
+    }
+
+    async fn wait_for_block(&self, block: u64) -> Result<(), WrapperError> {
+        wait_for_node_sync(
+            self.wallet.provider(),
+            block,
+            self.node_sync_poll_interval,
+            NODE_SYNC_MAX_ATTEMPTS,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     fn owner(&self) -> Address {
@@ -306,13 +377,17 @@ fn check_redeem_within_max(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Bytes;
+    use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy::primitives::{Bloom, Bytes};
+    use alloy::providers::Provider;
+    use alloy::providers::ProviderBuilder;
     use alloy::providers::RootProvider;
+    use alloy::providers::mock::Asserter;
     use alloy::rpc::client::RpcClient;
     use alloy::rpc::types::TransactionReceipt;
-    use std::sync::Arc;
-
+    use alloy::sol_types::SolCall;
     use st0x_evm::{Evm, EvmError};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -529,6 +604,295 @@ mod tests {
                 } if token == wrapped_token && req == requested && max == max_redeem
             ),
             "expected RedeemExceedsMax carrying the requested/max amounts, got: {error:?}"
+        );
+    }
+
+    /// A wallet whose provider is backed by a mock transport (Asserter).
+    /// `wait_for_block` tests only need the provider; `submit_wrap` tests also
+    /// configure canned write results so the approve/deposit flow runs without
+    /// a real chain.
+    struct MockedWallet<P> {
+        address: Address,
+        provider: P,
+        send_receipt: Option<TransactionReceipt>,
+        send_pending_tx_hash: TxHash,
+    }
+
+    impl<P: Provider + Clone + Send + Sync + 'static> MockedWallet<P> {
+        fn new(address: Address, provider: P) -> Self {
+            Self {
+                address,
+                provider,
+                send_receipt: None,
+                send_pending_tx_hash: TxHash::ZERO,
+            }
+        }
+
+        /// Configures the receipt returned by `send` (the approve tx) and the
+        /// hash returned by `send_pending` (the deposit tx) so `submit_wrap`
+        /// can be driven end to end.
+        fn with_write_results(
+            mut self,
+            send_receipt: TransactionReceipt,
+            send_pending_tx_hash: TxHash,
+        ) -> Self {
+            self.send_receipt = Some(send_receipt);
+            self.send_pending_tx_hash = send_pending_tx_hash;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl<P: Provider + Clone + Send + Sync + 'static> Evm for MockedWallet<P> {
+        type Provider = P;
+
+        fn provider(&self) -> &P {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl<P: Provider + Clone + Send + Sync + 'static> Wallet for MockedWallet<P> {
+        fn address(&self) -> Address {
+            self.address
+        }
+
+        async fn send_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            Ok(self.send_pending_tx_hash)
+        }
+
+        async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            Ok(self
+                .send_receipt
+                .clone()
+                .expect("await_receipt called without a configured send_receipt"))
+        }
+
+        async fn send(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            Ok(self
+                .send_receipt
+                .clone()
+                .expect("send called without a configured send_receipt"))
+        }
+    }
+
+    /// Verifies that `WrapperService::wait_for_block` delegates to
+    /// `wait_for_node_sync` correctly: when the node is already at the required
+    /// block, the call returns `Ok(())`.
+    #[tokio::test]
+    async fn wait_for_block_succeeds_when_node_is_at_required_block() {
+        let required_block = 42u64;
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(required_block));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = MockedWallet::new(Address::ZERO, provider);
+        let service = WrapperService::new(wallet, HashMap::new());
+
+        service
+            .wait_for_block(required_block)
+            .await
+            .expect("node is at required block -- wait_for_block must succeed");
+    }
+
+    /// Verifies that `WrapperService::wait_for_block` propagates
+    /// `EvmError::NodeBehindRequiredBlock` as `WrapperError::Evm` when the
+    /// node is consistently behind, confirming the `?` propagation inside the
+    /// service is wired correctly. Exercises all NODE_SYNC_MAX_ATTEMPTS (30)
+    /// poll attempts; the zero poll interval keeps the test instant instead of
+    /// sleeping through the production one-second cadence.
+    #[tokio::test]
+    async fn wait_for_block_propagates_node_behind_error_as_wrapper_evm_error() {
+        let required_block = 100u64;
+        let stale_tip = 1u64;
+        let asserter = Asserter::new();
+        // Push NODE_SYNC_MAX_ATTEMPTS stale-block responses so all attempts see
+        // a stale tip and the error is NodeBehindRequiredBlock.
+        for _ in 0..NODE_SYNC_MAX_ATTEMPTS {
+            asserter.push_success(&serde_json::Value::from(stale_tip));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = MockedWallet::new(Address::ZERO, provider);
+        let service =
+            WrapperService::with_node_sync_poll_interval(wallet, HashMap::new(), Duration::ZERO);
+
+        let error = service
+            .wait_for_block(required_block)
+            .await
+            .expect_err("stale node must cause wait_for_block to fail");
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::Evm(EvmError::NodeBehindRequiredBlock {
+                    required_block: 100,
+                    observed_tip: 1,
+                    attempts: NODE_SYNC_MAX_ATTEMPTS,
+                })
+            ),
+            "wait_for_block must surface NodeBehindRequiredBlock via WrapperError::Evm, got: {error:?}"
+        );
+    }
+
+    /// Builds a successful receipt carrying the given tx hash and block number.
+    fn receipt_with_block(tx_hash: TxHash, block_number: Option<u64>) -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: true.into(),
+                    cumulative_gas_used: 0,
+                    logs: vec![],
+                },
+                logs_bloom: Bloom::default(),
+            }),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number,
+            gas_used: 21000,
+            effective_gas_price: 1,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        }
+    }
+
+    /// Queues the two `eth_call` reads `submit_wrap` performs before the
+    /// approval branch: `asset()` (returns the underlying token) and
+    /// `allowance()` (returned as zero so the on-demand approval path runs).
+    fn push_asset_and_zero_allowance(asserter: &Asserter, underlying_token: Address) {
+        asserter.push_success(&<IERC4626::assetCall as SolCall>::abi_encode_returns(
+            &underlying_token,
+        ));
+        asserter.push_success(&<IERC20::allowanceCall as SolCall>::abi_encode_returns(
+            &U256::ZERO,
+        ));
+    }
+
+    /// On the on-demand approval path, `submit_wrap` must wait for the node to
+    /// reach the approval block before submitting the deposit, then return the
+    /// deposit tx hash once the gate clears.
+    #[tokio::test]
+    async fn submit_wrap_waits_for_node_sync_before_deposit_after_approval() {
+        let underlying = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let receiver = Address::repeat_byte(0x33);
+        let amount = U256::from(1_000u64);
+        let approval_block = 7u64;
+        let approve_tx = TxHash::repeat_byte(0xaa);
+        let deposit_tx = TxHash::repeat_byte(0xbb);
+
+        let asserter = Asserter::new();
+        push_asset_and_zero_allowance(&asserter, underlying);
+        // Node is already at the approval block, so the gate clears on the
+        // first poll and the deposit proceeds.
+        asserter.push_success(&serde_json::Value::from(approval_block));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = MockedWallet::new(Address::ZERO, provider).with_write_results(
+            receipt_with_block(approve_tx, Some(approval_block)),
+            deposit_tx,
+        );
+        let service =
+            WrapperService::with_node_sync_poll_interval(wallet, HashMap::new(), Duration::ZERO);
+
+        let tx_hash = service
+            .submit_wrap(wrapped, amount, receiver)
+            .await
+            .expect("submit_wrap must succeed once the node-sync gate clears");
+
+        assert_eq!(
+            tx_hash, deposit_tx,
+            "submit_wrap must return the deposit tx hash after the node-sync gate clears"
+        );
+    }
+
+    /// If the node never reaches the approval block, `submit_wrap` must surface
+    /// `NodeBehindRequiredBlock` and never attempt the deposit -- proving the
+    /// deposit is gated on the post-approval node-sync wait.
+    #[tokio::test]
+    async fn submit_wrap_gates_deposit_when_node_stays_behind_approval_block() {
+        let underlying = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let receiver = Address::repeat_byte(0x33);
+        let amount = U256::from(1_000u64);
+        let approval_block = 100u64;
+        let stale_tip = 1u64;
+        let approve_tx = TxHash::repeat_byte(0xaa);
+
+        let asserter = Asserter::new();
+        push_asset_and_zero_allowance(&asserter, underlying);
+        // Every poll sees a stale tip, so the gate never clears.
+        for _ in 0..NODE_SYNC_MAX_ATTEMPTS {
+            asserter.push_success(&serde_json::Value::from(stale_tip));
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = MockedWallet::new(Address::ZERO, provider).with_write_results(
+            receipt_with_block(approve_tx, Some(approval_block)),
+            TxHash::repeat_byte(0xbb),
+        );
+        let service =
+            WrapperService::with_node_sync_poll_interval(wallet, HashMap::new(), Duration::ZERO);
+
+        let error = service
+            .submit_wrap(wrapped, amount, receiver)
+            .await
+            .expect_err("a node stuck behind the approval block must gate the deposit");
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::Evm(EvmError::NodeBehindRequiredBlock {
+                    required_block: 100,
+                    observed_tip: 1,
+                    attempts: NODE_SYNC_MAX_ATTEMPTS,
+                })
+            ),
+            "submit_wrap must gate the deposit on node sync and surface NodeBehindRequiredBlock, got: {error:?}"
+        );
+    }
+
+    /// A confirmed approval receipt without a block number must fail hard --
+    /// silently skipping the node-sync wait would re-open the stale-RPC race.
+    #[tokio::test]
+    async fn submit_wrap_fails_when_approval_receipt_has_no_block_number() {
+        let underlying = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let receiver = Address::repeat_byte(0x33);
+        let amount = U256::from(1_000u64);
+        let approve_tx = TxHash::repeat_byte(0xaa);
+
+        let asserter = Asserter::new();
+        push_asset_and_zero_allowance(&asserter, underlying);
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = MockedWallet::new(Address::ZERO, provider).with_write_results(
+            receipt_with_block(approve_tx, None),
+            TxHash::repeat_byte(0xbb),
+        );
+        let service =
+            WrapperService::with_node_sync_poll_interval(wallet, HashMap::new(), Duration::ZERO);
+
+        let error = service
+            .submit_wrap(wrapped, amount, receiver)
+            .await
+            .expect_err("a blockless approval receipt must fail submit_wrap");
+
+        assert!(
+            matches!(error, WrapperError::MissingBlockNumber { tx_hash } if tx_hash == approve_tx),
+            "submit_wrap must fail with MissingBlockNumber when the approval receipt has no block, got: {error:?}"
         );
     }
 }

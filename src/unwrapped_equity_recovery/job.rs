@@ -1524,6 +1524,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: wrap_tx,
                     wrapped_shares: U256::from(5_000_000_000_000_000_000u128),
+                    wrap_block: 1,
                 },
             )
             .await

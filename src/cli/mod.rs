@@ -861,6 +861,7 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
             wrap_tx_hash,
             wrapped_shares,
             wrapped_at: now,
+            wrap_block: None,
         },
     ];
 

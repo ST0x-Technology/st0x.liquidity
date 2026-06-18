@@ -25,8 +25,11 @@ use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 use tokio::time::{interval, timeout};
+use tracing::{debug, warn};
 
 pub mod error_decoding;
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
@@ -142,6 +145,15 @@ impl WalletKind {
     }
 }
 
+/// Poll interval between `eth_blockNumber` calls in [`wait_for_node_sync`].
+pub const NODE_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum number of polls before [`wait_for_node_sync`] gives up.
+///
+/// 30 attempts at 1s each gives a 30s budget — generous for even a
+/// temporarily lagging backend node on a fast chain like Base.
+pub const NODE_SYNC_MAX_ATTEMPTS: u32 = 30;
+
 /// Errors that can occur during EVM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EvmError {
@@ -204,6 +216,18 @@ pub enum EvmError {
     #[cfg(feature = "turnkey")]
     #[error("Turnkey error: {0}")]
     Turnkey(#[from] turnkey::TurnkeyError),
+    /// The RPC node's tip remained below the required block after exhausting
+    /// the poll budget. Raised by [`wait_for_node_sync`] when a load-balanced
+    /// backend never catches up within the retry window.
+    #[error(
+        "RPC node tip {observed_tip} is behind required block {required_block} \
+         after {attempts} polls"
+    )]
+    NodeBehindRequiredBlock {
+        observed_tip: u64,
+        required_block: u64,
+        attempts: u32,
+    },
 }
 
 impl EvmError {
@@ -232,6 +256,7 @@ impl EvmError {
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
+            Self::NodeBehindRequiredBlock { .. } => false,
         }
     }
 }
@@ -647,6 +672,99 @@ async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
     }
 }
 
+/// Spin-polls `eth_blockNumber` until the serving node reports >= `required_block`.
+///
+/// Load-balanced RPCs route successive calls to different backend nodes. After
+/// tx N confirms at block B, the very next call may hit a node still at B-1.
+/// This function blocks the caller until one poll observes height >= B, ensuring
+/// dependent writes see the prerequisite tx's effects.
+///
+/// # Errors
+///
+/// Returns [`EvmError::NodeBehindRequiredBlock`] after `max_attempts` polls if
+/// the node never catches up.
+///
+/// Returns [`EvmError::Transport`] if the budget is exhausted while every poll
+/// resulted in a transport error (i.e. no successful `eth_blockNumber` response
+/// was ever received).
+///
+/// Transient transport errors (e.g. a momentary connection failure on a
+/// load-balanced RPC) are treated the same as a behind-tip poll: the attempt
+/// is counted against the budget and the loop continues. This preserves the
+/// full 30-attempt window as tolerance for both sync lag and transient
+/// failures, rather than aborting on the first network hiccup.
+pub async fn wait_for_node_sync(
+    provider: &impl Provider,
+    required_block: u64,
+    poll_interval: Duration,
+    max_attempts: u32,
+) -> Result<(), EvmError> {
+    // The production caller always passes NODE_SYNC_MAX_ATTEMPTS (>= 1).
+    // Passing 0 would cause an empty loop and a misleading NodeBehindRequiredBlock
+    // with observed_tip=0 and attempts=0 — a programming error.
+    debug_assert!(
+        max_attempts >= 1,
+        "wait_for_node_sync: max_attempts must be at least 1"
+    );
+
+    // Tracks the most recent successful block number response.
+    // Only appears in NodeBehindRequiredBlock, which requires at least
+    // one successful poll.
+    let mut observed_tip = 0u64;
+    // True once at least one get_block_number call returned Ok (even if stale).
+    // Used to distinguish "all polls failed with transport error" (return Transport)
+    // from "some polls succeeded but node never caught up" (return NodeBehindRequiredBlock).
+    let mut any_poll_succeeded = false;
+
+    for attempt in 1..=max_attempts {
+        if attempt > 1 {
+            sleep(poll_interval).await;
+        }
+
+        match provider.get_block_number().await {
+            Ok(tip) => {
+                observed_tip = tip;
+                any_poll_succeeded = true;
+                if observed_tip >= required_block {
+                    return Ok(());
+                }
+                debug!(
+                    target: "evm",
+                    observed_tip,
+                    required_block,
+                    attempt,
+                    max_attempts,
+                    "RPC node behind required block; retrying"
+                );
+            }
+            Err(transport_error) => {
+                warn!(
+                    target: "evm",
+                    ?transport_error,
+                    attempt,
+                    max_attempts,
+                    "Transient transport error polling block number; retrying"
+                );
+                // Treat transient transport errors as a behind-tip poll:
+                // count the attempt against the budget and retry, rather
+                // than aborting all remaining retries on the first hiccup.
+                // If attempts are exhausted, return Transport only when no
+                // poll ever succeeded; otherwise fall through to
+                // NodeBehindRequiredBlock with the last observed tip.
+                if attempt == max_attempts && !any_poll_succeeded {
+                    return Err(EvmError::Transport(transport_error));
+                }
+            }
+        }
+    }
+
+    Err(EvmError::NodeBehindRequiredBlock {
+        observed_tip,
+        required_block,
+        attempts: max_attempts,
+    })
+}
+
 /// Poll interval for fallback receipt polling.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const RECEIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -844,11 +962,156 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{Address, U256};
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
     use std::sync::Arc;
 
     use super::*;
+
+    /// Build a mock provider whose `eth_blockNumber` returns the given sequence
+    /// of block numbers in order, one per call.
+    fn mock_block_number_provider(block_numbers: &[u64]) -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        for block in block_numbers {
+            asserter.push_success(&serde_json::Value::from(*block));
+        }
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_succeeds_when_node_is_already_at_required_block() {
+        let provider = mock_block_number_provider(&[10]);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("node is at required block — should succeed immediately");
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_succeeds_when_node_is_ahead_of_required_block() {
+        let provider = mock_block_number_provider(&[15]);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("node tip > required block — should succeed immediately");
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_retries_until_node_catches_up() {
+        // Node returns blocks 8, 9 (below required 10), then 10 (at required).
+        let provider = mock_block_number_provider(&[8, 9, 10]);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("node catches up on third poll — should succeed");
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_fails_after_budget_exhausted() {
+        // Node always reports block 5, never reaching required block 10.
+        let provider = mock_block_number_provider(&[5, 5, 5]);
+
+        let error = wait_for_node_sync(&provider, 10, Duration::ZERO, 3)
+            .await
+            .expect_err("budget exhausted — should fail");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::NodeBehindRequiredBlock {
+                    observed_tip: 5,
+                    required_block: 10,
+                    attempts: 3,
+                }
+            ),
+            "expected NodeBehindRequiredBlock with correct fields, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_fails_with_transport_error_when_all_attempts_fail() {
+        let asserter = Asserter::new();
+        // Push 3 transport error responses; the exact error returned is an
+        // implementation detail — the contract is that EvmError::Transport is
+        // propagated after the budget is exhausted with all-transport errors.
+        for iteration in 1u32..=3 {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("connection refused attempt {iteration}").into(),
+                data: None,
+            });
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_node_sync(&provider, 10, Duration::ZERO, 3).await;
+
+        let error =
+            result.expect_err("all transport errors should propagate as EvmError::Transport");
+        assert!(
+            matches!(error, EvmError::Transport(_)),
+            "expected EvmError::Transport after exhausting budget with all-transport errors, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_succeeds_when_second_attempt_succeeds_after_transport_error() {
+        let asserter = Asserter::new();
+        // First attempt: transport error; second attempt: block 10 (at required).
+        let error_payload = alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "connection refused".into(),
+            data: None,
+        };
+        asserter.push_failure(error_payload);
+        asserter.push_success(&serde_json::Value::from(10u64));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("first transport error then success at block 10 — should succeed");
+    }
+
+    /// Verifies that when early attempts observe a stale tip (poll succeeded)
+    /// and the final attempt returns a transport error, the function returns
+    /// `NodeBehindRequiredBlock` (not `Transport`) using the last observed tip.
+    ///
+    /// This distinguishes the mixed case (some polls succeeded, node stale)
+    /// from the all-transport-error case (every poll failed before seeing any
+    /// block number). Only the all-transport-error case returns `Transport`.
+    #[tokio::test]
+    async fn wait_for_node_sync_returns_node_behind_when_stale_then_transport_error() {
+        let asserter = Asserter::new();
+        let stale_tip = 5u64;
+        let required_block = 10u64;
+        // First two attempts return a stale block number.
+        asserter.push_success(&serde_json::Value::from(stale_tip));
+        asserter.push_success(&serde_json::Value::from(stale_tip));
+        // Third (final) attempt returns a transport error.
+        asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "connection refused on final attempt".into(),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = wait_for_node_sync(&provider, required_block, Duration::ZERO, 3)
+            .await
+            .expect_err("mixed stale-then-transport must fail");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::NodeBehindRequiredBlock {
+                    observed_tip: 5,
+                    required_block: 10,
+                    attempts: 3,
+                }
+            ),
+            "must return NodeBehindRequiredBlock with last observed tip when at \
+             least one poll succeeded, got: {error:?}"
+        );
+    }
 
     sol!(
         #![sol(all_derives = true, rpc)]
