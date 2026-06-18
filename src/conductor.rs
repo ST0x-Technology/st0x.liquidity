@@ -6,6 +6,7 @@ mod exit;
 pub(crate) mod job;
 mod manifest;
 pub(crate) mod monitor;
+mod trading_queues;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -48,9 +49,8 @@ use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
 use crate::offchain::order::{
-    ExecutorOrderPlacer, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
-    OffchainOrderId, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
-    ReconcileOrderFillJobQueue, recover_submitted_offchain_orders,
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
+    PollOrderStatus, PollOrderStatusJobQueue,
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
@@ -62,10 +62,10 @@ use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
 use crate::position::{Position, PositionCommand, PositionError, TradeId};
-use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, TransferEquityToHedgingCtx,
-    TransferEquityToMarketMakingCtx,
+    CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
+    ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
+    TransferEquityToHedgingCtx, TransferEquityToMarketMakingCtx,
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{
@@ -97,6 +97,7 @@ use crate::wrapped_equity_recovery::{
 
 pub(crate) use builder::CqrsFrameworks;
 use manifest::QueryManifest;
+use trading_queues::{EquityRecoveryInputs, TradingJobQueues, setup_trading_job_queues};
 
 /// CQRS/event-store and apalis worker pools over the same SQLite database.
 #[derive(Clone)]
@@ -448,10 +449,14 @@ impl Conductor {
             transfer_usdc_to_market_making_ctx,
             transfer_equity_to_market_making_ctx,
             transfer_equity_to_hedging_ctx,
+            resume_tokenization_queue,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
-            &pool,
+            &DatabasePools {
+                cqrs: pool.clone(),
+                apalis: apalis_pool.clone(),
+            },
             inventory.clone(),
             event_sender,
             vault_registry.clone(),
@@ -500,64 +505,32 @@ impl Conductor {
             snapshot,
         };
 
-        let hedge_queue = crate::conductor::job::JobQueue::new(&apalis_pool);
-        let mut poll_status_queue = PollOrderStatusJobQueue::new(&apalis_pool);
-        let reconcile_queue = ReconcileOrderFillJobQueue::new(&apalis_pool);
-        let rejection_queue = HandleOrderRejectionJobQueue::new(&apalis_pool);
-
-        // A previous process may have died mid-job anywhere on the
-        // fill-to-hedge path, leaving apalis `Running` rows no live worker
-        // owns. Reset them before the monitor spawns, exactly like the
-        // transfer/backfill/recovery queues above. Trade accounting is the
-        // one that cannot be recovered any other way: once the backfill
-        // checkpoint advances, its job row is the only record of the fill.
-        requeue_trading_orphans(&job_queue, "trade accounting").await?;
-        requeue_trading_orphans(&hedge_queue, "hedge placement").await?;
-        requeue_trading_orphans(&poll_status_queue, "order status polling").await?;
-        requeue_trading_orphans(&reconcile_queue, "order fill reconciliation").await?;
-        requeue_trading_orphans(&rejection_queue, "order rejection handling").await?;
-
-        let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&apalis_pool);
-        let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&apalis_pool);
-
-        let wrapped_equity_recovery_ctx = build_wrapped_equity_recovery_ctx(
-            wrapped_equity_recovery_store,
-            rebalancing_service.clone(),
-            mint_store.clone(),
-            redemption_store.clone(),
-            inventory.clone(),
-            wrapped_equity_recovery_queue.clone(),
-            Duration::from_secs(ctx.inventory_poll_interval),
-        );
-
-        let unwrapped_equity_recovery_ctx = build_unwrapped_equity_recovery_ctx(
-            unwrapped_equity_recovery_store,
-            rebalancing_service.clone(),
-            mint_store,
-            redemption_store,
-            inventory.clone(),
-            unwrapped_equity_recovery_queue.clone(),
-            Duration::from_secs(ctx.inventory_poll_interval),
-        );
-
-        requeue_equity_recovery_orphans(
-            wrapped_equity_recovery_ctx.as_ref(),
-            unwrapped_equity_recovery_ctx.as_ref(),
-            &wrapped_equity_recovery_queue,
-            &unwrapped_equity_recovery_queue,
-        )
-        .await?;
-
-        let check_positions_queue = CheckPositionsJobQueue::new(&apalis_pool);
-
-        recover_submitted_offchain_orders(
+        let TradingJobQueues {
+            hedge_queue,
+            poll_status_queue,
+            reconcile_queue,
+            rejection_queue,
+            wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery_queue,
+            wrapped_equity_recovery_ctx,
+            unwrapped_equity_recovery_ctx,
+            check_positions_queue,
+        } = setup_trading_job_queues(
+            &apalis_pool,
+            &job_queue,
+            EquityRecoveryInputs {
+                wrapped_store: wrapped_equity_recovery_store,
+                unwrapped_store: unwrapped_equity_recovery_store,
+                rebalancing_service: rebalancing_service.clone(),
+                mint_store: mint_store.clone(),
+                redemption_store: redemption_store.clone(),
+                inventory: inventory.clone(),
+                inventory_poll_interval: Duration::from_secs(ctx.inventory_poll_interval),
+            },
             &frameworks.offchain_order_projection,
-            &mut poll_status_queue,
             executor.to_supported_executor(),
         )
         .await?;
-
-        bootstrap_check_positions(&apalis_pool, &check_positions_queue).await?;
 
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
@@ -583,6 +556,25 @@ impl Conductor {
         // Clone before the builder consumes it; the recovery handle needs the
         // rebalancing service to rebuild tracking during recheck recovery.
         let recovery_rebalancing_service = rebalancing_service.clone();
+
+        // Build ResumeTokenizationCtx only when BOTH the queue and the
+        // recovery_transfer are present (rebalancing enabled). zip() makes the
+        // dual-Some requirement explicit: if either is None the ctx is None,
+        // and the compiler flags any mismatch if one arm is accidentally set
+        // without the other.
+        let resume_tokenization_ctx = resume_tokenization_queue
+            .as_ref()
+            .zip(recovery_transfer.as_ref())
+            .map(|(_, transfer)| {
+                Arc::new(ResumeTokenizationCtx {
+                    transfer: transfer.clone(),
+                })
+            });
+
+        // Provide a fallback empty queue when rebalancing is disabled, so the
+        // builder always receives a concrete queue (it is never consumed).
+        let resume_tokenization_queue = resume_tokenization_queue
+            .unwrap_or_else(|| ResumeTokenizationJobQueue::new(&apalis_pool));
 
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
@@ -610,6 +602,8 @@ impl Conductor {
             .maybe_rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
+            .resume_tokenization_queue(resume_tokenization_queue)
+            .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
             .job_cleanup(job_cleanup)
             .call();
 
@@ -971,11 +965,13 @@ struct RebalancingInfrastructure {
     transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
     transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
     transfer_equity_to_hedging_ctx: Arc<TransferEquityToHedgingCtx>,
+    resume_tokenization_queue: ResumeTokenizationJobQueue,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
 struct RebalancingDeps {
     pool: SqlitePool,
+    apalis_pool: apalis_sqlite::SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
     event_sender: broadcast::Sender<Statement>,
@@ -1004,19 +1000,23 @@ struct PositionAndRebalancing {
     transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
     transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
+    resume_tokenization_queue: Option<ResumeTokenizationJobQueue>,
 }
 
 impl PositionAndRebalancing {
     async fn setup(
         rebalancing: Option<RebalancingCtx>,
         ctx: &Ctx,
-        pool: &SqlitePool,
+        pools: &DatabasePools,
         inventory: Arc<BroadcastingInventory>,
         event_sender: broadcast::Sender<Statement>,
         vault_registry: Arc<Store<VaultRegistry>>,
         vault_registry_projection: Arc<Projection<VaultRegistry>>,
         schedulers: RebalancingSchedulers,
     ) -> anyhow::Result<Self> {
+        let pool = &pools.cqrs;
+        let apalis_pool = &pools.apalis;
+
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = ctx.wallet()?;
             let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
@@ -1029,6 +1029,7 @@ impl PositionAndRebalancing {
                 base_wallet.clone(),
                 RebalancingDeps {
                     pool: pool.clone(),
+                    apalis_pool: apalis_pool.clone(),
                     ctx: ctx.clone(),
                     inventory: inventory.clone(),
                     event_sender,
@@ -1064,6 +1065,7 @@ impl PositionAndRebalancing {
                     infra.transfer_equity_to_market_making_ctx,
                 ),
                 transfer_equity_to_hedging_ctx: Some(infra.transfer_equity_to_hedging_ctx),
+                resume_tokenization_queue: Some(infra.resume_tokenization_queue),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -1093,6 +1095,7 @@ impl PositionAndRebalancing {
                 transfer_usdc_to_market_making_ctx: None,
                 transfer_equity_to_market_making_ctx: None,
                 transfer_equity_to_hedging_ctx: None,
+                resume_tokenization_queue: None,
             })
         }
     }
@@ -1213,13 +1216,15 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             )
             .await?;
 
+        let mut resume_tokenization_queue = ResumeTokenizationJobQueue::new(&deps.apalis_pool);
+
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
             &rebalancing_service,
             deps.inventory.as_ref(),
-            &recovery_transfer,
             built.mint.clone(),
             built.redemption.clone(),
+            &mut resume_tokenization_queue,
         )
         .await?;
 
@@ -1307,6 +1312,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             transfer_usdc_to_market_making_ctx,
             transfer_equity_to_market_making_ctx,
             transfer_equity_to_hedging_ctx,
+            resume_tokenization_queue,
         })
     })
 }
@@ -1388,14 +1394,53 @@ async fn recover_interrupted_tokenization_aggregates(
     pool: &SqlitePool,
     rebalancing_service: &RebalancingService,
     inventory: &BroadcastingInventory,
-    transfer: &CrossVenueEquityTransfer,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    resume_queue: &mut ResumeTokenizationJobQueue,
 ) -> anyhow::Result<()> {
+    // First promote any Running/Queued orphans (from a previous process that
+    // crashed mid-job) back to Pending. Then discard ALL pending rows.
+    // Order matters: if cancel_all_pending ran first, the orphan-reset step
+    // would re-activate those rows as Pending AFTER the cancel, leaving
+    // duplicate Pending rows for the same aggregates.
+    //
+    // Intentionally soft-fail (warn, not ?) unlike every other orphan-requeue
+    // call at startup. Propagating would re-introduce the startup-gating that
+    // moving resume off the startup path removes: the whole point of the async
+    // resume worker is that a slow or failing issuer cannot block monitoring
+    // from starting.
+    //
+    // When requeue_orphaned fails, a Running orphan is NOT promoted to Pending
+    // and therefore survives the subsequent cancel_all_pending. The fresh push
+    // below then leaves a Running+Pending PAIR for the same aggregate, not a
+    // plain duplicate Pending. Because the resume worker uses a deterministic
+    // WORKER_NAME, a restarted process keeps the orphan's heartbeat fresh, so
+    // apalis never re-enqueues or re-executes that Running row -- it stays stuck,
+    // and only the fresh Pending row runs. This is safe ONLY because resume_mint
+    // and resume_redemption are idempotent: the fresh run redoes any side effect
+    // the crashed attempt left partially applied. Idempotency is a load-bearing
+    // invariant here -- any future non-idempotent side-effect in resume would
+    // break this design.
+    if let Err(error) = resume_queue.requeue_orphaned().await {
+        warn!(
+            target: "tokenization",
+            %error,
+            "Failed to reset orphaned resume-tokenization rows; a Running orphan \
+             from a crashed process survives as a stuck row (the deterministic \
+             worker keeps its heartbeat fresh, so apalis never re-runs it) while \
+             the fresh Pending job executes. Tolerated because resume is idempotent."
+        );
+    }
+    resume_queue.cancel_all_pending().await;
+
+    // If the process dies after cancel_all_pending() but before the first push()
+    // below, the interrupted aggregates have neither a Pending nor a Running row,
+    // so they are not resumed until the next restart re-derives them from the
+    // events table (interrupted_mint_ids / interrupted_redemption_ids read the
+    // event store, not the queue). This self-heals on reboot.
+
     let interrupted_mints = interrupted_mint_ids(pool).await?;
     let interrupted_redemptions = interrupted_redemption_ids(pool).await?;
-
-    let mut resume_mints = Vec::new();
 
     for mint_id in &interrupted_mints {
         let Some(mint) = mint_store.load(mint_id).await? else {
@@ -1415,8 +1460,16 @@ async fn recover_interrupted_tokenization_aggregates(
         // try to submit the wrap tx). TokensWrapped and VaultDepositSubmitted
         // mints are always safe to resume (vault deposit is idempotent and
         // the aggregate/inventory guard both converge to Done).
+        //
+        // If cancel_all_pending silently failed above, a stale Pending row for
+        // this aggregate may still exist. The duplicate Pending row is tolerated
+        // because resume_mint is idempotent.
         if !is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress) {
-            resume_mints.push(mint_id.clone());
+            resume_queue
+                .push(ResumeTokenizationAggregate {
+                    target: ResumeTokenizationTarget::Mint(mint_id.clone()),
+                })
+                .await?;
         }
     }
 
@@ -1430,10 +1483,18 @@ async fn recover_interrupted_tokenization_aggregates(
         rebalancing_service
             .recover_redemption_state(redemption_id, &redemption)
             .await?;
+
+        // If cancel_all_pending silently failed above, a stale Pending row for
+        // this aggregate may still exist. The duplicate Pending row is tolerated
+        // because resume_redemption is idempotent.
+        resume_queue
+            .push(ResumeTokenizationAggregate {
+                target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+            })
+            .await?;
     }
 
     recover_stuck_redemptions(pool, inventory).await?;
-    resume_interrupted_transfers(transfer, &resume_mints, &interrupted_redemptions).await;
 
     Ok(())
 }
@@ -1461,47 +1522,6 @@ fn is_pre_wrap_held_for_recovery(
     } else {
         false
     }
-}
-
-async fn resume_interrupted_transfers(
-    transfer: &CrossVenueEquityTransfer,
-    interrupted_mints: &[crate::tokenized_equity_mint::IssuerRequestId],
-    interrupted_redemptions: &[crate::equity_redemption::RedemptionAggregateId],
-) {
-    let mut failed_mints = 0usize;
-    let mut failed_redemptions = 0usize;
-
-    for mint_id in interrupted_mints {
-        failed_mints += usize::from(
-            transfer
-                .resume_mint(mint_id)
-                .await
-                .inspect_err(|error| {
-                    error!(%mint_id, ?error, "Failed to resume mint -- skipping");
-                })
-                .is_err(),
-        );
-    }
-
-    for redemption_id in interrupted_redemptions {
-        failed_redemptions += usize::from(
-            transfer
-                .resume_redemption(redemption_id)
-                .await
-                .inspect_err(|error| {
-                    error!(%redemption_id, ?error, "Failed to resume redemption -- skipping");
-                })
-                .is_err(),
-        );
-    }
-
-    info!(
-        mint_count = interrupted_mints.len(),
-        redemption_count = interrupted_redemptions.len(),
-        failed_mints,
-        failed_redemptions,
-        "Interrupted tokenization transfer resume completed"
-    );
 }
 
 /// Recovers positions whose `pending_offchain_order_id` references an
@@ -2591,28 +2611,38 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
-    use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped};
+    use st0x_raindex::Raindex;
+    use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
 
     use super::*;
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::conductor::builder::CqrsFrameworks;
+    use crate::equity_redemption::{EquityRedemptionCommand, redemption_aggregate_id};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain::order::OrderPlacementResult;
+    use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::OnchainTrade;
-    use crate::rebalancing::equity::{TransferEquityToHedging, TransferEquityToMarketMaking};
+    use crate::rebalancing::equity::{
+        EquityTransferServices, ResumeTokenizationAggregate, ResumeTokenizationJobQueue,
+        ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToMarketMaking,
+    };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
         OnchainTradeBuilder, get_test_log, get_test_order, rebalancing_enabled_equities,
         setup_test_db, setup_test_pools,
     };
-    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::{
+        TokenizationRequestId, TokenizedEquityMintCommand, issuer_request_id,
+    };
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::AccountForDexTrade;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
+    use crate::vault_lookup::MockVaultLookup;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
@@ -2683,6 +2713,592 @@ mod tests {
                 .unwrap();
         assert_eq!(status, Status::Pending.to_string());
         assert_eq!(lock_by, None);
+    }
+
+    struct InterruptedAggregateFixture {
+        pool: sqlx::SqlitePool,
+        apalis_pool: apalis_sqlite::SqlitePool,
+        services: crate::rebalancing::equity::EquityTransferServices,
+        mint_id: crate::tokenized_equity_mint::IssuerRequestId,
+        redemption_id: crate::equity_redemption::RedemptionAggregateId,
+        tokenizer: Arc<crate::tokenization::mock::MockTokenizer>,
+        rebalancing_service: RebalancingService,
+        inventory: Arc<BroadcastingInventory>,
+        resume_queue: crate::rebalancing::equity::ResumeTokenizationJobQueue,
+    }
+
+    /// Shared setup for the three `recover_interrupted_tokenization_aggregates`
+    /// tests. Seeds one mint (MintAccepted state) and one redemption
+    /// (VaultWithdrawPending state) into an in-memory database, then builds the
+    /// `RebalancingService` and `ResumeTokenizationJobQueue` that the recovery
+    /// function requires.
+    async fn seed_interrupted_aggregates_and_build_service(
+        wallet_byte: u8,
+        mint_label: &str,
+        redemption_label: &str,
+    ) -> InterruptedAggregateFixture {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let mint_id = issuer_request_id(mint_label);
+        let redemption_id = redemption_aggregate_id(redemption_label);
+
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let tokenizer = Arc::new(MockTokenizer::new());
+
+        let services = EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+        };
+
+        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let seeding_redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+
+        seeding_mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: mint_id.clone(),
+                    symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
+                    quantity: st0x_float_macro::float!(10.0),
+                    wallet: alloy::primitives::Address::from([wallet_byte; 20]),
+                },
+            )
+            .await
+            .unwrap();
+
+        seeding_redemption_store
+            .send(
+                &redemption_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
+                    quantity: st0x_float_macro::float!(5.0),
+                    token: alloy::primitives::Address::from([wallet_byte; 20]),
+                    amount: alloy::primitives::U256::from(5_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            event_sender,
+        ));
+        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
+        let rebalancing_service = RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: crate::inventory::ImbalanceThreshold {
+                    target: st0x_float_macro::float!(0.5),
+                    deviation: st0x_float_macro::float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(60),
+                assets: AssetsConfig {
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
+                    cash: None,
+                },
+            },
+            vault_registry,
+            alloy::primitives::Address::ZERO,
+            alloy::primitives::Address::ZERO,
+            inventory.clone(),
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        let resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
+
+        InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id,
+            redemption_id,
+            tokenizer,
+            rebalancing_service,
+            inventory,
+            resume_queue,
+        }
+    }
+
+    /// Regression: `recover_interrupted_tokenization_aggregates` must enqueue
+    /// a `ResumeTokenizationAggregate` job for each interrupted aggregate and
+    /// return immediately without calling any issuer (tokenizer) method.
+    ///
+    /// The previous implementation called `resume_interrupted_transfers` inline
+    /// which awaited `poll_for_redemption` / `poll_mint_until_complete`, blocking
+    /// startup for up to 30 minutes when the issuer was down.
+    #[tokio::test]
+    async fn issuer_down_does_not_block_tokenization_resume() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id,
+            redemption_id,
+            tokenizer,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            1,
+            "test-interrupted-mint",
+            "test-interrupted-redemption",
+        )
+        .await;
+
+        // The recover function only calls store.load() (event replay); it does
+        // not invoke tokenizer methods. Use the same services for the function
+        // call -- MockTokenizer methods are never called during load().
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let calls_before = tokenizer.call_count();
+
+        // Must complete in under 1 second: no issuer poll blocking.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recover_interrupted_tokenization_aggregates(
+                &pool,
+                &rebalancing_service,
+                inventory.as_ref(),
+                mint_store,
+                redemption_store,
+                &mut resume_queue,
+            ),
+        )
+        .await
+        .expect("recover_interrupted_tokenization_aggregates must not block on issuer")
+        .expect("recover_interrupted_tokenization_aggregates must succeed");
+
+        // Recovery must not invoke the issuer at all -- it only replays stored
+        // events. Issuer calls happen later when the apalis worker runs the job.
+        assert_eq!(
+            tokenizer.call_count(),
+            calls_before,
+            "recover_interrupted_tokenization_aggregates must not call the issuer"
+        );
+
+        // Both interrupted aggregates must be enqueued -- assert the payloads
+        // (one targeting the mint, one the redemption), not just the count, so a
+        // regression that enqueued e.g. two mint jobs would be caught.
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+
+        let targets: Vec<ResumeTokenizationTarget> = payloads
+            .iter()
+            .map(|job| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(job)
+                    .expect("queued resume job must deserialize")
+                    .target
+            })
+            .collect();
+
+        assert_eq!(
+            targets.len(),
+            2,
+            "expected 2 pending ResumeTokenizationAggregate jobs (one mint + one redemption), \
+             got {targets:?}"
+        );
+        assert!(
+            targets.contains(&ResumeTokenizationTarget::Mint(mint_id.clone())),
+            "a queued resume job must target the interrupted mint {mint_id}, got {targets:?}"
+        );
+        assert!(
+            targets.contains(&ResumeTokenizationTarget::Redemption(redemption_id.clone())),
+            "a queued resume job must target the interrupted redemption {redemption_id}, \
+             got {targets:?}"
+        );
+    }
+
+    /// `recover_interrupted_tokenization_aggregates` called twice (simulating a
+    /// crash-restart cycle) must not accumulate duplicate pending jobs.
+    #[tokio::test]
+    async fn recover_interrupted_tokenization_aggregates_does_not_duplicate_jobs_on_restart() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id: _,
+            redemption_id: _,
+            tokenizer: _,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            2,
+            "dup-test-mint",
+            "dup-test-redemption",
+        )
+        .await;
+
+        // First call -- simulates initial startup.
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let after_first = pending_job_count::<ResumeTokenizationAggregate>(&apalis_pool).await;
+        assert_eq!(
+            after_first, 2,
+            "first call must enqueue exactly 2 pending jobs, got {after_first}"
+        );
+
+        // Second call -- simulates crash-restart. Must not add more pending rows.
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let after_second = pending_job_count::<ResumeTokenizationAggregate>(&apalis_pool).await;
+        assert_eq!(
+            after_second, 2,
+            "second call (crash-restart) must not duplicate pending jobs,              expected 2, got {after_second}"
+        );
+    }
+
+    /// Extension of the above: a crash mid-job leaves a `Running` row (not
+    /// `Pending`). `cancel_all_pending` alone cannot clean it up; the orphan
+    /// must be promoted to `Pending` first and then cancelled. Without the
+    /// `requeue_orphaned` call inside the function, the `Running` row would
+    /// survive `cancel_all_pending`, then get promoted by `requeue_orphaned`
+    /// later (in the old startup ordering), creating a duplicate `Pending` row.
+    #[tokio::test]
+    async fn recover_interrupted_tokenization_aggregates_does_not_duplicate_running_orphan() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id: _,
+            redemption_id: _,
+            tokenizer: _,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            3,
+            "running-orphan-mint",
+            "running-orphan-redemption",
+        )
+        .await;
+
+        // First call: simulate a previous startup that enqueued jobs.
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        // Simulate a crash mid-job: force both Pending rows to Running state.
+        let job_type = std::any::type_name::<ResumeTokenizationAggregate>();
+        sqlx_apalis::query("UPDATE Jobs SET status = ?, lock_at = 1 WHERE job_type = ?")
+            .bind(Status::Running.to_string())
+            .bind(job_type)
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+
+        // Second call: must not create duplicate Pending rows even though the
+        // previous rows are in Running state (not Pending).
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let after_restart = pending_job_count::<ResumeTokenizationAggregate>(&apalis_pool).await;
+        assert_eq!(
+            after_restart, 2,
+            "crash-restart with Running orphan must not duplicate pending jobs,              expected 2, got {after_restart}"
+        );
+    }
+
+    /// Integration test: `recover_interrupted_tokenization_aggregates` must NOT
+    /// enqueue a resume job for a mint in a pre-wrap state (`TokensReceived`)
+    /// when `wrapped_equity_recovery` is enabled. `recover_mint_state` sets the
+    /// guard to `HeldForRecovery` automatically, and `is_pre_wrap_held_for_recovery`
+    /// then gates the push. `UnwrappedEquityRecovery` owns those aggregates and
+    /// would race with a concurrent resume. Control case: same state with
+    /// recovery disabled (guard stays `ActiveTransfer`) DOES produce a job.
+    #[tokio::test]
+    async fn recover_interrupted_tokenization_aggregates_excludes_held_for_recovery_pre_wrap_mint()
+    {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Helper that builds a single-symbol EquitiesConfig with a configurable
+        // wrapped_equity_recovery mode.
+        let make_equities_config = |wrapped_equity_recovery_mode: OperationMode| EquitiesConfig {
+            operational_limit: None,
+            symbols: std::iter::once((
+                symbol.clone(),
+                EquityAssetConfig {
+                    tokenized_equity: alloy::primitives::Address::ZERO,
+                    tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                    pyth_feed_id: None,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: wrapped_equity_recovery_mode,
+                    operational_limit: None,
+                },
+            ))
+            .collect(),
+        };
+
+        // --- HeldForRecovery case: zero jobs expected ---
+        // With wrapped_equity_recovery ENABLED, recover_mint_state sets the guard
+        // to HeldForRecovery automatically for TokensReceived state, so
+        // is_pre_wrap_held_for_recovery blocks the resume push.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mint_id = issuer_request_id("pre-wrap-held-mint");
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let tokenizer = Arc::new(MockTokenizer::new());
+
+        let services = EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+        };
+
+        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+
+        // RequestMint (Pending) -> MintAccepted state.
+        // Poll with Completed outcome -> TokensReceived state (pre-wrap).
+        seeding_mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: mint_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5.0),
+                    wallet: alloy::primitives::Address::from([3u8; 20]),
+                },
+            )
+            .await
+            .unwrap();
+
+        seeding_mint_store
+            .send(&mint_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            event_sender,
+        ));
+        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
+        let rebalancing_service = RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: crate::inventory::ImbalanceThreshold {
+                    target: st0x_float_macro::float!(0.5),
+                    deviation: st0x_float_macro::float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(60),
+                assets: AssetsConfig {
+                    // wrapped_equity_recovery ENABLED: recover_mint_state will set
+                    // HeldForRecovery on TokensReceived, blocking the resume push.
+                    equities: make_equities_config(OperationMode::Enabled),
+                    cash: None,
+                },
+            },
+            vault_registry,
+            alloy::primitives::Address::ZERO,
+            alloy::primitives::Address::ZERO,
+            inventory.clone(),
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let mut resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            mint_store,
+            redemption_store,
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let held_jobs = pending_job_count::<ResumeTokenizationAggregate>(&apalis_pool).await;
+        assert_eq!(
+            held_jobs, 0,
+            "HeldForRecovery + TokensReceived must be excluded from resume jobs, \
+             got {held_jobs} pending jobs"
+        );
+
+        // --- Control case: recovery DISABLED keeps ActiveTransfer, job IS enqueued ---
+        let (pool2, apalis_pool2) = setup_test_pools().await;
+        let mint_id2 = issuer_request_id("pre-wrap-active-mint");
+
+        let services2 = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+
+        let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
+            pool2.clone(),
+            services2.clone(),
+        ));
+
+        seeding_mint_store2
+            .send(
+                &mint_id2,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: mint_id2.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5.0),
+                    wallet: alloy::primitives::Address::from([4u8; 20]),
+                },
+            )
+            .await
+            .unwrap();
+
+        seeding_mint_store2
+            .send(&mint_id2, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let (event_sender2, _) = broadcast::channel::<Statement>(16);
+        let inventory2 = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            event_sender2.clone(),
+        ));
+        let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
+        let rebalancing_service2 = RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: crate::inventory::ImbalanceThreshold {
+                    target: st0x_float_macro::float!(0.5),
+                    deviation: st0x_float_macro::float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(60),
+                assets: AssetsConfig {
+                    // wrapped_equity_recovery DISABLED: recover_mint_state keeps
+                    // ActiveTransfer, so the pre-wrap exclusion does NOT fire.
+                    equities: make_equities_config(OperationMode::Disabled),
+                    cash: None,
+                },
+            },
+            vault_registry2,
+            alloy::primitives::Address::ZERO,
+            alloy::primitives::Address::ZERO,
+            inventory2.clone(),
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool2),
+        );
+
+        let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
+            pool2.clone(),
+            services2.clone(),
+        ));
+        let redemption_store2 = Arc::new(test_store::<EquityRedemption>(
+            pool2.clone(),
+            services2.clone(),
+        ));
+        let mut resume_queue2 = ResumeTokenizationJobQueue::new(&apalis_pool2);
+
+        recover_interrupted_tokenization_aggregates(
+            &pool2,
+            &rebalancing_service2,
+            inventory2.as_ref(),
+            mint_store2,
+            redemption_store2,
+            &mut resume_queue2,
+        )
+        .await
+        .unwrap();
+
+        let active_jobs = pending_job_count::<ResumeTokenizationAggregate>(&apalis_pool2).await;
+        assert_eq!(
+            active_jobs, 1,
+            "ActiveTransfer (recovery disabled) + TokensReceived must produce 1 resume job, \
+             got {active_jobs}"
+        );
     }
 
     /// A crash mid trade-accounting job leaves a `Running` row that apalis
@@ -5787,7 +6403,10 @@ mod tests {
         let position_and_rebalancing = PositionAndRebalancing::setup(
             None,
             &ctx,
-            &pool,
+            &DatabasePools {
+                cqrs: pool.clone(),
+                apalis: apalis_pool.clone(),
+            },
             inventory,
             event_sender,
             vault_registry,

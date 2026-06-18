@@ -22,7 +22,10 @@ use super::Conductor;
 use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
-use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
+use super::job::{
+    FAIL_STOP_RECOVERY_TIMEOUT, build_best_effort_worker, build_supervised_worker,
+    build_worker_inner,
+};
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
@@ -44,6 +47,7 @@ use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
 use crate::rebalancing::equity::{
+    ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
     TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobQueue,
@@ -126,6 +130,8 @@ pub(crate) fn spawn<Prov, Exec>(
     rebalancing_service: Option<Arc<RebalancingService>>,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
+    resume_tokenization_queue: ResumeTokenizationJobQueue,
+    resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
     job_cleanup: JoinHandle<()>,
 ) -> Conductor
 where
@@ -353,6 +359,8 @@ where
         transfer_equity_to_market_making_ctx,
         transfer_equity_to_hedging_queue,
         transfer_equity_to_hedging_ctx,
+        resume_tokenization_queue,
+        resume_tokenization_ctx,
         apalis_shutdown_token,
         seed_vault_registry_queue,
         #[cfg(any(test, feature = "test-support"))]
@@ -409,6 +417,8 @@ where
     transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
     transfer_equity_to_hedging_queue: TransferEquityToHedgingJobQueue,
     transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
+    resume_tokenization_queue: ResumeTokenizationJobQueue,
+    resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     #[cfg(any(test, feature = "test-support"))]
@@ -454,6 +464,8 @@ where
             transfer_equity_to_market_making_ctx,
             transfer_equity_to_hedging_queue,
             transfer_equity_to_hedging_ctx,
+            resume_tokenization_queue,
+            resume_tokenization_ctx,
             apalis_shutdown_token,
             seed_vault_registry_queue,
             #[cfg(any(test, feature = "test-support"))]
@@ -490,6 +502,8 @@ where
         let failure_injector_for_transfer_equity_to_market_making = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_transfer_equity_to_hedging = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_resume_tokenization = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -526,6 +540,20 @@ where
         let fail_stop_for_transfer_usdc_to_market_making = fail_stop.clone();
         let fail_stop_for_transfer_equity_to_market_making = fail_stop.clone();
         let fail_stop_for_transfer_equity_to_hedging = fail_stop.clone();
+        // Best-effort workers must not latch idle after failures. We WANT a
+        // never-opening circuit, but apalis-core 1.0.0-rc.9's live worker path
+        // (`CircuitBreakerService::call`) hardcodes `failure_count >= 5` and
+        // never consults the configured `failure_threshold`, so `u32::MAX` does
+        // NOT keep the circuit closed: after 5 failed calls (e.g. interrupted
+        // aggregates exhausting retries while the issuer is down) the circuit
+        // opens and throttles resume. The short `recovery_timeout` is the real
+        // bound -- it IS honored by `call`, so the open state self-heals within
+        // 10s and resume keeps making progress instead of latching idle. The
+        // `with_failure_threshold(u32::MAX)` records the intended behavior and
+        // takes effect only if a future apalis release honors the config.
+        let best_effort_circuit = CircuitBreakerConfig::default()
+            .with_failure_threshold(u32::MAX)
+            .with_recovery_timeout(std::time::Duration::from_secs(10));
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -667,7 +695,7 @@ where
                 apalis_monitor,
                 wrapped_equity_recovery_ctx,
                 wrapped_equity_recovery_queue,
-                fail_stop_for_wrapped_equity_recovery,
+                FailStopCircuit(fail_stop_for_wrapped_equity_recovery),
                 failure_notify_for_wrapped_equity_recovery,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_wrapped_equity_recovery,
@@ -677,7 +705,7 @@ where
                 apalis_monitor,
                 unwrapped_equity_recovery_ctx,
                 unwrapped_equity_recovery_queue,
-                fail_stop_for_unwrapped_equity_recovery,
+                FailStopCircuit(fail_stop_for_unwrapped_equity_recovery),
                 failure_notify_for_unwrapped_equity_recovery,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_unwrapped_equity_recovery,
@@ -687,7 +715,7 @@ where
                 apalis_monitor,
                 transfer_usdc_to_hedging_ctx,
                 transfer_usdc_to_hedging_queue,
-                fail_stop_for_transfer_usdc_to_hedging,
+                FailStopCircuit(fail_stop_for_transfer_usdc_to_hedging),
                 failure_notify_for_transfer_usdc_to_hedging,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_usdc_to_hedging,
@@ -697,7 +725,7 @@ where
                 apalis_monitor,
                 transfer_usdc_to_market_making_ctx,
                 transfer_usdc_to_market_making_queue,
-                fail_stop_for_transfer_usdc_to_market_making,
+                FailStopCircuit(fail_stop_for_transfer_usdc_to_market_making),
                 failure_notify_for_transfer_usdc_to_market_making,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_usdc_to_market_making,
@@ -707,7 +735,7 @@ where
                 apalis_monitor,
                 transfer_equity_to_market_making_ctx,
                 transfer_equity_to_market_making_queue,
-                fail_stop_for_transfer_equity_to_market_making,
+                FailStopCircuit(fail_stop_for_transfer_equity_to_market_making),
                 failure_notify_for_transfer_equity_to_market_making,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_market_making,
@@ -717,10 +745,19 @@ where
                 apalis_monitor,
                 transfer_equity_to_hedging_ctx,
                 transfer_equity_to_hedging_queue,
-                fail_stop_for_transfer_equity_to_hedging,
+                FailStopCircuit(fail_stop_for_transfer_equity_to_hedging),
                 failure_notify_for_transfer_equity_to_hedging,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_hedging,
+            );
+
+            let apalis_monitor = register_resume_tokenization_worker(
+                apalis_monitor,
+                resume_tokenization_ctx,
+                resume_tokenization_queue,
+                BestEffortCircuit(best_effort_circuit),
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_resume_tokenization,
             );
 
             let is_draining = apalis_shutdown_token.clone();
@@ -795,6 +832,20 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     }
 }
 
+/// A circuit-breaker config for a FAIL-STOP worker (threshold 1, ~1yr timeout):
+/// a single terminal failure opens the circuit and latches the worker idle,
+/// tripping the conductor-wide fail-stop. A distinct type from
+/// [`BestEffortCircuit`] so the two policies cannot be cross-assigned at a
+/// worker-registration site -- passing the wrong one would be a compile error
+/// rather than a silent freeze.
+struct FailStopCircuit(CircuitBreakerConfig);
+
+/// A circuit-breaker config for a BEST-EFFORT worker: a failing job must not
+/// latch the worker idle (see `spawn_apalis_monitor` for the apalis caveat on
+/// the hardcoded open threshold). A distinct type from [`FailStopCircuit`] so
+/// the two policies cannot be cross-assigned.
+struct BestEffortCircuit(CircuitBreakerConfig);
+
 /// Conditionally registers the wrapped-equity recovery worker against the
 /// apalis monitor. Extracted because this is the only `Option`-gated worker
 /// registration and inlining the let-else + debug log keeps
@@ -803,7 +854,7 @@ fn register_wrapped_equity_recovery_worker(
     monitor: Monitor,
     recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     recovery_queue: WrappedEquityRecoveryJobQueue,
-    fail_stop: CircuitBreakerConfig,
+    FailStopCircuit(fail_stop): FailStopCircuit,
     failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
@@ -835,7 +886,7 @@ fn register_unwrapped_equity_recovery_worker(
     monitor: Monitor,
     recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
     recovery_queue: UnwrappedEquityRecoveryJobQueue,
-    fail_stop: CircuitBreakerConfig,
+    FailStopCircuit(fail_stop): FailStopCircuit,
     failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
@@ -869,7 +920,7 @@ fn register_transfer_usdc_to_hedging_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     transfer_queue: TransferUsdcToHedgingJobQueue,
-    fail_stop: CircuitBreakerConfig,
+    FailStopCircuit(fail_stop): FailStopCircuit,
     failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
@@ -901,7 +952,7 @@ fn register_transfer_usdc_to_market_making_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_queue: TransferUsdcToMarketMakingJobQueue,
-    fail_stop: CircuitBreakerConfig,
+    FailStopCircuit(fail_stop): FailStopCircuit,
     failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
@@ -934,7 +985,7 @@ fn register_transfer_equity_to_market_making_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
     transfer_queue: TransferEquityToMarketMakingJobQueue,
-    fail_stop: CircuitBreakerConfig,
+    FailStopCircuit(fail_stop): FailStopCircuit,
     failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
@@ -966,7 +1017,7 @@ fn register_transfer_equity_to_hedging_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     transfer_queue: TransferEquityToHedgingJobQueue,
-    fail_stop: CircuitBreakerConfig,
+    FailStopCircuit(fail_stop): FailStopCircuit,
     failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
@@ -986,6 +1037,38 @@ fn register_transfer_equity_to_hedging_worker(
             transfer_ctx.clone(),
             fail_stop.clone(),
             failure_notify.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
+}
+
+/// Conditionally registers the `ResumeTokenizationAggregate` worker. The ctx is
+/// `None` when rebalancing is disabled; in that case the queue exists but no
+/// worker consumes it. When enabled, runs interrupted mint/redemption aggregates
+/// off the startup path so a slow or down issuer cannot block monitoring.
+fn register_resume_tokenization_worker(
+    monitor: Monitor,
+    resume_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    resume_queue: ResumeTokenizationJobQueue,
+    BestEffortCircuit(circuit): BestEffortCircuit,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(resume_ctx) = resume_ctx else {
+        debug!(
+            "ResumeTokenizationAggregate worker not registered: rebalancing disabled \
+             (no resume ctx). Interrupted tokenization aggregates will not be resumed."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_best_effort_worker!(
+            ::<ResumeTokenizationCtx, ResumeTokenizationAggregate>,
+            index,
+            resume_queue.clone(),
+            resume_ctx.clone(),
+            circuit.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )

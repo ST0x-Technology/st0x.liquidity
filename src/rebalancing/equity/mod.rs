@@ -10,6 +10,7 @@
 //!   from a Raindex vault and sends it to Alpaca for redemption.
 
 mod job;
+mod resume_job;
 
 #[cfg(test)]
 pub(crate) use job::TransferEquityToMarketMakingJobError;
@@ -17,6 +18,10 @@ pub(crate) use job::{
     TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobQueue,
+};
+pub(crate) use resume_job::{
+    ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
+    ResumeTokenizationTarget,
 };
 
 use alloy::hex::FromHexError;

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use rain_math_float::Float;
 use reqwest::StatusCode;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::{FractionalShares, Symbol};
@@ -103,6 +104,8 @@ pub(crate) struct MockTokenizer {
     wait_for_block_calls: Mutex<Vec<u64>>,
     list_pending_outcome: MockListPendingOutcome,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
+    /// Total number of tokenizer method calls made (across all methods).
+    call_count: AtomicUsize,
     pending_requests: Vec<TokenizationRequest>,
     /// Override the token_symbol in completed mint responses.
     token_symbol_behavior: MockTokenSymbolBehavior,
@@ -125,10 +128,16 @@ impl MockTokenizer {
             wait_for_block_calls: Mutex::new(Vec::new()),
             list_pending_outcome: MockListPendingOutcome::Succeed,
             last_issuer_request_id: Mutex::new(None),
+            call_count: AtomicUsize::new(0),
             token_symbol_behavior: MockTokenSymbolBehavior::Default,
             fees_override: None,
             pending_requests: Vec::new(),
         }
+    }
+
+    /// Returns the total number of tokenizer method calls made since construction.
+    pub(crate) fn call_count(&self) -> usize {
+        self.call_count.load(Ordering::Relaxed)
     }
 
     pub(crate) fn with_mint_request_outcome(mut self, outcome: MockMintRequestOutcome) -> Self {
@@ -217,6 +226,7 @@ impl Tokenizer for MockTokenizer {
         _wallet: Address,
         issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         *self.last_issuer_request_id.lock().unwrap() = Some(issuer_request_id);
 
         match self.mint_request_outcome {
@@ -239,6 +249,7 @@ impl Tokenizer for MockTokenizer {
         &self,
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         match self.mint_poll_outcome {
             MockMintPollOutcome::Completed => {
                 let mut request = TokenizationRequest::mock_completed();
@@ -272,6 +283,7 @@ impl Tokenizer for MockTokenizer {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         self.pending_requests
             .iter()
             .find(|request| &request.id == id)
@@ -282,10 +294,12 @@ impl Tokenizer for MockTokenizer {
     }
 
     fn redemption_wallet(&self) -> Option<Address> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         self.redemption_wallet
     }
 
     async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         self.wait_for_block_calls.lock().unwrap().push(block);
 
         match self.wait_for_block_outcome {
@@ -303,6 +317,7 @@ impl Tokenizer for MockTokenizer {
         _token: Address,
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         match self.send_outcome {
             MockSendOutcome::ApiError => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
@@ -318,6 +333,7 @@ impl Tokenizer for MockTokenizer {
         &self,
         _tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         match self.detection_outcome {
             Some(MockDetectionOutcome::Detected) | None => Ok(TokenizationRequest::mock(
                 TokenizationRequestStatus::Pending,
@@ -340,6 +356,7 @@ impl Tokenizer for MockTokenizer {
         &self,
         tx_hash: &TxHash,
     ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .pending_requests
             .iter()
@@ -351,6 +368,7 @@ impl Tokenizer for MockTokenizer {
         &self,
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         match self.completion_outcome {
             Some(MockCompletionOutcome::Completed) => Ok(TokenizationRequest::mock(
                 TokenizationRequestStatus::Completed,
@@ -376,6 +394,7 @@ impl Tokenizer for MockTokenizer {
         wallet: Address,
         expected_amount: U256,
     ) -> Result<(), MintVerificationError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         match self.verification_outcome {
             MockVerificationOutcome::Success => Ok(()),
             MockVerificationOutcome::ReceiptNotFound => {
@@ -402,6 +421,7 @@ impl Tokenizer for MockTokenizer {
     }
 
     async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
         match self.list_pending_outcome {
             MockListPendingOutcome::ApiError => {
                 return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
