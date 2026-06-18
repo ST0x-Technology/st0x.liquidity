@@ -9,9 +9,10 @@
 //!
 //! Steps:
 //!
-//! 1. Claim the `equity_in_progress` guard for the symbol. If another task
-//!    already holds it, the job reschedules itself with a delay so an
-//!    unchanged wallet balance is not stranded waiting for another snapshot.
+//! 1. Claim the `equity_in_progress` guard for the symbol (from absent or
+//!    `HeldForRecovery`). If a live transfer owns it (`ActiveTransfer`), the
+//!    job reschedules itself with a delay so an unchanged wallet balance is
+//!    not stranded waiting for another snapshot.
 //! 2. Read the inventory view's wallet balance + active mint/redemption
 //!    maps to pick a `DispatchDecision`.
 //! 3. Send `Detect` followed by the path-specific command sequence:
@@ -25,7 +26,7 @@
 //! the previous attempt stopped.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -42,6 +43,7 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
+use crate::rebalancing::trigger::{GuardState, claim_guard_for_recovery_or_orphan};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 /// Apalis queue type for [`WrappedEquityRecoveryJob`].
@@ -55,7 +57,7 @@ pub(crate) struct WrappedEquityRecoveryCtx {
     pub(crate) store: Arc<Store<WrappedEquityRecovery>>,
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
-    pub(crate) equity_in_progress: Arc<RwLock<HashSet<Symbol>>>,
+    pub(crate) equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>>,
     /// Queue used for delayed self-reschedule when the shared equity guard is
     /// held by another recovery/transfer job.
     pub(crate) queue: WrappedEquityRecoveryJobQueue,
@@ -162,12 +164,25 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
     async fn perform(&self, ctx: &WrappedEquityRecoveryCtx) -> Result<Self::Output, Self::Error> {
         let symbol = self.symbol.clone();
 
-        let Some(guard) = claim_guard(&ctx.equity_in_progress, &symbol) else {
+        // Two-path claim: this job handles a positive `BaseWalletWrapped`
+        // balance, which can be either an orphan (absent guard) or the
+        // landed-but-unconfirmed `WrapSubmitted` outcome -- the wrap tx
+        // actually landed so the tokens are WRAPPED, but the confirmation read
+        // failed and the transfer job handed the slot to recovery as
+        // `HeldForRecovery`. Claiming `HeldForRecovery` here is what drains that
+        // slot; refusing it (as the old orphan-only claim did) left it wedged
+        // because `UnwrappedEquityRecovery` `NoBalanceSkip`s on a wrapped
+        // balance. The atomic claim makes a concurrent `UnwrappedEquityRecovery`
+        // claim safe -- only one wins, the other reschedules. Returns None only
+        // for `ActiveTransfer` (a live transfer job owns the slot).
+        let Some(guard) = claim_guard_for_recovery_or_orphan(&ctx.equity_in_progress, &symbol)
+        else {
             debug!(
                 target: "rebalance",
                 %symbol,
                 recovery_id = %self.recovery_id,
-                "Rescheduling wrapped equity recovery: equity_in_progress already held",
+                "Rescheduling wrapped equity recovery: equity_in_progress held by \
+                 active transfer; deferring",
             );
             ctx.queue
                 .clone()
@@ -185,18 +200,41 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
                 recovery_id = %self.recovery_id,
                 "Skipping wrapped equity recovery: aggregate already terminal",
             );
-            drop(guard);
+            guard.release();
             return Ok(());
         }
 
         let Some(snapshot) = read_recovery_snapshot(&ctx.inventory, &symbol).await else {
-            debug!(
-                target: "rebalance",
-                %symbol,
-                recovery_id = %self.recovery_id,
-                "Skipping wrapped equity recovery: no positive balance in inventory view",
-            );
-            drop(guard);
+            // No wrapped balance to drain this cycle. Do NOT release the guard:
+            // an orphan claim drops to absent (the reactor re-triggers on the
+            // next positive-balance poll), while a `HeldForRecovery` claim drops
+            // back to `HeldForRecovery`. The reactor only re-dispatches on a
+            // POSITIVE balance, so a `HeldForRecovery`-origin claim that finds
+            // zero balance must self-reschedule or the slot wedges with no job
+            // left to drain it.
+            if guard.claimed_from_held_for_recovery() {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    recovery_id = %self.recovery_id,
+                    "Rescheduling wrapped equity recovery: no positive balance yet but slot \
+                     is HeldForRecovery; re-enqueueing with delay to keep polling until the \
+                     balance resolves or the slot is cleared",
+                );
+                ctx.queue
+                    .clone()
+                    .push_with_delay(self.clone(), ctx.reschedule_interval)
+                    .await?;
+            } else {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    recovery_id = %self.recovery_id,
+                    "Skipping wrapped equity recovery: no positive balance in inventory view; \
+                     orphan claim, guard drop removes entry so future inventory polls can \
+                     re-trigger recovery",
+                );
+            }
             return Ok(());
         };
 
@@ -209,7 +247,9 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
                 "Wrapped equity recovery: active aggregate quantity mismatch; \
                  skipping dispatch",
             );
-            drop(guard);
+            // Validation failure is a retryable error: guard drops normally,
+            // restoring its claim origin (orphan removes the entry;
+            // HeldForRecovery restores HeldForRecovery for the next retry).
             return Err(error);
         }
 
@@ -285,15 +325,24 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
                         WrappedEquityRecoveryCommand::FailRecovery { reason },
                     )
                     .await?;
-                Err(WrappedEquityRecoveryJobError::ConflictingActiveTransfers {
+                // Aggregate is now terminal (FailRecovery). Release the guard
+                // directly here so future transfers are not permanently blocked.
+                guard.release();
+                return Err(WrappedEquityRecoveryJobError::ConflictingActiveTransfers {
                     symbol: symbol.clone(),
                     mint_id,
                     redemption_id,
-                })
+                });
             }
         };
 
-        drop(guard);
+        // Release the guard on success (removes the slot). On non-terminal
+        // failure, the guard drops normally: an orphan-origin claim removes the
+        // entry, while a HeldForRecovery-origin claim restores HeldForRecovery
+        // for a later recovery attempt.
+        if result.is_ok() {
+            guard.release();
+        }
         result
     }
 }
@@ -399,51 +448,6 @@ fn decide_dispatch(view: &InventoryView, symbol: &Symbol) -> DispatchDecision {
     }
 }
 
-/// RAII helper that inserts `symbol` into `equity_in_progress` and removes
-/// it on drop. Returns `None` if another task already holds the guard.
-struct InProgressGuard {
-    symbol: Symbol,
-    set: Arc<RwLock<HashSet<Symbol>>>,
-}
-
-impl Drop for InProgressGuard {
-    fn drop(&mut self) {
-        let mut guard = match self.set.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!(
-                    symbol = %self.symbol,
-                    "equity_in_progress lock poisoned during drop; releasing entry from inner guard"
-                );
-                poisoned.into_inner()
-            }
-        };
-        guard.remove(&self.symbol);
-    }
-}
-
-fn claim_guard(set: &Arc<RwLock<HashSet<Symbol>>>, symbol: &Symbol) -> Option<InProgressGuard> {
-    let mut guard = match set.write() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            warn!(
-                %symbol,
-                "equity_in_progress lock poisoned; recovering inner guard so future recovery attempts can proceed"
-            );
-            poisoned.into_inner()
-        }
-    };
-    if guard.contains(symbol) {
-        return None;
-    }
-    guard.insert(symbol.clone());
-    drop(guard);
-    Some(InProgressGuard {
-        symbol: symbol.clone(),
-        set: Arc::clone(set),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
@@ -467,7 +471,10 @@ mod tests {
     #[tokio::test]
     async fn guard_contention_reschedules_without_dropping_the_recovery() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let equity_in_progress = Arc::new(RwLock::new(HashSet::from([symbol.clone()])));
+        let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::ActiveTransfer { generation: 0 },
+        )])));
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 

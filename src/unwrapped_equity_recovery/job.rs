@@ -33,7 +33,7 @@
 //! up wherever the previous attempt stopped.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -50,6 +50,7 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
+use crate::rebalancing::trigger::{GuardState, claim_guard_for_recovery_or_orphan};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 /// Apalis queue type for [`UnwrappedEquityRecoveryJob`].
@@ -63,7 +64,7 @@ pub(crate) struct UnwrappedEquityRecoveryCtx {
     pub(crate) store: Arc<Store<UnwrappedEquityRecovery>>,
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
-    pub(crate) equity_in_progress: Arc<RwLock<HashSet<Symbol>>>,
+    pub(crate) equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>>,
     /// Queue the job re-pushes itself onto when it loses the per-symbol
     /// guard, so a skipped recovery is re-dispatched rather than stranded.
     pub(crate) queue: UnwrappedEquityRecoveryJobQueue,
@@ -132,6 +133,11 @@ pub(crate) enum UnwrappedEquityRecoveryJobError {
     ),
     #[error("failed to reschedule recovery job after guard contention: {0}")]
     Reschedule(#[from] QueuePushError),
+    #[error(
+        "no positive unwrapped balance in inventory view for symbol {symbol}; \
+         guard drop restores HeldForRecovery or removes orphan entry"
+    )]
+    NoBalanceSkip { symbol: Symbol },
 }
 
 /// Apalis job payload. The reactor pushes one of these per symbol with a
@@ -163,12 +169,23 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
     async fn perform(&self, ctx: &UnwrappedEquityRecoveryCtx) -> Result<Self::Output, Self::Error> {
         let symbol = self.symbol.clone();
 
-        let Some(guard) = claim_guard(&ctx.equity_in_progress, &symbol) else {
+        // Two-path guard claim:
+        // 1. `HeldForRecovery` -> `ActiveTransfer`: claim from a handoff set by
+        //    the transfer job after a PostReceipt error. When the mint aggregate
+        //    is in TokensReceived or WrapSubmitted, the ERC-4626 wrap reverted,
+        //    tokens are UNWRAPPED in the base wallet, and this job is the correct
+        //    deadlock-break claimant. (WrappedEquityRecovery handles the deposit-
+        //    failed path when the aggregate is in TokensWrapped.)
+        // 2. Absent -> `ActiveTransfer`: orphan path -- no active transfer was
+        //    in progress; inventory detected a wallet balance independently.
+        // 3. `ActiveTransfer`: a live transfer job owns the slot; reschedule.
+        let Some(guard) = claim_guard_for_recovery_or_orphan(&ctx.equity_in_progress, &symbol)
+        else {
             debug!(
                 target: "rebalance",
                 %symbol,
                 recovery_id = %self.recovery_id,
-                "Rescheduling unwrapped equity recovery: equity_in_progress already held",
+                "Rescheduling unwrapped equity recovery: equity_in_progress held by active transfer",
             );
             ctx.queue
                 .clone()
@@ -188,7 +205,7 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
                 recovery_id = %self.recovery_id,
                 "Skipping unwrapped equity recovery: aggregate already terminal",
             );
-            drop(guard);
+            guard.release();
             return Ok(());
         }
 
@@ -219,8 +236,54 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
             ) => Ok(()),
         };
 
-        drop(guard);
-        result
+        // Single exhaustive match on result:
+        // - Ok(()): release guard (removes slot); recovery completed.
+        // - Err(NoBalanceSkip): map to Ok(()) so apalis does NOT retry; guard
+        //   drops normally (HeldForRecovery origin restores to HeldForRecovery;
+        //   orphan removes). A HeldForRecovery-origin skip self-reschedules
+        //   (push_with_delay) since the reactor only re-dispatches on a positive
+        //   balance; an orphan skip relies on that next positive-balance poll.
+        // - Err(other): propagate; guard drops, restoring prior state.
+        match result {
+            Ok(()) => {
+                guard.release();
+                Ok(())
+            }
+            Err(UnwrappedEquityRecoveryJobError::NoBalanceSkip { symbol: ref sym }) => {
+                // No unwrapped balance to drain this cycle. The reactor only
+                // re-dispatches recovery on a POSITIVE balance, so a
+                // HeldForRecovery-origin claim that simply drops here would
+                // restore HeldForRecovery with no job left to drain it --
+                // wedging the symbol if the tokens left the wallet out of band.
+                // Re-enqueue with a delay to keep polling. An orphan claim
+                // instead drops to absent, so the next positive-balance poll
+                // re-triggers it without help.
+                if guard.claimed_from_held_for_recovery() {
+                    debug!(
+                        target: "rebalance",
+                        symbol = %sym,
+                        recovery_id = %self.recovery_id,
+                        "Rescheduling unwrapped equity recovery: no balance yet but slot is \
+                         HeldForRecovery; re-enqueueing with delay to keep polling until the \
+                         balance resolves or the slot is cleared",
+                    );
+                    ctx.queue
+                        .clone()
+                        .push_with_delay(self.clone(), ctx.reschedule_interval)
+                        .await?;
+                } else {
+                    info!(
+                        target: "rebalance",
+                        symbol = %sym,
+                        "Unwrapped equity recovery: no balance in inventory view; orphan \
+                         claim, guard drop removes the entry; next positive-balance poll \
+                         re-dispatches",
+                    );
+                }
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
     }
 }
 
@@ -236,9 +299,15 @@ async fn start_from_detect(
             target: "rebalance",
             %symbol,
             %recovery_id,
-            "Skipping unwrapped equity recovery: no positive balance in inventory view",
+            "Skipping unwrapped equity recovery: no positive balance in inventory view; \
+             guard drop restores HeldForRecovery or removes orphan entry",
         );
-        return Ok(());
+        // Return Err so the caller does NOT call guard.release(). Drop restores
+        // HeldForRecovery (if claimed from handoff) or removes the entry (orphan),
+        // letting the next inventory poll re-trigger recovery once tokens are visible.
+        return Err(UnwrappedEquityRecoveryJobError::NoBalanceSkip {
+            symbol: symbol.clone(),
+        });
     };
 
     validate_active_aggregate_quantity(ctx, symbol, &snapshot).await?;
@@ -426,7 +495,8 @@ fn is_business_validation_error(error: &UnwrappedEquityRecoveryJobError) -> bool
         | UnwrappedEquityRecoveryJobError::Domain(_)
         | UnwrappedEquityRecoveryJobError::ActiveMintAggregate(_)
         | UnwrappedEquityRecoveryJobError::ActiveRedemptionAggregate(_)
-        | UnwrappedEquityRecoveryJobError::Reschedule(_) => false,
+        | UnwrappedEquityRecoveryJobError::Reschedule(_)
+        | UnwrappedEquityRecoveryJobError::NoBalanceSkip { .. } => false,
     }
 }
 
@@ -619,51 +689,6 @@ fn decide_dispatch(view: &InventoryView, symbol: &Symbol) -> DispatchDecision {
     }
 }
 
-/// RAII helper that inserts `symbol` into `equity_in_progress` and removes
-/// it on drop. Returns `None` if another task already holds the guard.
-struct InProgressGuard {
-    symbol: Symbol,
-    set: Arc<RwLock<HashSet<Symbol>>>,
-}
-
-impl Drop for InProgressGuard {
-    fn drop(&mut self) {
-        let mut guard = match self.set.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!(
-                    symbol = %self.symbol,
-                    "equity_in_progress lock poisoned during drop; releasing entry from inner guard"
-                );
-                poisoned.into_inner()
-            }
-        };
-        guard.remove(&self.symbol);
-    }
-}
-
-fn claim_guard(set: &Arc<RwLock<HashSet<Symbol>>>, symbol: &Symbol) -> Option<InProgressGuard> {
-    let mut guard = match set.write() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            warn!(
-                %symbol,
-                "equity_in_progress lock poisoned; recovering inner guard so future recovery attempts can proceed"
-            );
-            poisoned.into_inner()
-        }
-    };
-    if guard.contains(symbol) {
-        return None;
-    }
-    guard.insert(symbol.clone());
-    drop(guard);
-    Some(InProgressGuard {
-        symbol: symbol.clone(),
-        set: Arc::clone(set),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256};
@@ -682,6 +707,7 @@ mod tests {
     };
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+    use crate::rebalancing::trigger::InProgressGuard;
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::tokenized_equity_mint::{
@@ -699,10 +725,10 @@ mod tests {
     }
 
     /// Builds a fully-wired recovery ctx around the given inventory view and
-    /// in-progress set, with every service backed by a succeeding mock.
+    /// in-progress map, with every service backed by a succeeding mock.
     async fn test_ctx(
         view: InventoryView,
-        equity_in_progress: HashSet<Symbol>,
+        equity_in_progress: HashMap<Symbol, GuardState>,
     ) -> UnwrappedEquityRecoveryCtx {
         test_ctx_with_tokenizer(view, equity_in_progress, Arc::new(MockTokenizer::new())).await
     }
@@ -712,7 +738,7 @@ mod tests {
     /// outcome.
     async fn test_ctx_with_tokenizer(
         view: InventoryView,
-        equity_in_progress: HashSet<Symbol>,
+        equity_in_progress: HashMap<Symbol, GuardState>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> UnwrappedEquityRecoveryCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
@@ -783,7 +809,10 @@ mod tests {
     #[tokio::test]
     async fn guard_contention_reschedules_without_halting_the_bot() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let equity_in_progress = Arc::new(RwLock::new(HashSet::from([symbol.clone()])));
+        let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::ActiveTransfer { generation: 0 },
+        )])));
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
@@ -924,7 +953,7 @@ mod tests {
             store,
             mint_store,
             redemption_store,
-            equity_in_progress: Arc::new(RwLock::new(HashSet::new())),
+            equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
             reschedule_interval: Duration::from_secs(1),
         };
@@ -1054,36 +1083,101 @@ mod tests {
     }
 
     #[test]
-    fn claim_guard_blocks_second_claim_and_releases_on_drop() {
+    fn claim_guard_for_recovery_or_orphan_blocks_active_transfer_and_releases_on_drop() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let set = Arc::new(RwLock::new(HashSet::new()));
+        let map = Arc::new(RwLock::new(HashMap::new()));
 
-        let guard = claim_guard(&set, &symbol).expect("first claim should succeed");
+        // Absent -> succeeds (orphan path).
+        let guard = claim_guard_for_recovery_or_orphan(&map, &symbol)
+            .expect("absent entry: first claim should succeed");
         assert!(
-            set.read().unwrap().contains(&symbol),
-            "claiming should insert the symbol into the in-progress set",
+            matches!(
+                map.read().unwrap().get(&symbol),
+                Some(GuardState::ActiveTransfer { .. })
+            ),
+            "claiming from absent must insert ActiveTransfer",
         );
 
-        let contended = claim_guard(&set, &symbol);
+        // ActiveTransfer -> blocks.
+        let contended = claim_guard_for_recovery_or_orphan(&map, &symbol);
         assert!(
             contended.is_none(),
-            "a second claim while the guard is held must return None",
+            "a second claim while ActiveTransfer must return None",
         );
 
         drop(guard);
         assert!(
-            !set.read().unwrap().contains(&symbol),
-            "dropping the guard must remove the symbol from the in-progress set",
+            !map.read().unwrap().contains_key(&symbol),
+            "dropping the guard must remove the symbol from the in-progress map",
         );
 
-        claim_guard(&set, &symbol).expect("claim should succeed again once released");
+        // After drop, absent again -> succeeds.
+        claim_guard_for_recovery_or_orphan(&map, &symbol)
+            .expect("claim should succeed again once released");
+    }
+
+    #[test]
+    fn claim_guard_for_recovery_or_orphan_succeeds_from_held_for_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let map = Arc::new(RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::HeldForRecovery,
+        )])));
+
+        let guard = claim_guard_for_recovery_or_orphan(&map, &symbol)
+            .expect("HeldForRecovery must allow claim");
+        assert!(
+            matches!(
+                map.read().unwrap().get(&symbol),
+                Some(GuardState::ActiveTransfer { .. })
+            ),
+            "HeldForRecovery claim must transition to ActiveTransfer",
+        );
+
+        // Drop restores to HeldForRecovery (not removes) so recovery retries
+        // can proceed but a new transfer job cannot start while tokens are
+        // still stranded.
+        drop(guard);
+        assert_eq!(
+            map.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery),
+            "dropping guard claimed from HeldForRecovery must restore to HeldForRecovery, \
+             not remove, so recovery retries are not blocked",
+        );
+    }
+
+    /// When the guard drops back to `HeldForRecovery` after a recovery failure,
+    /// a new transfer claim must be blocked (no double-mint while tokens are stranded).
+    #[test]
+    fn recovery_guard_drop_to_held_for_recovery_blocks_new_transfer_claim() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let map = Arc::new(RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::HeldForRecovery,
+        )])));
+
+        let guard = claim_guard_for_recovery_or_orphan(&map, &symbol)
+            .expect("HeldForRecovery must allow claim");
+        drop(guard);
+
+        // The slot is now HeldForRecovery; a new transfer claim must fail.
+        assert_eq!(
+            map.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery),
+        );
+
+        // Verify the restored HeldForRecovery actually blocks a new transfer claim.
+        assert!(
+            InProgressGuard::try_claim_for_transfer(symbol, Arc::clone(&map)).is_none(),
+            "HeldForRecovery restored by Drop must block new transfer claims (prevents double-mint)"
+        );
     }
 
     #[tokio::test]
     async fn read_recovery_snapshot_skips_zero_and_absent_balance() {
         let symbol = Symbol::new("AAPL").unwrap();
 
-        let absent = test_ctx(InventoryView::default(), HashSet::new()).await;
+        let absent = test_ctx(InventoryView::default(), HashMap::new()).await;
         assert!(
             read_recovery_snapshot(&absent.inventory, &symbol)
                 .await
@@ -1093,7 +1187,7 @@ mod tests {
 
         let zero = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::ZERO),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         assert!(
@@ -1105,7 +1199,7 @@ mod tests {
 
         let positive = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let snapshot = read_recovery_snapshot(&positive.inventory, &symbol)
@@ -1122,7 +1216,7 @@ mod tests {
     async fn validate_active_mint_quantity_accepts_exact_match() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("ISS001");
-        let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
 
         ctx.mint_store
             .send(
@@ -1150,7 +1244,7 @@ mod tests {
     async fn validate_active_mint_quantity_rejects_mismatch() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("ISS001");
-        let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
 
         ctx.mint_store
             .send(
@@ -1185,7 +1279,7 @@ mod tests {
     async fn validate_active_redemption_reports_missing_aggregate() {
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_id = redemption_aggregate_id("RED-NONEXISTENT");
-        let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
 
         let snapshot = RecoverySnapshot {
             shares: FractionalShares::new(float!(5)),
@@ -1211,7 +1305,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let job = UnwrappedEquityRecoveryJob {
@@ -1236,7 +1330,7 @@ mod tests {
         let mint_id = issuer_request_id("missing-mint");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id);
-        let ctx = test_ctx(view, HashSet::new()).await;
+        let ctx = test_ctx(view, HashMap::new()).await;
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
@@ -1264,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn perform_skips_when_inventory_reports_no_balance() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
@@ -1279,6 +1373,68 @@ mod tests {
             state.is_none(),
             "no inventory balance must not start a recovery aggregate, got {state:?}",
         );
+
+        // Orphan-origin (absent guard) no-balance skip must NOT self-reschedule:
+        // the slot drops to absent and the reactor re-triggers on the next
+        // positive-balance poll. Only a HeldForRecovery-origin skip reschedules.
+        let (rescheduled,): (i64,) =
+            sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+                .fetch_one(ctx.queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rescheduled, 0,
+            "an orphan no-balance skip must NOT reschedule; the reactor re-triggers on next poll",
+        );
+    }
+
+    /// When `start_from_detect` returns `NoBalanceSkip` and the guard was claimed
+    /// from `HeldForRecovery`, Drop restores the slot to `HeldForRecovery` AND the
+    /// job must self-reschedule with a delay. The inventory reactor only
+    /// re-dispatches on a positive balance, so without the reschedule a slot whose
+    /// tokens left the wallet out of band would wedge with no job to drain it.
+    #[tokio::test]
+    async fn perform_no_balance_skip_restores_held_for_recovery_and_reschedules() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Inventory reports zero balance for the symbol (no tokens in wallet).
+        let ctx = test_ctx(
+            InventoryView::default(),
+            HashMap::from([(symbol.clone(), GuardState::HeldForRecovery)]),
+        )
+        .await;
+
+        let job = UnwrappedEquityRecoveryJob {
+            symbol: symbol.clone(),
+            recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+        };
+
+        // Must return Ok(()) -- no apalis retry.
+        job.perform(&ctx)
+            .await
+            .expect("no-balance skip must return Ok");
+
+        // Guard must be restored to HeldForRecovery (Drop behavior for
+        // HeldForRecovery origin without release()).
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery),
+            "no-balance skip from HeldForRecovery claim must restore to HeldForRecovery"
+        );
+
+        // A delayed job must have been enqueued so polling continues until the
+        // balance resolves or the slot is cleared.
+        let (rescheduled,): (i64,) =
+            sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+                .fetch_one(ctx.queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rescheduled, 1,
+            "a HeldForRecovery-origin no-balance skip must enqueue a delayed job to keep polling",
+        );
     }
 
     #[tokio::test]
@@ -1286,7 +1442,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
@@ -1341,7 +1497,7 @@ mod tests {
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id.clone())
             .set_active_redemption(symbol.clone(), redemption_id.clone());
-        let ctx = test_ctx(view, HashSet::new()).await;
+        let ctx = test_ctx(view, HashMap::new()).await;
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
@@ -1366,7 +1522,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
@@ -1405,7 +1561,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(3))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
@@ -1446,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn perform_resume_from_detected_with_zero_balance_fails_aggregate() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
 
         ctx.store
@@ -1487,7 +1643,7 @@ mod tests {
         let mint_id = issuer_request_id("ISS001");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id.clone());
-        let ctx = test_ctx(view, HashSet::new()).await;
+        let ctx = test_ctx(view, HashMap::new()).await;
 
         // Seed the mint to `TokensWrapped` so `resume_mint` runs to completion
         // under the succeeding mocks:
@@ -1572,7 +1728,7 @@ mod tests {
                 .with_detection_outcome(MockDetectionOutcome::Detected)
                 .with_completion_outcome(MockCompletionOutcome::Completed),
         );
-        let ctx = test_ctx_with_tokenizer(view, HashSet::new(), tokenizer).await;
+        let ctx = test_ctx_with_tokenizer(view, HashMap::new(), tokenizer).await;
 
         // Seed the redemption at `VaultWithdrawSubmitted` (Redeem submits the
         // withdrawal); `resume_redemption` walks it to `Completed` under the
@@ -1628,7 +1784,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
@@ -1686,7 +1842,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
@@ -1751,7 +1907,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = test_ctx(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
-            HashSet::new(),
+            HashMap::new(),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());

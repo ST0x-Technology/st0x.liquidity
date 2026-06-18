@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
 use tokio::sync::{Mutex, broadcast};
@@ -67,6 +67,7 @@ use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, TransferEquityToHedgingCtx,
     TransferEquityToMarketMakingCtx,
 };
+use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
@@ -1282,6 +1283,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
             transfer: recovery_transfer.clone(),
+            equity_in_progress: rebalancing_service.equity_in_progress.clone(),
+            mint_store: mint_store.clone(),
+            equities_config: deps.ctx.assets.equities.clone(),
         });
 
         let transfer_equity_to_hedging_ctx = Arc::new(TransferEquityToHedgingCtx {
@@ -1391,6 +1395,8 @@ async fn recover_interrupted_tokenization_aggregates(
     let interrupted_mints = interrupted_mint_ids(pool).await?;
     let interrupted_redemptions = interrupted_redemption_ids(pool).await?;
 
+    let mut resume_mints = Vec::new();
+
     for mint_id in &interrupted_mints {
         let Some(mint) = mint_store.load(mint_id).await? else {
             return Err(anyhow::anyhow!(
@@ -1401,6 +1407,17 @@ async fn recover_interrupted_tokenization_aggregates(
         rebalancing_service
             .recover_mint_state(mint_id, &mint)
             .await?;
+
+        // Exclude pre-wrap mints (TokensReceived, WrapSubmitted) that are
+        // HeldForRecovery from direct resume. UnwrappedEquityRecovery owns
+        // those and will re-wrap + deposit the tokens. Calling resume_mint
+        // on the same aggregate would race with the recovery job (both would
+        // try to submit the wrap tx). TokensWrapped and VaultDepositSubmitted
+        // mints are always safe to resume (vault deposit is idempotent and
+        // the aggregate/inventory guard both converge to Done).
+        if !is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress) {
+            resume_mints.push(mint_id.clone());
+        }
     }
 
     for redemption_id in &interrupted_redemptions {
@@ -1416,9 +1433,34 @@ async fn recover_interrupted_tokenization_aggregates(
     }
 
     recover_stuck_redemptions(pool, inventory).await?;
-    resume_interrupted_transfers(transfer, &interrupted_mints, &interrupted_redemptions).await;
+    resume_interrupted_transfers(transfer, &resume_mints, &interrupted_redemptions).await;
 
     Ok(())
+}
+
+/// Returns `true` when `mint` is a pre-wrap post-receipt state
+/// (`TokensReceived` or `WrapSubmitted`) AND its symbol's guard is
+/// `HeldForRecovery`. These mints are excluded from direct `resume_mints`
+/// because `UnwrappedEquityRecovery` owns the slot and will re-wrap and
+/// deposit the tokens; calling `resume_mint` concurrently would race.
+fn is_pre_wrap_held_for_recovery(
+    mint: &TokenizedEquityMint,
+    equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
+) -> bool {
+    if let TokenizedEquityMint::TokensReceived { symbol, .. }
+    | TokenizedEquityMint::WrapSubmitted { symbol, .. } = mint
+    {
+        let guard = match equity_in_progress.read() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        match guard.get(symbol) {
+            Some(GuardState::HeldForRecovery) => true,
+            Some(GuardState::ActiveTransfer { .. }) | None => false,
+        }
+    } else {
+        false
+    }
 }
 
 async fn resume_interrupted_transfers(
@@ -2532,8 +2574,8 @@ mod tests {
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
     use std::future::pending;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, RwLock};
     use task_supervisor::SupervisorBuilder;
     use tokio::sync::broadcast;
 
@@ -2566,6 +2608,7 @@ mod tests {
         OnchainTradeBuilder, get_test_log, get_test_order, rebalancing_enabled_equities,
         setup_test_db, setup_test_pools,
     };
+    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::AccountForDexTrade;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
@@ -6797,5 +6840,93 @@ mod tests {
         let join_error = handle.await.unwrap_err();
 
         check_monitor_drain_result(Err(join_error)).unwrap_err();
+    }
+
+    /// `is_pre_wrap_held_for_recovery` excludes `TokensReceived` and
+    /// `WrapSubmitted` mints whose guard is `HeldForRecovery` from
+    /// `resume_mints`. All other states are included regardless.
+    #[test]
+    fn resume_exclusion_predicate_excludes_only_pre_wrap_held_for_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let tokens_received = TokenizedEquityMint::TokensReceived {
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            wallet: Address::ZERO,
+            issuer_request_id: issuer_request_id("exc-tokens-received"),
+            tokenization_request_id: TokenizationRequestId("TOK-TR".to_string()),
+            tx_hash: TxHash::ZERO,
+            shares_minted: U256::from(5u64),
+            fees: None,
+            requested_at: now,
+            accepted_at: now,
+            received_at: now,
+        };
+        let wrap_submitted = TokenizedEquityMint::WrapSubmitted {
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            wallet: Address::ZERO,
+            issuer_request_id: issuer_request_id("exc-wrap-submitted"),
+            tokenization_request_id: TokenizationRequestId("TOK-WS".to_string()),
+            tx_hash: TxHash::ZERO,
+            shares_minted: U256::from(5u64),
+            fees: None,
+            requested_at: now,
+            accepted_at: now,
+            received_at: now,
+            wrap_tx_hash: TxHash::ZERO,
+        };
+        let tokens_wrapped = TokenizedEquityMint::TokensWrapped {
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            wallet: Address::ZERO,
+            issuer_request_id: issuer_request_id("exc-tokens-wrapped"),
+            tokenization_request_id: TokenizationRequestId("TOK-TW".to_string()),
+            tx_hash: TxHash::ZERO,
+            shares_minted: U256::from(5u64),
+            requested_at: now,
+            accepted_at: now,
+            received_at: now,
+            wrap_tx_hash: TxHash::ZERO,
+            wrapped_shares: U256::from(5u64),
+            wrap_block: None,
+            wrapped_at: now,
+        };
+
+        // Without HeldForRecovery -- no mint is excluded.
+        equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation: 0 });
+        assert!(
+            !is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
+            "TokensReceived + ActiveTransfer must NOT be excluded"
+        );
+        assert!(
+            !is_pre_wrap_held_for_recovery(&wrap_submitted, &equity_in_progress),
+            "WrapSubmitted + ActiveTransfer must NOT be excluded"
+        );
+
+        // With HeldForRecovery -- only pre-wrap states are excluded.
+        equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol, GuardState::HeldForRecovery);
+        assert!(
+            is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
+            "TokensReceived + HeldForRecovery must be excluded from resume_mints"
+        );
+        assert!(
+            is_pre_wrap_held_for_recovery(&wrap_submitted, &equity_in_progress),
+            "WrapSubmitted + HeldForRecovery must be excluded from resume_mints"
+        );
+        assert!(
+            !is_pre_wrap_held_for_recovery(&tokens_wrapped, &equity_in_progress),
+            "TokensWrapped must NEVER be excluded (deposit idempotent)"
+        );
     }
 }
