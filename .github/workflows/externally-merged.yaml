@@ -50,14 +50,16 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          # --slurp collects all pages into a single JSON array of arrays before
-          # running --jq, so .[][] flattens them. Without --slurp, --jq runs per
-          # page and multi-line output from page 2+ breaks the boolean check.
+          # --slurp collects all pages into a single JSON array of arrays, then
+          # piped jq flattens them with .[][]. Without --slurp, jq would run per
+          # page and multi-line output from page 2+ breaks the boolean check. The
+          # runner's gh rejects --slurp combined with gh's own --jq, so we pipe to
+          # standalone jq instead of using --jq.
           merged=$(gh api --paginate --slurp \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-            --jq '[.[][]
+            | jq -r '[.[][]
               | select(.user.login == "graphite-app[bot]")
               | .body
               | contains("Merged by the [Graphite merge queue]")
@@ -227,14 +229,16 @@ jobs:
             # close PR), so retry a few times before giving up rather than
             # skip on the first miss.
             # --slurp + .[][] flattens page-arrays before filtering so the
-            # boolean is correct even when comments span multiple pages.
+            # boolean is correct even when comments span multiple pages. The
+            # runner's gh rejects --slurp combined with gh's own --jq, so we pipe
+            # to standalone jq instead of using --jq.
             marker_found=false
             for attempt in 1 2 3; do
               result=$(gh api --paginate --slurp \
                 -H "Accept: application/vnd.github+json" \
                 -H "X-GitHub-Api-Version: 2022-11-28" \
                 "/repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
-                --jq '[.[][]
+                | jq -r '[.[][]
                   | select(.user.login == "graphite-app[bot]")
                   | .body
                   | contains("Merged by the [Graphite merge queue]")
