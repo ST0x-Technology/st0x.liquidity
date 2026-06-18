@@ -2,6 +2,7 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use anyhow::Context;
 use sqlx::SqlitePool;
 use std::future::Future;
 use std::io::{self, Write};
@@ -489,6 +490,247 @@ async fn run_usdc_transfer<Writer: Write>(
         TransferDirection::ToAlpaca => "USDC transfer to Alpaca completed successfully",
     };
     writeln!(stdout, "{completion}")?;
+
+    Ok(())
+}
+
+/// Outcome of reloading a USDC rebalance immediately after sending `FailBridging`.
+/// A pre-burn `BridgingFailed` is the intended guard-clearing result; anything
+/// else means the transfer raced past us (a burn was recorded concurrently) or
+/// landed in an unexpected state.
+#[derive(Debug, PartialEq)]
+enum FailBridgingOutcome {
+    GuardCleared,
+    ConcurrentBurn,
+    Unexpected,
+}
+
+fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingOutcome {
+    match state {
+        Some(UsdcRebalance::BridgingFailed {
+            burn_tx_hash: None, ..
+        }) => FailBridgingOutcome::GuardCleared,
+        Some(UsdcRebalance::BridgingFailed { .. }) => FailBridgingOutcome::ConcurrentBurn,
+        None
+        | Some(
+            UsdcRebalance::Converting { .. }
+            | UsdcRebalance::ConversionComplete { .. }
+            | UsdcRebalance::ConversionFailed { .. }
+            | UsdcRebalance::WithdrawalSubmitting { .. }
+            | UsdcRebalance::Withdrawing { .. }
+            | UsdcRebalance::WithdrawalFailed { .. }
+            | UsdcRebalance::WithdrawalComplete { .. }
+            | UsdcRebalance::BridgingSubmitting { .. }
+            | UsdcRebalance::Bridging { .. }
+            | UsdcRebalance::AwaitingAttestation { .. }
+            | UsdcRebalance::Attested { .. }
+            | UsdcRebalance::Bridged { .. }
+            | UsdcRebalance::DepositInitiated { .. }
+            | UsdcRebalance::DepositConfirmed { .. }
+            | UsdcRebalance::DepositFailed { .. }
+            | UsdcRebalance::Reconciled { .. },
+        ) => FailBridgingOutcome::Unexpected,
+    }
+}
+
+/// Drive a pre-burn `BridgingSubmitting` or `WithdrawalComplete` USDC rebalance
+/// to the guard-clearing terminal `BridgingFailed { burn_tx_hash: None }`.
+///
+/// `WithdrawalComplete` is pre-CCTP-burn: no burn intent has been recorded.
+/// However, the source withdrawal has already completed and the USDC is sitting
+/// in the market-maker wallet awaiting bridging. After clearing the guard, the
+/// operator must reconcile or handle those funds separately.
+///
+/// `BridgingSubmitting` records burn intent but does NOT guarantee no burn was
+/// broadcast. A crash at this state may have broadcast a CCTP burn whose
+/// `BridgingInitiated` event never persisted (see the crash-recovery invariant
+/// in SPEC.md, "Crash-safe resume"). The operator MUST verify on-chain that no
+/// recent CCTP burn left the market-maker wallet before using this command on a
+/// `BridgingSubmitting` transfer; using it when a burn was broadcast strands
+/// the already-burned funds.
+///
+/// Refuses all post-burn states (any state where `burn_tx_hash` or `cctp_nonce`
+/// is recorded, or any post-burn leg: `Bridging`, `AwaitingAttestation`,
+/// `Attested`, `Bridged`, and later deposit legs). The preflight is the
+/// authoritative guard: `transition_fail_bridging` ACCEPTS post-burn `Bridging`/
+/// `Attested` (emitting a guard-HOLDING `BridgingFailed`), so the aggregate does
+/// NOT serve as a safety net here.
+///
+/// The command is CLI-direct (no running bot required). The live in-memory
+/// `usdc_in_progress` guard is NOT cleared by this command. A bot restart is
+/// required: `recover_usdc_guard` on startup skips
+/// `BridgingFailed { burn_tx_hash: None }` (non-guard-holding) and does not
+/// re-latch the guard.
+pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
+    stdout: &mut Writer,
+    id: Uuid,
+    reason: &str,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let id = UsdcRebalanceId(id);
+    writeln!(stdout, "Failing pre-burn USDC transfer {id}")?;
+
+    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        .build(())
+        .await?;
+
+    let Some(state) = usdc_store.load(&id).await? else {
+        anyhow::bail!(
+            "fail-usdc-transfer: no transfer found for id {id}. Refusing to act -- \
+             check the id and that you are pointed at the right database."
+        );
+    };
+
+    // AUTHORITATIVE post-burn guard: transition_fail_bridging accepts Bridging/
+    // AwaitingAttestation/Attested and emits guard-HOLDING BridgingFailed.
+    // This preflight is the only thing preventing an operator from accidentally
+    // clearing the guard on a transfer where CCTP may have already broadcast.
+    // Uses exhaustive match so new UsdcRebalance variants cause a compile error.
+    // BaseToAlpaca ConversionFailed is post-deposit/post-burn (holds the guard
+    // per holds_rebalance_guard()); AlpacaToBase ConversionFailed is pre-withdrawal.
+    let is_post_burn = match &state {
+        UsdcRebalance::Bridging { .. }
+        | UsdcRebalance::AwaitingAttestation { .. }
+        | UsdcRebalance::Attested { .. }
+        | UsdcRebalance::Bridged { .. }
+        | UsdcRebalance::DepositInitiated { .. }
+        | UsdcRebalance::DepositConfirmed { .. }
+        | UsdcRebalance::DepositFailed { .. }
+        | UsdcRebalance::Reconciled { .. }
+        | UsdcRebalance::ConversionFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            ..
+        } => true,
+        UsdcRebalance::BridgingFailed { burn_tx_hash, .. } => burn_tx_hash.is_some(),
+        UsdcRebalance::Converting { .. }
+        | UsdcRebalance::ConversionComplete { .. }
+        | UsdcRebalance::ConversionFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            ..
+        }
+        | UsdcRebalance::WithdrawalSubmitting { .. }
+        | UsdcRebalance::Withdrawing { .. }
+        | UsdcRebalance::WithdrawalFailed { .. }
+        | UsdcRebalance::WithdrawalComplete { .. }
+        | UsdcRebalance::BridgingSubmitting { .. } => false,
+    };
+
+    if is_post_burn {
+        anyhow::bail!(
+            "fail-usdc-transfer: transfer {id} is in a post-burn state. \
+             A CCTP burn may have already been broadcast. Refusing to act -- \
+             use reconcile-usdc-transfer for post-burn failures."
+        );
+    }
+
+    // Early check: already in the pre-burn failed terminal. The guard is already
+    // cleared (holds_rebalance_guard() returns false for burn_tx_hash: None) and
+    // will not re-arm on restart. No action is needed and re-running would be a
+    // no-op at best; return a clear error so the operator knows the state is good.
+    if matches!(
+        state,
+        UsdcRebalance::BridgingFailed {
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            ..
+        }
+    ) {
+        anyhow::bail!(
+            "fail-usdc-transfer: transfer {id} is already in pre-burn BridgingFailed \
+             (burn_tx_hash: None). The rebalancing guard is already in its cleared state \
+             and will not re-arm on restart. No action needed."
+        );
+    }
+
+    // Second gate: only BridgingSubmitting and WithdrawalComplete are accepted
+    // by transition_fail_bridging. Pre-bridge states (Converting, Withdrawing,
+    // etc.) return BridgingNotInitiated. Give the operator a clear error instead
+    // of surfacing the internal aggregate error message.
+    //
+    // Exhaustive match: new UsdcRebalance variants must be placed explicitly so
+    // the compiler flags unhandled variants at the gate boundary.
+    //
+    // Note: BridgingFailed reaches here only when burn_tx_hash is Some (the
+    // early idempotency check above consumed burn_tx_hash:None, and is_post_burn
+    // above rejected burn_tx_hash:Some via the post-burn gate). It is listed in
+    // the bail group for exhaustiveness.
+    match &state {
+        UsdcRebalance::WithdrawalComplete { .. } | UsdcRebalance::BridgingSubmitting { .. } => {}
+        UsdcRebalance::Converting { .. }
+        | UsdcRebalance::ConversionComplete { .. }
+        | UsdcRebalance::ConversionFailed { .. }
+        | UsdcRebalance::Withdrawing { .. }
+        | UsdcRebalance::WithdrawalSubmitting { .. }
+        | UsdcRebalance::WithdrawalFailed { .. }
+        | UsdcRebalance::Bridging { .. }
+        | UsdcRebalance::AwaitingAttestation { .. }
+        | UsdcRebalance::Attested { .. }
+        | UsdcRebalance::Bridged { .. }
+        | UsdcRebalance::BridgingFailed { .. }
+        | UsdcRebalance::DepositInitiated { .. }
+        | UsdcRebalance::DepositConfirmed { .. }
+        | UsdcRebalance::DepositFailed { .. }
+        | UsdcRebalance::Reconciled { .. } => {
+            anyhow::bail!(
+                "fail-usdc-transfer is only valid from BridgingSubmitting or WithdrawalComplete; \
+                 transfer {id} is in {state:?} (a pre-bridging or post-bridging phase). \
+                 Refusing to act."
+            );
+        }
+    }
+
+    usdc_store
+        .send(
+            &id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+
+    // Reload after send: if the bot raced us from BridgingSubmitting -> Bridging
+    // between the preflight and the send, transition_fail_bridging would have
+    // emitted a guard-HOLDING BridgingFailed with burn_tx_hash set. Check the
+    // actual resulting state so we do not print a false "no burn" success message.
+    //
+    // A reload failure here must NOT report success: FailBridging committed, but
+    // its outcome (guard cleared vs a concurrently-recorded burn) is unverified.
+    // Returning an error forces the operator to re-check rather than treat the
+    // guard-clear as confirmed; re-running the command is idempotent and yields
+    // the accurate state.
+    let reloaded = usdc_store.load(&id).await.with_context(|| {
+        format!(
+            "fail-usdc-transfer: FailBridging committed for transfer {id}, but re-reading to \
+             verify the final state failed. Re-run the command to confirm whether the guard \
+             cleared (pre-burn) or a burn was recorded concurrently before proceeding."
+        )
+    })?;
+    match classify_fail_bridging_reload(reloaded.as_ref()) {
+        FailBridgingOutcome::GuardCleared => {
+            writeln!(
+                stdout,
+                "USDC transfer {id} transitioned to BridgingFailed (pre-burn, no burn \
+                 recorded at transition time). The rebalancing guard will clear on the \
+                 next bot restart."
+            )?;
+        }
+        FailBridgingOutcome::ConcurrentBurn => {
+            anyhow::bail!(
+                "fail-usdc-transfer: a CCTP burn was recorded concurrently for transfer {id}. \
+                 The guard was NOT cleared. Use reconcile-usdc-transfer for this post-burn \
+                 failure. NOTE: reconcile-usdc-transfer must only be used after confirming \
+                 on-chain that the CCTP burn did NOT complete (or the minted USDC was \
+                 accounted for out-of-band); premature reconciliation on an in-flight bridge \
+                 strands the arriving funds."
+            );
+        }
+        FailBridgingOutcome::Unexpected => {
+            anyhow::bail!(
+                "fail-usdc-transfer: unexpected state after FailBridging for transfer {id}: \
+                 {reloaded:?}"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1012,7 +1254,9 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, ClientOrderId, TimeInForce,
+    };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
@@ -1720,6 +1964,855 @@ mod tests {
         assert!(
             err_msg.contains("requires [tokenization]"),
             "Expected tokenization config error, got: {err_msg}"
+        );
+    }
+
+    // Seeds a UsdcRebalance aggregate to WithdrawalComplete state via:
+    // Initiate (Uninitialized->Withdrawing) -> ConfirmWithdrawal (->WithdrawalComplete)
+    async fn seed_to_withdrawal_complete(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: Uuid,
+    ) {
+        let usdc_id = UsdcRebalanceId(id);
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Seeds from WithdrawalComplete to BridgingSubmitting via BeginBridging.
+    async fn seed_to_bridging_submitting(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: Uuid,
+    ) {
+        seed_to_withdrawal_complete(store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 1,
+                    burn_amount: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Seeds from BridgingSubmitting to Bridging via InitiateBridging.
+    async fn seed_to_bridging(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
+        seed_to_bridging_submitting(store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000dead"
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_unknown_id() {
+        let pool = setup_test_db().await;
+        let unknown_id = Uuid::from_u128(0xCAFE_BABE);
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, unknown_id, "reason", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no transfer found for id"),
+            "unknown id must be rejected; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_post_burn_bridging_state() {
+        // Bridging state has burn_tx_hash recorded; the preflight must block it
+        // because transition_fail_bridging would emit a guard-HOLDING BridgingFailed.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0001);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "Bridging state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_post_burn_awaiting_attestation() {
+        // AwaitingAttestation is also accepted by transition_fail_bridging and
+        // emits guard-HOLDING BridgingFailed -- the preflight must block it.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0002);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::TimeoutAttestation {
+                    retry_deadline_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "AwaitingAttestation state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_attested_state() {
+        // Attested has both burn_tx_hash and cctp_nonce recorded; the preflight must
+        // block it because transition_fail_bridging would emit a guard-HOLDING
+        // BridgingFailed.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0002_000B);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0xAB],
+                    cctp_nonce: b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000CAFE"
+                    ),
+                    message: vec![0xCD],
+                    mint_scan_from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "Attested state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_pre_bridge_converting_state() {
+        // Converting is before the bridging phase; transition_fail_bridging would
+        // return BridgingNotInitiated. The second gate must give a clear error.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0003);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
+            "Converting state must be rejected as not in bridging phase; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_already_terminal_pre_burn() {
+        // A pre-burn BridgingFailed (burn_tx_hash: None) is already in the
+        // guard-cleared terminal. The command must return a clear error telling
+        // the operator no action is needed, rather than a confusing "not in
+        // bridging phase" message.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0004);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging_submitting(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "seeded".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now in BridgingFailed { burn_tx_hash: None } -- the early check fires.
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "re-fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already in pre-burn BridgingFailed"),
+            "Already-terminal pre-burn BridgingFailed must return a clear 'already failed' \
+             error; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("No action needed"),
+            "Error must tell the operator no action is needed; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_succeeds_on_bridging_submitting() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0005);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging_submitting(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "manual fail", &pool).await;
+        result.expect("fail_usdc_transfer must succeed from BridgingSubmitting");
+
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        let UsdcRebalance::BridgingFailed {
+            burn_tx_hash,
+            cctp_nonce,
+            reason,
+            ..
+        } = state
+        else {
+            panic!("Expected BridgingFailed state, got: {state:?}");
+        };
+        assert_eq!(
+            burn_tx_hash, None,
+            "pre-burn BridgingFailed must have no burn_tx_hash"
+        );
+        assert_eq!(
+            cctp_nonce, None,
+            "pre-burn BridgingFailed must have no cctp_nonce"
+        );
+        assert_eq!(reason, "manual fail", "reason must be persisted in event");
+
+        let reloaded = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        assert!(
+            !reloaded.holds_rebalance_guard(),
+            "BridgingFailed with burn_tx_hash: None must NOT hold the rebalancing guard"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("restart"),
+            "success message must mention 'restart'; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_succeeds_on_withdrawal_complete() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0006);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_withdrawal_complete(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "wc-distinct-reason", &pool).await;
+        result.expect("fail_usdc_transfer must succeed from WithdrawalComplete");
+
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        let UsdcRebalance::BridgingFailed {
+            burn_tx_hash,
+            cctp_nonce,
+            reason,
+            ..
+        } = state
+        else {
+            panic!("Expected BridgingFailed state, got: {state:?}");
+        };
+        assert_eq!(
+            burn_tx_hash, None,
+            "pre-burn BridgingFailed must have no burn_tx_hash"
+        );
+        assert_eq!(
+            cctp_nonce, None,
+            "pre-burn BridgingFailed must have no cctp_nonce"
+        );
+        assert_eq!(
+            reason, "wc-distinct-reason",
+            "reason must be persisted in event"
+        );
+
+        let reloaded = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        assert!(
+            !reloaded.holds_rebalance_guard(),
+            "BridgingFailed with burn_tx_hash: None must NOT hold the rebalancing guard"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("restart"),
+            "success message must mention 'restart'; got: {output}"
+        );
+    }
+
+    // Seeds from Bridging to DepositFailed via:
+    // ReceiveAttestation -> ConfirmBridging -> InitiateDeposit -> FailDeposit
+    async fn seed_to_deposit_failed(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
+        let usdc_id = UsdcRebalanceId(id);
+        seed_to_bridging(store, id).await;
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0xAA],
+                    cctp_nonce: b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000CAFE"
+                    ),
+                    message: vec![0xBB],
+                    mint_scan_from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000BEEF"
+                    ),
+                    amount_received: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                    fee_collected: Usdc::new(Float::parse("0".to_string()).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000DEED"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "seeded deposit failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Seeds from Bridging to Bridged via:
+    // ReceiveAttestation -> ConfirmBridging
+    async fn seed_to_bridged(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
+        let usdc_id = UsdcRebalanceId(id);
+        seed_to_bridging(store, id).await;
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0xAA],
+                    cctp_nonce: b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000CAFE"
+                    ),
+                    message: vec![0xBB],
+                    mint_scan_from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000BEEF"
+                    ),
+                    amount_received: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                    fee_collected: Usdc::new(Float::parse("0".to_string()).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Seeds from Bridged to DepositInitiated via InitiateDeposit.
+    async fn seed_to_deposit_initiated(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
+        seed_to_bridged(store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(b256!(
+                        "0x000000000000000000000000000000000000000000000000000000000000DEED"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Seeds from DepositInitiated to DepositConfirmed via ConfirmDeposit.
+    async fn seed_to_deposit_confirmed(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
+        seed_to_deposit_initiated(store, id).await;
+        store
+            .send(&UsdcRebalanceId(id), UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_bridged_state() {
+        // Bridged has burn_tx_hash set (post-burn); the preflight must block it.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000B);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridged(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "Bridged state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_deposit_initiated_state() {
+        // DepositInitiated is post-burn (burn_tx_hash recorded); the preflight must block it.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000C);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_deposit_initiated(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "DepositInitiated state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_deposit_confirmed_state() {
+        // DepositConfirmed is post-burn (burn_tx_hash recorded); the preflight must block it.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000D);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_deposit_confirmed(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "DepositConfirmed state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    // Seeds from DepositConfirmed (BaseToAlpaca) to ConversionFailed via:
+    // InitiatePostDepositConversion -> FailConversion
+    async fn seed_to_conversion_failed_base_to_alpaca(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: Uuid,
+    ) {
+        seed_to_deposit_confirmed(store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xC01D_0000)),
+                    amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "seeded conversion failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_conversion_failed_base_to_alpaca() {
+        // ConversionFailed{BaseToAlpaca} is post-deposit/post-burn and holds the
+        // rebalancing guard (per holds_rebalance_guard()). The is_post_burn gate
+        // must reject it so the operator is routed to reconcile-usdc-transfer.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000E);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_conversion_failed_base_to_alpaca(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "ConversionFailed{{BaseToAlpaca}} must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    /// The classifier correctly identifies each of the three post-send reload
+    /// outcomes: pre-burn `BridgingFailed` (guard cleared), post-burn
+    /// `BridgingFailed` (concurrent burn raced us), and any other state
+    /// (unexpected).
+    ///
+    /// Inputs are built by driving real aggregate state through the store so the
+    /// test remains honest if the enum shape changes.
+    #[tokio::test]
+    async fn classify_fail_bridging_reload_distinguishes_pre_and_post_burn() {
+        let pool = setup_test_db().await;
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        // Case 1: pre-burn BridgingFailed (GuardCleared).
+        // Seed to BridgingSubmitting, send FailBridging, load.
+        let id_pre_burn = Uuid::from_u128(0xC1A5_0001);
+        seed_to_bridging_submitting(&store, id_pre_burn).await;
+        store
+            .send(
+                &UsdcRebalanceId(id_pre_burn),
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "pre-burn test".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let pre_burn_state = store.load(&UsdcRebalanceId(id_pre_burn)).await.unwrap();
+        assert_eq!(
+            classify_fail_bridging_reload(pre_burn_state.as_ref()),
+            FailBridgingOutcome::GuardCleared,
+            "pre-burn BridgingFailed must classify as GuardCleared"
+        );
+
+        // Case 2: post-burn BridgingFailed (ConcurrentBurn).
+        // Seed to Bridging (burn_tx_hash recorded), send FailBridging, load.
+        let id_post_burn = Uuid::from_u128(0xC1A5_0002);
+        seed_to_bridging(&store, id_post_burn).await;
+        store
+            .send(
+                &UsdcRebalanceId(id_post_burn),
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "post-burn test".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let post_burn_state = store.load(&UsdcRebalanceId(id_post_burn)).await.unwrap();
+        assert_eq!(
+            classify_fail_bridging_reload(post_burn_state.as_ref()),
+            FailBridgingOutcome::ConcurrentBurn,
+            "post-burn BridgingFailed must classify as ConcurrentBurn"
+        );
+
+        // Case 3: a non-BridgingFailed state (Unexpected).
+        // Load a seeded BridgingSubmitting without sending FailBridging.
+        let id_unexpected = Uuid::from_u128(0xC1A5_0003);
+        seed_to_bridging_submitting(&store, id_unexpected).await;
+        let unexpected_state = store.load(&UsdcRebalanceId(id_unexpected)).await.unwrap();
+        assert_eq!(
+            classify_fail_bridging_reload(unexpected_state.as_ref()),
+            FailBridgingOutcome::Unexpected,
+            "BridgingSubmitting (not BridgingFailed) must classify as Unexpected"
+        );
+
+        // Case 4: None (Unexpected).
+        assert_eq!(
+            classify_fail_bridging_reload(None),
+            FailBridgingOutcome::Unexpected,
+            "None state must classify as Unexpected"
+        );
+    }
+
+    /// Preflight rejects `BridgingFailed { burn_tx_hash: Some }` (post-burn)
+    /// directly at the `is_post_burn` guard, before `store.send` is called.
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_post_burn_bridging_failed() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0008);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        // Seed to Bridging (burn_tx_hash recorded), then FailBridging to reach
+        // BridgingFailed { burn_tx_hash: Some }.
+        seed_to_bridging(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "seeded post-burn fail".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "BridgingFailed with burn_tx_hash: Some must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    /// Preflight rejects `DepositFailed` (post-burn terminal) at the
+    /// `is_post_burn` guard.
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_deposit_failed() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0009);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_deposit_failed(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "DepositFailed state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    /// Preflight rejects `Reconciled` (post-burn terminal) at the
+    /// `is_post_burn` guard.
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_reconciled() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000A);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        // Seed to DepositFailed then reconcile to Reconciled.
+        seed_to_deposit_failed(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("post-burn"),
+            "Reconciled state must be rejected as post-burn; got: {err_msg}"
+        );
+    }
+
+    // Seeds a UsdcRebalance aggregate to ConversionFailed (AlpacaToBase direction) via:
+    // InitiateConversion(AlpacaToBase) -> FailConversion
+    async fn seed_to_conversion_failed_alpaca_to_base(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: Uuid,
+    ) {
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                    order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xC01D_0001)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "seeded AlpacaToBase conversion failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_conversion_failed_alpaca_to_base() {
+        // ConversionFailed{AlpacaToBase} is pre-withdrawal (pre-burn): is_post_burn
+        // returns false, so the second gate must reject it with the "only valid from
+        // BridgingSubmitting or WithdrawalComplete" message.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000F);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_conversion_failed_alpaca_to_base(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
+            "ConversionFailed{{AlpacaToBase}} must be rejected as not in bridging phase; \
+             got: {err_msg}"
+        );
+    }
+
+    // Seeds a UsdcRebalance aggregate to WithdrawalFailed (BaseToAlpaca direction) via:
+    // Initiate(BaseToAlpaca) -> FailWithdrawal
+    async fn seed_to_withdrawal_failed(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
+        let usdc_id = UsdcRebalanceId(id);
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                    withdrawal: TransferRef::OnchainTx(b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000002"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &usdc_id,
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: "seeded withdrawal failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_withdrawal_failed() {
+        // WithdrawalFailed is pre-burn; is_post_burn returns false, so the second
+        // gate must reject it with the "only valid from BridgingSubmitting or
+        // WithdrawalComplete" message.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0010);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_withdrawal_failed(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
+            "WithdrawalFailed state must be rejected as not in bridging phase; got: {err_msg}"
         );
     }
 }
