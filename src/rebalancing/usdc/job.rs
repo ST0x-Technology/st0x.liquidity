@@ -315,6 +315,24 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
+            // Ambient USDC in the market-maker wallet: the wallet-empty invariant
+            // is broken and no burn can safely proceed. The aggregate has already
+            // been moved to BridgingFailed via FailBridging; surface for operator
+            // reconciliation (same pattern as AttestationRetryDeadlineElapsed).
+            Err(UsdcTransferError::WalletUsdcAmbientBalance {
+                id,
+                balance,
+                nominal,
+            }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %balance,
+                    %nominal,
+                    "Alpaca->Base USDC transfer failed: ambient USDC in market-maker wallet; \
+                     bridge marked failed for operator reconciliation"
+                );
+            }
             Err(error) => return Err(error.into()),
         }
 
@@ -324,7 +342,7 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{TxHash, U256};
+    use alloy::primitives::TxHash;
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -382,6 +400,7 @@ mod tests {
     enum TerminalOutcome {
         DeadlineElapsed,
         PreviouslyFailed,
+        AmbientBalance,
     }
 
     impl TerminalOutcome {
@@ -393,6 +412,11 @@ mod tests {
                 Self::PreviouslyFailed => {
                     UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
                 }
+                Self::AmbientBalance => UsdcTransferError::WalletUsdcAmbientBalance {
+                    id: id.clone(),
+                    balance: Usdc::new(float!(1)),
+                    nominal: Usdc::new(float!(1)),
+                },
             }
         }
     }
@@ -656,6 +680,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn market_making_job_treats_ambient_balance_as_clean_terminal() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("ambient balance must be a clean terminal outcome, not a job error");
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "an ambient-balance failure must not be redriven and must not trip the breaker"
+        );
+    }
+
     /// Records the resume call and returns a configurable outcome, so the
     /// Alpaca->Base job's `perform` can be tested without onchain/broker setup.
     struct RecordingResume {
@@ -785,8 +833,7 @@ mod tests {
         ) -> Result<(), UsdcTransferError> {
             Err(UsdcTransferError::WalletUsdcInsufficient {
                 id: id.clone(),
-                required: U256::from(1_000_000u64),
-                actual: U256::ZERO,
+                nominal: Usdc::new(float!(1)),
             })
         }
     }

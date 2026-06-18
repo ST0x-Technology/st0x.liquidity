@@ -2041,15 +2041,22 @@ Alpaca to Base:
 2. Poll Alpaca until conversion order is filled
 3. Initiate USDC withdrawal from Alpaca (get transfer_id)
 4. Poll Alpaca API until withdrawal status is COMPLETE
-   - **Settlement gate (before proceeding):** verify that the withdrawn USDC is
-     confirmed present in the market-maker Ethereum wallet. Wait for the
-     withdrawal tx to reach the required confirmations on Ethereum (primary
-     gate), then re-check the balance at the entry of the burn step (fallback
-     gate). Alpaca marks a withdrawal "Complete" before the on-chain tx is
-     settled network-wide on load-balanced RPC nodes; burning against an
-     unconfirmed balance causes an ERC20 transfer-exceeds-balance revert. Both
-     gates are retryable: a transient "not yet settled" returns a retriable
-     error without advancing the aggregate.
+   - **Settlement gate (before proceeding):** wait for the withdrawal tx to
+     reach the required confirmations on Ethereum. Alpaca marks a withdrawal
+     "Complete" before the on-chain tx is settled network-wide on load-balanced
+     RPC nodes; burning against an unconfirmed balance causes an ERC20
+     transfer-exceeds-balance revert. This gate is retryable.
+   - **Balance read:** after confirmation, read the market-maker Ethereum wallet
+     USDC balance. Three cases:
+     - **balance == 0**: delayed redrive (withdrawal not yet reflected;
+       retried).
+     - **0 < balance <= nominal**: burn the received amount (nominal minus any
+       Alpaca withdrawal fee). Persisted in `BridgingSubmitting.burn_amount` so
+       a crash-resume scan targets the exact burned amount, not the nominal.
+     - **balance > nominal**: wallet-empty invariant broken — ambient/residual
+       USDC from a prior rebalance is present. Emits `FailBridging` (no burn
+       attempted) and surfaces `WalletUsdcAmbientBalance` for operator
+       reconciliation; the job treats this as a clean terminal (no redrive).
 5. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
 6. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
    with minFinalityThreshold=1000 and calculated maxFee for fast transfer

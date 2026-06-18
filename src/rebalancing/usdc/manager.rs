@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
@@ -643,7 +643,14 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 burn_tx_hash,
                 ..
             }) => {
-                self.continue_alpaca_to_base_from_bridging(id, amount, burn_tx_hash)
+                // The `Bridging` state carries only the nominal `amount`; it does
+                // not store the actual burn amount (only `BridgingSubmitting` does
+                // via its `burn_amount` field). At this point the burn has already
+                // been committed and the nominal serves as the best available proxy.
+                // `continue_alpaca_to_base_from_bridging` only uses `burn_amount`
+                // for `BurnReceipt`; the actual minted amount comes from the
+                // on-chain mint receipt, so supplying the nominal here is harmless.
+                self.continue_alpaca_to_base_from_bridging(id, usdc_to_u256(amount)?, burn_tx_hash)
                     .await
             }
 
@@ -810,13 +817,28 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 direction: AlpacaToBase,
                 amount,
                 from_block,
+                burn_amount,
                 ..
             }) => {
-                let amount_u256 = usdc_to_u256(amount)?;
+                let nominal_u256 = usdc_to_u256(amount)?;
+                let scan_amount = if let Some(burn_amount) = burn_amount {
+                    usdc_to_u256(burn_amount)?
+                } else {
+                    warn!(
+                        target: "rebalance",
+                        %id,
+                        nominal = %amount,
+                        "BridgingSubmitting has no persisted burn_amount; \
+                         falling back to nominal scan amount for legacy compatibility"
+                    );
+                    nominal_u256
+                };
                 let burn_receipt = self
-                    .resume_bridging_submitting_ethereum(id, amount_u256, from_block)
+                    .resume_bridging_submitting_ethereum(id, scan_amount, from_block)
                     .await?;
-                self.continue_alpaca_to_base_from_bridging(id, amount, burn_receipt.tx)
+                // Pass burn_receipt.amount (what was actually burned, per the scan)
+                // so BurnReceipt records the real amount, not the nominal.
+                self.continue_alpaca_to_base_from_bridging(id, burn_receipt.amount, burn_receipt.tx)
                     .await
             }
 
@@ -920,28 +942,125 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             }
         }
 
-        let burn_amount = match usdc_to_u256(amount) {
-            Ok(burn_amount) => burn_amount,
-            Err(error) => {
-                warn!(target: "rebalance", %error, "USDC to U256 conversion failed after withdrawal");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("USDC conversion failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(error);
-            }
-        };
+        // Read the actual USDC balance in the market-maker wallet.
+        // When the withdrawal tx is confirmed (primary gate above passed), this
+        // balance IS the received amount — use it directly as burn_amount.
+        // Using the balance (rather than re-reading the tx receipt) means the
+        // received amount reflects any Alpaca withdrawal fee, which lowers the
+        // actual landing amount below the nominal. When no tx hash was returned
+        // by Alpaca (withdrawal_tx: None), the balance is also the only
+        // settlement signal.
+        // Note: when withdrawal_tx is Some, ethereum_tx_block is still called
+        // below for the burn-scan lower bound — that is an independent RPC call
+        // unrelated to the amount derivation.
+        //
+        // The wallet MUST hold only USDC attributable to this rebalance: the
+        // invariant is that the market-maker wallet is flushed to zero by each
+        // CCTP burn, so the balance after a withdrawal == the received amount.
+        //
+        // Three cases:
+        //   actual == 0            -> delayed-redrive (settlement not yet on-chain)
+        //   0 < actual <= nominal  -> burn actual (valid; fee-reduced received amount)
+        //   actual > nominal       -> explicit reconciliation error (wallet-empty
+        //                            invariant broken; ambient/residual USDC present;
+        //                            cannot distinguish withdrawal from residual)
+        let nominal_u256 = usdc_to_u256(amount)?;
+        let actual_balance = self.read_ethereum_usdc_balance(id).await?;
 
-        // FALLBACK balance gate: verify the withdrawn USDC is present in the
-        // market-maker wallet before attempting the irreversible CCTP burn. When
-        // Alpaca returned no tx hash (withdrawal_tx: None), this is the only
-        // settlement check. When a tx hash is present and confirmed above, this
-        // is a cheap additional sanity check.
-        self.check_ethereum_usdc_balance(id, burn_amount).await?;
+        let burn_amount = if actual_balance == U256::ZERO {
+            // Zero balance after a confirmed withdrawal is unexpected: either the
+            // funds haven't settled (rare timing) or the wallet invariant is broken.
+            // Delayed-redrive so the job retries once settlement completes.
+            warn!(
+                target: "rebalance",
+                %id,
+                nominal = %amount,
+                "Market-maker wallet USDC balance is zero after confirmed withdrawal; retrying"
+            );
+            return Err(UsdcTransferError::WalletUsdcInsufficient {
+                id: id.clone(),
+                nominal: amount,
+            });
+        } else if actual_balance > nominal_u256 {
+            // Wallet holds MORE than the nominal: the wallet-empty invariant is
+            // broken. Ambient or residual USDC from a prior rebalance is present
+            // and we cannot distinguish those funds from this withdrawal's funds.
+            // Burning any amount here would risk burning funds belonging to a
+            // prior rebalance. Emit FailBridging for operator reconciliation.
+            let balance = u256_to_usdc(actual_balance)?;
+            error!(
+                target: "rebalance",
+                %id,
+                %balance,
+                nominal = %amount,
+                actual_raw = %actual_balance,
+                "Market-maker wallet holds more USDC than nominal; \
+                 wallet-empty invariant broken — ambient/residual USDC detected; \
+                 failing for operator reconciliation"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailBridging {
+                        reason: format!(
+                            "wallet holds {balance} USDC > nominal {amount}; \
+                             wallet-empty invariant broken; operator reconciliation required"
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::WalletUsdcAmbientBalance {
+                id: id.clone(),
+                balance,
+                nominal: amount,
+            });
+        } else {
+            // Wallet holds between 0 (exclusive) and nominal (inclusive).
+            // This is the valid range under the wallet-empty invariant:
+            // actual == nominal is the exact-receipt case (no fee), and
+            // actual < nominal is the fee-deducted received amount (prod scenario).
+            // Burn what arrived.
+
+            // Log the fee delta when Alpaca deducted a withdrawal fee so operators
+            // have an audit trail for P&L reconciliation.
+            match u256_to_usdc(actual_balance) {
+                Ok(received) if received < amount => match amount - received {
+                    Ok(delta) => info!(
+                        target: "rebalance",
+                        %id,
+                        nominal = %amount,
+                        %received,
+                        %delta,
+                        "Alpaca withdrawal fee deducted; bridging received amount, not nominal"
+                    ),
+                    Err(error) => warn!(
+                        target: "rebalance",
+                        %id,
+                        %error,
+                        nominal = %amount,
+                        %received,
+                        "Alpaca fee-delta subtraction failed; delta unknown"
+                    ),
+                },
+                Ok(_) => {}
+                Err(error) => {
+                    // Defensive: `actual_balance <= nominal_u256` and
+                    // `nominal_u256` was produced by `usdc_to_u256(amount)?`
+                    // (lossless), so this conversion should always succeed for
+                    // valid USDC amounts. If it somehow fails (precision overflow
+                    // in a future type change), the burn still proceeds with the
+                    // raw U256 -- only the fee-delta log is skipped.
+                    warn!(
+                        target: "rebalance",
+                        %id,
+                        %error,
+                        actual_balance_raw = %actual_balance,
+                        "Fee-delta log skipped: actual balance U256->Usdc conversion failed"
+                    );
+                }
+            }
+            actual_balance
+        };
 
         // Derive the burn-scan lower bound from this rebalance's confirmed
         // withdrawal tx block when available: the burn lands in a strictly later
@@ -969,7 +1088,9 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             .execute_cctp_burn_on_ethereum(id, burn_amount, burn_from_block)
             .await?;
 
-        self.continue_alpaca_to_base_from_bridging(id, amount, burn_receipt.tx)
+        // Pass the actual (capped) burn amount through so BurnReceipt records
+        // what was truly burned, not the nominal requested amount.
+        self.continue_alpaca_to_base_from_bridging(id, burn_receipt.amount, burn_receipt.tx)
             .await
     }
 
@@ -977,15 +1098,21 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     /// terminal. Re-polls the Circle attestation (idempotent for completed
     /// attestations) so we obtain a fresh [`AttestationResponse`] suitable
     /// for [`Bridge::mint`].
+    ///
+    /// `burn_amount` is the actual amount burned on Ethereum (may be less than
+    /// the nominal when Alpaca deducted a withdrawal fee). It is stored in
+    /// `BurnReceipt` for financial-accounting accuracy.
     async fn continue_alpaca_to_base_from_bridging(
         &self,
         id: &UsdcRebalanceId,
-        amount: Usdc,
+        // U256: SDK burn boundary; all call sites already hold U256 (on-chain data
+        // or usdc_to_u256 output) so no conversion is needed here.
+        burn_amount: U256,
         burn_tx_hash: TxHash,
     ) -> Result<(), UsdcTransferError> {
         let burn_receipt = BurnReceipt {
             tx: burn_tx_hash,
-            amount: usdc_to_u256(amount)?,
+            amount: burn_amount,
         };
 
         let attestation_response = match self
@@ -1337,61 +1464,27 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(withdrawal_tx)
     }
 
-    /// Checks that the market-maker Ethereum wallet holds at least `required`
-    /// USDC before the CCTP burn is attempted.
+    /// Reads the market-maker Ethereum wallet USDC balance.
     ///
-    /// FALLBACK settlement gate: ensures withdrawn USDC is present in the
-    /// market-maker wallet before burning. This guard fires at the top of
-    /// `continue_alpaca_to_base_from_withdrawal_complete`, which is the single
-    /// code path shared by both the resume-from-WithdrawalComplete path (where
-    /// the PRIMARY confirmation-wait in `poll_and_confirm_withdrawal` does not
-    /// re-run) and the normal flow.
+    /// Returns the raw balance (in atomic units, 6 decimals) for the caller to
+    /// use as the CCTP burn amount. The wallet is used exclusively as a CCTP
+    /// burn source between rebalances, so its balance after a confirmed
+    /// withdrawal equals the amount actually received (nominal minus any fees).
     ///
-    /// Insufficient balance returns `Err(WalletUsdcInsufficient)` -- a
-    /// retryable error that leaves the aggregate in `WithdrawalComplete` and
-    /// keeps `usdc_in_progress` latched. The job retries at its configured
-    /// apalis interval; no inner polling loop is needed.
-    ///
-    /// NOTE: This gate checks `balance >= required`, not a delta from a
-    /// pre-withdrawal snapshot. The market-maker Ethereum wallet is used
-    /// exclusively as a CCTP burn source and is expected to be empty between
-    /// rebalances. A pre-existing ambient USDC balance would cause the gate
-    /// to pass prematurely. If this invariant is broken (e.g. by a manual
-    /// transfer), operator reconciliation is required.
-    async fn check_ethereum_usdc_balance(
+    /// RPC failure is transient: the aggregate is in `WithdrawalComplete` (a
+    /// durable state), so `SettlementCheckTransient` is returned so the job
+    /// delayed-redrives instead of consuming the apalis retry budget.
+    async fn read_ethereum_usdc_balance(
         &self,
         id: &UsdcRebalanceId,
-        required: U256,
-    ) -> Result<(), UsdcTransferError> {
-        // RPC failure here is transient: the aggregate is in `WithdrawalComplete`
-        // (a durable state), so return `SettlementCheckTransient` so the job
-        // delayed-redrives instead of consuming the apalis retry budget.
-        let actual = self
-            .cctp_bridge
+    ) -> Result<U256, UsdcTransferError> {
+        self.cctp_bridge
             .ethereum_usdc_balance(self.market_maker_wallet)
             .await
             .map_err(|error| UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
                 source: Box::new(error),
-            })?;
-
-        if actual < required {
-            warn!(
-                target: "rebalance",
-                %id,
-                %required,
-                %actual,
-                "Market-maker Ethereum wallet has insufficient USDC; \
-                 withdrawal may not have settled yet"
-            );
-            return Err(UsdcTransferError::WalletUsdcInsufficient {
-                id: id.clone(),
-                required,
-                actual,
-            });
-        }
-
-        Ok(())
+            })
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
@@ -2473,7 +2566,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         // instead of re-burning (which would burn USDC twice with at most one mint).
         let from_block = self.raindex.current_block().await?;
         self.cqrs
-            .send(id, UsdcRebalanceCommand::BeginBridging { from_block })
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block,
+                    burn_amount: Some(u256_to_usdc(amount)?),
+                },
+            )
             .await?;
 
         let burn_receipt = self.burn_on_base(amount).await?;
@@ -2584,7 +2683,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 })?,
         };
         self.cqrs
-            .send(id, UsdcRebalanceCommand::BeginBridging { from_block })
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block,
+                    burn_amount: Some(u256_to_usdc(amount)?),
+                },
+            )
             .await?;
 
         let burn_receipt = self.burn_on_ethereum(amount).await?;
@@ -7391,114 +7496,95 @@ mod tests {
         .unwrap();
     }
 
-    /// Hypothesis: check_ethereum_usdc_balance returns WalletUsdcInsufficient
-    /// when the wallet holds zero USDC, without calling FailBridging or
-    /// advancing the aggregate.
+    /// Hypothesis: when Alpaca deducts a withdrawal fee and the wallet receives
+    /// LESS than the nominal amount, `continue_alpaca_to_base_from_withdrawal_complete`
+    /// uses the ACTUAL wallet balance (not nominal) as the CCTP burn amount.
+    /// The aggregate must advance past WithdrawalComplete (BeginBridging emitted).
+    ///
+    /// This test verifies AC#1, AC#2, and AC#3: a short delivery no longer
+    /// wedges forever. The burn proceeds with the received amount.
     #[tokio::test]
-    async fn check_ethereum_usdc_balance_insufficient_returns_wallet_usdc_insufficient() {
+    async fn withdrawal_fee_shortfall_burns_received_amount_not_nominal() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
 
-        // Deploy USDC with NO balance at market_maker_wallet.
-        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+        // Alpaca retained a 2 USDC fee: wallet received 998 USDC, not 1000.
+        let received_amount = U256::from(998_000_000u64); // 998 USDC in atomic units
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(received_amount, market_maker_wallet).await;
 
         let server = MockServer::start();
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        let required = U256::from(1_000_000u64); // 1 USDC
+        // Deploy a REVERT-only contract at TOKEN_MESSENGER_V2 so the burn
+        // attempt fails predictably: BeginBridging fires before the burn,
+        // leaving the aggregate at BridgingSubmitting (not BridgingFailed).
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
 
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Nominal was 1000 USDC but only 998 landed.
+        let nominal = usdc("1000");
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
+
+        // The burn attempt fails (Cctp error from the fee query or the REVERT
+        // contract). Either way the error must not be a balance-gate wedge.
         let error = manager
-            .check_ethereum_usdc_balance(&id, required)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
             .await
             .unwrap_err();
 
         assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error, not a balance-gate wedge; got: {error:?}"
+        );
+
+        // Aggregate at BridgingSubmitting confirms BeginBridging was emitted
+        // before the burn was attempted; the balance gate did not wedge here.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
             matches!(
-                error,
-                UsdcTransferError::WalletUsdcInsufficient { required: r, actual: a, .. }
-                    if r == required && a == U256::ZERO
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
             ),
-            "Expected WalletUsdcInsufficient with correct amounts, got: {error:?}"
-        );
-
-        // Aggregate must remain untouched (no FailBridging emitted).
-        let state = cqrs.load(&id).await.unwrap();
-        assert!(
-            state.is_none(),
-            "Aggregate must not be advanced by check_ethereum_usdc_balance; got: {state:?}"
-        );
-    }
-
-    /// Hypothesis: check_ethereum_usdc_balance returns Ok when the wallet holds
-    /// at least the required amount, and does not advance the aggregate.
-    #[tokio::test]
-    async fn check_ethereum_usdc_balance_sufficient_returns_ok() {
-        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
-        let required = U256::from(1_000_000u64); // 1 USDC
-        let minted = U256::from(5_000_000u64); // 5 USDC (exceeds required)
-
-        let chain = deploy_ethereum_usdc_chain_with_balance(minted, market_maker_wallet).await;
-
-        let server = MockServer::start();
-        let (manager, cqrs) =
-            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        // The gate must pass without error when balance >= required.
-        manager
-            .check_ethereum_usdc_balance(&id, required)
-            .await
-            .expect("check_ethereum_usdc_balance must return Ok when balance >= required");
-
-        // The gate must not emit any command -- aggregate stays uninitialized.
-        let state = cqrs.load(&id).await.unwrap();
-        assert!(
-            state.is_none(),
-            "check_ethereum_usdc_balance must not advance the aggregate on success; \
+            "Aggregate must be at BridgingSubmitting (burn attempted); \
+             WithdrawalComplete would indicate the balance gate incorrectly wedged; \
              got: {state:?}"
         );
-    }
 
-    /// Hypothesis: check_ethereum_usdc_balance returns Ok at the exact boundary
-    /// where balance == required, confirming the implementation uses strict less-than
-    /// (actual < required) rather than less-than-or-equal.
-    #[tokio::test]
-    async fn check_ethereum_usdc_balance_sufficient_at_exact_boundary_returns_ok() {
-        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
-        let required = U256::from(1_000_000u64); // 1 USDC
-
-        // Mint exactly the required amount -- no more, no less.
-        let chain = deploy_ethereum_usdc_chain_with_balance(required, market_maker_wallet).await;
-
-        let server = MockServer::start();
-        let (manager, cqrs) =
-            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        manager
-            .check_ethereum_usdc_balance(&id, required)
-            .await
-            .expect("check_ethereum_usdc_balance must return Ok when balance == required");
-
-        let state = cqrs.load(&id).await.unwrap();
-        assert!(
-            state.is_none(),
-            "check_ethereum_usdc_balance must not advance the aggregate at the exact boundary; \
-             got: {state:?}"
+        // The persisted burn_amount must be the RECEIVED (capped) amount, not
+        // nominal. This verifies crash-resume uses the correct scan amount.
+        let UsdcRebalance::BridgingSubmitting { burn_amount, .. } = state else {
+            panic!("Expected BridgingSubmitting state; got: {state:?}");
+        };
+        let expected_received = u256_to_usdc(received_amount).unwrap();
+        assert_eq!(
+            burn_amount,
+            Some(expected_received),
+            "BridgingSubmitting.burn_amount must be the received (capped) amount \
+             (998 USDC), not nominal (1000 USDC)"
         );
     }
 
-    /// Hypothesis: continue_alpaca_to_base_from_withdrawal_complete with
-    /// insufficient USDC balance returns WalletUsdcInsufficient (retryable),
-    /// does NOT call FailBridging, and the aggregate stays in WithdrawalComplete.
+    /// Hypothesis: zero wallet balance after confirmed withdrawal returns
+    /// WalletUsdcInsufficient (delayed-redrive), NOT BridgingFailed. The
+    /// aggregate stays in WithdrawalComplete for the next attempt.
     #[tokio::test]
-    async fn continue_from_withdrawal_complete_with_insufficient_balance_returns_retryable_error() {
+    async fn withdrawal_zero_balance_redrives_not_fails() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
 
-        // Market-maker wallet has zero USDC on Ethereum.
+        // Wallet holds zero USDC -- withdrawal funds have not settled yet.
         let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
 
         let server = MockServer::start();
@@ -7515,12 +7601,16 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            matches!(error, UsdcTransferError::WalletUsdcInsufficient { .. }),
-            "Expected WalletUsdcInsufficient, got: {error:?}"
+        let UsdcTransferError::WalletUsdcInsufficient { nominal, .. } = &error else {
+            panic!("Expected WalletUsdcInsufficient; got: {error:?}");
+        };
+        assert_eq!(
+            *nominal,
+            usdc("1"),
+            "WalletUsdcInsufficient nominal must match the requested amount"
         );
 
-        // Aggregate must remain in WithdrawalComplete (no BridgingFailed).
+        // No FailBridging; aggregate stays in WithdrawalComplete for next redrive.
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
@@ -7530,8 +7620,208 @@ mod tests {
                     ..
                 }
             ),
-            "Aggregate must stay in WithdrawalComplete, not advance to BridgingFailed; \
+            "Aggregate must stay in WithdrawalComplete (retryable), not BridgingFailed; \
              got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: when `withdrawal_tx` is `None`, the tx-confirmation gate is
+    /// entirely skipped (no RPC call to `ethereum_tx_block`). The burn-scan
+    /// `from_block` falls back to `source_block(EthereumToBase)` (chain head).
+    ///
+    /// This test is distinct from `withdrawal_fee_shortfall_burns_received_amount_not_nominal`:
+    /// that test exercises the fee-shortfall cap logic; this one focuses on the
+    /// `None`-tx code path, verifying that a missing tx hash does not cause an
+    /// RPC confirmation call (which would fail and wedge the aggregate).
+    ///
+    /// Proof: the MockServer has no RPC endpoint registered for
+    /// `eth_getTransactionByHash`. If the confirmation gate were entered, the
+    /// mock would return 404 and the call would propagate a `SettlementCheckTransient`
+    /// error — not the `Cctp` error we assert below.
+    #[tokio::test]
+    async fn withdrawal_no_tx_hash_skips_confirmation_gate() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        // 998 USDC in wallet (fee deducted scenario, no tx hash from Alpaca).
+        let received_amount = U256::from(998_000_000u64);
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(received_amount, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // REVERT-only contract: confirms burn was attempted (not wedged).
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let nominal = usdc("1000");
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
+
+        // withdrawal_tx = None: no confirmation gate is entered at all.
+        // If the confirmation gate ran, the mock server would return 404 (no
+        // tx-confirmation endpoint registered), producing SettlementCheckTransient.
+        // A Cctp error proves the gate was skipped and the burn was attempted.
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error (burn attempted, tx-confirmation gate skipped); \
+             SettlementCheckTransient would indicate the confirmation gate incorrectly fired; \
+             got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must be at BridgingSubmitting (burn proceeded); got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: when the market-maker wallet holds MORE USDC than the nominal,
+    /// `continue_alpaca_to_base_from_withdrawal_complete` returns
+    /// `WalletUsdcAmbientBalance` and NO burn is attempted. The aggregate moves
+    /// to `BridgingFailed` (FailBridging emitted) for operator reconciliation.
+    ///
+    /// This guards the wallet-empty-between-rebalances invariant: if ambient or
+    /// residual USDC from a prior rebalance is present, we cannot distinguish
+    /// the withdrawal's funds from the residual, so we must not burn at all.
+    #[tokio::test]
+    async fn wallet_balance_exceeding_nominal_returns_ambient_balance_error() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let nominal = usdc("1000");
+        let nominal_u256 = usdc_to_u256(nominal).unwrap();
+
+        // Wallet holds nominal + 50 USDC: the wallet-empty invariant is broken.
+        let ambient_balance = nominal_u256 + U256::from(50_000_000u64);
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(ambient_balance, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
+            .await
+            .unwrap_err();
+
+        // Must error with WalletUsdcAmbientBalance, NOT attempt the burn.
+        let UsdcTransferError::WalletUsdcAmbientBalance {
+            id: err_id,
+            balance,
+            nominal: err_nominal,
+        } = error
+        else {
+            panic!(
+                "Expected WalletUsdcAmbientBalance (ambient USDC in wallet, \
+                 no burn attempted); got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(err_nominal, nominal);
+        assert!(
+            balance > nominal,
+            "balance ({balance}) must exceed nominal ({nominal})"
+        );
+
+        // Aggregate must have moved to BridgingFailed (FailBridging emitted):
+        // no burn occurred, but the state is terminal for operator reconciliation.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "Aggregate must be at BridgingFailed with no burn tx \
+             (ambient USDC detected before any burn); got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: when `withdrawal_tx` is `Some` (confirmation gate passes) but
+    /// the wallet holds zero USDC, `continue_alpaca_to_base_from_withdrawal_complete`
+    /// returns `WalletUsdcInsufficient` (delayed-redrive) and the aggregate stays
+    /// at `WithdrawalComplete`. This is the timing-edge-case scenario: the
+    /// withdrawal tx is confirmed but the funds have not yet settled on the
+    /// destination RPC node.
+    #[tokio::test]
+    async fn withdrawal_zero_balance_with_confirmed_tx_redrives_not_fails() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        // Wallet holds zero USDC -- funds not yet visible on this RPC node.
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        // Mine extra blocks so the withdrawal tx has >= required_confirmations (3).
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider.anvil_mine(Some(5), None).await.unwrap();
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        // withdrawal_tx = Some(confirmed_tx): the confirmation gate passes, but
+        // the balance read returns zero (RPC node lag).
+        let confirmed_tx = chain.mint_tx;
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, Some(confirmed_tx))
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::WalletUsdcInsufficient { nominal, .. } = &error else {
+            panic!(
+                "Expected WalletUsdcInsufficient (zero balance after confirmed tx); \
+                 got: {error:?}"
+            );
+        };
+        assert_eq!(
+            *nominal, amount,
+            "WalletUsdcInsufficient nominal must match the requested amount"
+        );
+
+        // Aggregate stays in WithdrawalComplete -- retryable, not BridgingFailed.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must stay in WithdrawalComplete (retryable); got: {state:?}"
         );
     }
 
@@ -8132,24 +8422,22 @@ mod tests {
             "Aggregate must be WithdrawalComplete after absent-tx poll; got: {state:?}"
         );
 
-        // The balance gate (called by continue_alpaca_to_base_from_withdrawal_complete)
-        // returns WalletUsdcInsufficient because the wallet has zero USDC.
-        let required = usdc_to_u256(amount).unwrap();
+        // continue_alpaca_to_base_from_withdrawal_complete reads the wallet balance
+        // and returns WalletUsdcInsufficient (retryable) because the wallet holds
+        // zero USDC. No FailBridging is emitted; the aggregate stays in
+        // WithdrawalComplete for the next delayed-redrive attempt.
         let error = manager
-            .check_ethereum_usdc_balance(&id, required)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
             .await
             .unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                UsdcTransferError::WalletUsdcInsufficient { actual: a, .. } if a == U256::ZERO
-            ),
+            matches!(error, UsdcTransferError::WalletUsdcInsufficient { .. }),
             "Expected WalletUsdcInsufficient when balance is zero; got: {error:?}"
         );
 
         // Aggregate must still be in WithdrawalComplete -- the balance gate is
-        // staleness-safe (no FailBridging emitted on insufficient balance).
+        // staleness-safe (no FailBridging emitted on zero balance).
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
@@ -8159,7 +8447,7 @@ mod tests {
                     ..
                 }
             ),
-            "Aggregate must remain WithdrawalComplete after insufficient balance; got: {state:?}"
+            "Aggregate must remain WithdrawalComplete after zero balance; got: {state:?}"
         );
     }
 
@@ -8284,9 +8572,37 @@ mod tests {
         from_block: u64,
     ) {
         advance_to_withdrawal_complete_alpaca_to_base(cqrs, id, amount).await;
-        cqrs.send(id, UsdcRebalanceCommand::BeginBridging { from_block })
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::BeginBridging {
+                from_block,
+                burn_amount: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Advances the aggregate to `BridgingSubmitting` (AlpacaToBase) with an
+    /// explicit `burn_amount`. Used to test the crash-resume path where the
+    /// persisted burn amount is the fee-reduced received amount (not nominal).
+    async fn advance_to_bridging_submitting_alpaca_to_base_with_burn_amount(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        from_block: u64,
+        burn_amount: Usdc,
+    ) {
+        advance_to_withdrawal_complete_alpaca_to_base(cqrs, id, amount).await;
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::BeginBridging {
+                from_block,
+                burn_amount: Some(burn_amount),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// Advances the aggregate to `BridgingSubmitting { direction: BaseToAlpaca }`.
@@ -8317,9 +8633,15 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(id, UsdcRebalanceCommand::BeginBridging { from_block })
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::BeginBridging {
+                from_block,
+                burn_amount: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// `resume_alpaca_to_base` from `BridgingSubmitting { direction: BaseToAlpaca }`
@@ -8916,6 +9238,176 @@ mod tests {
         );
     }
 
+    /// `resume_alpaca_to_base` from `BridgingSubmitting { burn_amount: Some(received) }`
+    /// uses the persisted received amount as the burn-scan key and ADOPTS the
+    /// existing burn without issuing a second `depositForBurn`.
+    ///
+    /// This is the crash-resume path when Alpaca deducted a withdrawal fee: the
+    /// persisted `burn_amount` is the fee-reduced received amount (e.g. 98 USDC
+    /// from a 100 USDC nominal). The scan must target that exact amount to find
+    /// the in-flight burn and avoid a double-burn.
+    ///
+    /// The test stages an Ethereum burn for the received amount, then stages
+    /// `BridgingSubmitting { burn_amount: Some(received) }` and calls
+    /// `resume_bridging_submitting_ethereum` with the same received amount (the
+    /// value `resume_alpaca_to_base` derives from the persisted aggregate field).
+    /// A nonce check proves no second burn was submitted.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_alpaca_to_base_with_persisted_burn_amount_scans_received_amount_not_nominal() {
+        let chains = deploy_dual_chain_cctp().await;
+        let nominal = usdc("100");
+        // Simulate a 2 USDC withdrawal fee: received = 98 USDC.
+        let received = usdc("98");
+        let received_u256 = usdc_to_u256(received).unwrap();
+        // If the scan incorrectly used nominal, it would look for 100 USDC and
+        // miss the 98-USDC burn, then issue a second burn.
+        let nominal_u256 = usdc_to_u256(nominal).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // Fund the Ethereum bot wallet with enough USDC to burn the received amount.
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            nominal_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        // Capture the scan lower bound BEFORE the burn.
+        let from_block = cctp_bridge
+            .source_block(BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        // Submit the burn for the RECEIVED amount (98 USDC, not the 100 nominal).
+        let existing_burn = cctp_bridge
+            .burn(
+                BridgeDirection::EthereumToBase,
+                received_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            existing_burn.amount, received_u256,
+            "Pre-condition: burn was submitted for the received amount"
+        );
+
+        // Build the manager.
+        let server = MockServer::start();
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Stage `BridgingSubmitting` with burn_amount: Some(received) -- the
+        // crash state after a fee-deducted withdrawal burned the received amount
+        // but the process crashed before `InitiateBridging` was persisted.
+        advance_to_bridging_submitting_alpaca_to_base_with_burn_amount(
+            &cqrs, &id, nominal, from_block, received,
+        )
+        .await;
+
+        // Verify the pre-condition: aggregate is at BridgingSubmitting with
+        // burn_amount: Some(received).
+        let staged = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::BridgingSubmitting { burn_amount, .. } = staged else {
+            panic!("Expected BridgingSubmitting, got: {staged:?}");
+        };
+        assert_eq!(
+            burn_amount,
+            Some(received),
+            "Pre-condition: BridgingSubmitting must carry burn_amount=Some(received)"
+        );
+
+        // Capture the nonce before calling resume -- adopt must not submit a tx.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        let nonce_before = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        // Call resume_bridging_submitting_ethereum with the received amount --
+        // exactly what resume_alpaca_to_base extracts from the persisted
+        // burn_amount field and passes to the scan. The scan must find the
+        // existing 98-USDC burn and adopt it; searching for nominal (100 USDC)
+        // would miss it and issue a second burn.
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(&id, received_u256, from_block)
+            .await
+            .unwrap();
+
+        // Adopted: the returned receipt points at the existing burn tx.
+        assert_eq!(
+            burn_receipt.tx, existing_burn.tx,
+            "Resume with received amount must adopt the existing burn tx"
+        );
+        assert_eq!(
+            burn_receipt.amount, received_u256,
+            "Adopted burn receipt must carry the received (not nominal) amount"
+        );
+
+        let nonce_after = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            nonce_before, nonce_after,
+            "Adopting the existing burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        // Aggregate must be at Bridging (the adopted burn was recorded via
+        // record_cctp_burn -> InitiateBridging).
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                final_state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == existing_burn.tx
+            ),
+            "Aggregate must reach Bridging with the adopted burn tx; got: {final_state:?}"
+        );
+    }
+
     /// When `find_recent_burn` returns None (no prior burn),
     /// `resume_bridging_submitting_ethereum` issues a fresh burn and records it.
     /// Uses a `from_block` ABOVE the current head so no prior burn can be found.
@@ -9024,6 +9516,153 @@ mod tests {
                 }
             ),
             "Aggregate must reach Bridging after a fresh burn on resume; got: {state:?}"
+        );
+    }
+
+    /// `resume_bridging_submitting_ethereum` adopts an existing burn when given the
+    /// nominal U256 as the scan key, without issuing a second burn transaction.
+    ///
+    /// This exercises the lower-level function directly. The full dispatch path
+    /// (where `resume_alpaca_to_base` computes the scan key from `burn_amount` via
+    /// `unwrap_or(nominal_u256)`) is covered separately by
+    /// `resume_alpaca_to_base_with_persisted_burn_amount_scans_received_amount_not_nominal`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_adopts_existing_burn_for_nominal_scan_key() {
+        let chains = deploy_dual_chain_cctp().await;
+        let nominal = usdc("100");
+        let nominal_u256 = usdc_to_u256(nominal).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // Fund the Ethereum bot wallet with enough USDC to burn.
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            nominal_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        // Capture the scan lower bound BEFORE the burn.
+        let from_block = cctp_bridge
+            .source_block(BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        // Submit the burn for the NOMINAL amount (no fee deduction in pre-migration path).
+        let existing_burn = cctp_bridge
+            .burn(
+                BridgeDirection::EthereumToBase,
+                nominal_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        // Build the manager.
+        let server = MockServer::start();
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Stage pre-migration `BridgingSubmitting { burn_amount: None }`.
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, nominal, from_block).await;
+
+        // Pre-condition: aggregate has burn_amount: None.
+        let staged = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::BridgingSubmitting { burn_amount, .. } = staged else {
+            panic!("Expected BridgingSubmitting, got: {staged:?}");
+        };
+        assert_eq!(
+            burn_amount, None,
+            "Pre-condition: BridgingSubmitting must carry burn_amount=None (pre-migration)"
+        );
+
+        // Capture nonce before resume -- adopt must not submit a tx.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        let nonce_before = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        // Call resume_bridging_submitting_ethereum with the value that
+        // resume_alpaca_to_base derives: `burn_amount.map(usdc_to_u256).transpose()?
+        //   .unwrap_or(nominal_u256)` == nominal_u256 when burn_amount=None.
+        // The scan finds the existing nominal burn and adopts it without re-burning.
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(&id, nominal_u256, from_block)
+            .await
+            .unwrap();
+
+        // Adopted: receipt points at the existing burn tx.
+        assert_eq!(
+            burn_receipt.tx, existing_burn.tx,
+            "Resume with nominal_u256 (unwrap_or fallback) must adopt the existing burn tx"
+        );
+        assert_eq!(
+            burn_receipt.amount, nominal_u256,
+            "Adopted burn receipt must carry the nominal amount"
+        );
+
+        // No second burn submitted.
+        let nonce_after = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            nonce_before, nonce_after,
+            "Pre-migration resume (burn_amount=None -> nominal scan) must adopt the \
+             existing burn without submitting a second transaction (nonce unchanged)"
+        );
+
+        // Aggregate must reach Bridging (InitiateBridging emitted by record_cctp_burn).
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                final_state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == existing_burn.tx
+            ),
+            "Aggregate must reach Bridging with the adopted nominal burn tx; \
+             got: {final_state:?}"
         );
     }
 
