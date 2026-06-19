@@ -41,6 +41,7 @@ use st0x_wrapper::WrapperService;
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
+use crate::conductor::monitor::order_fills::{FinalityProbe, probe_finalized_block_support};
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
@@ -355,6 +356,30 @@ where
     Ok(())
 }
 
+/// Fails startup fast on an RPC endpoint that cannot serve what order-fill
+/// ingestion depends on: basic reachability and a usable `finalized` block tag.
+/// An endpoint that errors on `finalized`, or aliases it to the chain tip
+/// (disabling reorg protection), is rejected here rather than running silently
+/// degraded; a fresh chain with no finalized block yet is allowed through.
+async fn validate_rpc_endpoint<P: Provider>(provider: &P) -> anyhow::Result<()> {
+    let chain_tip = provider
+        .get_block_number()
+        .await
+        .context("failed to reach RPC endpoint at startup")?;
+
+    match probe_finalized_block_support(provider, chain_tip)
+        .await
+        .context("RPC endpoint cannot serve the `finalized` block tag at startup")?
+    {
+        FinalityProbe::AliasesChainTip => anyhow::bail!(
+            "RPC endpoint reports a finalized block at or beyond the chain tip \
+             ({chain_tip}); it appears to alias the `finalized` tag to `latest`, \
+             which would silently disable reorg protection. Refusing to start"
+        ),
+        FinalityProbe::Supported | FinalityProbe::NotYetAvailable => Ok(()),
+    }
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -383,14 +408,11 @@ impl Conductor {
         // contract calls. No WebSocket -- see `monitor::order_fills`.
         let provider = ProviderBuilder::new().connect_http(ctx.evm.rpc_url.clone());
 
-        // The HTTP transport connects lazily, so probe it once at startup to
-        // fail fast on a misconfigured or unreachable RPC rather than only
-        // surfacing it as repeated poll-loop retries. systemd's bounded
-        // restart loop handles a genuinely-down endpoint from here.
-        provider
-            .get_block_number()
-            .await
-            .context("failed to reach RPC endpoint at startup")?;
+        // The HTTP transport connects lazily, so validate it once at startup to
+        // fail fast on a misconfigured or unreachable RPC rather than surfacing
+        // it as repeated poll-loop retries. systemd's bounded restart loop
+        // handles a genuinely-down endpoint from here.
+        validate_rpc_endpoint(&provider).await?;
         let cache = SymbolCache::default();
 
         setup_apalis_tables(&apalis_pool).await?;

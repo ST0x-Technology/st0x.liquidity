@@ -112,10 +112,18 @@ excellent async ecosystem for handling concurrent trading flows.
 
 - Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
   Every `order_fill_poll_interval` seconds the monitor enqueues a backfill range
-  covering the blocks since the persisted checkpoint, capped at
-  `tip - required_confirmations`; the backfill worker fetches the `Clear` and
-  `TakeOrder` logs for the arbitrageur's owner address and advances the
-  checkpoint only on success.
+  covering the blocks since the persisted checkpoint, capped at the chain's
+  latest **finalized** block (`eth_getBlockByNumber("finalized")`; no finalized
+  block yet means nothing is enqueued); the backfill worker fetches the `Clear`
+  and `TakeOrder` logs for the arbitrageur's owner address and advances the
+  checkpoint only on success. A finalized block cannot reorg, so an ingested
+  fill can never be invalidated -- genuine single-chain reorg protection rather
+  than the earlier `tip - required_confirmations` confirmation-depth heuristic
+  (`required_confirmations` now governs only transaction-submission paths). The
+  tradeoff is hedge latency: on an L2 like Base the `finalized` tag tracks L1
+  finalization and lags the tip by minutes, so a fill is hedged only once its
+  block finalizes. First-class cross-chain reorg handling is tracked separately
+  in the Reorg protection project.
 - WebSocket `.watch()` filter polling and `eth_subscribe`/`subscribe_logs` are
   deliberately rejected: on a load-balanced RPC, filters live on a single
   backend node so most polls are round-robined to nodes returning `-32601`, and

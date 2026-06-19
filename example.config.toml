@@ -4,8 +4,9 @@ log_level = "debug"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
 # Interval (seconds) between continuous eth_getLogs polls for orderbook fills.
-# Each tick enqueues a backfill range over the unprocessed blocks, capped at
-# `tip - required_confirmations`. Defaults to 5 when omitted.
+# Each tick enqueues a backfill range over the unprocessed blocks, capped at the
+# chain's latest finalized block (a finalized block cannot reorg). Defaults to 5
+# when omitted.
 order_fill_poll_interval = 5
 hyperdx.service_name = "st0x-hedge"
 
@@ -20,13 +21,12 @@ beneficiary_entity_name = "Acme Corp"
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
-# Number of block confirmations required before an event is considered
-# safe to ingest. Naive reorg protection (NOT real chain finality):
-# backfill caps `to_block` at `latest - required_confirmations`, and live
-# ingestion defers persistence until events are this many blocks deep.
-# A deep reorg exceeding this depth will still corrupt state; the
-# monitor surfaces that case loudly rather than masking it. Set
-# explicitly per chain based on observed reorg behavior.
+# Block-confirmation depth required before a transaction this bot submits is
+# treated as settled (the primary gate for USDC rebalancing withdrawals). This
+# does NOT govern order-fill ingestion: the fill monitor now caps the backfill
+# range at the chain's latest finalized block (real reorg protection), so tuning
+# this value has no effect on ingestion latency. Set explicitly per chain based
+# on observed confirmation behavior.
 required_confirmations = 3
 
 # Wallet provider — select via `kind`:
