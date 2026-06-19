@@ -8,8 +8,6 @@ use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use st0x_config::TravelRuleConfig;
-
 use super::transfer::{Network, TokenSymbol};
 
 /// Travel Rule beneficiary info for Alpaca whitelist creation requests.
@@ -20,7 +18,7 @@ use super::transfer::{Network, TokenSymbol};
 /// Field names use `serde(rename)` to match the Alpaca API's
 /// `beneficiary_*` JSON keys while avoiding the `struct_field_names` lint.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct TravelRuleInfo {
+pub struct TravelRuleInfo {
     #[serde(rename = "beneficiary_is_self_hosted")]
     is_self_hosted: bool,
 
@@ -29,30 +27,30 @@ pub(crate) struct TravelRuleInfo {
 }
 
 impl TravelRuleInfo {
-    pub(crate) fn from_config(config: &TravelRuleConfig) -> Self {
+    pub fn new(beneficiary_entity_name: String) -> Self {
         Self {
             is_self_hosted: true,
-            entity_name: config.beneficiary_entity_name.clone(),
+            entity_name: beneficiary_entity_name,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub(crate) enum WhitelistStatus {
+pub enum WhitelistStatus {
     Pending,
     Approved,
     Rejected,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct WhitelistEntry {
-    pub(crate) id: String,
-    pub(crate) address: Address,
-    pub(crate) asset: TokenSymbol,
-    pub(crate) chain: Network,
-    pub(crate) status: WhitelistStatus,
-    pub(crate) created_at: DateTime<Utc>,
+pub struct WhitelistEntry {
+    pub id: String,
+    pub address: Address,
+    pub asset: TokenSymbol,
+    pub chain: Network,
+    pub status: WhitelistStatus,
+    pub created_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -62,7 +60,7 @@ mod tests {
     use serde_json::json;
     use uuid::{Uuid, uuid};
 
-    use st0x_execution::AlpacaAccountId;
+    use crate::AlpacaAccountId;
 
     use super::super::client::AlpacaWalletClient;
     use super::super::transfer::{Network, TokenSymbol};
@@ -250,9 +248,7 @@ mod tests {
         let server = MockServer::start();
         let target = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let travel_rule = TravelRuleInfo::from_config(&TravelRuleConfig {
-            beneficiary_entity_name: "T0 TRADE (BVI) LTD".to_string(),
-        });
+        let travel_rule = TravelRuleInfo::new("T0 TRADE (BVI) LTD".to_string());
 
         let checksummed = target.to_checksum(None);
 
@@ -374,9 +370,7 @@ mod tests {
             return;
         };
 
-        let travel_rule = TravelRuleInfo::from_config(&TravelRuleConfig {
-            beneficiary_entity_name: "T0 TRADE (BVI) LTD".to_string(),
-        });
+        let travel_rule = TravelRuleInfo::new("T0 TRADE (BVI) LTD".to_string());
 
         // 1. List existing whitelist entries.
         let entries = client.get_whitelisted_addresses().await.unwrap();

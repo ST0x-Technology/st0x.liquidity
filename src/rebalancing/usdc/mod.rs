@@ -22,11 +22,12 @@ use thiserror::Error;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_event_sorcery::SendError;
-use st0x_execution::{AlpacaBrokerApiError, ClientOrderId, InvalidSharesError, NotPositive};
+use st0x_execution::{
+    AlpacaBrokerApiError, AlpacaWalletError, ClientOrderId, InvalidSharesError, NotPositive,
+};
 use st0x_finance::{Usdc, UsdcConversionError};
 use st0x_raindex::RaindexError;
 
-use crate::alpaca_wallet::AlpacaWalletError;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 
 #[derive(Debug, Error)]

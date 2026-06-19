@@ -10,7 +10,8 @@ use st0x_config::EquityAssetConfig;
 use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaWalletService,
+    EmptySymbolError, Executor, Symbol,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
@@ -18,7 +19,6 @@ use st0x_wrapper::WrappedEquity;
 use super::usdc::{
     CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
 };
-use crate::alpaca_wallet::AlpacaWalletService;
 use crate::usdc_rebalance::UsdcRebalance;
 
 /// Errors that can occur when spawning the rebalancer.
@@ -166,13 +166,13 @@ mod tests {
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Symbol,
+        TimeInForce,
     };
     use st0x_float_macro::float;
     use st0x_wrapper::WrappedEquity;
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaWalletService;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::usdc::UsdcSettlementParams;

@@ -16,12 +16,12 @@ use super::transfer::{
     AlpacaTransferId, Transfer, TransferStatus, find_transfer_by_tx_hash, get_transfer_status,
 };
 
-pub(crate) struct PollingConfig {
-    pub(crate) interval: Duration,
-    pub(crate) timeout: Duration,
-    pub(crate) max_retries: usize,
-    pub(crate) min_retry_delay: Duration,
-    pub(crate) max_retry_delay: Duration,
+pub struct PollingConfig {
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub max_retries: usize,
+    pub min_retry_delay: Duration,
+    pub max_retry_delay: Duration,
 }
 
 impl Default for PollingConfig {
@@ -278,7 +278,7 @@ mod tests {
     use uuid::{Uuid, uuid};
 
     use super::*;
-    use st0x_execution::AlpacaAccountId;
+    use crate::AlpacaAccountId;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));

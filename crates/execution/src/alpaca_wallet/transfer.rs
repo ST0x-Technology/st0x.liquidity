@@ -10,16 +10,16 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_execution::Positive;
 use st0x_finance::Usdc;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
+use crate::Positive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TokenSymbol(pub(super) String);
+pub struct TokenSymbol(pub String);
 
 impl TokenSymbol {
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 }
@@ -43,7 +43,7 @@ impl std::fmt::Display for TokenSymbol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AlpacaTransferId(Uuid);
+pub struct AlpacaTransferId(pub Uuid);
 
 impl AlpacaTransferId {
     #[cfg(test)]
@@ -66,14 +66,14 @@ impl std::fmt::Display for AlpacaTransferId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub(crate) enum TransferDirection {
+pub enum TransferDirection {
     Incoming,
     Outgoing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub(crate) enum TransferStatus {
+pub enum TransferStatus {
     Pending,
     Processing,
     Complete,
@@ -82,7 +82,7 @@ pub(crate) enum TransferStatus {
 
 impl TransferStatus {
     /// Whether the transfer is still in flight (not yet complete or failed).
-    pub(crate) fn is_pending(self) -> bool {
+    pub fn is_pending(self) -> bool {
         use TransferStatus::*;
 
         match self {
@@ -94,25 +94,25 @@ impl TransferStatus {
 
 /// Transfer response from Alpaca Crypto Wallets API.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Transfer {
-    pub(crate) id: AlpacaTransferId,
+pub struct Transfer {
+    pub id: AlpacaTransferId,
     #[serde(rename = "tx_hash", default)]
-    pub(crate) tx: Option<TxHash>,
-    pub(crate) direction: TransferDirection,
+    pub tx: Option<TxHash>,
+    pub direction: TransferDirection,
     #[serde(deserialize_with = "deserialize_float_from_string")]
-    pub(crate) amount: Float,
-    pub(crate) chain: String,
-    pub(crate) asset: TokenSymbol,
+    pub amount: Float,
+    pub chain: String,
+    pub asset: TokenSymbol,
     #[serde(rename = "from_address")]
-    pub(crate) from: Address,
+    pub from: Address,
     #[serde(rename = "to_address")]
-    pub(crate) to: Address,
-    pub(crate) status: TransferStatus,
-    pub(crate) created_at: DateTime<Utc>,
+    pub to: Address,
+    pub status: TransferStatus,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Network(pub(super) String);
+pub struct Network(String);
 
 impl<'de> serde::Deserialize<'de> for Network {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -125,7 +125,7 @@ impl<'de> serde::Deserialize<'de> for Network {
 }
 
 impl Network {
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    pub fn new(s: impl Into<String>) -> Self {
         Self(s.into().to_lowercase())
     }
 }
@@ -251,8 +251,8 @@ mod tests {
     use std::str::FromStr;
     use uuid::uuid;
 
+    use crate::AlpacaAccountId;
     use rain_math_float::Float;
-    use st0x_execution::AlpacaAccountId;
 
     use super::*;
     use st0x_float_macro::float;
