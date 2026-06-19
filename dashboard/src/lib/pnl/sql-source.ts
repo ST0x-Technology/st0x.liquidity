@@ -1,13 +1,21 @@
 import Decimal from 'decimal.js'
 import type {
+  PnlAccountingBucket,
+  PnlAccountingEffect,
+  PnlCostCategory,
+  PnlCostEntry,
+  PnlCostSummary,
   PnlEntry,
+  PnlCounterTradingFilter,
+  PnlMarketSessionFilter,
   PnlResponse,
   PnlSampleStats,
-  PnlSampleSymbolStats,
   PnlStreamKey,
   PnlSummary,
   PnlSymbolSummary,
   PnlWindow,
+  PnlWindowCounterTradingSession,
+  PnlWindowMarketSession,
   PnlWindowSymbol
 } from './report'
 
@@ -17,7 +25,8 @@ export type SqlPnlQuery = {
   symbols: Set<string>
   fromDate?: string
   toDate?: string
-  dayFilter?: 'all' | 'weekday' | 'weekend'
+  marketSessionFilter?: PnlMarketSessionFilter
+  counterTradingFilter?: PnlCounterTradingFilter
 }
 
 export type SqlPositionEventRow = {
@@ -34,12 +43,12 @@ export type SqlPositionViewRow = {
   last_price_usdc: string | null
 }
 
-export type SqlSampleStatsRow = {
-  symbol: string
-  onchain_fill_count: number
-  offchain_fill_count: number
-  first_at: string | null
-  last_at: string | null
+export type SqlCostEventRow = {
+  rowid: number
+  aggregate_type: string
+  aggregate_id: string
+  event_type: string
+  payload: unknown
 }
 
 type Direction = 'Buy' | 'Sell'
@@ -117,6 +126,27 @@ type PositionReplayDelta = {
   positionNet: Decimal
 }
 
+type CostSummaryAcc = {
+  counterTradeCostsUsd: Decimal
+  onchainNettingCostsUsd: Decimal
+  directionalExposureCostsUsd: Decimal
+  genericCostsUsd: Decimal
+  genericRevenueUsd: Decimal
+  dividendRevenueUsd: Decimal
+  offchainExecutionFeesUsd: Decimal
+  tokenizationFeesUsd: Decimal
+  cctpFeesUsd: Decimal
+  conversionSlippageUsd: Decimal
+  oracleWriteCostUsd: Decimal
+  brokerFeesUsd: Decimal
+  regulatoryFeesUsd: Decimal
+  marginInterestUsd: Decimal
+  botGasUsd: Decimal
+  walletTransferFeesUsd: Decimal
+  unclassifiedCostsUsd: Decimal
+  missingCostObservationCount: number
+}
+
 const ATTRIBUTION_METHOD = 'direct_sql_position_fill_replay_fifo'
 const COUNTER_TRADE_THRESHOLD_SECONDS = 300
 const DATASSETTE_DEFAULT_MAX_RETURNED_ROWS = 1000
@@ -128,7 +158,9 @@ const ZERO = new Decimal(0)
 const ATTRIBUTION_WARNING =
   'PnL source: realized gross replay from the deployed SQL JSON endpoint. Fills are ordered by execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
 const BASELINE_WARNING =
-  'Displayed PnL is realized gross PnL by lot close date from persisted fills only. Baseline drift, percentage return, true period/NAV PnL, and cost-inclusive PnL require a persisted portfolio state vector plus price vector over time, cash-flow events, fees, and financing data; those are not currently persisted, so baseline drift is zero.'
+  'Displayed PnL is realized by lot close date from persisted fills. Baseline drift, percentage return, and true period/NAV PnL require a persisted portfolio state vector, price vector, and cash-flow events; those are not currently persisted, so baseline drift and percentage return are not reported.'
+const COST_WARNING =
+  'Tracked costs and revenues are built bottom-up by economic bucket. On-chain netting and raw directional drift have no direct bot-paid execution cost. USD and USDC are treated as equivalent reporting currency, so USD/USDC conversion basis is not modeled as PnL; only explicit persisted fees are deducted. Persisted SQLite costs currently include tokenization fees and CCTP fees; Alpaca account fees, margin interest, and dividends are included when the Alpaca account-activity API endpoint is configured. Oracle write cost is zero for the current setup. Wallet transfer fees and bot gas require additional ledger/receipt ingestion before they can be included.'
 
 const emptySummary = (): SummaryAcc => ({
   counterTradePnlUsd: new Decimal(0),
@@ -153,6 +185,27 @@ const emptySummary = (): SummaryAcc => ({
   matchedLotCount: 0,
   openLotCount: 0,
   unmatchedOffchainFillCount: 0
+})
+
+const emptyCostSummaryAcc = (): CostSummaryAcc => ({
+  counterTradeCostsUsd: new Decimal(0),
+  onchainNettingCostsUsd: new Decimal(0),
+  directionalExposureCostsUsd: new Decimal(0),
+  genericCostsUsd: new Decimal(0),
+  genericRevenueUsd: new Decimal(0),
+  dividendRevenueUsd: new Decimal(0),
+  offchainExecutionFeesUsd: new Decimal(0),
+  tokenizationFeesUsd: new Decimal(0),
+  cctpFeesUsd: new Decimal(0),
+  conversionSlippageUsd: new Decimal(0),
+  oracleWriteCostUsd: new Decimal(0),
+  brokerFeesUsd: new Decimal(0),
+  regulatoryFeesUsd: new Decimal(0),
+  marginInterestUsd: new Decimal(0),
+  botGasUsd: new Decimal(0),
+  walletTransferFeesUsd: new Decimal(0),
+  unclassifiedCostsUsd: new Decimal(0),
+  missingCostObservationCount: 0
 })
 
 const emptyBook = (): SymbolBook => ({
@@ -273,27 +326,25 @@ WHERE symbol IS NOT NULL
 ORDER BY symbol ASC
 `
 
-const sampleStatsSql = (): string => `
-SELECT
-  aggregate_id AS symbol,
-  SUM(CASE WHEN event_type = 'PositionEvent::OnChainOrderFilled' THEN 1 ELSE 0 END) AS onchain_fill_count,
-  SUM(CASE WHEN event_type = 'PositionEvent::OffChainOrderFilled' THEN 1 ELSE 0 END) AS offchain_fill_count,
-  MIN(COALESCE(
-    json_extract(payload, '$.OnChainOrderFilled.block_timestamp'),
-    json_extract(payload, '$.OffChainOrderFilled.broker_timestamp')
-  )) AS first_at,
-  MAX(COALESCE(
-    json_extract(payload, '$.OnChainOrderFilled.block_timestamp'),
-    json_extract(payload, '$.OffChainOrderFilled.broker_timestamp')
-  )) AS last_at
+const costEventsSql = (): string => `
+SELECT rowid, aggregate_type, aggregate_id, event_type, payload
 FROM events
-WHERE aggregate_type = 'Position'
-  AND event_type IN (
-    'PositionEvent::OnChainOrderFilled',
-    'PositionEvent::OffChainOrderFilled'
+WHERE (
+    aggregate_type = 'TokenizedEquityMint'
+    AND event_type IN (
+      'TokenizedEquityMintEvent::MintRequested',
+      'TokenizedEquityMintEvent::TokensReceived',
+      'TokenizedEquityMintEvent::ProviderCompletionRecovered'
+    )
   )
-GROUP BY aggregate_id
-ORDER BY aggregate_id ASC
+  OR (
+    aggregate_type = 'UsdcRebalance'
+    AND event_type IN (
+      'UsdcRebalanceEvent::Bridged',
+      'UsdcRebalanceEvent::BridgingCompletionRecovered'
+    )
+  )
+ORDER BY rowid ASC
 `
 
 const parsePayload = (payload: unknown): Record<string, unknown> | null => {
@@ -405,17 +456,93 @@ const orderedPositionEvents = (
 
 const dateKey = (iso: string): string => iso.slice(0, 10)
 
-const isWeekendIso = (iso: string): boolean => {
-  const day = new Date(iso).getUTCDay()
-  return day === 0 || day === 6
+const newYorkTimeParts = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  weekday: 'short',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23'
+})
+
+const parseNewYorkSessionParts = (
+  iso: string
+): { weekday: string; minuteOfDay: number } | null => {
+  const parsed = Date.parse(iso)
+  if (!Number.isFinite(parsed)) return null
+
+  const parts = newYorkTimeParts.formatToParts(new Date(parsed))
+  const weekday = parts.find((part) => part.type === 'weekday')?.value
+  const hour = parts.find((part) => part.type === 'hour')?.value
+  const minute = parts.find((part) => part.type === 'minute')?.value
+  if (weekday === undefined || hour === undefined || minute === undefined) return null
+
+  return {
+    weekday,
+    minuteOfDay: Number(hour) * 60 + Number(minute)
+  }
+}
+
+const isNewYorkWeekendIso = (iso: string): boolean => {
+  const parts = parseNewYorkSessionParts(iso)
+  return parts === null || parts.weekday === 'Sat' || parts.weekday === 'Sun'
+}
+
+const marketSessionForIso = (iso: string): Exclude<PnlMarketSessionFilter, 'all'> => {
+  const parts = parseNewYorkSessionParts(iso)
+  if (parts === null) return 'overnight'
+
+  const isWeekend = parts.weekday === 'Sat' || parts.weekday === 'Sun'
+  if (isWeekend) return 'weekend'
+
+  const preStartMinutes = 4 * 60
+  const rthStartMinutes = 9 * 60 + 30
+  const postStartMinutes = 16 * 60
+  const postEndMinutes = 20 * 60
+
+  if (parts.minuteOfDay >= preStartMinutes && parts.minuteOfDay < rthStartMinutes) return 'pre'
+  if (parts.minuteOfDay >= rthStartMinutes && parts.minuteOfDay < postStartMinutes) return 'rth'
+  if (parts.minuteOfDay >= postStartMinutes && parts.minuteOfDay < postEndMinutes) return 'post'
+  return 'overnight'
+}
+
+const counterTradingSessionForIso = (
+  iso: string
+): Exclude<PnlCounterTradingFilter, 'all'> => {
+  // Match the current Alpaca hotpath: hedges are market orders with
+  // extended_hours=false, and the executor gates on Alpaca calendar
+  // regular-hours open/close. In the dashboard model that maps to RTH.
+  const isActive = marketSessionForIso(iso) === 'rth'
+
+  return isActive ? 'counter_trading_active' : 'counter_trading_inactive'
+}
+
+const matchesMarketSessionFilter = (
+  iso: string,
+  filter: PnlMarketSessionFilter | undefined
+): boolean => {
+  if (filter === undefined || filter === 'all') return true
+  return marketSessionForIso(iso) === filter
+}
+
+const matchesCounterTradingFilter = (
+  iso: string,
+  filter: PnlCounterTradingFilter | undefined
+): boolean => {
+  if (filter === undefined || filter === 'all') return true
+  return counterTradingSessionForIso(iso) === filter
+}
+
+const matchesTradeFilters = (iso: string, query: SqlPnlQuery): boolean => {
+  if (!matchesMarketSessionFilter(iso, query.marketSessionFilter)) return false
+  if (!matchesCounterTradingFilter(iso, query.counterTradingFilter)) return false
+  return true
 }
 
 const matchesDateFilter = (entry: PnlEntry, query: SqlPnlQuery): boolean => {
   const day = dateKey(entry.closedAt)
   if (query.fromDate !== undefined && day < query.fromDate) return false
   if (query.toDate !== undefined && day > query.toDate) return false
-  if (query.dayFilter === 'weekday' && isWeekendIso(entry.closedAt)) return false
-  if (query.dayFilter === 'weekend' && !isWeekendIso(entry.closedAt)) return false
+  if (!matchesTradeFilters(entry.closedAt, query)) return false
   return true
 }
 
@@ -426,6 +553,268 @@ const fmtDecimal = (value: Decimal): string => {
   const fixed = value.toFixed(9)
   const trimmed = fixed.replace(/\.?0+$/u, '')
   return trimmed === '-0' || trimmed === '' ? '0' : trimmed
+}
+
+const matchesCostDateFilter = (entry: PnlCostEntry, query: SqlPnlQuery): boolean => {
+  const day = dateKey(entry.occurredAt)
+  if (query.fromDate !== undefined && day < query.fromDate) return false
+  if (query.toDate !== undefined && day > query.toDate) return false
+  if (
+    entry.aggregateType === 'AlpacaAccountActivity' &&
+    entry.accountingBucket === 'counter_trade'
+  ) {
+    if (query.marketSessionFilter !== undefined && query.marketSessionFilter !== 'all') {
+      if (query.marketSessionFilter !== 'rth') return false
+    }
+    if (
+      query.counterTradingFilter !== undefined &&
+      query.counterTradingFilter !== 'all' &&
+      query.counterTradingFilter !== 'counter_trading_active'
+    ) {
+      return false
+    }
+    return true
+  }
+
+  if (!matchesTradeFilters(entry.occurredAt, query)) return false
+  return true
+}
+
+const matchesCostSymbolFilter = (entry: PnlCostEntry, symbols: Set<string>): boolean =>
+  symbols.size === 0 || entry.symbol === null || symbols.has(entry.symbol)
+
+const costEntry = (
+  row: SqlCostEventRow,
+  category: PnlCostCategory,
+  accountingBucket: PnlAccountingBucket,
+  effect: PnlAccountingEffect,
+  amountUsd: Decimal,
+  occurredAt: string,
+  detail: string,
+  symbol: string | null = null
+): PnlCostEntry => ({
+  category,
+  accountingBucket,
+  effect,
+  amountUsd: fmtDecimal(amountUsd),
+  occurredAt,
+  aggregateType: row.aggregate_type,
+  aggregateId: row.aggregate_id,
+  eventRowid: row.rowid,
+  symbol,
+  detail
+})
+
+const addCost = (
+  summary: CostSummaryAcc,
+  category: PnlCostCategory,
+  accountingBucket: PnlAccountingBucket,
+  effect: PnlAccountingEffect,
+  amount: Decimal
+): void => {
+  if (effect === 'cost') {
+    if (accountingBucket === 'counter_trade') {
+      summary.counterTradeCostsUsd = summary.counterTradeCostsUsd.plus(amount)
+    } else if (accountingBucket === 'onchain_netting') {
+      summary.onchainNettingCostsUsd = summary.onchainNettingCostsUsd.plus(amount)
+    } else if (accountingBucket === 'directional_exposure') {
+      summary.directionalExposureCostsUsd = summary.directionalExposureCostsUsd.plus(amount)
+    } else {
+      summary.genericCostsUsd = summary.genericCostsUsd.plus(amount)
+    }
+  } else if (effect === 'revenue' && accountingBucket === 'dividend_revenue') {
+    summary.dividendRevenueUsd = summary.dividendRevenueUsd.plus(amount)
+  } else if (effect === 'revenue') {
+    summary.genericRevenueUsd = summary.genericRevenueUsd.plus(amount)
+  }
+
+  if (category === 'tokenization_fee') {
+    summary.tokenizationFeesUsd = summary.tokenizationFeesUsd.plus(amount)
+  } else if (category === 'cctp_fee') {
+    summary.cctpFeesUsd = summary.cctpFeesUsd.plus(amount)
+  } else if (category === 'conversion_slippage') {
+    summary.conversionSlippageUsd = summary.conversionSlippageUsd.plus(amount)
+  } else if (category === 'oracle_write') {
+    summary.oracleWriteCostUsd = summary.oracleWriteCostUsd.plus(amount)
+  } else if (category === 'broker_fee') {
+    summary.brokerFeesUsd = summary.brokerFeesUsd.plus(amount)
+  } else if (category === 'regulatory_fee') {
+    summary.regulatoryFeesUsd = summary.regulatoryFeesUsd.plus(amount)
+  } else if (category === 'margin_interest') {
+    summary.marginInterestUsd = summary.marginInterestUsd.plus(amount)
+  } else if (category === 'bot_gas') {
+    summary.botGasUsd = summary.botGasUsd.plus(amount)
+  } else if (category === 'wallet_transfer_fee') {
+    summary.walletTransferFeesUsd = summary.walletTransferFeesUsd.plus(amount)
+  } else if (category === 'offchain_execution_fee') {
+    summary.offchainExecutionFeesUsd = summary.offchainExecutionFeesUsd.plus(amount)
+  } else if (category === 'dividend_income') {
+    return
+  } else {
+    summary.unclassifiedCostsUsd = summary.unclassifiedCostsUsd.plus(amount)
+  }
+}
+
+const totalTrackedCosts = (summary: CostSummaryAcc): Decimal =>
+  summary.counterTradeCostsUsd
+    .plus(summary.onchainNettingCostsUsd)
+    .plus(summary.directionalExposureCostsUsd)
+    .plus(summary.genericCostsUsd)
+
+const totalTrackedRevenue = (summary: CostSummaryAcc): Decimal =>
+  summary.dividendRevenueUsd.plus(summary.genericRevenueUsd)
+
+const includedWhenNonZero = (value: Decimal): 'included' | 'not_ingested' =>
+  value.isZero() ? 'not_ingested' : 'included'
+
+const costSummaryToDto = (summary: CostSummaryAcc, costEntryCount: number): PnlCostSummary => ({
+  totalTrackedCostsUsd: fmtDecimal(totalTrackedCosts(summary)),
+  totalTrackedRevenueUsd: fmtDecimal(totalTrackedRevenue(summary)),
+  counterTradeCostsUsd: fmtDecimal(summary.counterTradeCostsUsd),
+  onchainNettingCostsUsd: fmtDecimal(summary.onchainNettingCostsUsd),
+  directionalExposureCostsUsd: fmtDecimal(summary.directionalExposureCostsUsd),
+  genericCostsUsd: fmtDecimal(summary.genericCostsUsd),
+  dividendRevenueUsd: fmtDecimal(summary.dividendRevenueUsd),
+  offchainExecutionFeesUsd: fmtDecimal(
+    summary.offchainExecutionFeesUsd.plus(summary.regulatoryFeesUsd)
+  ),
+  tokenizationFeesUsd: fmtDecimal(summary.tokenizationFeesUsd),
+  cctpFeesUsd: fmtDecimal(summary.cctpFeesUsd),
+  conversionSlippageUsd: fmtDecimal(summary.conversionSlippageUsd),
+  oracleWriteCostUsd: fmtDecimal(summary.oracleWriteCostUsd),
+  brokerFeesUsd: fmtDecimal(summary.brokerFeesUsd),
+  regulatoryFeesUsd: fmtDecimal(summary.regulatoryFeesUsd),
+  marginInterestUsd: fmtDecimal(summary.marginInterestUsd),
+  botGasUsd: fmtDecimal(summary.botGasUsd),
+  walletTransferFeesUsd: fmtDecimal(summary.walletTransferFeesUsd),
+  unclassifiedCostsUsd: fmtDecimal(summary.unclassifiedCostsUsd),
+  costEntryCount,
+  missingCostObservationCount: summary.missingCostObservationCount,
+  coverage: [
+    {
+      source: 'Alpaca fees',
+      accountingBucket: 'generic',
+      effect: 'cost',
+      status: includedWhenNonZero(summary.brokerFeesUsd),
+      amountUsd: fmtDecimal(summary.brokerFeesUsd),
+      note: 'Read from Alpaca account activity fee rows. These rows are not subtype-classified for now and are not allocated to symbols unless Alpaca supplies a symbol.'
+    },
+    {
+      source: 'On-chain netting execution costs',
+      accountingBucket: 'onchain_netting',
+      effect: 'none',
+      status: 'zero',
+      amountUsd: fmtDecimal(summary.onchainNettingCostsUsd),
+      note: 'Passive on-chain fills do not create bot-paid trade execution costs for the on-chain netting bucket.'
+    },
+    {
+      source: 'Directional drift direct costs',
+      accountingBucket: 'directional_exposure',
+      effect: 'none',
+      status: 'zero',
+      amountUsd: fmtDecimal(summary.directionalExposureCostsUsd),
+      note: 'Raw inventory drift is price movement on held exposure; it has no direct execution cost by itself.'
+    },
+    {
+      source: 'Tokenization fees',
+      accountingBucket: 'generic',
+      effect: 'cost',
+      status: 'included',
+      amountUsd: fmtDecimal(summary.tokenizationFeesUsd),
+      note: 'Read from TokenizedEquityMint terminal events when Alpaca reports fees.'
+    },
+    {
+      source: 'CCTP fees',
+      accountingBucket: 'generic',
+      effect: 'cost',
+      status: 'included',
+      amountUsd: fmtDecimal(summary.cctpFeesUsd),
+      note: 'Read from UsdcRebalance bridge completion events as fee_collected.'
+    },
+    {
+      source: 'USD/USDC reporting basis',
+      accountingBucket: 'generic',
+      effect: 'none',
+      status: 'zero',
+      amountUsd: fmtDecimal(summary.conversionSlippageUsd),
+      note: 'USD and USDC are treated as equivalent for reporting; conversion basis is not modeled as PnL. Only explicit persisted fees are deducted.'
+    },
+    {
+      source: 'Oracle writes',
+      accountingBucket: 'generic',
+      effect: 'none',
+      status: 'zero',
+      amountUsd: fmtDecimal(summary.oracleWriteCostUsd),
+      note: 'Current setup does not pay oracle write cost through the bot.'
+    },
+    {
+      source: 'Dividend income',
+      accountingBucket: 'dividend_revenue',
+      effect: 'revenue',
+      status: includedWhenNonZero(summary.dividendRevenueUsd),
+      amountUsd: fmtDecimal(summary.dividendRevenueUsd),
+      note: 'Dividend-bearing stock revenue increases net PnL when Alpaca dividend activity rows are available.'
+    },
+    {
+      source: 'Margin interest',
+      accountingBucket: 'generic',
+      effect: 'cost',
+      status: includedWhenNonZero(summary.marginInterestUsd),
+      amountUsd: fmtDecimal(summary.marginInterestUsd),
+      note: 'Included when Alpaca account activity interest rows are available; negative rows are costs and positive rows are credits.'
+    },
+    {
+      source: 'Bot gas',
+      accountingBucket: 'generic',
+      effect: 'cost',
+      status: 'not_ingested',
+      amountUsd: fmtDecimal(summary.botGasUsd),
+      note: 'Requires tx receipt ingestion, gas-payer classification, and ETH/USD valuation.'
+    },
+    {
+      source: 'Wallet transfer fees',
+      accountingBucket: 'generic',
+      effect: 'cost',
+      status: 'not_ingested',
+      amountUsd: fmtDecimal(summary.walletTransferFeesUsd),
+      note: 'Alpaca wallet fee fields are not currently persisted into the event stream.'
+    }
+  ]
+})
+
+const summarizeCostEntries = (
+  entries: PnlCostEntry[],
+  missingCostObservationCount: number
+): PnlCostSummary => {
+  const summary = emptyCostSummaryAcc()
+  summary.missingCostObservationCount = missingCostObservationCount
+
+  for (const entry of entries) {
+    addCost(
+      summary,
+      entry.category,
+      entry.accountingBucket,
+      entry.effect,
+      new Decimal(entry.amountUsd)
+    )
+  }
+
+  return costSummaryToDto(summary, entries.length)
+}
+
+const withCosts = (summary: PnlSummary, costs: PnlCostSummary): PnlSummary => {
+  const gross = new Decimal(summary.totalPnlUsd)
+  const trackedCosts = new Decimal(costs.totalTrackedCostsUsd)
+  const trackedRevenue = new Decimal(costs.totalTrackedRevenueUsd)
+  const net = gross.minus(trackedCosts).plus(trackedRevenue)
+
+  return {
+    ...summary,
+    grossRealizedPnlUsd: fmtDecimal(gross),
+    trackedCostsUsd: fmtDecimal(trackedCosts),
+    trackedRevenueUsd: fmtDecimal(trackedRevenue),
+    netRealizedPnlUsd: fmtDecimal(net)
+  }
 }
 
 const allocationSummaryText = (allocations: UnmatchedOffchainAllocation[]): string | null => {
@@ -951,6 +1340,10 @@ const summaryToDto = (summary: SummaryAcc): PnlSummary => {
     directionalImbalanceExcessPnlUsd: fmtDecimal(summary.directionalImbalanceExcessPnlUsd),
     directionalExposurePnlUsd: fmtDecimal(directionalExposurePnl),
     totalPnlUsd: fmtDecimal(totalPnl),
+    grossRealizedPnlUsd: fmtDecimal(totalPnl),
+    trackedCostsUsd: '0',
+    trackedRevenueUsd: '0',
+    netRealizedPnlUsd: fmtDecimal(totalPnl),
     realizedPnlUsd: fmtDecimal(summary.realizedPnlUsd),
     matchedShares: fmtDecimal(summary.matchedShares),
     onchainNotionalUsd: fmtDecimal(summary.onchainNotionalUsd),
@@ -983,6 +1376,10 @@ const symbolSummaryToDto = (symbol: string, summary: SummaryAcc): PnlSymbolSumma
     directionalImbalanceExcessPnlUsd: dto.directionalImbalanceExcessPnlUsd,
     directionalExposurePnlUsd: dto.directionalExposurePnlUsd,
     totalPnlUsd: dto.totalPnlUsd,
+    grossRealizedPnlUsd: dto.grossRealizedPnlUsd,
+    trackedCostsUsd: dto.trackedCostsUsd,
+    trackedRevenueUsd: dto.trackedRevenueUsd,
+    netRealizedPnlUsd: dto.netRealizedPnlUsd,
     realizedPnlUsd: dto.realizedPnlUsd,
     matchedShares: dto.matchedShares,
     inventoryDriftShares: dto.inventoryDriftShares,
@@ -1057,6 +1454,85 @@ const mergeSymbolReplayExposure = (
   return [...bySymbol.values()].sort((left, right) => left.symbol.localeCompare(right.symbol))
 }
 
+const withDirectSymbolCosts = (
+  symbols: PnlSymbolSummary[],
+  costEntries: PnlCostEntry[]
+): PnlSymbolSummary[] => {
+  const costsBySymbol = new Map<string, Decimal>()
+  const revenueBySymbol = new Map<string, Decimal>()
+  for (const entry of costEntries) {
+    if (entry.symbol === null) continue
+    const amount = new Decimal(entry.amountUsd)
+    if (entry.effect === 'revenue') {
+      const current = revenueBySymbol.get(entry.symbol) ?? ZERO
+      revenueBySymbol.set(entry.symbol, current.plus(amount))
+    } else if (entry.effect === 'cost') {
+      const current = costsBySymbol.get(entry.symbol) ?? ZERO
+      costsBySymbol.set(entry.symbol, current.plus(amount))
+    }
+  }
+
+  if (costsBySymbol.size === 0 && revenueBySymbol.size === 0) return symbols
+
+  const bySymbol = new Map(symbols.map((row) => [row.symbol, row]))
+  const affectedSymbols = new Set([...costsBySymbol.keys(), ...revenueBySymbol.keys()])
+  for (const symbol of affectedSymbols) {
+    const existing = bySymbol.get(symbol) ?? emptySymbolSummary(symbol)
+    const gross = new Decimal(existing.totalPnlUsd)
+    const cost = costsBySymbol.get(symbol) ?? ZERO
+    const revenue = revenueBySymbol.get(symbol) ?? ZERO
+    bySymbol.set(symbol, {
+      ...existing,
+      grossRealizedPnlUsd: fmtDecimal(gross),
+      trackedCostsUsd: fmtDecimal(cost),
+      trackedRevenueUsd: fmtDecimal(revenue),
+      netRealizedPnlUsd: fmtDecimal(gross.minus(cost).plus(revenue))
+    })
+  }
+
+  return [...bySymbol.values()].sort((left, right) => left.symbol.localeCompare(right.symbol))
+}
+
+const resetSymbolCosts = (symbols: PnlSymbolSummary[]): PnlSymbolSummary[] =>
+  symbols.map((row) => ({
+    ...row,
+    grossRealizedPnlUsd: row.totalPnlUsd,
+    trackedCostsUsd: '0',
+    trackedRevenueUsd: '0',
+    netRealizedPnlUsd: row.totalPnlUsd
+  }))
+
+export const mergePnlReportCostEntries = (
+  report: PnlResponse,
+  additionalCostEntries: PnlCostEntry[],
+  query: SqlPnlQuery
+): PnlResponse => {
+  if (additionalCostEntries.length === 0) return report
+
+  const filteredAdditionalCostEntries = additionalCostEntries
+    .filter((entry) => matchesCostSymbolFilter(entry, query.symbols))
+    .filter((entry) => matchesCostDateFilter(entry, query))
+
+  if (filteredAdditionalCostEntries.length === 0) return report
+
+  const costEntries = [...report.costEntries, ...filteredAdditionalCostEntries].sort((left, right) =>
+    right.occurredAt.localeCompare(left.occurredAt)
+  )
+  const costSummary = summarizeCostEntries(costEntries, report.costs.missingCostObservationCount)
+
+  return {
+    ...report,
+    warnings: [
+      ...report.warnings,
+      `Cost coverage note: ${String(filteredAdditionalCostEntries.length)} Alpaca account activity rows were fetched from the broker API and included as explicit cost/revenue ledger entries.`
+    ],
+    summary: withCosts(report.summary, costSummary),
+    costs: costSummary,
+    symbols: withDirectSymbolCosts(resetSymbolCosts(report.symbols), costEntries),
+    costEntries
+  }
+}
+
 const entryBucketToStream = (bucket: string): PnlStreamKey | null => {
   if (bucket === 'counter_trade') return 'counterTradePnlUsd'
   if (bucket === 'onchain_netting') return 'onchainNettingPnlUsd'
@@ -1129,6 +1605,14 @@ const buildWindows = (entries: PnlEntry[], symbols: string[]): PnlWindow[] => {
   return [...byDate.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([date, dayEntries]) => {
+      const marketSessions = new Set(dayEntries.map((entry) => marketSessionForIso(entry.closedAt)))
+      const counterTradingSessions = new Set(
+        dayEntries.map((entry) => counterTradingSessionForIso(entry.closedAt))
+      )
+      const marketSession: PnlWindowMarketSession =
+        marketSessions.size === 1 ? [...marketSessions][0] : 'mixed'
+      const counterTradingSession: PnlWindowCounterTradingSession =
+        counterTradingSessions.size === 1 ? [...counterTradingSessions][0] : 'mixed'
       const rows: PnlWindowSymbol[] = symbols.map((symbol) => {
         const values: Record<PnlStreamKey, Decimal> = {
           counterTradePnlUsd: new Decimal(0),
@@ -1168,11 +1652,164 @@ const buildWindows = (entries: PnlEntry[], symbols: string[]): PnlWindow[] => {
         startAt: `${date}T00:00:00.000Z`,
         endAt: `${date}T23:59:59.999Z`,
         label: date,
-        isWeekend: isWeekendIso(`${date}T00:00:00.000Z`),
+        isWeekend: isNewYorkWeekendIso(`${date}T00:00:00.000Z`),
+        marketSession,
+        counterTradingSession,
         granularity: 'day',
         symbols: rows
       }
     })
+}
+
+const parseTokenizedEquityMintCostEvent = (
+  row: SqlCostEventRow,
+  payload: Record<string, unknown>,
+  symbolsByMintAggregate: Map<string, string>,
+  warnings: string[]
+): { entry: PnlCostEntry | null; missingCostObservation: boolean } => {
+  if (row.event_type === 'TokenizedEquityMintEvent::MintRequested') {
+    const requested = nestedRecord(payload, 'MintRequested')
+    const symbol = requested === null ? null : textField(requested, 'symbol')
+    if (symbol !== null && isSafeSqlSymbol(symbol)) {
+      symbolsByMintAggregate.set(row.aggregate_id, symbol)
+    } else if (symbol !== null) {
+      warnings.push(`Skipped unsafe tokenization cost symbol in SQL PnL response: ${symbol}`)
+    }
+
+    return { entry: null, missingCostObservation: false }
+  }
+
+  const terminalKey =
+    row.event_type === 'TokenizedEquityMintEvent::TokensReceived'
+      ? 'TokensReceived'
+      : row.event_type === 'TokenizedEquityMintEvent::ProviderCompletionRecovered'
+        ? 'ProviderCompletionRecovered'
+        : null
+
+  if (terminalKey === null) return { entry: null, missingCostObservation: false }
+
+  const terminal = nestedRecord(payload, terminalKey)
+  if (terminal === null) {
+    warnings.push(`Skipped malformed tokenization cost event row ${String(row.rowid)}`)
+    return { entry: null, missingCostObservation: false }
+  }
+
+  const occurredAt =
+    terminalKey === 'TokensReceived'
+      ? textField(terminal, 'received_at')
+      : textField(terminal, 'recovered_at')
+  const fees = decimalField(terminal, 'fees')
+  if (occurredAt === null) {
+    warnings.push(`Skipped tokenization fee row ${String(row.rowid)} without timestamp`)
+    return { entry: null, missingCostObservation: false }
+  }
+
+  if (fees === null) {
+    return { entry: null, missingCostObservation: true }
+  }
+
+  if (fees.isZero()) return { entry: null, missingCostObservation: false }
+
+  return {
+    entry: costEntry(
+      row,
+      'tokenization_fee',
+      'generic',
+      'cost',
+      fees,
+      occurredAt,
+      'Alpaca tokenization fee reported by tokenization provider',
+      symbolsByMintAggregate.get(row.aggregate_id) ?? null
+    ),
+    missingCostObservation: false
+  }
+}
+
+const parseUsdcRebalanceCostEvent = (
+  row: SqlCostEventRow,
+  payload: Record<string, unknown>,
+  warnings: string[]
+): PnlCostEntry | null => {
+  const bridgeKey =
+    row.event_type === 'UsdcRebalanceEvent::Bridged'
+      ? 'Bridged'
+      : row.event_type === 'UsdcRebalanceEvent::BridgingCompletionRecovered'
+        ? 'BridgingCompletionRecovered'
+        : null
+
+  if (bridgeKey === null) return null
+
+  const bridged = nestedRecord(payload, bridgeKey)
+  const feeCollected = bridged === null ? null : decimalField(bridged, 'fee_collected')
+  const occurredAt =
+    bridged === null
+      ? null
+      : bridgeKey === 'Bridged'
+        ? textField(bridged, 'minted_at')
+        : textField(bridged, 'recovered_at')
+  if (feeCollected === null || occurredAt === null) {
+    warnings.push(`Skipped malformed CCTP bridge fee row ${String(row.rowid)}`)
+    return null
+  }
+
+  if (feeCollected.isZero()) return null
+
+  return costEntry(
+    row,
+    'cctp_fee',
+    'generic',
+    'cost',
+    feeCollected,
+    occurredAt,
+    'CCTP fee_collected from bridge mint'
+  )
+}
+
+const buildCostEntries = (
+  rows: SqlCostEventRow[],
+  warnings: string[]
+): { entries: PnlCostEntry[]; missingCostObservationCount: number } => {
+  const entries: PnlCostEntry[] = []
+  const symbolsByMintAggregate = new Map<string, string>()
+  let missingCostObservationCount = 0
+
+  for (const row of [...rows].sort((left, right) => left.rowid - right.rowid)) {
+    const payload = parsePayload(row.payload)
+    if (payload === null) {
+      warnings.push(`Skipped malformed cost event row ${String(row.rowid)}: invalid payload`)
+      continue
+    }
+
+    if (row.aggregate_type === 'TokenizedEquityMint') {
+      const result = parseTokenizedEquityMintCostEvent(
+        row,
+        payload,
+        symbolsByMintAggregate,
+        warnings
+      )
+      if (result.missingCostObservation) missingCostObservationCount += 1
+      if (result.entry !== null) entries.push(result.entry)
+      continue
+    }
+
+    if (row.aggregate_type === 'UsdcRebalance') {
+      const entry = parseUsdcRebalanceCostEvent(row, payload, warnings)
+      if (entry !== null) entries.push(entry)
+      continue
+    }
+
+    warnings.push(
+      `Skipped unsupported cost event row ${String(row.rowid)} with aggregate_type ${row.aggregate_type}`
+    )
+  }
+
+  if (missingCostObservationCount > 0) {
+    warnings.push(
+      `Cost coverage note: ${String(missingCostObservationCount)} tokenization completion events did not report a fee value; those observations are treated as zero because no fee amount is persisted.`
+    )
+  }
+
+  return { entries, missingCostObservationCount }
 }
 
 const parsePositionView = (
@@ -1202,31 +1839,77 @@ const parsePositionView = (
   return { positionNets, symbols: [...symbols].sort() }
 }
 
-const parseCount = (value: number | string | null | undefined): number => {
-  const parsed = Number(value ?? 0)
-  return Number.isFinite(parsed) ? parsed : 0
+type SampleStatsAcc = {
+  firstAt: string | null
+  lastAt: string | null
+  onchainFillCount: number
+  offchainFillCount: number
 }
 
-const buildSampleStats = (rows: SqlSampleStatsRow[], warnings: string[]): PnlSampleStats => {
-  const symbols: PnlSampleSymbolStats[] = []
+const addSampleFill = (sample: SampleStatsAcc, eventType: string, timestamp: string): void => {
+  if (eventType === 'PositionEvent::OnChainOrderFilled') {
+    sample.onchainFillCount += 1
+  } else if (eventType === 'PositionEvent::OffChainOrderFilled') {
+    sample.offchainFillCount += 1
+  }
+
+  if (sample.firstAt === null || timestamp < sample.firstAt) sample.firstAt = timestamp
+  if (sample.lastAt === null || timestamp > sample.lastAt) sample.lastAt = timestamp
+}
+
+const buildSampleStats = (
+  rows: SqlPositionEventRow[],
+  query: SqlPnlQuery,
+  warnings: string[]
+): PnlSampleStats => {
+  const bySymbol = new Map<string, SampleStatsAcc>()
   for (const row of rows) {
+    if (
+      row.event_type !== 'PositionEvent::OnChainOrderFilled' &&
+      row.event_type !== 'PositionEvent::OffChainOrderFilled'
+    ) {
+      continue
+    }
+
     if (!isSafeSqlSymbol(row.symbol)) {
       warnings.push(`Skipped unsafe sample stats symbol in SQL PnL response: ${row.symbol}`)
       continue
     }
 
-    const onchainFillCount = parseCount(row.onchain_fill_count)
-    const offchainFillCount = parseCount(row.offchain_fill_count)
+    const timestamp = positionEventReplayTimestamp(row)
+    if (timestamp === null) {
+      warnings.push(
+        `Skipped sample stats row ${String(row.rowid)} for ${row.symbol}: missing fill timestamp`
+      )
+      continue
+    }
+    if (!matchesTradeFilters(timestamp, query)) continue
 
-    symbols.push({
-      symbol: row.symbol,
-      firstAt: row.first_at,
-      lastAt: row.last_at,
-      onchainFillCount,
-      offchainFillCount,
-      totalFillCount: onchainFillCount + offchainFillCount
-    })
+    const sample =
+      bySymbol.get(row.symbol) ??
+      ({
+        firstAt: null,
+        lastAt: null,
+        onchainFillCount: 0,
+        offchainFillCount: 0
+      } satisfies SampleStatsAcc)
+    addSampleFill(sample, row.event_type, timestamp)
+    bySymbol.set(row.symbol, sample)
   }
+
+  const symbols = [...bySymbol.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([symbol, row]) => {
+      const totalFillCount = row.onchainFillCount + row.offchainFillCount
+      return {
+        symbol,
+        firstAt: row.firstAt,
+        lastAt: row.lastAt,
+        onchainFillCount: row.onchainFillCount,
+        offchainFillCount: row.offchainFillCount,
+        totalFillCount
+      }
+    })
 
   const firstAt =
     symbols
@@ -1253,16 +1936,16 @@ const buildSampleStats = (rows: SqlSampleStatsRow[], warnings: string[]): PnlSam
 export const buildPnlResponseFromSqlRows = (
   eventRows: SqlPositionEventRow[],
   positionRows: SqlPositionViewRow[],
-  sampleRows: SqlSampleStatsRow[],
-  query: SqlPnlQuery
+  query: SqlPnlQuery,
+  costRows: SqlCostEventRow[] = []
 ): PnlResponse => {
-  const warnings = [ATTRIBUTION_WARNING, BASELINE_WARNING]
+  const warnings = [ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING]
   appendInvalidQuerySymbols(warnings, query.symbols)
   const {
     positionNets,
     symbols: positionSymbols
   } = parsePositionView(positionRows, warnings)
-  const sampleStats = buildSampleStats(sampleRows, warnings)
+  const sampleStats = buildSampleStats(eventRows, query, warnings)
   const books = new Map<string, SymbolBook>()
   const entries: PnlEntry[] = []
   const unmatchedOffchainAllocations: UnmatchedOffchainAllocation[] = []
@@ -1304,10 +1987,22 @@ export const buildPnlResponseFromSqlRows = (
   const start = Math.min(query.offset, total)
   const end = Math.min(start + query.limit, total)
   const pageEntries = filteredEntries.slice(start, end)
+  const costReplay = buildCostEntries(costRows, warnings)
+  const filteredCostEntries = costReplay.entries
+    .filter((entry) => matchesCostSymbolFilter(entry, query.symbols))
+    .filter((entry) => matchesCostDateFilter(entry, query))
+    .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))
+  const costSummary = summarizeCostEntries(
+    filteredCostEntries,
+    costReplay.missingCostObservationCount
+  )
   const filtered = summaryFromEntries(filteredEntries)
   const replaySummary = summaryToDto(fullTotal)
-  const summary = withReplayExposure(filtered.summary, replaySummary)
-  const symbols = mergeSymbolReplayExposure(filtered.symbols, replaySymbols)
+  const summary = withCosts(withReplayExposure(filtered.summary, replaySummary), costSummary)
+  const symbols = withDirectSymbolCosts(
+    mergeSymbolReplayExposure(filtered.symbols, replaySymbols),
+    filteredCostEntries
+  )
   const symbolUniverse = [
     ...new Set([...positionSymbols, ...books.keys(), ...symbols.map((row) => row.symbol)])
   ].sort()
@@ -1317,9 +2012,11 @@ export const buildPnlResponseFromSqlRows = (
     warnings,
     sampleStats,
     summary,
+    costs: costSummary,
     symbols,
     symbolUniverse,
     entries: pageEntries,
+    costEntries: filteredCostEntries,
     total,
     hasMore: end < total,
     windows: buildWindows(filteredEntries, symbolUniverse)
@@ -1330,11 +2027,11 @@ export const fetchPnlReportFromSql = async (
   baseUrl: string,
   query: SqlPnlQuery
 ): Promise<PnlResponse> => {
-  const [eventRows, positionRows, sampleRows] = await Promise.all([
+  const [eventRows, positionRows, costRows] = await Promise.all([
     fetchSqlRows<SqlPositionEventRow>(baseUrl, positionEventsSql(query.symbols)),
     fetchSqlRows<SqlPositionViewRow>(baseUrl, positionViewSql(new Set())),
-    fetchSqlRows<SqlSampleStatsRow>(baseUrl, sampleStatsSql())
+    fetchSqlRows<SqlCostEventRow>(baseUrl, costEventsSql())
   ])
 
-  return buildPnlResponseFromSqlRows(eventRows, positionRows, sampleRows, query)
+  return buildPnlResponseFromSqlRows(eventRows, positionRows, query, costRows)
 }

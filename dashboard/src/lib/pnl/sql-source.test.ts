@@ -3,10 +3,12 @@ import {
   buildPnlResponseFromSqlRows,
   buildSqlApiUrl,
   fetchPnlReportFromSql,
+  mergePnlReportCostEntries,
+  type SqlCostEventRow,
   type SqlPositionEventRow,
-  type SqlPositionViewRow,
-  type SqlSampleStatsRow
+  type SqlPositionViewRow
 } from './sql-source'
+import type { PnlCostEntry } from './report'
 
 const baseQuery = {
   limit: 100,
@@ -14,7 +16,8 @@ const baseQuery = {
   symbols: new Set<string>(),
   fromDate: '2026-05-15',
   toDate: '2026-05-15',
-  dayFilter: 'all' as const
+  marketSessionFilter: 'all' as const,
+  counterTradingFilter: 'all' as const
 }
 
 const positionRows: SqlPositionViewRow[] = [
@@ -29,23 +32,6 @@ const positionRows: SqlPositionViewRow[] = [
     net_position: '0',
     last_updated: '2026-05-15T10:01:00Z',
     last_price_usdc: '86'
-  }
-]
-
-const sampleRows: SqlSampleStatsRow[] = [
-  {
-    symbol: 'RKLB',
-    onchain_fill_count: 1,
-    offchain_fill_count: 1,
-    first_at: '2026-05-15T10:00:00Z',
-    last_at: '2026-05-15T10:01:00Z'
-  },
-  {
-    symbol: 'SPYM',
-    onchain_fill_count: 4,
-    offchain_fill_count: 3,
-    first_at: '2026-05-15T11:00:00Z',
-    last_at: '2026-05-15T11:05:00Z'
   }
 ]
 
@@ -87,6 +73,91 @@ const offchainBuy = (
       direction: 'Buy',
       price,
       broker_timestamp: timestamp
+    }
+  }
+})
+
+const tokenizedMintRequested = (
+  rowid: number,
+  aggregateId = 'mint-rklb-1',
+  symbol = 'RKLB'
+): SqlCostEventRow => ({
+  rowid,
+  aggregate_type: 'TokenizedEquityMint',
+  aggregate_id: aggregateId,
+  event_type: 'TokenizedEquityMintEvent::MintRequested',
+  payload: {
+    MintRequested: {
+      symbol,
+      quantity: '1',
+      wallet: '0x0000000000000000000000000000000000000001',
+      requested_at: '2026-05-15T09:55:00Z'
+    }
+  }
+})
+
+const tokenizedTokensReceived = (
+  rowid: number,
+  aggregateId = 'mint-rklb-1',
+  fees = '0.25'
+): SqlCostEventRow => ({
+  rowid,
+  aggregate_type: 'TokenizedEquityMint',
+  aggregate_id: aggregateId,
+  event_type: 'TokenizedEquityMintEvent::TokensReceived',
+  payload: {
+    TokensReceived: {
+      tx_hash: '0x1111111111111111111111111111111111111111111111111111111111111111',
+      shares_minted: '1000000000000000000',
+      fees,
+      received_at: '2026-05-15T10:02:00Z'
+    }
+  }
+})
+
+const usdcConversionInitiated = (rowid: number, aggregateId = 'rebalance-1'): SqlCostEventRow => ({
+  rowid,
+  aggregate_type: 'UsdcRebalance',
+  aggregate_id: aggregateId,
+  event_type: 'UsdcRebalanceEvent::ConversionInitiated',
+  payload: {
+    ConversionInitiated: {
+      direction: 'AlpacaToBase',
+      amount: '10',
+      order_id: 'conversion-1',
+      initiated_at: '2026-05-15T10:03:00Z'
+    }
+  }
+})
+
+const usdcConversionConfirmed = (
+  rowid: number,
+  aggregateId = 'rebalance-1'
+): SqlCostEventRow => ({
+  rowid,
+  aggregate_type: 'UsdcRebalance',
+  aggregate_id: aggregateId,
+  event_type: 'UsdcRebalanceEvent::ConversionConfirmed',
+  payload: {
+    ConversionConfirmed: {
+      direction: 'AlpacaToBase',
+      filled_amount: '9.9',
+      converted_at: '2026-05-15T10:04:00Z'
+    }
+  }
+})
+
+const usdcBridged = (rowid: number, aggregateId = 'rebalance-1'): SqlCostEventRow => ({
+  rowid,
+  aggregate_type: 'UsdcRebalance',
+  aggregate_id: aggregateId,
+  event_type: 'UsdcRebalanceEvent::Bridged',
+  payload: {
+    Bridged: {
+      mint_tx_hash: '0x2222222222222222222222222222222222222222222222222222222222222222',
+      amount_received: '9.89',
+      fee_collected: '0.01',
+      minted_at: '2026-05-15T10:05:00Z'
     }
   }
 })
@@ -156,8 +227,8 @@ describe('fetchPnlReportFromSql', () => {
         return Promise.resolve(response({ rows: positionRows, truncated: false }))
       }
 
-      if (sql.includes('GROUP BY aggregate_id')) {
-        return Promise.resolve(response({ rows: sampleRows, truncated: false }))
+      if (sql.includes("aggregate_type = 'TokenizedEquityMint'")) {
+        return Promise.resolve(response({ rows: [], truncated: false }))
       }
 
       if (sql.includes('OFFSET 900')) {
@@ -198,7 +269,6 @@ describe('buildPnlResponseFromSqlRows', () => {
     const report = buildPnlResponseFromSqlRows(
       [onchainSell(1, '10'), offchainBuy(2, '2026-05-15T10:01:00Z', '8')],
       positionRows,
-      sampleRows,
       baseQuery
     )
 
@@ -209,11 +279,291 @@ describe('buildPnlResponseFromSqlRows', () => {
     expect(report.entries[0]?.delayedCounterTrade).toBe(false)
   })
 
+  it('filters realized rows to counter-trading active sessions', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [
+        onchainSell(1, '10', '2026-05-15T14:00:00Z'),
+        offchainBuy(2, '2026-05-15T14:01:00Z', '8'),
+        onchainSell(3, '11', '2026-05-15T12:00:00Z'),
+        offchainBuy(4, '2026-05-15T12:01:00Z', '9')
+      ],
+      positionRows,
+      {
+        ...baseQuery,
+        counterTradingFilter: 'counter_trading_active'
+      }
+    )
+
+    expect(report.entries).toHaveLength(1)
+    expect(report.entries[0]?.closingRowid).toBe(2)
+    expect(report.summary.grossRealizedPnlUsd).toBe('2')
+    expect(report.windows?.[0]?.counterTradingSession).toBe('counter_trading_active')
+  })
+
+  it('filters realized rows to counter-trading inactive sessions', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [
+        onchainSell(1, '10', '2026-05-15T14:00:00Z'),
+        offchainBuy(2, '2026-05-15T14:01:00Z', '8'),
+        onchainSell(3, '11', '2026-05-15T12:00:00Z'),
+        offchainBuy(4, '2026-05-15T12:01:00Z', '9')
+      ],
+      positionRows,
+      {
+        ...baseQuery,
+        counterTradingFilter: 'counter_trading_inactive'
+      }
+    )
+
+    expect(report.entries).toHaveLength(1)
+    expect(report.entries[0]?.closingRowid).toBe(4)
+    expect(report.summary.grossRealizedPnlUsd).toBe('2')
+    expect(report.windows?.[0]?.counterTradingSession).toBe('counter_trading_inactive')
+  })
+
+  it('filters realized rows by market session independently from counter-trading state', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [
+        onchainSell(1, '10', '2026-05-15T12:00:00Z'),
+        offchainBuy(2, '2026-05-15T12:01:00Z', '8'),
+        onchainSell(3, '11', '2026-05-15T14:00:00Z'),
+        offchainBuy(4, '2026-05-15T14:01:00Z', '7')
+      ],
+      positionRows,
+      {
+        ...baseQuery,
+        marketSessionFilter: 'rth'
+      }
+    )
+
+    expect(report.entries).toHaveLength(1)
+    expect(report.entries[0]?.closingRowid).toBe(4)
+    expect(report.summary.grossRealizedPnlUsd).toBe('4')
+    expect(report.windows?.[0]?.marketSession).toBe('rth')
+    expect(report.windows?.[0]?.counterTradingSession).toBe('counter_trading_active')
+  })
+
+  it('filters tracked costs by counter-trading session', () => {
+    const activeReport = buildPnlResponseFromSqlRows(
+      [onchainSell(1, '10', '2026-05-15T14:00:00Z'), offchainBuy(2, '2026-05-15T14:01:00Z', '8')],
+      positionRows,
+      {
+        ...baseQuery,
+        counterTradingFilter: 'counter_trading_active'
+      },
+      [tokenizedMintRequested(10), tokenizedTokensReceived(11)]
+    )
+
+    const inactiveReport = buildPnlResponseFromSqlRows(
+      [onchainSell(1, '10', '2026-05-15T14:00:00Z'), offchainBuy(2, '2026-05-15T14:01:00Z', '8')],
+      positionRows,
+      {
+        ...baseQuery,
+        counterTradingFilter: 'counter_trading_inactive'
+      },
+      [tokenizedMintRequested(10), tokenizedTokensReceived(11)]
+    )
+
+    expect(activeReport.summary.grossRealizedPnlUsd).toBe('2')
+    expect(activeReport.summary.trackedCostsUsd).toBe('0')
+    expect(activeReport.summary.netRealizedPnlUsd).toBe('2')
+    expect(activeReport.costEntries).toHaveLength(0)
+
+    expect(inactiveReport.summary.grossRealizedPnlUsd).toBe('0')
+    expect(inactiveReport.summary.trackedCostsUsd).toBe('0.25')
+    expect(inactiveReport.summary.netRealizedPnlUsd).toBe('-0.25')
+    expect(inactiveReport.costEntries).toHaveLength(1)
+  })
+
+  it('subtracts persisted tracked costs from realized gross PnL', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [onchainSell(1, '10'), offchainBuy(2, '2026-05-15T10:01:00Z', '8')],
+      positionRows,
+      baseQuery,
+      [
+        tokenizedMintRequested(10),
+        tokenizedTokensReceived(11),
+        usdcConversionInitiated(12),
+        usdcConversionConfirmed(13),
+        usdcBridged(14)
+      ]
+    )
+
+    expect(report.summary.grossRealizedPnlUsd).toBe('2')
+    expect(report.summary.trackedCostsUsd).toBe('0.26')
+    expect(report.summary.trackedRevenueUsd).toBe('0')
+    expect(report.summary.netRealizedPnlUsd).toBe('1.74')
+    expect(report.costs).toEqual(
+      expect.objectContaining({
+        totalTrackedCostsUsd: '0.26',
+        totalTrackedRevenueUsd: '0',
+        counterTradeCostsUsd: '0',
+        onchainNettingCostsUsd: '0',
+        directionalExposureCostsUsd: '0',
+        genericCostsUsd: '0.26',
+        dividendRevenueUsd: '0',
+        tokenizationFeesUsd: '0.25',
+        conversionSlippageUsd: '0',
+        cctpFeesUsd: '0.01',
+        oracleWriteCostUsd: '0'
+      })
+    )
+    expect(report.costs.coverage).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: 'Alpaca fees',
+          accountingBucket: 'generic',
+          effect: 'cost',
+          status: 'not_ingested'
+        }),
+        expect.objectContaining({
+          source: 'On-chain netting execution costs',
+          accountingBucket: 'onchain_netting',
+          effect: 'none',
+          status: 'zero'
+        }),
+        expect.objectContaining({
+          source: 'Dividend income',
+          accountingBucket: 'dividend_revenue',
+          effect: 'revenue',
+          status: 'not_ingested'
+        })
+      ])
+    )
+    expect(report.costEntries.map((entry) => entry.category)).toEqual([
+      'cctp_fee',
+      'tokenization_fee'
+    ])
+    expect(report.costEntries.every((entry) => entry.accountingBucket === 'generic')).toBe(true)
+    expect(report.costEntries.every((entry) => entry.effect === 'cost')).toBe(true)
+    expect(report.symbols).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          symbol: 'RKLB',
+          grossRealizedPnlUsd: '2',
+          trackedCostsUsd: '0.25',
+          trackedRevenueUsd: '0',
+          netRealizedPnlUsd: '1.75'
+        })
+      ])
+    )
+  })
+
+  it('merges Alpaca activity costs and revenues into net PnL without changing gross PnL', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [onchainSell(1, '10', '2026-05-15T14:00:00Z'), offchainBuy(2, '2026-05-15T14:01:00Z', '8')],
+      positionRows,
+      {
+        ...baseQuery,
+        marketSessionFilter: 'rth',
+        counterTradingFilter: 'counter_trading_active'
+      }
+    )
+    const alpacaEntries: PnlCostEntry[] = [
+      {
+        category: 'broker_fee',
+        accountingBucket: 'generic',
+        effect: 'cost',
+        amountUsd: '0.02',
+        occurredAt: '2026-05-15T16:00:00.000Z',
+        aggregateType: 'AlpacaAccountActivity',
+        aggregateId: 'fee-1',
+        eventRowid: -1,
+        symbol: 'RKLB',
+        detail: 'Alpaca account activity FEE'
+      },
+      {
+        category: 'dividend_income',
+        accountingBucket: 'dividend_revenue',
+        effect: 'revenue',
+        amountUsd: '0.25',
+        occurredAt: '2026-05-15T16:00:00.000Z',
+        aggregateType: 'AlpacaAccountActivity',
+        aggregateId: 'div-1',
+        eventRowid: -2,
+        symbol: 'RKLB',
+        detail: 'Alpaca account activity DIV'
+      }
+    ]
+
+    const merged = mergePnlReportCostEntries(report, alpacaEntries, {
+      ...baseQuery,
+      marketSessionFilter: 'rth',
+      counterTradingFilter: 'counter_trading_active'
+    })
+
+    expect(merged.summary.grossRealizedPnlUsd).toBe('2')
+    expect(merged.summary.trackedCostsUsd).toBe('0.02')
+    expect(merged.summary.trackedRevenueUsd).toBe('0.25')
+    expect(merged.summary.netRealizedPnlUsd).toBe('2.23')
+    expect(merged.costs.brokerFeesUsd).toBe('0.02')
+    expect(merged.costs.dividendRevenueUsd).toBe('0.25')
+    expect(merged.symbols).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          symbol: 'RKLB',
+          trackedCostsUsd: '0.02',
+          trackedRevenueUsd: '0.25',
+          netRealizedPnlUsd: '2.23'
+        })
+      ])
+    )
+  })
+
+  it('keeps symbolless costs at account level instead of allocating them to asset rows', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [onchainSell(1, '10', '2026-05-15T14:00:00Z'), offchainBuy(2, '2026-05-15T14:01:00Z', '8')],
+      positionRows,
+      {
+        ...baseQuery,
+        symbols: new Set(['RKLB']),
+        marketSessionFilter: 'rth',
+        counterTradingFilter: 'counter_trading_active'
+      }
+    )
+
+    const merged = mergePnlReportCostEntries(
+      report,
+      [
+        {
+          category: 'broker_fee',
+          accountingBucket: 'generic',
+          effect: 'cost',
+          amountUsd: '0.02',
+          occurredAt: '2026-05-15T16:00:00.000Z',
+          aggregateType: 'AlpacaAccountActivity',
+          aggregateId: 'fee-1',
+          eventRowid: -1,
+          symbol: null,
+          detail: 'Alpaca account activity FEE'
+        }
+      ],
+      {
+        ...baseQuery,
+        symbols: new Set(['RKLB']),
+        marketSessionFilter: 'rth',
+        counterTradingFilter: 'counter_trading_active'
+      }
+    )
+
+    expect(merged.summary.grossRealizedPnlUsd).toBe('2')
+    expect(merged.summary.trackedCostsUsd).toBe('0.02')
+    expect(merged.summary.netRealizedPnlUsd).toBe('1.98')
+    expect(merged.symbols).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          symbol: 'RKLB',
+          trackedCostsUsd: '0',
+          netRealizedPnlUsd: '2'
+        })
+      ])
+    )
+  })
+
   it('replays fills by execution timestamp rather than event rowid', () => {
     const report = buildPnlResponseFromSqlRows(
       [offchainBuy(1, '2026-05-15T10:01:00Z', '8'), onchainSell(2, '10')],
       positionRows,
-      sampleRows,
       baseQuery
     )
 
@@ -233,7 +583,6 @@ describe('buildPnlResponseFromSqlRows', () => {
     const report = buildPnlResponseFromSqlRows(
       [onchainSell(1, '10'), offchainBuy(2, '2026-05-15T10:06:01Z', '8')],
       positionRows,
-      sampleRows,
       baseQuery
     )
 
@@ -250,7 +599,6 @@ describe('buildPnlResponseFromSqlRows', () => {
     const report = buildPnlResponseFromSqlRows(
       [onchainSell(1, '10'), offchainBuy(2, '2026-05-15T10:01:00Z', '8')],
       positionRows,
-      sampleRows,
       {
         ...baseQuery,
         symbols: new Set(['RKLB'])
@@ -261,37 +609,36 @@ describe('buildPnlResponseFromSqlRows', () => {
     expect(report.symbolUniverse).toEqual(['RKLB', 'SPYM'])
   })
 
-  it('reports unfiltered database sample statistics for date-range selection', () => {
+  it('reports filtered database sample statistics for date-range selection', () => {
     const report = buildPnlResponseFromSqlRows(
-      [onchainSell(1, '10'), offchainBuy(2, '2026-05-15T10:01:00Z', '8')],
+      [
+        onchainSell(1, '10', '2026-05-15T12:00:00Z'),
+        offchainBuy(2, '2026-05-15T12:01:00Z', '8'),
+        onchainSell(3, '10', '2026-05-15T14:00:00Z'),
+        offchainBuy(4, '2026-05-15T14:01:00Z', '8')
+      ],
       positionRows,
-      sampleRows,
-      baseQuery
+      {
+        ...baseQuery,
+        marketSessionFilter: 'pre'
+      }
     )
 
     expect(report.sampleStats).toEqual({
-      firstAt: '2026-05-15T10:00:00Z',
-      lastAt: '2026-05-15T11:05:00Z',
-      symbolCount: 2,
-      onchainFillCount: 5,
-      offchainFillCount: 4,
-      totalFillCount: 9,
+      firstAt: '2026-05-15T12:00:00Z',
+      lastAt: '2026-05-15T12:01:00Z',
+      symbolCount: 1,
+      onchainFillCount: 1,
+      offchainFillCount: 1,
+      totalFillCount: 2,
       symbols: [
         {
           symbol: 'RKLB',
-          firstAt: '2026-05-15T10:00:00Z',
-          lastAt: '2026-05-15T10:01:00Z',
+          firstAt: '2026-05-15T12:00:00Z',
+          lastAt: '2026-05-15T12:01:00Z',
           onchainFillCount: 1,
           offchainFillCount: 1,
           totalFillCount: 2
-        },
-        {
-          symbol: 'SPYM',
-          firstAt: '2026-05-15T11:00:00Z',
-          lastAt: '2026-05-15T11:05:00Z',
-          onchainFillCount: 4,
-          offchainFillCount: 3,
-          totalFillCount: 7
         }
       ]
     })
@@ -316,16 +663,6 @@ describe('buildPnlResponseFromSqlRows', () => {
           last_price_usdc: '1'
         }
       ],
-      [
-        ...sampleRows,
-        {
-          symbol: "BAD';--",
-          onchain_fill_count: 1,
-          offchain_fill_count: 1,
-          first_at: '2026-05-15T10:00:00Z',
-          last_at: '2026-05-15T10:01:00Z'
-        }
-      ],
       {
         ...baseQuery,
         symbols: new Set(["RKLB'); DROP TABLE events; --"])
@@ -348,7 +685,6 @@ describe('buildPnlResponseFromSqlRows', () => {
     const report = buildPnlResponseFromSqlRows(
       [offchainBuy(1, '2026-05-15T10:01:00Z', '8')],
       positionRows,
-      sampleRows,
       baseQuery
     )
 
@@ -384,7 +720,6 @@ describe('buildPnlResponseFromSqlRows', () => {
         onchainSell(2, '10', '2026-05-15T10:02:00Z')
       ],
       positionRows,
-      sampleRows,
       baseQuery
     )
 
@@ -422,7 +757,6 @@ describe('buildPnlResponseFromSqlRows', () => {
         onchainSell(3, '11', '2026-05-15T10:02:00Z')
       ],
       positionRows,
-      sampleRows,
       baseQuery
     )
 
@@ -458,7 +792,6 @@ describe('buildPnlResponseFromSqlRows', () => {
     const report = buildPnlResponseFromSqlRows(
       [onchainSell(1, '10')],
       positionRows,
-      sampleRows,
       baseQuery
     )
 

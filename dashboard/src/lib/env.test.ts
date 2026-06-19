@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getWebSocketUrl, getExplorerTxUrl, getPnlSqlApiUrl } from './env'
+import {
+  getWebSocketUrl,
+  getExplorerTxUrl,
+  getPnlSqlApiUrl,
+  getPnlAlpacaActivitiesApiUrl,
+  isPnlSqlOnlyMode
+} from './env'
 
 const mockEnv = { current: {} as Record<string, string | undefined> }
 
@@ -218,5 +224,55 @@ describe('getPnlSqlApiUrl', () => {
     }
 
     expect(getPnlSqlApiUrl()).toBe('/__pnl_sql')
+  })
+})
+
+describe('getPnlAlpacaActivitiesApiUrl', () => {
+  beforeEach(() => {
+    mockEnv.current = {}
+  })
+
+  it('returns null when neither explicit URL nor backend URL is configured', () => {
+    expect(getPnlAlpacaActivitiesApiUrl()).toBeNull()
+  })
+
+  it('uses the dev proxy for an explicit absolute Alpaca activities URL', () => {
+    mockEnv.current = {
+      PUBLIC_PNL_ALPACA_ACTIVITIES_API_URL: ' https://backend.example.com/pnl/alpaca-activities '
+    }
+
+    expect(getPnlAlpacaActivitiesApiUrl()).toBe('/__pnl_alpaca_activities')
+  })
+
+  it('uses an explicit relative Alpaca activities URL as-is', () => {
+    mockEnv.current = {
+      PUBLIC_PNL_ALPACA_ACTIVITIES_API_URL: '/internal/pnl/alpaca-activities'
+    }
+
+    expect(getPnlAlpacaActivitiesApiUrl()).toBe('/internal/pnl/alpaca-activities')
+  })
+
+  it('uses the same-origin Alpaca activities route when backend proxy is configured', () => {
+    mockEnv.current = {
+      PUBLIC_BACKEND_API_URL: 'https://backend.example.com'
+    }
+
+    expect(getPnlAlpacaActivitiesApiUrl()).toBe('/pnl/alpaca-activities')
+  })
+})
+
+describe('isPnlSqlOnlyMode', () => {
+  beforeEach(() => {
+    mockEnv.current = {}
+  })
+
+  it('defaults to false', () => {
+    expect(isPnlSqlOnlyMode()).toBe(false)
+  })
+
+  it('accepts true-like env values', () => {
+    mockEnv.current = { PUBLIC_PNL_SQL_ONLY_MODE: ' true ' }
+
+    expect(isPnlSqlOnlyMode()).toBe(true)
   })
 })

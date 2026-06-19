@@ -55,9 +55,12 @@ bun run dev
 
 In local dev, absolute SQL URLs are proxied through `/__pnl_sql` so the browser
 does not depend on CORS headers from the SQL endpoint. `PUBLIC_BACKEND_API_URL`
-points the existing dashboard API proxy at a backend origin. In production, set
-`PUBLIC_PNL_SQL_API_URL` to a same-origin path or to an endpoint that allows the
-dashboard origin.
+points the existing dashboard API proxy at a backend origin. When a backend URL
+is configured, the PnL panel also reads Alpaca account activities from
+`/pnl/alpaca-activities` and includes Alpaca fees, margin interest, and
+dividends as explicit cost/revenue ledger entries when available. In production,
+set `PUBLIC_PNL_SQL_API_URL` to a same-origin path or to an endpoint that allows
+the dashboard origin.
 
 The adapter expects URLs with this shape:
 

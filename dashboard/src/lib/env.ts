@@ -3,6 +3,7 @@ import { env } from '$env/dynamic/public'
 
 const DEFAULT_LOCAL_DEV_PORT = '8001'
 const PNL_SQL_DEV_PROXY_PATH = '/__pnl_sql'
+const PNL_ALPACA_ACTIVITIES_DEV_PROXY_PATH = '/__pnl_alpaca_activities'
 const BACKEND_API_URL_ENV = 'PUBLIC_BACKEND_API_URL'
 
 const localDevPort = (): string => {
@@ -74,8 +75,27 @@ export const getPnlSqlApiUrl = (): string | null => {
   return val
 }
 
+export const getPnlAlpacaActivitiesApiUrl = (): string | null => {
+  const envKey = 'PUBLIC_PNL_ALPACA_ACTIVITIES_API_URL'
+  const rawEnv = env as Record<string, string | undefined>
+  const explicit = rawEnv[envKey]?.trim()
+  if (explicit !== undefined && explicit !== '') {
+    if (dev && isAbsoluteHttpUrl(explicit)) return PNL_ALPACA_ACTIVITIES_DEV_PROXY_PATH
+    return explicit
+  }
+
+  const backendApiUrl = getConfiguredBackendApiUrl()
+  if (backendApiUrl === null) return null
+  return '/pnl/alpaca-activities'
+}
+
 export const isDashboardMockMode = (): boolean => {
   const val = env['PUBLIC_DASHBOARD_MOCK_MODE']?.trim().toLowerCase()
+  return val === '1' || val === 'true'
+}
+
+export const isPnlSqlOnlyMode = (): boolean => {
+  const val = env['PUBLIC_PNL_SQL_ONLY_MODE']?.trim().toLowerCase()
   return val === '1' || val === 'true'
 }
 

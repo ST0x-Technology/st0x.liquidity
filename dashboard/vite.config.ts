@@ -34,8 +34,18 @@ const isMockMode = (): boolean => {
   return value === '1' || value === 'true'
 }
 
+const isPnlSqlOnlyMode = (): boolean => {
+  const value = process.env['PUBLIC_PNL_SQL_ONLY_MODE']?.trim().toLowerCase()
+  return value === '1' || value === 'true'
+}
+
 const pnlSqlApiUrl = (): string | null => {
   const value = process.env['PUBLIC_PNL_SQL_API_URL']?.trim()
+  return value !== undefined && value !== '' ? value : null
+}
+
+const pnlAlpacaActivitiesApiUrl = (): string | null => {
+  const value = process.env['PUBLIC_PNL_ALPACA_ACTIVITIES_API_URL']?.trim()
   return value !== undefined && value !== '' ? value : null
 }
 
@@ -48,6 +58,26 @@ const pnlSqlProxy = () => {
   const url = new URL(value)
   return {
     '/__pnl_sql': {
+      target: url.origin,
+      changeOrigin: true,
+      rewrite: (path: string) => {
+        const queryStart = path.indexOf('?')
+        const query = queryStart === -1 ? '' : path.slice(queryStart)
+        return `${url.pathname}${query}`
+      }
+    }
+  }
+}
+
+const pnlAlpacaActivitiesProxy = () => {
+  const value = pnlAlpacaActivitiesApiUrl()
+  if (value === null || !(value.startsWith('http://') || value.startsWith('https://'))) {
+    return {}
+  }
+
+  const url = new URL(value)
+  return {
+    '/__pnl_alpaca_activities': {
       target: url.origin,
       changeOrigin: true,
       rewrite: (path: string) => {
@@ -188,15 +218,25 @@ export default defineConfig({
   server: {
     proxy: isMockMode()
       ? {}
+      : isPnlSqlOnlyMode()
+        ? {
+            ...(configuredBackendUrl !== undefined && configuredBackendUrl !== ''
+              ? { '/pnl/alpaca-activities': backendProxy() }
+              : {}),
+            ...pnlSqlProxy(),
+            ...pnlAlpacaActivitiesProxy()
+          }
       : {
           '/api/ws': backendProxy(true),
+          '/pnl/alpaca-activities': backendProxy(),
           '/logs': backendProxy(),
           '/health': backendProxy(),
           '/orders': backendProxy(),
           '/trades': backendProxy(),
           '/transfers': backendProxy(),
           '/performance': backendProxy(),
-          ...pnlSqlProxy()
+          ...pnlSqlProxy(),
+          ...pnlAlpacaActivitiesProxy()
         }
   }
 })
