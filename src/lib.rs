@@ -37,7 +37,6 @@ use conductor::DatabasePools;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
 mod alerts;
-mod alpaca_wallet;
 pub mod api;
 #[cfg(any(test, feature = "test-support"))]
 pub mod bindings;

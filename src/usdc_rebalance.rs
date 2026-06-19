@@ -70,7 +70,7 @@
 //! `RecoverBridging`, which un-fails it back to `Bridged` once the mint that
 //! actually landed is confirmed on-chain.
 //!
-//! [`AlpacaWalletService`]: crate::alpaca_wallet::AlpacaWalletService
+//! [`AlpacaWalletService`]: st0x_execution::AlpacaWalletService
 
 use alloy::primitives::{B256, TxHash};
 use async_trait::async_trait;
@@ -84,10 +84,8 @@ use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
-use st0x_execution::ClientOrderId;
+use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Id, Usdc};
-
-use crate::alpaca_wallet::AlpacaTransferId;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -41,10 +41,9 @@ use st0x_evm::{
     EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
-use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
+use st0x_execution::{AlpacaAccountId, FractionalShares, Network, PollingConfig, Symbol};
 
 use super::{MintVerificationError, Tokenizer, TokenizerError};
-use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
