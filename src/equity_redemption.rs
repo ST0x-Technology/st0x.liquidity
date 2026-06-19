@@ -71,12 +71,11 @@ use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
-use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
+use st0x_evm::{EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
 use st0x_wrapper::WrapperError;
 
-use crate::bindings::IERC20;
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizationRequestId;

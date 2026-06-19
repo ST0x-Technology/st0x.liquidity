@@ -19,11 +19,9 @@
 
 use alloy::primitives::{Address, U256};
 
-use st0x_evm::{OpenChainErrorRegistry, Wallet};
+use st0x_evm::{IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 use st0x_wrapper::{Wrapper, WrapperError};
-
-use crate::bindings::IERC20;
 
 /// High watermark above which an existing allowance is treated as "already
 /// effectively unlimited", so the startup grant skips it. A genuine MAX

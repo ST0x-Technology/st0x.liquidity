@@ -59,14 +59,14 @@ mod tests {
     use chrono::DateTime;
     use rain_math_float::Float;
 
+    use st0x_evm::IERC20::{decimalsCall, symbolCall};
+    use st0x_evm::IPyth::getPriceUnsafeCall;
+    use st0x_evm::PythStructs::Price;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{FractionalShares, Symbol};
 
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IPyth::getPriceUnsafeCall;
     use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
-    use crate::bindings::PythStructs::Price;
     use crate::onchain::io::WrappedTokenizedShares;
     use crate::onchain::pyth::PythFeedIds;
     use crate::symbol::cache::SymbolCache;

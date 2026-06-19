@@ -2,12 +2,12 @@
 //!
 //! This crate provides the generic [`Raindex`] trait for Rain OrderBook vault
 //! operations (deposit, withdraw, confirm) plus the shared domain types
-//! ([`RaindexVaultId`], [`RaindexError`], [`USDC_BASE`]) used across consumers.
+//! ([`RaindexVaultId`], [`RaindexError`]) used across consumers.
 //!
 //! The concrete Rain implementation lives in the application crate while this
 //! crate owns the shared trait, errors, and identifier types used by consumers.
 
-use alloy::primitives::{Address, B256, TxHash, U256, address};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
@@ -18,9 +18,6 @@ use st0x_evm::EvmError;
 mod service;
 #[cfg(feature = "rain")]
 pub use service::RaindexService;
-
-/// Base USDC token address.
-pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
 /// Vault identifier for Rain OrderBook vaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

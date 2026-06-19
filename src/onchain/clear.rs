@@ -234,11 +234,11 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
 
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::io::WrappedTokenizedShares;

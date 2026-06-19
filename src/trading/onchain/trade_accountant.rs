@@ -248,10 +248,10 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,

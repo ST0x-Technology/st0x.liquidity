@@ -7,13 +7,11 @@ use std::io::Write;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
 use st0x_config::Ctx;
-use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
+use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
 use super::CctpChain;
-use crate::bindings::IERC20;
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).

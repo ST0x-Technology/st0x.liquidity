@@ -8,10 +8,8 @@ use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::sync::Mutex;
 
-use st0x_evm::EvmError;
+use st0x_evm::{EvmError, IERC20};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
-
-use crate::bindings::IERC20;
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
 /// with an "execution reverted" RPC error (simulating a revert during

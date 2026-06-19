@@ -25,7 +25,7 @@ use st0x_config::{
     AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
 };
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
-use st0x_evm::ReadOnlyEvm;
+use st0x_evm::{ReadOnlyEvm, USDC_BASE};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
 };
@@ -46,7 +46,6 @@ use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
 };
 use crate::onchain::OnchainTrade;
-use crate::onchain::USDC_BASE;
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
