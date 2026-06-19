@@ -1180,6 +1180,11 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
 
+        let issuance_freeze_reader = Arc::new(st0x_issuance_client::IssuanceClient::new(
+            deps.ctx.issuance.base_url.clone(),
+            deps.ctx.issuance.api_key.header_value(),
+        )?);
+
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
@@ -1194,6 +1199,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper.clone(),
             deps.schedulers,
         ));
+
+        rebalancing_service
+            .set_freeze_status_reader(issuance_freeze_reader)
+            .await;
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);

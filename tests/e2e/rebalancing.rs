@@ -274,6 +274,7 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -418,6 +419,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -548,6 +550,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
@@ -669,6 +672,7 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -803,6 +807,7 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1269,6 +1274,7 @@ async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<(
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
@@ -1407,6 +1413,7 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
@@ -1559,6 +1566,7 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
@@ -1709,6 +1717,7 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot1 = spawn_bot(ctx1);
 
@@ -1771,6 +1780,7 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
@@ -1916,6 +1926,7 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot1 = spawn_bot(ctx1);
 
@@ -1969,6 +1980,7 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
@@ -2120,6 +2132,7 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot1 = spawn_bot(ctx1);
@@ -2184,6 +2197,7 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let bot2 = spawn_bot(ctx2);
@@ -2302,6 +2316,7 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Enabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
@@ -2469,6 +2484,7 @@ async fn unwrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Resul
         .equity_imbalance(ImbalanceThreshold::new(float!(0.5), float!(100))?)
         .wrapped_equity_recovery(OperationMode::Enabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
@@ -2695,6 +2711,7 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
         .cash_rebalancing(OperationMode::Disabled)
         .wrapped_equity_recovery(OperationMode::Enabled)
         .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot(ctx);
