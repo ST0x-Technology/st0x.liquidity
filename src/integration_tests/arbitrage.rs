@@ -8,7 +8,7 @@
 //! is exercised end-to-end.
 
 use alloy::network::EthereumWallet;
-use alloy::node_bindings::AnvilInstance;
+use alloy::node_bindings::Anvil;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -33,7 +33,7 @@ use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
 
-use super::{ExpectedEvent, StoredEvent, anvil, assert_events, fetch_events};
+use super::{ExpectedEvent, StoredEvent, assert_events, fetch_events};
 use crate::bindings::IRaindexV6::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, Parser, RaindexV6, Store as RainStore,
@@ -49,7 +49,7 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
-use crate::test_utils::{deploy_tofu_singleton, setup_test_pools};
+use crate::test_utils::{TestAnvilInstance, deploy_tofu_singleton, setup_test_pools, spawn_anvil};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
@@ -381,7 +381,7 @@ async fn record_poll_partial_fill(
 
 /// Holds a deployed Rain OrderBook on a local Anvil node, ready to create real take-order events.
 struct AnvilOrderBook<P> {
-    _anvil: AnvilInstance,
+    _anvil: TestAnvilInstance,
     provider: P,
     orderbook_addr: Address,
     deployer_addr: Address,
@@ -476,7 +476,9 @@ async fn etch_rainlang<P: Provider>(provider: &P) {
 }
 
 async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provider + Clone> {
-    let (anvil, endpoint, key) = anvil::setup_anvil();
+    let anvil = spawn_anvil(Anvil::new());
+    let endpoint = anvil.endpoint();
+    let key = B256::from_slice(&anvil.keys()[0].to_bytes());
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
     let wallet = EthereumWallet::from(signer.clone());
     let provider = ProviderBuilder::new()

@@ -200,6 +200,7 @@ futures-util.workspace = true
 httpmock = { workspace = true, optional = true }
 itertools.workspace = true
 lazy_static.workspace = true
+num-decimal.workspace = true
 num-traits.workspace = true
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }

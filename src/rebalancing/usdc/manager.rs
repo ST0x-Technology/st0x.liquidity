@@ -3534,7 +3534,7 @@ fn conversion_amounts_from_order(
 
 #[cfg(test)]
 mod tests {
-    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{B256, address, b256, fixed_bytes};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
@@ -3568,6 +3568,7 @@ mod tests {
 
     use super::*;
     use crate::telemetry::TelemetrySender;
+    use crate::test_utils::{TestAnvilInstance, spawn_anvil, spawn_anvil_pair};
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
     };
@@ -3853,8 +3854,8 @@ mod tests {
             .unwrap();
     }
 
-    fn setup_anvil() -> (alloy::node_bindings::AnvilInstance, String, B256) {
-        let anvil = Anvil::new().spawn();
+    fn setup_anvil() -> (TestAnvilInstance, String, B256) {
+        let anvil = spawn_anvil(Anvil::new());
         let endpoint = anvil.endpoint();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         (anvil, endpoint, private_key)
@@ -5880,7 +5881,7 @@ mod tests {
             RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
         >,
         Arc<Store<UsdcRebalance>>,
-        alloy::node_bindings::AnvilInstance,
+        TestAnvilInstance,
     ) {
         let (anvil, endpoint, private_key) = setup_anvil();
         let alpaca_broker = InstrumentedAlpacaBroker::new(
@@ -5918,7 +5919,7 @@ mod tests {
             RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
         >,
         Arc<Store<UsdcRebalance>>,
-        alloy::node_bindings::AnvilInstance,
+        TestAnvilInstance,
     ) {
         let (anvil, endpoint, private_key) = setup_anvil();
         let alpaca_broker = InstrumentedAlpacaBroker::new(
@@ -7255,8 +7256,8 @@ mod tests {
     }
 
     struct DualChainCctp {
-        _base_anvil: AnvilInstance,
-        _ethereum_anvil: AnvilInstance,
+        _base_anvil: TestAnvilInstance,
+        _ethereum_anvil: TestAnvilInstance,
         base_endpoint: String,
         ethereum_endpoint: String,
         token_messenger: Address,
@@ -7272,8 +7273,8 @@ mod tests {
     /// identical contract addresses on both chains, so one token messenger /
     /// message transmitter pair drives the bridge.
     async fn deploy_dual_chain_cctp() -> DualChainCctp {
-        let base_anvil = Anvil::new().spawn();
-        let ethereum_anvil = Anvil::new().chain_id(1u64).spawn();
+        let (base_anvil, ethereum_anvil) =
+            spawn_anvil_pair(Anvil::new(), Anvil::new().chain_id(1u64));
         let base_endpoint = base_anvil.endpoint();
         let ethereum_endpoint = ethereum_anvil.endpoint();
 
@@ -8185,7 +8186,7 @@ mod tests {
         bot_key: B256,
         bot_address: Address,
         mint_tx: TxHash,
-        _anvil: AnvilInstance,
+        _anvil: TestAnvilInstance,
     }
 
     /// Deploys USDC on a fresh Ethereum anvil, funds the bot wallet, and records
@@ -8193,7 +8194,7 @@ mod tests {
     /// `mint_tx` bound. The bot is both the CCTP mint recipient and the deposit
     /// sender, mirroring production where `market_maker_wallet` is the bot wallet.
     async fn deploy_ethereum_usdc_chain() -> EthereumUsdcChain {
-        let anvil = Anvil::new().chain_id(1u64).spawn();
+        let anvil = spawn_anvil(Anvil::new().chain_id(1u64));
         let endpoint = anvil.endpoint();
         let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let bot_address = PrivateKeySigner::from_bytes(&bot_key).unwrap().address();
@@ -8526,7 +8527,7 @@ mod tests {
     /// block (no extra blocks mined). The finality-gated deposit scan cannot
     /// conclude here, so this isolates the fresh path's no-scan direct send.
     async fn deploy_ethereum_usdc_chain_head_at_mint() -> EthereumUsdcChain {
-        let anvil = Anvil::new().chain_id(1u64).spawn();
+        let anvil = spawn_anvil(Anvil::new().chain_id(1u64));
         let endpoint = anvil.endpoint();
         let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let bot_address = PrivateKeySigner::from_bytes(&bot_key).unwrap().address();
@@ -8651,7 +8652,7 @@ mod tests {
         usdc_amount: U256,
         recipient: Address,
     ) -> EthereumUsdcChain {
-        let anvil = Anvil::new().chain_id(1u64).spawn();
+        let anvil = spawn_anvil(Anvil::new().chain_id(1u64));
         let endpoint = anvil.endpoint();
         let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let bot_address = PrivateKeySigner::from_bytes(&bot_key).unwrap().address();

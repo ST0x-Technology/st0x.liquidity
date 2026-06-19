@@ -1034,7 +1034,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 return json_response(422, &json!({"message": "order rejected"}));
             }
 
-            if symbol.to_string() == "USDCUSD" {
+            if symbol == "USDCUSD" {
                 return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
             }
 

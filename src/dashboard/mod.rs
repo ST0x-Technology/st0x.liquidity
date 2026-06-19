@@ -20,6 +20,7 @@ use crate::AppState;
 use crate::position::Position;
 
 mod event;
+pub(crate) mod pnl;
 mod trade_loader;
 pub(crate) mod transfer_loader;
 pub(crate) use event::Broadcaster;

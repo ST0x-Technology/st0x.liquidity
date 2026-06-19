@@ -28,6 +28,7 @@ pub enum TimeInForce {
     MarketOnClose,
 }
 
+mod activity;
 mod auth;
 mod client;
 mod executor;
@@ -52,6 +53,7 @@ pub enum AssetStatus {
     Inactive,
 }
 
+pub use activity::{AccountActivitiesQuery, AccountActivity};
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 // Exposed as the single source of truth for the broker HTTP request timeout so
 // timing-sensitive integration tests derive their boundaries from it.
@@ -204,6 +206,19 @@ pub enum AlpacaBrokerApiError {
         queried: NaiveDate,
         returned: NaiveDate,
     },
+
+    #[error("Invalid Alpaca account activities URL {url}")]
+    InvalidAccountActivitiesUrl {
+        url: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error("Alpaca account activities pagination returned the same page token twice")]
+    AccountActivitiesPaginationInvariantViolation,
+
+    #[error("Alpaca account activities pagination exceeded {pages} pages")]
+    AccountActivitiesPageLimitExceeded { pages: usize },
 
     #[error("Asset {symbol} is not active (status: {status:?})")]
     AssetNotActive { symbol: Symbol, status: AssetStatus },

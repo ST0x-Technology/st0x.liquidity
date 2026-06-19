@@ -1614,7 +1614,7 @@ mod tests {
             .expect("should fail when vault_id is missing for TSLA");
 
         assert!(
-            matches!(&*error, CtxError::MissingEquityVaultId { symbol } if symbol.to_string() == "TSLA"),
+            matches!(&*error, CtxError::MissingEquityVaultId { symbol } if *symbol == "TSLA"),
             "expected MissingEquityVaultId for TSLA, got: {error:?}"
         );
     }

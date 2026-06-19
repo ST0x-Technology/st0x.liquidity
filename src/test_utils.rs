@@ -3,6 +3,7 @@
 
 use alloy::hex;
 use alloy::network::TransactionBuilder;
+use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
@@ -11,6 +12,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
@@ -18,6 +20,93 @@ use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
+
+const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
+
+static ANVIL_PERMITS: LazyLock<(Mutex<usize>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+
+pub(crate) struct TestAnvilInstance {
+    instance: AnvilInstance,
+    _permit: AnvilPermit,
+}
+
+impl std::ops::Deref for TestAnvilInstance {
+    type Target = AnvilInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
+}
+
+struct AnvilPermit;
+
+impl Drop for AnvilPermit {
+    fn drop(&mut self) {
+        let (lock, available) = &*ANVIL_PERMITS;
+        let mut in_use = match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *in_use = in_use.saturating_sub(1);
+        drop(in_use);
+        available.notify_all();
+    }
+}
+
+fn acquire_anvil_permits(count: usize) -> Vec<AnvilPermit> {
+    assert!(
+        (1..=MAX_CONCURRENT_TEST_ANVILS).contains(&count),
+        "requested {count} Anvil permits, but the limit is {MAX_CONCURRENT_TEST_ANVILS}"
+    );
+
+    let (lock, available) = &*ANVIL_PERMITS;
+    let mut in_use = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    while *in_use + count > MAX_CONCURRENT_TEST_ANVILS {
+        in_use = match available.wait(in_use) {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+    }
+
+    *in_use += count;
+    drop(in_use);
+    (0..count).map(|_| AnvilPermit).collect()
+}
+
+pub(crate) fn spawn_anvil(anvil: Anvil) -> TestAnvilInstance {
+    let permit = acquire_anvil_permits(1).pop().unwrap();
+    let instance = anvil.spawn();
+    TestAnvilInstance {
+        instance,
+        _permit: permit,
+    }
+}
+
+pub(crate) fn spawn_anvil_pair(
+    first: Anvil,
+    second: Anvil,
+) -> (TestAnvilInstance, TestAnvilInstance) {
+    let mut permits = acquire_anvil_permits(2);
+    let second_permit = permits.pop().unwrap();
+    let first_permit = permits.pop().unwrap();
+    let first_instance = first.spawn();
+    let second_instance = second.spawn();
+    (
+        TestAnvilInstance {
+            instance: first_instance,
+            _permit: first_permit,
+        },
+        TestAnvilInstance {
+            instance: second_instance,
+            _permit: second_permit,
+        },
+    )
+}
 
 /// Builds an equity assets config with the given symbols whitelisted for
 /// rebalancing. The trigger only dispatches transfers for symbols configured

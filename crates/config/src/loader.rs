@@ -4997,7 +4997,7 @@ mod tests {
             matches!(
                 error,
                 CtxError::ExtendedHoursWithoutCounterTrading { ref symbol }
-                    if symbol.to_string() == "AAPL"
+                    if *symbol == "AAPL"
             ),
             "Expected ExtendedHoursWithoutCounterTrading for AAPL, got {error:?}"
         );

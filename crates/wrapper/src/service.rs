@@ -560,7 +560,7 @@ mod tests {
             matches!(
                 error,
                 WrapperError::SymbolNotConfigured(ref symbol)
-                    if symbol.to_string() == "MSFT"
+                    if *symbol == "MSFT"
             ),
             "expected SymbolNotConfigured for MSFT, got: {error:?}"
         );
@@ -588,7 +588,7 @@ mod tests {
             matches!(
                 error,
                 WrapperError::SymbolNotConfigured(ref symbol)
-                    if symbol.to_string() == "XYZ"
+                    if *symbol == "XYZ"
             ),
             "expected SymbolNotConfigured for XYZ, got: {error:?}"
         );

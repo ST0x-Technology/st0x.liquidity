@@ -18,6 +18,9 @@ export const decimalAdd = (left: string, right: string): string =>
 export const decimalSub = (left: string, right: string): string =>
   toDecimal(left).minus(toDecimal(right)).toString()
 
+export const decimalMul = (left: string, right: string): string =>
+  toDecimal(left).mul(toDecimal(right)).toString()
+
 export const decimalCompare = (left: string, right: string): number =>
   toDecimal(left).cmp(toDecimal(right))
 
