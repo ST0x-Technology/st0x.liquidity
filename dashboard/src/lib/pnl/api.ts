@@ -1,7 +1,5 @@
-import { getApiBaseUrl, getPnlSqlApiUrl, getPnlAlpacaActivitiesApiUrl } from '$lib/env'
+import { getApiBaseUrl } from '$lib/env'
 import { FETCH_TIMEOUT_MS } from '$lib/time'
-import { fetchAlpacaActivityCostEntries } from '$lib/pnl/alpaca-activities'
-import { fetchPnlReportFromSql, mergePnlReportCostEntries } from '$lib/pnl/sql-source'
 import type { PnlCounterTradingFilter, PnlMarketSessionFilter, PnlResponse } from '$lib/pnl/report'
 
 export type PnlQuery = {
@@ -44,33 +42,17 @@ export const buildPnlParams = (query: PnlQuery): URLSearchParams => {
 }
 
 export const fetchPnlReport = async (query: PnlQuery): Promise<PnlResponse> => {
-  const sqlApiUrl = getPnlSqlApiUrl()
-  if (sqlApiUrl !== null) {
-    const report = await fetchPnlReportFromSql(sqlApiUrl, query)
-    const alpacaActivitiesApiUrl = getPnlAlpacaActivitiesApiUrl()
-    if (alpacaActivitiesApiUrl === null) return report
-
-    try {
-      const entries = await fetchAlpacaActivityCostEntries(alpacaActivitiesApiUrl, query)
-      return mergePnlReportCostEntries(report, entries, query)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return {
-        ...report,
-        warnings: [
-          ...report.warnings,
-          `Cost coverage note: Alpaca account activity API is configured but unavailable; Alpaca fees, margin interest, and dividends were not included. ${message}`
-        ]
-      }
-    }
-  }
-
   const response = await fetch(`${getApiBaseUrl()}/pnl?${buildPnlParams(query).toString()}`, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
 
   if (!response.ok) {
     throw new Error(`HTTP ${String(response.status)}`)
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('application/json')) {
+    throw new Error('Backend /pnl returned a non-JSON response')
   }
 
   return (await response.json()) as PnlResponse

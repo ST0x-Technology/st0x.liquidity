@@ -407,6 +407,9 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | CryptoOrderFailed { .. }
         | DuplicateOrderNotFound { .. }
         | CalendarIterationInvariantViolation
+        | InvalidAccountActivitiesUrl { .. }
+        | AccountActivitiesPaginationInvariantViolation
+        | AccountActivitiesPageLimitExceeded { .. }
         | AssetNotActive { .. }
         | AssetNotTradable { .. }
         | InvalidLimitPricePrecision { .. }

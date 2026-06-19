@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { buildPnlParams } from './api'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { buildPnlParams, fetchPnlReport } from './api'
 
 describe('buildPnlParams', () => {
   it('serializes filters for the backend PnL endpoint', () => {
@@ -28,5 +28,36 @@ describe('buildPnlParams', () => {
     })
 
     expect(params.toString()).toBe('limit=100&offset=0')
+  })
+})
+
+describe('fetchPnlReport', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('rejects non-JSON backend responses', async () => {
+    vi.stubGlobal('window', {
+      location: {
+        origin: 'http://localhost:5176'
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('<html></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' }
+        })
+      )
+    )
+
+    await expect(
+      fetchPnlReport({
+        limit: 1,
+        offset: 0,
+        symbols: new Set()
+      })
+    ).rejects.toThrow('Backend /pnl returned a non-JSON response')
   })
 })

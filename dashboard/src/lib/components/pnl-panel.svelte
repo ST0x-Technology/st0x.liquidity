@@ -252,10 +252,13 @@
     lastRequestedDateRangeKey = dateRangeKey(requestFromDate, requestToDate)
 
     try {
+      const requestSymbols = isCompleteSelection(selectedSymbols.current, allSymbols.current)
+        ? new Set<string>()
+        : selectedSymbols.current
       const data = await fetchPnlReport({
         limit: PNL_ENTRY_LIMIT,
         offset: 0,
-        symbols: selectedSymbols.current,
+        symbols: requestSymbols,
         fromDate: requestFromDate,
         toDate: requestToDate,
         marketSessionFilter: marketSessionFilter.current,
@@ -1041,8 +1044,8 @@
       </div>
       <span class="text-muted-foreground">
         Showing realized close dates {fromDate.current} to {toDate.current} for {marketSessionFilterLabel}
-        and {counterTradingFilterLabel} as {timeBuckets.length} {cadenceLabel} non-cumulative
-        buckets.
+        and {counterTradingFilterLabel} as {timeBuckets.length}
+        {cadenceLabel} non-cumulative buckets.
       </span>
     </div>
   </Card.Header>
@@ -1114,8 +1117,7 @@
               <div class="text-sm font-semibold">Database Trade Sample</div>
               <div class="mt-1 text-xs text-muted-foreground">
                 Position fill history for the selected assets, market session, and counter-trading
-                slice. Date range is not applied here, so this remains useful for choosing
-                dashboard dates.
+                slice inside the selected date range.
               </div>
             </div>
             <div class="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
@@ -1168,21 +1170,15 @@
       <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <div class="rounded-lg border bg-card/60 p-3">
           <div class="text-xs text-muted-foreground">Net Realized PnL</div>
-          <div
-            class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.netRealizedPnlUsd)}"
-          >
+          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.netRealizedPnlUsd)}">
             {fmtSignedUsd(summary.netRealizedPnlUsd)}
           </div>
-          <div class="mt-1 text-xs text-muted-foreground">
-            Gross minus costs plus revenues
-          </div>
+          <div class="mt-1 text-xs text-muted-foreground">Gross minus costs plus revenues</div>
         </div>
 
         <div class="rounded-lg border bg-card/60 p-3">
           <div class="text-xs text-muted-foreground">Realized Gross PnL</div>
-          <div
-            class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.grossRealizedPnlUsd)}"
-          >
+          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.grossRealizedPnlUsd)}">
             {fmtSignedUsd(summary.grossRealizedPnlUsd)}
           </div>
           <div class="mt-1 text-xs text-muted-foreground">Closed-lot fill replay before costs</div>
@@ -1200,9 +1196,7 @@
 
         <div class="rounded-lg border bg-card/60 p-3">
           <div class="text-xs text-muted-foreground">Tracked Revenue</div>
-          <div
-            class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.trackedRevenueUsd)}"
-          >
+          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.trackedRevenueUsd)}">
             {fmtSignedUsd(summary.trackedRevenueUsd)}
           </div>
           <div class="mt-1 text-xs text-muted-foreground">Dividends and broker ledger credits</div>

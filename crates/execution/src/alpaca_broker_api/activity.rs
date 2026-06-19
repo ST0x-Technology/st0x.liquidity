@@ -183,6 +183,23 @@ mod tests {
     #[tokio::test]
     async fn fetches_account_activities_with_pagination() {
         let server = MockServer::start();
+        let second_page = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/activities")
+                .query_param("account_id", TEST_ACCOUNT_ID.to_string())
+                .query_param("page_token", "20260600000000000099::fee");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([
+                    {
+                        "activity_type": "DIV",
+                        "id": "20260604000000000::div",
+                        "date": "2026-06-04",
+                        "net_amount": "1.25",
+                        "symbol": "SGOV"
+                    }
+                ]));
+        });
         let first_page = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/activities")
@@ -202,23 +219,6 @@ mod tests {
                         }))
                         .collect::<Vec<_>>()
                 ));
-        });
-        let second_page = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/activities")
-                .query_param("account_id", TEST_ACCOUNT_ID.to_string())
-                .query_param("page_token", "20260600000000000099::fee");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(serde_json::json!([
-                    {
-                        "activity_type": "DIV",
-                        "id": "20260604000000000::div",
-                        "date": "2026-06-04",
-                        "net_amount": "1.25",
-                        "symbol": "SGOV"
-                    }
-                ]));
         });
 
         let client = AlpacaBrokerApiClient::new(&create_test_ctx(&server)).unwrap();
