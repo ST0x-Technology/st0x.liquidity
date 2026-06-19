@@ -2785,6 +2785,36 @@ guard at boot and blocks new USDC rebalancing until it settles or an operator
 recovers it. USDC bridges are not auto-resumed on restart, so the guard is held
 until manual recovery.
 
+**Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
+become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
+or `BridgingSubmitting` (burn intent recorded) if the bot crashes or the burn
+fails before the `BridgingInitiated` event is persisted.
+
+`WithdrawalComplete` is pre-CCTP-burn: no burn has been broadcast. However, the
+source withdrawal has already completed and the USDC is sitting in the
+market-maker wallet awaiting bridging. After clearing the guard with this
+command, the operator must reconcile or handle those funds separately.
+
+`BridgingSubmitting` records burn intent but does NOT guarantee that no burn was
+broadcast. A crash at this state may have already submitted a CCTP burn whose
+`BridgingInitiated` event never persisted (see "Crash-safe resume" above, which
+describes `find_recent_burn` scanning for exactly this case). The operator MUST
+verify on-chain that no recent CCTP burn left the market-maker wallet before
+using `fail-usdc-transfer` on a `BridgingSubmitting` transfer. Using it when a
+burn was already broadcast will strand the burned funds.
+
+The `fail-usdc-transfer` CLI command sends `FailBridging { reason }`, which
+emits `BridgingFailed { burn_tx_hash: None, cctp_nonce: None }`. Because this is
+a pre-burn `BridgingFailed`, `holds_rebalance_guard()` returns false (no burn tx
+recorded), and the guard is NOT re-latched on the next startup. The command is
+valid ONLY from `BridgingSubmitting` or `WithdrawalComplete` -- it is refused
+for all post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`,
+`Bridged`, `DepositInitiated`, `DepositConfirmed`, `DepositFailed`,
+`Reconciled`, or any `BridgingFailed` with a recorded `burn_tx_hash`). The live
+in-memory guard is NOT cleared without a restart: `recover_usdc_guard` on boot
+skips non-guard-holding aggregates, so automatic USDC rebalancing resumes on the
+next restart.
+
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
 USDC rebalancing. Because the burned/minted USDC was handled out-of-band, this
@@ -2802,12 +2832,12 @@ tick, finds `Reconciled`, applies the source-venue inflight reconciliation with
 cancel, which would wrongly credit available), and clears the guard. No restart
 is required. The command is valid ONLY from a post-burn terminal failure that
 strands the guard: `DepositFailed` (the CCTP mint landed but the destination
-deposit failed), a post-burn `BridgingFailed` (a `burn_tx_hash` or `cctp_nonce`
-is recorded), or a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD
-leg). Every other state is rejected -- an in-progress transfer must be resumed,
-and a pre-burn failure already reconciles to source on its own. Because
-`Reconciled` is a clearable terminal, a restart does not re-latch the guard, and
-automatic USDC rebalancing resumes.
+deposit failed), a post-burn `BridgingFailed` (a `burn_tx_hash` is recorded), or
+a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every
+other state is rejected -- an in-progress transfer must be resumed, and a
+pre-burn failure already reconciles to source on its own. Because `Reconciled`
+is a clearable terminal, a restart does not re-latch the guard, and automatic
+USDC rebalancing resumes.
 
 ##### Manual Reconciliation Required
 

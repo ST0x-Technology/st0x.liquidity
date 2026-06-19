@@ -209,7 +209,7 @@ Not covered by `recheck-transfer` yet:
 - Provider rejections. These remain failed unless an operator performs a
   separate manual reconciliation.
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
-  their own recovery command. A manual `transfer-usdc` prints its transfer id
+  their own recovery commands. A manual `transfer-usdc` prints its transfer id
   and, if interrupted after the burn, is resumed with
   `stox resume-usdc-transfer --id <id> --direction <to-raindex|to-alpaca>
   --amount <amount>`.
@@ -219,6 +219,42 @@ Not covered by `recheck-transfer` yet:
   the aggregate's persisted amount. Run it only when the bot is not concurrently
   driving that same id, since it drives the aggregate directly rather than
   through the bot's resume lock.
+
+### Clearing a pre-burn guard latch
+
+Use `fail-usdc-transfer` when a USDC rebalance is stranded at
+`WithdrawalComplete` or `BridgingSubmitting` and the guard must be released.
+This transitions the aggregate to `BridgingFailed` (pre-burn,
+`burn_tx_hash: None`), which is non-guard-holding. The rebalancing guard clears
+on the next bot restart.
+
+**Stop the bot before running this command** to eliminate the race where the bot
+advances the transfer to `Bridging` between the preflight and the send.
+
+`WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
+broadcast yet. However, the Alpaca->on-chain USDC withdrawal has already
+completed, so the USDC is sitting in the market-maker wallet. After clearing the
+guard with this command, reconcile or handle those funds separately as needed.
+The command is safe to run once the bot is stopped.
+
+`BridgingSubmitting` is NOT unconditionally safe. A crash at this state may have
+already broadcast a CCTP burn whose `BridgingInitiated` event never persisted.
+Before running this command on a `BridgingSubmitting` transfer, verify on-chain
+that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
+`cast` against the Circle CCTP contract or by inspecting recent wallet txs).
+
+- **If no burn is found**: run `fail-usdc-transfer` to clear the guard.
+- **If a burn IS found** while the aggregate is still `BridgingSubmitting`: do
+  NOT run `fail-usdc-transfer` (strands the burned funds) and do NOT run
+  `reconcile-usdc-transfer` (its preflight rejects `BridgingSubmitting` -- it
+  only accepts persisted post-burn terminals such as `DepositFailed`). Instead,
+  run `resume-usdc-transfer`: its `find_recent_burn` scan adopts the orphan
+  burn, persists `BridgingInitiated`, and the transfer continues normally.
+
+`reconcile-usdc-transfer` is the path for persisted post-burn terminal failures
+(e.g. `DepositFailed`, `BridgingFailed` with a burn tx recorded).
+
+    stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
 For local dashboard testing, run:
 

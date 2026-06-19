@@ -312,6 +312,37 @@ pub enum Commands {
         reason: ReconcileReasonArg,
     },
 
+    /// Mark a pre-burn USDC rebalance as failed, clearing the in-progress guard.
+    ///
+    /// Valid only from `BridgingSubmitting` or `WithdrawalComplete`. Refused for
+    /// any state where a CCTP burn transaction has been submitted. Drives the
+    /// aggregate to `BridgingFailed { burn_tx_hash: None }`, which is
+    /// non-guard-holding. Guard clears on the next bot restart.
+    ///
+    /// Safety procedure:
+    /// - Stop the bot before running to avoid the concurrent-burn race where the
+    ///   bot advances the transfer to `Bridging` between the preflight and the
+    ///   send.
+    /// - For a `BridgingSubmitting` transfer, verify on-chain that no recent
+    ///   CCTP burn left the market-maker wallet before running (a crash at this
+    ///   state may have broadcast a burn whose event never persisted).
+    /// - Post-burn terminal failures (e.g. `DepositFailed`) use
+    ///   `reconcile-usdc-transfer`. In-flight post-burn states (`Bridging`,
+    ///   `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`)
+    ///   should be resumed with `resume-usdc-transfer`.
+    FailUsdcTransfer {
+        /// USDC rebalance aggregate ID (UUID)
+        #[arg(short = 'i', long = "id")]
+        id: Uuid,
+        /// Reason for failure (stored in the event for audit purposes)
+        #[arg(
+            short = 'r',
+            long = "reason",
+            default_value = "Manually failed via CLI"
+        )]
+        reason: String,
+    },
+
     /// Deposit USDC directly to Alpaca from Ethereum (bypasses vault/CCTP)
     ///
     /// This is a simplified command for testing Alpaca integration.
@@ -779,6 +810,10 @@ enum SimpleCommand {
         id: Uuid,
         reason: ReconcileReasonArg,
     },
+    FailUsdcTransfer {
+        id: Uuid,
+        reason: String,
+    },
 }
 
 #[cfg(feature = "test-support")]
@@ -1102,6 +1137,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::ReconcileUsdcTransfer { id, reason } => {
             Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
         }
+        Commands::FailUsdcTransfer { id, reason } => {
+            Ok(SimpleCommand::FailUsdcTransfer { id, reason })
+        }
     }
 }
 
@@ -1269,6 +1307,9 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::ReconcileUsdcTransfer { id, reason } => {
             rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
+        }
+        SimpleCommand::FailUsdcTransfer { id, reason } => {
+            rebalancing::fail_usdc_transfer_command(stdout, id, &reason, pool).await
         }
     }
 }
@@ -1806,6 +1847,74 @@ mod tests {
                 | ProviderCommand::AlpacaRedeem { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification, got provider command"),
+        }
+    }
+
+    #[test]
+    fn classify_fail_usdc_transfer_routes_without_provider() {
+        // fail-usdc-transfer only loads + sends to the event store, so it
+        // must route without an RPC provider.
+        let command = Commands::FailUsdcTransfer {
+            id: Uuid::from_u128(123),
+            reason: "test reason".to_string(),
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::FailUsdcTransfer { .. }) => {}
+            Ok(_) => panic!("expected fail-usdc-transfer simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification, got provider command"),
+        }
+    }
+
+    #[test]
+    fn fail_usdc_transfer_parses() {
+        let id = Uuid::from_u128(0xAB_CD_EF);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "fail-usdc-transfer",
+            "--id",
+            &id.to_string(),
+            "--reason",
+            "stuck pre-burn",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::FailUsdcTransfer {
+                id: parsed_id,
+                reason,
+            } => {
+                assert_eq!(parsed_id, id);
+                assert_eq!(reason, "stuck pre-burn");
+            }
+            other => panic!("expected fail-usdc-transfer command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_usdc_transfer_uses_default_reason_when_omitted() {
+        let id = Uuid::from_u128(0xDE_AD);
+        let cli = Cli::try_parse_from(["st0x-cli", "fail-usdc-transfer", "--id", &id.to_string()])
+            .unwrap();
+
+        match cli.command {
+            Commands::FailUsdcTransfer { reason, .. } => {
+                assert_eq!(
+                    reason, "Manually failed via CLI",
+                    "omitting --reason must use the default"
+                );
+            }
+            other => panic!("expected fail-usdc-transfer command, got: {other:?}"),
         }
     }
 
