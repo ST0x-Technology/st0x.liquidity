@@ -346,6 +346,14 @@ mod tests {
             unimplemented!("unwrap not used by approval target building")
         }
 
+        async fn donate(
+            &self,
+            _wrapped_token: Address,
+            _underlying_amount: U256,
+        ) -> Result<TxHash, WrapperError> {
+            unimplemented!("donate not used by approval target building")
+        }
+
         async fn submit_wrap(
             &self,
             _wrapped_token: Address,

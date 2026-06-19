@@ -184,6 +184,26 @@ pub trait Wrapper: Send + Sync {
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError>;
 
+    /// Donates underlying tokens directly into the wrapper to bump its NAV.
+    ///
+    /// A bare ERC-20 transfer of the underlying into the ERC-4626 vault raises
+    /// `totalAssets()` without minting any shares, so `convertToAssets` rises
+    /// for every existing holder. This is the dividend / corporate-action
+    /// NAV-bump path -- distinct from [`to_wrapped`](Wrapper::to_wrapped), which
+    /// mints shares to a receiver.
+    ///
+    /// # Arguments
+    /// * `wrapped_token` - The ERC-4626 vault (wrapper) address to donate into
+    /// * `underlying_amount` - Amount of underlying tokens to transfer in
+    ///
+    /// # Returns
+    /// The transfer transaction hash, once confirmed.
+    async fn donate(
+        &self,
+        wrapped_token: Address,
+        underlying_amount: U256,
+    ) -> Result<TxHash, WrapperError>;
+
     /// Submit an ERC-4626 deposit without waiting for confirmation.
     ///
     /// Handles approval if needed, submits the deposit transaction, and

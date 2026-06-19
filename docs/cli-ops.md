@@ -13,8 +13,10 @@ on any specific command.
 
 ## Token Address Reference
 
-The `-t` flag on tokenization/redemption commands expects the **unwrapped**
-token contract address for that equity. Current addresses:
+The **unwrapped** tokenized-equity contract address per symbol. The tokenization
+and redemption commands resolve this from `-s` via `[assets.equities]`, so it no
+longer has to be passed by hand; the table is kept for reference and
+cross-checking. Current addresses:
 
 | Symbol | Unwrapped Token Address                      |
 | ------ | -------------------------------------------- |
@@ -36,8 +38,11 @@ token contract address for that equity. Current addresses:
 
 ### Buying and Minting (Acquiring Tokenized Shares)
 
-To get tokenized shares into a wallet, buy offchain shares via the broker and
-then tokenize them onchain.
+To get tokenized shares into the **market-making** wallet, buy offchain shares
+via the broker and then tokenize them onchain. These run as the market-making
+bot (`stox`). For a dividend bump, use `s01 dividend-bump` instead (it runs as
+the issuer -- see below); do not follow the steps here with the liquidity
+wallet.
 
 **Step 1: Buy shares offchain**
 
@@ -52,14 +57,47 @@ Alpaca dashboard to confirm the order filled before proceeding.
 
 ```
 stox alpaca-tokenize -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38 \
   -r 0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6
 ```
 
-- `-t` is the unwrapped token contract address (see table above)
+- The tokenized-equity address is resolved from `-s` via `[assets.equities]`, so
+  it never has to be entered by hand
 - `-r` is the wallet that receives the minted tokens -- **always specify this**.
   Use the Fireblocks liquidity address
   (`0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6`)
+
+### Applying a Dividend NAV Bump (Donating into the Wrapper)
+
+When a dividend or corporate action revalues an equity, bump the wtStock
+wrapper's NAV with a single `dividend-bump` command: it buys the equivalent
+shares with the dividend cash, tokenizes them onchain, and **donates** the
+tokenized shares into the wrapper, waiting for each step to settle before the
+next. A bare ERC-20 transfer into the ERC-4626 vault raises its
+`convertToAssets` ratio without minting any wrapped shares -- see
+[wrapper-nav-bump.md](wrapper-nav-bump.md) for why.
+
+Run it as the **issuer** with `s01` -- the issuer-config counterpart of `stox`
+(same binary, but defaulting to the issuer's `[wallet]` turnkey signer, Alpaca
+account, and database) -- so the buy, tokenize, and donate are funded and signed
+by the issuer rather than the market-making wallet:
+
+```
+s01 dividend-bump -s COIN -q 10
+```
+
+`s01` defaults to `/run/st0x/s01-issuer.config` and
+`/run/agenix/s01-issuer.toml`; override with `S01_CONFIG`/`S01_SECRETS`.
+**Always run a dividend bump as the issuer:** a plain `stox dividend-bump` would
+buy, tokenize, and donate from the **market-making** wallet, not the issuer. To
+use `stox` you must pass the issuer `--config`/`--secrets` explicitly.
+
+The command buys 10 COIN offchain and waits for the fill, tokenizes the shares
+to the configured wallet and waits for them to arrive onchain, then transfers
+them into the wrapper and waits for confirmation. No wrapped shares are minted
+-- every existing wtCOIN holder's shares are simply worth more. The standalone
+`buy`, `alpaca-tokenize`, and `donate-equity` subcommands remain for running a
+single step in isolation; use `wrap-equity` only when you want to _receive_
+wrapped shares (a deposit), never for a dividend bump.
 
 ### Selling and Redeeming (Liquidating Tokenized Shares)
 
@@ -68,8 +106,7 @@ Reverse of buying and minting: redeem tokens offchain, then sell the shares.
 **Step 1: Redeem tokens**
 
 ```
-stox alpaca-redeem -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38
+stox alpaca-redeem -s COIN -q 10
 ```
 
 **Step 2: Sell shares offchain**
