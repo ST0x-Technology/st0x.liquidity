@@ -101,6 +101,31 @@ and the system proves market fit.
 
 Automated rebalancing is Alpaca Broker API based.
 
+#### Dividend Freeze
+
+A dividend (or other corporate action) bumps a tokenized equity's wrapper NAV.
+While that NAV is being reconciled the asset is **frozen** so supply cannot be
+created or redeemed at a stale ratio. The freeze is a single cross-bot
+mechanism: the issuance service rejects new mints, and the liquidity bot's
+rebalancing trigger skips frozen assets before starting any rebalancing flow,
+querying issuance's per-asset status endpoint each cycle (fails closed — skip
+and alert — when issuance is unreachable).
+
+The freeze is deliberately narrow: it suspends only **supply** operations.
+
+- **Suspended:** new mints (issuance) and new liquidity-initiated rebalancing
+  (mints / redemptions / transfers).
+- **Not suspended:** in-flight rebalancing flows, redemption detection, on-chain
+  secondary-market trading, and **market-making counter-trade hedging**. Hedging
+  is a reactive delta-neutraliser of fills that already executed on the standing
+  Raindex orders — which the bot does not place or control — so suspending it
+  would only strip the offset and leave naked directional exposure. Hedging
+  therefore continues through a freeze (see ADR 0008).
+
+Removing or repricing the standing Raindex orders to avoid stale-NAV arbitrage
+during the freeze window is order-management work external to this bot, and out
+of scope here.
+
 ## Bot Implementation Specification
 
 The arbitrage bot will be built in Rust to leverage its performance, safety, and

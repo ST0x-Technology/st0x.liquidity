@@ -65,8 +65,10 @@ A location where trades are executed. The system operates across two types of
 venue:
 
 - **Onchain venue (Raindex)**: A decentralized exchange on Base where tokenized
-  equities and USDC are traded via limit orders. The bot places and maintains
-  orders on Raindex.
+  equities and USDC are traded via limit orders placed and priced externally.
+  The bot monitors fills on those orders and manages vault balances
+  (deposits/withdrawals) for rebalancing; it does not add, remove, or reprice
+  the orders themselves.
 - **Offchain venue (brokerage)**: A traditional equity market accessed through
   the Alpaca Broker API. The bot executes offsetting trades here to hedge
   onchain exposure.

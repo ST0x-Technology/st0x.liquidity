@@ -120,3 +120,4 @@ decision.
 | [0004](0004-typed-identifiers.md)                           | Model identifiers by what determines them; derive the string form                | Accepted |
 | [0005](0005-max-token-approvals-on-startup.md)              | Grant one-time MAX token approvals to trusted spenders on startup                | Accepted |
 | [0006](0006-base-to-alpaca-explicit-alpaca-deposit-send.md) | BaseToAlpaca deposit sends USDC to Alpaca explicitly, idempotently               | Accepted |
+| [0008](0008-counter-trading-during-dividend-freeze.md)      | Counter-trading (broker hedging) during a dividend freeze                        | Proposed |
