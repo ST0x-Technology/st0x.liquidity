@@ -10,14 +10,15 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use st0x_dto::{HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue};
-use st0x_execution::FractionalShares;
+use st0x_config::BrokerCtx;
+use st0x_execution::{AccountActivitiesQuery, AccountActivity, FractionalShares};
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
@@ -146,6 +147,20 @@ struct TradeResponse {
     has_more: bool,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PnlAlpacaActivitiesQuery {
+    after: Option<String>,
+    until: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlAlpacaActivitiesResponse {
+    entries: Vec<AccountActivity>,
+    total: usize,
+}
+
 async fn health() -> Json<HealthResponse> {
     let uptime = Utc::now() - *STARTED_AT;
 
@@ -155,6 +170,62 @@ async fn health() -> Json<HealthResponse> {
         git_commit: GIT_COMMIT.to_string(),
         uptime_seconds: uptime.num_seconds(),
     })
+}
+
+fn parse_activity_time(value: &str) -> Result<DateTime<Utc>, String> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| format!("invalid timestamp/date: {value}"))?;
+    let datetime = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| format!("invalid timestamp/date: {value}"))?;
+    Ok(DateTime::from_naive_utc_and_offset(datetime, Utc))
+}
+
+async fn pnl_alpaca_activities(
+    State(state): State<AppState>,
+    Query(query): Query<PnlAlpacaActivitiesQuery>,
+) -> Result<Json<PnlAlpacaActivitiesResponse>, (StatusCode, String)> {
+    let after = query
+        .after
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_activity_time)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let until = query
+        .until
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_activity_time)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Alpaca Broker API is not configured".to_string(),
+        ));
+    };
+
+    let activities = alpaca_auth
+        .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
+        .await
+        .map_err(|error| {
+            error!(%error, "Failed to fetch Alpaca account activities for PnL");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Failed to fetch Alpaca account activities".to_string(),
+            )
+        })?;
+
+    Ok(Json(PnlAlpacaActivitiesResponse {
+        total: activities.len(),
+        entries: activities,
+    }))
 }
 
 #[derive(Deserialize, Default)]
@@ -1653,6 +1724,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/performance/rebalances", get(performance_rebalances))
         .route("/performance/reliability", get(performance_reliability))
         .route("/performance/infra", get(performance_infra))
+        .route("/pnl/alpaca-activities", get(pnl_alpaca_activities))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))

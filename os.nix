@@ -153,6 +153,7 @@ in
             "/health" = apiProxy "/health";
             "/logs" = apiProxy "/logs";
             "/orders/" = apiProxy "/orders/";
+            "/pnl/alpaca-activities" = apiProxy "/pnl/alpaca-activities";
             "/trades" = apiProxy "/trades";
             "/transfers" = apiProxy "/transfers";
             "/performance" = apiProxy "/performance";

@@ -24,9 +24,9 @@ pub mod mock;
 pub mod order;
 
 pub use alpaca_broker_api::{
-    AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
-    AlpacaBrokerApiMode, ConversionDirection, CryptoOrderOutcome, JournalResponse, JournalStatus,
-    TimeInForce,
+    AccountActivitiesQuery, AccountActivity, AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx,
+    AlpacaBrokerApiError, AlpacaBrokerApiMode, ConversionDirection, CryptoOrderOutcome,
+    JournalResponse, JournalStatus, TimeInForce,
 };
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
