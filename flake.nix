@@ -405,15 +405,13 @@
 
               secret = pkgs.writeShellApplication {
                 name = "secret";
-                runtimeInputs = [ ragenixPkg ];
+                runtimeInputs = [
+                  ragenixPkg
+                  pkgs.nushell
+                  pkgs.coreutils
+                ];
                 text = ''
-                  ${infraPkgs.parseIdentity}
-                  hash_before=$(sha256sum "$1")
-                  ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
-                  hash_after=$(sha256sum "$1")
-                  if [ "$hash_before" != "$hash_after" ]; then
-                    ${rekeySecrets}
-                  fi
+                  exec nu ${./scripts/secret.nu} "$@"
                 '';
               };
 
