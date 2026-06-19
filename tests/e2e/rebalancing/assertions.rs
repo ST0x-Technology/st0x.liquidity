@@ -215,6 +215,9 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     // poller still emits the events that dispatch recovery jobs.
     equity_imbalance: Option<ImbalanceThreshold>,
     redemption_wallet: Address,
+    /// Base URL of the mock issuance service (`TestInfra::issuance_base_url`) so
+    /// the rebalancing freeze guard reaches a reachable, not-frozen endpoint.
+    issuance_base_url: url::Url,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -275,7 +278,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         }),
     };
 
-    Ctx::for_test()
+    let mut ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
@@ -286,8 +289,9 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .wallet(wallet_ctx)
         .assets(assets)
         .redemption_wallet(redemption_wallet)
-        .call()
-        .map_err(Into::into)
+        .call()?;
+    ctx.issuance.base_url = issuance_base_url;
+    Ok(ctx)
 }
 
 /// Builds a `Ctx` with USDC rebalancing enabled and both chain endpoints.

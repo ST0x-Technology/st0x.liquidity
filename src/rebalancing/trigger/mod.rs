@@ -1,6 +1,7 @@
 //! Rebalancing trigger that reacts to inventory imbalances.
 
 mod equity;
+mod freeze;
 mod usdc;
 
 #[cfg(test)]
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
@@ -28,6 +29,7 @@ use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_wrapper::{Wrapper, WrapperError};
 
+use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
 use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
@@ -65,6 +67,8 @@ use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
 use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
 
 pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
+#[cfg(test)]
+pub(crate) use freeze::StubFreezeReader;
 pub(crate) use usdc::{UsdcRebalancingCheck, UsdcRebalancingCheckScheduler};
 
 /// Bundle of the equity + USDC schedulers so constructors and plumbing
@@ -475,6 +479,12 @@ pub(crate) struct RebalancingService {
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
+    /// Reads issuance's per-asset dividend freeze status so the equity trigger
+    /// can skip frozen assets before starting a flow. Set after construction via
+    /// `set_freeze_status_reader` (the conductor builds the issuance client from
+    /// config, mirroring `set_stores`); `None` only in tests that do not
+    /// exercise the gate.
+    freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pending_offchain_order_symbols: Arc<RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
@@ -583,6 +593,7 @@ impl RebalancingService {
             orderbook,
             order_owner,
             inventory,
+            freeze_status: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             pending_offchain_order_symbols: Arc::new(RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
@@ -626,6 +637,13 @@ impl RebalancingService {
         *self.mint_store.write().await = Some(mint_store);
         *self.redemption_store.write().await = Some(redemption_store);
         *self.usdc_store.write().await = Some(usdc_store);
+    }
+
+    /// Attach the issuance freeze-status reader so the equity trigger can skip
+    /// assets frozen for a dividend. Called by the conductor after construction
+    /// (the reader wraps the issuance client built from config).
+    pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
+        *self.freeze_status.write().await = Some(reader);
     }
 
     pub(crate) async fn recover_pending_offchain_order_symbols(
@@ -2437,6 +2455,40 @@ impl RebalancingService {
                 "Skipped equity trigger: rebalancing not enabled for symbol"
             );
             return Ok(());
+        }
+
+        // Dividend freeze guard: do not start a rebalancing flow for an asset
+        // issuance has frozen. The check goes before claiming the in-progress
+        // guard or building the operation so a frozen asset is skipped cheaply.
+        // The reader is `None` only in tests that do not exercise the gate; the
+        // conductor always sets it in production.
+        let freeze_status = self.freeze_status.read().await.clone();
+        if let Some(reader) = freeze_status {
+            match reader.is_frozen(symbol).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    info!(
+                        target: "rebalance",
+                        %symbol,
+                        "Skipped equity trigger: asset is frozen for a dividend"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    // Fail closed: a flow started for a frozen asset strands
+                    // funds, and rebalancing is latency-tolerant, so when
+                    // issuance cannot confirm the asset is unfrozen we skip the
+                    // cycle and alert rather than risk initiating it.
+                    error!(
+                        target: "rebalance",
+                        %symbol,
+                        ?error,
+                        "Skipped equity trigger: could not confirm asset is not \
+                         frozen; failing closed"
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         if self.has_pending_offchain_order(symbol).await {
@@ -6288,6 +6340,65 @@ mod tests {
             jobs.len(),
             1,
             "Whitelisted symbol with an imbalance should dispatch a mint job"
+        );
+        assert_eq!(jobs[0].symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn frozen_asset_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "A frozen asset must not dispatch an equity rebalancing job"
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_freeze_status_fails_closed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Indeterminate))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "An indeterminate freeze status must fail closed -- no rebalancing job dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_frozen_asset_passes_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::NotFrozen))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "A not-frozen asset with an imbalance should still dispatch a mint job"
         );
         assert_eq!(jobs[0].symbol, symbol);
     }
