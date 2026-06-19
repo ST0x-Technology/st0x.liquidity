@@ -18,10 +18,9 @@ use rain_math_float::{Float, FloatError};
 use st0x_float_macro::float;
 use tracing::debug;
 
+use st0x_evm::IPyth;
+use st0x_evm::PythStructs::Price;
 use st0x_execution::Symbol;
-
-use crate::bindings::IPyth;
-use crate::bindings::PythStructs::Price;
 
 pub const BASE_PYTH_CONTRACT_ADDRESS: Address =
     address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
@@ -137,11 +136,12 @@ fn scale_with_exponent(value: &impl ToString, exponent: i32) -> Result<Float, Fl
     }
 }
 
+/// Scales a raw Pyth `Price` to a human-readable Float. Only used in tests for
+/// verifying Pyth price conversions. A free function rather than an inherent
+/// method because `Price` is defined in `st0x-evm`, not this crate.
 #[cfg(test)]
-impl Price {
-    fn to_float(&self) -> Result<Float, FloatError> {
-        scale_with_exponent(&self.price, self.expo)
-    }
+fn price_to_float(price: &Price) -> Result<Float, FloatError> {
+    scale_with_exponent(&price.price, price.expo)
 }
 
 #[cfg(test)]
@@ -154,11 +154,11 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
+    use st0x_evm::IPyth::getPriceUnsafeCall;
     use st0x_float_macro::float;
     use st0x_float_serde::format_float_with_fallback;
 
     use super::*;
-    use crate::bindings::IPyth::getPriceUnsafeCall;
 
     /// Encodes a `Price` as the ABI return data of `getPriceUnsafe`, matching
     /// what an `eth_call` to the Pyth contract would return.
@@ -264,7 +264,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "1.23456789");
     }
@@ -278,7 +278,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "42");
     }
@@ -292,7 +292,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "123000");
     }
@@ -316,7 +316,7 @@ mod tests {
                 publishTime: U256::from(1_700_000_000u64),
             };
 
-            let exact = price.to_float().unwrap();
+            let exact = price_to_float(&price).unwrap();
 
             assert_eq!(
                 format_float_with_fallback(&exact),
@@ -335,7 +335,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "-50");
     }
@@ -349,7 +349,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "182.5");
     }

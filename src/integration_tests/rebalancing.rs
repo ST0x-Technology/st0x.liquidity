@@ -27,6 +27,7 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
+use st0x_evm::IERC20;
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
@@ -36,7 +37,7 @@ use st0x_raindex::{Raindex, RaindexVaultId};
 use st0x_wrapper::{MockWrapper, Wrapper};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
-use crate::bindings::{IERC20, TestERC20};
+use crate::bindings::TestERC20;
 use crate::conductor::job::Job;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,

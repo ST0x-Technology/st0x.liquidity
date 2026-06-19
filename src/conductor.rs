@@ -31,7 +31,7 @@ use st0x_event_sorcery::{
     AggregateError, LifecycleError, Projection, SendError, Store, StoreBuilder, compact_events,
     incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::Wallet;
+use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::{
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
@@ -54,7 +54,6 @@ use crate::offchain::order::{
     PollOrderStatus, PollOrderStatusJobQueue,
 };
 use crate::onchain::OnchainTrade;
-use crate::onchain::USDC_BASE;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};

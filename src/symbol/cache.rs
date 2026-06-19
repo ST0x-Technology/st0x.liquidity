@@ -10,9 +10,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use st0x_evm::{Evm, OpenChainErrorRegistry};
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry};
 
-use crate::bindings::{IERC20, IRaindexV6::IOV2};
+use crate::bindings::IRaindexV6::IOV2;
 use crate::onchain::OnChainError;
 
 #[derive(Debug, Default, Clone)]

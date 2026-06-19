@@ -8,7 +8,7 @@ use tracing::info;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_config::EquityAssetConfig;
 use st0x_event_sorcery::Store;
-use st0x_evm::Wallet;
+use st0x_evm::{USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
 };
@@ -19,7 +19,6 @@ use super::usdc::{
     CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
 };
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::usdc_rebalance::UsdcRebalance;
 
 /// Errors that can occur when spawning the rebalancer.

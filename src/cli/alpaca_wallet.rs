@@ -5,7 +5,7 @@ use alloy::primitives::Address;
 use std::io::Write;
 use uuid::Uuid;
 
-use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
+use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, Wallet};
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApi, ClientOrderId, ConversionDirection, Executor,
     FractionalShares, Positive, Symbol,
@@ -18,8 +18,6 @@ use crate::alpaca_wallet::{
     AlpacaWalletService, Network, TokenSymbol, TransferStatus, TravelRuleInfo, WhitelistEntry,
     WhitelistStatus,
 };
-use crate::bindings::IERC20;
-use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use st0x_config::{BrokerCtx, Ctx};
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
