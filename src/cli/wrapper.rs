@@ -146,6 +146,7 @@ mod tests {
     use crate::test_utils::positive_shares;
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_ctx_without_rebalancing() -> Ctx {
@@ -181,6 +182,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
         }
     }

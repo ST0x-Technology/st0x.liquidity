@@ -236,6 +236,89 @@ struct RestApiSecrets {
     key_secret: String,
 }
 
+/// TOML shape for `[issuance]` in the encrypted secrets file. The `api_key`
+/// stays a `String` at this layer so a malformed value never surfaces in a
+/// `toml::de::Error` (whose `Display` echoes the offending source line).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuanceSecretsToml {
+    base_url: Url,
+    api_key: String,
+}
+
+/// Validated issuance secrets with the API key parsed into a [`B256`].
+struct IssuanceSecrets {
+    base_url: Url,
+    api_key: B256,
+}
+
+impl IssuanceSecrets {
+    fn try_from_toml(raw: IssuanceSecretsToml) -> Result<Self, IssuanceApiKeyError> {
+        let api_key = raw
+            .api_key
+            .parse::<B256>()
+            .map_err(|_| IssuanceApiKeyError::NotThirtyTwoByteHex)?;
+
+        Ok(Self {
+            base_url: raw.base_url,
+            api_key,
+        })
+    }
+}
+
+/// Issuance internal API key: a 32-byte secret transmitted as a bare
+/// 64-character lowercase hex string in the `X-API-KEY` header.
+///
+/// Generated with `openssl rand -hex 32`.
+#[derive(Clone)]
+pub struct IssuanceApiKey(B256);
+
+impl IssuanceApiKey {
+    /// The bare lowercase hex form (no `0x`) sent as the `X-API-KEY` header
+    /// value, matching issuance's `openssl rand -hex 32` secret.
+    ///
+    /// Returns the raw secret as a `String`, which carries no redaction: never
+    /// log, store, or forward the result beyond the immediate header write.
+    #[must_use]
+    pub fn header_value(&self) -> String {
+        alloy::hex::encode(self.0)
+    }
+}
+
+/// Failure parsing an issuance `api_key` into a [`B256`]. Value-free by
+/// construction: the raw key must never appear in an error message, log, or
+/// `validate-config` output.
+#[derive(Debug, thiserror::Error)]
+pub enum IssuanceApiKeyError {
+    #[error("issuance api_key must be 32 bytes of hex (64 hex chars, optional 0x prefix)")]
+    NotThirtyTwoByteHex,
+}
+
+impl std::fmt::Debug for IssuanceApiKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IssuanceApiKey(<redacted>)")
+    }
+}
+
+/// Runtime context for reaching issuance's internal status API, assembled from
+/// secrets (`base_url`, `api_key`). The conductor constructs the typed issuance
+/// client from these.
+#[derive(Clone)]
+pub struct IssuanceStatusCtx {
+    pub base_url: Url,
+    pub api_key: IssuanceApiKey,
+}
+
+impl std::fmt::Debug for IssuanceStatusCtx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuanceStatusCtx")
+            .field("base_url", &self.base_url.as_str())
+            .field("api_key", &self.api_key)
+            .finish()
+    }
+}
+
 /// Combined REST API runtime context assembled from config + secrets.
 /// When absent from config, features that depend on it (e.g., the Orders
 /// dashboard tab) are gracefully disabled.
@@ -381,6 +464,7 @@ struct Secrets {
     alerts: Option<AlertsSecrets>,
     wallet: Option<toml::Value>,
     rest_api: Option<RestApiSecrets>,
+    issuance: Option<IssuanceSecretsToml>,
 }
 
 /// Broker type tag and all broker credentials.
@@ -445,6 +529,7 @@ pub struct Ctx {
     pub assets: AssetsConfig,
     pub travel_rule: Option<TravelRuleConfig>,
     pub rest_api: Option<RestApiCtx>,
+    pub issuance: IssuanceStatusCtx,
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub redemption_wallet: Option<Address>,
@@ -540,7 +625,8 @@ impl std::fmt::Debug for Ctx {
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("rest_api", &self.rest_api);
+            .field("rest_api", &self.rest_api)
+            .field("issuance", &self.issuance);
 
         debug_struct.finish()
     }
@@ -603,6 +689,7 @@ struct ValidatedParts {
     assets: AssetsConfig,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
+    issuance: IssuanceStatusCtx,
     redemption_wallet: Option<Address>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
     /// returns `WalletNotConfigured` when both config and secrets lack
@@ -845,9 +932,31 @@ fn parse_and_validate(
                 RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
             })
             .transpose()?,
+        issuance: issuance_ctx(
+            secrets
+                .issuance
+                .map(IssuanceSecrets::try_from_toml)
+                .transpose()
+                .map_err(|source| CtxError::InvalidIssuanceApiKey { source })?,
+        )?,
         redemption_wallet,
         wallet_inputs,
         wallet_meta,
+    })
+}
+
+/// Assembles the required issuance status context from secrets.
+/// `[issuance]` is mandatory: `base_url` and `api_key` must both be present
+/// and the URL must parse -- no silent fallbacks for an endpoint the
+/// rebalancing freeze guard depends on.
+fn issuance_ctx(secret: Option<IssuanceSecrets>) -> Result<IssuanceStatusCtx, CtxError> {
+    let Some(secret) = secret else {
+        return Err(CtxError::MissingIssuanceConfig);
+    };
+
+    Ok(IssuanceStatusCtx {
+        base_url: secret.base_url,
+        api_key: IssuanceApiKey(secret.api_key),
     })
 }
 
@@ -905,6 +1014,7 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
+            issuance: parts.issuance,
             redemption_wallet: parts.redemption_wallet,
         })
     }
@@ -1086,6 +1196,7 @@ impl Ctx {
             assets,
             travel_rule,
             rest_api,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet,
         })
     }
@@ -1097,6 +1208,13 @@ pub enum CtxError {
     Rebalancing(Box<RebalancingCtxError>),
     #[error("failed to build REST API HTTP client")]
     RestApiClient(#[source] reqwest::Error),
+    #[error("[issuance] section is required in secrets but was not configured")]
+    MissingIssuanceConfig,
+    #[error("[issuance] api_key is invalid")]
+    InvalidIssuanceApiKey {
+        #[source]
+        source: IssuanceApiKeyError,
+    },
     #[error("failed to read config file {path}")]
     ConfigIo {
         path: PathBuf,
@@ -1223,6 +1341,8 @@ impl CtxError {
             Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
             Self::WalletSecretsMissing => "wallet secrets missing",
             Self::RestApiClient(_) => "failed to build REST API HTTP client",
+            Self::MissingIssuanceConfig => "missing issuance config",
+            Self::InvalidIssuanceApiKey { .. } => "invalid issuance api_key",
         }
     }
 }
@@ -1281,6 +1401,17 @@ pub async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sql
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn create_test_issuance_ctx() -> IssuanceStatusCtx {
+    IssuanceStatusCtx {
+        // Hard-coded literal URL -- parse cannot fail in a test helper.
+        #[allow(clippy::unwrap_used)]
+        base_url: Url::parse("http://localhost:8000").unwrap(),
+        api_key: IssuanceApiKey(B256::repeat_byte(0xab)),
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
     Ctx {
         database_url: ":memory:".to_owned(),
@@ -1316,6 +1447,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         },
         travel_rule: None,
         rest_api: None,
+        issuance: create_test_issuance_ctx(),
         redemption_wallet: None,
     }
 }
@@ -1463,6 +1595,10 @@ mod tests {
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         )
         .unwrap();
@@ -1763,6 +1899,10 @@ mod tests {
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         );
 
@@ -2364,6 +2504,10 @@ mod tests {
 
             [hyperdx]
             api_key = "test-api-key"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         );
 
@@ -2841,6 +2985,10 @@ mod tests {
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         );
 
@@ -2849,6 +2997,223 @@ mod tests {
             .unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
+    }
+
+    #[tokio::test]
+    async fn missing_issuance_section_fails_at_startup() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingIssuanceConfig),
+            "expected MissingIssuanceConfig when [issuance] is absent from secrets, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_secret_without_api_key_fails() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::SecretsToml { .. }),
+            "expected SecretsToml when api_key is absent, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_issuance_base_url_fails() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "not a url"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::SecretsToml { .. }),
+            "expected SecretsToml for an unparseable base_url, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_api_key_must_be_32_bytes() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xdeadbeef"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::InvalidIssuanceApiKey { .. }),
+            "expected InvalidIssuanceApiKey for a non-32-byte api_key, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_issuance_api_key_never_echoes_the_raw_secret() {
+        // A non-hex key that resembles issuance's >=32-char string keys. If it
+        // ever surfaces in the error chain, the secret has leaked.
+        let raw_key = "this-is-a-secret-api-key-not-hex-0123456789";
+        let config = minimal_config_toml();
+        let secrets = toml_file(&format!(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "{raw_key}"
+        "#
+        ));
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::InvalidIssuanceApiKey { .. }),
+            "expected InvalidIssuanceApiKey for a non-hex api_key, got: {error:#}"
+        );
+
+        // The full error chain (what validate-config and startup logs print)
+        // must never contain the raw key.
+        let rendered = format!("{error:#}\n{error:?}");
+        assert!(
+            !rendered.contains(raw_key),
+            "the raw api_key leaked into the error output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn issuance_ctx_assembles_base_url_and_parses_api_key() {
+        // Exercise issuance_ctx directly so the assertion does not depend on a
+        // wallet feature being enabled for a full Ctx::load_files.
+        let ctx = issuance_ctx(Some(IssuanceSecrets {
+            base_url: Url::parse("http://issuance.test:8000").unwrap(),
+            api_key: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                .parse()
+                .unwrap(),
+        }))
+        .expect("a valid issuance secret must assemble the ctx");
+
+        assert_eq!(
+            ctx.base_url,
+            Url::parse("http://issuance.test:8000").unwrap(),
+            "base_url must come from the issuance secrets"
+        );
+        // The secret is 0x-prefixed; the header value must be the bare 64-char
+        // lowercase hex with no 0x prefix (issuance's X-API-KEY contract).
+        assert_eq!(
+            ctx.api_key.header_value(),
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            "header_value must be bare lowercase hex (no 0x prefix)"
+        );
+    }
+
+    #[test]
+    fn issuance_api_key_header_value_is_bare_lowercase_hex() {
+        let bare = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let with_prefix = format!("0x{bare}");
+        let from_bare = IssuanceApiKey(bare.parse().expect("bare hex must parse"));
+        let from_prefixed = IssuanceApiKey(with_prefix.parse().expect("0x hex must parse"));
+
+        assert_eq!(
+            from_bare.header_value(),
+            bare,
+            "header_value must round-trip bare lowercase hex"
+        );
+        assert_eq!(
+            from_prefixed.header_value(),
+            bare,
+            "the 0x prefix must be stripped in the header value"
+        );
+
+        let uppercase = IssuanceApiKey(
+            "0xAABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899"
+                .parse()
+                .expect("uppercase hex must parse"),
+        );
+        assert_eq!(
+            uppercase.header_value(),
+            bare,
+            "uppercase hex must normalise to bare lowercase hex"
+        );
     }
 
     #[tokio::test]
