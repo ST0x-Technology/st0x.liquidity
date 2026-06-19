@@ -367,6 +367,10 @@ impl Wrapper for PanickingWrapper {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
+    async fn donate(&self, _: Address, _: U256) -> Result<TxHash, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
     async fn submit_wrap(&self, _: Address, _: U256, _: Address) -> Result<TxHash, WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }

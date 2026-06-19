@@ -449,6 +449,72 @@ pub(super) async fn execute_broker_order<W: Write>(
     }
 }
 
+/// Poll cadence for the dividend-bump buy-fill wait. Mirrors the tokenization
+/// poll loop in `alpaca_tokenize_command`: a market buy normally fills quickly,
+/// but the composite flow must not tokenize against an unfilled order.
+const BUY_FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const BUY_FILL_MAX_ATTEMPTS: u32 = 150;
+
+/// Places a market buy and blocks until the broker reports it filled, so the
+/// dividend NAV bump can act on the acquired shares instead of racing an
+/// unfilled order into the tokenization step.
+pub(super) async fn execute_market_buy_until_filled<W: Write>(
+    ctx: &Ctx,
+    symbol: Symbol,
+    shares: Positive<FractionalShares>,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let market_order = MarketOrder {
+        symbol,
+        shares,
+        direction: Direction::Buy,
+        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+    };
+
+    match &ctx.broker {
+        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            place_market_order_until_filled(&broker, market_order, stdout).await
+        }
+        BrokerCtx::DryRun => {
+            let broker = MockExecutorCtx.try_into_executor().await?;
+            place_market_order_until_filled(&broker, market_order, stdout).await
+        }
+    }
+}
+
+async fn place_market_order_until_filled<Exec: Executor, W: Write>(
+    broker: &Exec,
+    market_order: MarketOrder,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let placement = broker.place_market_order(market_order).await?;
+    writeln!(stdout, "   Buy order placed: {}", placement.order_id)?;
+
+    for attempt in 1..=BUY_FILL_MAX_ATTEMPTS {
+        match broker.get_order_status(&placement.order_id).await? {
+            OrderState::Filled { order_id, .. } => {
+                writeln!(stdout, "   Buy filled (order {order_id})")?;
+                return Ok(());
+            }
+            OrderState::Failed { error_reason, .. } => {
+                anyhow::bail!("buy order failed: {error_reason:?}");
+            }
+            OrderState::Pending | OrderState::Submitted { .. } => {
+                if attempt % 10 == 0 {
+                    writeln!(
+                        stdout,
+                        "   Waiting for buy fill... (attempt {attempt}/{BUY_FILL_MAX_ATTEMPTS})"
+                    )?;
+                }
+                tokio::time::sleep(BUY_FILL_POLL_INTERVAL).await;
+            }
+        }
+    }
+
+    anyhow::bail!("timed out waiting for the buy order to fill")
+}
+
 pub(super) async fn process_found_trade<W: Write>(
     onchain_trade: OnchainTrade,
     ctx: &Ctx,
@@ -1164,6 +1230,54 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--time-in-force is not supported with --limit-price"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_returns_once_the_broker_reports_filled() {
+        // MockExecutor reports Filled by default, so the poll resolves on the
+        // first status check.
+        let broker = MockExecutor::new();
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .expect("a filled order must resolve the buy-fill wait");
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Buy filled"),
+            "the buy-fill wait must report the fill, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_fails_when_the_broker_rejects_the_order() {
+        let broker = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at: Utc::now(),
+            error_reason: Some("rejected".to_string()),
+        });
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("buy order failed"),
+            "a rejected order must fail the buy-fill wait, got: {error}"
         );
     }
 }
