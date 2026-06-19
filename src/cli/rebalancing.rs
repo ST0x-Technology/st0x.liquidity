@@ -814,7 +814,6 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: FractionalShares,
-    token: Address,
     recipient: Option<Address>,
     ctx: &Ctx,
     provider: Prov,
@@ -822,6 +821,10 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+
+    let token = ctx
+        .tokenized_equity(&symbol)
+        .ok_or_else(|| anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]"))?;
     writeln!(stdout, "   Token: {token}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
@@ -946,13 +949,16 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: FractionalShares,
-    token: Address,
     redemption_wallet_flag: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+
+    let token = ctx
+        .tokenized_equity(&symbol)
+        .ok_or_else(|| anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]"))?;
     writeln!(stdout, "   Token: {token}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
@@ -1247,6 +1253,7 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
+    use alloy::providers::ProviderBuilder;
     use rain_math_float::Float;
     use url::Url;
     use uuid::uuid;
@@ -1266,7 +1273,8 @@ mod tests {
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode, TradingMode,
+        AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
+        TradingMode,
     };
 
     /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
@@ -2813,6 +2821,85 @@ mod tests {
         assert!(
             err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
             "WithdrawalFailed state must be rejected as not in bridging phase; got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn tokenized_equity_resolves_from_config() {
+        let mut ctx = create_ctx_without_rebalancing();
+        let token = address!("0x626757e6f50675d17fcad312e82f989ae7a23d38");
+        ctx.assets.equities.symbols.insert(
+            Symbol::new("COIN").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: token,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        assert_eq!(
+            ctx.tokenized_equity(&Symbol::new("COIN").unwrap()),
+            Some(token),
+            "a configured symbol must resolve to its tokenized_equity address",
+        );
+        assert_eq!(
+            ctx.tokenized_equity(&Symbol::new("AAPL").unwrap()),
+            None,
+            "an unconfigured symbol must resolve to None, never a default address",
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_tokenize_fails_when_symbol_not_configured() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let provider =
+            ProviderBuilder::new().connect_http(Url::parse("http://localhost:8545").unwrap());
+        let mut stdout = Vec::new();
+
+        let error = alpaca_tokenize_command(
+            &mut stdout,
+            Symbol::new("COIN").unwrap(),
+            FractionalShares::new(float!(10)),
+            None,
+            &ctx,
+            provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("equity COIN is not configured in [assets.equities]"),
+            "an unconfigured symbol must fail before any network call, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_redeem_fails_when_symbol_not_configured() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let mut stdout = Vec::new();
+
+        let error = alpaca_redeem_command(
+            &mut stdout,
+            Symbol::new("COIN").unwrap(),
+            FractionalShares::new(float!(10)),
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("equity COIN is not configured in [assets.equities]"),
+            "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }
 }

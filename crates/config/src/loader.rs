@@ -1124,6 +1124,18 @@ impl Ctx {
             .get(symbol)
             .is_some_and(|config| config.wrapped_equity_recovery == OperationMode::Enabled)
     }
+
+    /// Returns the configured tokenized-equity (minted onchain token) address
+    /// for `symbol`, or `None` when the symbol is absent from
+    /// `[assets.equities]`. Lets operator commands resolve the token from the
+    /// ticker instead of taking an error-prone address argument.
+    pub fn tokenized_equity(&self, symbol: &Symbol) -> Option<Address> {
+        self.assets
+            .equities
+            .symbols
+            .get(symbol)
+            .map(|config| config.tokenized_equity)
+    }
 }
 
 /// Test-only constructor for `Ctx` that internalizes fields e2e tests

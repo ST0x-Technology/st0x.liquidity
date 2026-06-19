@@ -13,8 +13,10 @@ on any specific command.
 
 ## Token Address Reference
 
-The `-t` flag on tokenization/redemption commands expects the **unwrapped**
-token contract address for that equity. Current addresses:
+The **unwrapped** tokenized-equity contract address per symbol. The tokenization
+and redemption commands resolve this from `-s` via `[assets.equities]`, so it no
+longer has to be passed by hand; the table is kept for reference and
+cross-checking. Current addresses:
 
 | Symbol | Unwrapped Token Address                      |
 | ------ | -------------------------------------------- |
@@ -52,11 +54,11 @@ Alpaca dashboard to confirm the order filled before proceeding.
 
 ```
 stox alpaca-tokenize -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38 \
   -r 0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6
 ```
 
-- `-t` is the unwrapped token contract address (see table above)
+- The tokenized-equity address is resolved from `-s` via `[assets.equities]`, so
+  it never has to be entered by hand
 - `-r` is the wallet that receives the minted tokens -- **always specify this**.
   Use the Fireblocks liquidity address
   (`0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6`)
@@ -86,7 +88,6 @@ stox buy -s COIN -q 10
 
 ```
 stox alpaca-tokenize -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38 \
   -r <dividend turnkey wallet address>
 ```
 
@@ -109,8 +110,7 @@ Reverse of buying and minting: redeem tokens offchain, then sell the shares.
 **Step 1: Redeem tokens**
 
 ```
-stox alpaca-redeem -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38
+stox alpaca-redeem -s COIN -q 10
 ```
 
 **Step 2: Sell shares offchain**

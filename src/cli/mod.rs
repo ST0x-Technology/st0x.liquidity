@@ -519,15 +519,13 @@ pub enum Commands {
     /// This is an isolated test command that only interacts with Alpaca's API,
     /// without any Raindex/vault operations.
     AlpacaTokenize {
-        /// Stock symbol (e.g., AAPL, TSLA)
+        /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
+        /// address from `[assets.equities]`
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
         /// Number of shares to tokenize (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Token contract address (to verify balance after tokenization)
-        #[arg(short = 't', long = "token")]
-        token: Address,
         /// Recipient wallet address (defaults to configured wallet address)
         #[arg(short = 'r', long = "recipient")]
         recipient: Option<Address>,
@@ -539,15 +537,13 @@ pub enum Commands {
     /// This is an isolated test command that only interacts with Alpaca's API,
     /// without any Raindex/vault operations.
     AlpacaRedeem {
-        /// Stock symbol (e.g., AAPL, TSLA)
+        /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
+        /// address from `[assets.equities]`
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
         /// Number of shares to redeem (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Token contract address
-        #[arg(short = 't', long = "token")]
-        token: Address,
         /// Alpaca redemption wallet (overrides [tokenization] config)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
@@ -969,13 +965,11 @@ enum ProviderCommand {
     AlpacaTokenize {
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
         recipient: Option<Address>,
     },
     AlpacaRedeem {
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
         redemption_wallet: Option<Address>,
     },
     AlpacaTokenizationRequests,
@@ -1119,23 +1113,19 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::AlpacaTokenize {
             symbol,
             quantity,
-            token,
             recipient,
         } => Err(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            token,
             recipient,
         }),
         Commands::AlpacaRedeem {
             symbol,
             quantity,
-            token,
             redemption_wallet,
         } => Err(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
-            token,
             redemption_wallet,
         }),
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
@@ -1507,29 +1497,18 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            token,
             recipient,
         } => {
-            rebalancing::alpaca_tokenize_command(
-                stdout, symbol, quantity, token, recipient, ctx, provider,
-            )
-            .await
+            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, recipient, ctx, provider)
+                .await
         }
         ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
-            token,
             redemption_wallet,
         } => {
-            rebalancing::alpaca_redeem_command(
-                stdout,
-                symbol,
-                quantity,
-                token,
-                redemption_wallet,
-                ctx,
-            )
-            .await
+            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, redemption_wallet, ctx)
+                .await
         }
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
