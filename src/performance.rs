@@ -30,14 +30,22 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
+use st0x_event_sorcery::{EntityList, Reactor, deps};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use st0x_event_sorcery::{EntityList, Reactor, deps};
+use st0x_dto::{
+    HedgeCycleReport, HedgeCycleStatus, HedgeLatencies, LatencyBucket, LatencyStats,
+    LatencySummary, OpenExposureReport, StageLatencies,
+};
 use st0x_execution::Symbol;
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
 use crate::position::{Position, PositionEvent, TradeId};
+
+/// Waterfall rows returned per report; the full cycle count is still
+/// reported via `total_cycles`.
+const MAX_CYCLE_REPORTS: usize = 100;
 
 /// Per-symbol hedge performance assembled from the read-model tables.
 #[derive(Debug, Clone)]
@@ -164,15 +172,28 @@ pub(crate) enum PerformanceError {
 /// cycles from `hedge_cycle`, and open exposure recomputed by [`uncovered_fills`]
 /// from `hedge_fill` + `hedge_cycle` + `hedge_attribution_reset`. Symbols are
 /// emitted in deterministic (ascending) order.
+///
+/// `range` filters `hedge_fill` rows by `seen_at` and `hedge_cycle` rows by
+/// `placed_at` in SQL, using the existing per-column indexes. Open exposure is
+/// always recomputed unconditionally because it reflects the present unhedged
+/// state regardless of the requested time window.
 pub(crate) async fn load_hedge_performance(
     pool: &SqlitePool,
+    range: &ReportRange,
 ) -> Result<Vec<SymbolPerformance>, PerformanceError> {
     let mut by_symbol: BTreeMap<Symbol, SymbolAccumulator> = BTreeMap::new();
 
-    let fill_rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT symbol, block_timestamp, seen_at FROM hedge_fill ORDER BY id")
-            .fetch_all(pool)
-            .await?;
+    let from = range.from.to_rfc3339();
+    let to = range.to.to_rfc3339();
+
+    let fill_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT symbol, block_timestamp, seen_at FROM hedge_fill \
+         WHERE seen_at >= ? AND seen_at <= ? ORDER BY id",
+    )
+    .bind(&from)
+    .bind(&to)
+    .fetch_all(pool)
+    .await?;
 
     for (symbol, block_timestamp, seen_at) in fill_rows {
         let symbol: Symbol = match symbol.parse() {
@@ -200,8 +221,11 @@ pub(crate) async fn load_hedge_performance(
          hs.submitted_at, hc.filled_at, hc.failed_at \
          FROM hedge_cycle hc \
          LEFT JOIN hedge_submission hs ON hs.offchain_order_id = hc.offchain_order_id \
+         WHERE hc.placed_at >= ? AND hc.placed_at <= ? \
          ORDER BY hc.placed_at, hc.offchain_order_id",
     )
+    .bind(&from)
+    .bind(&to)
     .fetch_all(pool)
     .await?;
 
@@ -222,6 +246,28 @@ pub(crate) async fn load_hedge_performance(
         }
     }
 
+    // Open exposure reflects the present unhedged state and must surface even
+    // for a symbol whose fills all predate the requested window. Open exposure
+    // can only originate from a `hedge_fill` row, so seed every distinct fill
+    // symbol (date-unfiltered) before recomputing -- otherwise a quiet
+    // instrument carrying live exposure but no in-window activity would be
+    // dropped, contradicting this function's documented contract.
+    let exposure_symbols: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT symbol FROM hedge_fill")
+            .fetch_all(pool)
+            .await?;
+
+    for raw_symbol in exposure_symbols {
+        match raw_symbol.parse::<Symbol>() {
+            Ok(symbol) => {
+                by_symbol.entry(symbol).or_default();
+            }
+            Err(error) => {
+                warn!(%error, raw_symbol = %raw_symbol, "hedge_fill row has invalid symbol, skipping");
+            }
+        }
+    }
+
     // Recompute open exposure per symbol from the durable, append-only tables.
     // The uncovered pool is a pure replay of hedge_fill + hedge_cycle +
     // hedge_attribution_reset, so the read model needs no in-memory state and
@@ -231,8 +277,16 @@ pub(crate) async fn load_hedge_performance(
         accumulator.open_exposure = open_exposure(&uncovered);
     }
 
+    // Keep only symbols with in-window activity or live open exposure. Symbols
+    // seeded solely to evaluate exposure but found fully hedged would otherwise
+    // surface as empty rows.
     Ok(by_symbol
         .into_iter()
+        .filter(|(_, accumulator)| {
+            !accumulator.fills.is_empty()
+                || !accumulator.cycles.is_empty()
+                || accumulator.open_exposure.is_some()
+        })
         .map(|(symbol, accumulator)| SymbolPerformance {
             symbol,
             fills: accumulator.fills,
@@ -792,6 +846,224 @@ fn covered_fills(uncovered: &[UncoveredFill]) -> Option<CoveredFills> {
     })
 }
 
+/// Inclusive time range a latency report covers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReportRange {
+    pub(crate) from: DateTime<Utc>,
+    pub(crate) to: DateTime<Utc>,
+}
+
+impl ReportRange {
+    /// An all-encompassing range that matches every timestamp in the database.
+    ///
+    /// Used in tests that want to load the full read model without windowing.
+    /// Uses year 1000 and year 9000 as sentinels: far enough from any test
+    /// timestamp that the SQL WHERE clause is effectively a no-op, while
+    /// remaining within the RFC 3339 / SQLite text-comparison range.
+    #[cfg(test)]
+    pub(crate) fn all_time() -> Self {
+        use chrono::TimeZone;
+        Self {
+            from: Utc.with_ymd_and_hms(1000, 1, 1, 0, 0, 0).unwrap(),
+            to: Utc.with_ymd_and_hms(9000, 1, 1, 0, 0, 0).unwrap(),
+        }
+    }
+
+    fn contains(&self, timestamp: DateTime<Utc>) -> bool {
+        self.from <= timestamp && timestamp <= self.to
+    }
+
+    /// Bucket width mirroring the P&L tab's cadence: daily up to a month,
+    /// weekly up to half a year, otherwise ~monthly.
+    ///
+    /// Uses the P&L tab's INCLUSIVE day count -- `floor(span_in_days) + 1` --
+    /// stepping up past 31 and 183 days, rather than the exclusive span. A
+    /// range whose endpoints are exactly 31 (or 183) days apart spans 32 (184)
+    /// calendar days, so it must already step to the coarser cadence, matching
+    /// the P&L tab at the exact boundary.
+    fn bucket_width(&self) -> Duration {
+        let inclusive_days = (self.to - self.from).num_days() + 1;
+        if inclusive_days <= 31 {
+            Duration::days(1)
+        } else if inclusive_days <= 183 {
+            Duration::days(7)
+        } else {
+            Duration::days(30)
+        }
+    }
+}
+
+/// Latency samples (in milliseconds) for each pipeline stage.
+#[derive(Debug, Default)]
+struct StageSamples {
+    detection: Vec<i64>,
+    decision: Vec<i64>,
+    submission: Vec<i64>,
+    execution: Vec<i64>,
+    exposure_window: Vec<i64>,
+}
+
+impl StageSamples {
+    fn push_cycle(&mut self, cycle: &HedgeCycle) {
+        let stages = [
+            (&mut self.decision, cycle.decision_latency()),
+            (&mut self.submission, cycle.submission_latency()),
+            (&mut self.execution, cycle.execution_latency()),
+            (&mut self.exposure_window, cycle.exposure_window()),
+        ];
+        for (samples, latency) in stages {
+            if let Some(latency) = latency {
+                // The HedgeCycle latency methods already clamp to
+                // Duration::zero(), so num_milliseconds() is non-negative
+                // here. No secondary clamp needed.
+                samples.push(latency.num_milliseconds());
+            }
+        }
+    }
+
+    fn into_stage_latencies(mut self) -> StageLatencies {
+        StageLatencies {
+            detection: latency_stats(&mut self.detection),
+            decision: latency_stats(&mut self.decision),
+            submission: latency_stats(&mut self.submission),
+            execution: latency_stats(&mut self.execution),
+            exposure_window: latency_stats(&mut self.exposure_window),
+        }
+    }
+}
+
+/// Assemble the dashboard latency report from per-symbol performance.
+///
+/// Fills are windowed by `seen_at`, cycles by `placed_at`. Open exposures
+/// reflect the present state regardless of the requested range.
+pub(crate) fn hedge_latency_report(
+    performances: &[SymbolPerformance],
+    range: &ReportRange,
+) -> HedgeLatencies {
+    let width = range.bucket_width();
+    let bucket_index = |timestamp: DateTime<Utc>| -> i64 {
+        (timestamp - range.from).num_seconds() / width.num_seconds()
+    };
+
+    let mut summary_samples = StageSamples::default();
+    let mut bucket_samples: BTreeMap<i64, StageSamples> = BTreeMap::new();
+    let mut cycles = Vec::new();
+    let mut open_exposures = Vec::new();
+    let mut fill_count = 0;
+
+    for performance in performances {
+        for fill in &performance.fills {
+            if !range.contains(fill.seen_at) {
+                continue;
+            }
+            fill_count += 1;
+            let latency_ms = fill.detection_latency().num_milliseconds();
+            summary_samples.detection.push(latency_ms);
+            bucket_samples
+                .entry(bucket_index(fill.seen_at))
+                .or_default()
+                .detection
+                .push(latency_ms);
+        }
+
+        for cycle in &performance.cycles {
+            if !range.contains(cycle.placed_at) {
+                continue;
+            }
+            summary_samples.push_cycle(cycle);
+            bucket_samples
+                .entry(bucket_index(cycle.placed_at))
+                .or_default()
+                .push_cycle(cycle);
+            cycles.push(cycle_report(&performance.symbol, cycle));
+        }
+
+        if let Some(open) = &performance.open_exposure {
+            open_exposures.push(OpenExposureReport {
+                symbol: performance.symbol.clone(),
+                fill_count: open.fill_count,
+                oldest_fill_block_timestamp: open.oldest_block_timestamp,
+            });
+        }
+    }
+
+    cycles.sort_unstable_by_key(|cycle| std::cmp::Reverse(cycle.placed_at));
+    let total_cycles = cycles.len();
+    cycles.truncate(MAX_CYCLE_REPORTS);
+
+    let buckets = bucket_samples
+        .into_iter()
+        .map(|(index, samples)| LatencyBucket {
+            start: range.from + Duration::seconds(width.num_seconds() * index),
+            stages: samples.into_stage_latencies(),
+        })
+        .collect();
+
+    HedgeLatencies {
+        summary: LatencySummary {
+            fill_count,
+            stages: summary_samples.into_stage_latencies(),
+        },
+        buckets,
+        cycles,
+        total_cycles,
+        open_exposures,
+    }
+}
+
+fn cycle_report(symbol: &Symbol, cycle: &HedgeCycle) -> HedgeCycleReport {
+    let (status, completed_at) = match cycle.outcome {
+        HedgeOutcome::Pending => (HedgeCycleStatus::Pending, None),
+        HedgeOutcome::Filled { filled_at } => (HedgeCycleStatus::Filled, Some(filled_at)),
+        HedgeOutcome::Failed { failed_at } => (HedgeCycleStatus::Failed, Some(failed_at)),
+    };
+
+    HedgeCycleReport {
+        symbol: symbol.clone(),
+        offchain_order_id: cycle.offchain_order_id.as_uuid(),
+        placed_at: cycle.placed_at,
+        covered_fill_count: cycle.covered.as_ref().map_or(0, |covered| covered.count),
+        earliest_fill_block_timestamp: cycle
+            .covered
+            .as_ref()
+            .map(|covered| covered.earliest_block_timestamp),
+        submitted_at: cycle.submitted_at,
+        status,
+        completed_at,
+        decision_ms: cycle
+            .decision_latency()
+            .map(|latency| latency.num_milliseconds()),
+        submission_ms: cycle
+            .submission_latency()
+            .map(|latency| latency.num_milliseconds()),
+        execution_ms: cycle
+            .execution_latency()
+            .map(|latency| latency.num_milliseconds()),
+        exposure_window_ms: cycle
+            .exposure_window()
+            .map(|latency| latency.num_milliseconds()),
+    }
+}
+
+/// Nearest-rank percentiles over the given samples; `None` when empty.
+fn latency_stats(samples_ms: &mut [i64]) -> Option<LatencyStats> {
+    samples_ms.sort_unstable();
+    let len = samples_ms.len();
+    let nearest_rank = |numerator: usize, denominator: usize| -> Option<i64> {
+        let rank = (numerator * len).div_ceil(denominator).max(1);
+        samples_ms.get(rank - 1).copied()
+    };
+
+    Some(LatencyStats {
+        p50_ms: nearest_rank(1, 2)?,
+        p90_ms: nearest_rank(9, 10)?,
+        p95_ms: nearest_rank(19, 20)?,
+        p99_ms: nearest_rank(99, 100)?,
+        max_ms: samples_ms.last().copied()?,
+        sample_count: len,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
@@ -877,7 +1149,9 @@ mod tests {
                 .unwrap();
         }
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let performance = report
             .into_iter()
             .find(|performance| performance.symbol == symbol)
@@ -948,7 +1222,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let performance = &report[0];
 
         assert!(performance.open_exposure.is_none());
@@ -1108,7 +1384,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         assert_eq!(report[0].cycles.len(), 1);
         let cycle = &report[0].cycles[0];
         assert_eq!(cycle.decision_latency(), Some(Duration::seconds(5)));
@@ -1201,7 +1479,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let cycle = &report[0].cycles[0];
         assert_eq!(
             cycle.outcome,
@@ -1299,7 +1579,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
 
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].symbol, symbol());
@@ -1330,7 +1612,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
 
         assert_eq!(report.len(), 2);
         assert_eq!(report[0].symbol, Symbol::new("AAPL").unwrap());
@@ -1372,7 +1656,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let cycle = &report[0].cycles[0];
         assert_eq!(cycle.submitted_at, Some(timestamp(2)));
     }
@@ -1404,7 +1690,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let cycle = &report[0].cycles[0];
         let covered = cycle.covered.as_ref().unwrap();
         assert_eq!(covered.count, 1);
@@ -1438,10 +1726,411 @@ mod tests {
 
         // No reactor instance is alive. The read path alone must report the
         // single post-placement fill as open exposure.
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let open = report[0].open_exposure.as_ref().unwrap();
         assert_eq!(open.fill_count, 1);
         assert_eq!(open.oldest_block_timestamp, timestamp(40));
+    }
+
+    #[test]
+    fn latency_stats_uses_nearest_rank() {
+        let stats = latency_stats(&mut (1..=100).collect::<Vec<_>>()).unwrap();
+
+        assert_eq!(stats.p50_ms, 50);
+        assert_eq!(stats.p90_ms, 90);
+        assert_eq!(stats.p95_ms, 95);
+        assert_eq!(stats.p99_ms, 99);
+        assert_eq!(stats.max_ms, 100);
+        assert_eq!(stats.sample_count, 100);
+    }
+
+    #[test]
+    fn latency_stats_single_sample_is_every_percentile() {
+        let stats = latency_stats(&mut [42]).unwrap();
+
+        assert_eq!(stats.p50_ms, 42);
+        assert_eq!(stats.p90_ms, 42);
+        assert_eq!(stats.p95_ms, 42);
+        assert_eq!(stats.p99_ms, 42);
+        assert_eq!(stats.max_ms, 42);
+        assert_eq!(stats.sample_count, 1);
+    }
+
+    #[test]
+    fn latency_stats_empty_is_none() {
+        assert_eq!(latency_stats(&mut []), None);
+    }
+
+    fn report_range(from_offset: i64, to_offset: i64) -> ReportRange {
+        ReportRange {
+            from: timestamp(from_offset),
+            to: timestamp(to_offset),
+        }
+    }
+
+    /// Drive `Position` events through the reactor and return the full
+    /// per-symbol report, the input the report-assembly layer consumes.
+    async fn report_performances(events: Vec<PositionEvent>) -> Vec<SymbolPerformance> {
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        for event in events {
+            harness.receive::<Position>(symbol(), event).await.unwrap();
+        }
+
+        load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn report_windows_fills_and_cycles_by_range() {
+        let order_id = OffchainOrderId::new();
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        harness
+            .receive::<Position>(symbol(), fill_event(1, 0, 5))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), placed_event(order_id, 10))
+            .await
+            .unwrap();
+        harness
+            .receive::<OffchainOrder>(
+                order_id,
+                OffchainOrderEvent::Submitted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("broker-1"),
+                    submitted_at: timestamp(11),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), position_filled_event(order_id, 12))
+            .await
+            .unwrap();
+        // Outside the window below.
+        harness
+            .receive::<Position>(symbol(), fill_event(2, 100_000, 100_005))
+            .await
+            .unwrap();
+
+        let performances = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
+        let report = hedge_latency_report(&performances, &report_range(0, 1_000));
+
+        assert_eq!(report.summary.fill_count, 1);
+        assert_eq!(report.total_cycles, 1);
+        assert_eq!(report.cycles.len(), 1);
+        assert_eq!(
+            report.summary.stages.detection.as_ref().unwrap().p50_ms,
+            5_000
+        );
+        assert_eq!(
+            report
+                .summary
+                .stages
+                .exposure_window
+                .as_ref()
+                .unwrap()
+                .p50_ms,
+            12_000
+        );
+        // The out-of-window fill still counts as present open exposure.
+        let open = &report.open_exposures[0];
+        assert_eq!(open.fill_count, 1);
+        assert_eq!(open.oldest_fill_block_timestamp, timestamp(100_000));
+    }
+
+    /// Verify that `load_hedge_performance` excludes fills and cycles outside
+    /// the requested range at the SQL level, not just in-memory. A fill with
+    /// `seen_at` and a cycle with `placed_at` both outside the narrow range
+    /// must be absent from the returned `SymbolPerformance`.
+    #[tokio::test]
+    async fn sql_range_filter_excludes_out_of_range_fills_and_cycles() {
+        let in_range_order = OffchainOrderId::new();
+        let out_of_range_order = OffchainOrderId::new();
+
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        // In-range fill (seen_at = timestamp(5), inside [0, 1_000]).
+        harness
+            .receive::<Position>(symbol(), fill_event(1, 0, 5))
+            .await
+            .unwrap();
+        // In-range cycle (placed_at = timestamp(10), inside [0, 1_000]).
+        harness
+            .receive::<Position>(symbol(), placed_event(in_range_order, 10))
+            .await
+            .unwrap();
+
+        // Out-of-range fill (seen_at = timestamp(100_005), outside [0, 1_000]).
+        harness
+            .receive::<Position>(symbol(), fill_event(2, 100_000, 100_005))
+            .await
+            .unwrap();
+        // Out-of-range cycle (placed_at = timestamp(200_000), outside [0, 1_000]).
+        harness
+            .receive::<Position>(symbol(), placed_event(out_of_range_order, 200_000))
+            .await
+            .unwrap();
+
+        let narrow_range = report_range(0, 1_000);
+        let performances = load_hedge_performance(&pool, &narrow_range).await.unwrap();
+        let perf = performances
+            .iter()
+            .find(|perf| perf.symbol == symbol())
+            .unwrap();
+
+        // SQL filter must have excluded the out-of-range fill.
+        assert_eq!(perf.fills.len(), 1, "only the in-range fill must be loaded");
+        assert_eq!(perf.fills[0].seen_at, timestamp(5));
+
+        // SQL filter must have excluded the out-of-range cycle.
+        assert_eq!(
+            perf.cycles.len(),
+            1,
+            "only the in-range cycle must be loaded"
+        );
+        assert_eq!(perf.cycles[0].placed_at, timestamp(10));
+    }
+
+    /// Open exposure must surface for a symbol whose only fill predates the
+    /// requested window and was never covered by a cycle. Loading with the
+    /// SQL range filter must not drop the symbol just because it has no
+    /// in-window fills or cycles -- the unhedged exposure is a live risk
+    /// signal regardless of the window.
+    #[tokio::test]
+    async fn open_exposure_surfaces_for_symbol_with_only_out_of_window_fills() {
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        // The symbol's only fill is far outside [0, 1_000] and is never covered
+        // by a cycle, so the symbol carries open exposure but zero in-window
+        // activity.
+        harness
+            .receive::<Position>(symbol(), fill_event(1, 100_000, 100_005))
+            .await
+            .unwrap();
+
+        let narrow_range = report_range(0, 1_000);
+        let performances = load_hedge_performance(&pool, &narrow_range).await.unwrap();
+
+        let perf = performances
+            .iter()
+            .find(|perf| perf.symbol == symbol())
+            .expect("symbol with live open exposure must surface despite no in-window activity");
+
+        assert_eq!(
+            perf.fills.len(),
+            0,
+            "the out-of-window fill is range-excluded"
+        );
+        assert_eq!(perf.cycles.len(), 0, "no cycles exist for the symbol");
+        let open = perf
+            .open_exposure
+            .as_ref()
+            .expect("the uncovered out-of-window fill must produce open exposure");
+        assert_eq!(open.fill_count, 1);
+        assert_eq!(open.oldest_block_timestamp, timestamp(100_000));
+    }
+
+    /// A symbol whose out-of-window fill was fully covered by an out-of-window
+    /// cycle carries no open exposure and has no in-window data, so it must NOT
+    /// appear as an empty row in a narrow-window report.
+    #[tokio::test]
+    async fn fully_hedged_symbol_with_no_in_window_activity_is_absent() {
+        let order_id = OffchainOrderId::new();
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        // Fill and its covering placement both land outside [0, 1_000]. The
+        // placement covers the fill, so no open exposure remains.
+        harness
+            .receive::<Position>(symbol(), fill_event(1, 100_000, 100_005))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), placed_event(order_id, 100_010))
+            .await
+            .unwrap();
+
+        let narrow_range = report_range(0, 1_000);
+        let performances = load_hedge_performance(&pool, &narrow_range).await.unwrap();
+
+        assert!(
+            performances.iter().all(|perf| perf.symbol != symbol()),
+            "a fully hedged symbol with no in-window activity must not surface as an empty row"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_buckets_fills_by_day() {
+        let day = 86_400;
+        let performances = report_performances(vec![
+            fill_event(1, 0, 2),
+            fill_event(2, 3 * day, 3 * day + 4),
+        ])
+        .await;
+
+        let report = hedge_latency_report(&performances, &report_range(0, 10 * day));
+
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].start, timestamp(0));
+        assert_eq!(report.buckets[1].start, timestamp(3 * day));
+        assert_eq!(
+            report.buckets[0].stages.detection.as_ref().unwrap().p50_ms,
+            2_000
+        );
+        assert_eq!(
+            report.buckets[1].stages.detection.as_ref().unwrap().p50_ms,
+            4_000
+        );
+    }
+
+    #[tokio::test]
+    async fn report_buckets_weekly_for_ranges_over_a_month() {
+        let day = 86_400;
+        let performances = report_performances(vec![
+            fill_event(1, 0, 2),
+            fill_event(2, 10 * day, 10 * day + 4),
+        ])
+        .await;
+
+        let report = hedge_latency_report(&performances, &report_range(0, 60 * day));
+
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].start, timestamp(0));
+        assert_eq!(report.buckets[1].start, timestamp(7 * day));
+    }
+
+    #[tokio::test]
+    async fn report_buckets_monthly_for_ranges_over_half_a_year() {
+        let day = 86_400;
+        let performances = report_performances(vec![
+            fill_event(1, 0, 2),
+            fill_event(2, 45 * day, 45 * day + 4),
+        ])
+        .await;
+
+        let report = hedge_latency_report(&performances, &report_range(0, 300 * day));
+
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].start, timestamp(0));
+        assert_eq!(report.buckets[1].start, timestamp(30 * day));
+    }
+
+    /// A range whose endpoints are EXACTLY 31 days apart spans 32 inclusive
+    /// calendar days, so it must step from daily to weekly -- matching the P&L
+    /// tab's `> 31` inclusive-day threshold. The old exclusive-span logic
+    /// (`span <= 31 days`) stayed daily here, diverging from P&L.
+    #[test]
+    fn bucket_width_steps_to_weekly_at_exactly_31_days() {
+        let day = 86_400;
+        assert_eq!(report_range(0, 31 * day).bucket_width(), Duration::days(7));
+        // One day short: inclusive count 31, still daily.
+        assert_eq!(report_range(0, 30 * day).bucket_width(), Duration::days(1));
+    }
+
+    /// A range whose endpoints are EXACTLY 183 days apart spans 184 inclusive
+    /// calendar days, so it must step from weekly to monthly -- matching the
+    /// P&L tab's `> 183` threshold. The old logic stayed weekly here.
+    #[test]
+    fn bucket_width_steps_to_monthly_at_exactly_183_days() {
+        let day = 86_400;
+        assert_eq!(
+            report_range(0, 183 * day).bucket_width(),
+            Duration::days(30)
+        );
+        // One day short: inclusive count 183, still weekly.
+        assert_eq!(report_range(0, 182 * day).bucket_width(), Duration::days(7));
+    }
+
+    #[tokio::test]
+    async fn report_caps_cycle_rows_but_counts_all() {
+        let events = (0..=i64::try_from(MAX_CYCLE_REPORTS).unwrap())
+            .map(|index| placed_event(OffchainOrderId::new(), index))
+            .collect();
+
+        let performances = report_performances(events).await;
+        let report = hedge_latency_report(&performances, &report_range(0, 1_000));
+
+        assert_eq!(report.total_cycles, MAX_CYCLE_REPORTS + 1);
+        assert_eq!(report.cycles.len(), MAX_CYCLE_REPORTS);
+    }
+
+    #[tokio::test]
+    async fn report_clamps_negative_stage_latencies_to_zero() {
+        let order_id = OffchainOrderId::new();
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        harness
+            .receive::<Position>(symbol(), fill_event(1, 0, 1))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), placed_event(order_id, 3))
+            .await
+            .unwrap();
+        // Broker clock skew: submitted before placed.
+        harness
+            .receive::<OffchainOrder>(
+                order_id,
+                OffchainOrderEvent::Submitted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("broker-1"),
+                    submitted_at: timestamp(1),
+                },
+            )
+            .await
+            .unwrap();
+
+        let performances = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
+        let report = hedge_latency_report(&performances, &report_range(0, 1_000));
+
+        let submission = report.summary.stages.submission.as_ref().unwrap();
+        assert_eq!(submission.p50_ms, 0);
+        assert_eq!(submission.max_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn report_orders_cycles_newest_first() {
+        let first = OffchainOrderId::new();
+        let second = OffchainOrderId::new();
+        let performances = report_performances(vec![
+            fill_event(1, 0, 1),
+            placed_event(first, 5),
+            fill_event(2, 10, 11),
+            placed_event(second, 20),
+        ])
+        .await;
+
+        let report = hedge_latency_report(&performances, &report_range(0, 1_000));
+
+        assert_eq!(report.cycles.len(), 2);
+        assert_eq!(report.cycles[0].placed_at, timestamp(20));
+        assert_eq!(report.cycles[1].placed_at, timestamp(5));
+        assert_eq!(report.cycles[0].status, HedgeCycleStatus::Pending);
+    }
+
+    #[test]
+    fn report_empty_input_has_no_stats() {
+        let report = hedge_latency_report(&[], &report_range(0, 1_000));
+
+        assert_eq!(report.summary.fill_count, 0);
+        assert_eq!(report.total_cycles, 0);
+        assert_eq!(report.summary.stages.detection, None);
+        assert_eq!(report.buckets.len(), 0);
+        assert_eq!(report.cycles.len(), 0);
+        assert_eq!(report.open_exposures.len(), 0);
     }
 
     /// Multiple fills accumulate into one batch and a single placement
@@ -1528,7 +2217,9 @@ mod tests {
         assert_eq!(stored, Some((timestamp(3).to_rfc3339(),)));
 
         // But with no cycle row, the report has nothing to attach it to.
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         assert!(report.is_empty());
     }
 
@@ -1557,7 +2248,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result = load_hedge_performance(&pool).await.unwrap();
+        let result = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].symbol, Symbol::new("TSLA").unwrap());
         assert!(result[0].cycles.is_empty());
@@ -1586,7 +2279,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result = load_hedge_performance(&pool).await.unwrap();
+        let result = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let tsla = result
             .iter()
             .find(|perf| perf.symbol == Symbol::new("TSLA").unwrap());
@@ -1625,7 +2320,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result = load_hedge_performance(&pool).await.unwrap();
+        let result = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let tsla = result
             .iter()
             .find(|perf| perf.symbol == Symbol::new("TSLA").unwrap());
@@ -1682,7 +2379,9 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let result = load_hedge_performance(&pool).await.unwrap();
+        let result = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let tsla = result
             .iter()
             .find(|perf| perf.symbol == Symbol::new("TSLA").unwrap());
@@ -1728,7 +2427,9 @@ mod tests {
 
         // The report still loads: the malformed row is skipped, the valid fill
         // survives, and open exposure counts only the valid fill.
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let aapl = report
             .iter()
             .find(|perf| perf.symbol == symbol())
@@ -1772,7 +2473,9 @@ mod tests {
 
         // The report still loads: the malformed cycle is skipped everywhere and
         // the valid fill remains open exposure.
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let aapl = report
             .iter()
             .find(|perf| perf.symbol == symbol())
@@ -1809,7 +2512,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let cycle = &report[0].cycles[0];
         assert_eq!(
             cycle.outcome,
@@ -1854,7 +2559,9 @@ mod tests {
             .unwrap();
         assert_eq!(fill_count, 1);
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         // One fill observation, and the open exposure counts a single fill.
         assert_eq!(report[0].fills.len(), 1);
         let open = report[0].open_exposure.as_ref().unwrap();
@@ -1882,7 +2589,9 @@ mod tests {
             .await
             .unwrap();
 
-        let before = load_hedge_performance(&pool).await.unwrap();
+        let before = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         assert_eq!(before[0].cycles.len(), 1);
         assert!(before[0].open_exposure.is_none());
 
@@ -1892,7 +2601,9 @@ mod tests {
             .await
             .unwrap();
 
-        let after = load_hedge_performance(&pool).await.unwrap();
+        let after = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         // Still exactly one cycle, still covering the original fill, still no
         // open exposure: the redelivery changed nothing.
         assert_eq!(after[0].cycles.len(), 1);
@@ -1939,7 +2650,9 @@ mod tests {
 
         // The read path alone must drop the pre-reset fill and report only the
         // post-reset fill as open exposure.
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let open = report[0].open_exposure.as_ref().unwrap();
         assert_eq!(open.fill_count, 1);
         assert_eq!(open.oldest_block_timestamp, timestamp(40));
@@ -1974,7 +2687,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
         let cycle = &report[0].cycles[0];
         // The fix: submitted_at survives even though Submitted preceded the
         // placement. Before the durable hedge_submission table, the UPDATE-only

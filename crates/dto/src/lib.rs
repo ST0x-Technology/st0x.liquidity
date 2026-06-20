@@ -10,6 +10,7 @@ use std::path::Path;
 use ts_rs::TS;
 
 mod inventory;
+mod performance;
 mod position;
 mod settings;
 mod statement;
@@ -17,6 +18,7 @@ mod trade;
 mod transfer;
 
 pub use inventory::*;
+pub use performance::*;
 pub use position::*;
 pub use settings::*;
 pub use statement::*;
@@ -68,6 +70,14 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     UsdcBridgeOperation::export_all_to(out_dir)?;
     UsdcBridgeStatus::export_all_to(out_dir)?;
     TransferWarning::export_all_to(out_dir)?;
+    HedgeLatencies::export_all_to(out_dir)?;
+    LatencySummary::export_all_to(out_dir)?;
+    StageLatencies::export_all_to(out_dir)?;
+    LatencyStats::export_all_to(out_dir)?;
+    LatencyBucket::export_all_to(out_dir)?;
+    HedgeCycleReport::export_all_to(out_dir)?;
+    HedgeCycleStatus::export_all_to(out_dir)?;
+    OpenExposureReport::export_all_to(out_dir)?;
     std::fs::write(out_dir.join("StatementGuard.ts"), Statement::guard_ts())
         .map_err(ts_rs::ExportError::Io)?;
 
