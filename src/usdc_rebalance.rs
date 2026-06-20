@@ -113,10 +113,19 @@ pub(crate) enum TransferRef {
 }
 
 /// Direction of the USDC rebalancing operation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum RebalanceDirection {
     AlpacaToBase,
     BaseToAlpaca,
+}
+
+impl From<RebalanceDirection> for st0x_dto::UsdcBridgeDirection {
+    fn from(direction: RebalanceDirection) -> Self {
+        match direction {
+            RebalanceDirection::AlpacaToBase => Self::AlpacaToBase,
+            RebalanceDirection::BaseToAlpaca => Self::BaseToAlpaca,
+        }
+    }
 }
 
 /// Why an operator reconciled a USDC rebalance stranded in the post-burn
@@ -1044,7 +1053,7 @@ impl UsdcRebalance {
                 amount,
                 burn_tx_hash: Some(_),
                 ..
-            } => Some((direction.clone(), *amount)),
+            } => Some((*direction, *amount)),
             _ => None,
         }
     }
@@ -1078,7 +1087,7 @@ impl UsdcRebalance {
             | Self::DepositInitiated { direction, .. }
             | Self::DepositConfirmed { direction, .. }
             | Self::DepositFailed { direction, .. }
-            | Self::Reconciled { direction, .. } => direction.clone(),
+            | Self::Reconciled { direction, .. } => *direction,
         }
     }
 
@@ -1147,7 +1156,7 @@ impl UsdcRebalance {
                 burn_tx_hash: Some(_),
                 failed_at,
                 ..
-            } => Some((direction.clone(), *amount, *failed_at)),
+            } => Some((*direction, *amount, *failed_at)),
             // Guard-holding in-progress states: self-recover via
             // reactor/apalis once resumed; seeding would wedge
             // `DepositConfirmed`.
@@ -1308,7 +1317,7 @@ impl EventSourced for UsdcRebalance {
                 order_id,
                 initiated_at,
             } => Some(Self::Converting {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 order_id: order_id.clone(),
                 initiated_at: *initiated_at,
@@ -1320,7 +1329,7 @@ impl EventSourced for UsdcRebalance {
                 from_block,
                 submitting_at,
             } => Some(Self::WithdrawalSubmitting {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *submitting_at,
@@ -1332,7 +1341,7 @@ impl EventSourced for UsdcRebalance {
                 withdrawal_ref,
                 initiated_at,
             } => Some(Self::Withdrawing {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *initiated_at,
@@ -1359,7 +1368,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::DepositConfirmed { initiated_at, .. },
             ) => Self::Converting {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 order_id: order_id.clone(),
                 initiated_at: *initiated_at,
@@ -1378,7 +1387,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::ConversionComplete {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 filled_amount: *filled_amount,
                 initiated_at: *initiated_at,
@@ -1394,7 +1403,7 @@ impl EventSourced for UsdcRebalance {
                     initiated_at,
                 },
             ) => Self::ConversionFailed {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 order_id: order_id.clone(),
                 reason: reason.clone(),
@@ -1411,7 +1420,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::WithdrawalSubmitting {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *filled_amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
@@ -1426,7 +1435,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Withdrawing {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *initiated_at,
@@ -1441,7 +1450,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Withdrawing {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *filled_amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *initiated_at,
@@ -1459,7 +1468,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::WithdrawalComplete {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 initiated_at: *initiated_at,
                 confirmed_at: *confirmed_at,
@@ -1475,7 +1484,7 @@ impl EventSourced for UsdcRebalance {
                     initiated_at,
                 },
             ) => Self::WithdrawalFailed {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 reason: reason.clone(),
@@ -1496,7 +1505,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::BridgingSubmitting {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
@@ -1516,7 +1525,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Bridging {
-                direction: direction.clone(),
+                direction: *direction,
                 // Carry the actual burned amount (what was received after Alpaca
                 // withdrawal fees) into post-burn states so DTOs, recovery
                 // classification, and reconciliation see what was really burned,
@@ -1540,7 +1549,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Bridging {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 initiated_at: *initiated_at,
@@ -1570,7 +1579,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Attested {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
@@ -1595,7 +1604,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) if burn_tx_hash == state_burn_tx_hash => Self::AwaitingAttestation {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 initiated_at: *initiated_at,
@@ -1618,7 +1627,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Bridged {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
@@ -1647,7 +1656,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Bridged {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
@@ -1695,7 +1704,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::BridgingFailed {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
@@ -1718,7 +1727,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::DepositInitiated {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount_received,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -1741,7 +1750,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::DepositConfirmed {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -1764,7 +1773,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::DepositFailed {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -1798,7 +1807,7 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
             ) => Self::Reconciled {
-                direction: direction.clone(),
+                direction: *direction,
                 amount: *amount,
                 reason: *reason,
                 initiated_at: *initiated_at,
@@ -1979,7 +1988,7 @@ impl UsdcRebalance {
         use UsdcRebalanceEvent::*;
         match self {
             Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
-                direction: direction.clone(),
+                direction: *direction,
                 filled_amount,
                 converted_at: Utc::now(),
             }]),
@@ -2029,7 +2038,7 @@ impl UsdcRebalance {
             });
         }
         Ok(vec![ConversionInitiated {
-            direction: direction.clone(),
+            direction: *direction,
             amount: *amount,
             order_id,
             initiated_at: Utc::now(),
@@ -2534,7 +2543,7 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
             Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
-                direction: direction.clone(),
+                direction: *direction,
                 deposit_confirmed_at: Utc::now(),
             }]),
             Self::DepositConfirmed { .. }
@@ -2619,7 +2628,7 @@ impl UsdcRebalance {
                 amount,
                 initiated_at,
                 ..
-            } => (direction.clone(), *amount, *initiated_at),
+            } => (*direction, *amount, *initiated_at),
             Self::BridgingFailed {
                 direction,
                 amount,
@@ -2628,7 +2637,7 @@ impl UsdcRebalance {
                 initiated_at,
                 ..
             } if burn_tx_hash.is_some() || cctp_nonce.is_some() => {
-                (direction.clone(), *amount, *initiated_at)
+                (*direction, *amount, *initiated_at)
             }
             _ => {
                 return Err(UsdcRebalanceError::InvalidCommand {

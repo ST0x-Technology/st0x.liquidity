@@ -55,7 +55,7 @@ pub(super) struct UsdcRebalanceTracking {
 /// the USDC physically leaves. Both `UsdcRebalanceTracking::source_venue` and the
 /// restart-safe operator-reconciliation path (which has no tracking instance to
 /// call the method on) derive from this, so the two cannot drift.
-fn source_venue(direction: &RebalanceDirection) -> Venue {
+fn source_venue(direction: RebalanceDirection) -> Venue {
     match direction {
         RebalanceDirection::AlpacaToBase => Venue::Hedging,
         RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
@@ -64,7 +64,7 @@ fn source_venue(direction: &RebalanceDirection) -> Venue {
 
 impl UsdcRebalanceTracking {
     pub(super) fn source_venue(&self) -> Venue {
-        source_venue(&self.direction)
+        source_venue(self.direction)
     }
 
     fn source_transfer_started(&self) -> bool {
@@ -773,7 +773,7 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
         *inventory = inventory
             .clone()
-            .clear_usdc_inflight(source_venue(direction), now)?;
+            .clear_usdc_inflight(source_venue(*direction), now)?;
         drop(inventory);
 
         Ok(())
@@ -814,7 +814,7 @@ impl RebalancingService {
         let mut tracking = self.usdc_tracking.write().await;
         if let Some(existing) = tracking.get_mut(id) {
             let tracking_entry = UsdcRebalanceTracking {
-                direction: direction.clone(),
+                direction: *direction,
                 initiated_amount: amount,
                 bridged_amount_received: existing.bridged_amount_received,
                 stage,
@@ -845,7 +845,7 @@ impl RebalancingService {
         drop(tracking);
 
         let tracking_entry = UsdcRebalanceTracking {
-            direction: direction.clone(),
+            direction: *direction,
             initiated_amount: amount,
             bridged_amount_received: None,
             stage,
@@ -895,7 +895,7 @@ impl RebalancingService {
         let mut tracking = self.usdc_tracking.write().await;
 
         if let Some(existing) = tracking.get_mut(id) {
-            existing.direction = direction.clone();
+            existing.direction = *direction;
             if !existing.source_transfer_started() {
                 existing.initiated_amount = amount;
             }
@@ -905,7 +905,7 @@ impl RebalancingService {
         }
 
         let tracking_entry = UsdcRebalanceTracking {
-            direction: direction.clone(),
+            direction: *direction,
             initiated_amount: amount,
             bridged_amount_received: None,
             stage,
