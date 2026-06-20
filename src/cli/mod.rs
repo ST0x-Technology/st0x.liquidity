@@ -29,6 +29,7 @@ use st0x_finance::Usdc;
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::performance::rebalance::RebalanceTimingProjection;
+use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::vault_registry::VaultRegistry;
@@ -93,6 +94,10 @@ pub enum AggregateView {
     /// Rebalance stage-timing read model (rebalance_stage_timing). Replays every
     /// `UsdcRebalance` event stream through the reactor fold. Supports `--all` only.
     RebalanceTiming,
+    /// Lifecycle-failure read model (lifecycle_failure_event). Replays every
+    /// failure across all four subscribed streams through the reactor fold.
+    /// Supports `--all` only.
+    LifecycleFailure,
 }
 
 /// CCTP chain identifier for specifying source chain.
@@ -1420,6 +1425,25 @@ async fn rebuild_view<W: Write>(
                 "Rebuilt rebalance stage-timing read model ({replayed} events replayed)"
             )?;
         }
+        AggregateView::LifecycleFailure => {
+            if id.is_some() {
+                anyhow::bail!(
+                    "lifecycle-failure rebuild replays the whole read model; pass --all, not --id"
+                );
+            }
+
+            if !all {
+                anyhow::bail!("lifecycle-failure rebuild replays the whole read model; pass --all");
+            }
+
+            let replayed = LifecycleFailureProjection::new(pool.clone())
+                .rebuild_all()
+                .await?;
+            writeln!(
+                stdout,
+                "Rebuilt lifecycle-failure read model ({replayed} events replayed)"
+            )?;
+        }
     }
 
     Ok(())
@@ -1569,10 +1593,12 @@ async fn run_provider_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash, address};
+    use chrono::Utc;
     use clap::{CommandFactory, Parser};
     use url::Url;
 
     use super::*;
+    use crate::offchain::order::OffchainOrderEvent;
     use crate::test_utils::{positive_shares, setup_test_db};
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
@@ -2298,6 +2324,98 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "rebalance-timing rebuild replays the whole read model; pass --all, not --id"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_lifecycle_failure_requires_all() {
+        let pool = setup_test_db().await;
+        let mut stdout_buffer = Vec::new();
+
+        let error = rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::LifecycleFailure,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "lifecycle-failure rebuild replays the whole read model; pass --all"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_lifecycle_failure_rejects_id() {
+        let pool = setup_test_db().await;
+        let mut stdout_buffer = Vec::new();
+
+        let error = rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::LifecycleFailure,
+            Some("AAPL".to_string()),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "lifecycle-failure rebuild replays the whole read model; pass --all, not --id"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_lifecycle_failure_rebuilds_from_event_log() {
+        let pool = setup_test_db().await;
+        let order_id = OffchainOrderId::new();
+
+        // Seed a real OffchainOrder failure event so the rebuild has something to
+        // fold. The replay path deserializes events.payload, so it must be a
+        // genuine serialized OffchainOrderEvent, not a hand-written shape.
+        let failed = OffchainOrderEvent::Failed {
+            error: "rejected".to_string(),
+            failed_at: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('OffchainOrder', ?, 1, 'OffchainOrderEvent::Failed', '1', ?, '{}')",
+        )
+        .bind(order_id.to_string())
+        .bind(serde_json::to_string(&failed).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut stdout_buffer = Vec::new();
+        rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::LifecycleFailure,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("Rebuilt lifecycle-failure read model (1 events replayed)"),
+            "unexpected rebuild output: {output}"
+        );
+
+        let failure_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_failure_event")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            failure_rows, 1,
+            "the rebuild folded the one seeded failure event into the read model"
         );
     }
 

@@ -579,6 +579,10 @@ impl Conductor {
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
 
+        // Catch the lifecycle-failure read model up to the event log before its
+        // OffchainOrder reactor (registered below) goes live, in both modes.
+        catch_up_lifecycle_failures(&pool).await?;
+
         // The HedgeLatencyProjection subscribes to BOTH Position and
         // OffchainOrder (see its deps!). This instance, registered on the
         // OffchainOrder store, handles only OffchainOrderEvent::Submitted to
@@ -1301,6 +1305,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             replayed = rebalance_timing_replayed,
             "Rebalance stage-timing read model caught up to the event log at startup"
         );
+
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
             broadcaster,
@@ -1457,6 +1462,25 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             resume_tokenization_queue,
         })
     })
+}
+
+/// Catches the lifecycle-failure read model up to the event log before its
+/// reactor goes live. Runs in BOTH trading modes: the projection subscribes to
+/// OffchainOrder, which is active even in standalone/hedging-only mode, so a
+/// hedging-only deploy must replay its failure history too -- not just the
+/// rebalancing path. Idempotent via the dedup insert, so re-running cannot
+/// duplicate rows.
+async fn catch_up_lifecycle_failures(pool: &SqlitePool) -> anyhow::Result<()> {
+    let replayed = LifecycleFailureProjection::new(pool.clone())
+        .catch_up()
+        .await?;
+    info!(
+        target: "reliability",
+        replayed,
+        "Lifecycle-failure read model caught up to the event log at startup"
+    );
+
+    Ok(())
 }
 
 /// Builds the wrapped and unwrapped equity-recovery aggregate stores.
