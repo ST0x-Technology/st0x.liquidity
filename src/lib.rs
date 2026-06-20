@@ -50,6 +50,10 @@ mod inventory;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+// Forward-dead until RAI-991 (branch rai-991-performance-latency-endpoint) adds
+// the /performance/latencies endpoint that consumes this read model.
+#[allow(dead_code)]
+mod performance;
 mod position;
 mod position_check;
 mod rebalancing;
