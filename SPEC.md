@@ -821,6 +821,30 @@ streams. Views and snapshots are derived from retained event streams;
 observational aggregates may use snapshots as the durable source for compacted
 pre-snapshot history only when allowed by the compaction eligibility policy.
 
+##### Invariant: read models rebuild from the event log
+
+The event store is the **ultimate source of truth**. Every read model is a pure,
+deterministic function of the retained event streams and MUST be reconstructable
+by replaying them. This holds for cqrs-es materialized views **and** for
+reactor-maintained read models (e.g. the rebalance stage-timing table): each
+fold must depend only on event payloads -- never on processing-time wall-clock,
+nor on which events a live subscriber happened to observe -- so that replaying
+the log reproduces byte-identical state (replay-equals-live). No read model may
+hold state that cannot be rebuilt from events.
+
+A reactor-maintained read model that satisfies this invariant is therefore not
+"best-effort until someone rebuilds it". It catches up from a persisted
+per-stream checkpoint at startup (replaying only events past the checkpoint, so
+a restart never re-folds the whole history) and can be fully rebuilt on demand
+(truncate + replay). A dropped live event, table drift, or even a dropped table
+is then recoverable from the event log, never permanent. A new read model must
+provide this replay path -- startup catch-up plus a full rebuild -- before the
+system relies on it.
+
+The rebalance stage-timing table provides this path today. The hedge-latency
+table does not yet: it is still forward-only/best-effort and must gain the same
+startup catch-up plus full rebuild before it can claim this invariant.
+
 ##### Key Flow
 
 ```mermaid
