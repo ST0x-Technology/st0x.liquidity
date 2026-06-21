@@ -306,14 +306,21 @@ Workspace crates:
   conductor, dashboard backend, and CLI
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
-- **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
-  helpers, snapshot-backed loading, compactable observational event streams, and
-  testing utilities
+- **`st0x-event-sorcery`** (git dependency) - CQRS/event-sourcing helpers,
+  snapshot-backed loading, compactable observational event streams, and testing
+  utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
-  abstraction with Alpaca Broker API and mock implementations
+  abstraction with Alpaca Broker API, Alpaca wallet ops, and mock implementations
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
-- **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
+- **`st0x-raindex`** (`crates/raindex/`) - Rain OrderBook V6 abstraction with
+  `Raindex` trait for vault deposit/withdraw operations
+- **`st0x-wrapper`** (`crates/wrapper/`) - ERC-4626 wrap/unwrap abstractions
+  with `Wrapper` trait and ratio math
+- **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, ABI bindings (IERC20,
+  IPyth), chain/token constants, and test-chain support
+- **`st0x-config`** (`crates/config/`) - Configuration loading and runtime
+  context assembly; restricted to server and CLI binaries
 - **`st0x-finance`** (`crates/finance/`) - Shared financial primitives:
   `Symbol`, `FractionalShares`, `Usdc`, `Usd`, and related domain types
 - **`st0x-float-serde`** (`crates/float-serde/`) - Shared Rain Float formatting
