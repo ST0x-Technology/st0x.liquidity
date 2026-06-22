@@ -5,40 +5,51 @@
 //! stages) recorded as CQRS events from cosmetic log noise, and surfaces
 //! apalis queue backlogs and retry pressure.
 //!
-//! Lifecycle failure events are maintained forward-only by
-//! [`LifecycleFailureProjection`], which subscribes to the `OffchainOrder`,
-//! `UsdcRebalance`, `EquityRedemption`, and `TokenizedEquityMint` event
-//! streams and records one row per failure event into `lifecycle_failure_event`.
-//! [`load_failure_events`] reads ONLY that table and never folds the `events`
-//! table. The log-aggregation and job-queue-health read paths read their own
-//! sources (structured logs, the apalis `Jobs` table) and are left untouched.
+//! Lifecycle failure events are maintained by [`LifecycleFailureProjection`],
+//! which subscribes to the `OffchainOrder`, `UsdcRebalance`, `EquityRedemption`,
+//! and `TokenizedEquityMint` event streams and records one row per failure event
+//! into `lifecycle_failure_event`. [`load_failure_events`] reads ONLY that table
+//! and never folds the `events` table. The log-aggregation and job-queue-health
+//! read paths read their own sources (structured logs, the apalis `Jobs` table)
+//! and are left untouched.
 //!
-//! Forward-only: the reactor processes only events emitted after construction.
-//! There is NO startup backfill of pre-existing history. A single event is
-//! dropped from the read model if it cannot be persisted -- whether a crash
-//! between the source event committing and this reactor's INSERT, or the INSERT
-//! itself erroring (contention, disk full). The drop is logged at error level
-//! with the event's type and timestamp so an operator can reconcile from the
-//! event log. It is deliberately NOT retried: `lifecycle_failure_event` has no
-//! idempotency key, so a retry after a partially-applied write would
-//! double-count a money-at-risk failure. This best-effort guarantee matches the
-//! `Broadcaster` reactor.
+//! Checkpointed catch-up: [`LifecycleFailureProjection::catch_up`] runs at
+//! startup, before the live reactor consumes events, replaying every failure
+//! across all four streams past each aggregate's persisted checkpoint
+//! (`lifecycle_failure_checkpoint`). The live reactor is forward-only WHILE
+//! running, but an event it drops (a crash between an event being persisted and
+//! this table being updated) is replayed on the next startup -- so the read
+//! model converges on the event log instead of staying best-effort until someone
+//! rebuilds.
+//!
+//! Rebuildable: each failure row is a pure function of an event payload (the
+//! mappers read the event's own `failed_at`/`timed_out_at`, never a
+//! processing-time clock) and is written with `ON CONFLICT DO NOTHING` on its
+//! `(aggregate_type, aggregate_id, event_type, occurred_at)` identity, so
+//! replaying the log reproduces the exact rows live processing produced -- no
+//! duplicates. The live reactor has no access to the event `sequence` (the
+//! `Reactor` trait only passes the domain event), so the dedup key is that
+//! identity tuple rather than the sequence, and the checkpoint advances only on
+//! the replay/catch-up path. [`LifecycleFailureProjection::rebuild_all`]
+//! truncates both tables and re-folds every stream. That replay-equals-live
+//! property is what makes this a valid CQRS/ES projection: the event log stays
+//! the single source of truth.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::warn;
 
 use st0x_dto::{
     CountedLogLevel, FailureEventCount, FailureEventType, JobQueueHealth, LogTargetCount,
     LogVolumeBucket,
 };
 
-use st0x_event_sorcery::{EntityList, Reactor, deps};
+use st0x_event_sorcery::{EntityList, EventSourced, Reactor, deps};
 
 use super::{PerformanceError, ReportRange};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
@@ -117,38 +128,252 @@ deps!(
     ]
 );
 
+/// The dedup insert: one row per distinct failure event, keyed by event
+/// identity. Both the live reactor and the replay path write through it, so
+/// re-folding an already-recorded failure is a no-op rather than a duplicate.
+const INSERT_FAILURE_SQL: &str = "INSERT INTO lifecycle_failure_event (aggregate_type, aggregate_id, event_type, occurred_at) \
+     VALUES (?, ?, ?, ?) \
+     ON CONFLICT(aggregate_type, aggregate_id, event_type, occurred_at) DO NOTHING";
+
 impl LifecycleFailureProjection {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
-    /// Record a money-at-risk failure event. Non-failure events map to `None`
-    /// and are ignored. The canonical discriminator string is stored so the
-    /// read path can recover the `FailureEventType`.
+    /// Record a live failure event. Non-failure events map to `None` and are
+    /// ignored. Writes through the same dedup insert the replay path uses, so a
+    /// later catch-up that re-folds this event is a no-op rather than a duplicate.
+    /// The live reactor has no event `sequence`, so it leaves the
+    /// `lifecycle_failure_checkpoint` untouched -- only replay advances it.
     async fn record(
         &self,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        failure: Option<(FailureEventType, DateTime<Utc>)>,
+    ) -> Result<(), FailureProjectionError> {
+        // The reactor sees every event on four high-volume streams but only
+        // failures produce a row, so skip the write transaction entirely for the
+        // common non-failure case rather than opening and committing an empty one.
+        if failure.is_none() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        Self::insert_failure_tx(&mut tx, aggregate_type, aggregate_id, failure).await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Catches the read model up to the event log, then returns events folded.
+    ///
+    /// Replays only events past each aggregate's stored checkpoint, so a restart
+    /// re-folds the small tail emitted since the last catch-up rather than the
+    /// whole history. Run at startup, before the live reactor begins consuming
+    /// events: this seeds the table after a fresh deploy and recovers anything the
+    /// forward-only live path dropped in the previous run.
+    pub(crate) async fn catch_up(&self) -> Result<u64, FailureProjectionError> {
+        let mut tx = self.pool.begin().await?;
+
+        let replayed = Self::replay_pending(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(replayed)
+    }
+
+    /// Rebuilds the entire lifecycle-failure read model from the event log.
+    ///
+    /// Truncates both the failure table and its checkpoints, then re-folds every
+    /// stream from scratch via [`Self::replay_pending`] (empty checkpoints mean
+    /// every event is past `COALESCE(last_sequence, 0)`). Use to repair a
+    /// corrupted read model when an incremental [`Self::catch_up`] is not enough.
+    /// Runs in one transaction: a failure mid-rebuild rolls back, never leaving a
+    /// half-rebuilt table. Returns the number of events folded.
+    pub(crate) async fn rebuild_all(&self) -> Result<u64, FailureProjectionError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM lifecycle_failure_event")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM lifecycle_failure_checkpoint")
+            .execute(&mut *tx)
+            .await?;
+        let replayed = Self::replay_pending(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(replayed)
+    }
+
+    /// Folds every event past its aggregate's checkpoint into the read model,
+    /// advancing each aggregate's checkpoint as it goes.
+    ///
+    /// Reads all four subscribed aggregate types' events past their per-aggregate
+    /// `lifecycle_failure_checkpoint`, maps each to its failure signal (if any),
+    /// inserts the failure idempotently, and advances the checkpoint. The fold
+    /// reads only event payloads (no processing-time clock) and dedups by event
+    /// identity, so replaying reproduces the exact rows live processing produced.
+    /// The `LEFT JOIN` yields only un-folded events, so a steady-state catch-up
+    /// reads just the tail.
+    ///
+    /// A row whose payload cannot be parsed is skipped with a warning rather than
+    /// propagated: a single poison row must not brick startup (or the
+    /// `rebuild_all` repair path, which calls this too). The skip is non-silent by
+    /// construction -- a poison row caps its aggregate's checkpoint at the last
+    /// sequence before the gap, so the poison row, and every event after it on
+    /// that aggregate, is re-scanned (and re-warned) on every catch-up until the
+    /// corrupt payload is repaired in the `events` table. Parseable failures after
+    /// the gap are still folded, so no failure is silently dropped; the dedup
+    /// insert makes the repeated re-fold a no-op. `rebuild_all` cannot repair a
+    /// corrupt payload -- only fixing or deleting the offending `events` row can.
+    /// Database errors still propagate -- they are infrastructure failures, not
+    /// poison rows. Returns the count of events folded this pass (non-failures
+    /// count too); the same tail re-counts each pass while a poison gap persists.
+    async fn replay_pending(
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> Result<u64, FailureProjectionError> {
+        let pending: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT event.aggregate_type, event.aggregate_id, event.sequence, event.payload \
+             FROM events event \
+             LEFT JOIN lifecycle_failure_checkpoint checkpoint \
+               ON checkpoint.aggregate_type = event.aggregate_type \
+              AND checkpoint.aggregate_id = event.aggregate_id \
+             WHERE event.aggregate_type IN (?, ?, ?, ?) \
+               AND event.sequence > COALESCE(checkpoint.last_sequence, 0) \
+             ORDER BY event.aggregate_type, event.aggregate_id, event.sequence ASC",
+        )
+        .bind(OffchainOrder::AGGREGATE_TYPE)
+        .bind(UsdcRebalance::AGGREGATE_TYPE)
+        .bind(EquityRedemption::AGGREGATE_TYPE)
+        .bind(TokenizedEquityMint::AGGREGATE_TYPE)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let mut replayed: u64 = 0;
+        // Events arrive grouped by aggregate in ascending sequence. Track the
+        // aggregate currently being folded so a poison row can cap that
+        // aggregate's checkpoint at the last sequence before the gap.
+        let mut current_aggregate: Option<(String, String)> = None;
+        let mut aggregate_poisoned = false;
+
+        for (aggregate_type, aggregate_id, sequence, payload) in pending {
+            let same_aggregate =
+                current_aggregate
+                    .as_ref()
+                    .is_some_and(|(current_type, current_id)| {
+                        current_type == &aggregate_type && current_id == &aggregate_id
+                    });
+            if !same_aggregate {
+                current_aggregate = Some((aggregate_type.clone(), aggregate_id.clone()));
+                aggregate_poisoned = false;
+            }
+
+            let failure = match map_failure(&aggregate_type, &payload) {
+                Ok(failure) => failure,
+                Err(error) => {
+                    warn!(
+                        %aggregate_type,
+                        %aggregate_id,
+                        sequence,
+                        %error,
+                        "Skipping unparseable lifecycle-failure event payload"
+                    );
+                    aggregate_poisoned = true;
+                    continue;
+                }
+            };
+
+            Self::insert_failure_tx(tx, &aggregate_type, &aggregate_id, failure).await?;
+            replayed += 1;
+
+            // Stop advancing the checkpoint once a poison row has gapped this
+            // aggregate's stream, so the gap is re-scanned every catch-up instead
+            // of silently skipped past. The fold above still records parseable
+            // failures after the gap; the dedup insert makes the re-fold a no-op.
+            if !aggregate_poisoned {
+                Self::advance_checkpoint_tx(tx, &aggregate_type, &aggregate_id, sequence).await?;
+            }
+        }
+
+        Ok(replayed)
+    }
+
+    /// Idempotent failure insert shared by the live (`record`) and replay paths.
+    async fn insert_failure_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        aggregate_type: &str,
+        aggregate_id: &str,
         failure: Option<(FailureEventType, DateTime<Utc>)>,
     ) -> Result<(), FailureProjectionError> {
         let Some((event_type, occurred_at)) = failure else {
             return Ok(());
         };
-        sqlx::query("INSERT INTO lifecycle_failure_event (event_type, occurred_at) VALUES (?, ?)")
+        sqlx::query(INSERT_FAILURE_SQL)
+            .bind(aggregate_type)
+            .bind(aggregate_id)
             .bind(event_type.as_str())
             .bind(occurred_at.to_rfc3339())
-            .execute(&self.pool)
-            .await
-            .inspect_err(|error| {
-                error!(
-                    ?error,
-                    event_type = event_type.as_str(),
-                    %occurred_at,
-                    "failed to persist lifecycle failure event; this money-at-risk \
-                     failure is dropped from the reliability read model (the source \
-                     event remains in the event log for reconciliation)"
-                );
-            })?;
+            .execute(&mut **tx)
+            .await?;
 
         Ok(())
+    }
+
+    /// Advances an aggregate's replay checkpoint to `sequence`, monotonically.
+    ///
+    /// The `MAX` guard means a lower or out-of-order `sequence` can never regress
+    /// a checkpoint, so correctness does not depend on the caller folding events
+    /// in ascending order -- a future reordering or second caller cannot silently
+    /// rewind the checkpoint and trigger a redundant re-scan.
+    async fn advance_checkpoint_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+    ) -> Result<(), FailureProjectionError> {
+        sqlx::query(
+            "INSERT INTO lifecycle_failure_checkpoint \
+                 (aggregate_type, aggregate_id, last_sequence) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(aggregate_type, aggregate_id) \
+                 DO UPDATE SET last_sequence = MAX(last_sequence, excluded.last_sequence)",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// Deserializes a raw event payload for `aggregate_type` and maps it to its
+/// failure signal (if any). Returns `Ok(None)` for non-failure events and for an
+/// unknown aggregate type (unreachable given the replay query's `IN` filter).
+fn map_failure(
+    aggregate_type: &str,
+    payload: &str,
+) -> Result<Option<(FailureEventType, DateTime<Utc>)>, serde_json::Error> {
+    if aggregate_type == OffchainOrder::AGGREGATE_TYPE {
+        Ok(offchain_order_failure(&serde_json::from_str(payload)?))
+    } else if aggregate_type == UsdcRebalance::AGGREGATE_TYPE {
+        Ok(usdc_rebalance_failure(&serde_json::from_str(payload)?))
+    } else if aggregate_type == EquityRedemption::AGGREGATE_TYPE {
+        Ok(equity_redemption_failure(&serde_json::from_str(payload)?))
+    } else if aggregate_type == TokenizedEquityMint::AGGREGATE_TYPE {
+        Ok(tokenized_equity_mint_failure(&serde_json::from_str(
+            payload,
+        )?))
+    } else {
+        warn!(
+            %aggregate_type,
+            "lifecycle-failure replay saw an unsubscribed aggregate type; ignoring"
+        );
+        Ok(None)
     }
 }
 
@@ -167,10 +392,38 @@ impl Reactor for LifecycleFailureProjection {
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
         event
-            .on(|_id, event| async move { self.record(offchain_order_failure(&event)).await })
-            .on(|_id, event| async move { self.record(usdc_rebalance_failure(&event)).await })
-            .on(|_id, event| async move { self.record(equity_redemption_failure(&event)).await })
-            .on(|_id, event| async move { self.record(tokenized_equity_mint_failure(&event)).await })
+            .on(|id, event| async move {
+                self.record(
+                    OffchainOrder::AGGREGATE_TYPE,
+                    &id.to_string(),
+                    offchain_order_failure(&event),
+                )
+                .await
+            })
+            .on(|id, event| async move {
+                self.record(
+                    UsdcRebalance::AGGREGATE_TYPE,
+                    &id.to_string(),
+                    usdc_rebalance_failure(&event),
+                )
+                .await
+            })
+            .on(|id, event| async move {
+                self.record(
+                    EquityRedemption::AGGREGATE_TYPE,
+                    &id.to_string(),
+                    equity_redemption_failure(&event),
+                )
+                .await
+            })
+            .on(|id, event| async move {
+                self.record(
+                    TokenizedEquityMint::AGGREGATE_TYPE,
+                    &id.to_string(),
+                    tokenized_equity_mint_failure(&event),
+                )
+                .await
+            })
             .exhaustive()
             .await
     }
@@ -704,8 +957,8 @@ mod tests {
         // risk view must fail loudly rather than silently drop the category.
         let invalid = format!("{}T99:99:99Z", timestamp(100).format("%Y-%m-%d"));
         sqlx::query(
-            "INSERT INTO lifecycle_failure_event (event_type, occurred_at) \
-             VALUES ('OffchainOrderEvent::Failed', $1)",
+            "INSERT INTO lifecycle_failure_event (aggregate_type, aggregate_id, event_type, occurred_at) \
+             VALUES ('OffchainOrder', 'test-aggregate', 'OffchainOrderEvent::Failed', $1)",
         )
         .bind(&invalid)
         .execute(&pool)
@@ -761,10 +1014,11 @@ mod tests {
         let projection = LifecycleFailureProjection::new(pool);
 
         let error = projection
-            .record(Some((
-                FailureEventType::OffchainOrderFailed,
-                timestamp(100),
-            )))
+            .record(
+                OffchainOrder::AGGREGATE_TYPE,
+                &OffchainOrderId::new().to_string(),
+                Some((FailureEventType::OffchainOrderFailed, timestamp(100))),
+            )
             .await
             .unwrap_err();
 
@@ -1063,16 +1317,16 @@ mod tests {
 
         // Insert one row with a bogus event_type and one valid row.
         sqlx::query(
-            "INSERT INTO lifecycle_failure_event (event_type, occurred_at) \
-             VALUES ('NotARealEvent::Nope', $1)",
+            "INSERT INTO lifecycle_failure_event (aggregate_type, aggregate_id, event_type, occurred_at) \
+             VALUES ('OffchainOrder', 'test-aggregate', 'NotARealEvent::Nope', $1)",
         )
         .bind(timestamp(50).to_rfc3339())
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO lifecycle_failure_event (event_type, occurred_at) \
-             VALUES ('OffchainOrderEvent::Failed', $1)",
+            "INSERT INTO lifecycle_failure_event (aggregate_type, aggregate_id, event_type, occurred_at) \
+             VALUES ('OffchainOrder', 'test-aggregate', 'OffchainOrderEvent::Failed', $1)",
         )
         .bind(timestamp(100).to_rfc3339())
         .execute(&pool)
@@ -1244,6 +1498,424 @@ mod tests {
                 failed_at: timestamp(0),
             }
             .event_type()
+        );
+    }
+
+    /// Persists a real event into the store table so the replay path can fold
+    /// it, serializing the event exactly as the event store does.
+    async fn persist_event<E: serde::Serialize + DomainEvent>(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        event: &E,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES (?, ?, ?, ?, '1', ?, '{}')",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event.event_type())
+        .bind(serde_json::to_string(event).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Stages a raw event row with an arbitrary payload -- the only way to stage
+    /// a poison row that no real event could produce.
+    async fn insert_raw_event(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES (?, ?, ?, 'poison', '1', ?, '{}')",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn count_failure_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_failure_event")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Snapshots the failure table by identity so live and rebuilt state compare
+    /// row-for-row.
+    async fn fetch_failure_rows(pool: &SqlitePool) -> Vec<(String, String, String, String)> {
+        sqlx::query_as(
+            "SELECT aggregate_type, aggregate_id, event_type, occurred_at \
+             FROM lifecycle_failure_event \
+             ORDER BY aggregate_type, aggregate_id, event_type, occurred_at",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn fetch_checkpoint(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT last_sequence FROM lifecycle_failure_checkpoint \
+             WHERE aggregate_type = ? AND aggregate_id = ?",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Catch-up folds failures across all four subscribed streams, ignores
+    /// non-failure events (which still advance the checkpoint), and records one
+    /// row per failure.
+    #[tokio::test]
+    async fn catch_up_folds_failures_across_all_four_streams() {
+        let pool = setup_test_db().await;
+        let projection = LifecycleFailureProjection::new(pool.clone());
+
+        let offchain_id = OffchainOrderId::new().to_string();
+        let rebalance_id = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let redemption_id = Uuid::new_v4().to_string();
+        let mint_id = Uuid::new_v4().to_string();
+
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &offchain_id,
+            1,
+            &offchain_order_failed(100),
+        )
+        .await;
+        persist_event(
+            &pool,
+            UsdcRebalance::AGGREGATE_TYPE,
+            &rebalance_id,
+            1,
+            &UsdcRebalanceEvent::WithdrawalFailed {
+                reason: "revert".to_string(),
+                failed_at: timestamp(200),
+            },
+        )
+        .await;
+        // A non-failure event on the rebalance stream: advances the checkpoint
+        // but creates no failure row.
+        persist_event(
+            &pool,
+            UsdcRebalance::AGGREGATE_TYPE,
+            &rebalance_id,
+            2,
+            &UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: timestamp(250),
+                withdrawal_tx: None,
+            },
+        )
+        .await;
+        persist_event(
+            &pool,
+            EquityRedemption::AGGREGATE_TYPE,
+            &redemption_id,
+            1,
+            &EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::Timeout,
+                failed_at: timestamp(300),
+            },
+        )
+        .await;
+        persist_event(
+            &pool,
+            TokenizedEquityMint::AGGREGATE_TYPE,
+            &mint_id,
+            1,
+            &TokenizedEquityMintEvent::MintRejected {
+                reason: "rejected".to_string(),
+                rejected_at: timestamp(400),
+            },
+        )
+        .await;
+
+        let replayed = projection.catch_up().await.unwrap();
+        assert_eq!(
+            replayed, 5,
+            "every event folds (four failures + one non-failure), all advancing checkpoints"
+        );
+
+        assert_eq!(
+            count_failure_rows(&pool).await,
+            4,
+            "one failure row per stream; the non-failure event produces no row"
+        );
+        // The non-failure event still advanced the rebalance checkpoint to 2.
+        assert_eq!(
+            fetch_checkpoint(&pool, UsdcRebalance::AGGREGATE_TYPE, &rebalance_id).await,
+            Some(2),
+            "a non-failure event advances the checkpoint so it is not re-scanned"
+        );
+    }
+
+    /// The production restart path: the live reactor records a failure (no
+    /// checkpoint), and the next startup catch_up re-folds the same event from the
+    /// log -- the dedup insert makes it a no-op, not a duplicate.
+    #[tokio::test]
+    async fn live_then_catch_up_does_not_duplicate_failures() {
+        let pool = setup_test_db().await;
+
+        let harness = ReactorHarness::new(LifecycleFailureProjection::new(pool.clone()));
+        let order_id = OffchainOrderId::new();
+        let order_id_str = order_id.to_string();
+        harness
+            .receive::<OffchainOrder>(order_id, offchain_order_failed(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            count_failure_rows(&pool).await,
+            1,
+            "the live reactor recorded the failure"
+        );
+
+        // The same event is in the log; catch_up re-folds it but the dedup insert
+        // is a no-op.
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &order_id_str,
+            1,
+            &offchain_order_failed(100),
+        )
+        .await;
+        let replayed = LifecycleFailureProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(replayed, 1, "catch_up folds the one logged event");
+        assert_eq!(
+            count_failure_rows(&pool).await,
+            1,
+            "dedup: the live failure is not duplicated by catch_up"
+        );
+    }
+
+    /// Rebuilding from the event log alone reproduces the exact rows live
+    /// processing produced.
+    #[tokio::test]
+    async fn rebuild_all_reproduces_live_state() {
+        let pool = setup_test_db().await;
+
+        let harness = ReactorHarness::new(LifecycleFailureProjection::new(pool.clone()));
+        let order_id = OffchainOrderId::new();
+        let order_id_str = order_id.to_string();
+        let rebalance_id = UsdcRebalanceId(Uuid::new_v4());
+        let rebalance_id_str = rebalance_id.to_string();
+        let withdrawal_failed = UsdcRebalanceEvent::WithdrawalFailed {
+            reason: "revert".to_string(),
+            failed_at: timestamp(200),
+        };
+
+        harness
+            .receive::<OffchainOrder>(order_id, offchain_order_failed(100))
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(rebalance_id, withdrawal_failed.clone())
+            .await
+            .unwrap();
+
+        // The same events in the log for the rebuild to fold.
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &order_id_str,
+            1,
+            &offchain_order_failed(100),
+        )
+        .await;
+        persist_event(
+            &pool,
+            UsdcRebalance::AGGREGATE_TYPE,
+            &rebalance_id_str,
+            1,
+            &withdrawal_failed,
+        )
+        .await;
+
+        let live = fetch_failure_rows(&pool).await;
+        assert_eq!(live.len(), 2, "two live failure rows");
+
+        let replayed = LifecycleFailureProjection::new(pool.clone())
+            .rebuild_all()
+            .await
+            .unwrap();
+        assert_eq!(replayed, 2);
+
+        let rebuilt = fetch_failure_rows(&pool).await;
+        assert_eq!(
+            live, rebuilt,
+            "rebuilding from the event log reproduces the exact live failure rows"
+        );
+    }
+
+    /// A per-aggregate checkpoint means a steady-state catch-up folds only the
+    /// un-folded tail, never re-folding an aggregate already past its checkpoint.
+    #[tokio::test]
+    async fn catch_up_replays_only_events_past_the_checkpoint() {
+        let pool = setup_test_db().await;
+        let projection = LifecycleFailureProjection::new(pool.clone());
+
+        let first_order = OffchainOrderId::new().to_string();
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &first_order,
+            1,
+            &offchain_order_failed(100),
+        )
+        .await;
+
+        let first = projection.catch_up().await.unwrap();
+        assert_eq!(first, 1, "the first catch-up folds the only event");
+        assert_eq!(
+            fetch_checkpoint(&pool, OffchainOrder::AGGREGATE_TYPE, &first_order).await,
+            Some(1)
+        );
+
+        // A second failed order arrives; the first is already past its checkpoint.
+        let second_order = OffchainOrderId::new().to_string();
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &second_order,
+            1,
+            &offchain_order_failed(200),
+        )
+        .await;
+
+        let second = projection.catch_up().await.unwrap();
+        assert_eq!(
+            second, 1,
+            "the second catch-up folds only the new aggregate's tail, not the first"
+        );
+        assert_eq!(count_failure_rows(&pool).await, 2);
+    }
+
+    /// A poison event (valid aggregate type, unparseable payload) is skipped with
+    /// a warning rather than aborting catch_up; valid streams still fold.
+    #[tokio::test]
+    async fn catch_up_skips_unparseable_failure_payload() {
+        let pool = setup_test_db().await;
+
+        let valid_id = OffchainOrderId::new().to_string();
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &valid_id,
+            1,
+            &offchain_order_failed(100),
+        )
+        .await;
+        insert_raw_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &Uuid::new_v4().to_string(),
+            1,
+            "not-valid-json",
+        )
+        .await;
+
+        let replayed = LifecycleFailureProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed, 1,
+            "the valid failure folds; the poison row is skipped, not propagated"
+        );
+        assert_eq!(count_failure_rows(&pool).await, 1);
+    }
+
+    /// Contiguous-sequence checkpoint: a poison row buried between valid events on
+    /// the SAME aggregate caps that aggregate's checkpoint below the gap, so the
+    /// poison (and the tail after it) is re-scanned on every catch-up rather than
+    /// silently skipped past -- and the failure after the gap is still recorded.
+    #[tokio::test]
+    async fn catch_up_caps_checkpoint_below_intra_aggregate_poison_row() {
+        let pool = setup_test_db().await;
+        let aggregate_id = OffchainOrderId::new().to_string();
+
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &aggregate_id,
+            1,
+            &offchain_order_failed(100),
+        )
+        .await;
+        insert_raw_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &aggregate_id,
+            2,
+            "not-valid-json",
+        )
+        .await;
+        persist_event(
+            &pool,
+            OffchainOrder::AGGREGATE_TYPE,
+            &aggregate_id,
+            3,
+            &offchain_order_failed(300),
+        )
+        .await;
+
+        let projection = LifecycleFailureProjection::new(pool.clone());
+
+        let first = projection.catch_up().await.unwrap();
+        assert_eq!(
+            first, 2,
+            "both valid failures (seq 1 and seq 3) fold; the poison row at seq 2 is skipped"
+        );
+        assert_eq!(
+            count_failure_rows(&pool).await,
+            2,
+            "no silent loss: the failure after the poison row is still recorded"
+        );
+        assert_eq!(
+            fetch_checkpoint(&pool, OffchainOrder::AGGREGATE_TYPE, &aggregate_id).await,
+            Some(1),
+            "the checkpoint stops at seq 1, below the poison at seq 2, not advancing to 3"
+        );
+
+        let second = projection.catch_up().await.unwrap();
+        assert_eq!(
+            second, 1,
+            "the poison gap keeps seq 3 in the re-scanned tail rather than skipping past it"
+        );
+        assert_eq!(
+            count_failure_rows(&pool).await,
+            2,
+            "dedup: re-folding seq 3 produces no duplicate row"
+        );
+        assert_eq!(
+            fetch_checkpoint(&pool, OffchainOrder::AGGREGATE_TYPE, &aggregate_id).await,
+            Some(1),
+            "the checkpoint stays capped until the corrupt seq 2 payload is repaired"
         );
     }
 }
