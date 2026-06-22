@@ -2,6 +2,7 @@
 
 import type { AttestationSample } from '$lib/api/AttestationSample'
 import type { BlockLagPoint } from '$lib/api/BlockLagPoint'
+import type { DependencyBucket } from '$lib/api/DependencyBucket'
 import type { HedgeCycleReport } from '$lib/api/HedgeCycleReport'
 import type { LatencyBucket } from '$lib/api/LatencyBucket'
 import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming'
@@ -310,6 +311,28 @@ export const layoutBlockLagTrend = (
       .join(' '),
     maxLagBlocks,
   }
+}
+
+export type DependencySparkBar = {
+  /** Bar height scaled to the slowest bucket's median, in plot units. */
+  height: number
+  hasErrors: boolean
+}
+
+/**
+ * Lays out per-bucket median latency as sparkline bars; buckets containing
+ * errors are flagged so the template can tint them.
+ */
+export const layoutDependencySparkline = (
+  buckets: DependencyBucket[],
+  options: { plotHeight: number },
+): DependencySparkBar[] => {
+  const maxP50 = Math.max(1, ...buckets.map((bucket) => bucket.p50Ms ?? 0))
+
+  return buckets.map((bucket) => ({
+    height: ((bucket.p50Ms ?? 0) / maxP50) * options.plotHeight,
+    hasErrors: bucket.errors > 0,
+  }))
 }
 
 const PERCENTILE_KEYS: PercentileKey[] = ['p50Ms', 'p90Ms', 'p99Ms']

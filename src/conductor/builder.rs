@@ -133,6 +133,7 @@ pub(crate) fn spawn<Prov, Exec>(
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
     job_cleanup: JoinHandle<()>,
+    telemetry_writer: JoinHandle<()>,
 ) -> Conductor
 where
     Prov: Provider + Clone + Send + Sync + 'static,
@@ -372,6 +373,7 @@ where
         supervisor,
         monitor,
         job_cleanup,
+        telemetry_writer,
         shutdown_token: context.shutdown_token,
         apalis_shutdown_token: apalis_shutdown_token_for_struct,
     }

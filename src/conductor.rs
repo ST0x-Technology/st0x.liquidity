@@ -9,7 +9,11 @@ pub(crate) mod monitor;
 mod trading_queues;
 
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
+};
+use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
+use alloy::rpc::client::ClientBuilder;
 use anyhow::Context;
 use apalis::prelude::Status;
 use chrono::{DateTime, Utc};
@@ -24,6 +28,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use st0x_config::{AssetsConfig, BrokerCtx, Ctx, CtxError, ExecutionThreshold, RebalancingCtx};
 use st0x_dto::Statement;
@@ -79,6 +84,9 @@ use crate::rebalancing::{
     to_wrapped_equities,
 };
 use crate::symbol::cache::SymbolCache;
+use crate::telemetry::executor::InstrumentedExecutor;
+use crate::telemetry::rpc::RpcTelemetryLayer;
+use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
@@ -166,6 +174,8 @@ pub(crate) struct Conductor {
     monitor: JoinHandle<Result<(), MonitorTaskError>>,
     /// Periodically removes terminal rows from the persistent job queue.
     job_cleanup: JoinHandle<()>,
+    /// Drains dependency-call telemetry samples into SQLite in batches.
+    telemetry_writer: JoinHandle<()>,
     /// Cancelled by the outer shutdown handler to trigger graceful drain.
     shutdown_token: CancellationToken,
     /// Independent token for apalis — cancelled explicitly in Phase 2 after
@@ -358,18 +368,70 @@ where
     Ok(())
 }
 
-/// Fails startup fast on an RPC endpoint that cannot serve what order-fill
-/// ingestion depends on: basic reachability and a usable `finalized` block tag.
-/// An endpoint that errors on `finalized`, or aliases it to the chain tip
-/// (disabling reorg protection), is rejected here rather than running silently
-/// degraded; a fresh chain with no finalized block yet is allowed through.
-async fn validate_rpc_endpoint<P: Provider>(provider: &P) -> anyhow::Result<()> {
+/// Wires the telemetry channel, instrumented executor, and RPC provider together
+/// and spawns the background writer that drains samples into SQLite.
+///
+/// Returns the instrumented executor, provider (ready for use), and the writer
+/// task handle. Probes the RPC endpoint once to fail fast on misconfiguration
+/// before the rest of startup proceeds: basic reachability plus a usable
+/// `finalized` block tag, which order-fill ingestion depends on for reorg
+/// protection. An endpoint that errors on `finalized`, or aliases it to the
+/// chain tip (disabling reorg protection), is rejected here rather than running
+/// silently degraded; a fresh chain with no finalized block yet is allowed
+/// through. The telemetry sender is held by the executor and RPC layer clones;
+/// when all are dropped the writer exits cleanly.
+/// Provider type returned by `ProviderBuilder::new().connect_client(...)` over
+/// an HTTP transport. Named here to make `setup_instrumentation`'s return type
+/// concrete without coupling callers to `alloy` internals.
+type HttpProvider = FillProvider<
+    JoinFill<
+        Identity,
+        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+    >,
+    RootProvider,
+>;
+
+async fn setup_instrumentation<E>(
+    executor_ctx: impl TryIntoExecutor<Executor = E>,
+    rpc_url: &Url,
+    pool: SqlitePool,
+) -> anyhow::Result<(InstrumentedExecutor<E>, HttpProvider, JoinHandle<()>)>
+where
+    E: Executor,
+{
+    // Telemetry channel: the RPC layer and instrumented executor emit
+    // dependency-call samples through it; the writer task batches them
+    // into SQLite in the background.
+    let (telemetry, telemetry_receiver) = TelemetrySender::channel();
+
+    let executor =
+        InstrumentedExecutor::new(executor_ctx.try_into_executor().await?, telemetry.clone());
+
+    // Single HTTP transport: drives continuous eth_getLogs fill polling
+    // (via the OrderFillMonitor + backfill worker) and all read-only
+    // contract calls. No WebSocket -- see `monitor::order_fills`. The
+    // telemetry layer wraps the transport itself, so every JSON-RPC call
+    // from any provider handle is timed.
+    let rpc_client = ClientBuilder::default()
+        .layer(RpcTelemetryLayer::new(telemetry.clone()))
+        .http(rpc_url.clone());
+    let provider = ProviderBuilder::new().connect_client(rpc_client);
+
+    // The HTTP transport connects lazily, so probe it once at startup to
+    // fail fast on a misconfigured or unreachable RPC rather than only
+    // surfacing it as repeated poll-loop retries. systemd's bounded
+    // restart loop handles a genuinely-down endpoint from here.
     let chain_tip = provider
         .get_block_number()
         .await
         .context("failed to reach RPC endpoint at startup")?;
 
-    match probe_finalized_block_support(provider, chain_tip)
+    // Order-fill ingestion caps at the finalized block, so reject an endpoint
+    // that cannot serve a usable `finalized` tag here rather than running
+    // silently degraded. An endpoint reporting a finalized block at or beyond
+    // the tip is aliasing `finalized` to `latest` and would disable reorg
+    // protection; a fresh chain with no finalized block yet is allowed through.
+    match probe_finalized_block_support(&provider, chain_tip)
         .await
         .context("RPC endpoint cannot serve the `finalized` block tag at startup")?
     {
@@ -378,8 +440,14 @@ async fn validate_rpc_endpoint<P: Provider>(provider: &P) -> anyhow::Result<()> 
              ({chain_tip}); it appears to alias the `finalized` tag to `latest`, \
              which would silently disable reorg protection. Refusing to start"
         ),
-        FinalityProbe::Supported | FinalityProbe::NotYetAvailable => Ok(()),
+        FinalityProbe::Supported | FinalityProbe::NotYetAvailable => {}
     }
+
+    // Drop the original sender here; the executor and RPC layer each hold
+    // a clone. When all clones are eventually dropped, the writer exits.
+    let telemetry_writer = spawn_dependency_call_writer(pool, telemetry_receiver);
+
+    Ok((executor, provider, telemetry_writer))
 }
 
 impl Conductor {
@@ -403,18 +471,9 @@ impl Conductor {
             cqrs: pool,
             apalis: apalis_pool,
         } = pools;
-        let executor = executor_ctx.try_into_executor().await?;
 
-        // Single HTTP transport: drives continuous eth_getLogs fill polling
-        // (via the OrderFillMonitor + backfill worker) and all read-only
-        // contract calls. No WebSocket -- see `monitor::order_fills`.
-        let provider = ProviderBuilder::new().connect_http(ctx.evm.rpc_url.clone());
-
-        // The HTTP transport connects lazily, so validate it once at startup to
-        // fail fast on a misconfigured or unreachable RPC rather than surfacing
-        // it as repeated poll-loop retries. systemd's bounded restart loop
-        // handles a genuinely-down endpoint from here.
-        validate_rpc_endpoint(&provider).await?;
+        let (executor, provider, telemetry_writer) =
+            setup_instrumentation(executor_ctx, &ctx.evm.rpc_url, pool.clone()).await?;
         let cache = SymbolCache::default();
 
         setup_apalis_tables(&apalis_pool).await?;
@@ -639,6 +698,7 @@ impl Conductor {
             .resume_tokenization_queue(resume_tokenization_queue)
             .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
             .job_cleanup(job_cleanup)
+            .telemetry_writer(telemetry_writer)
             .call();
 
         // Publish the recovery handle only after all startup work
@@ -694,17 +754,20 @@ impl Conductor {
             warn!(target: "shutdown", %error, "Supervisor exited with error during drain");
         }
 
-        // Abort remaining non-critical background tasks. Equity and USDC
-        // transfers run as apalis jobs, so their in-flight operations drain
-        // with the rest of the queue in Phase 2.
-        self.abort_background_tasks();
+        // Job cleanup is not a drain target, so stop it now. The telemetry
+        // writer stays up through Phase 2 so dependency samples emitted by
+        // draining apalis jobs are still persisted; it is aborted only once
+        // the drain has completed.
+        self.job_cleanup.abort();
 
         // Phase 2: now that producers are stopped, signal apalis to drain
         // in-flight jobs. The apalis token is independent of the outer
         // shutdown token -- we cancel it explicitly after producers stop.
         info!(target: "shutdown", "Phase 2: draining in-flight jobs");
         self.apalis_shutdown_token.cancel();
-        check_monitor_drain_result((&mut self.monitor).await)
+        let monitor_result = check_monitor_drain_result((&mut self.monitor).await);
+        self.telemetry_writer.abort();
+        monitor_result
     }
 
     /// Abort all conductor tasks (force shutdown fallback).
@@ -719,6 +782,7 @@ impl Conductor {
 
     fn abort_background_tasks(&self) {
         self.job_cleanup.abort();
+        self.telemetry_writer.abort();
     }
 }
 
@@ -2709,6 +2773,7 @@ mod tests {
             supervisor,
             monitor,
             job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
         }
@@ -7348,6 +7413,7 @@ mod tests {
             supervisor,
             monitor,
             job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
         };
@@ -7375,6 +7441,7 @@ mod tests {
             supervisor,
             monitor,
             job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
         };
