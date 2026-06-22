@@ -12,6 +12,7 @@
   import PnlPanel from '$lib/components/pnl-panel.svelte'
   import { getWebSocketUrl, isDashboardMockMode } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
+  import { requestedLogTarget } from '$lib/log-filter-request.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket'
 
   const queryClient = useQueryClient()
@@ -224,7 +225,12 @@
     </main>
   {:else if activeTab.current === 'performance'}
     <main class="flex-1 overflow-hidden p-2 md:p-4">
-      <PerformancePanel />
+      <PerformancePanel
+        onOpenLogs={(target: string) => {
+          requestedLogTarget.update(() => target)
+          activeTab.update(() => 'logs')
+        }}
+      />
     </main>
   {:else}
     <main class="flex-1 overflow-hidden p-2 md:p-4">

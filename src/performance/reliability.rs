@@ -271,7 +271,7 @@ pub(crate) fn aggregate_log_entries(
 ) -> (Vec<LogVolumeBucket>, Vec<LogTargetCount>) {
     let width = range.bucket_width();
     let mut buckets: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
-    let mut targets: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut targets: BTreeMap<(String, String), BTreeMap<i64, usize>> = BTreeMap::new();
 
     for entry in entries {
         let Some(timestamp) = entry["timestamp"]
@@ -295,12 +295,18 @@ pub(crate) fn aggregate_log_entries(
             _ => continue,
         }
 
-        *targets.entry((target, level)).or_default() += 1;
+        *targets
+            .entry((target, level))
+            .or_default()
+            .entry(index)
+            .or_default() += 1;
     }
 
+    let bucket_indices: Vec<i64> = buckets.keys().copied().collect();
+
     let log_buckets = buckets
-        .into_iter()
-        .map(|(index, (errors, warnings))| LogVolumeBucket {
+        .iter()
+        .map(|(&index, &(errors, warnings))| LogVolumeBucket {
             start: range.from + chrono::Duration::seconds(width.num_seconds() * index),
             errors,
             warnings,
@@ -309,10 +315,18 @@ pub(crate) fn aggregate_log_entries(
 
     let mut log_targets: Vec<LogTargetCount> = targets
         .into_iter()
-        .map(|((target, level), count)| LogTargetCount {
-            target,
-            level,
-            count,
+        .map(|((target, level), per_bucket)| {
+            let sparkline: Vec<usize> = bucket_indices
+                .iter()
+                .map(|index| per_bucket.get(index).copied().unwrap_or_default())
+                .collect();
+
+            LogTargetCount {
+                target,
+                level,
+                count: per_bucket.values().sum(),
+                sparkline,
+            }
         })
         .collect();
     log_targets.sort_by(|left, right| right.count.cmp(&left.count));
@@ -453,9 +467,39 @@ mod tests {
                 target: "hedge".to_string(),
                 level: "ERROR".to_string(),
                 count: 2,
+                sparkline: vec![2],
             }
         );
         assert_eq!(targets.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_log_entries_aligns_sparklines_with_buckets() {
+        let day = 86_400;
+        let wide_range = ReportRange {
+            from: timestamp(0),
+            to: timestamp(10 * day),
+        };
+        let entries = vec![
+            log_entry(10, "ERROR", "hedge"),
+            log_entry(3 * day, "WARN", "rebalance"),
+            log_entry(3 * day + 5, "ERROR", "hedge"),
+        ];
+
+        let (buckets, targets) = aggregate_log_entries(&entries, &wide_range);
+
+        assert_eq!(buckets.len(), 2);
+        let hedge_errors = targets
+            .iter()
+            .find(|target| target.target == "hedge")
+            .unwrap();
+        assert_eq!(hedge_errors.sparkline, vec![1, 1]);
+
+        let rebalance_warnings = targets
+            .iter()
+            .find(|target| target.target == "rebalance")
+            .unwrap();
+        assert_eq!(rebalance_warnings.sparkline, vec![0, 1]);
     }
 
     #[test]

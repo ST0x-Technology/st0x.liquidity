@@ -278,6 +278,9 @@ pub struct LogTargetCount {
     pub level: String,
     #[ts(type = "number")]
     pub count: usize,
+    /// Per-bucket counts aligned with the report's `log_buckets`.
+    #[ts(type = "number[]")]
+    pub sparkline: Vec<usize>,
 }
 
 /// Occurrences of one lifecycle failure event type.
