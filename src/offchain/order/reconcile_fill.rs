@@ -139,17 +139,15 @@ impl Job<ReconcileOrderFillCtx> for ReconcileOrderFill {
 mod tests {
     use chrono::Utc;
 
+    use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{
-        ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
-    };
+    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::offchain::order::{noop_order_placer, noop_placed_shares};
+    use crate::offchain::order::noop_placed_shares;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use st0x_config::ExecutionThreshold;
 
     struct TestInfra {
         ctx: ReconcileOrderFillCtx,
@@ -159,7 +157,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let (offchain_order, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build(())
             .await
             .unwrap();
 
@@ -238,7 +236,20 @@ mod tests {
                     shares,
                     direction,
                     executor: SupportedExecutor::DryRun,
-                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                },
+            )
+            .await
+            .unwrap();
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("noop"),
+                    placed_shares: noop_placed_shares(shares),
+                    submitted_at: Utc::now(),
                 },
             )
             .await

@@ -80,11 +80,11 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
 mod tests {
     use chrono::Utc;
 
-    use st0x_execution::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
+    use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderId, noop_order_placer};
+    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderId};
     use crate::onchain_trade::{OnChainTradeCommand, OnChainTradeId};
     use crate::test_utils::setup_test_db;
 
@@ -135,11 +135,10 @@ mod tests {
     #[tokio::test]
     async fn load_trades_includes_offchain_fills() {
         let pool = setup_test_db().await;
-        let order_placer = noop_order_placer();
 
         let (store, _projection) =
             st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer.clone())
+                .build(())
                 .await
                 .unwrap();
 
@@ -153,7 +152,18 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("TEST"),
+                    placed_shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
+                    submitted_at: Utc::now(),
                 },
             )
             .await
@@ -275,11 +285,10 @@ mod tests {
     #[tokio::test]
     async fn load_trades_excludes_unfilled_offchain_orders() {
         let pool = setup_test_db().await;
-        let order_placer = noop_order_placer();
 
         let (store, _projection) =
             st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
                 .await
                 .unwrap();
 
@@ -293,7 +302,6 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
                     direction: Direction::Buy,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
                 },
             )
             .await

@@ -584,7 +584,7 @@ async fn broker_outage_with_submitted_order_halts_bot_and_restart_recovers() -> 
         .call()
         .await?;
 
-    poll_for_aggregate_events_containing(&mut bot, &infra.db_path, "OffchainOrder", "Submitted", 1)
+    poll_for_aggregate_events_containing(&mut bot, &infra.db_path, "OffchainOrder", "Accepted", 1)
         .await;
 
     latency.sever();

@@ -404,7 +404,7 @@ fn assert_offchain_order_events(expected_positions: &[ExpectedPosition], events:
             event_types,
             vec![
                 "OffchainOrderEvent::Placed",
-                "OffchainOrderEvent::Submitted",
+                "OffchainOrderEvent::Accepted",
                 "OffchainOrderEvent::Filled",
             ],
             "OffchainOrder aggregate {order_id} should have exact success event sequence",
