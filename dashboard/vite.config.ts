@@ -137,6 +137,47 @@ const mockApi = () => ({
         return
       }
 
+      if (path === '/performance/latencies') {
+        mockJson(response, {
+          summary: {
+            fillCount: 0,
+            stages: {
+              detection: null,
+              decision: null,
+              submission: null,
+              execution: null,
+              exposureWindow: null,
+            },
+          },
+          buckets: [],
+          cycles: [],
+          totalCycles: 0,
+          openExposures: [],
+        })
+        return
+      }
+
+      if (path === '/performance/rebalances') {
+        mockJson(response, {
+          operations: [],
+          totalOperations: 0,
+          skippedOperations: 0,
+          stageSummary: [],
+          attestationTrend: [],
+        })
+        return
+      }
+
+      if (path === '/performance/reliability') {
+        mockJson(response, {
+          logBuckets: [],
+          logTargets: [],
+          failureEvents: [],
+          jobQueues: [],
+        })
+        return
+      }
+
       goNext()
     })
   }
@@ -154,6 +195,7 @@ export default defineConfig({
           '/orders': backendProxy(),
           '/trades': backendProxy(),
           '/transfers': backendProxy(),
+          '/performance': backendProxy(),
           ...pnlSqlProxy()
         }
   }
