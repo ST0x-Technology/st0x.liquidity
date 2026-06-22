@@ -16,13 +16,16 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_dto::{HedgeLatencies, RebalanceTimings, TradingVenue};
+use st0x_dto::{HedgeLatencies, RebalanceTimings, ReliabilityReport, TradingVenue};
 use st0x_execution::FractionalShares;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
 use crate::performance::rebalance::load_rebalance_timings;
+use crate::performance::reliability::{
+    aggregate_log_entries, load_failure_events, load_job_queue_health,
+};
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
@@ -43,6 +46,9 @@ fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, InvalidT
 static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 const DEFAULT_RAINDEX_ORDERS_PAGE_SIZE: u32 = 50;
 const MAX_RAINDEX_ORDERS_PAGE_SIZE: u32 = 100;
+
+/// Upper bound on ERROR/WARN log entries aggregated per reliability report.
+const MAX_RELIABILITY_LOG_ENTRIES: usize = 50_000;
 
 const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
     Some(val) => val,
@@ -1534,11 +1540,74 @@ async fn performance_rebalances(
     Ok(Json(timings))
 }
 
+async fn performance_reliability(
+    State(state): State<AppState>,
+    Query(query): Query<PerformanceRangeQuery>,
+) -> Result<Json<ReliabilityReport>, StatusCode> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
+    if from >= to {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let range = ReportRange { from, to };
+
+    let (entries, log_entries_truncated) = if let Some(log_dir) = state.ctx.log_dir.as_deref() {
+        let log_dir = log_dir.to_owned();
+        let filter = LogFilter {
+            search_lower: None,
+            levels: Some(vec!["ERROR".to_string(), "WARN".to_string()]),
+            targets: None,
+            since: Some(from),
+            until: Some(to),
+        };
+        // Log scanning is synchronous file I/O; keep it off the async
+        // workers. The cap bounds memory during error storms, slightly
+        // undercounting the noisiest windows rather than exhausting the
+        // dashboard process.
+        let (entries, total, _) = tokio::task::spawn_blocking(move || {
+            read_matching_entries(&log_dir, &filter, 0, MAX_RELIABILITY_LOG_ENTRIES)
+        })
+        .await
+        .inspect_err(|error| error!(%error, "Log aggregation task failed"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let truncated = total > MAX_RELIABILITY_LOG_ENTRIES;
+        if truncated {
+            warn!(
+                total,
+                cap = MAX_RELIABILITY_LOG_ENTRIES,
+                "Reliability log aggregation truncated by entry cap"
+            );
+        }
+        (entries, truncated)
+    } else {
+        (Vec::new(), false)
+    };
+    let (log_buckets, log_targets) = aggregate_log_entries(&entries, &range);
+
+    let failure_events = load_failure_events(&state.pool, &range)
+        .await
+        .inspect_err(|error| error!(%error, "Failed to load failure events"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let job_queues = load_job_queue_health(&state.pool)
+        .await
+        .inspect_err(|error| error!(%error, "Failed to load job queue health"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ReliabilityReport {
+        log_buckets,
+        log_targets,
+        failure_events,
+        job_queues,
+        log_entries_truncated,
+    }))
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
         .route("/performance/rebalances", get(performance_rebalances))
+        .route("/performance/reliability", get(performance_reliability))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
@@ -1561,21 +1630,24 @@ mod tests {
     use alloy::primitives::Address;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use sqlx::SqlitePool;
     use tokio::sync::broadcast;
     use tower::ServiceExt;
 
     use st0x_config::{Ctx, RestApiCtx, create_test_ctx_with_order_owner};
+    use st0x_event_sorcery::ReactorHarness;
 
     use super::*;
     use crate::dashboard;
     use crate::inventory::{self, BroadcastingInventory};
+    use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
+    use crate::performance::reliability::LifecycleFailureProjection;
     use crate::tokenized_equity_mint::issuer_request_id;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        // Use the shared-cache test pool so the apalis `Jobs` table (set up by
+        // `setup_test_db`) is visible to the reliability job-queue-health query.
+        let pool = crate::test_utils::setup_test_db().await;
 
         AppState {
             settings: dashboard::settings_from_ctx(&ctx),
@@ -2033,6 +2105,183 @@ mod tests {
         assert_eq!(report["operations"], serde_json::json!([]));
         assert_eq!(report["stageSummary"], serde_json::json!([]));
         assert_eq!(report["attestationTrend"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn performance_reliability_returns_empty_report_on_fresh_database() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/reliability")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["logBuckets"], serde_json::json!([]));
+        assert_eq!(report["logTargets"], serde_json::json!([]));
+        assert_eq!(report["failureEvents"], serde_json::json!([]));
+        assert_eq!(report["jobQueues"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn performance_reliability_rejects_inverted_range() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/reliability\
+                         ?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_reliability_rejects_equal_range() {
+        // `from == to` is an empty interval and must be rejected with 400,
+        // matching the latencies and rebalances endpoints.
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/reliability\
+                         ?from=2026-01-01T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_reliability_reports_seeded_failures_and_jobs() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let now = chrono::Utc::now();
+
+        // The failure read model reads the reactor-maintained table. Drive the
+        // real reactor path (record()) via the harness rather than a raw
+        // INSERT, so a schema change to record() cannot leave this end-to-end
+        // test green while the live reactor breaks.
+        ReactorHarness::new(LifecycleFailureProjection::new(state.pool.clone()))
+            .receive::<OffchainOrder>(
+                OffchainOrderId::new(),
+                OffchainOrderEvent::Failed {
+                    error: "rejected".to_string(),
+                    failed_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO Jobs (job, id, job_type, status, attempts, run_at) \
+             VALUES ('{}', 'job-1', 'queue::A', 'Pending', 0, 1750000000)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/reliability")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            report["failureEvents"][0]["eventType"],
+            serde_json::json!("OffchainOrderEvent::Failed")
+        );
+        assert_eq!(report["failureEvents"][0]["count"], serde_json::json!(1));
+        assert_eq!(
+            report["jobQueues"][0]["jobType"],
+            serde_json::json!("queue::A")
+        );
+        assert_eq!(report["jobQueues"][0]["pending"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn performance_reliability_aggregates_log_dir_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Three log entries: one ERROR and one WARN within the default 7-day
+        // window, one INFO that must be filtered out.
+        let log_content = concat!(
+            "{\"timestamp\":\"2026-06-15T10:00:00Z\",\"level\":\"ERROR\",",
+            "\"target\":\"hedge\",\"message\":\"crash\"}\n",
+            "{\"timestamp\":\"2026-06-15T10:00:01Z\",\"level\":\"WARN\",",
+            "\"target\":\"rebalance\",\"message\":\"retry\"}\n",
+            "{\"timestamp\":\"2026-06-15T10:00:02Z\",\"level\":\"INFO\",",
+            "\"target\":\"hedge\",\"message\":\"ok\"}",
+        );
+        write_test_logs(temp_dir.path(), "st0x-hedge.log.2026-06-15", log_content);
+
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/reliability\
+                         ?from=2026-06-15T00:00:00Z&to=2026-06-16T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        // Only ERROR and WARN entries appear; INFO is excluded.
+        let buckets = &report["logBuckets"];
+        let targets = &report["logTargets"];
+        assert_eq!(
+            buckets.as_array().unwrap().len(),
+            1,
+            "both entries fall in the same hour -> exactly one bucket"
+        );
+        assert_eq!(buckets[0]["errors"], serde_json::json!(1));
+        assert_eq!(buckets[0]["warnings"], serde_json::json!(1));
+        // Two distinct (target, level) pairs: hedge/ERROR and rebalance/WARN.
+        assert_eq!(targets.as_array().unwrap().len(), 2);
+        // Well under the entry cap, so the partial-data flag must be false.
+        assert_eq!(report["logEntriesTruncated"], serde_json::json!(false));
     }
 
     #[tokio::test]

@@ -63,6 +63,7 @@ use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vau
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
+use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::{Position, PositionCommand, PositionError, TradeId};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
@@ -521,6 +522,7 @@ impl Conductor {
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+                .with(Arc::new(LifecycleFailureProjection::new(pool.clone())))
                 .build(order_placer)
                 .await?;
 
@@ -1217,11 +1219,13 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
         let rebalance_timing = Arc::new(RebalanceTimingProjection::new(deps.pool.clone()));
+        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(deps.pool.clone()));
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            lifecycle_failure,
         );
 
         let built = manifest
