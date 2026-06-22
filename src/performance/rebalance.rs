@@ -12,11 +12,26 @@
 //! reproducing the same stage breakdown the old fold computed over a full
 //! stream. The read path converts each stored operation into the dashboard DTO.
 //!
-//! Forward-only: the reactor processes only events emitted after construction.
-//! There is NO startup backfill of pre-existing history. A crash between an
-//! event being persisted and this reactor's table being updated can drop that
-//! single event from the read model -- accepted as best-effort, matching the
-//! `Broadcaster` reactor's guarantees.
+//! Checkpointed catch-up: [`RebalanceTimingProjection::catch_up`] runs at
+//! startup, before the live reactor consumes events, replaying everything past
+//! each operation's persisted `last_sequence` checkpoint. The live reactor is
+//! forward-only WHILE running, but an event it drops (a crash between an event
+//! being persisted and this table being updated) is replayed on the next
+//! startup -- so the read model converges on the event log instead of staying
+//! best-effort until someone rebuilds. Catch-up reads only the un-folded tail,
+//! so a restart does not re-fold the whole history -- except a poison row (an
+//! unparseable event or a corrupt stored row), which is skipped and re-scanned
+//! on every catch-up until a `rebuild_all` repairs it.
+//!
+//! Rebuildable: the fold is a pure function of event payloads (no
+//! processing-time clock) and writes upsert by `operation_id`, so replaying the
+//! event log reproduces the exact state the live reactor produced. Catch-up
+//! replays only the tail since the last checkpoint;
+//! [`RebalanceTimingProjection::rebuild_all`] truncates and re-folds every
+//! stream. That replay-equals-live property is what makes this a valid CQRS/ES
+//! projection: the event log stays the single source of truth.
+
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -29,7 +44,7 @@ use st0x_dto::{
     AttestationSample, RebalanceOperationTiming, RebalanceStageName, RebalanceStageStats,
     RebalanceStageTiming, RebalanceTimingStatus, RebalanceTimings, StageOutcome,
 };
-use st0x_event_sorcery::{EntityList, Reactor, deps};
+use st0x_event_sorcery::{EntityList, EventSourced, Reactor, deps};
 use st0x_finance::Usdc;
 
 use super::{PerformanceError, ReportRange, latency_stats};
@@ -215,13 +230,15 @@ impl RebalanceTimingProjection {
     async fn save_operation_tx(
         tx: &mut Transaction<'_, Sqlite>,
         operation: &StoredOperation,
+        checkpoint: Option<i64>,
     ) -> Result<(), ProjectionError> {
         let timing = serde_json::to_string(operation)?;
         sqlx::query(
-            "INSERT INTO rebalance_stage_timing (operation_id, started_at, timing) \
-             VALUES (?, ?, ?) \
+            "INSERT INTO rebalance_stage_timing (operation_id, started_at, timing, last_sequence) \
+             VALUES (?, ?, ?, ?) \
              ON CONFLICT(operation_id) DO UPDATE SET \
-             started_at = excluded.started_at, timing = excluded.timing",
+             started_at = excluded.started_at, timing = excluded.timing, \
+             last_sequence = COALESCE(excluded.last_sequence, rebalance_stage_timing.last_sequence)",
         )
         .bind(operation.operation_id.to_string())
         // The `started_at` column orders and windows rows, so it tracks the
@@ -230,6 +247,10 @@ impl RebalanceTimingProjection {
         // operation would have no sort/filter key.
         .bind(operation.first_seen_at.to_rfc3339())
         .bind(timing)
+        // The event sequence just folded in -- set by replay/catch-up so a later
+        // catch-up skips it. The live reactor has no access to the sequence and
+        // passes `None`, so `COALESCE` leaves the prior checkpoint untouched.
+        .bind(checkpoint)
         .execute(&mut **tx)
         .await?;
 
@@ -249,11 +270,156 @@ impl RebalanceTimingProjection {
             .await?
             .unwrap_or_else(|| StoredOperation::new(operation_id.clone(), observed_at(&event)));
         operation.apply(&operation_id, &event);
-        Self::save_operation_tx(&mut tx, &operation).await?;
+        Self::save_operation_tx(&mut tx, &operation, None).await?;
 
         tx.commit().await?;
 
         Ok(())
+    }
+
+    /// Catches the read model up to the event log, then returns events replayed.
+    ///
+    /// Replays only events past each operation's stored `last_sequence`
+    /// checkpoint, so a restart re-folds the small tail emitted since the last
+    /// catch-up rather than the whole event history. Run at startup, before the
+    /// live reactor begins consuming events: this both seeds the table after a
+    /// fresh deploy and recovers anything the forward-only live path dropped in
+    /// the previous run, so the live path has no permanent drop window.
+    pub(crate) async fn catch_up(&self) -> Result<u64, ProjectionError> {
+        let mut tx = self.pool.begin().await?;
+
+        let replayed = Self::replay_pending(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(replayed)
+    }
+
+    /// Rebuilds the entire `rebalance_stage_timing` table from the event log.
+    ///
+    /// Truncates the table and re-folds every stream from scratch via
+    /// [`Self::replay_pending`] (an empty table has no checkpoints, so every
+    /// event is past `COALESCE(last_sequence, 0)`). Use to repair a corrupted
+    /// read model when an incremental [`Self::catch_up`] is not enough. Runs in
+    /// one transaction: a failure mid-rebuild rolls back, never leaving a
+    /// half-rebuilt table. Returns the number of events replayed.
+    pub(crate) async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM rebalance_stage_timing")
+            .execute(&mut *tx)
+            .await?;
+        let replayed = Self::replay_pending(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(replayed)
+    }
+
+    /// Folds every `UsdcRebalance` event past its operation's checkpoint into the
+    /// read model, advancing each operation's `last_sequence` as it goes.
+    ///
+    /// The fold reads only event payloads (no processing-time clock) and writes
+    /// upsert by `operation_id`, so replaying reproduces the exact state live
+    /// processing produced. Operations are independent single-stream folds, so
+    /// cross-aggregate ordering is irrelevant; within an operation the
+    /// `ORDER BY ... sequence` clause preserves event order. The `LEFT JOIN`
+    /// yields only un-folded events, so a steady-state catch-up reads just the
+    /// tail rather than the whole history.
+    ///
+    /// A row whose aggregate id or event payload cannot be parsed -- or whose
+    /// existing stored timing row is itself corrupt JSON -- is skipped with a
+    /// warning rather than propagated: a single poison row must not brick startup
+    /// (and the `rebuild_all` repair path, which calls this too). A corrupt stored
+    /// row is recoverable via `rebuild_all`, which truncates first so it never
+    /// reloads the bad row. The returned count reflects only the events that were
+    /// successfully folded. Database errors still propagate and abort the
+    /// transaction -- they are infrastructure failures, not poison rows.
+    ///
+    /// Once a stream hits a poison row, the rest of that stream is left unfolded
+    /// for this pass: a later event must not advance the checkpoint past the
+    /// poison (which would bury it) nor fold onto the indeterminate state left
+    /// by the skipped event. Its checkpoint therefore holds at the last good
+    /// sequence before the poison, so the poison -- and everything after it --
+    /// is re-scanned (re-skipped, re-warned) on every catch-up until
+    /// `rebuild_all` repairs it. The "reads just the tail" bound still holds for
+    /// healthy streams; a poison stream stays visible rather than silently
+    /// buried.
+    async fn replay_pending(tx: &mut Transaction<'_, Sqlite>) -> Result<u64, ProjectionError> {
+        let pending: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT event.aggregate_id, event.sequence, event.payload \
+             FROM events event \
+             LEFT JOIN rebalance_stage_timing timing \
+               ON timing.operation_id = event.aggregate_id \
+             WHERE event.aggregate_type = ? \
+               AND event.sequence > COALESCE(timing.last_sequence, 0) \
+             ORDER BY event.aggregate_id, event.sequence ASC",
+        )
+        .bind(UsdcRebalance::AGGREGATE_TYPE)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let mut replayed: u64 = 0;
+        // Streams that hit a poison row this pass. Events arrive ordered by
+        // (aggregate_id, sequence), so once a stream is poisoned every later
+        // event of it must be left unfolded: folding them would advance the
+        // checkpoint past the poison (burying it) and fold onto an
+        // indeterminate state (the skipped event's effect is missing).
+        let mut poisoned_aggregates = HashSet::<String>::new();
+        for (aggregate_id, sequence, payload) in pending {
+            // Already poisoned earlier in this pass; the skip was logged then.
+            if poisoned_aggregates.contains(&aggregate_id) {
+                continue;
+            }
+
+            let operation_id: UsdcRebalanceId = match aggregate_id.parse() {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    warn!(
+                        %aggregate_id,
+                        %error,
+                        "Skipping rebalance event with an unparseable aggregate id"
+                    );
+                    poisoned_aggregates.insert(aggregate_id);
+                    continue;
+                }
+            };
+            let event: UsdcRebalanceEvent = match serde_json::from_str(&payload) {
+                Ok(event) => event,
+                Err(error) => {
+                    warn!(
+                        %operation_id,
+                        sequence,
+                        %error,
+                        "Skipping unparseable rebalance event payload"
+                    );
+                    poisoned_aggregates.insert(aggregate_id);
+                    continue;
+                }
+            };
+
+            let mut operation = match Self::load_operation_tx(tx, &operation_id).await {
+                Ok(Some(operation)) => operation,
+                Ok(None) => StoredOperation::new(operation_id.clone(), observed_at(&event)),
+                Err(ProjectionError::State(error)) => {
+                    warn!(
+                        %operation_id,
+                        sequence,
+                        %error,
+                        "Skipping rebalance event: corrupt stored timing row (repair with rebuild-view --all)"
+                    );
+                    poisoned_aggregates.insert(aggregate_id);
+                    continue;
+                }
+                Err(error @ ProjectionError::Database(_)) => return Err(error),
+            };
+            operation.apply(&operation_id, &event);
+            Self::save_operation_tx(tx, &operation, Some(sequence)).await?;
+
+            replayed += 1;
+        }
+
+        Ok(replayed)
     }
 }
 
@@ -629,11 +795,33 @@ impl StoredOperation {
         run.outcome = outcome;
     }
 
-    /// Close every open stage, e.g. when bridging fails or recovers without
-    /// per-stage end markers. A no-op when no stage is open, so a redelivered
-    /// terminal event does not re-close already-closed runs.
+    /// Close every stage open as of `at`, e.g. when bridging fails or recovers
+    /// without per-stage end markers. A no-op when no stage is open, so a
+    /// redelivered terminal event does not re-close already-closed runs.
+    ///
+    /// Only stages whose run started at or before `at` are closed. A restart
+    /// catch-up re-folds the whole stream onto already-folded state, so the
+    /// loaded state can already hold a stage opened by an event LATER than this
+    /// terminal one; without the `started_at <= at` guard, re-applying an earlier
+    /// `BridgingFailed`/`BridgingCompletionRecovered` would retroactively close
+    /// that later stage and diverge from the live single-pass fold. The guard
+    /// keeps the fold order-independent, so replay equals live.
+    ///
+    /// The guard equates "opened by a later event" with "started_at > at", which
+    /// holds whenever a stream's event timestamps rise with sequence -- the normal
+    /// case. A severe backward clock step (e.g. NTP) that stamps a later
+    /// stage-open earlier than an earlier terminal event could still let a re-fold
+    /// diverge; that residual is accepted here -- the impact is a single
+    /// read-model latency metric, never financial state, and a full rebuild
+    /// repairs it. Closing fully order-independently under such inversion would
+    /// require threading the event `sequence` through the fold (an event-sorcery
+    /// change deliberately left out of this PR's scope).
     fn close_open_stages(&mut self, at: DateTime<Utc>, outcome: StoredStageOutcome) {
-        for run in self.stages.iter_mut().filter(|run| run.ended_at.is_none()) {
+        for run in self
+            .stages
+            .iter_mut()
+            .filter(|run| run.ended_at.is_none() && run.started_at <= at)
+        {
             run.ended_at = Some(at);
             run.duration_ms = Some((at - run.started_at).num_milliseconds().max(0));
             run.outcome = outcome;
@@ -781,19 +969,19 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, TxHash};
+    use alloy::primitives::{B256, TxHash, fixed_bytes};
     use chrono::TimeZone;
     use uuid::Uuid;
 
     use st0x_dto::UsdcBridgeDirection;
-    use st0x_event_sorcery::ReactorHarness;
+    use st0x_event_sorcery::{ReactorHarness, StoreBuilder, test_store};
     use st0x_execution::ClientOrderId;
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
     use super::*;
     use crate::test_utils::setup_test_db;
-    use crate::usdc_rebalance::{ReconcileReason, TransferRef};
+    use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_750_000_000 + seconds, 0).unwrap()
@@ -924,6 +1112,681 @@ mod tests {
         let report = load_rebalance_timings(&pool, &range()).await.unwrap();
 
         (pool, operation_id, report)
+    }
+
+    /// Snapshots the full `rebalance_stage_timing` table so live and rebuilt
+    /// state can be compared row-for-row, including the accumulated timing JSON.
+    async fn fetch_timing_rows(pool: &SqlitePool) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT operation_id, started_at, timing FROM rebalance_stage_timing \
+             ORDER BY operation_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The projection is only a valid CQRS/ES read model if replaying the event
+    /// log through the reactor reproduces the state live processing produced.
+    /// This drives two independent `UsdcRebalance` streams through the live
+    /// reactor (so events are persisted AND the table is written), then rebuilds
+    /// the table from the event log alone and asserts the two are byte-identical.
+    #[tokio::test]
+    async fn rebuild_all_reproduces_live_reactor_table_state() {
+        let pool = setup_test_db().await;
+        // Production wiring: the reactor is a registered query, so each `send`
+        // persists the event to the store AND drives the live read-model write.
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(std::sync::Arc::new(RebalanceTimingProjection::new(
+                pool.clone(),
+            )))
+            .build(())
+            .await
+            .unwrap();
+
+        let amount = Usdc::new(float!(400.0));
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+
+        // Operation A: withdraw -> burn -> fail -> recover, five events spanning
+        // multiple stages plus a failure and recovery.
+        let recovered = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "transient receipt error".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::RecoverBridging {
+                    mint_tx,
+                    amount_received: Usdc::new(float!(399.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Operation B: a second, independent stream still mid-withdrawal. Proves
+        // the rebuild keeps per-aggregate rows independent.
+        let withdrawing = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &withdrawing,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+
+        let live = fetch_timing_rows(&pool).await;
+        assert_eq!(live.len(), 2, "two operations should produce two rows");
+
+        let replayed = RebalanceTimingProjection::new(pool.clone())
+            .rebuild_all()
+            .await
+            .unwrap();
+        assert_eq!(replayed, 6, "all six persisted events should replay");
+
+        let rebuilt = fetch_timing_rows(&pool).await;
+        assert_eq!(
+            live, rebuilt,
+            "rebuilding from the event log must reproduce the exact live table state"
+        );
+    }
+
+    /// Startup catch-up must replay only the events past each operation's
+    /// checkpoint -- the property that lets a restart skip re-folding history.
+    /// Persists events with no reactor attached (so the read model is behind,
+    /// exactly what catch-up reconciles), then asserts the second catch-up folds
+    /// only the newly-appended tail and converges on a full rebuild.
+    #[tokio::test]
+    async fn catch_up_replays_only_events_past_the_checkpoint() {
+        let pool = setup_test_db().await;
+        // No reactor registered: `send` persists events to the store but never
+        // writes the read model, leaving it behind the log.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let amount = Usdc::new(float!(400.0));
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+
+        // Operation A: three events.
+        let operation_a = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &operation_a,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_a,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_a,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            )
+            .await
+            .unwrap();
+
+        // Operation B: one event, never touched again.
+        let operation_b = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &operation_b,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+
+        let projection = RebalanceTimingProjection::new(pool.clone());
+
+        let first = projection.catch_up().await.unwrap();
+        assert_eq!(first, 4, "first catch-up folds every persisted event");
+        assert_eq!(
+            fetch_timing_rows(&pool).await.len(),
+            2,
+            "both operations land"
+        );
+
+        // Two more events arrive on operation A; operation B stays current.
+        store
+            .send(
+                &operation_a,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "transient receipt error".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_a,
+                UsdcRebalanceCommand::RecoverBridging {
+                    mint_tx,
+                    amount_received: Usdc::new(float!(399.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = projection.catch_up().await.unwrap();
+        assert_eq!(
+            second, 2,
+            "second catch-up folds only operation A's new tail, not the history"
+        );
+
+        // Incremental catch-up converges on the same state as a from-scratch
+        // rebuild: correct, not just cheap.
+        let incremental = fetch_timing_rows(&pool).await;
+        projection.rebuild_all().await.unwrap();
+        let rebuilt = fetch_timing_rows(&pool).await;
+        assert_eq!(
+            incremental, rebuilt,
+            "incremental catch-up must match a full rebuild"
+        );
+    }
+
+    /// Reads an operation's persisted replay checkpoint (`NULL` -> `None`).
+    async fn fetch_last_sequence(pool: &SqlitePool, operation_id: &UsdcRebalanceId) -> Option<i64> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT last_sequence FROM rebalance_stage_timing WHERE operation_id = ?",
+        )
+        .bind(operation_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+
+        row.and_then(|(last_sequence,)| last_sequence)
+    }
+
+    /// The production restart path: the live reactor writes rows with
+    /// `last_sequence = NULL`, so the next startup `catch_up` re-folds the ENTIRE
+    /// stream on top of the already-folded state, and that re-fold must reproduce
+    /// the live state exactly. This drives an operation that recovers from a
+    /// post-burn bridging failure and is left mid-deposit (Deposit stage open) --
+    /// the case where a non-order-independent `close_open_stages` would
+    /// retroactively fail the still-open Deposit when the earlier `BridgingFailed`
+    /// is re-applied. Asserts the re-fold leaves the table byte-identical to live.
+    #[tokio::test]
+    async fn catch_up_refold_preserves_a_stage_opened_after_a_recovered_failure() {
+        let pool = setup_test_db().await;
+        // Production wiring: the reactor is a registered query, so each `send`
+        // persists the event AND drives the live read-model write (last_sequence
+        // stays NULL).
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(std::sync::Arc::new(RebalanceTimingProjection::new(
+                pool.clone(),
+            )))
+            .build(())
+            .await
+            .unwrap();
+
+        let amount = Usdc::new(float!(400.0));
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let deposit_tx =
+            fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
+
+        // withdraw -> burn -> bridging fails -> recovered (un-fails to Bridged)
+        // -> deposit initiated but NOT confirmed, so the Deposit stage stays open.
+        let operation_id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "transient receipt error".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::RecoverBridging {
+                    mint_tx,
+                    amount_received: Usdc::new(float!(399.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(deposit_tx),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Live state: the Deposit stage is open (InProgress), still unmeasured.
+        let live = fetch_timing_rows(&pool).await;
+
+        // The live rows carry `last_sequence = NULL`, so catch_up re-folds all six
+        // events on top of the already-folded state -- the routine restart path.
+        let replayed = RebalanceTimingProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed, 6,
+            "every live-written event is re-folded (last_sequence was NULL)"
+        );
+        assert_eq!(
+            fetch_last_sequence(&pool, &operation_id).await,
+            Some(6),
+            "catch-up advances the checkpoint from NULL to the last folded sequence"
+        );
+
+        let after = fetch_timing_rows(&pool).await;
+        assert_eq!(
+            live, after,
+            "catch-up re-fold must reproduce the live state -- the open Deposit \
+             stage must stay open, not be retroactively failed by the re-applied \
+             BridgingFailed"
+        );
+    }
+
+    /// The live reactor writes `last_sequence = NULL` (`checkpoint = None`), and
+    /// the upsert's `COALESCE(excluded.last_sequence, ...)` must keep a checkpoint
+    /// a prior catch-up already set. Otherwise a single live write after catch-up
+    /// would null the checkpoint and the next restart would re-fold the whole
+    /// history. Catches up to set the checkpoint, fires one more live event, and
+    /// asserts the checkpoint survives.
+    #[tokio::test]
+    async fn live_write_preserves_the_catch_up_checkpoint() {
+        let pool = setup_test_db().await;
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(std::sync::Arc::new(RebalanceTimingProjection::new(
+                pool.clone(),
+            )))
+            .build(())
+            .await
+            .unwrap();
+
+        let amount = Usdc::new(float!(400.0));
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let operation_id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let projection = RebalanceTimingProjection::new(pool.clone());
+        projection.catch_up().await.unwrap();
+        assert_eq!(
+            fetch_last_sequence(&pool, &operation_id).await,
+            Some(2),
+            "catch-up checkpoints the operation at its last folded sequence"
+        );
+
+        // A live write (checkpoint = None) must not clobber the catch-up checkpoint.
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_last_sequence(&pool, &operation_id).await,
+            Some(2),
+            "the live write's None checkpoint leaves the prior checkpoint untouched"
+        );
+
+        // Proof the checkpoint held: the next catch-up re-folds only the one event
+        // past it, not the whole stream.
+        let replayed = projection.catch_up().await.unwrap();
+        assert_eq!(
+            replayed, 1,
+            "only the single event past the preserved checkpoint is re-folded"
+        );
+    }
+
+    /// Inserts a raw `UsdcRebalance` event row straight into the event store --
+    /// the only way to stage a poison row (malformed payload or aggregate id) that
+    /// no domain command can produce.
+    async fn insert_raw_rebalance_event(
+        pool: &SqlitePool,
+        aggregate_id: &str,
+        sequence: i64,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES (?, ?, ?, 'poison', '1', ?, '{}')",
+        )
+        .bind(UsdcRebalance::AGGREGATE_TYPE)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A poison row -- an unparseable aggregate id, an unparseable event payload,
+    /// or a corrupt stored timing row -- must NOT abort catch_up (and so must not
+    /// brick startup): the bad rows are skipped with a warning, valid streams
+    /// still fold, and the returned count reflects only folded events. Drives a
+    /// valid stream through a reactor-less store (events persisted, read model
+    /// behind), then stages each poison class directly, since no domain API can
+    /// produce them.
+    #[tokio::test]
+    async fn catch_up_skips_poison_rows_and_folds_the_rest() {
+        let pool = setup_test_db().await;
+        // No reactor: events persist but the read model stays behind, exactly what
+        // catch_up reconciles.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let amount = Usdc::new(float!(400.0));
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        // A valid stream that must still fold despite the poison rows around it.
+        let valid_id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &valid_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &valid_id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A stream whose stored timing row is corrupt JSON: catch_up must skip it
+        // (recoverable via rebuild_all) rather than bricking startup.
+        let corrupt_row_id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &corrupt_row_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO rebalance_stage_timing (operation_id, started_at, timing) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(corrupt_row_id.to_string())
+        .bind(timestamp(0).to_rfc3339())
+        .bind("not-valid-json")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A raw event row with an unparseable payload, and one with an unparseable
+        // aggregate id.
+        insert_raw_rebalance_event(&pool, &Uuid::new_v4().to_string(), 1, "not-valid-json").await;
+        insert_raw_rebalance_event(&pool, "not-a-uuid", 1, "not-valid-json").await;
+
+        // None of the poison rows abort catch_up; only the valid stream folds.
+        let replayed = RebalanceTimingProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed, 2,
+            "only the two events of the valid stream fold; every poison row is skipped"
+        );
+
+        let rows = fetch_timing_rows(&pool).await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "the valid fold and the untouched corrupt row remain; no poison-event rows are created"
+        );
+
+        let valid = valid_id.to_string();
+        assert!(
+            rows.iter()
+                .any(|(operation_id, _, _)| operation_id == &valid),
+            "the valid stream folded into a row"
+        );
+
+        // The corrupt row is left exactly as staged -- catch_up skipped it rather
+        // than overwriting or repairing it.
+        let corrupt = corrupt_row_id.to_string();
+        let corrupt_row = rows
+            .iter()
+            .find(|(operation_id, _, _)| operation_id == &corrupt)
+            .expect("the corrupt row remains in place");
+        assert_eq!(
+            corrupt_row.2, "not-valid-json",
+            "catch_up does not touch the corrupt stored row"
+        );
+
+        // The valid stream is checkpointed; the skipped corrupt row is not (so it
+        // stays visible and re-scanned until a rebuild repairs it).
+        assert_eq!(
+            fetch_last_sequence(&pool, &valid_id).await,
+            Some(2),
+            "the valid stream advances its checkpoint"
+        );
+        assert_eq!(
+            fetch_last_sequence(&pool, &corrupt_row_id).await,
+            None,
+            "the skipped corrupt row is never checkpointed"
+        );
+
+        // A second catch-up converges: the valid stream is past its checkpoint and
+        // the poison rows are re-skipped, so nothing new folds.
+        let second = RebalanceTimingProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(
+            second, 0,
+            "the valid stream is caught up and every poison row is re-skipped"
+        );
+    }
+
+    /// A poison event in the MIDDLE of a stream must not let later valid events
+    /// advance the checkpoint past it: that would bury the poison (the
+    /// `sequence > last_sequence` filter would stop re-scanning it) and fold the
+    /// tail onto the indeterminate state left by the skipped event. Stages a
+    /// real `valid(1), poison(2), valid(3)` stream by corrupting the middle
+    /// event's payload after the fact.
+    #[tokio::test]
+    async fn catch_up_holds_checkpoint_behind_a_mid_stream_poison_event() {
+        let pool = setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let amount = Usdc::new(float!(400.0));
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        // One stream with three valid events at sequences 1, 2, 3.
+        let operation_id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &operation_id,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            )
+            .await
+            .unwrap();
+
+        // Corrupt the middle event into a poison payload: now valid(1),
+        // poison(2), valid(3) within the one stream.
+        sqlx::query(
+            "UPDATE events SET payload = 'not-valid-json' \
+             WHERE aggregate_type = ? AND aggregate_id = ? AND sequence = 2",
+        )
+        .bind(UsdcRebalance::AGGREGATE_TYPE)
+        .bind(operation_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let replayed = RebalanceTimingProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed, 1,
+            "only seq 1 folds; the poison at seq 2 stops the stream, so seq 3 is left unfolded"
+        );
+
+        // The checkpoint holds at the last good sequence before the poison, not
+        // seq 3 -- otherwise the poison at seq 2 would be buried from re-scans.
+        assert_eq!(
+            fetch_last_sequence(&pool, &operation_id).await,
+            Some(1),
+            "the checkpoint stays at seq 1 so the poison at seq 2 stays visible"
+        );
+
+        // A second catch-up re-scans from seq 2, re-skips the poison, and folds
+        // nothing new: seq 3 stays blocked behind the poison until a rebuild.
+        let second = RebalanceTimingProjection::new(pool.clone())
+            .catch_up()
+            .await
+            .unwrap();
+        assert_eq!(
+            second, 0,
+            "the poison keeps blocking the tail; nothing new folds"
+        );
     }
 
     #[test]

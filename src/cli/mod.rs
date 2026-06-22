@@ -28,6 +28,7 @@ use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Sym
 use st0x_finance::Usdc;
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
+use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::vault_registry::VaultRegistry;
@@ -80,7 +81,7 @@ impl From<ReconcileReasonArg> for crate::usdc_rebalance::ReconcileReason {
     }
 }
 
-/// Aggregate types that have materialized views.
+/// Read models rebuildable by replaying events from scratch.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AggregateView {
     /// Position aggregate (position_view)
@@ -89,6 +90,9 @@ pub enum AggregateView {
     OffchainOrder,
     /// Vault registry aggregate (vault_registry_view)
     VaultRegistry,
+    /// Rebalance stage-timing read model (rebalance_stage_timing). Replays every
+    /// `UsdcRebalance` event stream through the reactor fold. Supports `--all` only.
+    RebalanceTiming,
 }
 
 /// CCTP chain identifier for specifying source chain.
@@ -1397,6 +1401,25 @@ async fn rebuild_view<W: Write>(
                 writeln!(stdout, "Rebuilt all vault registry views")?;
             }
         }
+        AggregateView::RebalanceTiming => {
+            if id.is_some() {
+                anyhow::bail!(
+                    "rebalance-timing rebuild replays the whole read model; pass --all, not --id"
+                );
+            }
+
+            if !all {
+                anyhow::bail!("rebalance-timing rebuild replays the whole read model; pass --all");
+            }
+
+            let replayed = RebalanceTimingProjection::new(pool.clone())
+                .rebuild_all()
+                .await?;
+            writeln!(
+                stdout,
+                "Rebuilt rebalance stage-timing read model ({replayed} events replayed)"
+            )?;
+        }
     }
 
     Ok(())
@@ -2233,6 +2256,48 @@ mod tests {
         assert!(
             output.contains("Set SPYM position from 0 to 100"),
             "unexpected output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_rebalance_timing_requires_all() {
+        let pool = setup_test_db().await;
+        let mut stdout_buffer = Vec::new();
+
+        let error = rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::RebalanceTiming,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rebalance-timing rebuild replays the whole read model; pass --all"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_rebalance_timing_rejects_id() {
+        let pool = setup_test_db().await;
+        let mut stdout_buffer = Vec::new();
+
+        let error = rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::RebalanceTiming,
+            Some("AAPL".to_string()),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rebalance-timing rebuild replays the whole read model; pass --all, not --id"
         );
     }
 

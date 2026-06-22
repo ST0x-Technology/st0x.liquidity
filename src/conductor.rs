@@ -1291,6 +1291,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
         let rebalance_timing = Arc::new(RebalanceTimingProjection::new(deps.pool.clone()));
         let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(deps.pool.clone()));
+        // Catch the rebalance stage-timing read model up to the event log before
+        // the reactor goes live, so a restart replays whatever the forward-only
+        // live path missed in the previous run. Reads only the un-folded tail
+        // past each operation's checkpoint, so this does not re-fold history.
+        let rebalance_timing_replayed = rebalance_timing.catch_up().await?;
+        info!(
+            target: "rebalance",
+            replayed = rebalance_timing_replayed,
+            "Rebalance stage-timing read model caught up to the event log at startup"
+        );
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
             broadcaster,
