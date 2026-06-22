@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
+  import type { InfraReport } from '$lib/api/InfraReport'
   import type { RebalanceStageName } from '$lib/api/RebalanceStageName'
   import type { RebalanceTimings } from '$lib/api/RebalanceTimings'
   import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
@@ -10,10 +11,12 @@
   import { reactive } from '$lib/frp.svelte'
   import {
     fetchHedgeLatencies,
+    fetchInfraReport,
     fetchRebalanceTimings,
     fetchReliabilityReport,
   } from '$lib/performance/api'
   import {
+    blockLagCard,
     detectionCard,
     errorsCard,
     exposureCard,
@@ -23,6 +26,7 @@
     type WaterfallSegmentName,
     type WaterfallSort,
     layoutAttestationTrend,
+    layoutBlockLagTrend,
     layoutPercentileSeries,
     layoutRebalanceBars,
     layoutWaterfall,
@@ -33,9 +37,14 @@
 
   const POLL_INTERVAL_MS = 30_000
   const CARD_WINDOW_HOURS = 24
+  // Mirrors the backend telemetry RETENTION (14d): ingestion-health samples
+  // (block lag, poll cycles) are pruned past this window, so a longer chart
+  // range would just render a truncated view.
+  const INGESTION_RETENTION_MS = 14 * 86_400_000
 
   const latencies = reactive<HedgeLatencies | null>(null)
   const reliability = reactive<ReliabilityReport | null>(null)
+  const infra = reactive<InfraReport | null>(null)
   const error = reactive<string | null>(null)
   const lastRefreshed = reactive<Date | null>(null)
 
@@ -47,6 +56,18 @@
     const seq = ++cardFetchSeq
     const to = new Date()
     const from = new Date(to.getTime() - CARD_WINDOW_HOURS * 3_600_000)
+
+    // Infra (block lag) is supplementary, so fetch it on its own promise: a
+    // transient /performance/infra failure must not block the latency and
+    // reliability refresh. On failure we keep the last infra value, which the
+    // block-lag card already degrades to STALE once its sample ages out.
+    const infraRefresh = fetchInfraReport({ from, to })
+      .then((infraReport) => {
+        if (seq === cardFetchSeq) infra.update(() => infraReport)
+      })
+      .catch(() => {
+        // Isolated: latency/reliability stay fresh even if infra is down.
+      })
 
     try {
       const [latencyReport, reliabilityReport] = await Promise.all([
@@ -68,6 +89,8 @@
         fetchError instanceof Error ? fetchError.message : 'Unknown error',
       )
     }
+
+    await infraRefresh
   }
 
   type RangePreset = '1W' | '1M' | 'YTD' | '1Y' | 'ALL'
@@ -100,6 +123,8 @@
   const chartRange = reactive<RangePreset>('1W')
   const chartLatencies = reactive<HedgeLatencies | null>(null)
   const chartRebalances = reactive<RebalanceTimings | null>(null)
+  const chartInfra = reactive<InfraReport | null>(null)
+  const ingestionTruncated = reactive<boolean>(false)
   const chartError = reactive<string | null>(null)
   // Timestamp captured at the moment the chart fetch was initiated, used as
   // `now` for in-progress cycle and operation elapsed-time calculations.
@@ -113,6 +138,24 @@
       from: rangeStart(chartRange.current, to),
       to,
     }
+
+    // Ingestion-health telemetry is pruned at the retention window, so clamp
+    // the infra query to it and flag when the selected range was truncated --
+    // a 1Y view must not be mistaken for "the system has only run 14 days".
+    const infraFrom = new Date(
+      Math.max(range.from.getTime(), to.getTime() - INGESTION_RETENTION_MS),
+    )
+    ingestionTruncated.update(() => infraFrom.getTime() > range.from.getTime())
+
+    // Infra is supplementary here too: keep its failure from blocking the
+    // latency and rebalance chart refresh (see refresh() for rationale).
+    const infraRefresh = fetchInfraReport({ from: infraFrom, to })
+      .then((infraReport) => {
+        if (seq === chartFetchSeq) chartInfra.update(() => infraReport)
+      })
+      .catch(() => {
+        // Isolated: latency/rebalance charts stay fresh even if infra is down.
+      })
 
     try {
       const [latencyReport, rebalanceReport] = await Promise.all([
@@ -133,6 +176,8 @@
         fetchError instanceof Error ? fetchError.message : 'Unknown error',
       )
     }
+
+    await infraRefresh
   }
 
   const selectRange = (preset: RangePreset) => {
@@ -158,6 +203,7 @@
     exposureCard(latencies.current),
     errorsCard(reliability.current, CARD_WINDOW_HOURS),
     openExposureCard(latencies.current, lastRefreshed.current),
+    blockLagCard(infra.current, lastRefreshed.current),
   ])
 
   const statusClasses = (status: SloStatus): string => {
@@ -284,6 +330,13 @@
     }),
   )
 
+  const blockLagTrend = $derived(
+    layoutBlockLagTrend(chartInfra.current?.monitor.blockLag ?? [], {
+      plotWidth: TREND_PLOT_WIDTH,
+      plotHeight: TREND_PLOT_HEIGHT,
+    }),
+  )
+
   const DIRECTION_LABELS: Record<UsdcBridgeDirection, string> = {
     alpaca_to_base: 'Alpaca → Base',
     base_to_alpaca: 'Base → Alpaca',
@@ -304,7 +357,7 @@
   {/if}
 
   <section>
-    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
       {#each cards as card (card.title)}
         <Card.Root class={`border-l-4 ${statusClasses(card.status)}`}>
           <Card.Header class="pb-1">
@@ -658,6 +711,64 @@
               <circle cx={point.x} cy={point.y} r="2" fill="#fbbf24" />
             {/each}
           </svg>
+        </div>
+      {/if}
+    </Card.Content>
+  </Card.Root>
+
+  <Card.Root>
+    <Card.Header class="pb-2">
+      <Card.Title class="text-sm font-medium">Ingestion health</Card.Title>
+      {#if ingestionTruncated.current}
+        <p class="text-xs text-muted-foreground">
+          Showing the last 14 days · older samples are pruned by the telemetry
+          retention window.
+        </p>
+      {/if}
+    </Card.Header>
+    <Card.Content>
+      {#if blockLagTrend.points.length === 0}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          No block-lag samples in the selected range.
+        </p>
+      {:else}
+        <p class="mb-1 text-xs font-medium text-muted-foreground">
+          Worst block lag per bucket (max {blockLagTrend.maxLagBlocks} blocks)
+        </p>
+        <svg
+          viewBox={`0 0 ${String(TREND_PLOT_WIDTH)} ${String(TREND_PLOT_HEIGHT)}`}
+          class="h-20 w-full"
+          preserveAspectRatio="none"
+        >
+          <polyline
+            points={blockLagTrend.path}
+            fill="none"
+            stroke="#38bdf8"
+            stroke-width="1.5"
+          />
+          {#each blockLagTrend.points as point, pointIndex (pointIndex)}
+            <circle cx={point.x} cy={point.y} r="2" fill="#38bdf8" />
+          {/each}
+        </svg>
+      {/if}
+
+      {#if chartInfra.current}
+        {@const poll = chartInfra.current.monitor.poll}
+        <div class="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-2 text-xs text-muted-foreground">
+          <span>{poll.cycles} poll cycles</span>
+          <span class={poll.errors > 0 ? 'text-red-400' : ''}>
+            {poll.errors} errors
+          </span>
+          <span class={poll.skippedTicks > 0 ? 'text-amber-400' : ''}>
+            {poll.skippedTicks} skipped ticks
+          </span>
+          {#if poll.duration}
+            <span>
+              poll p50 {formatDurationMs(poll.duration.p50Ms)} · p95
+              {formatDurationMs(poll.duration.p95Ms)} · max
+              {formatDurationMs(poll.duration.maxMs)}
+            </span>
+          {/if}
         </div>
       {/if}
     </Card.Content>

@@ -55,6 +55,7 @@ mod position;
 mod position_check;
 mod rebalancing;
 mod symbol;
+mod telemetry;
 mod tokenization;
 mod trading;
 #[cfg(feature = "mock")]

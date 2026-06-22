@@ -93,6 +93,10 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     FailureEventType::export_all_to(out_dir)?;
     FailureEventCount::export_all_to(out_dir)?;
     JobQueueHealth::export_all_to(out_dir)?;
+    InfraReport::export_all_to(out_dir)?;
+    MonitorTelemetry::export_all_to(out_dir)?;
+    BlockLagPoint::export_all_to(out_dir)?;
+    PollHealth::export_all_to(out_dir)?;
     std::fs::write(out_dir.join("StatementGuard.ts"), Statement::guard_ts())
         .map_err(ts_rs::ExportError::Io)?;
 

@@ -1,8 +1,10 @@
 /** Pure SLO card derivation for the Performance tab. */
 
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
+import type { InfraReport } from '$lib/api/InfraReport'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 import {
+  BLOCK_LAG_THRESHOLDS,
   DETECTION_THRESHOLDS,
   ERROR_COUNT_THRESHOLDS,
   EXPOSURE_WINDOW_THRESHOLDS,
@@ -115,6 +117,57 @@ export const errorsCard = (
             classifySlo(warnings, WARNING_COUNT_THRESHOLDS),
             queueStatus,
           ]),
+  }
+}
+
+/**
+ * A lag sample older than this is stale: the monitor polls every few
+ * seconds, so minutes without a sample means it is wedged or down — the
+ * exact failure the card exists to surface — and the frozen lag value can
+ * no longer be trusted as "current".
+ */
+const BLOCK_LAG_STALE_AFTER_MS = 300_000
+
+export const blockLagCard = (
+  report: InfraReport | null,
+  now: Date | null,
+): SloCard => {
+  if (!report || !now) {
+    return loadingCard('Block lag')
+  }
+
+  const { currentLagBlocks, currentLagSampledAt, poll } = report.monitor
+
+  if (currentLagBlocks === null || currentLagSampledAt === null) {
+    return {
+      title: 'Block lag',
+      primary: '—',
+      secondary: 'no checkpointed samples yet',
+      status: 'unknown',
+    }
+  }
+
+  const sampleAgeMs = now.getTime() - new Date(currentLagSampledAt).getTime()
+
+  if (sampleAgeMs > BLOCK_LAG_STALE_AFTER_MS) {
+    return {
+      title: 'Block lag',
+      primary: `${String(currentLagBlocks)} blocks`,
+      secondary: `STALE · sampled ${formatDurationMs(sampleAgeMs)} ago — monitor silent`,
+      // Staleness floors the card at warning, but a frozen reading that was
+      // already critical stays critical: a wedged monitor is at least as bad
+      // as a fresh one reporting the same lag.
+      status: worstStatus(['warning', classifySlo(currentLagBlocks, BLOCK_LAG_THRESHOLDS)]),
+    }
+  }
+
+  return {
+    title: 'Block lag',
+    primary: `${String(currentLagBlocks)} blocks`,
+    secondary:
+      `sampled ${formatDurationMs(sampleAgeMs)} ago · ` +
+      `${String(poll.skippedTicks)} skipped ticks`,
+    status: classifySlo(currentLagBlocks, BLOCK_LAG_THRESHOLDS),
   }
 }
 

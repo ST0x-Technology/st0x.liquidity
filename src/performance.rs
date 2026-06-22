@@ -43,6 +43,7 @@ use st0x_execution::Symbol;
 use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
 use crate::position::{Position, PositionEvent, TradeId};
 
+pub(crate) mod infra;
 pub(crate) mod rebalance;
 pub(crate) mod reliability;
 

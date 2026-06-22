@@ -2,19 +2,28 @@
 //! polling over a persisted checkpoint.
 //!
 //! Every `order_fill_poll_interval` seconds the monitor:
-//! 1. Skips the tick if a `BackfillRange` job is still in flight -- the
+//! 1. Records a block-lag telemetry sample (chain tip, finalized block,
+//!    checkpoint) before any skip, so ingestion lag stays observable even
+//!    during a long catch-up while a `BackfillRange` job is still in flight.
+//!    Lag is measured against the finalized block -- the actual ingestion
+//!    cutoff -- so a caught-up system reads zero.
+//! 2. Skips the tick if a `BackfillRange` job is still in flight -- the
 //!    checkpoint has not advanced yet, so re-enqueuing would re-scan the
 //!    same blocks (and during a long catch-up would stack unbounded
 //!    overlapping ranges).
-//! 2. Reads the chain's latest finalized block and uses it as the cutoff, so
+//! 3. Reads the chain's latest finalized block and uses it as the cutoff, so
 //!    ingestion never persists logs from blocks that could still reorg. A
 //!    finalized block cannot reorg, so this is real single-chain reorg
 //!    protection rather than a confirmation-depth heuristic.
-//! 3. Enqueues a `BackfillRange` job covering `(checkpoint+1, cutoff)`.
+//! 4. Enqueues a `BackfillRange` job covering `(checkpoint+1, cutoff)`.
 //!    The `backfill-worker` fetches the logs via HTTP `eth_getLogs`,
 //!    pushes an accounting job per fill, and advances the checkpoint only
 //!    on success -- so a failed range is retried and never silently
 //!    skipped. Downstream dedupes by `(tx_hash, log_index)`.
+//!
+//! Each tick also records a poll-cycle telemetry sample (poll duration,
+//! ticks skipped by `MissedTickBehavior::Skip`, and success/failure outcome)
+//! and periodically prunes expired telemetry rows.
 //!
 //! This replaces the previous WebSocket `.watch()` filter-polling path.
 //! On a load-balanced RPC, `.watch()` issued `eth_newFilter` once and
@@ -35,11 +44,12 @@
 //! protection project. `backfill_range` still surfaces a `removed: true` log
 //! loudly rather than masking it, as defense in depth.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::providers::Provider;
 use alloy::transports::{RpcError, TransportErrorKind};
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
@@ -51,6 +61,9 @@ use crate::conductor::job::QueuePushError;
 use crate::onchain::OnChainError;
 use crate::onchain::backfill::{
     BackfillJobQueue, BackfillRange, backfill_start_from_checkpoint, load_backfill_checkpoint,
+};
+use crate::telemetry::{
+    BlockLagSample, Monitor, prune_expired, record_block_lag, record_poll_cycle,
 };
 
 /// Polls the orderbook chain for `ClearV3` / `TakeOrderV3` fills on a
@@ -98,11 +111,48 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
 
         let mut interval = tokio::time::interval(self.poll_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut previous_tick: Option<Instant> = None;
+        let mut last_prune = Instant::now();
 
         loop {
             interval.tick().await;
+            let tick = Instant::now();
+            let elapsed = previous_tick.map(|previous| tick.duration_since(previous));
+            let skipped = skipped_ticks(elapsed, self.poll_interval);
+            previous_tick = Some(tick);
 
-            if let Err(error) = self.poll_once().await {
+            let sampled_at = Utc::now();
+            let result = self.poll_once(sampled_at).await;
+            // Capture elapsed right after poll_once returns: this measures the
+            // poll cycle's work -- including the in-cycle block-lag write
+            // poll_once performs -- while excluding the poll-cycle telemetry
+            // write below, which would otherwise measure itself.
+            let poll_duration = tick.elapsed();
+
+            // The poll-cycle outcome is a success/failure discriminator, so the
+            // structured PollOutcome on the success path is collapsed to `()`.
+            if let Err(error) = record_poll_cycle(
+                &self.pool,
+                Monitor::OrderFill,
+                self.evm_ctx.orderbook,
+                sampled_at,
+                poll_duration,
+                skipped,
+                result.as_ref().map(|_| ()),
+            )
+            .await
+            {
+                warn!(target: "orderbook", ?error, "Failed to record poll-cycle telemetry");
+            }
+
+            if last_prune.elapsed() >= PRUNE_INTERVAL {
+                last_prune = Instant::now();
+                if let Err(error) = prune_expired(&self.pool, Utc::now()).await {
+                    warn!(target: "orderbook", ?error, "Failed to prune expired telemetry");
+                }
+            }
+
+            if let Err(error) = result {
                 warn!(
                     target: "orderbook",
                     ?error,
@@ -111,6 +161,36 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
             }
         }
     }
+}
+
+/// How often expired telemetry rows are pruned.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Ticks silently dropped by [`MissedTickBehavior::Skip`] since the previous
+/// tick: under Skip a slow poll fires nothing for the missed slots, so the
+/// only evidence is the wall-clock gap between consecutive ticks.
+///
+/// The accounting deliberately resets on a supervised restart
+/// (`previous_tick` starts `None`): downtime across restarts shows up as a
+/// gap in the `sampled_at` series rather than a skipped-tick count.
+fn skipped_ticks(elapsed_since_previous_tick: Option<Duration>, poll_interval: Duration) -> u64 {
+    let Some(elapsed) = elapsed_since_previous_tick else {
+        return 0;
+    };
+    let interval_ms = poll_interval.as_millis().max(1);
+    // Round to the nearest interval count to absorb timer jitter; intervals
+    // beyond the first are skips.
+    let elapsed_intervals = (elapsed.as_millis() + interval_ms / 2) / interval_ms;
+    // Clamp at i64::MAX (not u64::MAX) so the value always survives the
+    // storage layer's i64 conversion instead of failing the sample write.
+    // The clamp guarantees capped <= i64::MAX, so i64::try_from succeeds;
+    // unsigned_abs() then yields the equivalent u64 without sign extension.
+    let capped = elapsed_intervals
+        .saturating_sub(1)
+        .min(u128::from(i64::MAX.unsigned_abs()));
+    i64::try_from(capped)
+        .map(i64::unsigned_abs)
+        .unwrap_or(i64::MAX.unsigned_abs())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,7 +240,35 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
     /// One poll iteration: enqueue a backfill range for the unprocessed
     /// blocks up to the latest finalized block, unless a previous range
     /// is still in flight or there is nothing new to fetch.
-    async fn poll_once(&mut self) -> Result<PollOutcome, OrderFillMonitorError> {
+    async fn poll_once(
+        &mut self,
+        sampled_at: DateTime<Utc>,
+    ) -> Result<PollOutcome, OrderFillMonitorError> {
+        // Read the chain tip and latest finalized block up front, before the
+        // overlap guard, so the block-lag sample is recorded even while a
+        // backfill is still in flight -- a long catch-up (or a stuck backfill)
+        // is exactly when growing lag must stay observable. The finalized block
+        // read here is also the ingestion cutoff used below.
+        let chain_tip = self.provider.get_block_number().await?;
+        let finalized = latest_finalized_block(&self.provider).await?;
+
+        // Block-lag telemetry is best-effort: a failed sample must never fail
+        // the poll. Lag is measured against the finalized block -- the real
+        // ingestion cutoff -- so a caught-up system reads zero rather than a
+        // permanent floor. A null finalized block records as 0, which saturates
+        // lag to 0.
+        let sampled_checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
+        let sample = BlockLagSample {
+            sampled_at,
+            orderbook: self.evm_ctx.orderbook,
+            chain_tip,
+            finalized_block: finalized.unwrap_or(0),
+            last_processed_block: sampled_checkpoint,
+        };
+        if let Err(error) = record_block_lag(&self.pool, &sample).await {
+            warn!(target: "orderbook", ?error, "Failed to record block-lag telemetry");
+        }
+
         // Overlap guard: while a previous range is still being processed
         // the checkpoint has not advanced, so a fresh enqueue would
         // re-scan the same blocks. During a long catch-up this would
@@ -173,12 +281,12 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
             return Ok(PollOutcome::RangeInFlight);
         }
 
-        // Load the checkpoint once per tick: `from_block` is derived from it, and
-        // both the null-finality guard and the finality-regression branch use
-        // whether it exists to tell an expected cold-start skip from a
-        // checkpoint-backed skip that signals an RPC finality anomaly. One read
-        // keeps those decisions consistent (no intra-tick TOCTOU) and avoids a
-        // redundant round-trip.
+        // Re-read the checkpoint now that the guard has passed: an in-flight job
+        // may have completed (advancing the checkpoint) between the telemetry
+        // read above and the guard, and deriving the range from the stale value
+        // would re-scan blocks that job just processed. This single post-guard
+        // read is the source for both the null-finality branch and the range
+        // derivation, keeping those decisions consistent (no intra-tick TOCTOU).
         let checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
 
         // Cutoff is the chain's latest finalized block. Backfill is guaranteed
@@ -186,7 +294,7 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
         // reorg, so an ingested fill can never be invalidated. `None` means the
         // node reports no finalized block yet (a chain shallower than finality);
         // there is nothing safe to ingest, so skip the tick.
-        let Some(cutoff_block) = latest_finalized_block(&self.provider).await? else {
+        let Some(cutoff_block) = finalized else {
             // No finalized block reported. Once a checkpoint exists the chain
             // has demonstrably finalized blocks before, so a null response is an
             // RPC problem (a load-balanced node returning no finality) worth a
@@ -393,16 +501,39 @@ mod tests {
         block
     }
 
+    /// Single finalized-block read, for [`probe_finalized_block_support`] tests
+    /// (the probe reads only the finalized block; the tip is passed in).
     fn provider_with_finalized(number: u64) -> impl Provider + Clone {
         let asserter = Asserter::new();
         asserter.push_success(&finalized_at(number));
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
-    /// A provider whose node reports no finalized block yet (null response).
+    /// A provider whose node reports no finalized block yet (null response),
+    /// for [`probe_finalized_block_support`] tests (single finalized read).
     fn provider_without_finalized() -> impl Provider + Clone {
         let asserter = Asserter::new();
         asserter.push_success(&Value::Null);
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    /// Queues the two RPC responses a single `poll_once` tick reads, in order:
+    /// `eth_blockNumber` (the chain tip) then `eth_getBlockByNumber("finalized")`.
+    /// `finalized: None` queues a JSON null -- a node reporting no finalized
+    /// block yet.
+    fn push_tick(asserter: &Asserter, chain_tip: u64, finalized: Option<u64>) {
+        asserter.push_success(&Value::from(chain_tip));
+        match finalized {
+            Some(number) => asserter.push_success(&finalized_at(number)),
+            None => asserter.push_success(&Value::Null),
+        }
+    }
+
+    /// Mock provider answering a single `poll_once` tick: chain tip `chain_tip`
+    /// then finalized block `finalized`.
+    fn provider_at(chain_tip: u64, finalized: u64) -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        push_tick(&asserter, chain_tip, Some(finalized));
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
@@ -471,12 +602,12 @@ mod tests {
     #[tokio::test]
     async fn poll_once_enqueues_range_up_to_finalized_block() {
         // checkpoint=99, finalized=102 -> from=100, cutoff=102.
-        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_with_finalized(102)).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(110, 102)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
             .unwrap();
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -494,9 +625,9 @@ mod tests {
     #[tokio::test]
     async fn poll_once_uses_deployment_block_without_checkpoint() {
         // No checkpoint: from_block falls back to deployment_block (1).
-        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_with_finalized(50)).await;
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at(55, 50)).await;
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -513,12 +644,12 @@ mod tests {
     #[tokio::test]
     async fn poll_once_skips_when_caught_up() {
         // checkpoint=102, finalized=102 -> from=103 > cutoff.
-        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_with_finalized(102)).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(110, 102)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
             .await
             .unwrap();
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(outcome, PollOutcome::CaughtUp);
         assert_eq!(
@@ -534,12 +665,12 @@ mod tests {
         // A load-balanced RPC returns a finalized block (150) below the already
         // persisted checkpoint (200) -> from_block=201 is >1 past the cutoff.
         // Ingestion must pause (warn path) without enqueuing or moving anything.
-        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_with_finalized(150)).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(205, 150)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
             .await
             .unwrap();
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -571,9 +702,9 @@ mod tests {
         // (1) == `cutoff` (0) + 1, but with no committed progress this is NOT
         // "caught up" -- it is the deployment block one short of finalizing, so
         // the outcome must be FinalityBehindDeployment, not CaughtUp.
-        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_with_finalized(0)).await;
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at(5, 0)).await;
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -596,12 +727,12 @@ mod tests {
         // NOT past finality -- so this must be the quiet deployment-wait, not the
         // loud finality-regression warning that blames the RPC.
         let (mut monitor, pool, apalis_pool, evm_ctx) =
-            setup_with_deployment_block(provider_with_finalized(10), 100).await;
+            setup_with_deployment_block(provider_at(15, 10), 100).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 5)
             .await
             .unwrap();
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -623,9 +754,12 @@ mod tests {
     async fn poll_once_does_not_enqueue_when_no_finalized_block_yet() {
         // No finalized block and no checkpoint (cold start) -> skip the tick
         // without enqueuing anything.
-        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_without_finalized()).await;
+        let asserter = Asserter::new();
+        push_tick(&asserter, 50, None);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider).await;
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -646,9 +780,12 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_once_skips_intermittent_null_without_moving_checkpoint() {
+        // Two ticks: the first reports null finality, the second a real
+        // finalized block. Each tick reads the chain tip then the finalized
+        // block.
         let asserter = Asserter::new();
-        asserter.push_success(&Value::Null);
-        asserter.push_success(&finalized_at(105));
+        push_tick(&asserter, 104, None);
+        push_tick(&asserter, 110, Some(105));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
@@ -658,7 +795,7 @@ mod tests {
         // First tick: node returns null finality -> skip, checkpoint frozen.
         // A checkpoint exists, so this is the warn branch, distinct from the
         // cold-start debug branch despite identical side effects.
-        let first = monitor.poll_once().await.unwrap();
+        let first = monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             first,
             PollOutcome::NoFinalityWithCheckpoint,
@@ -682,7 +819,7 @@ mod tests {
         );
 
         // Second tick: finality is back -> resume from exactly checkpoint+1.
-        let second = monitor.poll_once().await.unwrap();
+        let second = monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             second,
             PollOutcome::Enqueued {
@@ -719,7 +856,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = monitor.poll_once().await;
+        let result = monitor.poll_once(Utc::now()).await;
         assert!(
             matches!(result, Err(OrderFillMonitorError::Rpc(_))),
             "A severed RPC must surface as a typed RPC error; got: {result:?}",
@@ -727,7 +864,7 @@ mod tests {
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "No backfill range may be enqueued off a failed finalized-block read"
+            "No backfill range may be enqueued off a failed chain-state read"
         );
         assert_eq!(
             crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
@@ -757,10 +894,10 @@ mod tests {
             required_confirmations: 0,
         };
 
-        // One finalized-block response per poll_once call.
+        // One chain-tip + finalized-block response pair per poll_once call.
         let asserter = Asserter::new();
-        asserter.push_success(&finalized_at(50));
-        asserter.push_success(&finalized_at(50));
+        push_tick(&asserter, 55, Some(50));
+        push_tick(&asserter, 55, Some(50));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let mut monitor = OrderFillMonitor::new(
@@ -781,10 +918,11 @@ mod tests {
             .await
             .unwrap();
 
-        // The in-flight check is a read and succeeds under the WAL write
-        // lock; the enqueue INSERT blocks, then errors after the busy
-        // timeout.
-        let result = monitor.poll_once().await;
+        // The block-lag telemetry write blocks then fails under the lock, but
+        // it is best-effort (swallowed). The in-flight check is a read and
+        // succeeds under the WAL write lock; the enqueue INSERT then blocks and
+        // errors after the busy timeout -- that is the error poll_once returns.
+        let result = monitor.poll_once(Utc::now()).await;
         assert!(
             matches!(result, Err(OrderFillMonitorError::Enqueue(_))),
             "A write-locked database must surface as a typed enqueue \
@@ -798,7 +936,7 @@ mod tests {
 
         sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             1,
@@ -813,11 +951,10 @@ mod tests {
     #[tokio::test]
     async fn poll_once_skips_while_backfill_in_flight() {
         // A pending BackfillRange already exists: the overlap guard must
-        // short-circuit before enqueuing (and before touching the provider,
-        // so the empty asserter is never polled).
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider).await;
+        // short-circuit before enqueuing. The block-lag sample IS still
+        // recorded first -- a long catch-up (a backfill in flight) is exactly
+        // when lag must stay observable.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(140, 100)).await;
 
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
             .await
@@ -832,7 +969,7 @@ mod tests {
             .unwrap();
         assert_eq!(backfill_job_count(&apalis_pool).await, 1);
 
-        let outcome = monitor.poll_once().await.unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -844,6 +981,16 @@ mod tests {
             1,
             "overlap guard must prevent a second enqueue while one is in flight"
         );
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            lag_blocks,
+            Some(90),
+            "lag (finalized 100 - checkpoint 10) must be sampled even while a backfill is in flight"
+        );
     }
 
     #[tokio::test]
@@ -853,7 +1000,15 @@ mod tests {
         // indefinitely -- the deterministic worker name means apalis never
         // ages the orphan out. `requeue_orphaned`, wired at conductor startup,
         // is what unwedges it.
-        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_with_finalized(105)).await;
+        //
+        // Both ticks read the provider (the lag sample is recorded before the
+        // overlap guard): the first while wedged, the second after the orphan
+        // reaches a terminal state.
+        let asserter = Asserter::new();
+        push_tick(&asserter, 110, Some(105));
+        push_tick(&asserter, 110, Some(105));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
             .await
             .unwrap();
@@ -876,7 +1031,8 @@ mod tests {
         .unwrap();
 
         // The wedge: the poller skips while the orphan counts as in flight.
-        monitor.poll_once().await.unwrap();
+        // The lag sample is still recorded (reads happen before the guard).
+        monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             1,
@@ -904,11 +1060,116 @@ mod tests {
             .await
             .unwrap();
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             2,
             "once the orphan reaches a terminal state the poller enqueues a new range"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_records_block_lag_sample() {
+        // tip=105, finalized=102, checkpoint=99 -> lag = finalized - checkpoint = 3.
+        let (mut monitor, pool, _apalis_pool, evm_ctx) = setup(provider_at(105, 102)).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let (chain_tip, finalized_block, last_processed_block, lag_blocks): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT chain_tip, finalized_block, last_processed_block, lag_blocks \
+             FROM block_lag_samples",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain_tip, 105);
+        assert_eq!(finalized_block, 102);
+        assert_eq!(last_processed_block, Some(99));
+        assert_eq!(lag_blocks, Some(3));
+    }
+
+    #[tokio::test]
+    async fn poll_once_reads_zero_lag_when_caught_up() {
+        // checkpoint == finalized: a healthy caught-up system must read 0, not a
+        // permanent floor.
+        let (mut monitor, pool, _apalis_pool, evm_ctx) = setup(provider_at(105, 102)).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lag_blocks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn poll_once_records_null_lag_without_checkpoint() {
+        let (mut monitor, pool, _apalis_pool, _evm_ctx) = setup(provider_at(55, 50)).await;
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lag_blocks, None);
+    }
+
+    #[test]
+    fn skipped_ticks_is_zero_for_first_and_on_time_ticks() {
+        let interval = Duration::from_secs(5);
+
+        assert_eq!(skipped_ticks(None, interval), 0);
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(5)), interval), 0);
+        // Jitter well under half an interval still counts as on time.
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(5_400)), interval),
+            0
+        );
+    }
+
+    #[test]
+    fn skipped_ticks_counts_missed_intervals() {
+        let interval = Duration::from_secs(5);
+
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(10)), interval), 1);
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(31)), interval), 5);
+        // The rounding boundary: half an interval past the first tick tips
+        // the count from "on time" to one skip.
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(7_499)), interval),
+            0
+        );
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(7_500)), interval),
+            1
+        );
+    }
+
+    #[test]
+    fn skipped_ticks_clamps_at_i64_max_for_storage() {
+        // A pathological gap must clamp at i64::MAX (the storage layer's
+        // integer width), not fail the eventual sample write.
+        assert_eq!(
+            skipped_ticks(
+                Some(Duration::from_millis(u64::MAX)),
+                Duration::from_millis(1)
+            ),
+            i64::MAX.unsigned_abs()
         );
     }
 
