@@ -28,9 +28,10 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use url::Url;
 
-use st0x_config::{AssetsConfig, BrokerCtx, Ctx, CtxError, ExecutionThreshold, RebalancingCtx};
+use st0x_config::{
+    AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, RebalancingCtx,
+};
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
     AggregateError, LifecycleError, Projection, SendError, Store, StoreBuilder, compact_events,
@@ -46,7 +47,7 @@ use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
 
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
-use crate::conductor::monitor::order_fills::{FinalityProbe, probe_finalized_block_support};
+use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
@@ -375,13 +376,13 @@ where
 /// Returns the instrumented executor, provider (ready for use), the writer task
 /// handle, and the original telemetry sender. Probes the RPC endpoint once to
 /// fail fast on misconfiguration before the rest of startup proceeds: basic
-/// reachability plus a usable `finalized` block tag, which order-fill ingestion
-/// depends on for reorg protection. An endpoint that errors on `finalized`, or
-/// aliases it to the chain tip (disabling reorg protection), is rejected here
-/// rather than running silently degraded; a fresh chain with no finalized block
-/// yet is allowed through. The executor, RPC layer, and the returned sender each
-/// hold a clone of the telemetry channel; the writer exits only when all three
-/// are dropped.
+/// reachability plus a usable configured cutoff block tag (`safe` by default).
+/// An endpoint that errors on the tag, or aliases `finalized` to the chain tip
+/// (disabling reorg protection when `finalized` is configured), is rejected
+/// here rather than running silently degraded; a fresh chain with no block for
+/// the tag yet is allowed through. The executor, RPC layer, and the returned
+/// sender each hold a clone of the telemetry channel; the writer exits only
+/// when all three are dropped.
 /// Provider type returned by `ProviderBuilder::new().connect_client(...)` over
 /// an HTTP transport. Named here to make `setup_instrumentation`'s return type
 /// concrete without coupling callers to `alloy` internals.
@@ -395,7 +396,7 @@ type HttpProvider = FillProvider<
 
 async fn setup_instrumentation<E>(
     executor_ctx: impl TryIntoExecutor<Executor = E>,
-    rpc_url: &Url,
+    evm: &EvmCtx,
     pool: SqlitePool,
 ) -> anyhow::Result<(
     InstrumentedExecutor<E>,
@@ -421,7 +422,7 @@ where
     // from any provider handle is timed.
     let rpc_client = ClientBuilder::default()
         .layer(RpcTelemetryLayer::new(telemetry.clone()))
-        .http(rpc_url.clone());
+        .http(evm.rpc_url.clone());
     let provider = ProviderBuilder::new().connect_client(rpc_client);
 
     // The HTTP transport connects lazily, so probe it once at startup to
@@ -433,21 +434,15 @@ where
         .await
         .context("failed to reach RPC endpoint at startup")?;
 
-    // Order-fill ingestion caps at the finalized block, so reject an endpoint
-    // that cannot serve a usable `finalized` tag here rather than running
-    // silently degraded. An endpoint reporting a finalized block at or beyond
-    // the tip is aliasing `finalized` to `latest` and would disable reorg
-    // protection; a fresh chain with no finalized block yet is allowed through.
-    match probe_finalized_block_support(&provider, chain_tip)
+    // Probe the configured cutoff block tag at startup to surface a
+    // misconfigured or unsupported endpoint before the fill monitor starts
+    // polling. A null response is allowed through (cold start); an error or
+    // a detected `finalized`-aliasing-to-`latest` returns Err and fails startup.
+    match probe_cutoff_block_support(&provider, chain_tip, evm.ingestion_cutoff)
         .await
-        .context("RPC endpoint cannot serve the `finalized` block tag at startup")?
+        .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
     {
-        FinalityProbe::AliasesChainTip => anyhow::bail!(
-            "RPC endpoint reports a finalized block at or beyond the chain tip \
-             ({chain_tip}); it appears to alias the `finalized` tag to `latest`, \
-             which would silently disable reorg protection. Refusing to start"
-        ),
-        FinalityProbe::Supported | FinalityProbe::NotYetAvailable => {}
+        CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
     }
 
     // Spawn the writer before returning the sender: the executor, RPC layer,
@@ -481,7 +476,7 @@ impl Conductor {
         } = pools;
 
         let (executor, provider, telemetry_writer, telemetry) =
-            setup_instrumentation(executor_ctx, &ctx.evm.rpc_url, pool.clone()).await?;
+            setup_instrumentation(executor_ctx, &ctx.evm, pool.clone()).await?;
         let cache = SymbolCache::default();
 
         setup_apalis_tables(&apalis_pool).await?;

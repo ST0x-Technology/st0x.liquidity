@@ -51,14 +51,24 @@ SupervisorBuilder::default()
 Defined in `src/conductor/monitor/order_fills.rs`. Drives continuous HTTP
 `eth_getLogs` ingestion of `ClearV3`/`TakeOrderV3` fills. It is a supervised
 interval task: every `order_fill_poll_interval` seconds it reads the chain's
-latest finalized block via `eth_getBlockByNumber("finalized")`, uses it as the
-cutoff, and enqueues a `BackfillRange` job for `(checkpoint+1, cutoff)` (no
-finalized block yet -> nothing enqueued). The `backfill-worker` fetches the logs
-and pushes an `AccountForDexTrade` job per fill, advancing the persisted
-checkpoint only on success. Capping at the finalized block is genuine
-single-chain reorg protection (a finalized block cannot reorg); it is unrelated
-to `required_confirmations`, which now governs only transaction-submission
-paths.
+latest block for the configured ingestion cutoff tag (set via `ingestion_cutoff`
+in config; recommended value: `safe`), uses it as the cutoff, and enqueues a
+`BackfillRange` job for `(checkpoint+1, cutoff)` (no block for the tag yet ->
+nothing enqueued). The `backfill-worker` fetches the logs and pushes an
+`AccountForDexTrade` job per fill, advancing the persisted checkpoint only on
+success. The cutoff tag is unrelated to `required_confirmations`, which governs
+only transaction-submission paths.
+
+`ingestion_cutoff = "safe"` (recommended): On OP Stack chains like Base, `safe`
+is the latest L2 block whose sequencer batch has been posted to L1 -- typically
+only a few blocks behind the chain tip. Cuts hedging lag from ~20 min to
+~seconds. Tradeoff: a sufficiently deep L1 reorg dropping the batch tx before
+finalization could invalidate a safe-ingested fill; no reversal path exists
+today.
+
+`ingestion_cutoff = "finalized"` (strict): Uses
+`eth_getBlockByNumber("finalized")` (Casper FFG). Full reorg protection but ~20
+min hedging lag on Base.
 
 ```rust
 struct OrderFillMonitor<P> {
@@ -278,13 +288,13 @@ restart, while the old vault remains registered so inventory polling can surface
 any stranded balance.
 
 Ingestion is checkpoint-driven `eth_getLogs` polling, not a live subscription,
-so no events are missed across downtime. Reading the finalized-block cutoff
-(`eth_getBlockByNumber("finalized")`) is not a startup phase -- the
-`OrderFillMonitor` poll loop reads the latest finalized block every tick and
-enqueues a `BackfillRange` job for the gap since the persisted checkpoint. The
-backfill and trade-accounting workers start together in Phase 4; catch-up
-backfill runs continuously after spawn while the monitor always resumes from the
-persisted checkpoint and re-scans any gap.
+so no events are missed across downtime. Reading the ingestion cutoff block (tag
+configured via `ingestion_cutoff`; `safe` is the recommended value) is not a
+startup phase -- the `OrderFillMonitor` poll loop reads the latest cutoff block
+every tick and enqueues a `BackfillRange` job for the gap since the persisted
+checkpoint. The backfill and trade-accounting workers start together in Phase 4;
+catch-up backfill runs continuously after spawn while the monitor always resumes
+from the persisted checkpoint and re-scans any gap.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at

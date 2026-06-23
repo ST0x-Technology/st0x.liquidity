@@ -2288,7 +2288,7 @@ mod tests {
                 sampled_at: now,
                 orderbook,
                 chain_tip: 120,
-                finalized_block: 117,
+                cutoff_block: 117,
                 last_processed_block: Some(100),
             },
         )
@@ -2329,7 +2329,7 @@ mod tests {
 
         let body = body_to_string(response).await;
         let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        // Lag = finalized_block (117) - checkpoint (100).
+        // Lag = cutoff_block (117) - checkpoint (100).
         assert_eq!(report["monitor"]["currentLagBlocks"], serde_json::json!(17));
         assert_eq!(
             report["monitor"]["blockLag"][0]["maxLagBlocks"],

@@ -484,7 +484,7 @@ mod tests {
     use super::*;
     use crate::bindings::IRaindexV6;
     use crate::symbol::cache::SymbolCache;
-    use st0x_config::EvmCtx;
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_float_macro::float;
 
     #[tokio::test]
@@ -801,6 +801,7 @@ mod tests {
             orderbook: Address::ZERO,
             deployment_block: 0,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let tx_hash =

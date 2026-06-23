@@ -43,23 +43,22 @@ pub(crate) struct BlockLagSample {
     pub(crate) sampled_at: DateTime<Utc>,
     pub(crate) orderbook: Address,
     pub(crate) chain_tip: u64,
-    pub(crate) finalized_block: u64,
+    pub(crate) cutoff_block: u64,
     /// `None` before the first backfill checkpoint exists.
     pub(crate) last_processed_block: Option<u64>,
 }
 
 impl BlockLagSample {
-    /// Finalized blocks not yet processed: `finalized_block -
-    /// last_processed_block`. Measured against the finalized block (the
-    /// ingestion cutoff) rather than the raw tip because the checkpoint can
-    /// only ever advance to the finalized block -- against the raw tip a fully
-    /// caught-up system would read a permanent floor of the finality lag
-    /// instead of zero. Saturates at zero: a load-balanced RPC can briefly
-    /// report a finalized block behind the checkpoint, which is staleness
-    /// noise, not negative lag.
+    /// Cutoff blocks not yet processed: `cutoff_block - last_processed_block`.
+    /// Measured against the cutoff block (the ingestion boundary) rather than
+    /// the raw tip because the checkpoint can only ever advance to the cutoff
+    /// block -- against the raw tip a fully caught-up system would read a
+    /// permanent floor of the finality lag instead of zero. Saturates at zero:
+    /// a load-balanced RPC can briefly report a cutoff block behind the
+    /// checkpoint, which is staleness noise, not negative lag.
     fn lag_blocks(&self) -> Option<u64> {
         self.last_processed_block
-            .map(|checkpoint| self.finalized_block.saturating_sub(checkpoint))
+            .map(|checkpoint| self.cutoff_block.saturating_sub(checkpoint))
     }
 }
 
@@ -121,14 +120,14 @@ pub(crate) async fn record_block_lag(
 
     sqlx::query(
         "INSERT INTO block_lag_samples \
-         (sampled_at, orderbook, chain_tip, finalized_block, last_processed_block, \
+         (sampled_at, orderbook, chain_tip, cutoff_block, last_processed_block, \
           lag_blocks) \
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(sqlite_timestamp(sample.sampled_at))
     .bind(sample.orderbook.to_string())
     .bind(i64::try_from(sample.chain_tip)?)
-    .bind(i64::try_from(sample.finalized_block)?)
+    .bind(i64::try_from(sample.cutoff_block)?)
     .bind(last_processed_block)
     .bind(lag_blocks)
     .execute(pool)
@@ -496,8 +495,8 @@ mod tests {
             sampled_at: timestamp(seconds),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             chain_tip,
-            // Finality trails the tip by a few blocks in this mock.
-            finalized_block: chain_tip.saturating_sub(3),
+            // Cutoff trails the tip by a few blocks in this mock.
+            cutoff_block: chain_tip.saturating_sub(3),
             last_processed_block: checkpoint,
         }
     }
@@ -516,7 +515,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(chain_tip, 105);
-        // Lag measures finalized_block (105 - 3 = 102) minus the checkpoint
+        // Lag measures cutoff_block (105 - 3 = 102) minus the checkpoint
         // (100): a caught-up system reads zero, not the finality lag.
         assert_eq!(lag_blocks, Some(2));
     }
@@ -539,10 +538,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_block_lag_saturates_stale_finalized_to_zero() {
+    async fn record_block_lag_saturates_stale_cutoff_to_zero() {
         let pool = setup_test_db().await;
 
-        // A load-balanced RPC reported a finalized block behind the checkpoint.
+        // A load-balanced RPC reported a cutoff block behind the checkpoint.
         record_block_lag(&pool, &sample(0, 99, Some(100)))
             .await
             .unwrap();

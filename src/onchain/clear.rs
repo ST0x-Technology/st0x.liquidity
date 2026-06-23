@@ -238,6 +238,8 @@ mod tests {
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
 
+    use st0x_config::IngestionCutoff;
+
     use super::*;
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
@@ -254,6 +256,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         }
     }
 

@@ -331,7 +331,7 @@ mod tests {
                 sampled_at: timestamp(seconds),
                 orderbook,
                 chain_tip,
-                finalized_block: chain_tip.saturating_sub(3),
+                cutoff_block: chain_tip.saturating_sub(3),
                 last_processed_block: checkpoint,
             },
         )
@@ -346,9 +346,9 @@ mod tests {
     #[tokio::test]
     async fn reports_latest_lag_and_bucketed_maxima() {
         let pool = setup_test_db().await;
-        insert_lag(&pool, 10, 110, Some(100)).await; // finalized 107, lag 7
-        insert_lag(&pool, 20, 125, Some(100)).await; // finalized 122, lag 22
-        insert_lag(&pool, 4_000, 210, Some(205)).await; // finalized 207, lag 2
+        insert_lag(&pool, 10, 110, Some(100)).await; // cutoff 107, lag 7
+        insert_lag(&pool, 20, 125, Some(100)).await; // cutoff 122, lag 22
+        insert_lag(&pool, 4_000, 210, Some(205)).await; // cutoff 207, lag 2
 
         let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
             .await
@@ -375,9 +375,9 @@ mod tests {
     async fn current_lag_ignores_range_but_buckets_respect_it() {
         let pool = setup_test_db().await;
         // Outside (after) the report range, with a DISTINCT lag value so
-        // the assertion can tell which sample won: finalized 497, lag 2.
+        // the assertion can tell which sample won: cutoff 497, lag 2.
         insert_lag(&pool, 100_000, 500, Some(495)).await;
-        // In range: finalized 107, lag 7.
+        // In range: cutoff 107, lag 7.
         insert_lag(&pool, 10, 110, Some(100)).await;
 
         let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)

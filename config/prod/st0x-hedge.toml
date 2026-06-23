@@ -28,9 +28,12 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
-# Block confirmations required before an event is ingested
-# (naive reorg protection, not real chain finality).
+# Block confirmations required before a submitted transaction is treated as
+# settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
 required_confirmations = 3
+# Use the OP-Stack safe block as the fill-ingestion cutoff. This cuts hedging
+# lag from ~20 min (finalized) to ~seconds. See example.config.toml for tradeoffs.
+ingestion_cutoff = "safe"
 
 # Wallet configuration (Turnkey secure enclave signing).
 [wallet]
