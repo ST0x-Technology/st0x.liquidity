@@ -118,13 +118,19 @@ decision.
 | [0002](0002-axum-and-tower.md)                                          | Adopt Axum and lean on Tower for both transport and business logic                   | Accepted               |
 | [0003](0003-durable-usdc-rebalance-guard-on-restart.md)                 | Reconstruct the USDC rebalancing guard from persisted state on startup               | Accepted               |
 | [0004](0004-typed-identifiers.md)                                       | Model identifiers by what determines them; derive the string form                    | Accepted               |
+| [0005](0005-exactly-once-fill-accounting.md)                            | Exactly-once fill accounting across the Witness/Acknowledge boundary                 | Accepted               |
 | [0005](0005-max-token-approvals-on-startup.md)                          | Grant one-time MAX token approvals to trusted spenders on startup                    | Accepted               |
 | [0006](0006-base-to-alpaca-explicit-alpaca-deposit-send.md)             | BaseToAlpaca deposit sends USDC to Alpaca explicitly, idempotently                   | Accepted               |
-| [0008](0008-counter-trading-during-dividend-freeze.md)                  | Counter-trading (broker hedging) during a dividend freeze                            | Proposed               |
+| [0008](0008-counter-trading-during-dividend-freeze.md)                  | Counter-trading (broker hedging) during a dividend freeze                            | Accepted               |
 | [0009](0009-record-overfill-as-acceptance.md)                           | Record a broker over-fill as an acceptance, not a failure                            | Accepted               |
 | [0010](0010-bounded-pending-ack-set-for-cross-process-exactly-once.md)  | Bounded pending-acknowledgement set for cross-process exactly-once                   | Accepted               |
+| [0011](0011-decouple-ingestion-latency-from-reorg-safety.md)            | Decouple fill-ingestion latency from reorg safety via first-class reorg handling     | Proposed               |
 | [0014](0014-runtime-stuck-pending-recovery-and-serialized-placement.md) | Recover stuck Pending placements at runtime, and serialize broker-placement attempts | Accepted               |
 | [0015](0015-bot-gas-pnl-requires-explicit-receipt-cost-ledger.md)       | Require an explicit receipt cost ledger for bot gas PnL                              | Proposed               |
+| [0015](0015-single-writer-reconciliation-for-hedging-equity-balance.md) | Use single-writer reconciliation for the Hedging equity balance                      | Accepted               |
 | [0016](0016-store-bot-gas-costs-in-the-event-stream.md)                 | Store bot-gas costs in the event stream                                              | Proposed               |
 | [0017](0017-eth-usd-valuation-via-pyth-base-block-pinned.md)            | Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned                     | Superseded by ADR 0020 |
+| [0018](0018-back-pnl-with-a-cqrs-read-model.md)                         | Back `/pnl` with a CQRS read model instead of raw SQL over the events table          | Accepted               |
+| [0018](0018-block-watermarked-onchain-fill-absorption.md)               | Use block-watermarked absorption of onchain fill deltas                              | Accepted               |
+| [0019](0019-mark-priced-close-flatten-with-widening-cross.md)           | Resolve close-flatten prices through a fallback chain                                | Accepted               |
 | [0020](0020-chainlink-eth-usd-gas-valuation-on-base.md)                 | Value bot-paid gas via Chainlink ETH/USD on Base                                     | Accepted               |
