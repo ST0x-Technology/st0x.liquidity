@@ -5,8 +5,7 @@ database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
 # Interval (seconds) between continuous eth_getLogs polls for orderbook fills.
 # Each tick enqueues a backfill range over the unprocessed blocks, capped at the
-# chain's latest finalized block (a finalized block cannot reorg). Defaults to 5
-# when omitted.
+# configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
 order_fill_poll_interval = 5
 hyperdx.service_name = "st0x-hedge"
 
@@ -23,11 +22,23 @@ orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 # Block-confirmation depth required before a transaction this bot submits is
 # treated as settled (the primary gate for USDC rebalancing withdrawals). This
-# does NOT govern order-fill ingestion: the fill monitor now caps the backfill
-# range at the chain's latest finalized block (real reorg protection), so tuning
-# this value has no effect on ingestion latency. Set explicitly per chain based
-# on observed confirmation behavior.
+# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
+# at the configured ingestion_cutoff block, not this depth. Set explicitly per
+# chain based on observed confirmation behavior.
 required_confirmations = 3
+# Block tag used as the fill-ingestion cutoff. REQUIRED -- must be set
+# explicitly to "safe" or "finalized"; omitting this field fails startup.
+# "safe"      -- OP-Stack safe block: sequencer batch posted to L1, not yet
+#                L1-finalized. Cuts hedging lag to ~seconds on Base.
+#                Tradeoff: an L1 reorg dropping the batch tx could in principle
+#                invalidate a safe-ingested fill (no reversal path exists; full
+#                reorg handling is tracked separately in the Reorg protection
+#                project). Also, when safe regresses within the quiet-skew band,
+#                the checkpoint is frozen and newly-canonical fills in the
+#                reorged range are not ingested (same no-reversal-path tradeoff).
+# "finalized" -- L1-finalized block (Casper FFG). Full reorg protection but
+#                ~20 min hedging lag on Base.
+ingestion_cutoff = "safe"
 
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)

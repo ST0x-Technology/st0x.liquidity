@@ -61,7 +61,8 @@ mod tests {
 
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, LogLevel, TradingMode,
+        AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, IngestionCutoff,
+        LogLevel, TradingMode,
     };
 
     use super::*;
@@ -79,6 +80,7 @@ mod tests {
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,

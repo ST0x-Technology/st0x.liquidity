@@ -15,7 +15,7 @@ mod threshold;
 mod wallet;
 
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets};
-pub use evm::{EvmConfig, EvmCtx, EvmSecrets};
+pub use evm::{EvmConfig, EvmCtx, EvmSecrets, IngestionCutoff};
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;
 pub use order_poller::OrderPollerCtx;

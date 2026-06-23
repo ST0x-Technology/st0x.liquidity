@@ -712,11 +712,11 @@ mod tests {
     use super::*;
     use crate::cli::ConvertDirection;
     use crate::inventory::ImbalanceThreshold;
-    use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_float_macro::float;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -731,6 +731,7 @@ mod tests {
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
@@ -804,6 +805,7 @@ mod tests {
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,

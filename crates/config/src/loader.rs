@@ -1138,6 +1138,9 @@ impl Ctx {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::IngestionCutoff;
+
 /// Test-only constructor for `Ctx` that internalizes fields e2e tests
 /// don't need to control (log level, operational limits, EVM wrapping,
 /// polling intervals). This keeps `Ctx` fields `pub(crate)` while
@@ -1190,6 +1193,7 @@ impl Ctx {
                 orderbook,
                 deployment_block,
                 required_confirmations,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 1,
             order_polling_max_jitter: 0,
@@ -1438,6 +1442,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 1,
+            ingestion_cutoff: IngestionCutoff::Safe,
         },
         order_polling_interval: 15,
         order_polling_max_jitter: 5,
@@ -1525,6 +1530,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -1553,6 +1559,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -1582,6 +1589,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -1716,6 +1724,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1756,6 +1765,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -1801,6 +1811,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -1843,6 +1854,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -1884,6 +1896,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -1962,6 +1975,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2049,6 +2063,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2084,6 +2099,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2119,6 +2135,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2155,6 +2172,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2194,6 +2212,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2232,6 +2251,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2287,6 +2307,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2348,6 +2369,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2400,6 +2422,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2491,6 +2514,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2547,6 +2571,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [hyperdx]
             service_name = "test-service"
@@ -2609,6 +2634,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2667,6 +2693,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2729,6 +2756,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -2797,6 +2825,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
 
             [broker]
@@ -2847,6 +2876,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
 
             [broker]
@@ -2945,6 +2975,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 0
@@ -3304,6 +3335,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -3421,6 +3453,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3482,6 +3515,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3632,6 +3666,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3664,6 +3699,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3699,6 +3735,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3730,6 +3767,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3814,6 +3852,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -4610,6 +4649,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -4657,6 +4697,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
         "#,
         );
         let secrets = toml_file(
@@ -4691,6 +4732,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
 
             [broker]
@@ -4740,6 +4782,7 @@ mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
 
             [broker]
@@ -4826,6 +4869,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"
@@ -4867,6 +4911,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [wallet]
             kind = "private-key"

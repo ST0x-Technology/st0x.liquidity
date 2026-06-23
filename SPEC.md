@@ -137,18 +137,29 @@ excellent async ecosystem for handling concurrent trading flows.
 
 - Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
   Every `order_fill_poll_interval` seconds the monitor enqueues a backfill range
-  covering the blocks since the persisted checkpoint, capped at the chain's
-  latest **finalized** block (`eth_getBlockByNumber("finalized")`; no finalized
-  block yet means nothing is enqueued); the backfill worker fetches the `Clear`
-  and `TakeOrder` logs for the arbitrageur's owner address and advances the
-  checkpoint only on success. A finalized block cannot reorg, so an ingested
-  fill can never be invalidated -- genuine single-chain reorg protection rather
-  than the earlier `tip - required_confirmations` confirmation-depth heuristic
-  (`required_confirmations` now governs only transaction-submission paths). The
-  tradeoff is hedge latency: on an L2 like Base the `finalized` tag tracks L1
-  finalization and lags the tip by minutes, so a fill is hedged only once its
-  block finalizes. First-class cross-chain reorg handling is tracked separately
-  in the Reorg protection project.
+  covering the blocks since the persisted checkpoint, capped at the configured
+  ingestion cutoff block (must be explicitly configured; recommended value:
+  `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill worker fetches the
+  `Clear` and `TakeOrder` logs for the arbitrageur's owner address and advances
+  the checkpoint only on success. `required_confirmations` governs
+  transaction-submission paths only and does not affect fill ingestion. The
+  cutoff tag is configured via `ingestion_cutoff` (required field):
+  - **`safe` (recommended):** On OP Stack chains like Base, `safe` is the latest
+    L2 block whose sequencer batch has been posted to L1 (not yet L1-finalized).
+    Cuts hedging lag from ~20 min to ~seconds. Tradeoff: a sufficiently deep L1
+    reorg dropping the batch tx could, in principle, invalidate a safe-ingested
+    fill. In practice this is extremely rare and far less likely than the
+    latency cost of waiting for L1 finality. The bot currently has no reversal
+    path if a fill is invalidated; this trades fill-ingestion correctness for
+    latency until full reorg handling is implemented. Additionally, when `safe`
+    regresses below the checkpoint within the quiet-skew band
+    (`SAFE_CUTOFF_QUIET_SKEW` blocks), the checkpoint is left frozen and any
+    newly-canonical fills in the reorged range are not ingested -- consistent
+    with the no-reversal-path tradeoff; full reorg handling tracked separately
+    in the Reorg protection project.
+  - **`finalized`:** Uses `eth_getBlockByNumber("finalized")` (Casper FFG). Full
+    reorg protection but ~20 min hedging lag on Base. First-class cross-chain
+    reorg handling is tracked separately in the Reorg protection project.
 - WebSocket `.watch()` filter polling and `eth_subscribe`/`subscribe_logs` are
   deliberately rejected: on a load-balanced RPC, filters live on a single
   backend node so most polls are round-robined to nodes returning `-32601`, and

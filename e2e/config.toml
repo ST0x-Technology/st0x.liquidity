@@ -16,6 +16,7 @@ tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 required_confirmations = 0
+ingestion_cutoff = "safe"
 
 [rest_api]
 url = "http://localhost:8099"

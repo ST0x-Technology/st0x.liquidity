@@ -354,6 +354,7 @@ beneficiary_entity_name = "Simulate Failures"
 orderbook = "{orderbook}"
 deployment_block = {current_block}
 required_confirmations = 0
+ingestion_cutoff = "safe"
 
 [wallet]
 kind = "private-key"

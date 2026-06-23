@@ -14,7 +14,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use st0x_config::EvmCtx;
 use st0x_evm::Evm;
@@ -335,19 +335,22 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .chain(take_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
         .filter(|log| {
-            // Callers cap `to_block` at the chain's finalized block,
-            // which cannot reorg, so `removed: true` here implies a
-            // reorg crossing finality. Surface it loudly rather than
-            // silently ingesting; skip the log so we don't persist a
-            // vanished event.
+            // Callers cap `to_block` at the ingestion cutoff block.
+            // Under `finalized`, this block cannot reorg, so `removed: true`
+            // implies a deep reorg crossing L1 finality. Under `safe`, a reorg
+            // is plausible (the batch may not yet be L1-finalized). In either
+            // case the fill is skipped to avoid persisting a vanished event. If a
+            // hedge was already placed against this fill, no reversal occurs; full
+            // reorg handling is tracked in the Reorg protection project.
             if log.removed {
-                error!(
+                warn!(
                     target: "orderbook",
                     tx_hash = ?log.transaction_hash,
                     log_index = ?log.log_index,
                     block_number = ?log.block_number,
-                    "Backfill returned `removed: true` for a log past the finalized block -- \
-                     reorg crossing finality detected; skipping"
+                    "Backfill returned `removed: true` for a log at or below the \
+                     ingestion cutoff -- reorg detected; skipping. No reversal path \
+                     exists if a hedge was placed against this fill"
                 );
                 return false;
             }
@@ -435,12 +438,12 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use url::Url;
 
     use super::*;
     use crate::bindings::IRaindexV6;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_pools};
-    use st0x_config::EvmCtx;
 
     fn test_retry_strategy() -> ExponentialBuilder {
         ExponentialBuilder::default()
@@ -474,6 +477,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
@@ -489,6 +493,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 80).await.unwrap();
@@ -506,6 +511,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 20).await.unwrap();
@@ -547,6 +553,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         backfill_events(
@@ -576,6 +583,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -612,6 +620,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -646,6 +655,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -765,6 +775,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let clear_config = IRaindexV6::ClearConfigV2 {
@@ -831,6 +842,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let take_event = IRaindexV6::TakeOrderV3 {
@@ -898,6 +910,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let different_order = get_test_order();
@@ -997,6 +1010,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1037,6 +1051,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1124,6 +1139,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // 30 take logs, 3 per block across 10 blocks, served by the
@@ -1219,6 +1235,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let tx_hash1 =
@@ -1271,6 +1288,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1000,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1312,6 +1330,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 500,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1354,6 +1373,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let take_event = create_test_take_event(
@@ -1397,6 +1417,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1434,6 +1455,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let valid_take_event = create_test_take_event(
@@ -1525,6 +1547,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let tx_hash1 =
@@ -1571,6 +1594,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1607,6 +1631,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1647,6 +1672,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1695,6 +1721,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // Create malformed log with invalid event signature
@@ -1741,10 +1768,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_skips_removed_logs() {
-        // Backfill caller caps `to_block` at the confirmation
-        // boundary, so a `removed: true` log here implies a deep
-        // reorg. We must skip it (logged as error) rather than
-        // ingesting a vanished event.
+        // Backfill caller caps `to_block` at the ingestion cutoff
+        // block. A `removed: true` log implies a reorg; skip it
+        // (logged as warn) rather than ingesting a vanished event.
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
@@ -1753,6 +1779,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let take_event = create_test_take_event(
@@ -1800,6 +1827,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 42,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1833,6 +1861,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -1885,6 +1914,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // Both the clear and take fetches succeed at getLogs but observe a tip
@@ -1931,6 +1961,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1963,6 +1994,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -2022,6 +2054,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -2076,6 +2109,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -2118,6 +2152,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 100,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // No RPC calls should be made when deployment block > end block
@@ -2147,6 +2182,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -2225,6 +2261,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // Should start from deployment_block (50) to end_block (100)

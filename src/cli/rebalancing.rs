@@ -1266,6 +1266,14 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::RebalancingCtx;
+    use st0x_config::create_test_issuance_ctx;
+    use st0x_config::{
+        AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
+        TradingMode,
+    };
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, ClientOrderId, TimeInForce,
     };
@@ -1276,14 +1284,6 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::test_utils::setup_test_db;
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
-    use st0x_config::EvmCtx;
-    use st0x_config::ExecutionThreshold;
-    use st0x_config::RebalancingCtx;
-    use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{
-        AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
-        TradingMode,
-    };
 
     /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
     /// after an attestation timeout and drive through to success -- so a single
@@ -1389,6 +1389,7 @@ mod tests {
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
@@ -1451,6 +1452,7 @@ mod tests {
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,

@@ -2,19 +2,19 @@
 //! polling over a persisted checkpoint.
 //!
 //! Every `order_fill_poll_interval` seconds the monitor:
-//! 1. Records a block-lag telemetry sample (chain tip, finalized block,
+//! 1. Records a block-lag telemetry sample (chain tip, cutoff block,
 //!    checkpoint) before any skip, so ingestion lag stays observable even
 //!    during a long catch-up while a `BackfillRange` job is still in flight.
-//!    Lag is measured against the finalized block -- the actual ingestion
-//!    cutoff -- so a caught-up system reads zero.
+//!    Lag is measured against the cutoff block -- the actual ingestion
+//!    boundary -- so a caught-up system reads zero.
 //! 2. Skips the tick if a `BackfillRange` job is still in flight -- the
 //!    checkpoint has not advanced yet, so re-enqueuing would re-scan the
 //!    same blocks (and during a long catch-up would stack unbounded
 //!    overlapping ranges).
-//! 3. Reads the chain's latest finalized block and uses it as the cutoff, so
-//!    ingestion never persists logs from blocks that could still reorg. A
-//!    finalized block cannot reorg, so this is real single-chain reorg
-//!    protection rather than a confirmation-depth heuristic.
+//! 3. Reads the chain's latest cutoff block (tag configured via the required
+//!    `ingestion_cutoff` setting; production configs use `safe`) and uses it
+//!    as the ingestion boundary. `None` means the node has not yet surfaced
+//!    this block tag; there is nothing safe to ingest, so the tick is skipped.
 //! 4. Enqueues a `BackfillRange` job covering `(checkpoint+1, cutoff)`.
 //!    The `backfill-worker` fetches the logs via HTTP `eth_getLogs`,
 //!    pushes an accounting job per fill, and advances the checkpoint only
@@ -37,12 +37,36 @@
 //! visible retries (the apalis job) is the deliberate choice here,
 //! aligning liquidity with the issuance bot's ingestion architecture.
 //!
-//! Capping at the finalized block is the simplified single-chain reorg
-//! protection: a finalized Base block will not reorg, so an
-//! ingested fill cannot be invalidated. Serious cross-chain reorg handling
-//! (first-class reversal events) is tracked separately in the Reorg
-//! protection project. `backfill_range` still surfaces a `removed: true` log
-//! loudly rather than masking it, as defense in depth.
+//! **Default cutoff: `safe` (configurable via `ingestion_cutoff`)**
+//!
+//! On OP Stack chains (e.g. Base), `safe` is the latest L2 block whose
+//! sequencer batch has been posted to L1. It is typically only a few blocks
+//! behind the chain tip rather than hundreds, cutting hedging lag from ~20 min
+//! (with `finalized`) to ~seconds.
+//!
+//! **Reorg tradeoff (`safe` cutoff):** The `safe` block is not yet
+//! L1-finalized (Casper FFG). A sufficiently deep L1 reorg that drops the
+//! batch transaction before it finalizes could, in principle, cause the L2
+//! block to be reorganized out, invalidating a fill that was ingested against
+//! it. This trades fill-ingestion correctness for latency until full reorg
+//! handling is implemented. In practice, L1 reorgs deep enough to drop a
+//! submitted batch are extremely rare (single-slot reorgs, which are the most
+//! common, do not affect posted batches in the same block). The bot currently
+//! has no reversal path if a fill is invalidated; full cross-chain reorg
+//! handling is tracked separately in the Reorg protection project.
+//!
+//! **Quiet-skew band tradeoff (`safe` cutoff):** When `safe` regresses below
+//! the checkpoint within `SAFE_CUTOFF_QUIET_SKEW` blocks (normal cross-backend
+//! RPC skew on a load-balanced fleet), the checkpoint is left frozen and the
+//! reorged-and-replaced blocks below it are not re-scanned, so any
+//! newly-canonical fills in that range are not ingested. This is consistent
+//! with the no-reversal-path tradeoff above; full reorg handling is tracked
+//! separately in the Reorg protection project.
+//!
+//! Operators who need strict reorg protection at the cost of hedging latency
+//! can set `ingestion_cutoff = "finalized"` in config. `backfill_range` still
+//! surfaces a `removed: true` log as a warning rather than masking it, as
+//! defense in depth.
 
 use std::time::{Duration, Instant};
 
@@ -55,7 +79,7 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-use st0x_config::EvmCtx;
+use st0x_config::{EvmCtx, IngestionCutoff};
 
 use crate::conductor::job::QueuePushError;
 use crate::onchain::OnChainError;
@@ -195,7 +219,7 @@ fn skipped_ticks(elapsed_since_previous_tick: Option<Duration>, poll_interval: D
 
 #[derive(Debug, thiserror::Error)]
 enum OrderFillMonitorError {
-    #[error("RPC error reading finalized block: {0}")]
+    #[error("RPC error reading cutoff block: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error(transparent)]
     OnChain(#[from] OnChainError),
@@ -208,7 +232,7 @@ enum OrderFillMonitorError {
 /// The branch a single [`OrderFillMonitor::poll_once`] tick took. The supervised
 /// run loop discards it (it reacts only to `Err`); it exists so tests can observe
 /// the cutoff decision -- in particular to tell an expected cold-start skip apart
-/// from a checkpoint-backed skip that signals an RPC finality anomaly. Those two
+/// from a checkpoint-backed skip that signals an RPC cutoff anomaly. Those two
 /// share identical side effects (no enqueue, checkpoint frozen), so without a
 /// typed outcome an inverted checkpoint check could not be caught from the
 /// outside.
@@ -216,53 +240,85 @@ enum OrderFillMonitorError {
 enum PollOutcome {
     /// A previous backfill range is still in flight; the tick was skipped.
     RangeInFlight,
-    /// No finalized block reported and no checkpoint exists yet -- expected
-    /// cold-start lag on a chain shallower than finality.
-    NoFinalityColdStart,
-    /// No finalized block reported while a checkpoint exists -- a finality
-    /// regression (likely a stale or load-balanced RPC); ingestion is paused.
-    NoFinalityWithCheckpoint,
-    /// A backfill range up to the finalized block was enqueued.
+    /// No cutoff block reported and no checkpoint exists yet -- expected
+    /// cold-start lag on a chain where the block tag is not yet available.
+    NoCutoffColdStart,
+    /// No cutoff block reported while a checkpoint exists -- likely a stale
+    /// or load-balanced RPC node; ingestion is paused.
+    NoCutoffWithCheckpoint,
+    /// A backfill range up to the cutoff block was enqueued.
     Enqueued { from_block: u64, to_block: u64 },
-    /// Ingestion has reached the finalized block; nothing to enqueue.
+    /// Ingestion has reached the cutoff block; nothing to enqueue.
     CaughtUp,
-    /// The finalized block is behind committed ingestion progress (a checkpoint
-    /// exists) -- a finality regression that pauses ingestion until it advances.
-    FinalityBehindCheckpoint,
-    /// Finality has not yet reached the `deployment_block`: either cold start (no
-    /// checkpoint) or a checkpoint at/below finality with `deployment_block`
+    /// A `safe` cutoff block is slightly behind the checkpoint within
+    /// `SAFE_CUTOFF_QUIET_SKEW` (normal cross-backend RPC skew). Ingestion
+    /// skips this tick without the full-pause warning, but a `warn` still
+    /// records the regression so possible reorgs remain observable.
+    CutoffWithinQuietSkew,
+    /// The cutoff block is behind committed ingestion progress under `finalized`,
+    /// or significantly behind under `safe` -- a regression that pauses ingestion.
+    CutoffBehindCheckpoint,
+    /// The cutoff has not yet reached the `deployment_block`: either cold start
+    /// (no checkpoint) or a checkpoint at/below the cutoff with `deployment_block`
     /// configured ahead of it. Nothing to ingest yet; no committed progress is at
     /// risk.
-    FinalityBehindDeployment,
+    CutoffBehindDeployment,
+}
+
+/// Maximum backwards deviation from the checkpoint that is tolerated quietly
+/// under the `safe` cutoff. Cross-backend RPC skew on a load-balanced fleet
+/// (e.g. dRPC on Base) can cause `safe` to momentarily report below the
+/// checkpoint by a handful of blocks when consecutive reads land on backends
+/// at different heads.
+///
+/// 32 is a conservative band chosen to absorb normal cross-backend skew
+/// (typically a few blocks) while staying far below a finality-scale
+/// regression that would indicate a real reorg or persistent RPC anomaly.
+/// The exact value is a deliberate estimate pending measured Base `safe`-tag
+/// skew data from the deployment fleet; it will be revised once measurements
+/// are available. Under `finalized`, finality lag is hundreds of blocks, so
+/// any cutoff < checkpoint is a meaningful regression worth a warning.
+const SAFE_CUTOFF_QUIET_SKEW: u64 = 32;
+
+/// Converts the configured ingestion cutoff to the alloy `BlockNumberOrTag`
+/// used in RPC calls. Factored out so adding a new `IngestionCutoff` variant
+/// produces a single compile error rather than two.
+fn cutoff_block_tag(cutoff: IngestionCutoff) -> BlockNumberOrTag {
+    match cutoff {
+        IngestionCutoff::Safe => BlockNumberOrTag::Safe,
+        IngestionCutoff::Finalized => BlockNumberOrTag::Finalized,
+    }
 }
 
 impl<P: Provider + Clone> OrderFillMonitor<P> {
     /// One poll iteration: enqueue a backfill range for the unprocessed
-    /// blocks up to the latest finalized block, unless a previous range
+    /// blocks up to the latest cutoff block, unless a previous range
     /// is still in flight or there is nothing new to fetch.
     async fn poll_once(
         &mut self,
         sampled_at: DateTime<Utc>,
     ) -> Result<PollOutcome, OrderFillMonitorError> {
-        // Read the chain tip and latest finalized block up front, before the
+        let cutoff_tag = cutoff_block_tag(self.evm_ctx.ingestion_cutoff);
+
+        // Read the chain tip and latest cutoff block up front, before the
         // overlap guard, so the block-lag sample is recorded even while a
         // backfill is still in flight -- a long catch-up (or a stuck backfill)
-        // is exactly when growing lag must stay observable. The finalized block
-        // read here is also the ingestion cutoff used below.
+        // is exactly when growing lag must stay observable. The cutoff block
+        // read here is also the ingestion boundary used below.
         let chain_tip = self.provider.get_block_number().await?;
-        let finalized = latest_finalized_block(&self.provider).await?;
+        let cutoff_opt = latest_cutoff_block(&self.provider, cutoff_tag).await?;
 
         // Block-lag telemetry is best-effort: a failed sample must never fail
-        // the poll. Lag is measured against the finalized block -- the real
-        // ingestion cutoff -- so a caught-up system reads zero rather than a
-        // permanent floor. A null finalized block records as 0, which saturates
+        // the poll. Lag is measured against the cutoff block -- the real
+        // ingestion boundary -- so a caught-up system reads zero rather than a
+        // permanent floor. A null cutoff block records as 0, which saturates
         // lag to 0.
         let sampled_checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
         let sample = BlockLagSample {
             sampled_at,
             orderbook: self.evm_ctx.orderbook,
             chain_tip,
-            finalized_block: finalized.unwrap_or(0),
+            cutoff_block: cutoff_opt.unwrap_or(0),
             last_processed_block: sampled_checkpoint,
         };
         if let Err(error) = record_block_lag(&self.pool, &sample).await {
@@ -285,36 +341,42 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
         // may have completed (advancing the checkpoint) between the telemetry
         // read above and the guard, and deriving the range from the stale value
         // would re-scan blocks that job just processed. This single post-guard
-        // read is the source for both the null-finality branch and the range
+        // read is the source for both the null-cutoff branch and the range
         // derivation, keeping those decisions consistent (no intra-tick TOCTOU).
         let checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
 
-        // Cutoff is the chain's latest finalized block. Backfill is guaranteed
-        // not to ingest logs above this boundary, and a finalized block cannot
-        // reorg, so an ingested fill can never be invalidated. `None` means the
-        // node reports no finalized block yet (a chain shallower than finality);
-        // there is nothing safe to ingest, so skip the tick.
-        let Some(cutoff_block) = finalized else {
-            // No finalized block reported. Once a checkpoint exists the chain
-            // has demonstrably finalized blocks before, so a null response is an
-            // RPC problem (a load-balanced node returning no finality) worth a
-            // warning -- ingestion stalls until it clears. At cold start on a
-            // chain shallower than finality it is expected, so stay quiet.
+        // Cutoff is the chain's latest block for the configured tag. `None`
+        // means the node has not yet surfaced this block tag (e.g. cold start on
+        // a chain where the tag is not yet available); there is nothing safe to
+        // ingest, so skip the tick.
+        let Some(cutoff_block) = cutoff_opt else {
+            // No cutoff block reported. Once a checkpoint exists the tag was
+            // available before, so a null response is likely an RPC problem worth
+            // a warning -- ingestion stalls until it clears. At cold start it is
+            // expected, so stay quiet.
             if checkpoint.is_some() {
                 warn!(
                     target: "orderbook",
-                    "No finalized block reported while a checkpoint exists; the RPC \
-                     node may be returning no finality. Ingestion paused this tick"
+                    "No cutoff block reported while a checkpoint exists; the RPC \
+                     node may be returning a stale response for the configured tag. \
+                     Ingestion paused this tick"
                 );
-                return Ok(PollOutcome::NoFinalityWithCheckpoint);
+                return Ok(PollOutcome::NoCutoffWithCheckpoint);
             }
 
+            // Cold start: no checkpoint means ingestion has never run, so
+            // the tag being absent is expected and transient. The startup
+            // probe (`probe_cutoff_block_support`) already emits a one-time
+            // warn if the endpoint persistently returns null, so a persistent
+            // unsupported endpoint is not silent. Stay quiet here.
+            let cutoff = self.evm_ctx.ingestion_cutoff;
             debug!(
                 target: "orderbook",
-                "No finalized block reported yet (chain shallower than \
-                 finality); nothing to ingest this tick"
+                %cutoff,
+                "No cutoff block at cold start; expected briefly -- startup \
+                 probe already surfaced a persistent null"
             );
-            return Ok(PollOutcome::NoFinalityColdStart);
+            return Ok(PollOutcome::NoCutoffColdStart);
         };
 
         let from_block = backfill_start_from_checkpoint(checkpoint, self.evm_ctx.deployment_block);
@@ -324,7 +386,7 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
                 target: "orderbook",
                 from_block,
                 cutoff_block,
-                "Enqueuing order-fill backfill range up to the finalized block"
+                "Enqueuing order-fill backfill range up to the cutoff block"
             );
 
             self.backfill_queue
@@ -340,29 +402,61 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
             });
         }
 
-        // Nothing to ingest this tick: the next block is past the finalized tip.
+        // Nothing to ingest this tick: the next block is past the cutoff.
         // Classify why from committed progress (the checkpoint), not from
-        // `from_block` -- the `deployment_block` floor can push `from_block` past
-        // the cutoff even when the checkpoint is well behind it, so branching on
-        // `from_block` would misreport that config case as a finality regression.
+        // `from_block` -- the `deployment_block` floor can push `from_block`
+        // past the cutoff even when the checkpoint is well behind it, so
+        // branching on `from_block` would misreport that config case as a
+        // cutoff regression.
         match checkpoint {
-            // Committed progress is past the finalized block: either finality
-            // regressed (a stale or load-balanced RPC) or, right after upgrading
-            // from the old confirmation-depth cutoff, finality has not yet caught
-            // up to a checkpoint that ran ahead of it. Ingestion pauses either way.
+            // Committed progress is past the cutoff block. Under `finalized`,
+            // any such regression is an RPC anomaly worth a warning (finality
+            // lag is hundreds of blocks, dwarfing any cross-backend skew).
+            // Under `safe`, small backwards steps (within SAFE_CUTOFF_QUIET_SKEW
+            // blocks) are the on-chain signature of either benign cross-backend
+            // RPC skew on a load-balanced fleet OR a small reorg. Either way,
+            // ingestion skips this tick without pausing the monitor. "Quiet"
+            // means "do not pause ingestion", NOT "do not log" -- the regression
+            // is surfaced at warn with magnitude so an in-band reorg is
+            // observable. The regressed range below the frozen checkpoint is
+            // not re-scanned (no reversal path). Larger regressions still warn
+            // via the shared warn! below and pause ingestion.
             Some(checkpoint) if checkpoint > cutoff_block => {
+                let regression = checkpoint - cutoff_block;
+                let is_safe = match self.evm_ctx.ingestion_cutoff {
+                    IngestionCutoff::Safe => true,
+                    IngestionCutoff::Finalized => false,
+                };
+
+                if is_safe && regression <= SAFE_CUTOFF_QUIET_SKEW {
+                    // Safe cutoff stepped backwards within the quiet-skew
+                    // window. May be benign cross-backend RPC skew or a small
+                    // reorg. Ingestion skips this tick; the regressed range is
+                    // not re-scanned (no reversal path).
+                    warn!(
+                        target: "orderbook",
+                        checkpoint,
+                        cutoff_block,
+                        regression,
+                        "Safe cutoff block stepped backwards below checkpoint \
+                         (may be RPC skew or small reorg); skipping tick without \
+                         re-scanning the regressed range"
+                    );
+                    return Ok(PollOutcome::CutoffWithinQuietSkew);
+                }
+
                 warn!(
                     target: "orderbook",
                     checkpoint,
                     cutoff_block,
-                    "Finalized block is behind committed ingestion progress; ingestion \
-                     paused until finality advances. Expected briefly after upgrading \
-                     from the confirmation-depth cutoff; if it persists the RPC node \
-                     may be returning stale finality data"
+                    "Cutoff block is behind committed ingestion progress; ingestion \
+                     paused until the cutoff advances. Expected briefly after \
+                     upgrading from the finalized to safe cutoff; if it persists \
+                     the RPC node may be returning stale data"
                 );
-                Ok(PollOutcome::FinalityBehindCheckpoint)
+                Ok(PollOutcome::CutoffBehindCheckpoint)
             }
-            // The checkpoint has reached the finalized block; nothing new yet.
+            // The checkpoint has reached the cutoff block; nothing new yet.
             Some(_) if from_block == cutoff_block.saturating_add(1) => {
                 debug!(
                     target: "orderbook",
@@ -372,113 +466,129 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
                 );
                 Ok(PollOutcome::CaughtUp)
             }
-            // Either cold start (no checkpoint) or a checkpoint at/below finality
-            // with `deployment_block` configured ahead of it: both are simply
-            // waiting for finality to reach the deployment block, with no committed
-            // progress at risk. Expected, so stay quiet.
+            // Either cold start (no checkpoint) or a checkpoint at/below the
+            // cutoff with `deployment_block` configured ahead of it: both are
+            // simply waiting for the cutoff to reach the deployment block, with
+            // no committed progress at risk. Expected, so stay quiet.
             _ => {
                 debug!(
                     target: "orderbook",
                     from_block,
                     cutoff_block,
-                    "Finality has not yet reached the deployment block; nothing to \
+                    "Cutoff has not yet reached the deployment block; nothing to \
                      ingest this tick"
                 );
-                Ok(PollOutcome::FinalityBehindDeployment)
+                Ok(PollOutcome::CutoffBehindDeployment)
             }
         }
     }
 }
 
-/// The chain's latest finalized block number, or `None` when the node reports
-/// no finalized block yet (e.g. a chain shallower than finality). A finalized
-/// block cannot reorg, so capping ingestion at it is real reorg protection for
-/// single-chain operation -- unlike the previous `tip - required_confirmations`
-/// heuristic, which reused the transaction-submission confirmation depth and was
-/// not true finality.
+/// The block number for the given block tag, or `None` when the node has not
+/// yet surfaced that tag (e.g. a fresh chain or a cold-start race).
 ///
-/// The `None` arm relies on the Ethereum execution-api JSON-RPC convention that
-/// `eth_getBlockByNumber` returns a `null` result (not an error) for a block tag
-/// it cannot resolve yet -- which alloy maps to `Ok(None)`. A node that instead
-/// errors on the `finalized` tag (unsupported method, wrong network behind a
-/// broken proxy) surfaces as the `Err` arm, which
-/// [`probe_finalized_block_support`] rejects at startup and `poll_once` treats
-/// as a transient RPC failure (checkpoint frozen, retried next tick).
-pub(crate) async fn latest_finalized_block<P: Provider>(
+/// Relies on the Ethereum execution-API JSON-RPC convention that
+/// `eth_getBlockByNumber` returns a `null` result (not an error) for a tag it
+/// cannot resolve yet -- which alloy maps to `Ok(None)`. A node that instead
+/// errors (unsupported method, wrong-network proxy) surfaces as `Err`, which
+/// [`probe_cutoff_block_support`] rejects at startup and `poll_once` treats as
+/// a transient RPC failure (checkpoint frozen, retried next tick).
+pub(crate) async fn latest_cutoff_block<P: Provider>(
     provider: &P,
+    tag: BlockNumberOrTag,
 ) -> Result<Option<u64>, RpcError<TransportErrorKind>> {
     Ok(provider
-        .get_block_by_number(BlockNumberOrTag::Finalized)
+        .get_block_by_number(tag)
         .await?
         .map(|block| block.header.number))
 }
 
-/// The outcome of [`probe_finalized_block_support`]. Logged inside the probe and
-/// returned so [`crate::conductor`]'s startup decision and tests can observe
-/// which finality state the endpoint is in. [`FinalityProbe::AliasesChainTip`]
-/// and an `Err` are both fatal at the conductor; [`FinalityProbe::NotYetAvailable`]
-/// is the only non-fatal soft signal.
+/// The outcome of [`probe_cutoff_block_support`]. Returned so
+/// [`crate::conductor`]'s startup decision and tests can observe which state the
+/// endpoint is in. An `Err` from the probe is always fatal at the conductor.
+/// [`CutoffProbe::NotYetAvailable`] is the only non-fatal soft signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FinalityProbe {
-    /// The endpoint reports a finalized block strictly behind the chain tip --
-    /// genuine finality, as expected.
+pub(crate) enum CutoffProbe {
+    /// The endpoint returned a usable block for the configured cutoff tag.
     Supported,
-    /// The endpoint reports no finalized block yet (a chain shallower than
-    /// finality); ingestion is deferred until finality becomes available.
+    /// The endpoint returned no block for this tag yet (null response) --
+    /// valid at cold start; ingestion is deferred until the tag is available.
     NotYetAvailable,
-    /// The endpoint reports a finalized block at or ahead of the chain tip,
-    /// suggesting it aliases the `finalized` tag to `latest` -- which would
-    /// silently disable the reorg protection this monitor depends on.
-    AliasesChainTip,
 }
 
-/// Verifies at startup that the RPC endpoint can serve a usable `finalized` block
-/// tag, so a misconfigured endpoint surfaces at boot instead of letting the bot
-/// run while silently undermining reorg protection. Outcomes:
+/// Error returned by [`probe_cutoff_block_support`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CutoffProbeError {
+    /// RPC transport failure probing the cutoff block tag.
+    #[error("RPC error probing cutoff block tag: {0}")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
+    /// The `finalized` block tag is at or beyond the chain tip, indicating the
+    /// endpoint aliases `finalized` to `latest` and silently disables reorg
+    /// protection.
+    #[error(
+        "finalized block ({cutoff_block}) at or beyond chain tip ({chain_tip}); \
+         endpoint likely aliases `finalized` to `latest`"
+    )]
+    FinalizedAliasesChainTip { cutoff_block: u64, chain_tip: u64 },
+}
+
+/// Verifies at startup that the RPC endpoint can serve the configured cutoff
+/// block tag, so a misconfigured endpoint surfaces at boot instead of letting
+/// the bot run silently degraded.
 ///
-/// - An error (unsupported method, wrong-network proxy) is the `Err` arm, which
-///   the caller propagates to fail startup -- mirroring the basic reachability
-///   probe in [`crate::conductor`].
-/// - `None` is the only non-fatal soft signal: a chain shallower than finality (a
-///   fresh test chain) legitimately has no finalized block yet, and failing would
-///   be racy against finality catching up. Logged at `warn` so the deferral is
-///   visible.
-/// - `finalized >= chain_tip` means the endpoint reports a finalized block at or
-///   beyond the tip, which only an endpoint aliasing `finalized` to `latest`
-///   does -- it would restore near-tip ingestion with no reorg protection. The
-///   conductor treats this as fatal. The comparison assumes finality lag dwarfs
-///   any cross-backend skew on a load-balanced RPC, which holds on the deployment
-///   target (Base finalizes ~hundreds of blocks behind the tip, far more than a
-///   few-block skew); detection fundamentally needs a tip read taken no later
-///   than `finalized`, so the caller passes the tip it read just before this
-///   probe rather than this probe re-reading a fresher (and thus always-ahead)
-///   tip.
-pub(crate) async fn probe_finalized_block_support<P: Provider>(
+/// For `Safe`: confirms the endpoint returns a non-null, non-error response for
+/// the `safe` tag. No aliasing check -- `safe` legitimately reaches or exceeds
+/// the chain tip when the sequencer batch cadence is fast, so a near-tip value
+/// is expected, not an error. The probe only verifies tag support.
+///
+/// For `Finalized`: additionally checks that `finalized < chain_tip`. If
+/// `finalized >= chain_tip` the endpoint is likely aliasing `finalized` to
+/// `latest`, which would silently disable reorg protection. This case is fatal
+/// at the conductor (returned as `Err`). The comparison assumes finality lag
+/// (~hundreds of blocks on Base) dwarfs any cross-backend skew; the caller
+/// passes the tip it read just before this probe so the comparison uses a
+/// consistent read pair.
+///
+/// Outcomes:
+/// - `Err`: RPC error (unsupported method, wrong-network proxy) or detected
+///   `finalized` aliasing -- both are fatal at the conductor.
+/// - `Ok(NotYetAvailable)`: tag not yet available (null response); logged and
+///   allowed through so a fresh chain does not fail startup.
+/// - `Ok(Supported)`: endpoint supports the tag.
+pub(crate) async fn probe_cutoff_block_support<P: Provider>(
     provider: &P,
     chain_tip: u64,
-) -> Result<FinalityProbe, RpcError<TransportErrorKind>> {
-    let Some(finalized) = latest_finalized_block(provider).await? else {
+    cutoff: IngestionCutoff,
+) -> Result<CutoffProbe, CutoffProbeError> {
+    let tag = cutoff_block_tag(cutoff);
+
+    let Some(cutoff_block) = latest_cutoff_block(provider, tag).await? else {
         warn!(
             target: "orderbook",
-            "RPC endpoint reports no finalized block at startup; order-fill \
-             ingestion will not begin until the endpoint exposes finality"
+            %cutoff,
+            "RPC endpoint reports no {cutoff} block at startup; order-fill \
+             ingestion will not begin until the endpoint exposes it",
         );
-        return Ok(FinalityProbe::NotYetAvailable);
+        return Ok(CutoffProbe::NotYetAvailable);
     };
 
-    if finalized >= chain_tip {
-        warn!(
-            target: "orderbook",
-            finalized,
+    // Only check aliasing for `finalized`: on `finalized`, a value at or
+    // beyond the tip is only possible if the endpoint aliases the tag to
+    // `latest`, disabling reorg protection. On `safe`, the cutoff can
+    // legitimately reach or slightly exceed the tip (fast sequencer batching),
+    // so this check would false-positive on startup.
+    let check_aliasing = match cutoff {
+        IngestionCutoff::Safe => false,
+        IngestionCutoff::Finalized => true,
+    };
+    if check_aliasing && cutoff_block >= chain_tip {
+        return Err(CutoffProbeError::FinalizedAliasesChainTip {
+            cutoff_block,
             chain_tip,
-            "RPC endpoint reports a finalized block at or ahead of the chain tip; \
-             it may be aliasing the `finalized` tag to `latest`, which would \
-             silently disable reorg protection"
-        );
-        return Ok(FinalityProbe::AliasesChainTip);
+        });
     }
 
-    Ok(FinalityProbe::Supported)
+    Ok(CutoffProbe::Supported)
 }
 
 #[cfg(test)]
@@ -493,47 +603,46 @@ mod tests {
     use super::*;
     use crate::test_utils::setup_test_pools;
 
-    /// Builds a mock provider whose `eth_getBlockByNumber("finalized")`
-    /// resolves to a block at `number`, so `latest_finalized_block` returns it.
+    /// Builds a mock block at `number` for use in mock provider responses.
     fn finalized_at(number: u64) -> Block {
         let mut block = Block::<Transaction>::default();
         block.header.inner.number = number;
         block
     }
 
-    /// Single finalized-block read, for [`probe_finalized_block_support`] tests
-    /// (the probe reads only the finalized block; the tip is passed in).
-    fn provider_with_finalized(number: u64) -> impl Provider + Clone {
+    /// Single cutoff-block read, for [`probe_cutoff_block_support`] tests
+    /// (the probe reads only the cutoff block; the tip is passed in).
+    fn provider_with_cutoff(number: u64) -> impl Provider + Clone {
         let asserter = Asserter::new();
         asserter.push_success(&finalized_at(number));
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
-    /// A provider whose node reports no finalized block yet (null response),
-    /// for [`probe_finalized_block_support`] tests (single finalized read).
-    fn provider_without_finalized() -> impl Provider + Clone {
+    /// A provider whose node reports no cutoff block yet (null response),
+    /// for [`probe_cutoff_block_support`] tests (single cutoff read).
+    fn provider_without_cutoff() -> impl Provider + Clone {
         let asserter = Asserter::new();
         asserter.push_success(&Value::Null);
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
     /// Queues the two RPC responses a single `poll_once` tick reads, in order:
-    /// `eth_blockNumber` (the chain tip) then `eth_getBlockByNumber("finalized")`.
-    /// `finalized: None` queues a JSON null -- a node reporting no finalized
-    /// block yet.
-    fn push_tick(asserter: &Asserter, chain_tip: u64, finalized: Option<u64>) {
+    /// `eth_blockNumber` (the chain tip) then `eth_getBlockByNumber(<tag>)`.
+    /// `cutoff: None` queues a JSON null -- a node reporting the tag is not
+    /// yet available.
+    fn push_tick(asserter: &Asserter, chain_tip: u64, cutoff: Option<u64>) {
         asserter.push_success(&Value::from(chain_tip));
-        match finalized {
+        match cutoff {
             Some(number) => asserter.push_success(&finalized_at(number)),
             None => asserter.push_success(&Value::Null),
         }
     }
 
     /// Mock provider answering a single `poll_once` tick: chain tip `chain_tip`
-    /// then finalized block `finalized`.
-    fn provider_at(chain_tip: u64, finalized: u64) -> impl Provider + Clone {
+    /// then cutoff block `cutoff`.
+    fn provider_at(chain_tip: u64, cutoff: u64) -> impl Provider + Clone {
         let asserter = Asserter::new();
-        push_tick(&asserter, chain_tip, Some(finalized));
+        push_tick(&asserter, chain_tip, Some(cutoff));
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
@@ -566,6 +675,20 @@ mod tests {
         apalis_sqlite::SqlitePool,
         EvmCtx,
     ) {
+        setup_with_deployment_block_and_cutoff(provider, deployment_block, IngestionCutoff::Safe)
+            .await
+    }
+
+    async fn setup_with_deployment_block_and_cutoff<P>(
+        provider: P,
+        deployment_block: u64,
+        ingestion_cutoff: IngestionCutoff,
+    ) -> (
+        OrderFillMonitor<P>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+        EvmCtx,
+    ) {
         let (pool, apalis_pool) = setup_test_pools().await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
@@ -573,9 +696,8 @@ mod tests {
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block,
-            // No longer used by the monitor cutoff (it caps at the finalized
-            // block); kept on the ctx for transaction-submission paths.
             required_confirmations: 0,
+            ingestion_cutoff,
         };
 
         let monitor = OrderFillMonitor::new(
@@ -600,8 +722,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_once_enqueues_range_up_to_finalized_block() {
-        // checkpoint=99, finalized=102 -> from=100, cutoff=102.
+    async fn poll_once_enqueues_range_up_to_cutoff_block() {
+        // checkpoint=99, cutoff=102 -> from=100, cutoff=102.
         let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(110, 102)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
@@ -619,7 +741,7 @@ mod tests {
         assert_eq!(backfill_job_count(&apalis_pool).await, 1);
         let job = loaded_backfill(&apalis_pool).await;
         assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
-        assert_eq!(job.to_block, 102, "cutoff must equal the finalized block");
+        assert_eq!(job.to_block, 102, "cutoff must equal the cutoff block");
     }
 
     #[tokio::test]
@@ -643,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_skips_when_caught_up() {
-        // checkpoint=102, finalized=102 -> from=103 > cutoff.
+        // checkpoint=102, cutoff=102 -> from=103 > cutoff.
         let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(110, 102)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
             .await
@@ -655,17 +777,22 @@ mod tests {
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "nothing to enqueue when the checkpoint has reached the finalized block"
+            "nothing to enqueue when the checkpoint has reached the cutoff block"
         );
     }
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_once_skips_when_finalized_behind_checkpoint() {
-        // A load-balanced RPC returns a finalized block (150) below the already
-        // persisted checkpoint (200) -> from_block=201 is >1 past the cutoff.
-        // Ingestion must pause (warn path) without enqueuing or moving anything.
-        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(205, 150)).await;
+    async fn poll_once_pauses_when_finalized_cutoff_far_behind_checkpoint() {
+        // A load-balanced RPC returns a finalized block (150) far below the
+        // already-persisted checkpoint (200). Under `finalized`, any regression
+        // is significant and must pause with a warning.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(205, 150),
+            1,
+            IngestionCutoff::Finalized,
+        )
+        .await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
             .await
             .unwrap();
@@ -674,58 +801,240 @@ mod tests {
 
         assert_eq!(
             outcome,
-            PollOutcome::FinalityBehindCheckpoint,
-            "a finalized block behind the checkpoint is a finality regression"
+            PollOutcome::CutoffBehindCheckpoint,
+            "a finalized cutoff block behind the checkpoint is a cutoff regression"
         );
         assert!(
-            logs_contain("Finalized block is behind committed ingestion progress"),
-            "the finality-regression pause must warn operators"
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "the cutoff-regression pause must warn operators"
         );
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "a finalized block behind the checkpoint must not enqueue a range"
+            "a finalized cutoff behind the checkpoint must not enqueue a range"
         );
         assert_eq!(
             crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
                 .await
                 .unwrap(),
             Some(200),
-            "the checkpoint must not move when finalized regresses behind it"
+            "the checkpoint must not move when the finalized cutoff regresses"
         );
     }
 
+    /// Under `finalized`, even a 1-block regression (checkpoint=200,
+    /// finalized=199) is significant and must pause ingestion with a warning.
+    /// This proves the mode boundary: the same 1-block regression under `safe`
+    /// would quiet-skip (within SAFE_CUTOFF_QUIET_SKEW), but under `finalized`
+    /// any cutoff < checkpoint is a meaningful anomaly.
+    #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_once_skips_when_finality_behind_deployment_block() {
-        // Cold start (no checkpoint): finality (genesis block 0) sits below the
+    async fn poll_once_pauses_when_finalized_cutoff_one_behind_checkpoint() {
+        // checkpoint=200, finalized=199 (1-block regression). Under `finalized`
+        // any regression must pause with a warning, even a single block.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(205, 199),
+            1,
+            IngestionCutoff::Finalized,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a 1-block finalized regression must pause ingestion (no quiet-skew band under finalized)"
+        );
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "a 1-block finalized regression must warn operators"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a 1-block finalized regression must not enqueue a range"
+        );
+        assert_eq!(
+            crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+                .await
+                .unwrap(),
+            Some(200),
+            "the checkpoint must not move on a 1-block finalized regression"
+        );
+    }
+
+    /// Under `safe`, a small backwards step (within SAFE_CUTOFF_QUIET_SKEW)
+    /// skips ingestion for the tick and emits a warn (observable for reorg
+    /// detection) without pausing the monitor.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_quietly_when_safe_cutoff_slightly_behind_checkpoint() {
+        // checkpoint=1000, safe=995 (5-block backwards skew). Within
+        // SAFE_CUTOFF_QUIET_SKEW: must return CutoffWithinQuietSkew (not
+        // CutoffBehindCheckpoint) and warn at the stepped-backwards level.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(1005, 995),
+            1,
+            IngestionCutoff::Safe,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 1000)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffWithinQuietSkew,
+            "a small safe-cutoff skew must skip quietly (CutoffWithinQuietSkew), not pause ingestion"
+        );
+        assert!(
+            logs_contain("Safe cutoff block stepped backwards below checkpoint"),
+            "a small safe skew must warn so an in-band reorg is observable"
+        );
+        assert!(
+            !logs_contain("Cutoff block is behind committed ingestion progress"),
+            "a small safe skew must not emit the full-pause warning"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a small safe skew must not enqueue a range"
+        );
+    }
+
+    /// Under `safe`, a large regression (beyond SAFE_CUTOFF_QUIET_SKEW) still
+    /// pauses ingestion with a warning.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_pauses_when_safe_cutoff_far_behind_checkpoint() {
+        // checkpoint=200, safe=100 (100-block backwards skew). Exceeds
+        // SAFE_CUTOFF_QUIET_SKEW (32), so ingestion must pause with a warning.
+        let (mut monitor, pool, apalis_pool, evm_ctx) =
+            setup_with_deployment_block_and_cutoff(provider_at(205, 100), 1, IngestionCutoff::Safe)
+                .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a large safe-cutoff regression must pause ingestion"
+        );
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "a large safe-cutoff regression must warn operators"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a large safe regression must not enqueue a range"
+        );
+    }
+
+    /// regression == SAFE_CUTOFF_QUIET_SKEW (32): must quiet-skip with a warn.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_quietly_at_exact_skew_boundary() {
+        // checkpoint=1032, safe=1000 (32-block regression == SAFE_CUTOFF_QUIET_SKEW).
+        // Must return CutoffWithinQuietSkew (not pause) and warn.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(1040, 1000),
+            1,
+            IngestionCutoff::Safe,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 1032)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffWithinQuietSkew,
+            "a regression of exactly SAFE_CUTOFF_QUIET_SKEW must quiet-skip"
+        );
+        assert!(
+            logs_contain("Safe cutoff block stepped backwards below checkpoint"),
+            "exact boundary must warn so an in-band reorg is observable"
+        );
+        assert!(
+            !logs_contain("Cutoff block is behind committed ingestion progress"),
+            "exact boundary must not emit the full-pause warning"
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 0);
+    }
+
+    /// regression == SAFE_CUTOFF_QUIET_SKEW + 1 (33): must pause with a warning.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_pauses_at_one_beyond_skew_boundary() {
+        // checkpoint=1033, safe=1000 (33-block regression > SAFE_CUTOFF_QUIET_SKEW).
+        // Must pause with a warning.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(1040, 1000),
+            1,
+            IngestionCutoff::Safe,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 1033)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a regression of SAFE_CUTOFF_QUIET_SKEW+1 must pause ingestion"
+        );
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "one block beyond the boundary must warn operators"
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_when_cutoff_behind_deployment_block() {
+        // Cold start (no checkpoint): cutoff (genesis block 0) sits below the
         // deployment block (1), so there is nothing to ingest yet. `from_block`
         // (1) == `cutoff` (0) + 1, but with no committed progress this is NOT
-        // "caught up" -- it is the deployment block one short of finalizing, so
-        // the outcome must be FinalityBehindDeployment, not CaughtUp.
+        // "caught up" -- it is the deployment block one short of the cutoff, so
+        // the outcome must be CutoffBehindDeployment, not CaughtUp.
         let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at(5, 0)).await;
 
         let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             outcome,
-            PollOutcome::FinalityBehindDeployment,
-            "cold start with finality below deployment_block must not report CaughtUp"
+            PollOutcome::CutoffBehindDeployment,
+            "cold start with cutoff below deployment_block must not report CaughtUp"
         );
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "nothing to ingest until finality reaches the deployment block"
+            "nothing to ingest until the cutoff reaches the deployment block"
         );
     }
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_once_does_not_warn_when_deployment_block_is_ahead_of_finality() {
+    async fn poll_once_does_not_warn_when_deployment_block_is_ahead_of_cutoff() {
         // Unusual config: a low stale checkpoint (5) but deployment_block (100)
-        // configured ahead of the finalized block (10). `from_block` is driven by
+        // configured ahead of the cutoff block (10). `from_block` is driven by
         // the deployment floor to 100 > cutoff + 1, but committed progress (5) is
-        // NOT past finality -- so this must be the quiet deployment-wait, not the
-        // loud finality-regression warning that blames the RPC.
+        // NOT past the cutoff -- so this must be the quiet deployment-wait, not
+        // the loud cutoff-regression warning that blames the RPC.
         let (mut monitor, pool, apalis_pool, evm_ctx) =
             setup_with_deployment_block(provider_at(15, 10), 100).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 5)
@@ -736,8 +1045,8 @@ mod tests {
 
         assert_eq!(
             outcome,
-            PollOutcome::FinalityBehindDeployment,
-            "a deployment_block ahead of finality is not a finality regression"
+            PollOutcome::CutoffBehindDeployment,
+            "a deployment_block ahead of the cutoff is not a cutoff regression"
         );
         assert!(
             !logs_contain("behind committed ingestion progress"),
@@ -746,14 +1055,16 @@ mod tests {
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "nothing to ingest until finality reaches the deployment block"
+            "nothing to ingest until the cutoff reaches the deployment block"
         );
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_once_does_not_enqueue_when_no_finalized_block_yet() {
-        // No finalized block and no checkpoint (cold start) -> skip the tick
-        // without enqueuing anything.
+    async fn poll_once_does_not_enqueue_when_no_cutoff_block_yet() {
+        // No cutoff block and no checkpoint (cold start) -> skip the tick
+        // without enqueuing anything. Cold start is expected/transient, so
+        // no warn must fire (the startup probe surfaces persistent nulls).
         let asserter = Asserter::new();
         push_tick(&asserter, 50, None);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -763,26 +1074,33 @@ mod tests {
 
         assert_eq!(
             outcome,
-            PollOutcome::NoFinalityColdStart,
-            "no checkpoint + null finality is an expected cold-start skip"
+            PollOutcome::NoCutoffColdStart,
+            "no checkpoint + null cutoff is an expected cold-start skip"
+        );
+        assert!(
+            !logs_contain("Ingestion cannot start"),
+            "cold-start null cutoff must not emit the old warn message"
+        );
+        assert!(
+            !logs_contain("No cutoff block reported while a checkpoint exists"),
+            "cold-start null cutoff must not trigger the checkpoint-exists warn"
         );
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "no finalized block to ingest yet -> no enqueue"
+            "no cutoff block available yet -> no enqueue"
         );
     }
 
-    /// A null finalized response while a checkpoint already exists must skip the
+    /// A null cutoff response while a checkpoint already exists must skip the
     /// tick without moving the checkpoint (the financial invariant: a skip never
     /// advances ingestion past unverified blocks), and a later tick that sees a
-    /// real finalized block must resume from exactly where it left off.
+    /// real cutoff block must resume from exactly where it left off.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_once_skips_intermittent_null_without_moving_checkpoint() {
-        // Two ticks: the first reports null finality, the second a real
-        // finalized block. Each tick reads the chain tip then the finalized
-        // block.
+        // Two ticks: the first reports null cutoff, the second a real cutoff
+        // block. Each tick reads the chain tip then the cutoff block.
         let asserter = Asserter::new();
         push_tick(&asserter, 104, None);
         push_tick(&asserter, 110, Some(105));
@@ -792,33 +1110,33 @@ mod tests {
             .await
             .unwrap();
 
-        // First tick: node returns null finality -> skip, checkpoint frozen.
+        // First tick: node returns null cutoff -> skip, checkpoint frozen.
         // A checkpoint exists, so this is the warn branch, distinct from the
         // cold-start debug branch despite identical side effects.
         let first = monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             first,
-            PollOutcome::NoFinalityWithCheckpoint,
-            "null finality while a checkpoint exists is the warn (regression) branch"
+            PollOutcome::NoCutoffWithCheckpoint,
+            "null cutoff while a checkpoint exists is the warn (regression) branch"
         );
         assert!(
-            logs_contain("No finalized block reported while a checkpoint exists"),
+            logs_contain("No cutoff block reported while a checkpoint exists"),
             "the warn branch must emit an operator-visible warning"
         );
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             0,
-            "a null finalized response must not enqueue a range"
+            "a null cutoff response must not enqueue a range"
         );
         assert_eq!(
             crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
                 .await
                 .unwrap(),
             Some(99),
-            "the checkpoint must not move when finality is momentarily null"
+            "the checkpoint must not move when the cutoff block is momentarily null"
         );
 
-        // Second tick: finality is back -> resume from exactly checkpoint+1.
+        // Second tick: cutoff is back -> resume from exactly checkpoint+1.
         let second = monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             second,
@@ -826,18 +1144,65 @@ mod tests {
                 from_block: 100,
                 to_block: 105
             },
-            "a recovered finalized response resumes from checkpoint+1"
+            "a recovered cutoff response resumes from checkpoint+1"
         );
         assert_eq!(
             backfill_job_count(&apalis_pool).await,
             1,
-            "a recovered finalized response must resume ingestion"
+            "a recovered cutoff response must resume ingestion"
         );
         let job = loaded_backfill(&apalis_pool).await;
         assert_eq!(job.from_block, 100, "resume from exactly checkpoint+1");
         assert_eq!(
             job.to_block, 105,
-            "cutoff equals the recovered finalized block"
+            "cutoff equals the recovered cutoff block"
+        );
+    }
+
+    /// Same as `poll_once_skips_intermittent_null_without_moving_checkpoint`
+    /// but for the `Finalized` cutoff. The null-handling path is tag-agnostic;
+    /// this test guards against accidental tag-specific divergence.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_intermittent_null_finalized_without_moving_checkpoint() {
+        let asserter = Asserter::new();
+        push_tick(&asserter, 104, None);
+        push_tick(&asserter, 110, Some(105));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) =
+            setup_with_deployment_block_and_cutoff(provider, 1, IngestionCutoff::Finalized).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        let first = monitor.poll_once(Utc::now()).await.unwrap();
+        assert_eq!(first, PollOutcome::NoCutoffWithCheckpoint);
+        assert!(logs_contain(
+            "No cutoff block reported while a checkpoint exists"
+        ));
+        assert_eq!(backfill_job_count(&apalis_pool).await, 0);
+        assert_eq!(
+            crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+                .await
+                .unwrap(),
+            Some(99),
+        );
+
+        let second = monitor.poll_once(Utc::now()).await.unwrap();
+        assert_eq!(
+            second,
+            PollOutcome::Enqueued {
+                from_block: 100,
+                to_block: 105
+            },
+            "a recovered cutoff response resumes from checkpoint+1"
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 1);
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 100, "resume from exactly checkpoint+1");
+        assert_eq!(
+            job.to_block, 105,
+            "cutoff equals the recovered cutoff block"
         );
     }
 
@@ -892,9 +1257,10 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
-        // One chain-tip + finalized-block response pair per poll_once call.
+        // One chain-tip + cutoff-block response pair per poll_once call.
         let asserter = Asserter::new();
         push_tick(&asserter, 55, Some(50));
         push_tick(&asserter, 55, Some(50));
@@ -989,7 +1355,7 @@ mod tests {
         assert_eq!(
             lag_blocks,
             Some(90),
-            "lag (finalized 100 - checkpoint 10) must be sampled even while a backfill is in flight"
+            "lag (cutoff 100 - checkpoint 10) must be sampled even while a backfill is in flight"
         );
     }
 
@@ -1054,7 +1420,7 @@ mod tests {
         // A requeued (Pending) job still counts as in flight, so the wedge only
         // truly lifts once a worker drains it to a terminal state. Simulate that
         // completion, then confirm the next poll resumes ingestion -- it reaches
-        // the finalized-block RPC (consuming the mock) and enqueues a fresh range.
+        // the cutoff-block RPC (consuming the mock) and enqueues a fresh range.
         sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type LIKE '%BackfillRange%'")
             .execute(&apalis_pool)
             .await
@@ -1070,7 +1436,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_records_block_lag_sample() {
-        // tip=105, finalized=102, checkpoint=99 -> lag = finalized - checkpoint = 3.
+        // tip=105, cutoff=102, checkpoint=99 -> lag = cutoff - checkpoint = 3.
         let (mut monitor, pool, _apalis_pool, evm_ctx) = setup(provider_at(105, 102)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
@@ -1078,27 +1444,27 @@ mod tests {
 
         monitor.poll_once(Utc::now()).await.unwrap();
 
-        let (chain_tip, finalized_block, last_processed_block, lag_blocks): (
+        let (chain_tip, cutoff_block, last_processed_block, lag_blocks): (
             i64,
             i64,
             Option<i64>,
             Option<i64>,
         ) = sqlx::query_as(
-            "SELECT chain_tip, finalized_block, last_processed_block, lag_blocks \
+            "SELECT chain_tip, cutoff_block, last_processed_block, lag_blocks \
              FROM block_lag_samples",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(chain_tip, 105);
-        assert_eq!(finalized_block, 102);
+        assert_eq!(cutoff_block, 102);
         assert_eq!(last_processed_block, Some(99));
         assert_eq!(lag_blocks, Some(3));
     }
 
     #[tokio::test]
     async fn poll_once_reads_zero_lag_when_caught_up() {
-        // checkpoint == finalized: a healthy caught-up system must read 0, not a
+        // checkpoint == cutoff: a healthy caught-up system must read 0, not a
         // permanent floor.
         let (mut monitor, pool, _apalis_pool, evm_ctx) = setup(provider_at(105, 102)).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
@@ -1174,76 +1540,154 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_finalized_block_support_accepts_a_finalized_block() {
-        // Finalized (102) strictly behind the chain tip (110): genuine finality.
-        let outcome = probe_finalized_block_support(&provider_with_finalized(102), 110)
-            .await
-            .unwrap();
+    async fn probe_cutoff_block_support_accepts_a_safe_block() {
+        // Safe cutoff (108) behind the chain tip (110): genuine support.
+        let outcome =
+            probe_cutoff_block_support(&provider_with_cutoff(108), 110, IngestionCutoff::Safe)
+                .await
+                .unwrap();
 
-        assert_eq!(outcome, FinalityProbe::Supported);
+        assert_eq!(outcome, CutoffProbe::Supported);
+    }
+
+    #[tokio::test]
+    async fn probe_cutoff_block_support_accepts_a_finalized_block() {
+        // Finalized (102) strictly behind the chain tip (110): genuine finality.
+        let outcome =
+            probe_cutoff_block_support(&provider_with_cutoff(102), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, CutoffProbe::Supported);
+    }
+
+    /// The `safe` tag can legitimately equal or exceed the chain tip (fast
+    /// sequencer batch cadence). The probe must accept this as normal, not flag
+    /// it as aliasing.
+    #[tokio::test]
+    async fn probe_cutoff_block_support_does_not_flag_safe_near_tip() {
+        // safe == chain_tip (110 == 110): valid for `safe`, must return Supported.
+        let outcome =
+            probe_cutoff_block_support(&provider_with_cutoff(110), 110, IngestionCutoff::Safe)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            CutoffProbe::Supported,
+            "safe == chain_tip is normal for fast sequencer batching; must not flag aliasing"
+        );
     }
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn probe_finalized_block_support_accepts_missing_finality() {
-        // A chain shallower than finality (null `finalized`) is a legitimate
-        // cold-start state, so the startup probe must not reject it -- failing
-        // here would be racy against finality catching up on a fresh chain.
-        let outcome = probe_finalized_block_support(&provider_without_finalized(), 110)
-            .await
-            .unwrap();
+    async fn probe_cutoff_block_support_accepts_null_response() {
+        // A null response (tag not yet available) must be allowed through as
+        // NotYetAvailable, so a fresh chain does not fail startup.
+        let outcome =
+            probe_cutoff_block_support(&provider_without_cutoff(), 110, IngestionCutoff::Safe)
+                .await
+                .unwrap();
 
-        assert_eq!(outcome, FinalityProbe::NotYetAvailable);
+        assert_eq!(outcome, CutoffProbe::NotYetAvailable);
         assert!(
-            logs_contain("RPC endpoint reports no finalized block at startup"),
+            logs_contain("RPC endpoint reports no safe block at startup"),
             "deferred ingestion at startup must be operator-visible"
         );
     }
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn probe_finalized_block_support_flags_finalized_aliasing_the_tip() {
-        // A provider that reports `finalized` at the chain tip (110 == 110) is
-        // likely aliasing `finalized` to `latest`, which would silently disable
-        // reorg protection -- the probe must flag it rather than accept it.
-        let outcome = probe_finalized_block_support(&provider_with_finalized(110), 110)
-            .await
-            .unwrap();
+    async fn probe_cutoff_block_support_accepts_null_finalized_response() {
+        // A null response for the finalized tag (tag not yet available) must
+        // be allowed through as NotYetAvailable, so a fresh chain does not
+        // fail startup.
+        let outcome =
+            probe_cutoff_block_support(&provider_without_cutoff(), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap();
 
-        assert_eq!(outcome, FinalityProbe::AliasesChainTip);
+        assert_eq!(outcome, CutoffProbe::NotYetAvailable);
         assert!(
-            logs_contain("may be aliasing the `finalized` tag to `latest`"),
-            "a tip-aliased finalized tag must be operator-visible"
+            logs_contain("RPC endpoint reports no finalized block at startup"),
+            "deferred ingestion at startup must be operator-visible"
         );
     }
 
     #[tokio::test]
-    async fn probe_finalized_block_support_flags_finalized_strictly_ahead_of_tip() {
-        // finalized (111) strictly ahead of the chain tip (110): a finalized read
-        // beyond the tip can only mean the endpoint is not reporting real finality,
-        // so the probe must flag it like the equal case (the `>` half of `>=`).
-        let outcome = probe_finalized_block_support(&provider_with_finalized(111), 110)
-            .await
-            .unwrap();
+    async fn probe_cutoff_block_support_flags_finalized_aliasing_tip() {
+        // A provider reporting `finalized` at the chain tip (110 == 110) is
+        // likely aliasing `finalized` to `latest`, disabling reorg protection.
+        // The probe must return a structured FinalizedAliasesChainTip error.
+        let error =
+            probe_cutoff_block_support(&provider_with_cutoff(110), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap_err();
 
-        assert_eq!(outcome, FinalityProbe::AliasesChainTip);
+        assert!(
+            matches!(
+                error,
+                CutoffProbeError::FinalizedAliasesChainTip {
+                    cutoff_block: 110,
+                    chain_tip: 110,
+                }
+            ),
+            "finalized aliasing the tip must surface as FinalizedAliasesChainTip; got: {error:?}"
+        );
     }
 
     #[tokio::test]
-    async fn probe_finalized_block_support_rejects_an_rpc_error() {
+    async fn probe_cutoff_block_support_flags_finalized_strictly_ahead_of_tip() {
+        // finalized (111) strictly ahead of the chain tip (110): only an
+        // endpoint aliasing `finalized` to `latest` can produce this.
+        let error =
+            probe_cutoff_block_support(&provider_with_cutoff(111), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CutoffProbeError::FinalizedAliasesChainTip {
+                    cutoff_block: 111,
+                    chain_tip: 110,
+                }
+            ),
+            "finalized ahead of the tip must surface as FinalizedAliasesChainTip; got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_cutoff_block_support_rpc_error_bubbles_for_safe_tag() {
         let asserter = Asserter::new();
         asserter.push_failure_msg("connection refused");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        // An endpoint that errors on the finalized tag must fail the startup
-        // probe rather than letting the bot start and silently never ingest.
-        let error = probe_finalized_block_support(&provider, 110)
+        // An endpoint that errors on the safe tag must fail the startup probe.
+        let error = probe_cutoff_block_support(&provider, 110, IngestionCutoff::Safe)
             .await
             .unwrap_err();
 
         assert!(
-            matches!(error, RpcError::ErrorResp(_)),
-            "a finalized-tag RPC failure must surface as an error response; got: {error:?}"
+            matches!(error, CutoffProbeError::Rpc(RpcError::ErrorResp(_))),
+            "a safe-tag RPC failure must surface as a wrapped RPC error; got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_cutoff_block_support_rpc_error_bubbles_for_finalized_tag() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection refused");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        // An endpoint that errors on the finalized tag must fail the startup probe.
+        let error = probe_cutoff_block_support(&provider, 110, IngestionCutoff::Finalized)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CutoffProbeError::Rpc(RpcError::ErrorResp(_))),
+            "a finalized-tag RPC failure must surface as a wrapped RPC error; got: {error:?}"
         );
     }
 }

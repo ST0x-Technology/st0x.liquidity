@@ -192,6 +192,10 @@ mod tests {
     use alloy::primitives::Address;
     use url::Url;
 
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::create_test_issuance_ctx;
+    use st0x_config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_execution::Symbol;
     use st0x_wrapper::MockWrapper;
 
@@ -200,10 +204,6 @@ mod tests {
         unwrap_equity_with_wrapper, wrap_equity_command, wrap_equity_with_wrapper,
     };
     use crate::test_utils::positive_shares;
-    use st0x_config::EvmCtx;
-    use st0x_config::ExecutionThreshold;
-    use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -217,6 +217,7 @@ mod tests {
                 orderbook: Address::random(),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,

@@ -1597,13 +1597,14 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use url::Url;
 
-    use super::*;
-    use crate::offchain::order::OffchainOrderEvent;
-    use crate::test_utils::{positive_shares, setup_test_db};
-    use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{EvmCtx, IngestionCutoff};
+
+    use super::*;
+    use crate::offchain::order::OffchainOrderEvent;
+    use crate::test_utils::{positive_shares, setup_test_db};
 
     fn create_test_ctx() -> Ctx {
         Ctx {
@@ -1617,6 +1618,7 @@ mod tests {
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
@@ -2493,6 +2495,7 @@ mod tests {
                 orderbook = "0x1111111111111111111111111111111111111111"
                 deployment_block = 1
                 required_confirmations = 3
+                ingestion_cutoff = "safe"
 
                 [wallet]
                 kind = "private-key"
@@ -2542,6 +2545,7 @@ mod tests {
         assert!(matches!(command, Commands::Buy { .. }));
         assert_eq!(ctx.database_url, ":memory:");
         assert_eq!(ctx.evm.required_confirmations, 3);
+        assert_eq!(ctx.evm.ingestion_cutoff, IngestionCutoff::Safe);
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
     }
 }

@@ -206,15 +206,16 @@ impl BaseChain<()> {
         // requiring multiple confirmations (e.g., REQUIRED_CONFIRMATIONS=3
         // in ShareWrapper) complete on Anvil instead of hanging forever.
         //
-        // `--slots-in-an-epoch 1` (Foundry anvil flag) shrinks Anvil's finality
-        // lag so the finalized-block fill monitor can ingest within a short
-        // test. Anvil advances the `finalized` block tag a fixed number of
-        // slots/epochs behind the tip; empirically, with the default 32-slot
-        // epoch the lag is large enough that a brief e2e never mines past it --
-        // ingestion is starved and the 120s poll times out. A 1-slot epoch
-        // drops the observed lag to a couple of blocks, which the 1s
-        // auto-mining clears within seconds. (If a future Anvil changes this
-        // relationship the failure is a loud e2e timeout, not a silent pass.)
+        // `--slots-in-an-epoch 1` (Foundry anvil flag) shrinks Anvil's block
+        // tag lag so the fill monitor can ingest within a short test. The e2e
+        // bot uses the `safe` tag (`Ctx::for_test` pins `ingestion_cutoff =
+        // Safe`). On reth/anvil `safe` tracks one epoch behind the tip and
+        // `finalized` two; with the default 32-slot epoch the lag is large
+        // enough that a brief e2e never mines past it -- ingestion is starved
+        // and the 120s poll times out. A 1-slot epoch drops the observed lag
+        // to a couple of blocks, which the 1s auto-mining clears within
+        // seconds. (If a future Anvil changes this relationship the failure
+        // is a loud e2e timeout, not a silent pass.)
         let anvil = Anvil::new()
             .block_time(1)
             .arg("--slots-in-an-epoch")
