@@ -2799,15 +2799,22 @@ mod tests {
         }
     }
 
-    fn onchain_sell(rowid: i64, price: &str, timestamp: &str) -> PositionEventRow {
+    fn onchain_fill(
+        rowid: i64,
+        symbol: &str,
+        direction: &str,
+        price: &str,
+        shares: &str,
+        timestamp: &str,
+    ) -> PositionEventRow {
         event(
             rowid,
-            "RKLB",
+            symbol,
             "PositionEvent::OnChainOrderFilled",
             serde_json::json!({
                 "OnChainOrderFilled": {
-                    "amount": "1",
-                    "direction": "Sell",
+                    "amount": shares,
+                    "direction": direction,
                     "price_usdc": price,
                     "block_timestamp": timestamp,
                     "trade_id": {
@@ -2819,21 +2826,44 @@ mod tests {
         )
     }
 
-    fn offchain_buy(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionEventRow {
+    fn onchain_sell(rowid: i64, price: &str, timestamp: &str) -> PositionEventRow {
+        onchain_fill(rowid, "RKLB", "Sell", price, "1", timestamp)
+    }
+
+    fn onchain_buy(rowid: i64, price: &str, timestamp: &str) -> PositionEventRow {
+        onchain_fill(rowid, "RKLB", "Buy", price, "1", timestamp)
+    }
+
+    fn offchain_fill(
+        rowid: i64,
+        symbol: &str,
+        direction: &str,
+        timestamp: &str,
+        price: &str,
+        shares: &str,
+    ) -> PositionEventRow {
         event(
             rowid,
-            "RKLB",
+            symbol,
             "PositionEvent::OffChainOrderFilled",
             serde_json::json!({
                 "OffChainOrderFilled": {
                     "offchain_order_id": format!("alpaca-{rowid}"),
                     "shares_filled": shares,
-                    "direction": "Buy",
+                    "direction": direction,
                     "price": price,
                     "broker_timestamp": timestamp
                 }
             }),
         )
+    }
+
+    fn offchain_buy(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionEventRow {
+        offchain_fill(rowid, "RKLB", "Buy", timestamp, price, shares)
+    }
+
+    fn offchain_sell(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionEventRow {
+        offchain_fill(rowid, "RKLB", "Sell", timestamp, price, shares)
     }
 
     fn position_rows() -> Vec<PositionViewRow> {
@@ -2853,20 +2883,154 @@ mod tests {
         }
     }
 
-    fn report(events: Vec<PositionEventRow>) -> PnlResponse {
+    fn position_row(symbol: &str, net_position: &str) -> PositionViewRow {
+        PositionViewRow {
+            symbol: symbol.to_owned(),
+            net_position: Some(net_position.to_owned()),
+        }
+    }
+
+    fn cost_event(
+        rowid: i64,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> CostEventRow {
+        CostEventRow {
+            rowid,
+            aggregate_type: aggregate_type.to_owned(),
+            aggregate_id: aggregate_id.to_owned(),
+            event_type: event_type.to_owned(),
+            payload,
+        }
+    }
+
+    fn tokenized_mint_requested(rowid: i64, aggregate_id: &str, symbol: &str) -> CostEventRow {
+        cost_event(
+            rowid,
+            "TokenizedEquityMint",
+            aggregate_id,
+            "TokenizedEquityMintEvent::MintRequested",
+            serde_json::json!({
+                "MintRequested": {
+                    "symbol": symbol
+                }
+            }),
+        )
+    }
+
+    fn tokenized_tokens_received(
+        rowid: i64,
+        aggregate_id: &str,
+        fees: &str,
+        timestamp: &str,
+    ) -> CostEventRow {
+        cost_event(
+            rowid,
+            "TokenizedEquityMint",
+            aggregate_id,
+            "TokenizedEquityMintEvent::TokensReceived",
+            serde_json::json!({
+                "TokensReceived": {
+                    "received_at": timestamp,
+                    "fees": fees
+                }
+            }),
+        )
+    }
+
+    fn usdc_bridged(rowid: i64, aggregate_id: &str, fee: &str, timestamp: &str) -> CostEventRow {
+        cost_event(
+            rowid,
+            "UsdcRebalance",
+            aggregate_id,
+            "UsdcRebalanceEvent::Bridged",
+            serde_json::json!({
+                "Bridged": {
+                    "minted_at": timestamp,
+                    "fee_collected": fee
+                }
+            }),
+        )
+    }
+
+    fn account_activity(
+        id: &str,
+        activity_type: &str,
+        amount: &str,
+        symbol: Option<&str>,
+        timestamp: &str,
+    ) -> AccountActivity {
+        AccountActivity {
+            id: id.to_owned(),
+            activity_type: activity_type.to_owned(),
+            activity_sub_type: None,
+            date: None,
+            created_at: None,
+            net_amount: Some(amount.to_owned()),
+            symbol: symbol.map(str::to_owned),
+            qty: None,
+            per_share_amount: None,
+            price: None,
+            side: None,
+            order_id: None,
+            transaction_time: parse_timestamp(timestamp),
+            description: None,
+            status: None,
+            group_id: None,
+            currency: Some("USD".to_owned()),
+        }
+    }
+
+    fn report_with(
+        events: Vec<PositionEventRow>,
+        position_rows: Vec<PositionViewRow>,
+        cost_rows: Vec<CostEventRow>,
+        alpaca_activities: Vec<AccountActivity>,
+        query: PnlQuery,
+        symbols: BTreeSet<String>,
+    ) -> PnlResponse {
         build_pnl_response_from_rows(
             events,
-            position_rows(),
-            Vec::new(),
-            Vec::new(),
-            &query(),
-            BTreeSet::new(),
+            position_rows,
+            cost_rows,
+            alpaca_activities,
+            &query,
+            symbols,
             vec![
                 ATTRIBUTION_WARNING.to_owned(),
                 BASELINE_WARNING.to_owned(),
                 COST_WARNING.to_owned(),
             ],
         )
+    }
+
+    fn report(events: Vec<PositionEventRow>) -> PnlResponse {
+        report_with(
+            events,
+            position_rows(),
+            Vec::new(),
+            Vec::new(),
+            query(),
+            BTreeSet::new(),
+        )
+    }
+
+    fn symbol_summary<'a>(report: &'a PnlResponse, symbol: &str) -> &'a PnlSymbolSummary {
+        report
+            .symbols
+            .iter()
+            .find(|row| row.symbol == symbol)
+            .expect("missing symbol summary")
+    }
+
+    fn window_symbol<'a>(window: &'a PnlWindow, symbol: &str) -> &'a PnlWindowSymbol {
+        window
+            .symbols
+            .iter()
+            .find(|row| row.symbol == symbol)
+            .expect("missing window symbol")
     }
 
     #[test]
@@ -2881,6 +3045,62 @@ mod tests {
         assert_eq!(report.summary.total_pnl_usd, "2");
         assert_eq!(report.entries[0].pnl_bucket, "counter_trade");
         assert!(!report.entries[0].delayed_counter_trade);
+    }
+
+    #[test]
+    fn replays_fills_by_execution_timestamp_before_rowid() {
+        let report = report(vec![
+            offchain_buy(1, "2026-05-15T14:01:00Z", "8", "1"),
+            onchain_sell(2, "10", "2026-05-15T14:00:00Z"),
+        ]);
+
+        assert_eq!(report.summary.counter_trade_pnl_usd, "2");
+        assert_eq!(report.summary.directional_imbalance_excess_pnl_usd, "0");
+        assert_eq!(report.entries[0].opening_rowid, 2);
+        assert_eq!(report.entries[0].closing_rowid, 1);
+        assert_eq!(report.entries[0].pnl_bucket, "counter_trade");
+    }
+
+    #[test]
+    fn closes_long_inventory_with_counter_trade_sell() {
+        let report = report(vec![
+            onchain_buy(1, "8", "2026-05-15T14:00:00Z"),
+            offchain_sell(2, "2026-05-15T14:01:00Z", "10", "1"),
+        ]);
+
+        assert_eq!(report.summary.counter_trade_pnl_usd, "2");
+        assert_eq!(report.summary.total_pnl_usd, "2");
+        assert_eq!(report.entries[0].opening_direction, "buy");
+        assert_eq!(report.entries[0].closing_direction, "sell");
+    }
+
+    #[test]
+    fn nets_onchain_fills_by_fifo_without_offchain_parentage() {
+        let report = report(vec![
+            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+            onchain_buy(2, "8", "2026-05-15T14:01:00Z"),
+        ]);
+
+        assert_eq!(report.summary.onchain_netting_pnl_usd, "2");
+        assert_eq!(report.summary.counter_trade_pnl_usd, "0");
+        assert_eq!(report.summary.total_pnl_usd, "2");
+        assert_eq!(report.entries[0].opening_venue, "onchain");
+        assert_eq!(report.entries[0].closing_venue, "onchain");
+        assert_eq!(report.entries[0].pnl_bucket, "onchain_netting");
+    }
+
+    #[test]
+    fn delayed_counter_trade_is_bucketed_as_directional_exposure() {
+        let report = report(vec![
+            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:10:01Z", "8", "1"),
+        ]);
+
+        assert_eq!(report.summary.counter_trade_pnl_usd, "0");
+        assert_eq!(report.summary.directional_imbalance_excess_pnl_usd, "2");
+        assert_eq!(report.summary.total_pnl_usd, "2");
+        assert_eq!(report.entries[0].pnl_bucket, "directional_exposure");
+        assert!(report.entries[0].delayed_counter_trade);
     }
 
     #[test]
@@ -2923,6 +3143,127 @@ mod tests {
         assert_eq!(report.summary.unmatched_offchain_shares, "2");
         assert_eq!(report.summary.unmatched_offchain_notional_usd, "16");
         assert_eq!(report.summary.unmatched_offchain_fill_count, 1);
+    }
+
+    #[test]
+    fn date_filter_uses_realized_close_date() {
+        let report = report(vec![
+            onchain_sell(1, "10", "2026-05-14T20:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:00:00Z", "8", "1"),
+        ]);
+
+        assert_eq!(report.summary.total_pnl_usd, "2");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].opened_at, "2026-05-14T20:00:00Z");
+        assert_eq!(report.entries[0].closed_at, "2026-05-15T14:00:00Z");
+    }
+
+    #[test]
+    fn paginates_entries_without_changing_filtered_summary() {
+        let report = report_with(
+            vec![
+                onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+                offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+                onchain_sell(3, "20", "2026-05-15T15:00:00Z"),
+                offchain_buy(4, "2026-05-15T15:01:00Z", "17", "1"),
+            ],
+            position_rows(),
+            Vec::new(),
+            Vec::new(),
+            PnlQuery {
+                limit: Some(1),
+                offset: Some(0),
+                ..query()
+            },
+            BTreeSet::new(),
+        );
+
+        assert_eq!(report.total, 2);
+        assert!(report.has_more);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.summary.total_pnl_usd, "5");
+    }
+
+    #[test]
+    fn counter_trading_filter_keeps_rth_closes_only() {
+        let report = report_with(
+            vec![
+                onchain_sell(1, "10", "2026-05-15T11:59:00Z"),
+                offchain_buy(2, "2026-05-15T12:00:00Z", "8", "1"),
+                onchain_sell(3, "20", "2026-05-15T13:59:00Z"),
+                offchain_buy(4, "2026-05-15T14:00:00Z", "17", "1"),
+            ],
+            position_rows(),
+            Vec::new(),
+            Vec::new(),
+            PnlQuery {
+                counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingActive),
+                ..query()
+            },
+            BTreeSet::new(),
+        );
+
+        assert_eq!(report.summary.total_pnl_usd, "3");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].closed_at, "2026-05-15T14:00:00Z");
+        assert_eq!(report.sample_stats.total_fill_count, 2);
+    }
+
+    #[test]
+    fn counter_trading_filter_keeps_inactive_closes_only() {
+        let report = report_with(
+            vec![
+                onchain_sell(1, "10", "2026-05-15T12:00:00Z"),
+                offchain_buy(2, "2026-05-15T12:01:00Z", "8", "1"),
+                onchain_sell(3, "20", "2026-05-15T14:00:00Z"),
+                offchain_buy(4, "2026-05-15T14:01:00Z", "17", "1"),
+            ],
+            position_rows(),
+            Vec::new(),
+            Vec::new(),
+            PnlQuery {
+                counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingInactive),
+                ..query()
+            },
+            BTreeSet::new(),
+        );
+
+        assert_eq!(report.summary.total_pnl_usd, "2");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].closing_rowid, 2);
+        assert_eq!(
+            report.windows[0].counter_trading_session,
+            "counter_trading_inactive"
+        );
+    }
+
+    #[test]
+    fn market_session_filter_is_independent_from_counter_trading_filter() {
+        let report = report_with(
+            vec![
+                onchain_sell(1, "10", "2026-05-15T12:00:00Z"),
+                offchain_buy(2, "2026-05-15T12:01:00Z", "8", "1"),
+                onchain_sell(3, "20", "2026-05-15T14:00:00Z"),
+                offchain_buy(4, "2026-05-15T14:01:00Z", "17", "1"),
+            ],
+            position_rows(),
+            Vec::new(),
+            Vec::new(),
+            PnlQuery {
+                market_session_filter: Some(PnlMarketSessionFilter::Rth),
+                ..query()
+            },
+            BTreeSet::new(),
+        );
+
+        assert_eq!(report.summary.total_pnl_usd, "3");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].closing_rowid, 4);
+        assert_eq!(report.windows[0].market_session, "rth");
+        assert_eq!(
+            report.windows[0].counter_trading_session,
+            "counter_trading_active"
+        );
     }
 
     #[test]
