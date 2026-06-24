@@ -137,9 +137,11 @@ Add a new section under `[assets.equities]`:
 
 ```toml
 [assets.equities.SGOV]
-trading = "disabled"        # "enabled" or "disabled"
-rebalancing = "disabled"    # "enabled" or "disabled"
-vault_id = "0xfab"          # Raindex vault ID (can omit for auto-discovery)
+trading = "disabled"                          # "enabled" or "disabled"
+rebalancing = "disabled"                      # "enabled" or "disabled"
+wrapped_equity_recovery = "disabled"          # "enabled" or "disabled"
+extended_hours_counter_trading = "disabled"   # "enabled" or "disabled"
+vault_id = "0xfab"                            # Raindex vault ID (can omit for auto-discovery)
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 ```
@@ -150,6 +152,15 @@ tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
   ready.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
   Usually `"disabled"` at first.
+- `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity
+  positions. Set to `"enabled"` to allow the bot to recover wrapped equity;
+  `"disabled"` skips recovery for this asset. Must be specified for every equity
+  entry.
+- `extended_hours_counter_trading`: Explicit opt-in for counter-trading during
+  extended hours (pre-market and after-hours). Set to `"enabled"` to allow the
+  bot to place offsetting broker trades outside regular market hours;
+  `"disabled"` restricts counter-trading to regular session only. Must be
+  specified for every equity entry.
 - `vault_id`: The Raindex vault ID. Can be omitted to let the bot discover it
   automatically.
 - `tokenized_equity`: The base token contract address.

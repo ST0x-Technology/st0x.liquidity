@@ -1842,4 +1842,52 @@ mod tests {
         let parsed: Usd = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
+
+    #[tokio::test]
+    async fn offchain_order_view_status_maps_all_lifecycle_states() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let cases: &[(&str, Option<&str>)] = &[
+            (r#"{"Live":{"Pending":{}}}"#, Some("Pending")),
+            (r#"{"Live":{"Submitted":{}}}"#, Some("Submitted")),
+            (
+                r#"{"Live":{"PartiallyFilled":{}}}"#,
+                Some("PartiallyFilled"),
+            ),
+            (r#"{"Live":{"Cancelling":{}}}"#, Some("Cancelling")),
+            (r#"{"Live":{"Filled":{}}}"#, Some("Filled")),
+            (r#"{"Live":{"Failed":{}}}"#, Some("Failed")),
+            (r#"{"Live":{"Cancelled":{}}}"#, Some("Cancelled")),
+            // Unrecognized payload — CASE has no ELSE, so status column must be NULL.
+            (r#"{"Live":{"UnknownFutureState":{}}}"#, None),
+        ];
+
+        for (index, (payload, expected_status)) in cases.iter().enumerate() {
+            let view_id = format!("view-{index}");
+
+            sqlx::query(
+                "INSERT INTO offchain_order_view (view_id, version, payload) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(&view_id)
+            .bind(1_i64)
+            .bind(*payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM offchain_order_view WHERE view_id = $1")
+                    .bind(&view_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            assert_eq!(
+                status.as_deref(),
+                *expected_status,
+                "payload {payload} should produce status {expected_status:?}"
+            );
+        }
+    }
 }
