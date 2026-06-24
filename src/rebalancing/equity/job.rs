@@ -479,6 +479,7 @@ mod tests {
             trading: OperationMode::Disabled,
             rebalancing: OperationMode::Enabled,
             wrapped_equity_recovery: recovery_mode,
+            extended_hours_counter_trading: OperationMode::Disabled,
             operational_limit: None,
         };
         let mut equities_config = EquitiesConfig::default();

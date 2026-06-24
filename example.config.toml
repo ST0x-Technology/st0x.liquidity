@@ -94,6 +94,13 @@ rebalancing = "disabled"
 # resumes a stalled mint/redemption that owns the balance, or
 # deposits orphaned tokens back into the Raindex vault.
 wrapped_equity_recovery = "disabled"
+# When enabled, counter-trades for this asset may be placed during extended
+# (pre-/after-market) sessions as limit orders, instead of waiting for the
+# regular open. Extended sessions have thinner liquidity and wider spreads,
+# so the limit price is derived from the latest trade plus
+# `[broker].counter_trade_slippage_bps`. Leave disabled to restrict hedging
+# to regular-hours market orders.
+extended_hours_counter_trading = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0

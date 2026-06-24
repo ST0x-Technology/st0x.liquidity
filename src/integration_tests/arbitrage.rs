@@ -2291,6 +2291,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: Some(
                         Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     ),
@@ -2499,6 +2500,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: Some(
                         Positive::new(FractionalShares::new(float!(2))).unwrap(),
                     ),
