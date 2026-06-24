@@ -2181,6 +2181,36 @@ enum BridgeStage { Burn, Attestation, Mint }
 - **Circle Attestation API**: Poll for attestation using CCTP nonce
 - **Rain OrderBook**: deposit2()/withdraw2() for vault operations
 
+##### CCTP Allowance (Standing U256::MAX Approval)
+
+Before each `depositForBurn`, the bridge checks the wallet's USDC allowance to
+the TokenMessenger. The bridge maintains a **standing `U256::MAX` allowance**
+rather than approving the exact burn amount each time.
+
+**Hot path (steady state):** If the allowance is at or above `U256::MAX / 2`
+(the threshold), no approve tx is submitted. This is the normal case.
+
+**Cold path (first use or allowance has been externally reduced):** An
+`approve(TokenMessenger, U256::MAX)` tx is submitted and confirmed. After
+confirmation, the bridge calls `wait_for_node_sync` to poll `eth_blockNumber`
+until at least one poll through the load-balanced endpoint returns a block at or
+above the approve block. This significantly reduces (but does not fully
+eliminate) the chance that the subsequent `depositForBurn` pre-flight `eth_call`
+hits a lagging node that reads allowance = 0 and reverts. The cross-node race is
+bounded by (a) the standing `U256::MAX` allowance meaning the cold path fires
+only on first use or a manual reset, and (b) the defense-in-depth retry below.
+
+**Defense-in-depth retry:** If `depositForBurn` reverts despite the above
+(structurally: re-read allowance < burn amount), the bridge re-runs the cold
+path and retries the burn exactly once. This handles rare cases where the
+node-sync poll window expires before a node catches up.
+
+Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
+`transferFrom`. At realistic rebalancing sizes the allowance never drops below
+`U256::MAX / 2`, so the approve fires once at startup and not again. The
+single-USDC-rebalance-in-flight invariant ensures two concurrent burns cannot
+race the same allowance.
+
 ##### CCTP Flow (using V2 Fast Transfer)
 
 Alpaca to Base:
@@ -2205,37 +2235,41 @@ Alpaca to Base:
        USDC from a prior rebalance is present. Emits `FailBridging` (no burn
        attempted) and surfaces `WalletUsdcAmbientBalance` for operator
        reconciliation; the job treats this as a clean terminal (no redrive).
-5. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
-6. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
+5. Ensure standing allowance to TokenMessenger (see above)
+6. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
+   allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)
+7. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
    with minFinalityThreshold=1000 and calculated maxFee for fast transfer
-7. Wait for burn tx confirmation and extract CCTP nonce from event logs
-8. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
+8. Wait for burn tx confirmation and extract CCTP nonce from event logs
+9. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
    for fast transfer)
-9. Submit receiveMessage() tx on Base MessageTransmitter with attestation
-10. Wait for mint tx confirmation (~8 seconds on Base)
-11. Submit deposit tx to Rain orderbook vault on Base
-12. Wait for deposit tx confirmation
+10. Submit receiveMessage() tx on Base MessageTransmitter with attestation
+11. Wait for mint tx confirmation (~8 seconds on Base)
+12. Submit deposit tx to Rain orderbook vault on Base
+13. Wait for deposit tx confirmation
 
 Base to Alpaca:
 
 1. Submit withdraw tx from Rain orderbook vault on Base
 2. Wait for withdraw tx confirmation
-3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
-4. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0) with
+3. Ensure standing allowance to TokenMessenger on Base (see above)
+4. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
+   allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)
+5. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0) with
    minFinalityThreshold=1000 and calculated maxFee for fast transfer
-5. Wait for burn tx confirmation and extract CCTP nonce from event logs
-6. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
+6. Wait for burn tx confirmation and extract CCTP nonce from event logs
+7. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
    for fast transfer)
-7. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
+8. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
    (mints USDC to the bot's own Ethereum wallet)
-8. Wait for mint tx confirmation (~20 seconds on Ethereum)
-9. Send the minted USDC from the bot wallet to Alpaca's deposit address (see
-   "BaseToAlpaca deposit send"; fresh sends directly, resume adopts an existing
-   send)
-10. Poll Alpaca API by the send tx until deposit status is COMPLETE
-11. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
+9. Wait for mint tx confirmation (~20 seconds on Ethereum)
+10. Send the minted USDC from the bot wallet to Alpaca's deposit address (see
+    "BaseToAlpaca deposit send"; fresh sends directly, resume adopts an existing
+    send)
+11. Poll Alpaca API by the send tx until deposit status is COMPLETE
+12. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
     USDC)
-12. Poll Alpaca until conversion order is filled
+13. Poll Alpaca until conversion order is filled
 
 ###### Fast Transfer Benefits
 
