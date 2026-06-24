@@ -57,12 +57,12 @@ attestation_retry_deadline_secs = 86400
 
 [rebalancing.usdc]
 mode = "enabled"
-target = 0.5
-deviation = 0.2
+target = 0.6
+deviation = 0.05
 
 [rebalancing.equity]
-target = 0.6
-deviation = 0.1
+target = 0.5
+deviation = 0.05
 
 [rest_api]
 url = "https://api.st0x.io"
@@ -88,7 +88,7 @@ vault_id = "0xfab4"
 # Whether automatic USDC rebalancing between venues is active.
 rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
-operational_limit = 1000
+operational_limit = 10000
 # No cash reserve: all offchain USDC is available for rebalancing.
 # (Omitted because `reserved` is typed Positive<Usd> and rejects 0.)
 
