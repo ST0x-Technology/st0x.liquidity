@@ -155,6 +155,7 @@ in
             "/orders/" = apiProxy "/orders/";
             "/trades" = apiProxy "/trades";
             "/transfers" = apiProxy "/transfers";
+            "/performance" = apiProxy "/performance";
             "/__pnl_sql" = {
               proxyPass = "http://127.0.0.1:8081/st0x-hedge.json";
             };
