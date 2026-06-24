@@ -1151,10 +1151,6 @@ fn min_decimal(left: &Num, right: &Num) -> Num {
     }
 }
 
-fn nonzero(value: &Num) -> bool {
-    !value.is_zero()
-}
-
 fn add_cost(
     summary: &mut CostSummaryAcc,
     category: CostCategory,
@@ -1263,7 +1259,7 @@ fn cost_summary_to_dto(summary: &CostSummaryAcc, cost_entry_count: usize) -> Pnl
         coverage: vec![
             coverage(
                 "Alpaca fees",
-                AccountingBucket::Generic,
+                AccountingBucket::CounterTrade,
                 AccountingEffect::Cost,
                 included_when_nonzero(&summary.broker_fees_usd),
                 &summary.broker_fees_usd,
@@ -2583,12 +2579,16 @@ fn add_sample_fill(sample: &mut SampleStatsAcc, event_type: &str, timestamp: &st
 
     if sample
         .first_at
-        .as_ref()
+        .as_deref()
         .is_none_or(|first| timestamp < first)
     {
         sample.first_at = Some(timestamp.to_owned());
     }
-    if sample.last_at.as_ref().is_none_or(|last| timestamp > last) {
+    if sample
+        .last_at
+        .as_deref()
+        .is_none_or(|last| timestamp > last)
+    {
         sample.last_at = Some(timestamp.to_owned());
     }
 }
@@ -2680,7 +2680,7 @@ fn classify_activity(
     {
         return Some((
             CostCategory::BrokerFee,
-            AccountingBucket::Generic,
+            AccountingBucket::CounterTrade,
             if signed_amount.is_negative() {
                 AccountingEffect::Cost
             } else {
