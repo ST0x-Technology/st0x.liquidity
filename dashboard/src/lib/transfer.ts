@@ -1,3 +1,4 @@
+import type { UsdcBridgeDirection } from './api/UsdcBridgeDirection'
 import { formatDecimal } from './decimal'
 import { formatBalance } from './format'
 
@@ -17,6 +18,28 @@ export const kindLabel = (kind: string): string => {
     default:
       return kind
   }
+}
+
+// Routing the Record through `UsdcBridgeDirection` makes a new direction variant
+// fail compilation here, mirroring performance-panel.svelte's direction labels.
+const USDC_BRIDGE_DIRECTION_LABELS: Record<UsdcBridgeDirection, string> = {
+  alpaca_to_base: 'Alpaca → Raindex',
+  base_to_alpaca: 'Raindex → Alpaca'
+}
+
+/// Row/detail label for a transfer's type. A USDC bridge spells out its
+/// direction ("Alpaca → Raindex" / "Raindex → Alpaca") since the asset column
+/// already reads "USDC"; the bare `kindLabel` ("USDC Bridge") still backs the
+/// kind filter, where direction is not a selectable dimension.
+export const transferTypeLabel = (transfer: {
+  kind: string
+  direction?: UsdcBridgeDirection
+}): string => {
+  if (transfer.kind === 'usdc_bridge' && transfer.direction !== undefined) {
+    return USDC_BRIDGE_DIRECTION_LABELS[transfer.direction]
+  }
+
+  return kindLabel(transfer.kind)
 }
 
 /// Maps a status string to colour classes.  Works for both DTO statuses
