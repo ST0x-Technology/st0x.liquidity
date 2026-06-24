@@ -5,6 +5,7 @@
   import * as Table from '$lib/components/ui/table'
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import type { Position } from '$lib/api/Position'
+  import type { UsdcBridgeDirection } from '$lib/api/UsdcBridgeDirection'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import {
@@ -18,6 +19,7 @@
   import { cashUsdTooltip, equityUsdTooltip } from '$lib/inventory-value'
   import {
     kindLabel,
+    transferTypeLabel,
     statusStyle,
     humanizeStatus,
     humanizeStep,
@@ -53,7 +55,7 @@
     symbol?: string
     quantity?: string
     amount?: string
-    direction?: string
+    direction?: UsdcBridgeDirection
     status: { status: string }
     startedAt: string
     updatedAt: string
@@ -444,7 +446,7 @@
                 {formatUtc(transfer.startedAt)}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs font-medium">
-                {kindLabel(transfer.kind)}
+                {transferTypeLabel(transfer)}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs">
                 {transfer.kind === 'usdc_bridge' ? 'USDC' : (transfer.symbol ?? '')}
@@ -550,7 +552,7 @@
     {@const amount = transferAmount(transfer)}
     <div class="flex items-center justify-between border-b px-5 py-3">
       <div class="flex items-center gap-2 text-sm font-semibold">
-        <span>{kindLabel(transfer.kind)}</span>
+        <span>{transferTypeLabel(transfer)}</span>
         <span class="font-mono text-xs font-normal text-muted-foreground">
           {transfer.kind === 'usdc_bridge' ? 'USDC' : (transfer.symbol ?? '')}
         </span>

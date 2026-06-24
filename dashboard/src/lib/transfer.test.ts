@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  kindLabel,
+  transferTypeLabel,
   statusStyle,
   isTxHash,
   formatNumericDetailValue,
@@ -10,6 +12,28 @@ import {
   stuckReasonLabel,
   recoveryCommand,
 } from './transfer'
+
+describe('transferTypeLabel', () => {
+  it('spells out the destination venue for each bridge direction', () => {
+    expect(transferTypeLabel({ kind: 'usdc_bridge', direction: 'alpaca_to_base' })).toBe(
+      'Alpaca → Raindex'
+    )
+    expect(transferTypeLabel({ kind: 'usdc_bridge', direction: 'base_to_alpaca' })).toBe(
+      'Raindex → Alpaca'
+    )
+  })
+
+  it('falls back to the bare kind label for equity transfers', () => {
+    expect(transferTypeLabel({ kind: 'equity_mint' })).toBe('Mint')
+    expect(transferTypeLabel({ kind: 'equity_redemption' })).toBe('Redeem')
+  })
+
+  it('falls back to "USDC Bridge" when a bridge has no direction', () => {
+    // The DTO always carries a direction; this guards the optional-field path
+    // so a missing direction degrades to the generic label rather than blank.
+    expect(transferTypeLabel({ kind: 'usdc_bridge' })).toBe(kindLabel('usdc_bridge'))
+  })
+})
 
 describe('statusStyle', () => {
   it('matches completed substring case-insensitively', () => {
