@@ -154,6 +154,14 @@ pub(super) async fn order_status_command<W: Write>(
                 "   The order has been submitted and is waiting to be filled."
             )?;
         }
+        OrderState::PartiallyFilled { order_id, .. } => {
+            writeln!(stdout, "⏳ Order Status: PARTIALLY FILLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+        }
+        OrderState::Cancelled { order_id, .. } => {
+            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+        }
         OrderState::Filled {
             executed_at,
             order_id,
@@ -165,12 +173,13 @@ pub(super) async fn order_status_command<W: Write>(
             writeln!(
                 stdout,
                 "   Fill Price: ${}",
-                format_float_with_fallback(&price)
+                format_float_with_fallback(&price.into())
             )?;
         }
         OrderState::Failed {
             failed_at,
             error_reason,
+            ..
         } => {
             writeln!(stdout, "❌ Order Status: FAILED")?;
             writeln!(stdout, "   Failed At: {failed_at}")?;
@@ -298,12 +307,13 @@ async fn execute_alpaca_limit_order<W: Write>(
 
     let broker = alpaca_auth.clone().try_into_executor().await?;
     let placement = broker
-        .place_limit_order(AlpacaLimitOrder {
+        .place_alpaca_limit_order(AlpacaLimitOrder {
             symbol: request.symbol.clone(),
             shares: request.shares,
             direction: request.direction,
             limit_price,
             extended_hours,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
         })
         .await?;
 
@@ -500,7 +510,12 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
             OrderState::Failed { error_reason, .. } => {
                 anyhow::bail!("buy order failed: {error_reason:?}");
             }
-            OrderState::Pending | OrderState::Submitted { .. } => {
+            OrderState::Cancelled { .. } => {
+                anyhow::bail!("buy order was cancelled by the broker");
+            }
+            OrderState::PartiallyFilled { .. }
+            | OrderState::Pending
+            | OrderState::Submitted { .. } => {
                 if attempt % 10 == 0 {
                     writeln!(
                         stdout,
@@ -951,17 +966,11 @@ mod tests {
         });
 
         let order_mock = server.mock(|when, then| {
+            // Match on method + path only: the request body now carries a
+            // generated `client_order_id`, and the field-level body shape is
+            // verified by the execution crate's own order tests.
             when.method(httpmock::Method::POST)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body(json!({
-                    "symbol": "AAPL",
-                    "qty": "10",
-                    "side": "buy",
-                    "type": "limit",
-                    "limit_price": "195.25",
-                    "time_in_force": "day",
-                    "extended_hours": true
-                }));
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -1264,6 +1273,8 @@ mod tests {
         let broker = MockExecutor::new().with_order_status(OrderState::Failed {
             failed_at: Utc::now(),
             error_reason: Some("rejected".to_string()),
+            shares_filled: None,
+            avg_price: None,
         });
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),

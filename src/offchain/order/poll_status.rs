@@ -131,20 +131,32 @@ impl PollOrderStatus {
         E: Executor + Clone + Send + Sync + 'static,
         JobError: From<E::Error>,
     {
-        use OrderState::{Failed, Filled, Pending, Submitted};
+        use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
         match order_state {
             Filled {
                 price,
                 order_id,
                 executed_at,
             } => {
-                self.enqueue_reconcile(ctx, symbol, price, order_id, executed_at)
+                self.enqueue_reconcile(ctx, symbol, price.into(), order_id.to_string(), executed_at)
                     .await
             }
 
             Failed { error_reason, .. } => self.enqueue_rejection(ctx, symbol, error_reason).await,
 
-            Pending | Submitted { .. } => {
+            // The execution layer now surfaces broker-side cancellations as a
+            // distinct state; treat as a rejection until the aggregate learns
+            // to reconcile cancellations against the pending position.
+            Cancelled { .. } => {
+                self.enqueue_rejection(ctx, symbol, Some("Order cancelled by broker".to_string()))
+                    .await
+            }
+
+            // Partial fills now have a dedicated state; until the aggregate
+            // reconciles them, keep re-polling until the order reaches a
+            // terminal state (the pre-feature behaviour, where partial fills
+            // surfaced as `Submitted`).
+            PartiallyFilled { .. } | Pending | Submitted { .. } => {
                 debug!(
                     target: "broker",
                     %symbol,
@@ -604,6 +616,8 @@ mod tests {
         let executor = MockExecutor::new().with_order_status(OrderState::Failed {
             failed_at: Utc::now(),
             error_reason: Some("broker rejected".to_string()),
+            shares_filled: None,
+            avg_price: None,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -666,6 +680,20 @@ mod tests {
                 order: st0x_execution::MarketOrder,
             ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
                 self.inner.place_market_order(order).await
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+                self.inner.place_limit_order(order).await
+            }
+
+            async fn cancel_order(
+                &self,
+                order_id: &Self::OrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
+                self.inner.cancel_order(order_id).await
             }
 
             async fn get_order_status(

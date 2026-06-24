@@ -29,7 +29,6 @@ use st0x_evm::{ReadOnlyEvm, USDC_BASE};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
 };
-use st0x_finance::Usd;
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
@@ -169,7 +168,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
             .await
             .map_err(|error| format!("get_order_status: {error}"))?;
 
-        use OrderState::{Failed, Filled, Pending, Submitted};
+        use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
         match state {
             Filled {
                 price,
@@ -177,12 +176,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 executed_at,
             } => {
                 offchain_order
-                    .send(
-                        &order_id,
-                        OffchainOrderCommand::CompleteFill {
-                            price: Usd::new(price),
-                        },
-                    )
+                    .send(&order_id, OffchainOrderCommand::CompleteFill { price })
                     .await?;
 
                 position
@@ -193,7 +187,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                             shares_filled: order.shares(),
                             direction: order.direction(),
                             executor_order_id: ExecutorOrderId::new(&broker_order_id),
-                            price: Usd::new(price),
+                            price,
                             broker_timestamp: executed_at,
                         },
                     )
@@ -224,7 +218,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                     .await?;
             }
 
-            Pending | Submitted { .. } => {}
+            PartiallyFilled { .. } | Cancelled { .. } | Pending | Submitted { .. } => {}
         }
     }
 
@@ -929,6 +923,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected order".to_string()),
+        shares_filled: None,
+        avg_price: None,
     });
     poll_submitted_orders(
         &failed_executor,
@@ -2554,6 +2550,8 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected".to_string()),
+        shares_filled: None,
+        avg_price: None,
     });
     poll_submitted_orders(
         &failed_executor,

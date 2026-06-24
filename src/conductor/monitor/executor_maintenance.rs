@@ -109,6 +109,20 @@ mod tests {
             unreachable!("not used in maintenance tests")
         }
 
+        async fn place_limit_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
         async fn get_order_status(
             &self,
             _order_id: &Self::OrderId,
