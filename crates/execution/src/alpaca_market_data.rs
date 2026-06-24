@@ -5,7 +5,7 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tracing::trace;
 
-use crate::{Positive, Symbol, deserialize_float_from_number_or_string};
+use crate::{Positive, Symbol, Usd, deserialize_float_from_number_or_string};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AlpacaMarketDataError {
@@ -42,7 +42,7 @@ pub(crate) async fn fetch_latest_trade_price(
     client: &Client,
     market_data_base_url: &str,
     symbol: &Symbol,
-) -> Result<Positive<Float>, AlpacaMarketDataError> {
+) -> Result<Positive<Usd>, AlpacaMarketDataError> {
     let response = client
         .get(format!(
             "{market_data_base_url}/v2/stocks/{symbol}/trades/latest"
@@ -77,9 +77,11 @@ pub(crate) async fn fetch_latest_trade_price(
     response
         .trade
         .map(|trade| {
-            Positive::new(trade.price).map_err(|error| AlpacaMarketDataError::NonPositivePrice {
-                symbol: symbol.clone(),
-                price: error.value,
+            Positive::new(Usd::new(trade.price)).map_err(|error| {
+                AlpacaMarketDataError::NonPositivePrice {
+                    symbol: symbol.clone(),
+                    price: error.value.inner(),
+                }
             })
         })
         .transpose()?
@@ -147,11 +149,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            price
-                .inner()
-                .eq(Float::parse("123.45".to_string()).unwrap())
-                .unwrap()
+        assert_eq!(
+            price.inner(),
+            Usd::new(Float::parse("123.45".to_string()).unwrap())
         );
     }
 

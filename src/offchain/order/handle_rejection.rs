@@ -9,10 +9,14 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use st0x_dto::Direction;
 use st0x_event_sorcery::Store;
+use st0x_execution::{ExecutorOrderId, FractionalShares, NotPositive, Positive, Symbol};
+use st0x_finance::Usd;
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
@@ -31,6 +35,14 @@ pub(crate) struct HandleOrderRejectionCtx {
 pub(crate) struct HandleOrderRejection {
     pub(crate) offchain_order_id: OffchainOrderId,
     pub(crate) error: String,
+}
+
+struct RetainedPartialFill {
+    shares_filled: Positive<FractionalShares>,
+    direction: Direction,
+    executor_order_id: ExecutorOrderId,
+    price: Usd,
+    broker_timestamp: DateTime<Utc>,
 }
 
 impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
@@ -57,13 +69,29 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
         };
 
         let symbol = order.symbol().clone();
+        let retained_partial_fill =
+            retained_partial_fill(&order)
+                .transpose()
+                .map_err(|source| JobError::InvalidPartialFill {
+                    offchain_order_id: self.offchain_order_id,
+                    source,
+                })?;
 
-        // Retry-safe: the two writes (OffchainOrder MarkFailed +
-        // Position FailOffChainOrder) are not atomic. If a prior attempt
-        // completed step 1 but failed step 2, apalis re-runs us with the
-        // order already in `Failed`. Re-sending `MarkFailed` would surface
-        // `AlreadyCompleted` and stall the job forever, so we only run
-        // step 1 when the order has not yet been marked failed.
+        if let Some(fill) = &retained_partial_fill {
+            self.complete_position_for_partial_fill(ctx, &symbol, fill)
+                .await?;
+        }
+
+        // Retry-safe for no-fill rejections: the two writes (OffchainOrder
+        // MarkFailed + Position FailOffChainOrder) are not atomic. If a prior
+        // attempt completed step 1 but failed step 2, apalis re-runs us with
+        // the order already in `Failed`. Re-sending `MarkFailed` would surface
+        // `AlreadyCompleted` and stall the job forever, so we only run step 1
+        // when the order has not yet been marked failed.
+        //
+        // For retained partial fills, the position update runs first so a retry
+        // cannot lose the partial-fill quantity by loading an already-Failed
+        // OffchainOrder that no longer carries the partial-fill fields.
         use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
         match &order {
             Failed { .. } => {
@@ -91,6 +119,10 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                 );
                 return Ok(());
             }
+        }
+
+        if retained_partial_fill.is_some() {
+            return Ok(());
         }
 
         // Retry-safe step 2: if a prior attempt or the startup recovery
@@ -123,6 +155,75 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
 
         Ok(())
     }
+}
+
+impl HandleOrderRejection {
+    async fn complete_position_for_partial_fill(
+        &self,
+        ctx: &HandleOrderRejectionCtx,
+        symbol: &Symbol,
+        fill: &RetainedPartialFill,
+    ) -> Result<(), JobError> {
+        let position_pending = ctx
+            .position
+            .load(symbol)
+            .await?
+            .and_then(|position| position.pending_offchain_order_id);
+        if position_pending != Some(self.offchain_order_id) {
+            info!(
+                offchain_order_id = %self.offchain_order_id,
+                ?position_pending,
+                "HandleOrderRejection: position no longer expecting this partial fill, skipping"
+            );
+            return Ok(());
+        }
+
+        ctx.position
+            .send(
+                symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: self.offchain_order_id,
+                    shares_filled: fill.shares_filled,
+                    direction: fill.direction,
+                    executor_order_id: fill.executor_order_id.clone(),
+                    price: fill.price,
+                    broker_timestamp: fill.broker_timestamp,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+fn retained_partial_fill(
+    order: &OffchainOrder,
+) -> Option<Result<RetainedPartialFill, NotPositive<FractionalShares>>> {
+    let OffchainOrder::PartiallyFilled {
+        shares_filled,
+        direction,
+        executor_order_id,
+        avg_price,
+        partially_filled_at,
+        ..
+    } = order
+    else {
+        return None;
+    };
+
+    if *shares_filled == FractionalShares::ZERO {
+        return None;
+    }
+
+    Some(
+        Positive::new(*shares_filled).map(|shares_filled| RetainedPartialFill {
+            shares_filled,
+            direction: *direction,
+            executor_order_id: executor_order_id.clone(),
+            price: *avg_price,
+            broker_timestamp: *partially_filled_at,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -230,6 +331,20 @@ mod tests {
             .await
             .unwrap();
 
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
         offchain_order_id
     }
 
@@ -277,6 +392,76 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "Position must clear pending state after rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_fill_rejection_retains_executed_quantity_on_position() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+        let broker_timestamp = Utc::now();
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(0.75)),
+                    avg_price: Usd::new(float!(150.25)),
+                },
+            )
+            .await
+            .unwrap();
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker cancelled after partial fill".to_string(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let offchain = infra
+            .ctx
+            .offchain_order
+            .load(&order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        assert!(
+            matches!(offchain, OffchainOrder::Failed { .. }),
+            "terminal partial rejection must still mark the offchain order failed"
+        );
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.net,
+            FractionalShares::new(float!(1.25)),
+            "position must retain the partially executed sell quantity"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "partial fill completion must clear pending state"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "retained partial fills are completed, not marked as no-fill failures"
+        );
+        assert!(
+            position
+                .last_updated
+                .is_some_and(|updated| updated >= broker_timestamp),
+            "position timestamp should reflect the retained broker fill"
         );
     }
 

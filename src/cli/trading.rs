@@ -140,6 +140,12 @@ pub(super) async fn order_status_command<W: Write>(
 
     let state = get_broker_order_status(ctx, pool, order_id, stdout).await?;
 
+    write_order_status(stdout, state)?;
+
+    Ok(())
+}
+
+fn write_order_status<W: Write>(stdout: &mut W, state: OrderState) -> anyhow::Result<()> {
     match state {
         OrderState::Pending => {
             writeln!(stdout, "⏳ Order Status: PENDING")?;
@@ -156,6 +162,14 @@ pub(super) async fn order_status_command<W: Write>(
                 "   The order has been submitted and is waiting to be filled."
             )?;
         }
+        OrderState::PartiallyFilled { order_id, .. } => {
+            writeln!(stdout, "⏳ Order Status: PARTIALLY FILLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+        }
+        OrderState::Cancelled { order_id, .. } => {
+            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+        }
         OrderState::Filled {
             executed_at,
             order_id,
@@ -167,12 +181,13 @@ pub(super) async fn order_status_command<W: Write>(
             writeln!(
                 stdout,
                 "   Fill Price: ${}",
-                format_float_with_fallback(&price)
+                format_float_with_fallback(&price.into())
             )?;
         }
         OrderState::Failed {
             failed_at,
             error_reason,
+            ..
         } => {
             writeln!(stdout, "❌ Order Status: FAILED")?;
             writeln!(stdout, "   Failed At: {failed_at}")?;
@@ -300,12 +315,13 @@ async fn execute_alpaca_limit_order<W: Write>(
 
     let broker = alpaca_auth.clone().try_into_executor().await?;
     let placement = broker
-        .place_limit_order(AlpacaLimitOrder {
+        .place_alpaca_limit_order(AlpacaLimitOrder {
             symbol: request.symbol.clone(),
             shares: request.shares,
             direction: request.direction,
             limit_price,
             extended_hours,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
         })
         .await?;
 
@@ -502,7 +518,27 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
             OrderState::Failed { error_reason, .. } => {
                 anyhow::bail!("buy order failed: {error_reason:?}");
             }
-            OrderState::Pending | OrderState::Submitted { .. } => {
+            OrderState::Cancelled {
+                shares_filled,
+                avg_price,
+                ..
+            } => {
+                if shares_filled == FractionalShares::ZERO {
+                    anyhow::bail!("buy order was cancelled by the broker");
+                }
+
+                let Some(avg_price) = avg_price else {
+                    anyhow::bail!("buy order was cancelled after partial fill of {shares_filled}");
+                };
+
+                anyhow::bail!(
+                    "buy order was cancelled after partial fill of {shares_filled} \
+                     at average price ${avg_price}"
+                );
+            }
+            OrderState::PartiallyFilled { .. }
+            | OrderState::Pending
+            | OrderState::Submitted { .. } => {
                 if attempt % 10 == 0 {
                     writeln!(
                         stdout,
@@ -937,6 +973,8 @@ mod tests {
     use rain_math_float::Float;
     use regex::Regex;
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
     use url::Url;
     use uuid::uuid;
@@ -947,7 +985,8 @@ mod tests {
         IngestionCutoff, LogLevel, OperationMode, TradingMode,
     };
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, SupportedExecutor,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
+        ExecutionError, InventoryResult, LimitOrder, SupportedExecutor,
     };
 
     use super::*;
@@ -998,6 +1037,102 @@ mod tests {
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
+    #[derive(Clone)]
+    struct SequencedStatusExecutor {
+        statuses: Arc<Vec<OrderState>>,
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    impl SequencedStatusExecutor {
+        fn new(statuses: Vec<OrderState>) -> Self {
+            Self {
+                statuses: Arc::new(statuses),
+                status_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn status_calls(&self) -> usize {
+            self.status_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for SequencedStatusExecutor {
+        type Error = ExecutionError;
+        type OrderId = String;
+        type Ctx = ();
+
+        async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+            Ok(Self::new(vec![OrderState::Pending]))
+        }
+
+        async fn is_market_open(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            Ok(OrderPlacement {
+                order_id: "sequenced-order-id".to_string(),
+                symbol: order.symbol,
+                shares: order.shares,
+                direction: order.direction,
+                placed_at: Utc::now(),
+                extended_hours: false,
+                limit_price: None,
+            })
+        }
+
+        async fn get_order_status(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<OrderState, Self::Error> {
+            let call_index = self.status_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .statuses
+                .get(call_index)
+                .or_else(|| self.statuses.last())
+                .cloned()
+                .unwrap_or(OrderState::Pending))
+        }
+
+        fn to_supported_executor(&self) -> SupportedExecutor {
+            SupportedExecutor::DryRun
+        }
+
+        fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+            Ok(order_id_str.to_string())
+        }
+
+        async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+            Ok(InventoryResult::Unimplemented)
+        }
+
+        async fn place_limit_order(
+            &self,
+            order: LimitOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            Ok(OrderPlacement {
+                order_id: "sequenced-limit-order-id".to_string(),
+                symbol: order.symbol,
+                shares: order.shares,
+                direction: order.direction,
+                placed_at: Utc::now(),
+                extended_hours: order.extended_hours,
+                limit_price: Some(order.limit_price),
+            })
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<CancellationOutcome, Self::Error> {
+            Ok(CancellationOutcome::Requested)
+        }
+    }
 
     fn create_base_test_ctx() -> Ctx {
         Ctx {
@@ -1205,18 +1340,31 @@ mod tests {
                 }));
         });
 
+        // The broker-side `client_order_id` is a fresh UUID per CLI invocation,
+        // so its exact value cannot be pinned. Assert the value is a well-formed
+        // CLI idempotency key (`cli-{uuid}`); `json_body_includes` covers the
+        // static fields.
+        let client_order_id_pattern = Regex::new(
+            r#""client_order_id":"cli-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""#,
+        )
+        .unwrap();
+
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body(json!({
-                    "symbol": "AAPL",
-                    "qty": "10",
-                    "side": "buy",
-                    "type": "limit",
-                    "limit_price": "195.25",
-                    "time_in_force": "day",
-                    "extended_hours": true
-                }));
+                .body_matches(client_order_id_pattern.clone())
+                .json_body_includes(
+                    json!({
+                        "symbol": "AAPL",
+                        "qty": "10",
+                        "side": "buy",
+                        "type": "limit",
+                        "limit_price": "195.25",
+                        "time_in_force": "day",
+                        "extended_hours": true
+                    })
+                    .to_string(),
+                );
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -1514,11 +1662,54 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn market_buy_keeps_polling_after_partial_fill_until_filled() {
+        let broker = SequencedStatusExecutor::new(vec![
+            OrderState::PartiallyFilled {
+                order_id: ExecutorOrderId::new("sequenced-order-id"),
+                shares_filled: FractionalShares::new(Float::parse("3.5".to_string()).unwrap()),
+                avg_price: Some(st0x_execution::Usd::new(
+                    Float::parse("195.25".to_string()).unwrap(),
+                )),
+                partially_filled_at: Utc::now(),
+            },
+            OrderState::Filled {
+                executed_at: Utc::now(),
+                order_id: ExecutorOrderId::new("sequenced-order-id"),
+                price: st0x_execution::Usd::new(Float::parse("195.30".to_string()).unwrap()),
+            },
+        ]);
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .expect("partial fill should keep polling until the broker reports Filled");
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            broker.status_calls(),
+            2,
+            "the buy-fill wait must poll again after PartiallyFilled"
+        );
+        assert!(
+            output.contains("Buy filled"),
+            "the buy-fill wait must report the final fill, got: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn market_buy_fails_when_the_broker_rejects_the_order() {
         let broker = MockExecutor::new().with_order_status(OrderState::Failed {
             failed_at: Utc::now(),
             error_reason: Some("rejected".to_string()),
+            shares_filled: None,
+            avg_price: None,
         });
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -2739,6 +2930,119 @@ mod tests {
         assert_eq!(
             fill_count, 1,
             "successful broker submission must account the onchain fill exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_fails_when_the_broker_cancels_the_order() {
+        let broker = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("some-broker-order-id"),
+            shares_filled: FractionalShares::ZERO,
+            avg_price: None,
+        });
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("buy order was cancelled"),
+            "a cancelled order must fail the buy-fill wait, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_cancelled_after_partial_fill_reports_details() {
+        let broker = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("some-broker-order-id"),
+            shares_filled: FractionalShares::new(Float::parse("1.5".to_string()).unwrap()),
+            avg_price: Some(st0x_execution::Usd::new(
+                Float::parse("195.25".to_string()).unwrap(),
+            )),
+        });
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .unwrap_err();
+        let error = error.to_string();
+
+        assert!(
+            error.contains("cancelled after partial fill"),
+            "a cancelled partial fill must be explicit, got: {error}"
+        );
+        assert!(
+            error.contains("average price"),
+            "a cancelled partial fill with price must report it, got: {error}"
+        );
+    }
+
+    #[test]
+    fn write_order_status_displays_partially_filled_state() {
+        let mut stdout = Vec::new();
+
+        write_order_status(
+            &mut stdout,
+            OrderState::PartiallyFilled {
+                order_id: ExecutorOrderId::new("some-broker-order-id"),
+                shares_filled: FractionalShares::new(Float::parse("1.5".to_string()).unwrap()),
+                avg_price: Some(st0x_execution::Usd::new(
+                    Float::parse("195.25".to_string()).unwrap(),
+                )),
+                partially_filled_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("PARTIALLY FILLED"),
+            "status output must include the partial-fill arm, got: {output}"
+        );
+        assert!(
+            output.contains("some-broker-order-id"),
+            "status output must include the broker order id, got: {output}"
+        );
+    }
+
+    #[test]
+    fn write_order_status_displays_cancelled_state() {
+        let mut stdout = Vec::new();
+
+        write_order_status(
+            &mut stdout,
+            OrderState::Cancelled {
+                cancelled_at: Utc::now(),
+                order_id: ExecutorOrderId::new("some-broker-order-id"),
+                shares_filled: FractionalShares::ZERO,
+                avg_price: None,
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("CANCELLED"),
+            "status output must include the cancelled arm, got: {output}"
+        );
+        assert!(
+            output.contains("some-broker-order-id"),
+            "status output must include the broker order id, got: {output}"
         );
     }
 }

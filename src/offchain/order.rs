@@ -44,7 +44,8 @@ use st0x_dto::{Direction, Trade, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
     AlpacaBrokerApiError, ClientOrderId, ExecutionError, Executor, ExecutorOrderId,
-    FractionalShares, MarketOrder, PersistenceError, Positive, SupportedExecutor, Symbol,
+    FractionalShares, MarketOrder, NotPositive, PersistenceError, Positive, SupportedExecutor,
+    Symbol,
 };
 use st0x_finance::Usd;
 
@@ -78,6 +79,20 @@ pub(crate) enum JobError {
     PositionAggregate(#[from] st0x_event_sorcery::SendError<Position>),
     #[error("Failed to enqueue follow-up job: {0}")]
     Enqueue(#[from] QueuePushError),
+    #[error(
+        "Broker reported partial fill of {shares_filled} for offchain order \
+         {offchain_order_id} without an average price"
+    )]
+    MissingPartialFillPrice {
+        offchain_order_id: OffchainOrderId,
+        shares_filled: FractionalShares,
+    },
+    #[error("Broker reported invalid partial fill for offchain order {offchain_order_id}")]
+    InvalidPartialFill {
+        offchain_order_id: OffchainOrderId,
+        #[source]
+        source: NotPositive<FractionalShares>,
+    },
 }
 
 /// Drives one offchain order placement end to end: records intent via `Place`,
