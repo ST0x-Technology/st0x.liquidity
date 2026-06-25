@@ -335,24 +335,24 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
         let (vault_registry, _vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
@@ -463,24 +463,24 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(order_owner);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
         let (vault_registry, _vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 

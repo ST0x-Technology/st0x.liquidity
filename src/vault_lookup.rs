@@ -195,7 +195,7 @@ mod tests {
     async fn seeded_lookup() -> VaultRegistryLookup {
         let pool = setup_test_db().await;
         let (store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -221,7 +221,7 @@ mod tests {
     async fn vault_id_for_token_returns_primary_vault() {
         let pool = setup_test_db().await;
         let (store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
+            .build()
             .await
             .unwrap();
         let registry_id = VaultRegistryId {
@@ -274,7 +274,7 @@ mod tests {
     async fn vault_token_for_symbol_rejects_ambiguous_tokens() {
         let pool = setup_test_db().await;
         let (store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
+            .build()
             .await
             .unwrap();
         let registry_id = VaultRegistryId {
@@ -346,7 +346,7 @@ mod tests {
     async fn empty_registry_is_registry_not_found() {
         let pool = setup_test_db().await;
         let (_store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
+            .build()
             .await
             .unwrap();
         let lookup = VaultRegistryLookup::new(projection, TEST_ORDERBOOK, TEST_OWNER);

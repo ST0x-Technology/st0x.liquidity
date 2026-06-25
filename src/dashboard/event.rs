@@ -248,7 +248,7 @@ mod tests {
     async fn offchain_order_filled_broadcasts_fill() {
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
@@ -319,7 +319,7 @@ mod tests {
     async fn position_update_broadcasts_net_position() {
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
@@ -393,7 +393,7 @@ mod tests {
     async fn manual_position_adjustment_broadcasts_adjusted_net() {
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
@@ -482,7 +482,7 @@ mod tests {
     async fn reorged_broadcasts_reversed_net() {
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());

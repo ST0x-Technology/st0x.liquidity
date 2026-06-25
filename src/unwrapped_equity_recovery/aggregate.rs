@@ -35,7 +35,6 @@
 //! can resume from the persisted tx hash without double-wrapping.
 
 use alloy::primitives::{Address, TxHash, U256};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -43,7 +42,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_raindex::Raindex;
 use st0x_wrapper::Wrapper;
@@ -74,7 +73,7 @@ impl FromStr for UnwrappedEquityRecoveryId {
 
 /// Onchain/transfer dependencies the recovery job uses to perform the
 /// recovery's side effects before recording the outcome through the aggregate's
-/// pure commands. (The aggregate itself takes `Services = ()`.)
+/// pure commands. (The aggregate itself takes `Jobs = Nil`.)
 #[derive(Clone)]
 pub(crate) struct UnwrappedEquityRecoveryServices {
     pub(crate) raindex: Arc<dyn Raindex>,
@@ -311,13 +310,12 @@ impl UnwrappedEquityRecovery {
     }
 }
 
-#[async_trait]
 impl EventSourced for UnwrappedEquityRecovery {
     type Id = UnwrappedEquityRecoveryId;
     type Event = UnwrappedEquityRecoveryEvent;
     type Command = UnwrappedEquityRecoveryCommand;
     type Error = UnwrappedEquityRecoveryError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "UnwrappedEquityRecovery";
@@ -488,9 +486,9 @@ impl EventSourced for UnwrappedEquityRecovery {
         })
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             UnwrappedEquityRecoveryCommand::Detect { symbol, shares } => {
@@ -504,10 +502,10 @@ impl EventSourced for UnwrappedEquityRecovery {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use UnwrappedEquityRecoveryCommand::*;
 
@@ -639,16 +637,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn detect_initializes_aggregate_into_detected_state() {
+    #[test]
+    fn detect_initializes_aggregate_into_detected_state() {
         let events = UnwrappedEquityRecovery::initialize(
             UnwrappedEquityRecoveryCommand::Detect {
                 symbol: aapl(),
                 shares: one_share(),
             },
-            &(),
+            &mut JobQueue::default(),
         )
-        .await
         .unwrap();
         let [UnwrappedEquityRecoveryEvent::Detected { symbol, shares, .. }] = events.as_slice()
         else {
@@ -662,17 +659,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_to_mint_emits_dispatched_to_mint_with_command_id() {
+    #[test]
+    fn dispatch_to_mint_emits_dispatched_to_mint_with_command_id() {
         let mint_id = crate::tokenized_equity_mint::issuer_request_id("dispatch-mint");
         let events = detected()
             .transition(
                 UnwrappedEquityRecoveryCommand::DispatchToMint {
                     mint_id: mint_id.clone(),
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .expect("DispatchToMint should succeed from Detected");
         let [
             UnwrappedEquityRecoveryEvent::DispatchedToMint {
@@ -688,8 +684,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_to_redemption_emits_dispatched_to_redemption_with_command_id() {
+    #[test]
+    fn dispatch_to_redemption_emits_dispatched_to_redemption_with_command_id() {
         let redemption_id =
             crate::equity_redemption::redemption_aggregate_id("dispatch-redemption");
         let events = detected()
@@ -697,9 +693,8 @@ mod tests {
                 UnwrappedEquityRecoveryCommand::DispatchToRedemption {
                     redemption_id: redemption_id.clone(),
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .expect("DispatchToRedemption should succeed from Detected");
         let [
             UnwrappedEquityRecoveryEvent::DispatchedToRedemption {
@@ -790,8 +785,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn detect_on_live_aggregate_is_rejected() {
+    #[test]
+    fn detect_on_live_aggregate_is_rejected() {
         let state = UnwrappedEquityRecovery::Detected {
             symbol: aapl(),
             shares: one_share(),
@@ -803,9 +798,8 @@ mod tests {
                     symbol: aapl(),
                     shares: one_share(),
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .unwrap_err();
         assert!(matches!(
             error,
@@ -813,8 +807,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn confirm_orphan_wrap_only_valid_after_submit_wrap() {
+    #[test]
+    fn confirm_orphan_wrap_only_valid_after_submit_wrap() {
         let state = UnwrappedEquityRecovery::Detected {
             symbol: aapl(),
             shares: one_share(),
@@ -826,9 +820,8 @@ mod tests {
                     wrapped_amount: U256::from(1u64),
                     wrap_block: 1,
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .unwrap_err();
         assert!(matches!(
             error,
@@ -836,8 +829,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn submit_orphan_deposit_only_valid_after_confirm_wrap() {
+    #[test]
+    fn submit_orphan_deposit_only_valid_after_confirm_wrap() {
         let state = UnwrappedEquityRecovery::OrphanWrapSubmitted {
             symbol: aapl(),
             shares: one_share(),
@@ -850,9 +843,8 @@ mod tests {
                 UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit {
                     vault_deposit_tx_hash: FAKE_WRAP_TX,
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .unwrap_err();
         assert!(matches!(
             error,
@@ -860,8 +852,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn terminal_state_rejects_further_commands() {
+    #[test]
+    fn terminal_state_rejects_further_commands() {
         let state = UnwrappedEquityRecovery::Failed {
             symbol: aapl(),
             shares: one_share(),
@@ -873,23 +865,21 @@ mod tests {
                 UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
                     wrap_tx_hash: FAKE_WRAP_TX,
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .unwrap_err();
         assert!(matches!(error, UnwrappedEquityRecoveryError::Terminal));
     }
 
-    #[tokio::test]
-    async fn submit_orphan_wrap_emits_submitted_event() {
+    #[test]
+    fn submit_orphan_wrap_emits_submitted_event() {
         let events = detected()
             .transition(
                 UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
                     wrap_tx_hash: FAKE_WRAP_TX,
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .expect("SubmitOrphanWrap should succeed from Detected");
         let [UnwrappedEquityRecoveryEvent::OrphanWrapSubmitted { wrap_tx_hash, .. }] =
             events.as_slice()
@@ -903,8 +893,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn confirm_orphan_wrap_emits_confirmed_wrapped_amount() {
+    #[test]
+    fn confirm_orphan_wrap_emits_confirmed_wrapped_amount() {
         let wrapped_amount = U256::from(7u64);
         let state = UnwrappedEquityRecovery::OrphanWrapSubmitted {
             symbol: aapl(),
@@ -919,9 +909,8 @@ mod tests {
                     wrapped_amount,
                     wrap_block: 5,
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .expect("ConfirmOrphanWrap should succeed from OrphanWrapSubmitted");
         let [
             UnwrappedEquityRecoveryEvent::OrphanWrapped {
@@ -949,17 +938,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn submit_orphan_deposit_emits_submitted_event() {
+    #[test]
+    fn submit_orphan_deposit_emits_submitted_event() {
         let vault_deposit_tx = OTHER_TX;
         let events = orphan_wrapped()
             .transition(
                 UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit {
                     vault_deposit_tx_hash: vault_deposit_tx,
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .expect("SubmitOrphanDeposit should succeed from OrphanWrapped");
         let [
             UnwrappedEquityRecoveryEvent::OrphanDepositSubmitted {
@@ -977,8 +965,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn confirm_orphan_deposit_completes_orphan_branch() {
+    #[test]
+    fn confirm_orphan_deposit_completes_orphan_branch() {
         let state = UnwrappedEquityRecovery::OrphanDepositSubmitted {
             symbol: aapl(),
             shares: one_share(),
@@ -989,8 +977,10 @@ mod tests {
             deposit_submitted_at: Utc::now(),
         };
         let events = state
-            .transition(UnwrappedEquityRecoveryCommand::ConfirmOrphanDeposit, &())
-            .await
+            .transition(
+                UnwrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
+                &mut JobQueue::default(),
+            )
             .expect("ConfirmOrphanDeposit should succeed from OrphanDepositSubmitted");
         let [
             UnwrappedEquityRecoveryEvent::OrphanDeposited {
@@ -1008,16 +998,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn fail_recovery_from_detected_emits_recovery_failed() {
+    #[test]
+    fn fail_recovery_from_detected_emits_recovery_failed() {
         let events = detected()
             .transition(
                 UnwrappedEquityRecoveryCommand::FailRecovery {
                     reason: "operator abort".to_string(),
                 },
-                &(),
+                &mut JobQueue::default(),
             )
-            .await
             .expect("FailRecovery should succeed from a non-terminal state");
         let [UnwrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice()
         else {

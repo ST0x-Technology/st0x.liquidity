@@ -3657,7 +3657,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        Arc::new(test_store(pool, ()))
+        Arc::new(test_store(pool))
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal ->
@@ -10192,7 +10192,7 @@ mod tests {
     async fn burn_recording_pending_retries_and_succeeds_on_second_attempt() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let cqrs = Arc::new(test_store(pool.clone()));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("1");
@@ -11528,7 +11528,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::migrate!().run(&writable).await.unwrap();
-        let writable_cqrs = test_store::<UsdcRebalance>(writable.clone(), ());
+        let writable_cqrs = test_store::<UsdcRebalance>(writable.clone());
 
         let base_provider = ProviderBuilder::new()
             .connect(&chains.base_endpoint)
@@ -11552,7 +11552,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cqrs = Arc::new(test_store(read_only, ()));
+        let cqrs = Arc::new(test_store(read_only));
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,

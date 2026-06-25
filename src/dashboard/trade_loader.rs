@@ -106,7 +106,7 @@ mod tests {
         };
 
         let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -139,7 +139,7 @@ mod tests {
 
         let (store, _projection) =
             st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
@@ -192,7 +192,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -254,7 +254,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -292,7 +292,7 @@ mod tests {
 
         let (store, _projection) =
             st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 

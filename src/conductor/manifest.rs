@@ -91,21 +91,21 @@ impl QueryManifest {
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(hedge_latency)
-            .build(())
+            .build()
             .await?;
 
         let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(lifecycle_failure.clone())
-            .build(())
+            .build()
             .await?;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(lifecycle_failure.clone())
-            .build(())
+            .build()
             .await?;
 
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
@@ -113,14 +113,14 @@ impl QueryManifest {
             .with(broadcaster)
             .with(rebalance_timing)
             .with(lifecycle_failure)
-            .build(())
+            .build()
             .await?;
 
         // The reactor's underlying trigger owns the snapshot projection
         // internally, so it's the sole subscriber here.
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
             .with(rebalancing_service)
-            .build(())
+            .build()
             .await?;
 
         Ok(BuiltFrameworks {
@@ -185,7 +185,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
@@ -237,7 +237,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
@@ -308,7 +308,7 @@ mod tests {
         let orderbook = Address::repeat_byte(0xAB);
         let owner = Address::repeat_byte(0xCD);
         let token = Address::repeat_byte(0xEF);
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
         vault_registry
             .send(
                 &VaultRegistryId { orderbook, owner },

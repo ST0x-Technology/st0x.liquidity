@@ -41,14 +41,14 @@ let
   fullSrc = withRainMathFloat "st0x-src" cleanedSrc;
 
   # Vendor cargo deps with git dependency hashes
-  baseVendorDir = craneLib.vendorCargoDeps {
+  cargoVendorDir = craneLib.vendorCargoDeps {
     src = fullSrc;
     cargoLock = ./Cargo.lock;
     outputHashes = {
       "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
-      "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=1557172049c8a43add209a86c7d809e89a5fbc82#1557172049c8a43add209a86c7d809e89a5fbc82" =
-        "sha256-GkQaR+cp09NJBarrz8VeJV/6DVFz+EhMsu2y8jP0Uck=";
+      "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=0.2.0-rc2#70267675e3e7ad5dda57e52addbc23822a929d84" =
+        "sha256-CBPWEhc5HGtTiwHBon2s8dbpfaCTwMbInb3k/pPzX0w=";
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
     };
@@ -83,14 +83,11 @@ let
         drv;
   };
 
-  # sqlite-es uses sqlx::migrate!("../../migrations") which resolves inside
-  # the vendor dir. Fetch migrations from event-sorcery at the same commit
-  # as Cargo.lock specifies for sqlite-es.
+  # event-sorcery 0.2.0-rc2 makes sqlite-es self-contained: its migrations live
+  # in-crate (`migrate!("./migrations")`) and survive `cargo package`, so the
+  # vendored crate already carries them. No migration-copy workaround is needed
+  # (the pre-0.2.0 `migrate!("../../migrations")` hack is gone).
   cargoLock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
-  sqliteEsPackage = builtins.head (
-    builtins.filter (p: p.name or "" == "sqlite-es") cargoLock.package
-  );
-  sqliteEsRev = builtins.head (builtins.match ".*#([a-f0-9]+)" sqliteEsPackage.source);
 
   # Issuance vendor override (above) reuses the rev Cargo.lock locks for the
   # st0x-issuance-* crates, so the rev can never drift from the Cargo.toml pins.
@@ -99,29 +96,6 @@ let
     builtins.filter (p: p.name or "" == "st0x-issuance-dto") cargoLock.package
   );
   issuanceRev = builtins.head (builtins.match ".*#([a-f0-9]+)" issuancePackage.source);
-
-  sqliteEsMigrations =
-    builtins.fetchGit {
-      url = "https://github.com/ST0x-Technology/event-sorcery";
-      rev = sqliteEsRev;
-    }
-    + "/migrations";
-
-  cargoVendorDir = pkgs.runCommand "vendor-with-migrations" { } ''
-    cp -rL --no-preserve=mode ${baseVendorDir} $out
-
-    # sqlite-es's ../../migrations resolves from crate root (sqlite-es-0.1.0/),
-    # going up two levels to vendor root
-    cp -r ${sqliteEsMigrations} "$out/migrations"
-
-    # config.toml tells cargo where to find vendored crates. It contains
-    # absolute nix store paths like:
-    #   [source.nix-sources-c798c58f...]
-    #   directory = "/nix/store/xxx-vendor-cargo-deps/c798c58f..."
-    # We must update these to point to our wrapped vendor dir, otherwise
-    # cargo will look in the original (immutable, no migrations) location.
-    ${pkgs.gnused}/bin/sed -i "s|${baseVendorDir}|$out|g" $out/config.toml
-  '';
 
   # Build args without ABI env vars. Used for the deps-only derivation so an
   # ABI change doesn't bust the cached dependency artifacts -- third-party

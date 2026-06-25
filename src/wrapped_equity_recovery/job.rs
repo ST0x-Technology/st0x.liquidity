@@ -773,8 +773,8 @@ mod tests {
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             vault_lookup.clone(),
@@ -790,7 +790,7 @@ mod tests {
             wrapper,
             transfer,
         };
-        let store = Arc::new(test_store(pool.clone(), ()));
+        let store = Arc::new(test_store(pool.clone()));
 
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
@@ -896,8 +896,8 @@ mod tests {
     ) -> WrappedEquityRecoveryCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             vault_lookup.clone(),
@@ -913,7 +913,7 @@ mod tests {
             wrapper,
             transfer,
         };
-        let store = Arc::new(test_store(pool, ()));
+        let store = Arc::new(test_store(pool));
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(view, sender));
 

@@ -9,14 +9,13 @@ use std::str::FromStr;
 
 use alloy::hex::FromHexError;
 use alloy::primitives::{B256, TxHash};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use st0x_dto::{Direction, Trade, TradingVenue};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil};
 use st0x_execution::Symbol;
 use st0x_finance::FractionalShares;
 
@@ -110,13 +109,12 @@ pub(crate) struct OnChainTrade {
     pub(crate) reorg_acknowledged_at: Option<DateTime<Utc>>,
 }
 
-#[async_trait]
 impl EventSourced for OnChainTrade {
     type Id = OnChainTradeId;
     type Event = OnChainTradeEvent;
     type Command = OnChainTradeCommand;
     type Error = OnChainTradeError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
@@ -220,9 +218,9 @@ impl EventSourced for OnChainTrade {
         }
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use OnChainTradeCommand::*;
         use OnChainTradeEvent::*;
@@ -254,10 +252,10 @@ impl EventSourced for OnChainTrade {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use OnChainTradeCommand::*;
         use OnChainTradeEvent::*;
@@ -672,7 +670,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given_no_previous_events()
             .when(OnChainTradeCommand::Witness {
                 symbol: symbol.clone(),
@@ -697,7 +695,7 @@ mod tests {
         let block_hash =
             b256!("0xabababababababababababababababababababababababababababababababab");
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given_no_previous_events()
             .when(OnChainTradeCommand::Witness {
                 symbol,
@@ -735,7 +733,7 @@ mod tests {
             publish_time: now,
         };
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
                 amount: float!(10.5),
@@ -770,7 +768,7 @@ mod tests {
             publish_time: now,
         };
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol: symbol.clone(),
@@ -814,7 +812,7 @@ mod tests {
             publish_time: now,
         };
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given_no_previous_events()
             .when(OnChainTradeCommand::Enrich {
                 gas_used: 50000,
@@ -842,7 +840,7 @@ mod tests {
             publish_time: now,
         };
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol,
                 amount: float!("10.5"),
@@ -872,7 +870,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol,
                 amount: float!(10.5),
@@ -898,7 +896,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol,
@@ -926,7 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_acknowledge_unwitnessed_trade() {
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given_no_previous_events()
             .when(OnChainTradeCommand::Acknowledge)
             .await
@@ -943,7 +941,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol,
                 amount: float!(10.5),
@@ -975,7 +973,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol,
@@ -1094,7 +1092,7 @@ mod tests {
         };
 
         // Acknowledge the witnessed fill through the command handler.
-        let acknowledge_events = TestHarness::<OnChainTrade>::with(())
+        let acknowledge_events = TestHarness::<OnChainTrade>::with()
             .given(vec![filled.clone()])
             .when(OnChainTradeCommand::Acknowledge)
             .await
@@ -1108,7 +1106,7 @@ mod tests {
         ));
 
         // RecordReorg the now-acknowledged fill through the command handler.
-        let reorg_events = TestHarness::<OnChainTrade>::with(())
+        let reorg_events = TestHarness::<OnChainTrade>::with()
             .given(vec![filled.clone(), acknowledged.clone()])
             .when(OnChainTradeCommand::RecordReorg { reorg_depth: 4 })
             .await
@@ -1130,7 +1128,7 @@ mod tests {
         assert!(trade.is_acknowledged());
 
         // (b) A retried Acknowledge after the reorg is rejected.
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![filled, acknowledged.clone(), reorged.clone()])
             .when(OnChainTradeCommand::Acknowledge)
             .await
@@ -1146,7 +1144,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol,
@@ -1175,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_reorg_unfilled_trade() {
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given_no_previous_events()
             .when(OnChainTradeCommand::RecordReorg { reorg_depth: 1 })
             .await
@@ -1210,7 +1208,7 @@ mod tests {
     async fn acknowledge_reorg_marks_reversal_complete() {
         let now = Utc::now();
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given(filled_then_reorged(now))
             .when(OnChainTradeCommand::AcknowledgeReorg)
             .await
@@ -1248,7 +1246,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol,
                 amount: float!(10.5),
@@ -1277,7 +1275,7 @@ mod tests {
             reorg_acknowledged_at: now,
         });
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(events)
             .when(OnChainTradeCommand::AcknowledgeReorg)
             .await
@@ -1322,7 +1320,7 @@ mod tests {
         let new_block_hash =
             b256!("0xbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc");
 
-        let events = TestHarness::<OnChainTrade>::with(())
+        let events = TestHarness::<OnChainTrade>::with()
             .given(filled_acknowledged_reorged_acknowledged(now))
             .when(OnChainTradeCommand::ReWitness {
                 block_number: 99999,
@@ -1353,7 +1351,7 @@ mod tests {
         // desync the `record_reorg` resume keying.
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(filled_then_reorged(now))
             .when(OnChainTradeCommand::ReWitness {
                 block_number: 99999,
@@ -1375,7 +1373,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol,
                 amount: float!(10.5),
@@ -1457,7 +1455,7 @@ mod tests {
             re_witnessed_at: now,
         });
 
-        let acknowledge_events = TestHarness::<OnChainTrade>::with(())
+        let acknowledge_events = TestHarness::<OnChainTrade>::with()
             .given(events)
             .when(OnChainTradeCommand::Acknowledge)
             .await
@@ -1519,7 +1517,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
                 amount: float!(10.5),
@@ -1560,7 +1558,7 @@ mod tests {
             publish_time: now,
         };
 
-        let error = TestHarness::<OnChainTrade>::with(())
+        let error = TestHarness::<OnChainTrade>::with()
             .given(vec![
                 OnChainTradeEvent::Filled {
                     symbol: symbol.clone(),
