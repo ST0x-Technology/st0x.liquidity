@@ -249,8 +249,9 @@ where
 
     let poll_status_ctx = Arc::new(PollOrderStatusCtx {
         executor: context.executor.clone(),
-        offchain_order: context.frameworks.offchain_order.clone(),
         offchain_order_projection: context.frameworks.offchain_order_projection.clone(),
+        offchain_order_store: context.frameworks.offchain_order.clone(),
+        position_store: context.frameworks.position.clone(),
         poll_status_queue: poll_status_queue.clone(),
         reconcile_queue: reconcile_queue.clone(),
         rejection_queue: rejection_queue.clone(),

@@ -1,18 +1,53 @@
 //! Repair CLI commands for manually recovering stuck local CQRS state.
 
 use anyhow::{Context, bail};
+use async_trait::async_trait;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
+use std::sync::Arc;
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::{
+    CancellationOutcome, ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, Symbol,
+};
 
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
+    OrderPlacer,
 };
 use crate::position::{Position, PositionCommand};
+
+/// An [`OrderPlacer`] for repair commands that must never place or cancel an
+/// order: `MarkFailed` is a pure terminal transition that never touches the
+/// placer. Returns an error on the unreachable placement/cancellation paths
+/// rather than panicking.
+struct RepairOrderPlacer;
+
+#[async_trait]
+impl OrderPlacer for RepairOrderPlacer {
+    async fn place_market_order(
+        &self,
+        _order: MarketOrder,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
+    }
+
+    async fn place_limit_order(
+        &self,
+        _order: LimitOrder,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
+    }
+
+    async fn cancel_order(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        Err("repair must not cancel offchain orders; MarkFailed is terminal-only".into())
+    }
+}
 
 /// Fails a position's pending offchain order pointer and drives the orphaned
 /// `OffchainOrder` aggregate to `Failed`.
@@ -66,6 +101,13 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
                     "OffchainOrder {offchain_order_id} is Filled: the hedge executed. This \
                      command cannot repair a filled order -- reconcile the fill into the \
                      position instead of failing it."
+                );
+            }
+            OffchainOrder::Cancelling { .. } | OffchainOrder::Cancelled { .. } => {
+                bail!(
+                    "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state: \
+                     this command fails stuck Pending/Submitted orders, not cancellations -- \
+                     refusing. Confirm the intended recovery path for cancellation states."
                 );
             }
             OffchainOrder::Pending { .. }
@@ -157,10 +199,19 @@ enum ReloadOutcome {
 /// Single source of the executed-shares-escalate rule shared by both re-load
 /// sites in [`fail_offchain_order_aggregate`].
 fn classify_reloaded_state(state: Option<&OffchainOrder>) -> ReloadOutcome {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
 
     match state {
-        Some(Filled { .. } | PartiallyFilled { .. }) => ReloadOutcome::Escalate,
+        // Executed shares (Filled/PartiallyFilled) would erase a hedge; and a
+        // concurrent transition into a cancellation lifecycle state during a
+        // fail must route to manual reconciliation rather than being failed
+        // blind (a Cancelled order may carry a partial fill). Confirm the
+        // intended recovery path for cancellation states.
+        Some(Filled { .. } | PartiallyFilled { .. } | Cancelling { .. } | Cancelled { .. }) => {
+            ReloadOutcome::Escalate
+        }
         Some(Failed { .. }) => ReloadOutcome::BenignTerminal,
         Some(Pending { .. } | Submitted { .. }) | None => ReloadOutcome::Proceed,
     }
@@ -180,7 +231,9 @@ async fn fail_offchain_order_aggregate<W: Write>(
     offchain_order_id: OffchainOrderId,
     reason: String,
 ) -> anyhow::Result<()> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
 
     let Some(order) = order else {
         writeln!(
@@ -205,6 +258,13 @@ async fn fail_offchain_order_aggregate<W: Write>(
             bail!(
                 "OffchainOrder {offchain_order_id} has executed shares (state {order:?}) -- \
                  refusing to erase the executed hedge"
+            );
+        }
+        Cancelling { .. } | Cancelled { .. } => {
+            bail!(
+                "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state \
+                 (state {order:?}): this command fails Pending/Submitted orders, not \
+                 cancellations -- refusing. Confirm the intended recovery path."
             );
         }
         Pending { .. } | Submitted { .. } => {}
@@ -253,13 +313,16 @@ async fn fail_offchain_order_aggregate<W: Write>(
     // projection updates immediately -- a stale 'Submitted' row in the view is
     // the very symptom this command exists to repair.
     let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(())
+        .build(Arc::new(RepairOrderPlacer))
         .await
         .context("failed to build offchain order store")?;
     let send_result = store
         .send(
             &offchain_order_id,
-            OffchainOrderCommand::MarkFailed { error: reason },
+            OffchainOrderCommand::MarkFailed {
+                error: reason,
+                failed_at: chrono::Utc::now(),
+            },
         )
         .await;
 
@@ -390,9 +453,10 @@ mod tests {
     use alloy::primitives::TxHash;
 
     use st0x_config::ExecutionThreshold;
-    use st0x_execution::{Direction, ExecutorOrderId, FractionalShares};
+    use st0x_execution::{ClientOrderId, Direction, ExecutorOrderId, FractionalShares};
     use st0x_finance::Usd;
     use st0x_float_macro::float;
+    use uuid::Uuid;
 
     use super::*;
     use crate::position::TradeId;
@@ -410,8 +474,10 @@ mod tests {
                 shares: positive_shares("0.5"),
                 direction: Direction::Sell,
                 executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -426,8 +492,10 @@ mod tests {
                 executor_order_id: ExecutorOrderId::new("seed-accept"),
                 placed_shares: positive_shares("0.5"),
                 submitted_at: chrono::Utc::now(),
+                market_session: st0x_execution::MarketSession::Regular,
+                limit_price: None,
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -590,8 +658,9 @@ mod tests {
             &order_id,
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
+                filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -648,8 +717,9 @@ mod tests {
             &order_id,
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
+                filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -697,8 +767,9 @@ mod tests {
             OffchainOrderCommand::UpdatePartialFill {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
+                partially_filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -769,8 +840,9 @@ mod tests {
             OffchainOrderCommand::UpdatePartialFill {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
+                partially_filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -790,8 +862,9 @@ mod tests {
             &filled_id,
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
+                filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -811,8 +884,9 @@ mod tests {
             &failed_id,
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it".to_string(),
+                failed_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -857,8 +931,9 @@ mod tests {
             &order_id,
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
+                filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -898,8 +973,9 @@ mod tests {
             &order_id,
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it concurrently".to_string(),
+                failed_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -949,8 +1025,9 @@ mod tests {
             &order_id,
             OffchainOrderCommand::MarkFailed {
                 error: "pre-failed".to_string(),
+                failed_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -1140,8 +1217,9 @@ mod tests {
             OffchainOrderCommand::UpdatePartialFill {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
+                partially_filled_at: chrono::Utc::now(),
             },
-            (),
+            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();

@@ -80,7 +80,7 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
 mod tests {
     use chrono::Utc;
 
-    use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
+    use st0x_execution::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
     use st0x_float_macro::float;
 
     use super::*;
@@ -138,7 +138,7 @@ mod tests {
 
         let (store, _projection) =
             st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(crate::offchain::order::noop_order_placer())
                 .await
                 .unwrap();
 
@@ -152,6 +152,8 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -164,6 +166,8 @@ mod tests {
                     executor_order_id: st0x_execution::ExecutorOrderId::new("TEST"),
                     placed_shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
                     submitted_at: Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
                 },
             )
             .await
@@ -174,6 +178,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::CompleteFill {
                     price: st0x_finance::Usd::new(float!(200)),
+                    filled_at: Utc::now(),
                 },
             )
             .await
@@ -288,7 +293,7 @@ mod tests {
 
         let (store, _projection) =
             st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(crate::offchain::order::noop_order_placer())
                 .await
                 .unwrap();
 
@@ -302,6 +307,8 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
                     direction: Direction::Buy,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await

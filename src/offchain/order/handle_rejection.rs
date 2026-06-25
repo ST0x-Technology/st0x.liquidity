@@ -13,13 +13,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use st0x_dto::Direction;
 use st0x_event_sorcery::Store;
-use st0x_execution::{ExecutorOrderId, FractionalShares, NotPositive, Positive, Symbol};
-use st0x_finance::Usd;
+use st0x_execution::{Direction, ExecutorOrderId, FractionalShares, Positive};
 
 use crate::conductor::job::{Job, JobQueue, Label};
-use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
+use crate::offchain::order::{
+    JobError, NoFillOutcome, OffchainOrder, OffchainOrderCommand, OffchainOrderId, RetainedFill,
+    TerminalPositionFinalization, terminal_position_finalization,
+};
 use crate::position::{Position, PositionCommand};
 
 pub(crate) type HandleOrderRejectionJobQueue = JobQueue<HandleOrderRejection>;
@@ -35,14 +36,13 @@ pub(crate) struct HandleOrderRejectionCtx {
 pub(crate) struct HandleOrderRejection {
     pub(crate) offchain_order_id: OffchainOrderId,
     pub(crate) error: String,
-}
-
-struct RetainedPartialFill {
-    shares_filled: Positive<FractionalShares>,
-    direction: Direction,
-    executor_order_id: ExecutorOrderId,
-    price: Usd,
-    broker_timestamp: DateTime<Utc>,
+    /// Broker-reported failure time, when the enqueuing poll observed a
+    /// broker `Failed` state. `None` when the rejection has no broker
+    /// timestamp (the job then stamps its own observation time).
+    /// `#[serde(default)]` so jobs queued before this field existed still
+    /// deserialize.
+    #[serde(default)]
+    pub(crate) broker_failed_at: Option<DateTime<Utc>>,
 }
 
 impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
@@ -69,30 +69,15 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
         };
 
         let symbol = order.symbol().clone();
-        let retained_partial_fill =
-            retained_partial_fill(&order)
-                .transpose()
-                .map_err(|source| JobError::InvalidPartialFill {
-                    offchain_order_id: self.offchain_order_id,
-                    source,
-                })?;
-
-        if let Some(fill) = &retained_partial_fill {
-            self.complete_position_for_partial_fill(ctx, &symbol, fill)
-                .await?;
-        }
-
-        // Retry-safe for no-fill rejections: the two writes (OffchainOrder
-        // MarkFailed + Position FailOffChainOrder) are not atomic. If a prior
-        // attempt completed step 1 but failed step 2, apalis re-runs us with
-        // the order already in `Failed`. Re-sending `MarkFailed` would surface
-        // `AlreadyCompleted` and stall the job forever, so we only run step 1
-        // when the order has not yet been marked failed.
-        //
-        // For retained partial fills, the position update runs first so a retry
-        // cannot lose the partial-fill quantity by loading an already-Failed
-        // OffchainOrder that no longer carries the partial-fill fields.
-        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+        // Retry-safe: the two writes (OffchainOrder MarkFailed +
+        // Position FailOffChainOrder) are not atomic. If a prior attempt
+        // completed step 1 but failed step 2, apalis re-runs us with the
+        // order already in `Failed`. Re-sending `MarkFailed` would surface
+        // `AlreadyCompleted` and stall the job forever, so we only run
+        // step 1 when the order has not yet been marked failed.
+        use OffchainOrder::{
+            Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+        };
         match &order {
             Failed { .. } => {
                 info!(
@@ -101,12 +86,16 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                 );
             }
 
-            Pending { .. } | Submitted { .. } | PartiallyFilled { .. } => {
+            Pending { .. } | Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. } => {
                 ctx.offchain_order
                     .send(
                         &self.offchain_order_id,
                         OffchainOrderCommand::MarkFailed {
                             error: self.error.clone(),
+                            // Prefer the broker's failure time; rejections
+                            // without one (e.g. cleanup paths) fall back to
+                            // this job's observation time.
+                            failed_at: self.broker_failed_at.unwrap_or_else(Utc::now),
                         },
                     )
                     .await?;
@@ -119,10 +108,13 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                 );
                 return Ok(());
             }
-        }
 
-        if retained_partial_fill.is_some() {
-            return Ok(());
+            Cancelled { .. } => {
+                info!(
+                    offchain_order_id = %self.offchain_order_id,
+                    "HandleOrderRejection: order already Cancelled -- skipping MarkFailed, resuming position update"
+                );
+            }
         }
 
         // Retry-safe step 2: if a prior attempt or the startup recovery
@@ -143,86 +135,139 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
             return Ok(());
         }
 
-        ctx.position
-            .send(
-                &symbol,
-                PositionCommand::FailOffChainOrder {
-                    offchain_order_id: self.offchain_order_id,
-                    error: self.error.clone(),
-                },
-            )
-            .await?;
+        // `broker_timestamp` must be the broker event time the matched state
+        // recorded, not the wall-clock time this recovery job happens to run --
+        // it flows into `Position.last_updated` and any recency/ordering logic
+        // keyed off it. Each state carries its own broker timestamp.
+        let position_command = match &order {
+            PartiallyFilled {
+                shares_filled,
+                direction,
+                executor_order_id,
+                avg_price,
+                partially_filled_at,
+                ..
+            }
+            | Cancelling {
+                retained_fill:
+                    Some(RetainedFill::Priced {
+                        shares_filled,
+                        avg_price,
+                        partially_filled_at,
+                    }),
+                direction,
+                executor_order_id,
+                ..
+            }
+            | Failed {
+                retained_fill:
+                    Some(RetainedFill::Priced {
+                        shares_filled,
+                        avg_price,
+                        partially_filled_at,
+                    }),
+                executor_order_id: Some(executor_order_id),
+                direction,
+                ..
+            } => position_command_for_retained_fill(
+                self.offchain_order_id,
+                *shares_filled,
+                *direction,
+                executor_order_id.clone(),
+                *avg_price,
+                *partially_filled_at,
+                self.error.clone(),
+            ),
+
+            // A locally-`Cancelled` order is already terminal and must NOT be
+            // recorded as a broker failure: that would set the failure /
+            // idempotency anchor for an intentional cancellation and drop any
+            // partial fill it retained. Route through the shared terminal
+            // finalization so this mapping cannot drift from the recovery and
+            // cancel-and-replace paths.
+            cancelled @ Cancelled { .. } => {
+                match terminal_position_finalization(cancelled) {
+                    Some(TerminalPositionFinalization::Complete {
+                        shares_filled,
+                        direction,
+                        executor_order_id,
+                        price,
+                        broker_timestamp,
+                    }) => PositionCommand::CompleteOffChainOrder {
+                        offchain_order_id: self.offchain_order_id,
+                        shares_filled,
+                        direction,
+                        executor_order_id,
+                        price,
+                        broker_timestamp,
+                    },
+                    // Zero-fill cancellation: release the slot without the
+                    // failure anchor.
+                    Some(TerminalPositionFinalization::NoFill(NoFillOutcome::Cancelled {
+                        reason,
+                        cancelled_at,
+                    })) => PositionCommand::CancelOffChainOrder {
+                        offchain_order_id: self.offchain_order_id,
+                        reason,
+                        cancelled_at,
+                    },
+                    // A Cancelled order always classifies as the Cancelled
+                    // outcome, so a Failed outcome cannot occur here; a
+                    // positive fill with no price cannot be applied. Both fail
+                    // so the slot is released rather than left pending forever.
+                    Some(
+                        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed { .. })
+                        | TerminalPositionFinalization::UnpricedFill { .. },
+                    )
+                    | None => PositionCommand::FailOffChainOrder {
+                        offchain_order_id: self.offchain_order_id,
+                        error: self.error.clone(),
+                    },
+                }
+            }
+
+            Pending { .. }
+            | Submitted { .. }
+            | Cancelling { .. }
+            | Failed {
+                executor_order_id: None,
+                ..
+            }
+            | Failed { .. } => PositionCommand::FailOffChainOrder {
+                offchain_order_id: self.offchain_order_id,
+                error: self.error.clone(),
+            },
+            Filled { .. } => unreachable!("filled orders return before position update"),
+        };
+
+        ctx.position.send(&symbol, position_command).await?;
 
         Ok(())
     }
 }
 
-impl HandleOrderRejection {
-    async fn complete_position_for_partial_fill(
-        &self,
-        ctx: &HandleOrderRejectionCtx,
-        symbol: &Symbol,
-        fill: &RetainedPartialFill,
-    ) -> Result<(), JobError> {
-        let position_pending = ctx
-            .position
-            .load(symbol)
-            .await?
-            .and_then(|position| position.pending_offchain_order_id);
-        if position_pending != Some(self.offchain_order_id) {
-            info!(
-                offchain_order_id = %self.offchain_order_id,
-                ?position_pending,
-                "HandleOrderRejection: position no longer expecting this partial fill, skipping"
-            );
-            return Ok(());
-        }
-
-        ctx.position
-            .send(
-                symbol,
-                PositionCommand::CompleteOffChainOrder {
-                    offchain_order_id: self.offchain_order_id,
-                    shares_filled: fill.shares_filled,
-                    direction: fill.direction,
-                    executor_order_id: fill.executor_order_id.clone(),
-                    price: fill.price,
-                    broker_timestamp: fill.broker_timestamp,
-                },
-            )
-            .await?;
-
-        Ok(())
-    }
-}
-
-fn retained_partial_fill(
-    order: &OffchainOrder,
-) -> Option<Result<RetainedPartialFill, NotPositive<FractionalShares>>> {
-    let OffchainOrder::PartiallyFilled {
-        shares_filled,
-        direction,
-        executor_order_id,
-        avg_price,
-        partially_filled_at,
-        ..
-    } = order
-    else {
-        return None;
-    };
-
-    if *shares_filled == FractionalShares::ZERO {
-        return None;
-    }
-
-    Some(
-        Positive::new(*shares_filled).map(|shares_filled| RetainedPartialFill {
-            shares_filled,
-            direction: *direction,
-            executor_order_id: executor_order_id.clone(),
-            price: *avg_price,
-            broker_timestamp: *partially_filled_at,
-        }),
+fn position_command_for_retained_fill(
+    offchain_order_id: OffchainOrderId,
+    shares_filled: FractionalShares,
+    direction: Direction,
+    executor_order_id: ExecutorOrderId,
+    avg_price: st0x_finance::Usd,
+    broker_timestamp: chrono::DateTime<chrono::Utc>,
+    fallback_error: String,
+) -> PositionCommand {
+    Positive::new(shares_filled).map_or_else(
+        |_| PositionCommand::FailOffChainOrder {
+            offchain_order_id,
+            error: fallback_error,
+        },
+        |positive_filled| PositionCommand::CompleteOffChainOrder {
+            offchain_order_id,
+            shares_filled: positive_filled,
+            direction,
+            executor_order_id,
+            price: avg_price,
+            broker_timestamp,
+        },
     )
 }
 
@@ -232,7 +277,11 @@ mod tests {
 
     use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_execution::{
+        ClientOrderId, Direction, FractionalShares, MarketSession, Positive, SupportedExecutor,
+        Symbol,
+    };
+    use st0x_finance::Usd;
     use st0x_float_macro::float;
 
     use super::*;
@@ -247,7 +296,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let (offchain_order, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build(crate::offchain::order::noop_order_placer())
             .await
             .unwrap();
 
@@ -326,6 +375,8 @@ mod tests {
                     shares,
                     direction,
                     executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -340,6 +391,8 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
                 },
             )
             .await
@@ -361,6 +414,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: error_message.clone(),
+            broker_failed_at: None,
         }
         .perform(&infra.ctx)
         .await
@@ -412,6 +466,7 @@ mod tests {
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(float!(0.75)),
                     avg_price: Usd::new(float!(150.25)),
+                    partially_filled_at: broker_timestamp,
                 },
             )
             .await
@@ -420,6 +475,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: "broker cancelled after partial fill".to_string(),
+            broker_failed_at: None,
         }
         .perform(&infra.ctx)
         .await
@@ -489,6 +545,7 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: original_error.clone(),
+                    failed_at: Utc::now(),
                 },
             )
             .await
@@ -510,6 +567,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: original_error,
+            broker_failed_at: None,
         }
         .perform(&infra.ctx)
         .await
@@ -525,6 +583,62 @@ mod tests {
         assert_eq!(
             position_after.pending_offchain_order_id, None,
             "Retry must clear the position's pending state by running step 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_failed_partial_fill_completes_position_fill() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(1)),
+                    avg_price: st0x_finance::Usd::new(float!(150)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "broker failed after partial fill".to_string(),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker failed after partial fill".to_string(),
+            broker_failed_at: None,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position_after = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position_after.pending_offchain_order_id, None,
+            "Retry must clear pending by completing the retained partial fill"
         );
     }
 
@@ -545,6 +659,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: error_message.clone(),
+            broker_failed_at: None,
         }
         .perform(&infra.ctx)
         .await
@@ -554,6 +669,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: error_message,
+            broker_failed_at: None,
         }
         .perform(&infra.ctx)
         .await
@@ -569,6 +685,110 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "Position must remain cleared after no-op retry"
+        );
+    }
+
+    /// The broker's failure time (carried on the job from the status poll)
+    /// must be the timestamp persisted on the `Failed` event, not the wall
+    /// clock at which this recovery job happens to run.
+    #[tokio::test]
+    async fn rejection_records_broker_failure_time_on_failed_event() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        let broker_failed_at = Utc::now() - chrono::Duration::hours(2);
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker rejected".to_string(),
+            broker_failed_at: Some(broker_failed_at),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra
+            .ctx
+            .offchain_order
+            .load(&order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        let OffchainOrder::Failed { failed_at, .. } = order else {
+            panic!("expected Failed, got {order:?}");
+        };
+        assert_eq!(
+            failed_at, broker_failed_at,
+            "Failed event must carry the broker-reported failure time"
+        );
+    }
+
+    /// A rejection that lands while the order is `Cancelling` with a retained
+    /// fill must finalize the position with the fill's broker timestamp (the
+    /// `partially_filled_at` carried onto the Cancelling state), not the
+    /// local cancel-request wall clock.
+    #[tokio::test]
+    async fn cancelling_rejection_finalizes_position_with_fill_broker_time() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        let broker_fill_time = Utc::now() - chrono::Duration::minutes(30);
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(1)),
+                    avg_price: st0x_finance::Usd::new(float!(150)),
+                    partially_filled_at: broker_fill_time,
+                },
+            )
+            .await
+            .unwrap();
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: crate::offchain::order::CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker rejected during cancellation".to_string(),
+            broker_failed_at: None,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Retained fill must complete the position and release the slot"
+        );
+        assert_eq!(
+            position.last_updated,
+            Some(broker_fill_time),
+            "Position must be stamped with the fill's broker time, not the \
+             cancel-request wall clock"
         );
     }
 }

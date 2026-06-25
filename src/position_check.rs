@@ -331,7 +331,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::offchain::order::{OffchainOrder, OffchainOrderCommand};
+    use crate::offchain::order::{OffchainOrder, OffchainOrderCommand, noop_order_placer};
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_pools;
 
@@ -351,7 +351,7 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(noop_order_placer())
                 .await
                 .unwrap();
 
@@ -427,6 +427,10 @@ mod tests {
                     shares,
                     direction: Direction::Sell,
                     executor: SupportedExecutor::DryRun,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(
+                        offchain_order_id.as_uuid(),
+                    ),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -573,7 +577,7 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(noop_order_placer())
                 .await
                 .unwrap();
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
 
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
@@ -17,14 +18,16 @@ use st0x_execution::{
     MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
     TryIntoExecutor,
 };
+use st0x_float_serde::format_float_with_fallback;
 
 use crate::conductor::{
     FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
     execute_settle_fill, is_expected_place_offchain_order_rejection,
 };
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderId, OrderPlacementResult, OrderPlacer,
-    client_order_id_for_placement, place_offchain_order_at_broker,
+    OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
+    TerminalPositionFinalization, client_order_id_for_placement, place_offchain_order_at_broker,
+    position_command_for_finalization, terminal_position_finalization,
 };
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::PythFeedIds;
@@ -32,8 +35,6 @@ use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
-use st0x_config::{BrokerCtx, Ctx};
-use st0x_float_serde::format_float_with_fallback;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
 /// constructed from config.
@@ -53,7 +54,30 @@ impl OrderPlacer for CliOrderPlacer {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            is_extended_hours: placement.extended_hours,
+            limit_price: placement.limit_price,
         })
+    }
+
+    async fn place_limit_order(
+        &self,
+        _order: st0x_execution::LimitOrder,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support automated limit order placement".into())
+    }
+
+    async fn cancel_order(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support order cancellation".into())
+    }
+
+    async fn get_order_status(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<OrderState, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support reading order status via OrderPlacer".into())
     }
 }
 
@@ -162,13 +186,19 @@ fn write_order_status<W: Write>(stdout: &mut W, state: OrderState) -> anyhow::Re
                 "   The order has been submitted and is waiting to be filled."
             )?;
         }
-        OrderState::PartiallyFilled { order_id, .. } => {
-            writeln!(stdout, "⏳ Order Status: PARTIALLY FILLED")?;
+        OrderState::PartiallyFilled {
+            order_id,
+            shares_filled,
+            avg_price,
+            partially_filled_at,
+        } => {
+            writeln!(stdout, "🟡 Order Status: PARTIALLY FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
-        }
-        OrderState::Cancelled { order_id, .. } => {
-            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
-            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Partially Filled At: {partially_filled_at}")?;
+            writeln!(stdout, "   Shares Filled: {shares_filled}")?;
+            if let Some(price) = avg_price {
+                writeln!(stdout, "   Avg Fill Price: ${price}")?;
+            }
         }
         OrderState::Filled {
             executed_at,
@@ -178,21 +208,40 @@ fn write_order_status<W: Write>(stdout: &mut W, state: OrderState) -> anyhow::Re
             writeln!(stdout, "✅ Order Status: FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
-            writeln!(
-                stdout,
-                "   Fill Price: ${}",
-                format_float_with_fallback(&price.into())
-            )?;
+            writeln!(stdout, "   Fill Price: ${price}")?;
+        }
+        OrderState::Cancelled {
+            cancelled_at,
+            order_id,
+            shares_filled,
+            avg_price,
+        } => {
+            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Cancelled At: {cancelled_at}")?;
+            if shares_filled != FractionalShares::ZERO {
+                writeln!(stdout, "   Shares Filled: {shares_filled}")?;
+            }
+            if let Some(avg_price) = avg_price {
+                writeln!(stdout, "   Avg Fill Price: ${avg_price}")?;
+            }
         }
         OrderState::Failed {
             failed_at,
             error_reason,
-            ..
+            shares_filled,
+            avg_price,
         } => {
             writeln!(stdout, "❌ Order Status: FAILED")?;
             writeln!(stdout, "   Failed At: {failed_at}")?;
             if let Some(reason) = error_reason {
                 writeln!(stdout, "   Reason: {reason}")?;
+            }
+            if let Some(shares_filled) = shares_filled {
+                writeln!(stdout, "   Shares Filled: {shares_filled}")?;
+            }
+            if let Some(avg_price) = avg_price {
+                writeln!(stdout, "   Avg Fill Price: ${avg_price}")?;
             }
         }
     }
@@ -578,7 +627,7 @@ pub(super) async fn process_found_trade<W: Write>(
         .build(())
         .await?;
     let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(())
+        .build(order_placer.clone())
         .await?;
 
     let Some(block_number) = onchain_trade.block_number else {
@@ -732,11 +781,13 @@ pub(super) async fn process_found_trade<W: Write>(
         &offchain_order_store,
         order_placer.as_ref(),
         &offchain_order_id,
-        params.symbol.clone(),
-        params.shares,
-        params.direction,
-        params.executor,
-        client_order_id,
+        OffchainOrderPlacement::market(
+            params.symbol.clone(),
+            params.shares,
+            params.direction,
+            params.executor,
+            client_order_id,
+        ),
     )
     .await?;
 
@@ -809,18 +860,6 @@ async fn reconcile_existing_pending_order<W: Write>(
             );
         })?;
 
-    let outcome = match &loaded_order {
-        Some(OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. }) => {
-            CliPendingReconciliation::InFlight
-        }
-        None
-        | Some(
-            OffchainOrder::Failed { .. }
-            | OffchainOrder::Pending { .. }
-            | OffchainOrder::Filled { .. },
-        ) => CliPendingReconciliation::Cleared,
-    };
-
     reconcile_loaded_post_place_state(
         loaded_order,
         position_store,
@@ -829,9 +868,7 @@ async fn reconcile_existing_pending_order<W: Write>(
         CliPendingClearNextStep::ContinueThisRun,
         stdout,
     )
-    .await?;
-
-    Ok(outcome)
+    .await
 }
 
 // Mirrors dispatch_post_place_state in the normal pipeline: inspect the
@@ -865,6 +902,7 @@ async fn reconcile_post_place_state<W: Write>(
         stdout,
     )
     .await
+    .map(|_| ())
 }
 
 async fn reconcile_loaded_post_place_state<W: Write>(
@@ -874,7 +912,7 @@ async fn reconcile_loaded_post_place_state<W: Write>(
     offchain_order_id: OffchainOrderId,
     next_step: CliPendingClearNextStep,
     stdout: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CliPendingReconciliation> {
     match loaded_order {
         Some(OffchainOrder::Failed { error, .. }) => {
             // Broker placement failed: clear pending_offchain_order_id so the
@@ -889,12 +927,21 @@ async fn reconcile_loaded_post_place_state<W: Write>(
                 )
                 .await?;
             write_pending_clear_message(stdout, "Hedge placement failed", next_step)?;
+            Ok(CliPendingReconciliation::Cleared)
         }
         Some(OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. }) => {
             // Order submitted to the broker. The CLI does not enqueue a live
             // polling job; the order will be reconciled to a terminal state by
             // the order-status recovery sweep on the next bot startup.
             writeln!(stdout, "Trade processing completed!")?;
+            Ok(CliPendingReconciliation::InFlight)
+        }
+        Some(OffchainOrder::Cancelling { .. }) => {
+            writeln!(
+                stdout,
+                "Pending hedge cancellation is still in progress; not placing another hedge."
+            )?;
+            Ok(CliPendingReconciliation::InFlight)
         }
         None => {
             position_store
@@ -911,16 +958,66 @@ async fn reconcile_loaded_post_place_state<W: Write>(
                 "Hedge placement produced unexpected state",
                 next_step,
             )?;
+            Ok(CliPendingReconciliation::Cleared)
         }
-        Some(OffchainOrder::Pending { .. } | OffchainOrder::Filled { .. }) => {
+        Some(OffchainOrder::Pending { .. }) => {
             anyhow::bail!(
                 "offchain order {offchain_order_id} for {symbol} is in an unexpected \
                  post-placement state; refusing to clear the position claim"
             );
         }
+        Some(order @ (OffchainOrder::Filled { .. } | OffchainOrder::Cancelled { .. })) => {
+            reconcile_terminal_post_place_state(
+                &order,
+                position_store,
+                symbol,
+                offchain_order_id,
+                next_step,
+                stdout,
+            )
+            .await
+        }
     }
+}
 
-    Ok(())
+async fn reconcile_terminal_post_place_state<W: Write>(
+    order: &OffchainOrder,
+    position_store: &Store<Position>,
+    symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+    next_step: CliPendingClearNextStep,
+    stdout: &mut W,
+) -> anyhow::Result<CliPendingReconciliation> {
+    let Some(finalization) = terminal_position_finalization(order) else {
+        anyhow::bail!(
+            "offchain order {offchain_order_id} for {symbol} is terminal but did not \
+             produce a position finalization; refusing to clear the position claim"
+        );
+    };
+
+    let command = match finalization {
+        TerminalPositionFinalization::UnpricedFill { shares_filled } => {
+            anyhow::bail!(
+                "offchain order {offchain_order_id} for {symbol} has {shares_filled} filled \
+                 shares without an average price; refusing to clear the position claim"
+            );
+        }
+        finalization => {
+            let Some(command) = position_command_for_finalization(finalization, offchain_order_id)
+            else {
+                anyhow::bail!(
+                    "offchain order {offchain_order_id} for {symbol} could not be mapped to a \
+                     position finalization command; refusing to clear the position claim"
+                );
+            };
+            command
+        }
+    };
+
+    position_store.send(symbol, command).await?;
+    write_pending_clear_message(stdout, "Existing pending hedge finalized", next_step)?;
+
+    Ok(CliPendingReconciliation::Cleared)
 }
 
 fn write_pending_clear_message<W: Write>(
@@ -995,7 +1092,7 @@ mod tests {
         TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
         process_queued_trade,
     };
-    use crate::offchain::order::PollOrderStatusJobQueue;
+    use crate::offchain::order::{CancellationReason, PollOrderStatusJobQueue, noop_order_placer};
     use crate::onchain::trade::RaindexTradeEvent;
     use crate::onchain_trade::{OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand};
     use crate::test_utils::{
@@ -1016,6 +1113,20 @@ mod tests {
         ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
             Err("broker rejected the order".into())
         }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Err("broker rejected the order".into())
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            Err("broker rejected the cancellation".into())
+        }
     }
 
     /// `OrderPlacer` that always returns a successful placement, used to drive
@@ -1031,7 +1142,28 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                 placed_shares: order.shares,
+                is_extended_hours: false,
+                limit_price: None,
             })
+        }
+
+        async fn place_limit_order(
+            &self,
+            order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
+                placed_shares: order.shares,
+                is_extended_hours: order.extended_hours,
+                limit_price: Some(order.limit_price),
+            })
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            Err("unexpected cancellation from CLI test order placer".into())
         }
     }
 
@@ -1340,19 +1472,14 @@ mod tests {
                 }));
         });
 
-        // The broker-side `client_order_id` is a fresh UUID per CLI invocation,
-        // so its exact value cannot be pinned. Assert the value is a well-formed
-        // CLI idempotency key (`cli-{uuid}`); `json_body_includes` covers the
-        // static fields.
-        let client_order_id_pattern = Regex::new(
-            r#""client_order_id":"cli-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""#,
-        )
-        .unwrap();
-
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .body_matches(client_order_id_pattern.clone())
+                // CLI limit orders now carry a fresh `cli-{uuid}` client_order_id
+                // (added for broker-side idempotency), so match the static fields
+                // partially and assert the key is a well-formed CLI idempotency
+                // key rather than pinning its random value.
+                .body_matches(client_order_id_cli_pattern())
                 .json_body_includes(
                     json!({
                         "symbol": "AAPL",
@@ -1378,6 +1505,15 @@ mod tests {
         });
 
         (account_mock, asset_mock, order_mock)
+    }
+
+    /// Regex asserting a request body carries a well-formed `cli-{uuid}`
+    /// `client_order_id`, shared by the market- and limit-order mocks.
+    fn client_order_id_cli_pattern() -> Regex {
+        Regex::new(
+            r#""client_order_id":"cli-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""#,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2013,7 +2149,7 @@ mod tests {
             .await
             .unwrap();
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build(noop_order_placer())
             .await
             .unwrap();
 
@@ -2265,6 +2401,8 @@ mod tests {
             shares: positive_shares("1"),
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            executor_order_id: None,
             error: "previous placement failed".to_string(),
             placed_at: block_timestamp,
             failed_at: block_timestamp,
@@ -2309,7 +2447,7 @@ mod tests {
             .await
             .unwrap();
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build(noop_order_placer())
             .await
             .unwrap();
 
@@ -2361,6 +2499,179 @@ mod tests {
         assert!(
             output.contains("pending order cleared"),
             "missing order cleanup must report the cleared pending marker, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_cancelling_pending_order_remains_in_flight() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let block_timestamp = onchain_trade
+            .block_timestamp
+            .expect("test trade should have a block timestamp");
+
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        execute_acknowledge_fill(
+            &position_store,
+            &onchain_trade,
+            ExecutionThreshold::whole_share(),
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cancelling_order = OffchainOrder::Cancelling {
+            symbol: symbol.clone(),
+            shares: positive_shares("1"),
+            retained_fill: None,
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("broker-order-id"),
+            reason: CancellationReason::MarketOpenReplacement,
+            placed_at: block_timestamp,
+            submitted_at: block_timestamp,
+            cancel_requested_at: block_timestamp,
+            market_session: st0x_execution::MarketSession::Regular,
+        };
+
+        let mut stdout = Vec::new();
+        let outcome = reconcile_loaded_post_place_state(
+            Some(cancelling_order),
+            &position_store,
+            &symbol,
+            offchain_order_id,
+            CliPendingClearNextStep::ContinueThisRun,
+            &mut stdout,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, CliPendingReconciliation::InFlight),
+            "cancelling orders must remain in flight until broker cancellation confirms"
+        );
+
+        let position = position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist after setup");
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "Cancelling must leave the position claim in place"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("cancellation is still in progress"),
+            "cancelling order reconciliation must explain why no new hedge is placed, \
+             got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_cancelled_pending_order_clears_position_claim() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let block_timestamp = onchain_trade
+            .block_timestamp
+            .expect("test trade should have a block timestamp");
+
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        execute_acknowledge_fill(
+            &position_store,
+            &onchain_trade,
+            ExecutionThreshold::whole_share(),
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cancelled_order = OffchainOrder::Cancelled {
+            symbol: symbol.clone(),
+            shares: positive_shares("1"),
+            retained_fill: None,
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("broker-order-id"),
+            reason: CancellationReason::MarketOpenReplacement,
+            placed_at: block_timestamp,
+            cancelled_at: block_timestamp,
+        };
+
+        let mut stdout = Vec::new();
+        let outcome = reconcile_loaded_post_place_state(
+            Some(cancelled_order),
+            &position_store,
+            &symbol,
+            offchain_order_id,
+            CliPendingClearNextStep::ContinueThisRun,
+            &mut stdout,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, CliPendingReconciliation::Cleared),
+            "cancelled orders with no retained fill must clear the pending claim"
+        );
+
+        let position = position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist after setup");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Cancelled must clear the position claim through CancelOffChainOrder"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Existing pending hedge finalized"),
+            "cancelled order reconciliation must report the finalized pending order, \
+             got: {output}"
         );
     }
 
@@ -2895,7 +3206,7 @@ mod tests {
             .expect("pending_offchain_order_id must be set after successful broker submission");
 
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build(noop_order_placer())
             .await
             .unwrap();
         let offchain_order = offchain_order_store

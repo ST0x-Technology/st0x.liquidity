@@ -87,6 +87,9 @@ impl HedgeLatencyProjection {
             PositionEvent::ManualPositionAdjusted { adjusted_at, .. } => {
                 self.manual_position_adjusted(&symbol, adjusted_at).await
             }
+            PositionEvent::OffChainOrderCancelled {
+                offchain_order_id, ..
+            } => self.offchain_order_cancelled(offchain_order_id).await,
         }
     }
 
@@ -276,6 +279,27 @@ impl HedgeLatencyProjection {
         Ok(())
     }
 
+    /// An intentionally cancelled hedge is neither a fill nor a failure, so it
+    /// must not linger as a never-resolved pending cycle nor count toward
+    /// failure-rate analytics. Drop the pending cycle row; a cycle that already
+    /// recorded a terminal outcome (fill/failure) is left untouched.
+    async fn offchain_order_cancelled(
+        &self,
+        offchain_order_id: OffchainOrderId,
+    ) -> Result<(), ProjectionError> {
+        let id_str = offchain_order_id.to_string();
+
+        sqlx::query(
+            "DELETE FROM hedge_cycle \
+             WHERE offchain_order_id = ? AND filled_at IS NULL AND failed_at IS NULL",
+        )
+        .bind(&id_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn on_offchain_order(
         &self,
         id: OffchainOrderId,
@@ -316,7 +340,9 @@ impl HedgeLatencyProjection {
             OffchainOrderEvent::Placed { .. }
             | OffchainOrderEvent::PartiallyFilled { .. }
             | OffchainOrderEvent::Filled { .. }
-            | OffchainOrderEvent::Failed { .. } => Ok(()),
+            | OffchainOrderEvent::Failed { .. }
+            | OffchainOrderEvent::CancelRequested { .. }
+            | OffchainOrderEvent::Cancelled { .. } => Ok(()),
         }
     }
 }

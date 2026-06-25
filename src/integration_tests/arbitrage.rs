@@ -206,7 +206,13 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 executed_at,
             } => {
                 offchain_order
-                    .send(&order_id, OffchainOrderCommand::CompleteFill { price })
+                    .send(
+                        &order_id,
+                        OffchainOrderCommand::CompleteFill {
+                            price,
+                            filled_at: executed_at,
+                        },
+                    )
                     .await?;
 
                 position
@@ -269,6 +275,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                         &order_id,
                         OffchainOrderCommand::MarkFailed {
                             error: error.clone(),
+                            failed_at,
                         },
                     )
                     .await?;
@@ -325,6 +332,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                         &order_id,
                         OffchainOrderCommand::MarkFailed {
                             error: error.clone(),
+                            failed_at: cancelled_at,
                         },
                     )
                     .await?;
@@ -398,6 +406,7 @@ async fn record_poll_partial_fill(
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled,
                     avg_price,
+                    partially_filled_at: broker_timestamp,
                 },
             )
             .await?;
@@ -887,7 +896,7 @@ async fn create_test_cqrs_with_assets(
 
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build(order_placer.clone())
             .await
             .unwrap();
 
