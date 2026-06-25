@@ -94,7 +94,7 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256};
+    use alloy::primitives::{Address, B256, TxHash, U256, b256};
     use serde_json::json;
     use st0x_event_sorcery::test_store;
     use st0x_float_macro::float;
@@ -147,7 +147,7 @@ mod tests {
             wrapper: wrapper.clone(),
         };
 
-        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let mint_store = Arc::new(test_store(pool.clone(), ()));
         let redemption_store = Arc::new(test_store(pool, transfer_services));
 
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
@@ -173,22 +173,33 @@ mod tests {
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
         // Drive mint to DepositedIntoRaindex (terminal) via command chain.
-        // MockTokenizer returns tokens immediately so Poll succeeds.
+        // RecordMintRequested lands in MintAccepted; RecordTokensReceived with a
+        // matching wrapped symbol drives MintAccepted -> TokensReceived.
         mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("resume-mint-terminal-req"),
                 },
             )
             .await
             .unwrap();
 
         mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -241,22 +252,32 @@ mod tests {
         let id = issuer_request_id("resume-mint-failed");
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
-        // Drive to Failed via RequestMint + Poll + FailWrapping.
+        // Drive to Failed via RecordMintRequested + RecordTokensReceived + FailWrapping.
         mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("resume-mint-failed-req"),
                 },
             )
             .await
             .unwrap();
 
         mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -375,16 +396,17 @@ mod tests {
         let id = issuer_request_id("resume-mint-interrupted");
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
-        // RequestMint emits MintRequested + MintAccepted (MockTokenizer accepts),
-        // leaving a non-terminal MintAccepted aggregate -- the interrupted state.
+        // RecordMintRequested emits MintRequested + MintAccepted, leaving a
+        // non-terminal MintAccepted aggregate -- the interrupted state.
         mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("resume-mint-interrupted-req"),
                 },
             )
             .await

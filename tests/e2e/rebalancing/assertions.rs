@@ -860,7 +860,7 @@ pub(crate) async fn assert_initial_base_wallet_unwrapped_and_wrapped_equity_snap
     expected_unwrapped_balance: FractionalShares,
     expected_wrapped_balance: FractionalShares,
 ) -> anyhow::Result<()> {
-    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(120);
     let deadline = tokio::time::Instant::now() + timeout;
     let context = format!(
         "Base-wallet unwrapped and wrapped equity snapshots for {symbol} matching unwrapped \

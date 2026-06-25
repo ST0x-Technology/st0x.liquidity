@@ -113,7 +113,7 @@ async fn build_equity_transfer_services(
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-        .build(services.clone())
+        .build(())
         .await?;
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -1403,8 +1403,6 @@ pub(crate) async fn fail_transfer_command<W: Write>(
     id: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let services = EquityTransferServices::panicking();
-
     match transfer_type {
         TransferType::Mint => {
             let mint_id: IssuerRequestId = id
@@ -1441,16 +1439,18 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 }
             };
 
-            st0x_event_sorcery::send_command::<TokenizedEquityMint>(
-                pool, &mint_id, command, services,
-            )
-            .await
-            .map_err(|error| stale_state_context("Mint", id, error))?;
+            st0x_event_sorcery::send_command::<TokenizedEquityMint>(pool, &mint_id, command, ())
+                .await
+                .map_err(|error| stale_state_context("Mint", id, error))?;
 
             writeln!(stdout, "Mint {id} marked as failed")?;
         }
 
         TransferType::Redemption => {
+            // Only the redemption aggregate still takes `EquityTransferServices`;
+            // its failure commands never invoke them, so the panicking stub is safe.
+            let services = EquityTransferServices::panicking();
+
             let redemption_id: RedemptionAggregateId = id
                 .parse()
                 .map_err(|error| anyhow::anyhow!("Invalid redemption ID: {error}"))?;
@@ -1540,8 +1540,6 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
     reason: String,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    let services = EquityTransferServices::panicking();
-
     match transfer_type {
         TransferType::Mint => {
             let mint_id: IssuerRequestId = id.parse().map_err(|error| {
@@ -1564,7 +1562,7 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 pool,
                 &mint_id,
                 TokenizedEquityMintCommand::Reconcile { reason },
-                services,
+                (),
             )
             .await?;
 
@@ -1572,6 +1570,10 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
         }
 
         TransferType::Redemption => {
+            // Only the redemption aggregate still takes `EquityTransferServices`;
+            // Reconcile never invokes them, so the panicking stub is safe.
+            let services = EquityTransferServices::panicking();
+
             let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
                 anyhow::anyhow!("transfer reconcile: invalid redemption id {id:?}: {error}")
             })?;
@@ -4172,21 +4174,22 @@ mod tests {
     }
 
     /// Drives a mint through the real command flow to its `Failed` terminal:
-    /// requested, then acceptance force-failed. (`redemption_services()` returns
-    /// the shared `EquityTransferServices`, used by both aggregate stores.)
+    /// requested, then acceptance force-failed. Uses `()` services because
+    /// `TokenizedEquityMint` performs no I/O in its handlers.
     async fn seed_mint_to_failed(pool: &SqlitePool, id: &IssuerRequestId) {
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(redemption_services())
+            .build(())
             .await
             .unwrap();
         store
             .send(
                 id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("test-req-id"),
                 },
             )
             .await
@@ -4208,7 +4211,7 @@ mod tests {
         command: TokenizedEquityMintCommand,
     ) {
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(redemption_services())
+            .build(())
             .await
             .unwrap();
         store.send(id, command).await.unwrap();
@@ -4242,11 +4245,12 @@ mod tests {
         send_mint_command(
             &pool,
             &id,
-            TokenizedEquityMintCommand::RequestMint {
+            TokenizedEquityMintCommand::RecordMintRequested {
                 issuer_request_id: id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
                 wallet: Address::ZERO,
+                tokenization_request_id: tokenization_request_id("test-req-id"),
             },
         )
         .await;

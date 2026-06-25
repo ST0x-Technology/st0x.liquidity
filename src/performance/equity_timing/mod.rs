@@ -993,13 +993,12 @@ impl From<StoredStageName> for EquityStageName {
 mod tests {
     use alloy::primitives::{Address, TxHash, U256};
     use chrono::TimeZone;
-    use std::sync::Arc;
     use uuid::Uuid;
 
     use st0x_dto::EquityOperationKind;
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_float_macro::float;
-    use st0x_tokenization::{TokenizationRequestId, issuer_request_id};
+    use st0x_tokenization::{TokenizationRequestId, issuer_request_id, tokenization_request_id};
 
     use super::*;
     use crate::equity_redemption::redemption_aggregate_id;
@@ -1230,24 +1229,20 @@ mod tests {
 
         // Seed events directly through a store with NO projection attached,
         // simulating history that accumulated before this projection existed.
-        // `RequestMint`'s `initialize()` calls `services.tokenizer.request_mint`,
-        // so the panicking stub's tokenizer is swapped for a working mock --
-        // mirrors `simulated_transfers.rs`'s `FixtureTokenizer` wiring pattern.
-        let mut services = crate::rebalancing::equity::EquityTransferServices::panicking();
-        services.tokenizer = Arc::new(st0x_tokenization::mock::MockTokenizer::new());
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(services)
+            .build(())
             .await
             .unwrap();
         let operation_id = issuer_request_id("catch-up-mint");
         mint_store
             .send(
                 &operation_id,
-                TokenizedEquityMintCommand::RequestMintAt {
+                TokenizedEquityMintCommand::RecordMintRequestedAt {
                     issuer_request_id: operation_id.clone(),
                     symbol: symbol(),
                     quantity: float!(5),
                     wallet: Address::repeat_byte(0x11),
+                    tokenization_request_id: tokenization_request_id("catch-up-mint-tok"),
                     requested_at: timestamp(0),
                 },
             )
@@ -1256,8 +1251,8 @@ mod tests {
 
         let projection = EquityTimingProjection::new(pool.clone());
         let replayed = projection.catch_up().await.unwrap();
-        // `RequestMintAt` against a mock tokenizer that returns `Pending` (not
-        // `Rejected`) persists both `MintRequested` and `MintAccepted`.
+        // `RecordMintRequestedAt` persists both `MintRequested` and
+        // `MintAccepted`.
         assert_eq!(
             replayed, 2,
             "catch_up must replay exactly the two pre-existing events"

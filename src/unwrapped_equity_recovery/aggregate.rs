@@ -932,10 +932,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
-        let mint_store = Arc::new(st0x_event_sorcery::test_store(
-            pool.clone(),
-            services.clone(),
-        ));
+        let mint_store = Arc::new(st0x_event_sorcery::test_store(pool.clone(), ()));
         let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
