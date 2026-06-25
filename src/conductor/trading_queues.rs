@@ -34,6 +34,7 @@ use crate::unwrapped_equity_recovery::{
 };
 use crate::wrapped_equity_recovery::{
     WrappedEquityRecovery, WrappedEquityRecoveryCtx, WrappedEquityRecoveryJobQueue,
+    WrappedEquityRecoveryServices,
 };
 
 /// Equity-recovery stores and related state passed to [`setup_trading_job_queues`].
@@ -41,6 +42,7 @@ use crate::wrapped_equity_recovery::{
 /// recovery contexts, keeping the function argument count within the lint limit.
 pub(super) struct EquityRecoveryInputs {
     pub(super) wrapped_store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    pub(super) wrapped_services: Option<WrappedEquityRecoveryServices>,
     pub(super) unwrapped_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
     pub(super) unwrapped_services: Option<UnwrappedEquityRecoveryServices>,
     pub(super) rebalancing_service: Option<Arc<RebalancingService>>,
@@ -78,6 +80,7 @@ pub(super) async fn setup_trading_job_queues(
 ) -> anyhow::Result<TradingJobQueues> {
     let EquityRecoveryInputs {
         wrapped_store: wrapped_equity_recovery_store,
+        wrapped_services: wrapped_equity_recovery_services,
         unwrapped_store: unwrapped_equity_recovery_store,
         unwrapped_services: unwrapped_equity_recovery_services,
         rebalancing_service,
@@ -108,6 +111,7 @@ pub(super) async fn setup_trading_job_queues(
 
     let wrapped_equity_recovery_ctx = build_wrapped_equity_recovery_ctx(
         wrapped_equity_recovery_store,
+        wrapped_equity_recovery_services,
         rebalancing_service.clone(),
         mint_store.clone(),
         redemption_store.clone(),

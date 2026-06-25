@@ -2633,15 +2633,13 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
     ));
-    let store = Arc::new(test_store(
-        pool.clone(),
-        WrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
-            transfer,
-        },
-    ));
+    let services = WrappedEquityRecoveryServices {
+        raindex,
+        vault_lookup,
+        wrapper,
+        transfer,
+    };
+    let store = Arc::new(test_store(pool.clone(), ()));
 
     let (sender, _receiver) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
@@ -2649,6 +2647,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let ctx = WrappedEquityRecoveryCtx {
         inventory,
         store: Arc::clone(&store),
+        services,
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
@@ -2739,15 +2738,13 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
     ));
-    let store = Arc::new(test_store(
-        pool.clone(),
-        WrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
-            transfer,
-        },
-    ));
+    let services = WrappedEquityRecoveryServices {
+        raindex,
+        vault_lookup,
+        wrapper,
+        transfer,
+    };
+    let store = Arc::new(test_store(pool.clone(), ()));
 
     // Inventory reports WRAPPED balance: the wrap landed, tokens are wtSTOCK
     // in the base wallet outside Raindex.
@@ -2768,6 +2765,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     let ctx = WrappedEquityRecoveryCtx {
         inventory,
         store: Arc::clone(&store),
+        services,
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
