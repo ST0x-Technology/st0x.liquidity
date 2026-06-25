@@ -125,6 +125,7 @@ decision.
 | [0010](0010-bounded-pending-ack-set-for-cross-process-exactly-once.md)  | Bounded pending-acknowledgement set for cross-process exactly-once                   | Accepted           |
 | [0011](0011-decouple-ingestion-latency-from-reorg-safety.md)            | Decouple fill-ingestion latency from reorg safety via first-class reorg handling     | Proposed           |
 | [0012](0012-exactly-once-reorg-accounting.md)                           | Exactly-once reorg accounting across the OnChainTrade/Position boundary              | Proposed           |
+| [0013](0013-equity-family-side-effect-extraction.md)                    | Extract the equity family's handler side effects into the existing durable-job orchestrators | Proposed           |
 | [0014](0014-runtime-stuck-pending-recovery-and-serialized-placement.md) | Recover stuck Pending placements at runtime, and serialize broker-placement attempts | Accepted           |
 | [0015](0015-reconstruct-pre-burn-usdc-inventory-on-resume.md)           | Reconstruct pre-burn Alpaca-to-Base USDC inventory before resume                     | Proposed           |
 | [0016](0016-independent-durable-inventory-source-jobs.md)               | Run inventory observations as independent durable source jobs                        | Accepted           |
