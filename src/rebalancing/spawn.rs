@@ -171,6 +171,7 @@ mod tests {
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::usdc::UsdcSettlementParams;
     use crate::telemetry::TelemetrySender;
+    use crate::test_utils::spawn_anvil;
 
     #[test]
     fn to_wrapped_equities_maps_underlying_and_derivative() {
@@ -271,7 +272,7 @@ mod tests {
         RebalancerServices<RawPrivateKeyWallet<BaseProvider>>,
         RebalancingCtx,
     ) {
-        let anvil = Anvil::new().spawn();
+        let anvil = spawn_anvil(Anvil::new());
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let rebalancing_ctx = make_ctx();

@@ -1018,7 +1018,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::network::TransactionBuilder;
-    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{Address, B256, address, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use httpmock::MockServer;
@@ -1032,6 +1032,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
+    use crate::test_utils::{TestAnvilInstance, spawn_anvil};
     use crate::tokenized_equity_mint::issuer_request_id;
     use st0x_float_macro::float;
 
@@ -1049,8 +1050,8 @@ pub(crate) mod tests {
         format!("/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests")
     }
 
-    pub(crate) fn setup_anvil() -> (AnvilInstance, String, B256) {
-        let anvil = Anvil::new().spawn();
+    pub(crate) fn setup_anvil() -> (TestAnvilInstance, String, B256) {
+        let anvil = spawn_anvil(Anvil::new());
         let endpoint = anvil.endpoint();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         (anvil, endpoint, private_key)

@@ -8,7 +8,6 @@
 //! is exercised end-to-end.
 
 use alloy::network::EthereumWallet;
-use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -50,7 +49,7 @@ use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
-use crate::test_utils::{deploy_tofu_singleton, setup_test_pools};
+use crate::test_utils::{TestAnvilInstance, deploy_tofu_singleton, setup_test_pools};
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -233,7 +232,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
 
 /// Holds a deployed Rain OrderBook on a local Anvil node, ready to create real take-order events.
 struct AnvilOrderBook<P> {
-    _anvil: AnvilInstance,
+    _anvil: TestAnvilInstance,
     provider: P,
     orderbook_addr: Address,
     deployer_addr: Address,
