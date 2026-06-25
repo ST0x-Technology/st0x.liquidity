@@ -11,6 +11,7 @@
 
 mod job;
 mod resume_job;
+mod step;
 
 #[cfg(test)]
 pub(crate) use job::{
@@ -55,9 +56,7 @@ use super::trigger::freeze::FreezeStatusReader;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
-use crate::tokenized_equity_mint::{
-    TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
-};
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 use crate::vault_lookup::{VaultLookup, VaultLookupError};
 
 /// Data extracted from the TokensReceived aggregate state for
@@ -488,6 +487,16 @@ impl From<SendError<TokenizedEquityMint>> for MintError {
     }
 }
 
+impl From<step::EquityVaultStepError> for MintError {
+    fn from(error: step::EquityVaultStepError) -> Self {
+        match error {
+            step::EquityVaultStepError::Wrapper(error) => Self::Wrapper(error),
+            step::EquityVaultStepError::Raindex(error) => Self::Raindex(error),
+            step::EquityVaultStepError::VaultLookup(error) => Self::VaultLookup(error),
+        }
+    }
+}
+
 /// Distinguishes mint failures before vs after tokens were received from
 /// Alpaca. Post-receipt failures must NOT clear the in-progress guard
 /// because real tokens exist in the wallet and startup recovery will
@@ -704,17 +713,13 @@ impl CrossVenueEquityTransfer {
         wrapped_token: Address,
         wrapped_shares: U256,
     ) -> Result<(), MintError> {
-        let vault_id = self.vault_lookup.vault_id_for_token(wrapped_token).await?;
-
-        let vault_deposit_tx_hash = self
-            .raindex
-            .submit_deposit(
-                wrapped_token,
-                vault_id,
-                wrapped_shares,
-                TOKENIZED_EQUITY_DECIMALS,
-            )
-            .await?;
+        let vault_deposit_tx_hash = step::submit_vault_deposit(
+            self.vault_lookup.as_ref(),
+            self.raindex.as_ref(),
+            wrapped_token,
+            wrapped_shares,
+        )
+        .await?;
 
         self.mint_store
             .send(
@@ -830,12 +835,16 @@ impl CrossVenueEquityTransfer {
     ) -> Result<WrappedMintResult, MintError> {
         info!(target: "rebalance", "Onchain verification passed, wrapping into ERC-4626 shares");
 
-        let token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
-
-        let wrap_tx_hash = self
-            .wrapper
-            .submit_wrap(token, tokens_received.shares_minted, self.wallet)
-            .await?;
+        let step::SubmittedWrap {
+            wrapped_token: token,
+            wrap_tx_hash,
+        } = step::submit_wrap(
+            self.wrapper.as_ref(),
+            &tokens_received.symbol,
+            tokens_received.shares_minted,
+            self.wallet,
+        )
+        .await?;
 
         self.mint_store
             .send(
