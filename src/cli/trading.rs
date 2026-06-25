@@ -51,7 +51,30 @@ impl OrderPlacer for CliOrderPlacer {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            is_extended_hours: placement.extended_hours,
+            limit_price: placement.limit_price,
         })
+    }
+
+    async fn place_limit_order(
+        &self,
+        _order: st0x_execution::LimitOrder,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support automated limit order placement".into())
+    }
+
+    async fn cancel_order(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support order cancellation".into())
+    }
+
+    async fn get_order_status(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<OrderState, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support reading order status via OrderPlacer".into())
     }
 }
 
@@ -154,13 +177,19 @@ pub(super) async fn order_status_command<W: Write>(
                 "   The order has been submitted and is waiting to be filled."
             )?;
         }
-        OrderState::PartiallyFilled { order_id, .. } => {
-            writeln!(stdout, "⏳ Order Status: PARTIALLY FILLED")?;
+        OrderState::PartiallyFilled {
+            order_id,
+            shares_filled,
+            avg_price,
+            partially_filled_at,
+        } => {
+            writeln!(stdout, "🟡 Order Status: PARTIALLY FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
-        }
-        OrderState::Cancelled { order_id, .. } => {
-            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
-            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Partially Filled At: {partially_filled_at}")?;
+            writeln!(stdout, "   Shares Filled: {shares_filled}")?;
+            if let Some(price) = avg_price {
+                writeln!(stdout, "   Avg Fill Price: ${price}")?;
+            }
         }
         OrderState::Filled {
             executed_at,
@@ -170,21 +199,40 @@ pub(super) async fn order_status_command<W: Write>(
             writeln!(stdout, "✅ Order Status: FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
-            writeln!(
-                stdout,
-                "   Fill Price: ${}",
-                format_float_with_fallback(&price.into())
-            )?;
+            writeln!(stdout, "   Fill Price: ${price}")?;
+        }
+        OrderState::Cancelled {
+            cancelled_at,
+            order_id,
+            shares_filled,
+            avg_price,
+        } => {
+            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Cancelled At: {cancelled_at}")?;
+            if let Some(shares_filled) = shares_filled {
+                writeln!(stdout, "   Shares Filled: {shares_filled}")?;
+            }
+            if let Some(avg_price) = avg_price {
+                writeln!(stdout, "   Avg Fill Price: ${avg_price}")?;
+            }
         }
         OrderState::Failed {
             failed_at,
             error_reason,
-            ..
+            shares_filled,
+            avg_price,
         } => {
             writeln!(stdout, "❌ Order Status: FAILED")?;
             writeln!(stdout, "   Failed At: {failed_at}")?;
             if let Some(reason) = error_reason {
                 writeln!(stdout, "   Reason: {reason}")?;
+            }
+            if let Some(shares_filled) = shares_filled {
+                writeln!(stdout, "   Shares Filled: {shares_filled}")?;
+            }
+            if let Some(avg_price) = avg_price {
+                writeln!(stdout, "   Avg Fill Price: ${avg_price}")?;
             }
         }
     }
@@ -510,12 +558,9 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
             OrderState::Failed { error_reason, .. } => {
                 anyhow::bail!("buy order failed: {error_reason:?}");
             }
-            OrderState::Cancelled { .. } => {
-                anyhow::bail!("buy order was cancelled by the broker");
-            }
-            OrderState::PartiallyFilled { .. }
-            | OrderState::Pending
-            | OrderState::Submitted { .. } => {
+            OrderState::Pending
+            | OrderState::Submitted { .. }
+            | OrderState::PartiallyFilled { .. } => {
                 if attempt % 10 == 0 {
                     writeln!(
                         stdout,
@@ -523,6 +568,9 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
                     )?;
                 }
                 tokio::time::sleep(BUY_FILL_POLL_INTERVAL).await;
+            }
+            OrderState::Cancelled { .. } => {
+                anyhow::bail!("buy order was cancelled before filling");
             }
         }
     }
@@ -629,6 +677,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 direction: params.direction,
                 executor: params.executor,
                 client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
             },
         )
         .await
@@ -966,11 +1015,25 @@ mod tests {
         });
 
         let order_mock = server.mock(|when, then| {
-            // Match on method + path only: the request body now carries a
-            // generated `client_order_id`, and the field-level body shape is
-            // verified by the execution crate's own order tests.
             when.method(httpmock::Method::POST)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                // CLI limit orders now carry a fresh `cli-{uuid}` client_order_id
+                // (added for broker-side idempotency), so match the static fields
+                // partially and assert the key is a well-formed CLI idempotency
+                // key rather than pinning its random value.
+                .body_matches(client_order_id_cli_pattern())
+                .json_body_includes(
+                    json!({
+                        "symbol": "AAPL",
+                        "qty": "10",
+                        "side": "buy",
+                        "type": "limit",
+                        "limit_price": "195.25",
+                        "time_in_force": "day",
+                        "extended_hours": true
+                    })
+                    .to_string(),
+                );
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -984,6 +1047,15 @@ mod tests {
         });
 
         (account_mock, asset_mock, order_mock)
+    }
+
+    /// Regex asserting a request body carries a well-formed `cli-{uuid}`
+    /// `client_order_id`, shared by the market- and limit-order mocks.
+    fn client_order_id_cli_pattern() -> Regex {
+        Regex::new(
+            r#""client_order_id":"cli-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""#,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

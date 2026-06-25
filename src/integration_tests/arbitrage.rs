@@ -176,7 +176,13 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 executed_at,
             } => {
                 offchain_order
-                    .send(&order_id, OffchainOrderCommand::CompleteFill { price })
+                    .send(
+                        &order_id,
+                        OffchainOrderCommand::CompleteFill {
+                            price,
+                            filled_at: executed_at,
+                        },
+                    )
                     .await?;
 
                 position
@@ -194,7 +200,11 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                     .await?;
             }
 
-            Failed { error_reason, .. } => {
+            Failed {
+                error_reason,
+                failed_at,
+                ..
+            } => {
                 let error =
                     error_reason.unwrap_or_else(|| "Order failed with no error reason".to_string());
 
@@ -203,6 +213,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                         &order_id,
                         OffchainOrderCommand::MarkFailed {
                             error: error.clone(),
+                            failed_at,
                         },
                     )
                     .await?;

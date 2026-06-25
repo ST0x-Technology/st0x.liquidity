@@ -139,7 +139,9 @@ impl Reactor for Broadcaster {
                     Placed { .. }
                     | Submitted { .. }
                     | PartiallyFilled { .. }
-                    | Failed { .. } => {}
+                    | CancelRequested { .. }
+                    | Failed { .. }
+                    | Cancelled { .. } => {}
                 }
             })
 
@@ -266,6 +268,7 @@ mod tests {
                     direction: st0x_execution::Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -275,6 +278,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::CompleteFill {
                     price: st0x_finance::Usd::new(st0x_float_macro::float!(245)),
+                    filled_at: now,
                 },
             )
             .await

@@ -62,9 +62,11 @@ async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
     pending_id: OffchainOrderId,
 ) -> Result<(), TradeAccountingError> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
     match ctx.offchain_order.load(&pending_id).await? {
-        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+        Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             ctx.poll_status_queue
                 .clone()
                 .push(PollOrderStatus {
@@ -73,7 +75,7 @@ async fn recover_pending_poll_status(
                 .await?;
             Ok(())
         }
-        Some(Pending { .. } | Filled { .. } | Failed { .. }) | None => Ok(()),
+        Some(Pending { .. } | Filled { .. } | Failed { .. } | Cancelled { .. }) | None => Ok(()),
     }
 }
 
@@ -174,11 +176,16 @@ impl Job<HedgeCtx> for PlaceHedge {
                     direction: self.direction,
                     executor: self.executor,
                     client_order_id,
+                    // Regular-hours market order; session-aware order-kind
+                    // selection is added with the cancel-and-replace wiring.
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await?;
 
-        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+        use OffchainOrder::{
+            Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+        };
         match ctx.offchain_order.load(&self.offchain_order_id).await? {
             Some(Failed { error, .. }) => {
                 ctx.position
@@ -192,7 +199,7 @@ impl Job<HedgeCtx> for PlaceHedge {
                     .await?;
             }
 
-            Some(Submitted { .. } | PartiallyFilled { .. }) => {
+            Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
                 let mut queue = ctx.poll_status_queue.clone();
 
                 queue
@@ -202,7 +209,7 @@ impl Job<HedgeCtx> for PlaceHedge {
                     .await?;
             }
 
-            Some(Filled { .. } | Pending { .. }) | None => {}
+            Some(Filled { .. } | Pending { .. } | Cancelled { .. }) | None => {}
         }
 
         Ok(())
@@ -257,7 +264,30 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-order-123"),
                     placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
                 })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-limit-order-123"),
+                    placed_shares: order.shares,
+                    is_extended_hours: order.extended_hours,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
@@ -277,6 +307,24 @@ mod tests {
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Err("Broker rejected: insufficient buying power".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<
+                crate::offchain::order::OrderPlacementResult,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err("Broker rejected: insufficient buying power".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
