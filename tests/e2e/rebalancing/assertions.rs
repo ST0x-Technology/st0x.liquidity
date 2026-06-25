@@ -663,8 +663,8 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     let redeem_events = fetch_events_by_type(pool, "EquityRedemption").await?;
     assert_eq!(
         redeem_events.len(),
-        10,
-        "Expected exactly 10 EquityRedemption success events",
+        11,
+        "Expected exactly 11 EquityRedemption success events",
     );
     assert_event_subsequence(
         &redeem_events,
@@ -676,6 +676,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
             "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
             "EquityRedemptionEvent::SendPending",
+            "EquityRedemptionEvent::SendSubmitted",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::Completed",

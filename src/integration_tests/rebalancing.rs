@@ -47,7 +47,7 @@ use super::{
 use crate::bindings::TestERC20;
 use crate::conductor::job::Job;
 use crate::equity_redemption::{
-    EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
+    EquityRedemption, EquityRedemptionCommand, SendOutcome, redemption_aggregate_id,
 };
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
@@ -55,7 +55,7 @@ use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, TransferEquityToHedging,
+    CrossVenueEquityTransfer, MintTransferError, TransferEquityToHedging,
     TransferEquityToHedgingCtx, TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobError,
 };
@@ -463,17 +463,8 @@ fn build_equity_transfer_with_wrapper(
 ) -> Arc<CrossVenueEquityTransfer> {
     let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
-    let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
-    };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(
-        pool.clone(),
-        equity_services,
-    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
         vault_lookup,
@@ -500,13 +491,6 @@ async fn build_equity_transfer_with_service(
 ) -> Arc<CrossVenueEquityTransfer> {
     let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
-    let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
-    };
-
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::clone(service))
         .build(())
@@ -515,7 +499,7 @@ async fn build_equity_transfer_with_service(
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
         .with(Arc::clone(service))
-        .build(equity_services)
+        .build(())
         .await
         .unwrap();
 
@@ -1015,6 +999,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "EquityRedemption",
                 &redemption_agg_id,
+                "EquityRedemptionEvent::SendSubmitted",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
                 "EquityRedemptionEvent::TokensSent",
             ),
             ExpectedEvent::new(
@@ -1039,14 +1028,21 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         "VaultWithdrawPending should target the correct symbol"
     );
     assert_eq!(
-        events[15].payload["TokensSent"]["redemption_tx"]
+        events[15].payload["SendSubmitted"]["redemption_tx"]
+            .as_str()
+            .unwrap(),
+        format!("{expected_tx_hash:#x}"),
+        "SendSubmitted should record the broadcast redemption_tx before finalizing"
+    );
+    assert_eq!(
+        events[16].payload["TokensSent"]["redemption_tx"]
             .as_str()
             .unwrap(),
         format!("{expected_tx_hash:#x}"),
         "TokensSent redemption_tx should match the deterministic Anvil hash"
     );
     assert_eq!(
-        events[16].payload["Detected"]["tokenization_request_id"]
+        events[17].payload["Detected"]["tokenization_request_id"]
             .as_str()
             .unwrap(),
         "redeem_int_test",
@@ -2481,18 +2477,9 @@ async fn transfer_failed_cancels_redemption_inflight() {
     seed_vault_registry(&pool, &symbol, token_address).await;
 
     // Build a redemption store wired to the trigger so events flow through
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new().with_send_failure());
-
-    let equity_services = EquityTransferServices {
-        raindex: Arc::new(MockRaindex::new()),
-        vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
-        tokenizer,
-        wrapper: Arc::new(MockWrapper::new()),
-    };
-
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
         .with(Arc::clone(&service))
-        .build(equity_services)
+        .build(())
         .await
         .unwrap();
 
@@ -2524,12 +2511,23 @@ async fn transfer_failed_cancels_redemption_inflight() {
     );
 
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::SubmitWithdraw)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::SubmitWithdraw {
+                tx_hash: TxHash::random(),
+            },
+        )
         .await
         .unwrap();
 
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::ConfirmWithdraw)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::ConfirmWithdraw {
+                actual_wrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
+                raindex_withdraw_block: 100,
+            },
+        )
         .await
         .unwrap();
 
@@ -2541,12 +2539,24 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .unwrap();
 
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::SubmitUnwrap)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::SubmitUnwrap {
+                unwrap_tx_hash: TxHash::random(),
+            },
+        )
         .await
         .unwrap();
 
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::ConfirmUnwrap)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::ConfirmUnwrap {
+                underlying_token: token_address,
+                unwrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
+                unwrap_block: 101,
+            },
+        )
         .await
         .unwrap();
 
@@ -2556,10 +2566,15 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .await
         .unwrap();
 
-    // SendTokens: mock tokenizer fails -> TransferFailed event
-    // The aggregate emits TransferFailed, trigger cancels inflight
+    // A failed send (what the orchestrator records when send_for_redemption
+    // reverts) emits TransferFailed; the trigger must cancel inflight.
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::SendTokens)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::RecordSendOutcome {
+                outcome: SendOutcome::SendFailed,
+            },
+        )
         .await
         .unwrap();
 
@@ -2607,17 +2622,8 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
-    };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(
-        pool.clone(),
-        equity_services,
-    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -2722,17 +2728,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
-    };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(
-        pool.clone(),
-        equity_services,
-    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -2856,17 +2853,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
-    };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(
-        pool.clone(),
-        equity_services,
-    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -2982,17 +2970,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
-    };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(
-        pool.clone(),
-        equity_services,
-    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
