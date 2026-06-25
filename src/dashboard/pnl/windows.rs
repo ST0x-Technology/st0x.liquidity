@@ -1,0 +1,108 @@
+use std::collections::{BTreeSet, HashMap};
+
+use num_decimal::Num;
+
+use super::parsing::{fmt_decimal, parse_decimal_lossy};
+use super::response::{PnlEntry, PnlWindow, PnlWindowSymbol};
+use super::sessions::{counter_trading_session_for_iso, date_key, market_session_for_iso};
+
+fn entry_bucket_to_stream(bucket: &str) -> Option<&'static str> {
+    match bucket {
+        "counter_trade" => Some("counterTradePnlUsd"),
+        "onchain_netting" => Some("onchainNettingPnlUsd"),
+        "directional_exposure" => Some("directionalImbalanceExcessPnlUsd"),
+        _ => None,
+    }
+}
+
+pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<PnlWindow> {
+    let mut by_date: HashMap<String, Vec<&PnlEntry>> = HashMap::new();
+    for entry in entries {
+        by_date
+            .entry(date_key(&entry.closed_at).to_owned())
+            .or_default()
+            .push(entry);
+    }
+
+    let mut dates: Vec<_> = by_date.into_iter().collect();
+    dates.sort_by(|(left, _), (right, _)| left.cmp(right));
+    dates
+        .into_iter()
+        .map(|(date, day_entries)| {
+            let market_sessions: BTreeSet<_> = day_entries
+                .iter()
+                .map(|entry| market_session_for_iso(&entry.closed_at))
+                .collect();
+            let counter_sessions: BTreeSet<_> = day_entries
+                .iter()
+                .map(|entry| counter_trading_session_for_iso(&entry.closed_at))
+                .collect();
+            let market_session = if market_sessions.len() == 1 {
+                market_sessions
+                    .iter()
+                    .next()
+                    .map_or("mixed".to_owned(), |session| (*session).to_owned())
+            } else {
+                "mixed".to_owned()
+            };
+            let counter_trading_session = if counter_sessions.len() == 1 {
+                counter_sessions
+                    .iter()
+                    .next()
+                    .map_or("mixed".to_owned(), |session| (*session).to_owned())
+            } else {
+                "mixed".to_owned()
+            };
+
+            let rows = symbols
+                .iter()
+                .map(|symbol| window_symbol_row(symbol, &day_entries))
+                .collect();
+
+            PnlWindow {
+                window_id: date.clone(),
+                start_at: format!("{date}T00:00:00.000Z"),
+                end_at: format!("{date}T23:59:59.999Z"),
+                label: date.clone(),
+                is_weekend: market_session_for_iso(&format!("{date}T00:00:00.000Z")) == "weekend",
+                market_session,
+                counter_trading_session,
+                granularity: "day",
+                symbols: rows,
+            }
+        })
+        .collect()
+}
+
+fn window_symbol_row(symbol: &str, entries: &[&PnlEntry]) -> PnlWindowSymbol {
+    let mut counter_trade = Num::default();
+    let mut onchain_netting = Num::default();
+    let directional_baseline = Num::default();
+    let mut directional_excess = Num::default();
+
+    for entry in entries {
+        if entry.symbol != symbol {
+            continue;
+        }
+        let pnl = parse_decimal_lossy(&entry.realized_pnl_usd);
+        match entry_bucket_to_stream(entry.pnl_bucket) {
+            Some("counterTradePnlUsd") => counter_trade += &pnl,
+            Some("onchainNettingPnlUsd") => onchain_netting += &pnl,
+            Some("directionalImbalanceExcessPnlUsd") => directional_excess += &pnl,
+            _ => {}
+        }
+    }
+
+    let directional_exposure = &directional_baseline + &directional_excess;
+    let total =
+        &(&(&counter_trade + &onchain_netting) + &directional_baseline) + &directional_excess;
+    PnlWindowSymbol {
+        symbol: symbol.to_owned(),
+        counter_trade_pnl_usd: fmt_decimal(&counter_trade),
+        onchain_netting_pnl_usd: fmt_decimal(&onchain_netting),
+        directional_inventory_baseline_pnl_usd: fmt_decimal(&directional_baseline),
+        directional_imbalance_excess_pnl_usd: fmt_decimal(&directional_excess),
+        directional_exposure_pnl_usd: fmt_decimal(&directional_exposure),
+        total_pnl_usd: fmt_decimal(&total),
+    }
+}
