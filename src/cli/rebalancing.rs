@@ -27,7 +27,7 @@ use crate::api::ResumeResponse;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::equity::CrossVenueEquityTransfer;
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
 use crate::telemetry::TelemetrySender;
@@ -98,19 +98,12 @@ async fn build_equity_transfer_services(
 
     let raindex = Arc::new(RaindexService::new(base_caller, ctx.evm.orderbook, wallet));
 
-    let services = EquityTransferServices {
-        raindex: raindex.clone(),
-        vault_lookup: vault_lookup.clone(),
-        tokenizer: tokenization_service.clone(),
-        wrapper: wrapper.clone(),
-    };
-
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .build(())
         .await?;
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .build(services.clone())
+        .build(())
         .await?;
 
     let transfer = CrossVenueEquityTransfer::new(
@@ -1326,10 +1319,6 @@ pub(crate) async fn fail_transfer_command<W: Write>(
         }
 
         TransferType::Redemption => {
-            // Only the redemption aggregate still takes `EquityTransferServices`;
-            // its failure commands never invoke them, so the panicking stub is safe.
-            let services = EquityTransferServices::panicking();
-
             let redemption_id: RedemptionAggregateId = id
                 .parse()
                 .map_err(|error| anyhow::anyhow!("Invalid redemption ID: {error}"))?;
@@ -1350,6 +1339,16 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 | SendPending { .. } => FailTransfer {
                     reason: reason.to_string(),
                 },
+                // The redemption transfer was broadcast and is finalizing to
+                // `TokensSent` (a pure, resume-driven step). Failing it here would
+                // mis-record a broadcast transfer as never-sent; let it finalize,
+                // then fail from `TokensSent` if detection never fires.
+                SendSubmitted { .. } => {
+                    anyhow::bail!(
+                        "Redemption {id} is mid-send (transfer broadcast, finalizing); \
+                         re-run once it reaches TokensSent"
+                    );
+                }
                 // Tokens reached Alpaca's redemption wallet but detection never
                 // fired: force the detection-failure terminal (DetectionFailed
                 // -> Failed), persisting the operator's reason on the event.
@@ -1374,14 +1373,9 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 }
             };
 
-            st0x_event_sorcery::send_command::<EquityRedemption>(
-                pool,
-                &redemption_id,
-                command,
-                services,
-            )
-            .await
-            .map_err(|error| stale_state_context("Redemption", id, error))?;
+            st0x_event_sorcery::send_command::<EquityRedemption>(pool, &redemption_id, command, ())
+                .await
+                .map_err(|error| stale_state_context("Redemption", id, error))?;
 
             writeln!(
                 stdout,
@@ -1449,10 +1443,6 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
         }
 
         TransferType::Redemption => {
-            // Only the redemption aggregate still takes `EquityTransferServices`;
-            // Reconcile never invokes them, so the panicking stub is safe.
-            let services = EquityTransferServices::panicking();
-
             let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
                 anyhow::anyhow!("transfer reconcile: invalid redemption id {id:?}: {error}")
             })?;
@@ -1473,7 +1463,7 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 pool,
                 &redemption_id,
                 EquityRedemptionCommand::Reconcile { reason },
-                services,
+                (),
             )
             .await?;
 
@@ -1608,7 +1598,7 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address, b256};
+    use alloy::primitives::{Address, TxHash, address, b256};
     use alloy::providers::ProviderBuilder;
     use rain_math_float::Float;
     use url::Url;
@@ -1628,17 +1618,13 @@ mod tests {
     };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
-    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::mock::MockRaindex;
     use crate::test_utils::setup_test_db;
-    use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
-    use crate::vault_lookup::MockVaultLookup;
 
     /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
     /// after an attestation timeout and drive through to success -- so a single
@@ -3595,17 +3581,6 @@ mod tests {
         );
     }
 
-    fn redemption_services() -> EquityTransferServices {
-        EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(
-                MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)),
-            ),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        }
-    }
-
     /// Drives a redemption through the real CQRS command flow until the vault
     /// withdrawal is confirmed (`WithdrawnFromRaindex`) -- stuck before the
     /// tokens leave the bot's custody.
@@ -3613,7 +3588,7 @@ mod tests {
         use EquityRedemptionCommand::*;
 
         let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(redemption_services())
+            .build(())
             .await
             .unwrap();
 
@@ -3629,8 +3604,25 @@ mod tests {
             )
             .await
             .unwrap();
-        store.send(id, SubmitWithdraw).await.unwrap();
-        store.send(id, ConfirmWithdraw).await.unwrap();
+        store
+            .send(
+                id,
+                SubmitWithdraw {
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                ConfirmWithdraw {
+                    actual_wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+                    raindex_withdraw_block: 1,
+                },
+            )
+            .await
+            .unwrap();
     }
 
     /// Continues the real CQRS command flow until the redemption is stuck in
@@ -3642,18 +3634,43 @@ mod tests {
         seed_redemption_to_withdrawn(pool, id).await;
 
         let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(redemption_services())
+            .build(())
             .await
             .unwrap();
-        for command in [
-            UnwrapTokens,
-            SubmitUnwrap,
-            ConfirmUnwrap,
-            PrepareSend,
-            SendTokens,
-        ] {
-            store.send(id, command).await.unwrap();
-        }
+        store.send(id, UnwrapTokens).await.unwrap();
+        store
+            .send(
+                id,
+                SubmitUnwrap {
+                    unwrap_tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                ConfirmUnwrap {
+                    underlying_token: Address::random(),
+                    unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+                    unwrap_block: 2,
+                },
+            )
+            .await
+            .unwrap();
+        store.send(id, PrepareSend).await.unwrap();
+        store
+            .send(
+                id,
+                RecordSendOutcome {
+                    outcome: crate::equity_redemption::SendOutcome::Sent {
+                        redemption_wallet: Address::random(),
+                        redemption_tx: TxHash::random(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
     }
 
     async fn send_redemption_command(
@@ -3662,7 +3679,7 @@ mod tests {
         command: EquityRedemptionCommand,
     ) {
         let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(redemption_services())
+            .build(())
             .await
             .unwrap();
         store.send(id, command).await.unwrap();

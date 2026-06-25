@@ -108,6 +108,8 @@ pub(crate) struct MockTokenizer {
     call_count: AtomicUsize,
     /// Number of `request_mint` calls made (the provider-side mint requests).
     request_mint_count: AtomicUsize,
+    /// Number of `send_for_redemption` calls made.
+    redemption_send_count: AtomicUsize,
     pending_requests: Vec<TokenizationRequest>,
     /// Override the token_symbol in completed mint responses.
     token_symbol_behavior: MockTokenSymbolBehavior,
@@ -132,6 +134,7 @@ impl MockTokenizer {
             last_issuer_request_id: Mutex::new(None),
             call_count: AtomicUsize::new(0),
             request_mint_count: AtomicUsize::new(0),
+            redemption_send_count: AtomicUsize::new(0),
             token_symbol_behavior: MockTokenSymbolBehavior::Default,
             fees_override: None,
             pending_requests: Vec::new(),
@@ -146,6 +149,13 @@ impl MockTokenizer {
     /// Returns how many times `request_mint` was called since construction.
     pub(crate) fn request_mint_count(&self) -> usize {
         self.request_mint_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of `send_for_redemption` calls made. Lets a test
+    /// assert that a step short-circuited (e.g. on a failed `wait_for_block`)
+    /// before sending tokens to Alpaca.
+    pub(crate) fn redemption_send_count(&self) -> usize {
+        self.redemption_send_count.load(Ordering::Relaxed)
     }
 
     pub(crate) fn with_mint_request_outcome(mut self, outcome: MockMintRequestOutcome) -> Self {
@@ -327,6 +337,7 @@ impl Tokenizer for MockTokenizer {
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_count.fetch_add(1, Ordering::Relaxed);
         match self.send_outcome {
             MockSendOutcome::ApiError => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {

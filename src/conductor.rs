@@ -75,9 +75,9 @@ use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::{Position, PositionCommand, PositionError, TradeId};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
-    ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
-    TransferEquityToHedgingCtx, TransferEquityToMarketMakingCtx,
+    CrossVenueEquityTransfer, ResumeTokenizationAggregate, ResumeTokenizationCtx,
+    ResumeTokenizationJobQueue, ResumeTokenizationTarget, TransferEquityToHedgingCtx,
+    TransferEquityToMarketMakingCtx,
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{
@@ -1303,13 +1303,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             to_wrapped_equities(&deps.ctx.assets.equities.symbols),
         ));
 
-        let equity_transfer_services = EquityTransferServices {
-            raindex: raindex_service.clone(),
-            vault_lookup: vault_lookup.clone(),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
-        };
-
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
@@ -1361,9 +1354,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             lifecycle_failure,
         );
 
-        let built = manifest
-            .build(deps.pool.clone(), equity_transfer_services)
-            .await?;
+        let built = manifest.build(deps.pool.clone()).await?;
 
         rebalancing_service
             .recover_pending_offchain_order_symbols(&built.position_projection)
@@ -3134,8 +3125,7 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
-    use st0x_raindex::Raindex;
-    use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
+    use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped};
 
     use super::*;
     use crate::bindings::IRaindexV6::{
@@ -3146,11 +3136,10 @@ mod tests {
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain::order::OrderPlacementResult;
-    use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::equity::{
-        EquityTransferServices, ResumeTokenizationAggregate, ResumeTokenizationJobQueue,
-        ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToMarketMaking,
+        ResumeTokenizationAggregate, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
+        TransferEquityToHedging, TransferEquityToMarketMaking,
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
@@ -3165,7 +3154,6 @@ mod tests {
     use crate::trading::onchain::trade_accountant::AccountForDexTrade;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
-    use crate::vault_lookup::MockVaultLookup;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
@@ -3266,7 +3254,6 @@ mod tests {
     struct InterruptedAggregateFixture {
         pool: sqlx::SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
-        services: crate::rebalancing::equity::EquityTransferServices,
         mint_id: crate::tokenized_equity_mint::IssuerRequestId,
         redemption_id: crate::equity_redemption::RedemptionAggregateId,
         tokenizer: Arc<crate::tokenization::mock::MockTokenizer>,
@@ -3290,22 +3277,10 @@ mod tests {
         let mint_id = issuer_request_id(mint_label);
         let redemption_id = redemption_aggregate_id(redemption_label);
 
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
-        let services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
-        };
-
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let seeding_redemption_store = Arc::new(test_store::<EquityRedemption>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let seeding_redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
 
         seeding_mint_store
             .send(
@@ -3369,7 +3344,6 @@ mod tests {
         InterruptedAggregateFixture {
             pool,
             apalis_pool,
-            services,
             mint_id,
             redemption_id,
             tokenizer,
@@ -3391,7 +3365,6 @@ mod tests {
         let InterruptedAggregateFixture {
             pool,
             apalis_pool,
-            services,
             mint_id,
             redemption_id,
             tokenizer,
@@ -3409,10 +3382,7 @@ mod tests {
         // not invoke tokenizer methods. Use the same services for the function
         // call -- MockTokenizer methods are never called during load().
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store::<EquityRedemption>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
         let calls_before = tokenizer.call_count();
 
         // Must complete in under 1 second: no issuer poll blocking.
@@ -3483,7 +3453,6 @@ mod tests {
         let InterruptedAggregateFixture {
             pool,
             apalis_pool,
-            services,
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
@@ -3503,10 +3472,7 @@ mod tests {
             &rebalancing_service,
             inventory.as_ref(),
             Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
             &mut resume_queue,
         )
         .await
@@ -3524,10 +3490,7 @@ mod tests {
             &rebalancing_service,
             inventory.as_ref(),
             Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
             &mut resume_queue,
         )
         .await
@@ -3551,7 +3514,6 @@ mod tests {
         let InterruptedAggregateFixture {
             pool,
             apalis_pool,
-            services,
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
@@ -3571,10 +3533,7 @@ mod tests {
             &rebalancing_service,
             inventory.as_ref(),
             Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
             &mut resume_queue,
         )
         .await
@@ -3596,10 +3555,7 @@ mod tests {
             &rebalancing_service,
             inventory.as_ref(),
             Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
             &mut resume_queue,
         )
         .await
@@ -3650,16 +3606,6 @@ mod tests {
         // is_pre_wrap_held_for_recovery blocks the resume push.
         let (pool, apalis_pool) = setup_test_pools().await;
         let mint_id = issuer_request_id("pre-wrap-held-mint");
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let tokenizer = Arc::new(MockTokenizer::new());
-
-        let services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
-        };
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
 
@@ -3724,10 +3670,7 @@ mod tests {
         );
 
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store::<EquityRedemption>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
         let mut resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
 
         recover_interrupted_tokenization_aggregates(
@@ -3751,13 +3694,6 @@ mod tests {
         // --- Control case: recovery DISABLED keeps ActiveTransfer, job IS enqueued ---
         let (pool2, apalis_pool2) = setup_test_pools().await;
         let mint_id2 = issuer_request_id("pre-wrap-active-mint");
-
-        let services2 = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        };
 
         let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone(), ()));
 
@@ -3822,10 +3758,7 @@ mod tests {
         );
 
         let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone(), ()));
-        let redemption_store2 = Arc::new(test_store::<EquityRedemption>(
-            pool2.clone(),
-            services2.clone(),
-        ));
+        let redemption_store2 = Arc::new(test_store::<EquityRedemption>(pool2.clone(), ()));
         let mut resume_queue2 = ResumeTokenizationJobQueue::new(&apalis_pool2);
 
         recover_interrupted_tokenization_aggregates(
