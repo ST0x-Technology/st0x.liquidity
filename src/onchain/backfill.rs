@@ -7,11 +7,12 @@
 //! downtime. A persisted checkpoint records the last block that was fully
 //! enqueued.
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{B256, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
+use chrono::{DateTime, Utc};
 use futures_util::future;
 use itertools::Itertools;
 use metrics::counter;
@@ -22,7 +23,7 @@ use std::collections::hash_map::Entry;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_config::EvmCtx;
+use st0x_config::{EvmCtx, ExecutionThreshold};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_evm::Evm;
 use st0x_execution::{Executor, FractionalShares};
@@ -44,18 +45,71 @@ use crate::trading::onchain::trade_accountant::{
 /// identified for reversal. The `(tx_hash, log_index)` identity is the
 /// [`OnChainTradeId`] of the fill to reverse; `block_number` lets the caller
 /// derive how deep the reorg ran (current tip minus this block).
+///
+/// `reinclusion` distinguishes the two reorg signals. A `removed: true` log is a
+/// fill the canonical chain truly dropped, with no re-inclusion (`None`): the
+/// reversal is all there is to do. A block-hash mismatch is the SAME fill
+/// re-mined on a new canonical block (`Some`): after reversing the stale-block
+/// impact, [`record_reorg`] re-witnesses and re-applies the fill on the new
+/// block so the net returns to the fill's impact rather than staying flat.
 #[derive(Debug, Clone)]
 pub(crate) struct RemovedTrade {
     pub(crate) trade_id: OnChainTradeId,
     pub(crate) block_number: u64,
+    pub(crate) reinclusion: Option<ReInclusion>,
 }
 
-/// What an `enqueue_batch_events` pass found: how many fresh fills it enqueued
-/// and which already-accounted fills its logs reported as reorged away.
+/// The new canonical block a reorged `(tx_hash, log_index)` fill was re-mined
+/// on, carried so [`record_reorg`] can re-witness and re-apply the fill after
+/// reversing its stale-block impact. The fill content (amount/direction/price)
+/// is unchanged -- only the block moved -- so it is read from the persisted
+/// `OnChainTrade`, not duplicated here.
+#[derive(Debug, Clone)]
+pub(crate) struct ReInclusion {
+    /// Hash of the new canonical block. `detect_block_hash_reorgs` only produces
+    /// a re-inclusion when the observed hash is present, so this is never absent.
+    pub(crate) hash: B256,
+    pub(crate) number: u64,
+    /// Timestamp of the new canonical block. `None` when the re-scan log carried
+    /// none (some nodes omit it on `eth_getLogs`); the reapply then falls back to
+    /// the persisted fill's timestamp rather than fabricating one.
+    pub(crate) timestamp: Option<DateTime<Utc>>,
+}
+
+/// Identity of a present (non-removed) backfill log, carried so the caller can
+/// compare its freshly-observed `block_hash` against the one persisted for an
+/// already-witnessed `(tx_hash, log_index)`. A mismatch means a fork swap during
+/// downtime re-served the same key on a different block -- a reorg the
+/// `removed: true` path never surfaces over `eth_getLogs`.
+#[derive(Debug, Clone)]
+pub(crate) struct PresentLog {
+    pub(crate) tx_hash: TxHash,
+    pub(crate) log_index: u64,
+    pub(crate) block_number: u64,
+    pub(crate) block_hash: Option<B256>,
+    /// Timestamp of the block this log was observed in, carried so a detected
+    /// block-hash reorg can re-apply the re-mined fill on the new canonical
+    /// block's time. `None` when the source log omitted it.
+    pub(crate) block_timestamp: Option<DateTime<Utc>>,
+}
+
+/// What an `enqueue_batch_events` pass found: how many fresh fills it enqueued,
+/// which already-accounted fills its logs reported as reorged away
+/// (`removed: true`), and the identities of the present logs (for block-hash
+/// fork detection by the caller).
 #[derive(Debug)]
 struct BatchOutcome {
     enqueued: usize,
     removed: Vec<RemovedTrade>,
+    present: Vec<PresentLog>,
+}
+
+/// Aggregated result of a backfill range scan: fills the logs reported reorged
+/// away plus the present-log identities for block-hash fork detection.
+#[derive(Debug, Default)]
+pub(crate) struct BackfillScan {
+    pub(crate) removed: Vec<RemovedTrade>,
+    pub(crate) present: Vec<PresentLog>,
 }
 
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
@@ -93,7 +147,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
 ) -> Result<Vec<RemovedTrade>, OnChainError> {
     let start_block = backfill_start_block(pool, evm_ctx).await?;
 
-    backfill_range(
+    Ok(backfill_range(
         provider,
         evm_ctx,
         bot_operator,
@@ -103,7 +157,8 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
         retry_strategy,
         job_queue,
     )
-    .await
+    .await?
+    .removed)
 }
 
 /// Fetches `ClearV3` / `TakeOrderV3` logs from the OrderBook and
@@ -131,7 +186,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
     to_block: u64,
     retry_strategy: B,
     job_queue: DexTradeAccountingJobQueue,
-) -> Result<Vec<RemovedTrade>, OnChainError> {
+) -> Result<BackfillScan, OnChainError> {
     if from_block > to_block {
         info!(
             target: "orderbook",
@@ -140,7 +195,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         );
 
         save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
-        return Ok(Vec::new());
+        return Ok(BackfillScan::default());
     }
 
     let total_blocks = to_block - from_block + 1;
@@ -155,6 +210,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
 
     let mut total_enqueued: usize = 0;
     let mut removed_trades = Vec::new();
+    let mut present_logs = Vec::new();
     for (batch_start, batch_end) in batch_ranges {
         let outcome = enqueue_batch_events(
             provider,
@@ -168,6 +224,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         .await?;
         total_enqueued += outcome.enqueued;
         removed_trades.extend(outcome.removed);
+        present_logs.extend(outcome.present);
     }
 
     info!(
@@ -179,7 +236,10 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
 
     save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
 
-    Ok(removed_trades)
+    Ok(BackfillScan {
+        removed: removed_trades,
+        present: present_logs,
+    })
 }
 
 /// Persistent job queue for backfill jobs.
@@ -227,7 +287,7 @@ where
     }
 
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
-        let removed = backfill_range(
+        let scan = backfill_range(
             ctx.evm.provider(),
             &ctx.ctx.evm,
             BotOperator(ctx.ctx.order_owner()),
@@ -239,7 +299,14 @@ where
         )
         .await?;
 
-        if removed.is_empty() {
+        // A `removed: true` log is the legacy (now-inert over `eth_getLogs`)
+        // reorg signal; the authoritative one is a present log re-served on a
+        // different block_hash than the witnessed fill persisted. Both funnel
+        // through the same exactly-once `record_reorg` reversal.
+        let mut reorged = scan.removed;
+        reorged.extend(detect_block_hash_reorgs(&ctx.cqrs.onchain_trade, &scan.present).await?);
+
+        if reorged.is_empty() {
             return Ok(());
         }
 
@@ -248,7 +315,7 @@ where
         // reused for every reversal in this batch.
         let tip = ctx.evm.provider().get_block_number().await?;
 
-        for removed_trade in removed {
+        for removed_trade in reorged {
             // A tip behind the removed block would saturate `reorg_depth` to 0 --
             // a permanently underreported depth on an audit record. The load-
             // balanced RPC routed us to a lagging node; fail so apalis retries
@@ -266,6 +333,7 @@ where
                 &ctx.cqrs.position,
                 &removed_trade,
                 reorg_depth,
+                ctx.cqrs.execution_threshold,
             )
             .await?;
         }
@@ -294,39 +362,148 @@ pub(crate) fn backfill_start_from_checkpoint(
     })
 }
 
-/// Reverses an already-accounted fill that a reorg dropped at or below the
-/// ingestion cutoff, exactly once across both aggregates (ADR 0012). Loads the
-/// `OnChainTrade` keyed by `(tx_hash, log_index)` and resumes at whichever step
-/// is unfinished, appending through the CQRS framework (never direct SQL):
+/// Detects fork swaps that a `removed: true` log never surfaces over
+/// `eth_getLogs`: a present (re-served) backfill log whose `(tx_hash, log_index)`
+/// matches an already-witnessed fill but whose `block_hash` differs from the one
+/// persisted on the `OnChainTrade` means the fill was accounted against a block
+/// the canonical chain no longer holds -- a reorg to reverse.
 ///
-/// - reorg-acknowledged -> fully reversed already; re-settle the position's
-///   bounded pending-reorg set to self-heal a prune that an earlier delivery
-///   crashed before issuing, then done;
-/// - not yet reorged -> record the reorg, reverse the position, acknowledge,
-///   then prune the pending-reorg set;
-/// - reorged but not acknowledged -> a prior delivery crashed mid-reversal;
-///   resume directly at the position reversal, then acknowledge and prune.
+/// A key is flagged only when BOTH the persisted and freshly-observed hashes are
+/// present and differ. An unwitnessed key (nothing accounted), a missing
+/// persisted hash (legacy fill or a log that carried none), or a missing
+/// observed hash all skip the comparison -- there is nothing to compare against,
+/// not evidence of a reorg. The returned [`RemovedTrade`]s flow through the same
+/// exactly-once `record_reorg` reversal as the `removed: true` path.
+async fn detect_block_hash_reorgs(
+    onchain_trade: &Store<OnChainTrade>,
+    present: &[PresentLog],
+) -> Result<Vec<RemovedTrade>, OnChainError> {
+    let mut reorged = Vec::new();
+
+    for log in present {
+        let Some(observed_block_hash) = log.block_hash else {
+            continue;
+        };
+
+        let trade_id = OnChainTradeId {
+            tx_hash: log.tx_hash,
+            log_index: log.log_index,
+        };
+        let Some(trade) = onchain_trade.load(&trade_id).await? else {
+            continue;
+        };
+
+        // Short-circuit a reorg whose reversal is already acknowledged: its
+        // re-application is driven by the re-served log's own accounting job and
+        // the re-witness will clear the marker, so re-flagging (and re-comparing)
+        // it here is redundant work on an in-flight reorg.
+        if trade.is_reorg_acknowledged() {
+            continue;
+        }
+
+        let Some(persisted_block_hash) = trade.block_hash else {
+            continue;
+        };
+
+        if persisted_block_hash != observed_block_hash {
+            warn!(
+                target: "orderbook",
+                tx_hash = ?log.tx_hash,
+                log_index = log.log_index,
+                ?persisted_block_hash,
+                ?observed_block_hash,
+                "Backfill re-observed a witnessed fill on a different block_hash -- fork swap \
+                 during downtime; recording reorg reversal"
+            );
+            reorged.push(RemovedTrade {
+                trade_id: OnChainTradeId {
+                    tx_hash: log.tx_hash,
+                    log_index: log.log_index,
+                },
+                // Anchor the reorg on the block the fill was originally accounted
+                // against (the persisted block), not the re-mined block observed
+                // now -- reorg depth is measured from the original block. Fall
+                // back to the observed block only if the persisted one is absent.
+                block_number: trade.block_number.unwrap_or(log.block_number),
+                // The re-served log IS the new canonical block: carry it so the
+                // reversal is followed by a re-witness + re-apply of the fill.
+                reinclusion: Some(ReInclusion {
+                    hash: observed_block_hash,
+                    number: log.block_number,
+                    timestamp: log.block_timestamp,
+                }),
+            });
+        }
+    }
+
+    Ok(reorged)
+}
+
+/// Reverses a reorged fill across both aggregates, then -- when the reorg was a
+/// re-mining of the SAME fill on a new canonical block -- re-witnesses and
+/// re-applies it so the net returns to the fill's impact (ADR 0012).
 ///
-/// The `OnChainTrade` reorg-ack marker is written only after the position
-/// reversal succeeds, and the position rejects a `trade_id` it has already
-/// reversed, so a re-delivered backfill range neither skips nor double-applies a
-/// reversal. The final `SettleReorg` prunes the reversed `trade_id` from the
-/// position's bounded `pending_reorged_trade_ids` set once the marker is durable
-/// (ADR 0012); it is an idempotent no-op when the entry is already gone. A fill
-/// we never witnessed (e.g. a non-hedgeable pair) has nothing to reverse and is
-/// skipped.
+/// # Reverse-then-reapply
 ///
-/// The `Position` reversal runs under the same per-symbol lock that
-/// `AccountForDexTrade` holds while it mutates position state, so a concurrent
-/// live fill for the symbol cannot interleave with the reversal and corrupt the
-/// net.
+/// A `removed: true` log (`reinclusion: None`) is a fill the canonical chain
+/// truly dropped: the reversal is the whole job. A block-hash mismatch
+/// (`reinclusion: Some`) is the same `(tx_hash, log_index)` re-mined on a new
+/// block with identical economic content; reversing alone would leave the
+/// position permanently FLAT, so after the reversal this re-witnesses the fill
+/// onto the new block (clearing the reorg markers) and re-acknowledges it,
+/// restoring the impact.
+///
+/// The reverse phase resumes at whichever step is unfinished, keyed on the
+/// `OnChainTrade` reorg markers (see [`reverse_reorged_fill`]). The reapply phase
+/// re-drives the normal `AcknowledgeOnChainFill` -> `Acknowledge` pair (see
+/// [`reapply_reincluded_fill`]). Everything appends through the CQRS framework,
+/// never direct SQL. A fill we never witnessed (e.g. a non-hedgeable pair) has
+/// nothing to reverse and is skipped.
+///
+/// # Crash-safety
+///
+/// The whole sequence runs under the per-symbol lock that `AccountForDexTrade`
+/// also holds, so a live fill cannot interleave its `Position` writes with the
+/// reversal. Across re-deliveries the resume is keyed on durable state:
+///
+/// - The reverse phase's exactly-once guarantee is unchanged (ADR 0012): the
+///   reorg-ack marker is written only after the position reversal, and the
+///   position's bounded `pending_reorged_trade_ids` set + `last_reorged_trade_id`
+///   slot reject a double-reverse.
+/// - `ReWitnessed` clears the reorg markers, which would otherwise make a
+///   resumed reverse re-run from scratch. The guard against that is the block
+///   hash itself: once the re-witness is durable the persisted `block_hash`
+///   equals the new canonical hash, so `detect_block_hash_reorgs` no longer
+///   flags the fill and `record_reorg` is not re-invoked for it. Within this
+///   call, `already_rewitnessed` detects the same condition and skips the
+///   reverse phase (and the re-`ReWitness`) so a resume after the re-witness
+///   does not append a spurious second reverse cycle.
+/// - If the process crashes after `ReWitnessed` but before the re-acknowledge,
+///   the re-served canonical log's own `AccountForDexTrade` job (always enqueued
+///   by the same backfill pass) completes the re-apply: it now finds the trade
+///   witnessed-but-not-acknowledged and resumes the acknowledge pair. The reapply
+///   here and that job both serialize on the symbol lock and are idempotent
+///   (`DuplicateTrade` / `AlreadyAcknowledged`), so whichever runs second is a
+///   no-op.
+///
+/// Alternative considered: treat a re-mined fill as net-zero (update only the
+/// persisted `block_hash` for audit, never reversing or re-applying). Rejected
+/// because it does not fit the exactly-once `Reorged` model the rest of the
+/// stack and the e2e expect -- the reversal is an auditable event the inventory
+/// reactor consumes, and skipping it would diverge the `Position` from its event
+/// log. Reverse-then-reapply keeps every step an explicit, replayable event.
 async fn record_reorg(
     onchain_trade: &Store<OnChainTrade>,
     position: &Store<Position>,
     removed: &RemovedTrade,
     reorg_depth: u64,
+    threshold: ExecutionThreshold,
 ) -> Result<(), OnChainError> {
-    let RemovedTrade { trade_id, .. } = removed;
+    let RemovedTrade {
+        trade_id,
+        reinclusion,
+        ..
+    } = removed;
 
     let Some(trade) = onchain_trade.load(trade_id).await? else {
         warn!(
@@ -345,12 +522,69 @@ async fn record_reorg(
     let symbol_lock = get_symbol_lock(&trade.symbol).await;
     let _symbol_guard = symbol_lock.lock().await;
 
+    // A prior delivery already re-witnessed the fill iff the persisted block hash
+    // already equals the re-inclusion's. `ReWitness` only fires once the reversal
+    // is fully acknowledged, so a match means the reverse phase is complete and
+    // must be skipped -- re-running it would append a spurious second reverse
+    // cycle on top of an already-re-applied fill.
+    let already_rewitnessed = match (reinclusion, trade.block_hash) {
+        (Some(reinclusion), Some(persisted_block_hash)) => persisted_block_hash == reinclusion.hash,
+        _ => false,
+    };
+
+    if !already_rewitnessed {
+        reverse_reorged_fill(onchain_trade, position, &trade, trade_id, reorg_depth).await?;
+    }
+
+    if let Some(reinclusion) = reinclusion {
+        reapply_reincluded_fill(
+            onchain_trade,
+            position,
+            &trade,
+            trade_id,
+            reinclusion,
+            threshold,
+            already_rewitnessed,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Reverses an already-accounted reorged fill exactly once across both
+/// aggregates (ADR 0012), resuming at whichever step is unfinished:
+///
+/// - reorg-acknowledged -> fully reversed already; re-settle the position's
+///   bounded pending-reorg set to self-heal a prune that an earlier delivery
+///   crashed before issuing, then done;
+/// - not yet reorged -> record the reorg, reverse the position, acknowledge,
+///   then prune the pending-reorg set;
+/// - reorged but not acknowledged -> a prior delivery crashed mid-reversal;
+///   resume directly at the position reversal, then acknowledge and prune.
+///
+/// The `OnChainTrade` reorg-ack marker is written only after the position
+/// reversal succeeds, and the position rejects a `trade_id` it has already
+/// reversed, so a re-delivered backfill range neither skips nor double-applies a
+/// reversal. Runs under the caller's per-symbol lock.
+async fn reverse_reorged_fill(
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnChainTrade,
+    trade_id: &OnChainTradeId,
+    reorg_depth: u64,
+) -> Result<(), OnChainError> {
+    let position_trade_id = TradeId {
+        tx_hash: trade_id.tx_hash,
+        log_index: trade_id.log_index,
+    };
+
     if trade.is_reorg_acknowledged() {
         debug!(
             target: "orderbook",
             tx_hash = ?trade_id.tx_hash,
             log_index = trade_id.log_index,
-            "Reorg already fully acknowledged; skipping"
+            "Reorg already fully acknowledged; skipping reversal"
         );
         // Self-heal: a prior delivery may have crashed between AcknowledgeReorg
         // and SettleReorg, leaving the reversed `trade_id` in the position's
@@ -361,10 +595,7 @@ async fn record_reorg(
             .send(
                 &trade.symbol,
                 PositionCommand::SettleReorg {
-                    trade_id: TradeId {
-                        tx_hash: trade_id.tx_hash,
-                        log_index: trade_id.log_index,
-                    },
+                    trade_id: position_trade_id,
                 },
             )
             .await?;
@@ -397,10 +628,7 @@ async fn record_reorg(
         .send(
             &trade.symbol,
             PositionCommand::RecordReorg {
-                trade_id: TradeId {
-                    tx_hash: trade_id.tx_hash,
-                    log_index: trade_id.log_index,
-                },
+                trade_id: position_trade_id.clone(),
                 amount: FractionalShares::new(trade.amount),
                 direction: trade.direction,
                 price_usdc: trade.price_usdc,
@@ -436,10 +664,113 @@ async fn record_reorg(
         .send(
             &trade.symbol,
             PositionCommand::SettleReorg {
-                trade_id: TradeId {
-                    tx_hash: trade_id.tx_hash,
-                    log_index: trade_id.log_index,
+                trade_id: position_trade_id,
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Re-witnesses a reorged fill on its new canonical block and re-applies its
+/// position impact, after [`reverse_reorged_fill`] settled the reversal. This is
+/// what stops a block-hash reorg from leaving the position permanently flat: the
+/// same fill was re-mined, so its impact must be restored.
+///
+/// `ReWitness` clears the `OnChainTrade` reorg/ack markers, returning the fill to
+/// a fresh post-witness state; the normal `AcknowledgeOnChainFill` -> `Acknowledge`
+/// -> `SettleOnChainFill` sequence then re-applies it. Every step is idempotent
+/// on resume: `already_rewitnessed` skips the `ReWitness` send (a re-send would be
+/// rejected `NotReorgAcknowledged` once the markers are cleared), `DuplicateTrade`
+/// absorbs a position re-apply an earlier delivery (or the re-served log's own
+/// `AccountForDexTrade` job) already did, and `AlreadyAcknowledged` absorbs a
+/// re-driven marker. Runs under the caller's per-symbol lock.
+async fn reapply_reincluded_fill(
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnChainTrade,
+    trade_id: &OnChainTradeId,
+    reinclusion: &ReInclusion,
+    threshold: ExecutionThreshold,
+    already_rewitnessed: bool,
+) -> Result<(), OnChainError> {
+    // Prefer the new canonical block's timestamp; fall back to the persisted
+    // fill's when the re-scan log carried none (the same economic fill, so its
+    // recorded time is a faithful stand-in) rather than fabricating one. The
+    // timestamp is audit metadata only -- it never affects net or price.
+    let block_timestamp = reinclusion.timestamp.unwrap_or(trade.block_timestamp);
+
+    let position_trade_id = TradeId {
+        tx_hash: trade_id.tx_hash,
+        log_index: trade_id.log_index,
+    };
+
+    // Re-witness onto the new canonical block. Skip when a prior delivery already
+    // did: `ReWitnessed` cleared the reorg-ack marker, so a re-send would be
+    // rejected `NotReorgAcknowledged`.
+    if !already_rewitnessed {
+        onchain_trade
+            .send(
+                trade_id,
+                OnChainTradeCommand::ReWitness {
+                    block_number: reinclusion.number,
+                    block_hash: Some(reinclusion.hash),
+                    block_timestamp,
                 },
+            )
+            .await?;
+    }
+
+    // Re-apply the fill's position impact. `DuplicateTrade` means a prior
+    // delivery (or the re-served log's own `AccountForDexTrade` job) already
+    // re-applied it; idempotent, so proceed to the marker. The threshold is only
+    // consulted when the position needs initializing, which a re-mined fill never
+    // does (it was applied, then reversed, on an existing position).
+    match position
+        .send(
+            &trade.symbol,
+            PositionCommand::AcknowledgeOnChainFill {
+                symbol: trade.symbol.clone(),
+                threshold,
+                trade_id: position_trade_id.clone(),
+                amount: FractionalShares::new(trade.amount),
+                direction: trade.direction,
+                price_usdc: trade.price_usdc,
+                block_timestamp,
+            },
+        )
+        .await
+    {
+        Ok(())
+        | Err(AggregateError::UserError(LifecycleError::Apply(PositionError::DuplicateTrade {
+            ..
+        }))) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Mark the re-applied fill acknowledged (idempotent via `AlreadyAcknowledged`)
+    // only after the position write, so a crash before this resumes the re-apply.
+    // The fill was just re-witnessed, so `CannotAcknowledgeReorgedFill` cannot
+    // occur under the held lock; were it to, propagating it retries the pair.
+    match onchain_trade
+        .send(trade_id, OnChainTradeCommand::Acknowledge)
+        .await
+    {
+        Ok(())
+        | Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::AlreadyAcknowledged,
+        ))) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Prune the pending-acknowledgement entry now the marker is durable (ADR
+    // 0010). A no-op when already pruned, so a re-delivered range re-settles
+    // harmlessly.
+    position
+        .send(
+            &trade.symbol,
+            PositionCommand::SettleOnChainFill {
+                trade_id: position_trade_id,
             },
         )
         .await?;
@@ -897,6 +1228,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
 
     let mut removed_trades = Vec::new();
     let mut present_logs = Vec::new();
+    let mut present_log_ids = Vec::new();
     for log in clear_logs
         .into_iter()
         .chain(take_logs)
@@ -908,17 +1240,39 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         // for reversal rather than silently dropping a vanished, already-accounted
         // event.
         //
-        // NOTE: this `removed: true` path is inert in production today. Both the
-        // monitor and backfill read fills via `eth_getLogs` range queries, which
-        // only ever return the current canonical chain and never flag a log
-        // `removed: true` -- only subscription / `eth_getFilterChanges`
-        // notifications do that, and neither path uses them. The authoritative
-        // reorg detector is a separate block-hash-mismatch re-scan -- comparing
-        // the persisted `block_hash` for a known `(tx_hash, log_index)` against a
-        // freshly observed one -- which is not yet built. This branch is kept as
-        // correct scaffolding for that detector; tests exercise it by
-        // synthesizing `removed: true` logs.
+        // NOTE: this `removed: true` path is currently INERT in production. It
+        // relied on `eth_getFilterChanges`/subscription notifications, which set
+        // `removed: true` on reorged-out logs; since the monitor moved to
+        // continuous `eth_getLogs` polling and backfill uses `eth_getLogs` range
+        // queries, neither path ever surfaces `removed: true` (a range query
+        // returns only the current canonical logs). The authoritative reorg
+        // detector is the block-hash-mismatch re-scan (`detect_block_hash_reorgs`):
+        // the present logs collected below carry their freshly-observed
+        // `block_hash`, which the caller compares against the one persisted for the
+        // witnessed `(tx_hash, log_index)`. This `removed: true` branch is kept as
+        // correct scaffolding; tests exercise it by synthesizing `removed: true`
+        // logs.
         if !log.removed {
+            // Collect the identity so the caller can compare this freshly-observed
+            // block_hash against the one persisted for the same (tx_hash,
+            // log_index); a mismatch is a fork swap that re-served the key on a
+            // different block. Logs missing identity fields cannot be
+            // fork-checked but are still accounted via the present-log decode.
+            if let (Some(tx_hash), Some(log_index), Some(block_number)) =
+                (log.transaction_hash, log.log_index, log.block_number)
+            {
+                present_log_ids.push(PresentLog {
+                    tx_hash,
+                    log_index,
+                    block_number,
+                    block_hash: log.block_hash,
+                    block_timestamp: log.block_timestamp.and_then(|seconds| {
+                        i64::try_from(seconds)
+                            .ok()
+                            .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+                    }),
+                });
+            }
             present_logs.push(log);
             continue;
         }
@@ -948,6 +1302,9 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         removed_trades.push(RemovedTrade {
             trade_id: OnChainTradeId { tx_hash, log_index },
             block_number,
+            // A `removed: true` log is a truly dropped fill: the canonical chain
+            // no longer holds it, so there is nothing to re-apply.
+            reinclusion: None,
         });
     }
 
@@ -993,6 +1350,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     Ok(BatchOutcome {
         enqueued: enqueued_count,
         removed: removed_trades,
+        present: present_log_ids,
     })
 }
 
@@ -4363,11 +4721,18 @@ mod tests {
         let removed = RemovedTrade {
             trade_id: OnChainTradeId { tx_hash, log_index },
             block_number: 100,
+            reinclusion: None,
         };
         let before_reorg = Utc::now();
-        record_reorg(&onchain_trade, &position, &removed, 12)
-            .await
-            .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            12,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
         let after_reorg = Utc::now();
 
         assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
@@ -4448,10 +4813,17 @@ mod tests {
         let removed = RemovedTrade {
             trade_id: OnChainTradeId { tx_hash, log_index },
             block_number: 100,
+            reinclusion: None,
         };
-        record_reorg(&onchain_trade, &position, &removed, 12)
-            .await
-            .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            12,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
 
         let position_state = position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
@@ -4530,6 +4902,7 @@ mod tests {
         let removed = RemovedTrade {
             trade_id: OnChainTradeId { tx_hash, log_index },
             block_number: 100,
+            reinclusion: None,
         };
 
         // Hold the same per-symbol lock the live fill path acquires. While it is
@@ -4539,7 +4912,13 @@ mod tests {
 
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            record_reorg(&onchain_trade, &position, &removed, 12),
+            record_reorg(
+                &onchain_trade,
+                &position,
+                &removed,
+                12,
+                ExecutionThreshold::whole_share(),
+            ),
         )
         .await;
         blocked.unwrap_err();
@@ -4558,9 +4937,15 @@ mod tests {
 
         // Releasing the lock lets the same reversal proceed and return to flat.
         drop(guard);
-        record_reorg(&onchain_trade, &position, &removed, 12)
-            .await
-            .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            12,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
 
         let reversed = position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
@@ -4597,13 +4982,26 @@ mod tests {
         let removed = RemovedTrade {
             trade_id: OnChainTradeId { tx_hash, log_index },
             block_number: 100,
+            reinclusion: None,
         };
-        record_reorg(&onchain_trade, &position, &removed, 12)
-            .await
-            .unwrap();
-        record_reorg(&onchain_trade, &position, &removed, 12)
-            .await
-            .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            12,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            12,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
         assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
@@ -4684,10 +5082,17 @@ mod tests {
         let removed = RemovedTrade {
             trade_id: OnChainTradeId { tx_hash, log_index },
             block_number: 100,
+            reinclusion: None,
         };
-        record_reorg(&onchain_trade, &position, &removed, 12)
-            .await
-            .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            12,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
 
         let position_state = position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
@@ -4728,10 +5133,17 @@ mod tests {
                 log_index: 1,
             },
             block_number: 100,
+            reinclusion: None,
         };
-        record_reorg(&onchain_trade, &position, &removed, 5)
-            .await
-            .unwrap();
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            5,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 0);
         assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 0);
@@ -4745,6 +5157,27 @@ mod tests {
         log_index: u64,
         now: chrono::DateTime<Utc>,
     ) {
+        seed_witnessed_fill_with_block_hash(
+            onchain_trade,
+            position,
+            symbol,
+            tx_hash,
+            log_index,
+            None,
+            now,
+        )
+        .await;
+    }
+
+    async fn seed_witnessed_fill_with_block_hash(
+        onchain_trade: &Store<OnChainTrade>,
+        position: &Store<Position>,
+        symbol: &Symbol,
+        tx_hash: TxHash,
+        log_index: u64,
+        block_hash: Option<B256>,
+        now: chrono::DateTime<Utc>,
+    ) {
         onchain_trade
             .send(
                 &OnChainTradeId { tx_hash, log_index },
@@ -4754,7 +5187,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_number: 100,
-                    block_hash: None,
+                    block_hash,
                     block_timestamp: now,
                 },
             )
@@ -4776,6 +5209,17 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // Production fills are witnessed AND acknowledged on the OnChainTrade once
+        // the position has accounted them, so seed that complete state -- a reorg
+        // strikes an acknowledged fill, not a half-witnessed one.
+        onchain_trade
+            .send(
+                &OnChainTradeId { tx_hash, log_index },
+                OnChainTradeCommand::Acknowledge,
+            )
+            .await
+            .unwrap();
     }
 
     async fn count_events(pool: &SqlitePool, event_type: &str) -> i64 {
@@ -4784,5 +5228,701 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// A fork swap during downtime re-serves the same
+    /// `(tx_hash, log_index)` on a NEW canonical block. The backfill re-scan
+    /// detects it by comparing the freshly-observed `block_hash` against the
+    /// witnessed fill's persisted one. Because the fill was re-mined (identical
+    /// economic content) rather than dropped, `record_reorg` reverses the
+    /// stale-block impact AND re-witnesses + re-applies the fill on the new
+    /// block, returning the net to the fill's impact instead of leaving it flat.
+    #[tokio::test]
+    async fn backfill_block_hash_mismatch_reverses_then_reapplies_reorg() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let block_hash_a = B256::repeat_byte(0xaa);
+        let block_hash_b = B256::repeat_byte(0xbb);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(block_hash_a),
+            now,
+        )
+        .await;
+
+        // The re-scan re-served the same key on a different block.
+        let present = vec![PresentLog {
+            tx_hash,
+            log_index,
+            block_number: 100,
+            block_hash: Some(block_hash_b),
+            block_timestamp: Some(now),
+        }];
+        let reorged = detect_block_hash_reorgs(&onchain_trade, &present)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reorged.len(),
+            1,
+            "a block_hash mismatch on a witnessed fill must be flagged as a reorg",
+        );
+        assert_eq!(reorged[0].trade_id.tx_hash, tx_hash);
+        assert_eq!(reorged[0].trade_id.log_index, log_index);
+
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &reorged[0],
+            5,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        // The full reverse-then-reapply cycle is recorded on the OnChainTrade.
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReorgAcknowledged").await,
+            1,
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReWitnessed").await,
+            1
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::Acknowledged").await,
+            2,
+            "the original acknowledge plus the re-acknowledge of the re-mined fill \
+             on its new canonical block",
+        );
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+
+        // The persisted block hash advanced to the new canonical block, so a
+        // later benign re-scan no longer flags it, and the trade is live again.
+        let trade = onchain_trade
+            .load(&OnChainTradeId { tx_hash, log_index })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(trade.block_hash, Some(block_hash_b));
+        assert!(trade.is_acknowledged());
+        assert!(!trade.is_reorged());
+
+        // The net returns to the fill's impact (+5 from the seeded Buy), NOT
+        // flat: the fill was re-mined, not dropped.
+        assert_eq!(
+            position.load(&symbol).await.unwrap().unwrap().net,
+            FractionalShares::new(float!(5)),
+            "the re-mined fill's position impact must be restored, not left flat",
+        );
+    }
+
+    /// The full reverse-then-reapply cycle for a fully-acknowledged fill struck
+    /// by a block-hash reorg: the reversal events fire, the fill is re-witnessed
+    /// on the new canonical block and acknowledged a SECOND time, and the net
+    /// returns to the fill's impact rather than staying flat.
+    #[tokio::test]
+    async fn record_reorg_reverses_then_reapplies_a_reincluded_fill() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let block_hash_a = B256::repeat_byte(0xaa);
+        let block_hash_b = B256::repeat_byte(0xbb);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(block_hash_a),
+            now,
+        )
+        .await;
+
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+            reinclusion: Some(ReInclusion {
+                hash: block_hash_b,
+                number: 100,
+                timestamp: Some(now),
+            }),
+        };
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            5,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReorgAcknowledged").await,
+            1,
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReWitnessed").await,
+            1
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::Acknowledged").await,
+            2,
+            "the original acknowledge plus the re-acknowledge of the re-mined fill",
+        );
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+
+        let trade = onchain_trade
+            .load(&OnChainTradeId { tx_hash, log_index })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(trade.block_hash, Some(block_hash_b));
+        assert!(trade.is_acknowledged());
+        assert!(!trade.is_reorged());
+        assert!(!trade.is_reorg_acknowledged());
+
+        let position_state = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position_state.net,
+            FractionalShares::new(float!(5)),
+            "the reverse-then-reapply must restore the fill's impact, not leave it flat",
+        );
+        // The pending sets are empty at rest: the reversal settled its reorg
+        // entry and the re-apply settled its acknowledgement entry.
+        assert!(position_state.pending_reorged_trade_ids.is_empty());
+        assert!(position_state.pending_acknowledged_trade_ids.is_empty());
+    }
+
+    /// A re-delivered backfill range must not double-apply the re-mined fill.
+    /// The second `record_reorg` finds the trade already re-witnessed
+    /// (`block_hash` advanced) and re-applied (`DuplicateTrade` /
+    /// `AlreadyAcknowledged`), so it appends no new events and the net stays at
+    /// the fill's impact.
+    #[tokio::test]
+    async fn record_reorg_reapply_is_idempotent_across_redelivery() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let block_hash_a = B256::repeat_byte(0xaa);
+        let block_hash_b = B256::repeat_byte(0xbb);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(block_hash_a),
+            now,
+        )
+        .await;
+
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+            reinclusion: Some(ReInclusion {
+                hash: block_hash_b,
+                number: 100,
+                timestamp: Some(now),
+            }),
+        };
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            5,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+        // Re-deliver the exact same reorg+re-inclusion.
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            5,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        // No step is duplicated across the re-delivery.
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReorgAcknowledged").await,
+            1,
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReWitnessed").await,
+            1
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::Acknowledged").await,
+            2,
+            "the seed acknowledge plus the re-apply's re-acknowledge; the \
+             re-delivery must not re-acknowledge again",
+        );
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+
+        let position_state = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position_state.net,
+            FractionalShares::new(float!(5)),
+            "a re-delivery must not apply the re-mined fill twice",
+        );
+        assert!(position_state.pending_acknowledged_trade_ids.is_empty());
+    }
+
+    /// The critical crash window: a delivery reversed the fill fully (reorg
+    /// acknowledged) but died BEFORE re-witnessing it, so the persisted block
+    /// hash is still the stale one. A re-delivery must self-heal the reversal and
+    /// then re-witness + re-apply, restoring the net to the fill's impact rather
+    /// than leaving it flat.
+    #[tokio::test]
+    async fn record_reorg_resumes_reapply_after_reversal_but_before_rewitness() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let block_hash_a = B256::repeat_byte(0xaa);
+        let block_hash_b = B256::repeat_byte(0xbb);
+        let now = Utc::now();
+        let trade_id = OnChainTradeId { tx_hash, log_index };
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(block_hash_a),
+            now,
+        )
+        .await;
+
+        // Drive the reversal to completion by hand, stopping before the
+        // re-witness: this is exactly the durable state a crash there leaves.
+        onchain_trade
+            .send(
+                &trade_id,
+                OnChainTradeCommand::RecordReorg { reorg_depth: 5 },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::RecordReorg {
+                    trade_id: TradeId { tx_hash, log_index },
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    reorg_depth: 5,
+                },
+            )
+            .await
+            .unwrap();
+        onchain_trade
+            .send(&trade_id, OnChainTradeCommand::AcknowledgeReorg)
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::SettleReorg {
+                    trade_id: TradeId { tx_hash, log_index },
+                },
+            )
+            .await
+            .unwrap();
+        // Premise: reversed (flat) but still on the stale block hash.
+        let pre_resume = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pre_resume.net, FractionalShares::ZERO);
+        let pre_trade = onchain_trade.load(&trade_id).await.unwrap().unwrap();
+        assert_eq!(pre_trade.block_hash, Some(block_hash_a));
+        assert!(pre_trade.is_reorg_acknowledged());
+
+        // Re-deliver the reorg carrying the re-inclusion: the reverse self-heals
+        // (no second reverse) and the reapply re-witnesses + re-acknowledges.
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+            reinclusion: Some(ReInclusion {
+                hash: block_hash_b,
+                number: 100,
+                timestamp: Some(now),
+            }),
+        };
+        record_reorg(
+            &onchain_trade,
+            &position,
+            &removed,
+            5,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_events(&pool, "PositionEvent::Reorged").await,
+            1,
+            "the reversal must not run a second time",
+        );
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReWitnessed").await,
+            1
+        );
+
+        let trade = onchain_trade.load(&trade_id).await.unwrap().unwrap();
+        assert_eq!(trade.block_hash, Some(block_hash_b));
+        assert!(trade.is_acknowledged());
+        assert!(!trade.is_reorged());
+
+        assert_eq!(
+            position.load(&symbol).await.unwrap().unwrap().net,
+            FractionalShares::new(float!(5)),
+            "the resume must restore the fill's impact after a crash before re-witness",
+        );
+    }
+
+    /// The common case: a benign re-scan re-serves witnessed fills at the SAME
+    /// block_hash. That is not a reorg and must not be flagged.
+    #[tokio::test]
+    async fn backfill_matching_block_hash_is_not_a_reorg() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let block_hash = B256::repeat_byte(0xaa);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(block_hash),
+            now,
+        )
+        .await;
+
+        let present = vec![PresentLog {
+            tx_hash,
+            log_index,
+            block_number: 100,
+            block_hash: Some(block_hash),
+            block_timestamp: Some(now),
+        }];
+        let reorged = detect_block_hash_reorgs(&onchain_trade, &present)
+            .await
+            .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "a matching block_hash on re-scan is a benign re-observation, not a reorg",
+        );
+    }
+
+    /// The comparison needs both hashes to draw a conclusion. Three cases all skip
+    /// -- absence of evidence is not a reorg: an unwitnessed key (nothing
+    /// accounted), a witnessed fill with no persisted block_hash (legacy fill / a
+    /// log that carried none), and a witnessed fill WITH a persisted hash whose
+    /// freshly-observed hash is absent (an `eth_getLogs` response without a block
+    /// hash).
+    #[tokio::test]
+    async fn backfill_block_hash_check_skips_when_nothing_to_compare() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let legacy_tx = TxHash::repeat_byte(0xab);
+        let unwitnessed_tx = TxHash::repeat_byte(0xcd);
+        let observed_absent_tx = TxHash::repeat_byte(0xef);
+        let now = Utc::now();
+
+        // A witnessed fill with NO persisted block_hash (legacy).
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            legacy_tx,
+            1,
+            None,
+            now,
+        )
+        .await;
+
+        // A witnessed fill that DOES carry a persisted block_hash, paired below
+        // with a re-scan log whose own block_hash is absent.
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            observed_absent_tx,
+            3,
+            Some(B256::repeat_byte(0xaa)),
+            now,
+        )
+        .await;
+
+        let present = vec![
+            // Legacy witnessed fill: persisted hash absent -> cannot compare.
+            PresentLog {
+                tx_hash: legacy_tx,
+                log_index: 1,
+                block_number: 100,
+                block_hash: Some(B256::repeat_byte(0xbb)),
+                block_timestamp: Some(now),
+            },
+            // Never-witnessed key: nothing accounted -> nothing to reverse.
+            PresentLog {
+                tx_hash: unwitnessed_tx,
+                log_index: 2,
+                block_number: 100,
+                block_hash: Some(B256::repeat_byte(0xbb)),
+                block_timestamp: Some(now),
+            },
+            // Witnessed fill with a persisted hash, but the re-scan log carried no
+            // block_hash (RPC response without one) -> an absent observed hash is
+            // not a reorg.
+            PresentLog {
+                tx_hash: observed_absent_tx,
+                log_index: 3,
+                block_number: 100,
+                block_hash: None,
+                block_timestamp: Some(now),
+            },
+        ];
+        let reorged = detect_block_hash_reorgs(&onchain_trade, &present)
+            .await
+            .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "an absent persisted, absent observed, or unwitnessed key must not be \
+             flagged as a reorg",
+        );
+    }
+
+    /// The reorg anchor (`RemovedTrade.block_number`) is the block the fill was
+    /// originally accounted against -- the persisted `OnChainTrade.block_number`
+    /// -- not the re-mined block the re-scan observed it on. The re-mined block is
+    /// carried separately as the re-inclusion's `number`. This matters because
+    /// `BackfillRange::perform` measures reorg depth from the anchor.
+    #[tokio::test]
+    async fn detect_block_hash_reorg_anchors_on_persisted_block_number() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let persisted_block_hash = B256::repeat_byte(0xaa);
+        let observed_block_hash = B256::repeat_byte(0xbb);
+        let now = Utc::now();
+
+        // The seed witnesses the fill on block 100 (its persisted block number).
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(persisted_block_hash),
+            now,
+        )
+        .await;
+
+        // The re-scan re-served the same key on a LATER block (150) under a new
+        // hash: a fork swap re-mined the fill.
+        let present = vec![PresentLog {
+            tx_hash,
+            log_index,
+            block_number: 150,
+            block_hash: Some(observed_block_hash),
+            block_timestamp: Some(now),
+        }];
+        let reorged = detect_block_hash_reorgs(&onchain_trade, &present)
+            .await
+            .unwrap();
+
+        let [removed] = reorged.as_slice() else {
+            panic!("a block_hash mismatch must surface exactly one reorg, got {reorged:?}");
+        };
+        assert_eq!(
+            removed.block_number, 100,
+            "the reorg must anchor on the persisted block (100), not the observed \
+             re-mined block (150)",
+        );
+        let reinclusion = removed
+            .reinclusion
+            .as_ref()
+            .expect("a re-served log must carry a re-inclusion");
+        assert_eq!(
+            reinclusion.number, 150,
+            "the re-inclusion carries the new canonical block the fill was re-mined on",
+        );
+        assert_eq!(reinclusion.hash, observed_block_hash);
+    }
+
+    /// Pins the `eth_getLogs` wire-shape assumption the block-hash reorg detector
+    /// depends on: a Base RPC log element carries the block hash in a camelCase
+    /// `blockHash` field. This deserializes a hand-built wire-shape JSON element
+    /// (field names written out as literals, not a re-serialized in-code `Log`)
+    /// through `enqueue_batch_events` and asserts the resulting
+    /// `PresentLog.block_hash` is the exact hash from the wire. A captured real
+    /// response would be ideal; a hand-built element matching the documented wire
+    /// shape is the next best pin.
+    #[tokio::test]
+    async fn present_log_carries_block_hash_from_eth_get_logs_wire_shape() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+        let evm_ctx = EvmCtx {
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        };
+
+        let expected_block_hash = B256::repeat_byte(0xb1);
+        let expected_tx_hash = TxHash::repeat_byte(0xbe);
+
+        // A single `eth_getLogs` result element in the exact JSON wire shape a Base
+        // RPC node returns: camelCase identity fields and hex-quantity numbers. The
+        // field NAMES are hand-written literals; only the hash/address VALUES come
+        // from typed primitives so the hex is well-formed. The detector reads
+        // `blockHash` from here, so this pins that field's name and type. The
+        // topics/data are a minimal valid log -- this test pins block_hash
+        // propagation, not event decoding.
+        let wire_log = serde_json::json!({
+            "address": evm_ctx.orderbook,
+            "topics": [B256::repeat_byte(0x5e)],
+            "data": "0x",
+            "blockHash": expected_block_hash,
+            "blockNumber": "0x32",
+            "transactionHash": expected_tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": "0x1",
+            "removed": false,
+        });
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([wire_log])); // clear getLogs
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // take getLogs
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory getLogs
+        push_tip_response(&asserter);
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let outcome = enqueue_batch_events(
+            &provider,
+            &evm_ctx,
+            BotOperator(TEST_BOT_OPERATOR),
+            1,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        let [present] = outcome.present.as_slice() else {
+            panic!(
+                "the wire-shape log must yield exactly one present log, got {:?}",
+                outcome.present
+            );
+        };
+        assert_eq!(
+            present.block_hash,
+            Some(expected_block_hash),
+            "the camelCase `blockHash` wire field must populate PresentLog.block_hash",
+        );
+        assert_eq!(present.tx_hash, expected_tx_hash);
+        assert_eq!(present.log_index, 1);
+        assert_eq!(present.block_number, 50);
     }
 }
