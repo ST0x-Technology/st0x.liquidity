@@ -30,6 +30,7 @@ use crate::trading::offchain::hedge::HedgeJobQueue;
 use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJobQueue,
+    UnwrappedEquityRecoveryServices,
 };
 use crate::wrapped_equity_recovery::{
     WrappedEquityRecovery, WrappedEquityRecoveryCtx, WrappedEquityRecoveryJobQueue,
@@ -41,6 +42,7 @@ use crate::wrapped_equity_recovery::{
 pub(super) struct EquityRecoveryInputs {
     pub(super) wrapped_store: Option<Arc<Store<WrappedEquityRecovery>>>,
     pub(super) unwrapped_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
+    pub(super) unwrapped_services: Option<UnwrappedEquityRecoveryServices>,
     pub(super) rebalancing_service: Option<Arc<RebalancingService>>,
     pub(super) mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     pub(super) redemption_store: Option<Arc<Store<EquityRedemption>>>,
@@ -77,6 +79,7 @@ pub(super) async fn setup_trading_job_queues(
     let EquityRecoveryInputs {
         wrapped_store: wrapped_equity_recovery_store,
         unwrapped_store: unwrapped_equity_recovery_store,
+        unwrapped_services: unwrapped_equity_recovery_services,
         rebalancing_service,
         mint_store,
         redemption_store,
@@ -115,6 +118,7 @@ pub(super) async fn setup_trading_job_queues(
 
     let unwrapped_equity_recovery_ctx = build_unwrapped_equity_recovery_ctx(
         unwrapped_equity_recovery_store,
+        unwrapped_equity_recovery_services,
         rebalancing_service,
         mint_store,
         redemption_store,
