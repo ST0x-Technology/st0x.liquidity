@@ -264,7 +264,15 @@ pub enum Commands {
         #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
     },
-    /// Process a transaction hash to execute opposite-side trade
+    /// Account a missed onchain fill by its transaction hash, then place the
+    /// opposite-side hedge.
+    ///
+    /// Recovery tool for fills the bot never recorded: it refuses a fill the bot
+    /// has already witnessed in the OnChainTrade log (re-applying would
+    /// double-count the position). Run it only when the bot is NOT concurrently
+    /// processing the same symbol -- the CLI and the bot run in separate
+    /// processes and cannot be serialized by a lock, so a concurrent bot could
+    /// still double-account the fill.
     ProcessTx {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]

@@ -1886,7 +1886,7 @@ pub(crate) async fn discover_vaults_for_trade(
 /// Done: with the backfill checkpoint already advanced, a swallowed
 /// witness failure is a permanently lost fill and silent unhedged
 /// exposure.
-async fn execute_witness_trade(
+pub(crate) async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
@@ -1935,7 +1935,10 @@ async fn execute_witness_trade(
     }
 }
 
-async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &OnchainTrade) {
+pub(crate) async fn execute_enrich_trade(
+    onchain_trade: &Store<OnChainTrade>,
+    trade: &OnchainTrade,
+) {
     let (Some(gas_used), Some(effective_gas_price), Some(pyth_price)) = (
         trade.gas_used,
         trade.effective_gas_price,
@@ -1988,7 +1991,7 @@ async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &Oncha
 /// resume path's crash window between the position write and the
 /// acknowledgement marker). Every other error propagates so the apalis job
 /// retries instead of silently dropping the fill.
-async fn execute_acknowledge_fill(
+pub(crate) async fn execute_acknowledge_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
     threshold: ExecutionThreshold,
@@ -2043,7 +2046,7 @@ async fn execute_acknowledge_fill(
 /// A re-driven marker (`AlreadyAcknowledged`) is idempotent;
 /// infrastructure errors propagate so the apalis retry re-drives the
 /// idempotent acknowledge pair.
-async fn execute_mark_acknowledged(
+pub(crate) async fn execute_mark_acknowledged(
     onchain_trade: &Store<OnChainTrade>,
     trade_id: &OnChainTradeId,
 ) -> Result<(), SendError<OnChainTrade>> {
@@ -2057,6 +2060,27 @@ async fn execute_mark_acknowledged(
         ))) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Prunes the fill from the position's pending-acknowledgement set once its
+/// `OnChainTrade` marker is durable, completing the exactly-once sequence
+/// (ADR 0010). Pruning a trade not in the set emits no events (a no-op), so a
+/// re-driven settle is idempotent; infrastructure errors propagate so the
+/// apalis retry re-drives the settle until the entry self-heals.
+pub(crate) async fn execute_settle_fill(
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+) -> Result<(), SendError<Position>> {
+    let base_symbol = trade.symbol.base();
+
+    let command = PositionCommand::SettleOnChainFill {
+        trade_id: TradeId {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        },
+    };
+
+    position.send(base_symbol, command).await
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
@@ -2104,6 +2128,11 @@ where
                 symbol = %trade.symbol,
                 "Trade already processed (duplicate event), skipping"
             );
+            // Self-heal a marker-without-settle leak (ADR 0010): a crash
+            // between MARK and SETTLE leaves the trade marked but still in
+            // the pending set. The marker is durable, so prune it now. A
+            // no-op when already pruned.
+            execute_settle_fill(&cqrs.position, &trade).await?;
             return Ok(None);
         }
         Ok(Some(state)) => {
@@ -2151,6 +2180,10 @@ where
     )
     .await?;
     execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await?;
+    // Prune the pending-acknowledgement entry now that the marker is durable
+    // (ADR 0010), before any early return below, so the threshold-not-met and
+    // placement-skip paths still settle.
+    execute_settle_fill(&cqrs.position, &trade).await?;
 
     let base_symbol = trade.symbol.base();
 
@@ -4950,6 +4983,97 @@ mod tests {
         assert_eq!(
             fills_after, 2,
             "re-delivering the marked fill must not re-apply it (no double-count)"
+        );
+    }
+
+    /// Exactly-once across a CRASH + later fill -- the scenario the single
+    /// slot cannot handle (ADR 0010). Fill A is witnessed and applied to the
+    /// position but its marker never lands (crash before MARK). A later fill B
+    /// advances the single-slot guard to B, so the slot no longer holds A.
+    /// Re-delivering A through the real pipeline must be rejected by the
+    /// position's pending-acknowledgement set -- not double-counted. This is the
+    /// cross-process / process-tx-CLI double-count the slot alone misses; with
+    /// only the single slot, re-delivering A would emit a third
+    /// `OnChainOrderFilled`.
+    #[tokio::test]
+    async fn redelivery_of_unmarked_fill_after_later_fill_is_rejected() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        // Fill A: witnessed and applied to the position, but crash before MARK
+        // (and SETTLE). A is durably in the pending-acknowledgement set.
+        let event_a = make_trade_event(60);
+        let trade_a = test_trade_with_amount(float!(1.0), 60);
+        let block_timestamp_a = trade_a
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+        execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade_a,
+            event_a.block_number,
+            block_timestamp_a,
+        )
+        .await
+        .unwrap();
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade_a,
+            cqrs.execution_threshold,
+            block_timestamp_a,
+        )
+        .await
+        .expect("premise: A's position write must land before the crash");
+
+        // Fill B: processed end-to-end. Advances the single slot to B,
+        // displacing A; A remains in the pending set.
+        let event_b = make_trade_event(61);
+        process_queued_trade(
+            &MockExecutor::new(),
+            &event_b,
+            test_trade_with_amount(float!(2.0), 61),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let (fills_before,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("PositionEvent::OnChainOrderFilled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fills_before, 2, "premise: A and B each applied once");
+
+        // Re-deliver A (resume path) after B displaced the slot. The pending
+        // set still holds A, so the re-drive must be rejected -- not counted
+        // a second time.
+        process_queued_trade(
+            &MockExecutor::new(),
+            &event_a,
+            test_trade_with_amount(float!(1.0), 60),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let (fills_after,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("PositionEvent::OnChainOrderFilled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fills_after, 2,
+            "re-delivering the unmarked, slot-displaced fill must not re-apply \
+             it (no double-count)"
         );
     }
 

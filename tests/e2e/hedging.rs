@@ -415,9 +415,13 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         pre_shutdown_onchain_events + ONCHAIN_EVENTS_PER_TRADE,
         "Restart should persist exactly one new witnessed-and-acknowledged trade",
     );
+    // One hedged fill emits five Position events: OnChainOrderFilled +
+    // OnChainFillApplied (dedup bookkeeping, ADR 0010) + the marker's
+    // OnChainFillSettled, then OffChainOrderPlaced and
+    // OffChainOrderFilled.
     assert_eq!(
         post_restart_position_events,
-        pre_shutdown_position_events + 3,
+        pre_shutdown_position_events + 5,
         "Restart should emit exact Position success transition events for one hedge",
     );
     assert_eq!(
