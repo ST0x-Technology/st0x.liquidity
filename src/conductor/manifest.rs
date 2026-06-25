@@ -102,7 +102,7 @@ impl QueryManifest {
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(lifecycle_failure.clone())
-            .build(services.clone())
+            .build(())
             .await?;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
