@@ -50,36 +50,6 @@ Variables and parameters of this type must be named `job_queue`, never
 `storage`. The primary purpose is queueing jobs for processing; the fact that
 SQLite backs it is an implementation detail.
 
-### Operator Recovery Verbs
-
-CLI commands that recover stuck or failed operations follow a fixed vocabulary
-so each command's intent is unambiguous. A command is grouped under the object
-it acts on (`transfer`, `position`, `view`, `cctp`) and uses exactly one of six
-verbs -- one verb per intent:
-
-- `resume` -- drive an interrupted, non-terminal operation forward; idempotent,
-  never forces a transition.
-- `recheck` -- re-query the external provider and apply the result (REST).
-- `fail` -- force a stuck non-terminal operation to its `Failed` terminal;
-  `--reason` required.
-- `reconcile` -- release an already-terminal-failed operation handled
-  out-of-band: clears the stranded guard and zeroes source-venue inflight
-  without crediting available (the funds already left the source venue, whether
-  stuck in transit or failed after arrival); `--reason` required.
-- `set` -- overwrite aggregate-derived state to an operator-asserted value;
-  `--reason` required.
-- `rebuild` -- recompute a projection from the event log.
-
-Two commands sit deliberately outside the verb set, named for their exact
-effect: `cctp complete-mint` (a raw on-chain primitive touching no aggregate)
-and `position release-hedge` (releases a Position's stuck pending-offchain-order
-pointer so hedging can retry; `--reason` required).
-
-`recover` is forbidden as a CLI verb -- it spans three unrelated intents and
-carries no information. All state-mutating verbs emit events through aggregate
-commands (CQRS); none write the `events` table directly. See the "Operator
-Recovery Surface" section of [SPEC.md](../SPEC.md) for the full treatment.
-
 ### Refactoring Completeness
 
 When renaming a type, **all** related names must change: variable names,

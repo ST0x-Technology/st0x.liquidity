@@ -26,9 +26,7 @@ use st0x_config::{
 };
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
 use st0x_evm::{ReadOnlyEvm, USDC_BASE};
-use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
-};
+use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Positive, Symbol};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
@@ -192,7 +190,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                             offchain_order_id: order_id,
                             shares_filled: order.shares(),
                             direction: order.direction(),
-                            executor_order_id: ExecutorOrderId::new(&broker_order_id),
+                            executor_order_id: broker_order_id.clone(),
                             price,
                             broker_timestamp: executed_at,
                         },
@@ -229,7 +227,23 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                     .await?;
             }
 
-            PartiallyFilled { .. } | Cancelled { .. } | Pending | Submitted { .. } => {}
+            // This helper cannot faithfully replay a broker cancellation:
+            // the production path (recover_unrequested_cancellation) drives
+            // CancelOrder + ConfirmCancellation through the aggregate's
+            // OrderPlacer services, but this store is wired with its own
+            // MockExecutor whose status reads would reconcile against the
+            // wrong broker state. Fail loudly so a future test that needs
+            // cancellations drives the real PollOrderStatus job instead of
+            // silently leaving the position stuck.
+            Cancelled { .. } => {
+                return Err(format!(
+                    "poll_submitted_orders does not support broker cancellations \
+                     (order {order_id}); drive the real PollOrderStatus job instead"
+                )
+                .into());
+            }
+
+            Pending | Submitted { .. } | PartiallyFilled { .. } => {}
         }
     }
 
@@ -724,6 +738,7 @@ async fn create_test_cqrs_with_assets(
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
+        hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
     };
 
     (
