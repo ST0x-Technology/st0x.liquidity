@@ -520,6 +520,7 @@ async fn ingest_position(
         | PositionEvent::ThresholdUpdated { .. }
         | PositionEvent::OnChainFillApplied { .. }
         | PositionEvent::OnChainFillSettled { .. }
+        | PositionEvent::ReorgSettled { .. }
         | PositionEvent::OffChainOrderFailed { .. }
         | PositionEvent::OffChainOrderCancelled { .. }
         | PositionEvent::ReorgSettled { .. } => {}

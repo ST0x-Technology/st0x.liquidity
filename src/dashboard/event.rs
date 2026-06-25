@@ -1180,7 +1180,8 @@ impl Reactor for Broadcaster {
                         })
                         .await?;
                     }
-                    OnChainTradeEvent::SourceAttributed { .. } => {
+                    OnChainTradeEvent::SourceAttributed { .. }
+                    | OnChainTradeEvent::ReWitnessed { .. } => {
                         self.broadcast_onchain_trade_revision(id).await?;
                     }
                     OnChainTradeEvent::Enriched { .. }
