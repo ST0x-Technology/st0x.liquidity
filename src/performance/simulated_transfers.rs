@@ -60,8 +60,8 @@ use crate::vault_lookup::{VaultLookup, VaultLookupError};
 /// Minimal [`Tokenizer`] shared by [`seed_simulated_mint_history`]'s and
 /// [`seed_simulated_equity_redemption_history`]'s temporary stores.
 ///
-/// The mint fixture drives only the mint happy path (`RequestMintAt` ->
-/// `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`), which calls exactly
+/// The mint fixture drives only the mint happy path (`RecordMintRequestedAt` ->
+/// `RecordTokensReceivedAt` -> `WrapTokensAt` -> `DepositToVaultAt`), which calls exactly
 /// `request_mint`/`poll_mint_until_complete`. The redemption fixture drives
 /// only `wait_for_block`/`redemption_wallet`/`send_for_redemption` (its
 /// `Detect`/`Complete` steps are pure state transitions with no service
@@ -226,7 +226,8 @@ fn usdc(value: f64) -> anyhow::Result<Usdc> {
 /// Seeds deterministic equity-mint history for local dashboard simulation.
 ///
 /// Drives the `TokenizedEquityMint` aggregate's happy path
-/// (`RequestMintAt` -> `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`)
+/// (`RecordMintRequestedAt` -> `RecordTokensReceivedAt` -> `WrapTokensAt` ->
+/// `DepositToVaultAt`)
 /// through a temporary store, one mint per day alternating between the same
 /// dedicated fixture symbols (`AAPL.SIM`/`TSLA.SIM`) used by
 /// [`super::seed_simulated_hedge_latency_history`].
@@ -237,17 +238,11 @@ pub async fn seed_simulated_mint_history(
 ) -> anyhow::Result<()> {
     sqlx::migrate!().set_ignore_missing(true).run(pool).await?;
 
-    let mut services = EquityTransferServices::panicking();
-    // Mint's happy path never calls `redemption_wallet`/`send_for_redemption`;
-    // the address and day are meaningful only to
-    // `seed_simulated_equity_redemption_history`'s use of this same fixture.
-    services.tokenizer = Arc::new(FixtureTokenizer::new(Address::ZERO, 0));
-
     let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::new(RetryOnBusy {
             inner: EquityTimingProjection::new(pool.clone()),
         }))
-        .build(services)
+        .build(())
         .await?;
 
     let range_start = now - Duration::days(i64::from(days)) - Duration::days(1);
@@ -267,19 +262,31 @@ pub async fn seed_simulated_mint_history(
 
         mint.send(
             &issuer_request_id,
-            TokenizedEquityMintCommand::RequestMintAt {
+            TokenizedEquityMintCommand::RecordMintRequestedAt {
                 issuer_request_id: issuer_request_id.clone(),
                 symbol: symbol.clone(),
                 quantity,
                 wallet,
+                tokenization_request_id: tokenization_request_id(&format!(
+                    "sim-mint-{issuer_request_id}"
+                )),
                 requested_at,
             },
         )
         .await?;
 
+        // Derived from the 16-byte `IssuerRequestId` uuid, matching the mint
+        // tx-hash convention of the redemption fixture's tokenizer.
+        let mint_tx_hash = TxHash::left_padding_from(issuer_request_id.0.as_bytes());
+
         mint.send(
             &issuer_request_id,
-            TokenizedEquityMintCommand::PollAt { received_at },
+            TokenizedEquityMintCommand::RecordTokensReceivedAt {
+                tx_hash: Some(mint_tx_hash),
+                token_symbol: Some(format!("t{symbol}")),
+                fees: None,
+                received_at,
+            },
         )
         .await?;
 

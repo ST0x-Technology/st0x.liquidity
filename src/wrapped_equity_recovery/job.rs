@@ -488,7 +488,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
-        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
