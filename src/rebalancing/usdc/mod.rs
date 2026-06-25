@@ -38,6 +38,22 @@ pub(crate) enum UsdcTransferError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] Box<CctpError>),
+    /// Emitted only by burn call sites (`burn_on_base`, `burn_on_ethereum`) when
+    /// the burn fails with a revert-class error: EVM execution reverts and
+    /// pre-flight rejections that produce no on-chain state change. Safe to
+    /// redrive via the scan-or-reburn path in `resume_bridging_submitting` /
+    /// `resume_bridging_submitting_ethereum`.
+    ///
+    /// IMPORTANT: The double-burn safety guarantee does NOT come from this
+    /// classification. It comes from `resume_bridging_submitting` /
+    /// `resume_bridging_submitting_ethereum` scanning for an existing burn (via
+    /// `find_recent_burn`) before attempting a new one, with the scan lower bound
+    /// (`from_block`) durably recorded in the `BeginBridging` / `BridgingSubmitting`
+    /// event before the burn call. This variant identifies errors where the EVM
+    /// produced no lasting state change (post-mining reverts, pre-flight rejections).
+    /// The safety guarantee is the scan, not this variant.
+    #[error("CCTP burn revert (no on-chain state change): {0}")]
+    BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]

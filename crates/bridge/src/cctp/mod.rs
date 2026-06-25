@@ -431,6 +431,11 @@ impl CctpError {
     /// Returns `true` if this error represents a transaction revert (as opposed
     /// to a transport failure or other non-revert EVM error).
     ///
+    /// Revert classification is an intentional, supported part of `CctpError`'s
+    /// public contract: the main crate's burn paths (`burn_on_base` /
+    /// `burn_on_ethereum`) call it to distinguish a redrivable revert-class burn
+    /// failure from a terminal one.
+    ///
     /// Used by `burn_internal` to gate the allowance-check retry: only reverts
     /// can be allowance-related; transport errors and other non-revert errors
     /// are not.
@@ -443,7 +448,7 @@ impl CctpError {
     /// only revert-class when the inner error carries actual revert data (same
     /// reasoning as `EvmError::Contract` — a network blip wraps as Contract with
     /// no revert data and must not trigger the retry).
-    pub(crate) fn is_revert(&self) -> bool {
+    pub fn is_revert(&self) -> bool {
         match self {
             // Delegate to EvmError::is_revert(), which is exhaustive over all
             // EvmError variants (including feature-gated ones) and lives in

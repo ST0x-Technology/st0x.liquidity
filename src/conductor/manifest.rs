@@ -207,6 +207,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
 
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -265,6 +266,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
@@ -381,6 +383,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
