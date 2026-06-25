@@ -537,6 +537,7 @@ impl Conductor {
             recovery_transfer,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
+            unwrapped_equity_recovery_services,
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,
@@ -570,19 +571,8 @@ impl Conductor {
         )
         .await?;
 
-        // Hydrate the in-memory InventoryView from persisted snapshot
-        // state so the runtime projection has the same data as the
-        // database. Without this, the first post-restart poll may emit
-        // no events (unchanged values are deduplicated), leaving the
-        // view empty and potentially causing incorrect rebalancing.
-        hydrate_inventory_from_snapshot(&pool, &inventory).await;
-        if let Some(service) = &rebalancing_service {
-            service.enqueue_recovery_for_current_wallet_balances().await;
-        }
-
-        // Catch the lifecycle-failure read model up to the event log before its
-        // OffchainOrder reactor (registered below) goes live, in both modes.
-        catch_up_lifecycle_failures(&pool).await?;
+        hydrate_startup_inventory_and_read_models(&pool, &inventory, rebalancing_service.as_ref())
+            .await?;
 
         // The HedgeLatencyProjection subscribes to BOTH Position and
         // OffchainOrder (see its deps!). This instance, on the OffchainOrder
@@ -638,6 +628,7 @@ impl Conductor {
             EquityRecoveryInputs {
                 wrapped_store: wrapped_equity_recovery_store,
                 unwrapped_store: unwrapped_equity_recovery_store,
+                unwrapped_services: unwrapped_equity_recovery_services,
                 rebalancing_service: rebalancing_service.clone(),
                 mint_store: mint_store.clone(),
                 redemption_store: redemption_store.clone(),
@@ -842,6 +833,7 @@ fn build_wrapped_equity_recovery_ctx(
 /// job needs is present; returns `None` (recovery wiring absent) if any is not.
 fn build_unwrapped_equity_recovery_ctx(
     store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
+    services: Option<UnwrappedEquityRecoveryServices>,
     service: Option<Arc<RebalancingService>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
@@ -849,8 +841,8 @@ fn build_unwrapped_equity_recovery_ctx(
     queue: UnwrappedEquityRecoveryJobQueue,
     reschedule_interval: Duration,
 ) -> Option<Arc<UnwrappedEquityRecoveryCtx>> {
-    let (Some(store), Some(service), Some(mint_store), Some(redemption_store)) =
-        (store, service, mint_store, redemption_store)
+    let (Some(store), Some(services), Some(service), Some(mint_store), Some(redemption_store)) =
+        (store, services, service, mint_store, redemption_store)
     else {
         return None;
     };
@@ -858,6 +850,7 @@ fn build_unwrapped_equity_recovery_ctx(
     Some(Arc::new(UnwrappedEquityRecoveryCtx {
         inventory,
         store,
+        services,
         mint_store,
         redemption_store,
         equity_in_progress: service.equity_in_progress.clone(),
@@ -1085,6 +1078,26 @@ async fn hydrate_single_snapshot(
     info!(%id, event_count, "Hydrated InventoryView from persisted snapshot");
 }
 
+/// Brings the in-memory startup state into line with the event log before the
+/// job workers and reactors go live: hydrates the `InventoryView` from the
+/// persisted snapshot (without this, the first post-restart poll deduplicates
+/// unchanged values and leaves the view empty, risking incorrect rebalancing),
+/// enqueues recovery for any current wallet balances, and catches the
+/// lifecycle-failure read model up to the log before its `OffchainOrder`
+/// reactor is registered.
+async fn hydrate_startup_inventory_and_read_models(
+    pool: &SqlitePool,
+    inventory: &Arc<BroadcastingInventory>,
+    rebalancing_service: Option<&Arc<RebalancingService>>,
+) -> anyhow::Result<()> {
+    hydrate_inventory_from_snapshot(pool, inventory).await;
+    if let Some(service) = rebalancing_service {
+        service.enqueue_recovery_for_current_wallet_balances().await;
+    }
+    catch_up_lifecycle_failures(pool).await?;
+    Ok(())
+}
+
 struct RebalancingInfrastructure {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
@@ -1094,6 +1107,7 @@ struct RebalancingInfrastructure {
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
+    unwrapped_equity_recovery_services: UnwrappedEquityRecoveryServices,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
     transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
@@ -1130,6 +1144,7 @@ struct PositionAndRebalancing {
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
     unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
+    unwrapped_equity_recovery_services: Option<UnwrappedEquityRecoveryServices>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
     transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
@@ -1183,6 +1198,7 @@ impl PositionAndRebalancing {
                 recovery_transfer: Some(infra.recovery_transfer),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
                 unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
+                unwrapped_equity_recovery_services: Some(infra.unwrapped_equity_recovery_services),
                 mint_store: Some(infra.mint_store),
                 redemption_store: Some(infra.redemption_store),
                 transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
@@ -1222,6 +1238,7 @@ impl PositionAndRebalancing {
                 recovery_transfer: None,
                 wrapped_equity_recovery_store: None,
                 unwrapped_equity_recovery_store: None,
+                unwrapped_equity_recovery_services: None,
                 mint_store: None,
                 redemption_store: None,
                 transfer_usdc_to_hedging_ctx: None,
@@ -1378,18 +1395,22 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             built.redemption.clone(),
         ));
 
-        // Built outside `QueryManifest`: services depend on mint/redemption stores
-        // that the manifest produces.
-        let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
-            build_equity_recovery_stores(
-                &deps.pool,
-                raindex_service.clone(),
-                vault_lookup.clone(),
-                wrapper.clone(),
-                recovery_transfer.clone(),
-                base_wallet.address(),
-            )
-            .await?;
+        // Built outside `QueryManifest` because the recovery aggregate's
+        // services include `recovery_transfer`, which depends on the
+        // mint/redemption stores produced by the manifest above.
+        let (
+            wrapped_equity_recovery_store,
+            unwrapped_equity_recovery_store,
+            unwrapped_equity_recovery_services,
+        ) = build_equity_recovery_stores(
+            &deps.pool,
+            raindex_service.clone(),
+            vault_lookup.clone(),
+            wrapper.clone(),
+            recovery_transfer.clone(),
+            base_wallet.address(),
+        )
+        .await?;
 
         let mut resume_tokenization_queue = ResumeTokenizationJobQueue::new(&deps.apalis_pool);
 
@@ -1488,6 +1509,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             recovery_transfer,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
+            unwrapped_equity_recovery_services,
             mint_store: built.mint,
             redemption_store: built.redemption,
             transfer_usdc_to_hedging_ctx,
@@ -1534,6 +1556,7 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
 ) -> anyhow::Result<(
     Arc<Store<WrappedEquityRecovery>>,
     Arc<Store<UnwrappedEquityRecovery>>,
+    UnwrappedEquityRecoveryServices,
 )> {
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
         .build(WrappedEquityRecoveryServices {
@@ -1544,17 +1567,22 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
         })
         .await?;
 
+    // The unwrapped-recovery aggregate is a pure event recorder; its onchain
+    // side effects run in the recovery job, which holds these services on its
+    // ctx rather than on the store.
+    let unwrapped_services = UnwrappedEquityRecoveryServices {
+        raindex,
+        vault_lookup,
+        wrapper,
+        transfer,
+        wallet,
+    };
+
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
-        .build(UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
-            transfer,
-            wallet,
-        })
+        .build(())
         .await?;
 
-    Ok((wrapped_store, unwrapped_store))
+    Ok((wrapped_store, unwrapped_store, unwrapped_services))
 }
 
 /// Recovers inflight state from event history at startup.
