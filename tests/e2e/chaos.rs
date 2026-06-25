@@ -60,7 +60,20 @@ pub(crate) enum ChaosBehaviour {
     /// block range -- the same logs are delivered again in a later poll
     /// round, after the consumer's checkpoint has already advanced.
     ReplayLogs,
+    /// Like [`ChaosBehaviour::ReplayLogs`], but rewrites each re-served
+    /// log's `blockHash` to [`FORK_BLOCK_HASH`]. Models a load-balanced
+    /// RPC node on a forked branch re-serving an already-ingested fill's
+    /// log under the fork's block -- the reorg the consumer detects via
+    /// block-hash mismatch against the hash it persisted at ingestion.
+    ForkReplay,
 }
+
+/// Block hash the [`ChaosBehaviour::ForkReplay`] perturbation stamps onto
+/// re-served logs. All-`0xff` cannot collide with a real Anvil block hash,
+/// so the consumer's persisted-vs-observed comparison always sees a
+/// mismatch and treats the re-served fill as reorged off the canonical
+/// chain.
+const FORK_BLOCK_HASH: &str = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 /// Knob describing which method to perturb and for how many calls.
 ///
@@ -234,6 +247,23 @@ impl ChaosProxy {
         *self.config.lock().await = Some(ChaosConfig {
             method: "eth_getLogs".to_owned(),
             behaviour: ChaosBehaviour::ReplayLogs,
+            remaining: count,
+            pending_stale_tips: 0,
+        });
+    }
+
+    /// Convenience: re-serve the last non-empty `eth_getLogs` result for
+    /// the same event signature into the next `count` `eth_getLogs`
+    /// responses with each re-served log's `blockHash` rewritten to
+    /// [`FORK_BLOCK_HASH`], modelling a forked RPC node re-serving an
+    /// already-ingested fill's log under a competing block. A generous
+    /// `count` covers both event-signature polls across several rounds;
+    /// the consumer's reorg reversal is exactly-once, so re-detecting the
+    /// same fork on later rounds is an idempotent no-op.
+    pub(crate) async fn fork_replay_get_logs(&self, count: usize) {
+        *self.config.lock().await = Some(ChaosConfig {
+            method: "eth_getLogs".to_owned(),
+            behaviour: ChaosBehaviour::ForkReplay,
             remaining: count,
             pending_stale_tips: 0,
         });
@@ -587,8 +617,20 @@ enum Perturbation {
     /// Forward upstream, then hold the response for this long.
     DelayResponse(Duration),
     /// Forward upstream, then merge previously-cached logs for the same
-    /// event signature into the response.
-    ReplayResponse,
+    /// event signature into the response, in the given mode.
+    ReplayResponse(ReplayMode),
+}
+
+/// How [`replay_cached_logs`] re-serves cached logs.
+#[derive(Debug, Clone, Copy)]
+enum ReplayMode {
+    /// Re-serve cached logs verbatim, modelling a stale node on the same
+    /// chain ([`ChaosBehaviour::ReplayLogs`]).
+    SameChain,
+    /// Re-serve cached logs with their `blockHash` rewritten to
+    /// [`FORK_BLOCK_HASH`], modelling a node on a competing fork
+    /// ([`ChaosBehaviour::ForkReplay`]).
+    Forked,
 }
 
 /// Decide a single JSON-RPC request: synthesize, delay, or replay a
@@ -619,9 +661,9 @@ async fn process_one(state: &ProxyState, request: Value) -> Value {
             tokio::time::sleep(duration).await;
             response
         }
-        Some(Perturbation::ReplayResponse) => {
+        Some(Perturbation::ReplayResponse(mode)) => {
             let response = forward_or_rpc_error(state, &request, id).await;
-            replay_cached_logs(state, &request, response).await
+            replay_cached_logs(state, &request, response, mode).await
         }
         None => {
             let response = forward_or_rpc_error(state, &request, id).await;
@@ -667,8 +709,15 @@ async fn cache_get_logs_result(state: &ProxyState, request: &Value, response: &V
 /// response, skipping logs already present (matched by transaction hash
 /// and log index), then refreshes the cache with the original result.
 /// The merged response models a stale node re-serving logs from outside
-/// the requested block range.
-async fn replay_cached_logs(state: &ProxyState, request: &Value, mut response: Value) -> Value {
+/// the requested block range. Under [`ReplayMode::Forked`] each re-served
+/// log's `blockHash` is rewritten to [`FORK_BLOCK_HASH`] so the merge
+/// models a competing fork rather than the same chain.
+async fn replay_cached_logs(
+    state: &ProxyState,
+    request: &Value,
+    mut response: Value,
+    mode: ReplayMode,
+) -> Value {
     let Some(signature) = filter_event_signature(request) else {
         return response;
     };
@@ -709,15 +758,25 @@ async fn replay_cached_logs(state: &ProxyState, request: &Value, mut response: V
     };
     let present: Vec<_> = result.iter().map(log_key).collect();
 
-    let replayed: Vec<Value> = cached_logs
+    let mut replayed: Vec<Value> = cached_logs
         .into_iter()
         .filter(|log| !present.contains(&log_key(log)))
         .collect();
 
+    match mode {
+        ReplayMode::Forked => {
+            for log in &mut replayed {
+                log["blockHash"] = json!(FORK_BLOCK_HASH);
+            }
+        }
+        ReplayMode::SameChain => {}
+    }
+
     warn!(
         signature,
         replayed = replayed.len(),
-        "ReplayLogs: re-serving stale logs alongside the live response"
+        ?mode,
+        "replay: re-serving stale logs alongside the live response"
     );
     result.extend(replayed);
 
@@ -775,7 +834,11 @@ async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturb
                     }
                     ChaosBehaviour::ReplayLogs => {
                         cfg.remaining -= 1;
-                        Some(Perturbation::ReplayResponse)
+                        Some(Perturbation::ReplayResponse(ReplayMode::SameChain))
+                    }
+                    ChaosBehaviour::ForkReplay => {
+                        cfg.remaining -= 1;
+                        Some(Perturbation::ReplayResponse(ReplayMode::Forked))
                     }
                 }
             } else {
@@ -832,5 +895,102 @@ fn json_response(value: &Value) -> Response {
             warn!(?error, "chaos proxy failed to serialize response");
             axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::Client;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use url::Url;
+
+    use super::{ProxyState, ReplayMode, replay_cached_logs};
+
+    /// Pins the [`ChaosBehaviour::ForkReplay`] harness contract the reorg e2e
+    /// depends on: a fill log cached from an earlier witnessing round is re-served
+    /// on a later `eth_getLogs` round as the *same* log (transaction hash and log
+    /// index preserved) but stamped with the competing fork's block hash. The
+    /// bot's reorg detection keys entirely off that block-hash mismatch, so if the
+    /// merge ever stopped re-serving the cached log or stopped rewriting its
+    /// `blockHash`, the e2e would silently stop exercising a reorg.
+    ///
+    /// This exercises [`replay_cached_logs`] directly -- the proxy's response
+    /// transform -- without the upstream node or the full bot: the only collaborator
+    /// it needs is the pre-seeded logs cache.
+    #[tokio::test]
+    async fn fork_replay_reserves_cached_fill_under_competing_block_hash() {
+        let signature =
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_owned();
+        let canonical_block_hash =
+            "0x00000000000000000000000000000000000000000000000000000000000000aa";
+        let transaction_hash = "0x00000000000000000000000000000000000000000000000000000000000000bb";
+        let log_index = "0x0";
+
+        // The fill the bot already ingested, cached by the proxy under its event
+        // signature during the witnessing round, on its original canonical block.
+        let cached_log = json!({
+            "transactionHash": transaction_hash,
+            "logIndex": log_index,
+            "blockHash": canonical_block_hash,
+        });
+
+        let state = ProxyState {
+            config: Arc::new(Mutex::new(None)),
+            logs_cache: Arc::new(Mutex::new(HashMap::from([(
+                signature.clone(),
+                vec![cached_log],
+            )]))),
+            // Never used by `replay_cached_logs` (it transforms an already-received
+            // response), but required to build the handler state.
+            upstream: Url::parse("http://127.0.0.1:1").unwrap(),
+            client: Client::new(),
+        };
+
+        // A later poll round whose live result is empty: the forked node serves no
+        // new logs in the requested range but replays the stale cached fill.
+        let request = json!({ "params": [{ "topics": [signature] }] });
+        let live_response = json!({ "jsonrpc": "2.0", "id": 1, "result": [] });
+
+        let replayed =
+            replay_cached_logs(&state, &request, live_response, ReplayMode::Forked).await;
+
+        let result = replayed["result"]
+            .as_array()
+            .expect("the replayed response must carry a result array");
+        assert_eq!(
+            result.len(),
+            1,
+            "ForkReplay must re-serve the single cached fill into the empty live result",
+        );
+
+        let reserved = &result[0];
+        assert_eq!(
+            reserved["transactionHash"],
+            json!(transaction_hash),
+            "the re-served log must be the same fill (transaction hash preserved)",
+        );
+        assert_eq!(
+            reserved["logIndex"],
+            json!(log_index),
+            "the re-served log must be the same fill (log index preserved)",
+        );
+
+        // 32 bytes of 0xff, derived independently of the production constant so the
+        // assertion pins the value rather than comparing the code against itself.
+        let competing_fork_hash = format!("0x{}", "f".repeat(64));
+        assert_eq!(
+            reserved["blockHash"],
+            json!(competing_fork_hash),
+            "ForkReplay must stamp the re-served fill with the competing fork block hash",
+        );
+        assert_ne!(
+            reserved["blockHash"],
+            json!(canonical_block_hash),
+            "the re-served block hash must differ from the canonical hash the bot \
+             persisted, so the bot detects the block-hash mismatch",
+        );
     }
 }
