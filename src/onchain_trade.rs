@@ -150,9 +150,11 @@ impl EventSourced for OnChainTrade {
                 reorg_acknowledged_at: None,
             }),
 
-            Enriched { .. } | Acknowledged { .. } | Reorged { .. } | ReorgAcknowledged { .. } => {
-                None
-            }
+            Enriched { .. }
+            | Acknowledged { .. }
+            | Reorged { .. }
+            | ReorgAcknowledged { .. }
+            | ReWitnessed { .. } => None,
         }
     }
 
@@ -191,6 +193,26 @@ impl EventSourced for OnChainTrade {
                 reorg_acknowledged_at,
             } => Ok(Some(Self {
                 reorg_acknowledged_at: Some(*reorg_acknowledged_at),
+                ..entity.clone()
+            })),
+
+            // Re-mined on a new canonical block: rewrite the block fields and
+            // clear all three lifecycle markers so the fill returns to a fresh
+            // post-witness state, re-acknowledgeable through the normal path. The
+            // fill content (symbol/amount/direction/price_usdc) and `filled_at`
+            // are preserved via `..entity.clone()`; only the block changed.
+            ReWitnessed {
+                block_number,
+                block_hash,
+                block_timestamp,
+                ..
+            } => Ok(Some(Self {
+                block_number: Some(*block_number),
+                block_hash: *block_hash,
+                block_timestamp: *block_timestamp,
+                acknowledged_at: None,
+                reorged_at: None,
+                reorg_acknowledged_at: None,
                 ..entity.clone()
             })),
 
@@ -245,9 +267,11 @@ impl EventSourced for OnChainTrade {
                 filled_at,
             }]),
 
-            Enrich { .. } | Acknowledge | RecordReorg { .. } | AcknowledgeReorg => {
-                Err(OnChainTradeError::NotFilled)
-            }
+            Enrich { .. }
+            | Acknowledge
+            | RecordReorg { .. }
+            | AcknowledgeReorg
+            | ReWitness { .. } => Err(OnChainTradeError::NotFilled),
         }
     }
 
@@ -334,6 +358,26 @@ impl EventSourced for OnChainTrade {
                     reorg_acknowledged_at: Utc::now(),
                 }])
             }
+
+            ReWitness {
+                block_number,
+                block_hash,
+                block_timestamp,
+            } => {
+                // Only re-witness once the reversal is fully settled across both
+                // aggregates. Re-witnessing earlier would clear the reorg markers
+                // mid-reversal and desync the resume keying in `record_reorg`.
+                if !self.is_reorg_acknowledged() {
+                    return Err(OnChainTradeError::NotReorgAcknowledged);
+                }
+
+                Ok(vec![ReWitnessed {
+                    block_number,
+                    block_hash,
+                    block_timestamp,
+                    re_witnessed_at: Utc::now(),
+                }])
+            }
         }
     }
 }
@@ -394,6 +438,8 @@ pub(crate) enum OnChainTradeError {
     NotReorged,
     #[error("Trade's reorg has already been acknowledged")]
     AlreadyReorgAcknowledged,
+    #[error("Cannot re-witness a fill whose reorg reversal is not yet acknowledged")]
+    NotReorgAcknowledged,
     #[error(
         "Effective gas price {effective_gas_price} exceeds i64::MAX \
          and cannot be stored in SQLite"
@@ -459,6 +505,18 @@ pub(crate) enum OnChainTradeCommand {
     /// "reversal started" from "reversal finished" and resume a crashed
     /// reversal instead of skipping it (ADR 0012).
     AcknowledgeReorg,
+    /// Re-witnesses a reorged fill on the new canonical block it was re-mined
+    /// on. The same `(tx_hash, log_index)` re-confirmed with identical economic
+    /// content (amount/direction/price) on a block the original reorg did not
+    /// hold. Valid only once the reversal is fully acknowledged: it rewrites the
+    /// block fields and clears the acknowledge/reorg markers so the fill can be
+    /// re-acknowledged through the normal `Acknowledge` path, restoring the
+    /// position to the fill's impact (the reverse-then-reapply reorg model).
+    ReWitness {
+        block_number: u64,
+        block_hash: Option<B256>,
+        block_timestamp: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +555,19 @@ pub(crate) enum OnChainTradeEvent {
     },
     ReorgAcknowledged {
         reorg_acknowledged_at: DateTime<Utc>,
+    },
+    /// The reorged fill was re-mined on a new canonical block. Resets the
+    /// aggregate to a fresh post-witness state for that block: updates the block
+    /// fields and clears `acknowledged_at`/`reorged_at`/`reorg_acknowledged_at`
+    /// while preserving the unchanged fill content (`symbol`/`amount`/
+    /// `direction`/`price_usdc`), so the fill can be re-acknowledged like a fresh
+    /// witness.
+    ReWitnessed {
+        block_number: u64,
+        #[serde(default)]
+        block_hash: Option<B256>,
+        block_timestamp: DateTime<Utc>,
+        re_witnessed_at: DateTime<Utc>,
     },
 }
 
@@ -575,6 +646,25 @@ impl PartialEq for OnChainTradeEvent {
                     reorg_acknowledged_at: at_b,
                 },
             ) => at_a == at_b,
+            (
+                Self::ReWitnessed {
+                    block_number: block_num_a,
+                    block_hash: block_hash_a,
+                    block_timestamp: block_ts_a,
+                    re_witnessed_at: at_a,
+                },
+                Self::ReWitnessed {
+                    block_number: block_num_b,
+                    block_hash: block_hash_b,
+                    block_timestamp: block_ts_b,
+                    re_witnessed_at: at_b,
+                },
+            ) => {
+                block_num_a == block_num_b
+                    && block_hash_a == block_hash_b
+                    && block_ts_a == block_ts_b
+                    && at_a == at_b
+            }
             _ => false,
         }
     }
@@ -590,6 +680,7 @@ impl DomainEvent for OnChainTradeEvent {
             Self::Acknowledged { .. } => "OnChainTradeEvent::Acknowledged".to_string(),
             Self::Reorged { .. } => "OnChainTradeEvent::Reorged".to_string(),
             Self::ReorgAcknowledged { .. } => "OnChainTradeEvent::ReorgAcknowledged".to_string(),
+            Self::ReWitnessed { .. } => "OnChainTradeEvent::ReWitnessed".to_string(),
         }
     }
 
@@ -1277,6 +1368,189 @@ mod tests {
             error,
             LifecycleError::Apply(OnChainTradeError::AlreadyReorgAcknowledged)
         ));
+    }
+
+    fn filled_acknowledged_reorged_acknowledged(now: DateTime<Utc>) -> Vec<OnChainTradeEvent> {
+        vec![
+            OnChainTradeEvent::Filled {
+                symbol: Symbol::new("AAPL").unwrap(),
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_hash: Some(b256!(
+                    "0xabababababababababababababababababababababababababababababababab"
+                )),
+                block_timestamp: now,
+                filled_at: now,
+            },
+            OnChainTradeEvent::Acknowledged {
+                acknowledged_at: now,
+            },
+            OnChainTradeEvent::Reorged {
+                reorg_depth: 3,
+                reorged_at: now,
+            },
+            OnChainTradeEvent::ReorgAcknowledged {
+                reorg_acknowledged_at: now,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn re_witness_after_reorg_acknowledged_emits_re_witnessed() {
+        let now = Utc::now();
+        let new_block_hash =
+            b256!("0xbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc");
+
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given(filled_acknowledged_reorged_acknowledged(now))
+            .when(OnChainTradeCommand::ReWitness {
+                block_number: 99999,
+                block_hash: Some(new_block_hash),
+                block_timestamp: now,
+            })
+            .await
+            .events();
+
+        let [
+            OnChainTradeEvent::ReWitnessed {
+                block_number,
+                block_hash,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("ReWitness on a reorg-acknowledged trade must emit ReWitnessed; got {events:?}");
+        };
+        assert_eq!(*block_number, 99999);
+        assert_eq!(*block_hash, Some(new_block_hash));
+    }
+
+    #[tokio::test]
+    async fn cannot_re_witness_before_reorg_acknowledged() {
+        // A fill reorged but whose reversal is not yet acknowledged must not be
+        // re-witnessed -- that would clear the reorg markers mid-reversal and
+        // desync the `record_reorg` resume keying.
+        let now = Utc::now();
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(filled_then_reorged(now))
+            .when(OnChainTradeCommand::ReWitness {
+                block_number: 99999,
+                block_hash: None,
+                block_timestamp: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::NotReorgAcknowledged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cannot_re_witness_a_live_fill() {
+        // A freshly witnessed fill that was never reorged cannot be re-witnessed.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_hash: None,
+                block_timestamp: now,
+                filled_at: now,
+            }])
+            .when(OnChainTradeCommand::ReWitness {
+                block_number: 99999,
+                block_hash: None,
+                block_timestamp: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::NotReorgAcknowledged)
+        ));
+    }
+
+    /// `ReWitnessed` resets the aggregate to a fresh post-witness state: the
+    /// block fields advance to the new canonical block, all three lifecycle
+    /// markers clear, and the unchanged fill content survives.
+    #[test]
+    fn re_witnessed_resets_to_fresh_post_witness_state() {
+        let now = Utc::now();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let new_block_hash =
+            b256!("0xbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc");
+
+        let mut events = filled_acknowledged_reorged_acknowledged(now);
+        events.push(OnChainTradeEvent::ReWitnessed {
+            block_number: 99999,
+            block_hash: Some(new_block_hash),
+            block_timestamp: now,
+            re_witnessed_at: now,
+        });
+
+        let trade = replay::<OnChainTrade>(events)
+            .unwrap()
+            .expect("replay must produce a live trade");
+
+        assert!(
+            !trade.is_acknowledged(),
+            "re-witness must clear the acknowledge marker",
+        );
+        assert!(
+            !trade.is_reorged(),
+            "re-witness must clear the reorged marker"
+        );
+        assert!(
+            !trade.is_reorg_acknowledged(),
+            "re-witness must clear the reorg-ack marker",
+        );
+        assert_eq!(trade.block_number, Some(99999));
+        assert_eq!(trade.block_hash, Some(new_block_hash));
+        // The fill content is unchanged: the same economic fill on a new block.
+        assert_eq!(trade.symbol, symbol);
+        assert!(trade.amount.eq(float!(10.5)).unwrap());
+        assert_eq!(trade.direction, Direction::Buy);
+        assert!(trade.price_usdc.eq(float!(150.25)).unwrap());
+    }
+
+    /// The reverse-then-reapply model relies on a re-witnessed fill accepting
+    /// `Acknowledge` again, so the position can be returned to the fill's impact.
+    #[tokio::test]
+    async fn acknowledge_succeeds_after_re_witness() {
+        let now = Utc::now();
+
+        let mut events = filled_acknowledged_reorged_acknowledged(now);
+        events.push(OnChainTradeEvent::ReWitnessed {
+            block_number: 99999,
+            block_hash: None,
+            block_timestamp: now,
+            re_witnessed_at: now,
+        });
+
+        let acknowledge_events = TestHarness::<OnChainTrade>::with(())
+            .given(events)
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                acknowledge_events.as_slice(),
+                [OnChainTradeEvent::Acknowledged { .. }]
+            ),
+            "a re-witnessed fill must accept Acknowledge again; got {acknowledge_events:?}",
+        );
     }
 
     /// Production emits `Enriched` before `Acknowledged`: enrichment runs
