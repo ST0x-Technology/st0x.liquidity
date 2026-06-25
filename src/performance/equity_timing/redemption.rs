@@ -124,6 +124,13 @@ impl StoredOperation {
             SendPending { pending_at } => {
                 self.open_once(RedemptionSend, *pending_at);
             }
+            // Mid-stream-first case as above: `open_once` no-ops when
+            // `SendPending` already opened the stage, so this only seeds the
+            // send stage for an operation first observed at the submitted
+            // event (deploy/restart backfill).
+            SendSubmitted { submitted_at, .. } => {
+                self.open_once(RedemptionSend, *submitted_at);
+            }
             // Terminal failures: whichever stage is currently open (varies by
             // which of these fired) is closed as failed and the operation
             // ends. `TransferFailed` is emitted either by `SendTokens` (from
@@ -306,6 +313,9 @@ pub(super) fn redemption_observed_at(event: &EquityRedemptionEvent) -> DateTime<
             unwrapped_at: at, ..
         }
         | SendPending { pending_at: at }
+        | SendSubmitted {
+            submitted_at: at, ..
+        }
         | TransferFailed { failed_at: at, .. }
         | TokensSent { sent_at: at, .. }
         | DetectionFailed { failed_at: at, .. }

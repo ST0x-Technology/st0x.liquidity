@@ -588,7 +588,6 @@ mod tests {
 
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
-    use crate::rebalancing::equity::EquityTransferServices;
     use crate::vault_lookup::MockVaultLookup;
 
     use super::*;
@@ -624,14 +623,8 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: wrapper.clone(),
-        };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services));
+        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, ()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             Arc::new(mock_vault_lookup()),
@@ -817,14 +810,8 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let inner_services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: wrapper.clone(),
-        };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, inner_services));
+        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, ()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             Arc::new(mock_vault_lookup()),

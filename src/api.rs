@@ -1091,7 +1091,7 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
                     .or_else(|| shares_from_u256_18_decimal(unwrapped_amount));
             }
 
-            TokensSent { .. } => sent = true,
+            TokensSent { .. } | SendSubmitted { .. } => sent = true,
 
             DetectionFailed { .. } if sent => {
                 terminal = Some((

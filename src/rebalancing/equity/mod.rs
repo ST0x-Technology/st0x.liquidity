@@ -29,8 +29,6 @@ pub(crate) use resume_job::{
 
 use alloy::hex::FromHexError;
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::rpc::types::TransactionReceipt;
-use async_trait::async_trait;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use thiserror::Error;
@@ -40,21 +38,19 @@ use tracing::{debug, error, info, instrument, warn};
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
-use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError};
 use st0x_tokenization::{
     AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
     TokenizationRequestId, TokenizationRequestIdError, TokenizationRequestStatus, Tokenizer,
     TokenizerError,
 };
-use st0x_wrapper::{
-    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
-};
+use st0x_wrapper::{WrapConfirmation, Wrapper, WrapperError};
 
 use super::RebalancingService;
 use super::trigger::RecoveryClaim;
 use super::trigger::freeze::FreezeStatusReader;
 use crate::equity_redemption::{
-    DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
+    DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId, SendOutcome,
 };
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintError,
@@ -188,241 +184,6 @@ async fn load_mint_recheck_context(
     })
 }
 
-/// Services shared by both equity transfer aggregates.
-///
-/// Both `TokenizedEquityMint` (hedging -> market-making) and
-/// `EquityRedemption` (market-making -> hedging) need Raindex for
-/// vault operations and Tokenizer for Alpaca API interactions.
-#[derive(Clone)]
-pub(crate) struct EquityTransferServices {
-    pub(crate) raindex: Arc<dyn Raindex>,
-    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
-    pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) wrapper: Arc<dyn Wrapper>,
-}
-
-impl EquityTransferServices {
-    /// Constructs a services instance whose methods all panic.
-    ///
-    /// Only the redemption aggregate (`EquityRedemption`) still takes
-    /// `EquityTransferServices`; its failure and `Reconcile` commands never
-    /// invoke them, so the panicking stub is safe for the CLI `transfer fail`
-    /// and `transfer reconcile` subcommands where no real broker/RPC connection
-    /// exists. Mint commands use `()` services directly -- `TokenizedEquityMint`
-    /// performs no I/O in its handlers.
-    pub(crate) fn panicking() -> Self {
-        Self {
-            raindex: Arc::new(PanickingRaindex),
-            vault_lookup: Arc::new(PanickingVaultLookup),
-            tokenizer: Arc::new(PanickingTokenizer),
-            wrapper: Arc::new(PanickingWrapper),
-        }
-    }
-}
-
-/// Panicking Raindex stub for CLI-only use. All methods panic.
-struct PanickingRaindex;
-
-#[async_trait]
-impl Raindex for PanickingRaindex {
-    async fn withdraw(
-        &self,
-        _: Address,
-        _: RaindexVaultId,
-        _: U256,
-        _: u8,
-    ) -> Result<TxHash, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
-    async fn submit_deposit(
-        &self,
-        _: Address,
-        _: RaindexVaultId,
-        _: U256,
-        _: u8,
-    ) -> Result<TxHash, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
-    async fn submit_withdraw(
-        &self,
-        _: Address,
-        _: RaindexVaultId,
-        _: U256,
-        _: u8,
-    ) -> Result<TxHash, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
-    async fn confirm_tx_receipt(&self, _: TxHash) -> Result<TransactionReceipt, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-}
-
-/// Panicking VaultLookup stub for CLI-only use. All methods panic.
-struct PanickingVaultLookup;
-
-#[async_trait]
-impl VaultLookup for PanickingVaultLookup {
-    async fn vault_id_for_token(&self, _: Address) -> Result<RaindexVaultId, VaultLookupError> {
-        unimplemented!("PanickingVaultLookup: not available in CLI context")
-    }
-
-    async fn vault_token_for_symbol(&self, _: &Symbol) -> Result<Address, VaultLookupError> {
-        unimplemented!("PanickingVaultLookup: not available in CLI context")
-    }
-}
-
-/// Panicking Tokenizer stub for CLI-only use. All methods panic.
-struct PanickingTokenizer;
-
-#[async_trait]
-impl Tokenizer for PanickingTokenizer {
-    async fn request_mint(
-        &self,
-        _: Symbol,
-        _: FractionalShares,
-        _: Address,
-        _: IssuerRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn poll_mint_until_complete(
-        &self,
-        _: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn get_request(
-        &self,
-        _: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    fn redemption_wallet(&self) -> Option<Address> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn wait_for_block(&self, _: u64) -> Result<(), EvmError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn send_for_redemption(&self, _: Address, _: U256) -> Result<TxHash, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn poll_for_redemption(&self, _: &TxHash) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn find_redemption_by_tx(
-        &self,
-        _: &TxHash,
-    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn poll_redemption_until_complete(
-        &self,
-        _: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn verify_mint_tx(
-        &self,
-        _: TxHash,
-        _: Address,
-        _: Address,
-        _: U256,
-    ) -> Result<(), MintVerificationError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-
-    async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
-        unimplemented!("PanickingTokenizer: not available in CLI context")
-    }
-}
-
-/// Panicking Wrapper stub for CLI-only use. All methods panic.
-struct PanickingWrapper;
-
-#[async_trait]
-impl Wrapper for PanickingWrapper {
-    async fn get_ratio_for_symbol(&self, _: &Symbol) -> Result<UnderlyingPerWrapped, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    fn lookup_underlying(&self, _: &Symbol) -> Result<Address, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    fn lookup_derivative(&self, _: &Symbol) -> Result<Address, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn to_wrapped(
-        &self,
-        _: Address,
-        _: U256,
-        _: Address,
-    ) -> Result<(TxHash, U256), WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn to_underlying(
-        &self,
-        _: Address,
-        _: U256,
-        _: Address,
-        _: Address,
-    ) -> Result<(TxHash, U256), WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn donate(&self, _: Address, _: U256) -> Result<TxHash, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn submit_wrap(&self, _: Address, _: U256, _: Address) -> Result<TxHash, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn confirm_wrap(&self, _: Address, _: TxHash) -> Result<WrapConfirmation, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn submit_unwrap(
-        &self,
-        _: Address,
-        _: U256,
-        _: Address,
-        _: Address,
-    ) -> Result<TxHash, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn confirm_unwrap(
-        &self,
-        _: Address,
-        _: TxHash,
-    ) -> Result<UnwrapConfirmation, WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    async fn wait_for_block(&self, _: u64) -> Result<(), WrapperError> {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-
-    fn owner(&self) -> Address {
-        unimplemented!("PanickingWrapper: not available in CLI context")
-    }
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
     #[error("Aggregate error: {0}")]
@@ -498,6 +259,7 @@ impl From<step::EquityVaultStepError> for MintError {
             step::EquityVaultStepError::Wrapper(error) => Self::Wrapper(error),
             step::EquityVaultStepError::Raindex(error) => Self::Raindex(error),
             step::EquityVaultStepError::VaultLookup(error) => Self::VaultLookup(error),
+            other => unreachable!("withdrawal-specific step error on mint path: {other:?}"),
         }
     }
 }
@@ -575,6 +337,10 @@ pub(crate) enum RedemptionError {
     Tokenizer(#[from] TokenizerError),
     #[error(transparent)]
     SharesConversion(#[from] SharesConversionError),
+    #[error(transparent)]
+    Step(#[from] step::EquityVaultStepError),
+    #[error(transparent)]
+    NodeSync(#[from] EvmError),
     #[error("Entity not found after command: {aggregate_id}")]
     EntityNotFound { aggregate_id: RedemptionAggregateId },
     #[error("Token send to Alpaca failed: {entity:?}")]
@@ -1116,8 +882,8 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
-    /// Sends the Redeem command to submit vault withdrawal, then
-    /// ConfirmWithdraw to wait for confirmation.
+    /// Sends Redeem, then drives the withdraw I/O in the orchestrator,
+    /// recording the submitted tx and the confirmation via pure commands.
     async fn withdraw_from_raindex(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -1138,14 +904,64 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::SubmitWithdraw)
-            .await?;
+        self.submit_and_confirm_withdraw(aggregate_id, token, amount)
+            .await
+    }
+
+    /// Submits the vault withdrawal, records it, then confirms it. Shared by the
+    /// fresh-start path and resume from `VaultWithdrawPending`.
+    async fn submit_and_confirm_withdraw(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        token: Address,
+        wrapped_amount: U256,
+    ) -> Result<(), RedemptionError> {
+        let tx_hash = step::submit_vault_withdraw(
+            self.vault_lookup.as_ref(),
+            self.raindex.as_ref(),
+            token,
+            wrapped_amount,
+        )
+        .await?;
 
         self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::SubmitWithdraw { tx_hash },
+            )
             .await?;
 
+        self.confirm_withdraw(aggregate_id, token, tx_hash).await
+    }
+
+    /// Confirms a submitted withdrawal and records the decoded receipt. Shared
+    /// by resume from `VaultWithdrawSubmitted`.
+    async fn confirm_withdraw(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        token: Address,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        let step::ConfirmedWithdraw {
+            actual_wrapped_amount,
+            raindex_withdraw_block,
+        } = step::confirm_vault_withdraw(
+            self.raindex.as_ref(),
+            self.wrapper.as_ref(),
+            token,
+            tx_hash,
+        )
+        .await?;
+
+        self.redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::ConfirmWithdraw {
+                    actual_wrapped_amount,
+                    raindex_withdraw_block,
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -1159,13 +975,26 @@ impl CrossVenueEquityTransfer {
             .send(aggregate_id, EquityRedemptionCommand::UnwrapTokens)
             .await?;
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::SubmitUnwrap)
-            .await?;
+        let (symbol, token, wrapped_amount, raindex_withdraw_block) =
+            match self.load_redemption_entity(aggregate_id).await? {
+                EquityRedemption::UnwrapPending {
+                    symbol,
+                    token,
+                    wrapped_amount,
+                    raindex_withdraw_block,
+                    ..
+                } => (symbol, token, wrapped_amount, raindex_withdraw_block),
+                entity => return Err(RedemptionError::UnexpectedEntity { entity }),
+            };
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::ConfirmUnwrap)
-            .await?;
+        self.submit_and_confirm_unwrap(
+            aggregate_id,
+            &symbol,
+            token,
+            wrapped_amount,
+            raindex_withdraw_block,
+        )
+        .await?;
 
         info!(target: "rebalance", %aggregate_id, "Tokens unwrapped, sending to Alpaca");
 
@@ -1173,20 +1002,174 @@ impl CrossVenueEquityTransfer {
             .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
             .await?;
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::SendTokens)
-            .await?;
+        self.send_redemption(aggregate_id).await?;
 
-        let entity = self.redemption_store.load(aggregate_id).await?.ok_or(
-            RedemptionError::EntityNotFound {
-                aggregate_id: aggregate_id.clone(),
-            },
-        )?;
-
-        match entity {
+        match self.load_redemption_entity(aggregate_id).await? {
             EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
             entity @ EquityRedemption::Failed { .. } => Err(RedemptionError::SendFailed { entity }),
             entity => Err(RedemptionError::UnexpectedEntity { entity }),
+        }
+    }
+
+    /// Submits the ERC-4626 unwrap, records it, then confirms it. Shared by the
+    /// fresh-start path and resume from `UnwrapPending`.
+    async fn submit_and_confirm_unwrap(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        token: Address,
+        wrapped_amount: U256,
+        raindex_withdraw_block: Option<u64>,
+    ) -> Result<(), RedemptionError> {
+        let unwrap_tx_hash = step::submit_token_unwrap(
+            self.wrapper.as_ref(),
+            token,
+            wrapped_amount,
+            raindex_withdraw_block,
+        )
+        .await?;
+
+        self.redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::SubmitUnwrap { unwrap_tx_hash },
+            )
+            .await?;
+
+        self.confirm_unwrap(aggregate_id, symbol, token, unwrap_tx_hash)
+            .await
+    }
+
+    /// Confirms a submitted unwrap and records the result. Shared by resume from
+    /// `UnwrapSubmitted`.
+    async fn confirm_unwrap(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        token: Address,
+        unwrap_tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        let step::ConfirmedUnwrap {
+            underlying_token,
+            unwrapped_amount,
+            unwrap_block,
+        } = step::confirm_token_unwrap(self.wrapper.as_ref(), symbol, token, unwrap_tx_hash)
+            .await?;
+
+        self.redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::ConfirmUnwrap {
+                    underlying_token,
+                    unwrapped_amount,
+                    unwrap_block,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Performs the send-to-Alpaca step (reading the persisted `SendPending`
+    /// state) and records its outcome. Shared by the fresh-start path and resume
+    /// from `SendPending`.
+    async fn send_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        let (symbol, underlying_token, unwrapped_amount, unwrap_block) =
+            match self.load_redemption_entity(aggregate_id).await? {
+                EquityRedemption::SendPending {
+                    symbol,
+                    underlying_token,
+                    unwrapped_amount,
+                    unwrap_block,
+                    ..
+                } => (symbol, underlying_token, unwrapped_amount, unwrap_block),
+                entity => return Err(RedemptionError::UnexpectedEntity { entity }),
+            };
+
+        let outcome = self
+            .send_to_alpaca(&symbol, underlying_token, unwrapped_amount, unwrap_block)
+            .await?;
+
+        match outcome {
+            SendOutcome::Sent {
+                redemption_wallet,
+                redemption_tx,
+            } => {
+                // Persist the broadcast tx immediately, before finalizing, so a
+                // crash here resumes by confirming the recorded tx rather than
+                // re-broadcasting an irreversible transfer.
+                self.redemption_store
+                    .send(
+                        aggregate_id,
+                        EquityRedemptionCommand::SubmitSend {
+                            redemption_wallet,
+                            redemption_tx,
+                        },
+                    )
+                    .await?;
+                self.confirm_send(aggregate_id).await
+            }
+            failure @ (SendOutcome::WalletNotConfigured | SendOutcome::SendFailed) => {
+                self.redemption_store
+                    .send(
+                        aggregate_id,
+                        EquityRedemptionCommand::RecordSendOutcome { outcome: failure },
+                    )
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Finalizes a broadcast redemption send to `TokensSent` without
+    /// re-broadcasting. Shared by the fresh-send path and resume from
+    /// `SendSubmitted`.
+    async fn confirm_send(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::ConfirmSend)
+            .await?;
+        Ok(())
+    }
+
+    /// Sends unwrapped tokens to Alpaca's redemption wallet, mapping the result
+    /// to a [`SendOutcome`]. A missing wallet or a send revert is a terminal
+    /// outcome (the aggregate records `TransferFailed`); a node-sync wait
+    /// failure is a retryable error so apalis retries the job.
+    async fn send_to_alpaca(
+        &self,
+        symbol: &Symbol,
+        token: Address,
+        amount: U256,
+        unwrap_block: Option<u64>,
+    ) -> Result<SendOutcome, RedemptionError> {
+        let Some(redemption_wallet) = Tokenizer::redemption_wallet(self.tokenizer.as_ref()) else {
+            warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
+            return Ok(SendOutcome::WalletNotConfigured);
+        };
+
+        // Wait for the tokenizer's provider to index the unwrap block before
+        // sending, so the transfer is not simulated against a stale zero
+        // balance. A wait failure is retryable (NOT a terminal send failure).
+        if let Some(block) = unwrap_block {
+            self.tokenizer.wait_for_block(block).await?;
+        }
+
+        info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
+
+        match Tokenizer::send_for_redemption(self.tokenizer.as_ref(), token, amount).await {
+            Ok(redemption_tx) => Ok(SendOutcome::Sent {
+                redemption_wallet,
+                redemption_tx,
+            }),
+            Err(error) => {
+                warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
+                Ok(SendOutcome::SendFailed)
+            }
         }
     }
 
@@ -1372,31 +1355,47 @@ impl CrossVenueEquityTransfer {
             }
 
             match entity {
-                EquityRedemption::VaultWithdrawPending { .. } => {
+                EquityRedemption::VaultWithdrawPending {
+                    token,
+                    wrapped_amount,
+                    ..
+                } => {
                     info!(%aggregate_id, "Resuming pending vault withdrawal");
-                    self.redemption_store
-                        .send(aggregate_id, EquityRedemptionCommand::SubmitWithdraw)
+                    self.submit_and_confirm_withdraw(aggregate_id, token, wrapped_amount)
                         .await?;
                 }
-                EquityRedemption::VaultWithdrawSubmitted { .. } => {
+                EquityRedemption::VaultWithdrawSubmitted { token, tx_hash, .. } => {
                     info!(%aggregate_id, "Resuming submitted vault withdrawal");
-                    self.redemption_store
-                        .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
-                        .await?;
+                    self.confirm_withdraw(aggregate_id, token, tx_hash).await?;
                 }
                 EquityRedemption::WithdrawnFromRaindex { .. } => {
                     self.resume_withdrawn_redemption(aggregate_id).await?;
                 }
-                EquityRedemption::UnwrapPending { .. } => {
+                EquityRedemption::UnwrapPending {
+                    symbol,
+                    token,
+                    wrapped_amount,
+                    raindex_withdraw_block,
+                    ..
+                } => {
                     info!(%aggregate_id, "Resuming pending unwrap");
-                    self.redemption_store
-                        .send(aggregate_id, EquityRedemptionCommand::SubmitUnwrap)
-                        .await?;
+                    self.submit_and_confirm_unwrap(
+                        aggregate_id,
+                        &symbol,
+                        token,
+                        wrapped_amount,
+                        raindex_withdraw_block,
+                    )
+                    .await?;
                 }
-                EquityRedemption::UnwrapSubmitted { .. } => {
+                EquityRedemption::UnwrapSubmitted {
+                    symbol,
+                    token,
+                    unwrap_tx_hash,
+                    ..
+                } => {
                     info!(%aggregate_id, "Resuming submitted unwrap");
-                    self.redemption_store
-                        .send(aggregate_id, EquityRedemptionCommand::ConfirmUnwrap)
+                    self.confirm_unwrap(aggregate_id, &symbol, token, unwrap_tx_hash)
                         .await?;
                 }
                 EquityRedemption::TokensUnwrapped { .. } => {
@@ -1404,9 +1403,11 @@ impl CrossVenueEquityTransfer {
                 }
                 EquityRedemption::SendPending { .. } => {
                     info!(%aggregate_id, "Resuming pending send");
-                    self.redemption_store
-                        .send(aggregate_id, EquityRedemptionCommand::SendTokens)
-                        .await?;
+                    self.send_redemption(aggregate_id).await?;
+                }
+                EquityRedemption::SendSubmitted { .. } => {
+                    info!(%aggregate_id, "Resuming submitted send");
+                    self.confirm_send(aggregate_id).await?;
                 }
                 EquityRedemption::TokensSent { redemption_tx, .. } => {
                     self.resume_sent_redemption(aggregate_id, &redemption_tx)
@@ -1986,6 +1987,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use st0x_config::{AssetsConfig, EquitiesConfig};
+    use st0x_raindex::RaindexVaultId;
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockMintPollOutcome, MockMintRequestOutcome,
@@ -2012,15 +2014,6 @@ mod tests {
             .with_symbol_token(Symbol::new("TEST").unwrap(), Address::ZERO)
             .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
             .with_default_vault(RaindexVaultId(B256::ZERO))
-    }
-
-    fn mock_services() -> EquityTransferServices {
-        EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        }
     }
 
     async fn insert_mint_event(
@@ -2184,7 +2177,7 @@ mod tests {
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(())
             .await
             .unwrap();
         service
@@ -2331,7 +2324,7 @@ mod tests {
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(())
             .await
             .unwrap();
         service
@@ -2660,7 +2653,7 @@ mod tests {
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(())
             .await
             .unwrap();
         service
@@ -2704,7 +2697,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), mock_services()));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
         let vault_lookup = mock_vault_lookup();
 
         let transfer = CrossVenueEquityTransfer::new(
@@ -2718,6 +2711,150 @@ mod tests {
         );
 
         (transfer, pool)
+    }
+
+    #[tokio::test]
+    async fn send_to_alpaca_returns_wallet_not_configured_when_no_wallet() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let outcome = transfer
+            .send_to_alpaca(
+                &Symbol::new("AAPL").unwrap(),
+                Address::ZERO,
+                U256::from(1_000_000_000_000_000_000_u64),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, SendOutcome::WalletNotConfigured),
+            "expected WalletNotConfigured, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_alpaca_returns_send_failed_on_send_error() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_send_failure()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let outcome = transfer
+            .send_to_alpaca(
+                &Symbol::new("AAPL").unwrap(),
+                Address::ZERO,
+                U256::from(1_000_000_000_000_000_000_u64),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, SendOutcome::SendFailed),
+            "expected SendFailed when send_for_redemption errors, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_alpaca_waits_for_unwrap_block_then_sends() {
+        let unwrap_block = 4242u64;
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let outcome = transfer
+            .send_to_alpaca(
+                &Symbol::new("AAPL").unwrap(),
+                Address::ZERO,
+                U256::from(1_000_000_000_000_000_000_u64),
+                Some(unwrap_block),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, SendOutcome::Sent { .. }),
+            "expected Sent, got {outcome:?}"
+        );
+        assert_eq!(
+            tokenizer.wait_for_block_calls(),
+            vec![unwrap_block],
+            "send must wait for the unwrap block before sending"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_alpaca_skips_wait_when_unwrap_block_is_none() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let outcome = transfer
+            .send_to_alpaca(
+                &Symbol::new("AAPL").unwrap(),
+                Address::ZERO,
+                U256::from(1_000_000_000_000_000_000_u64),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, SendOutcome::Sent { .. }));
+        assert_eq!(
+            tokenizer.wait_for_block_calls(),
+            Vec::<u64>::new(),
+            "send must NOT wait for a block when unwrap_block is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_alpaca_returns_node_sync_error_when_wait_fails() {
+        let tokenizer = Arc::new(MockTokenizer::new().failing_wait_for_block());
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = transfer
+            .send_to_alpaca(
+                &Symbol::new("AAPL").unwrap(),
+                Address::ZERO,
+                U256::from(1_000_000_000_000_000_000_u64),
+                Some(99),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RedemptionError::NodeSync(EvmError::NodeBehindRequiredBlock { .. })
+            ),
+            "a wait-for-block failure must surface as a retryable NodeSync error, got {error:?}"
+        );
+        assert_eq!(
+            tokenizer.redemption_send_count(),
+            0,
+            "tokens must NOT be sent when the node-sync wait fails (wait happens first)"
+        );
     }
 
     #[tokio::test]
@@ -3263,36 +3400,474 @@ mod tests {
         );
     }
 
-    /// Drives a redemption to `SendPending` (the last pre-send state) via the
-    /// command chain, without touching the tokenizer.
+    /// Resume from `VaultWithdrawSubmitted` re-confirms the persisted withdraw tx
+    /// without re-broadcasting it -- the crash-recovery property the submit/confirm
+    /// split exists to deliver.
+    #[tokio::test]
+    async fn resume_from_vault_withdraw_submitted_confirms_without_resubmitting() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("resume-withdraw-submitted");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        // Seed `VaultWithdrawSubmitted`: the withdraw tx was broadcast and
+        // recorded, then the process crashed before confirmation.
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    quantity: quantity.inner(),
+                    token,
+                    amount,
+                },
+            )
+            .await
+            .unwrap();
+        let tx_hash = step::submit_vault_withdraw(
+            transfer.vault_lookup.as_ref(),
+            transfer.raindex.as_ref(),
+            token,
+            amount,
+        )
+        .await
+        .unwrap();
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw { tx_hash })
+            .await
+            .unwrap();
+
+        let seeded = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(seeded, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "test setup must seed VaultWithdrawSubmitted, got: {seeded:?}"
+        );
+
+        // Resume takes the confirm-only arm. Re-entering the submit path would
+        // re-send `SubmitWithdraw` from an already-submitted aggregate, which the
+        // state machine rejects -- so reaching `Completed` proves the persisted
+        // withdraw was confirmed, never re-broadcast.
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected Completed after resume from VaultWithdrawSubmitted, got: {entity:?}"
+        );
+    }
+
+    /// Resume from `UnwrapSubmitted` re-confirms the persisted unwrap tx without
+    /// re-broadcasting it.
+    #[tokio::test]
+    async fn resume_from_unwrap_submitted_confirms_without_resubmitting() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("resume-unwrap-submitted");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        // Drive through the confirmed withdrawal to `UnwrapPending`.
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        // Seed `UnwrapSubmitted`: the unwrap tx was broadcast and recorded, then
+        // the process crashed before confirmation.
+        let (unwrap_token, wrapped_amount, raindex_withdraw_block) =
+            match transfer.redemption_store.load(&id).await.unwrap().unwrap() {
+                EquityRedemption::UnwrapPending {
+                    token,
+                    wrapped_amount,
+                    raindex_withdraw_block,
+                    ..
+                } => (token, wrapped_amount, raindex_withdraw_block),
+                other => panic!("expected UnwrapPending, got: {other:?}"),
+            };
+        let unwrap_tx_hash = step::submit_token_unwrap(
+            transfer.wrapper.as_ref(),
+            unwrap_token,
+            wrapped_amount,
+            raindex_withdraw_block,
+        )
+        .await
+        .unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitUnwrap { unwrap_tx_hash },
+            )
+            .await
+            .unwrap();
+
+        let seeded = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(seeded, EquityRedemption::UnwrapSubmitted { .. }),
+            "test setup must seed UnwrapSubmitted, got: {seeded:?}"
+        );
+
+        // Resume takes the confirm-only arm; re-entering submit would re-send
+        // `SubmitUnwrap` from an already-submitted aggregate (rejected), so
+        // reaching `Completed` proves the unwrap was confirmed, not re-broadcast.
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected Completed after resume from UnwrapSubmitted, got: {entity:?}"
+        );
+    }
+
+    /// A partial vault fill collapses the withdrawn amount; the orchestrator must
+    /// unwrap that actual amount, not the originally requested one.
+    #[tokio::test]
+    async fn unwrap_uses_actual_partial_withdraw_amount_through_orchestrator() {
+        let quantity = FractionalShares::new(float!(37.143292455));
+        let requested = quantity.to_u256_18_decimals().unwrap();
+        let actual = U256::from(33_681_456_848_531_939_569_u128);
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let wrapper = Arc::new(MockWrapper::new());
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual)),
+            wrapper.clone(),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("partial-unwrap");
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+
+        // Orchestrator-driven partial withdrawal: the receipt yields `actual` <
+        // `requested`, which the aggregate collapses into the persisted amount.
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, requested)
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        let (unwrap_token, wrapped_amount, raindex_withdraw_block) =
+            match transfer.redemption_store.load(&id).await.unwrap().unwrap() {
+                EquityRedemption::UnwrapPending {
+                    token,
+                    wrapped_amount,
+                    raindex_withdraw_block,
+                    ..
+                } => (token, wrapped_amount, raindex_withdraw_block),
+                other => panic!("expected UnwrapPending, got: {other:?}"),
+            };
+
+        assert_eq!(
+            wrapped_amount, actual,
+            "orchestrator-driven confirm must collapse the persisted amount to the \
+             partial receipt amount"
+        );
+
+        // The unwrap submits the collapsed amount the orchestrator loaded, not the
+        // original request. (Asserted before confirm, which consumes the record.)
+        step::submit_token_unwrap(
+            transfer.wrapper.as_ref(),
+            unwrap_token,
+            wrapped_amount,
+            raindex_withdraw_block,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            wrapper.submitted_unwrap_amount(),
+            Some(actual),
+            "the orchestrator must unwrap the actual partial-withdraw amount, not the request"
+        );
+    }
+
+    /// RPC lag while waiting to unwrap surfaces as a retryable
+    /// `RedemptionError::Step(Wrapper(Evm(NodeBehindRequiredBlock)))`, so apalis
+    /// retries it. Documents the intended retryable shape for unwrap waits (the
+    /// unwrap path mirrors the mint path's treatment of the same wrapper wait,
+    /// unlike the send path which maps its tokenizer wait to `NodeSync`).
+    #[tokio::test]
+    async fn unwrap_wait_for_block_lag_surfaces_as_retryable_step_error() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("unwrap-wait-lag");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .await
+            .unwrap();
+
+        let error = transfer.unwrap_and_send(&id).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RedemptionError::Step(step::EquityVaultStepError::Wrapper(WrapperError::Evm(
+                    EvmError::NodeBehindRequiredBlock { .. }
+                )))
+            ),
+            "unwrap wait-for-block lag must surface as a retryable Step error, got: {error:?}"
+        );
+    }
+
+    /// The full redemption flow broadcasts the Alpaca transfer exactly once
+    /// (submit/confirm split: SubmitSend records the broadcast, ConfirmSend
+    /// finalizes without re-sending).
+    #[tokio::test]
+    async fn send_redemption_broadcasts_the_transfer_exactly_once() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("send-once");
+        transfer
+            .resume_equity_to_hedging(
+                &id,
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "expected Completed, got: {entity:?}"
+        );
+        assert_eq!(
+            tokenizer.redemption_send_count(),
+            1,
+            "the redemption transfer must be broadcast exactly once across the full flow"
+        );
+    }
+
+    /// Resume from `SendSubmitted` finalizes the persisted redemption tx without
+    /// re-broadcasting -- the crash-window the submit/confirm split closes.
+    #[tokio::test]
+    async fn resume_from_send_submitted_finalizes_without_resending() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("resume-send-submitted");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        // Drive to `SendPending` through the orchestrator.
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        let (unwrap_token, wrapped_amount, raindex_withdraw_block) =
+            match transfer.redemption_store.load(&id).await.unwrap().unwrap() {
+                EquityRedemption::UnwrapPending {
+                    token,
+                    wrapped_amount,
+                    raindex_withdraw_block,
+                    ..
+                } => (token, wrapped_amount, raindex_withdraw_block),
+                other => panic!("expected UnwrapPending, got: {other:?}"),
+            };
+        transfer
+            .submit_and_confirm_unwrap(
+                &id,
+                &symbol,
+                unwrap_token,
+                wrapped_amount,
+                raindex_withdraw_block,
+            )
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::PrepareSend)
+            .await
+            .unwrap();
+
+        // Seed `SendSubmitted`: the transfer was broadcast and recorded, then a
+        // crash before the bookkeeping finalization. (SubmitSend is pure -- no
+        // real send happens in the test, so the send counter stays at zero.)
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitSend {
+                    redemption_wallet: Address::random(),
+                    redemption_tx: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        let seeded = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(seeded, EquityRedemption::SendSubmitted { .. }),
+            "test setup must seed SendSubmitted, got: {seeded:?}"
+        );
+
+        // Resume takes the confirm-only arm. Re-entering the send path would
+        // re-send `SubmitSend` from a non-SendPending state (rejected) and
+        // re-broadcast, so reaching Completed with zero sends proves the transfer
+        // was finalized, never re-broadcast.
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "resume from SendSubmitted must finalize to Completed, got: {entity:?}"
+        );
+        assert_eq!(
+            tokenizer.redemption_send_count(),
+            0,
+            "resume from SendSubmitted must NOT re-broadcast the irreversible transfer"
+        );
+    }
+
+    /// Drives a redemption to `SendPending` (the last pre-send state) through
+    /// the orchestrator steps, without touching the tokenizer.
     async fn seed_send_pending(
         transfer: &CrossVenueEquityTransfer,
         id: &RedemptionAggregateId,
         symbol: &Symbol,
     ) {
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        transfer
+            .withdraw_from_raindex(id, symbol, quantity, token, amount)
+            .await
+            .unwrap();
         transfer
             .redemption_store
-            .send(
+            .send(id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        let (unwrap_token, wrapped_amount, raindex_withdraw_block) =
+            match transfer.redemption_store.load(id).await.unwrap().unwrap() {
+                EquityRedemption::UnwrapPending {
+                    token,
+                    wrapped_amount,
+                    raindex_withdraw_block,
+                    ..
+                } => (token, wrapped_amount, raindex_withdraw_block),
+                other => panic!("expected UnwrapPending, got: {other:?}"),
+            };
+        transfer
+            .submit_and_confirm_unwrap(
                 id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: symbol.clone(),
-                    quantity: float!(50),
-                    token: Address::ZERO,
-                    amount: U256::from(50_000_000_000_000_000_000_u128),
-                },
+                symbol,
+                unwrap_token,
+                wrapped_amount,
+                raindex_withdraw_block,
             )
             .await
             .unwrap();
-        for command in [
-            EquityRedemptionCommand::SubmitWithdraw,
-            EquityRedemptionCommand::ConfirmWithdraw,
-            EquityRedemptionCommand::UnwrapTokens,
-            EquityRedemptionCommand::SubmitUnwrap,
-            EquityRedemptionCommand::ConfirmUnwrap,
-            EquityRedemptionCommand::PrepareSend,
-        ] {
-            transfer.redemption_store.send(id, command).await.unwrap();
-        }
+        transfer
+            .redemption_store
+            .send(id, EquityRedemptionCommand::PrepareSend)
+            .await
+            .unwrap();
+
+        let seeded = transfer.redemption_store.load(id).await.unwrap().unwrap();
+        assert!(
+            matches!(seeded, EquityRedemption::SendPending { .. }),
+            "test setup must seed SendPending, got: {seeded:?}"
+        );
     }
 
     /// A pre-send redemption holds during a dividend freeze: the resume
@@ -3378,12 +3953,20 @@ mod tests {
 
         let id = redemption_aggregate_id("redeem-frozen-post-send");
         let symbol = Symbol::new("TEST").unwrap();
-        seed_send_pending(&transfer, &id, &symbol).await;
-        transfer
-            .redemption_store
-            .send(&id, EquityRedemptionCommand::SendTokens)
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
             .await
             .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        // Drive past the send commitment (`TokensSent`) before freezing.
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
 
         transfer
             .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))

@@ -18,36 +18,20 @@
 //! `EquityRedemptionError::AlreadyStarted`). The only caller (`simulate()` in
 //! `tests/e2e/full_system.rs`) always seeds a freshly created database file.
 
-use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy::primitives::{Address, B256, Bloom, Log as PrimitiveLog, TxHash, U256};
-use alloy::rpc::types::{Log, TransactionReceipt};
-use alloy::sol_types::SolEvent;
-use async_trait::async_trait;
+use alloy::primitives::{Address, B256, TxHash};
 use chrono::{DateTime, Duration, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
-use st0x_evm::IERC20;
-use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Symbol};
+use st0x_execution::{AlpacaTransferId, ClientOrderId, Symbol};
 use st0x_finance::Usdc;
-use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
-use st0x_tokenization::{
-    AlpacaTokenizationError, IssuerRequestId, TokenizationRequest, TokenizationRequestId,
-    TokenizationRequestStatus, TokenizationRequestType, Tokenizer, TokenizerError,
-    tokenization_request_id,
-};
-use st0x_wrapper::{
-    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
-};
+use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
 
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
-use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -55,159 +39,6 @@ use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
     UsdcRebalanceId,
 };
-use crate::vault_lookup::{VaultLookup, VaultLookupError};
-
-/// Minimal [`Tokenizer`] shared by [`seed_simulated_mint_history`]'s and
-/// [`seed_simulated_equity_redemption_history`]'s temporary stores.
-///
-/// The mint fixture drives only the mint happy path (`RecordMintRequestedAt` ->
-/// `RecordTokensReceivedAt` -> `WrapTokensAt` -> `DepositToVaultAt`), which calls exactly
-/// `request_mint`/`poll_mint_until_complete`. The redemption fixture drives
-/// only `wait_for_block`/`redemption_wallet`/`send_for_redemption` (its
-/// `Detect`/`Complete` steps are pure state transitions with no service
-/// call). Every other `Tokenizer` method is unreachable from either path.
-///
-/// Stateful rather than static (unlike `st0x_tokenization::mock::MockTokenizer`)
-/// because `poll_mint_until_complete` must echo back the SAME symbol
-/// `request_mint` was called with -- the mint aggregate validates
-/// `token_symbol == format!("t{symbol}")`, and this fixture cycles through
-/// multiple symbols in one run.
-struct FixtureTokenizer {
-    pending: Mutex<HashMap<TokenizationRequestId, (Symbol, TxHash)>>,
-    redemption_wallet: Address,
-    /// Feeds `send_for_redemption`'s synthetic tx hash through
-    /// `simulated_transfer_uuid`, keeping it deterministic across runs like
-    /// every other id in this module.
-    day: u32,
-}
-
-impl FixtureTokenizer {
-    fn new(redemption_wallet: Address, day: u32) -> Self {
-        Self {
-            pending: Mutex::new(HashMap::new()),
-            redemption_wallet,
-            day,
-        }
-    }
-}
-
-#[async_trait]
-impl Tokenizer for FixtureTokenizer {
-    async fn request_mint(
-        &self,
-        symbol: Symbol,
-        quantity: FractionalShares,
-        wallet: Address,
-        issuer_request_id: IssuerRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        let id = tokenization_request_id(&format!("sim-mint-{issuer_request_id}"));
-        // Derived from the 16-byte `IssuerRequestId` uuid, not the (longer)
-        // `TokenizationRequestId` string: `TxHash::left_padding_from` panics
-        // above 32 input bytes, and the request-id string exceeds that.
-        let tx_hash = TxHash::left_padding_from(issuer_request_id.0.as_bytes());
-        self.pending
-            .lock()
-            .await
-            .insert(id.clone(), (symbol.clone(), tx_hash));
-
-        Ok(TokenizationRequest {
-            id,
-            r#type: Some(TokenizationRequestType::Mint),
-            status: TokenizationRequestStatus::Pending,
-            underlying_symbol: symbol,
-            token_symbol: None,
-            quantity,
-            wallet: Some(wallet),
-            issuer_request_id: Some(issuer_request_id),
-            tx_hash: None,
-            fees: None,
-            created_at: Utc::now(),
-        })
-    }
-
-    async fn poll_mint_until_complete(
-        &self,
-        id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        let (symbol, tx_hash) = self.pending.lock().await.get(id).cloned().ok_or_else(|| {
-            TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id: id.clone() })
-        })?;
-
-        Ok(TokenizationRequest {
-            id: id.clone(),
-            r#type: Some(TokenizationRequestType::Mint),
-            status: TokenizationRequestStatus::Completed,
-            token_symbol: Some(format!("t{symbol}")),
-            underlying_symbol: symbol,
-            quantity: FractionalShares::ZERO,
-            wallet: None,
-            issuer_request_id: None,
-            tx_hash: Some(tx_hash),
-            fees: None,
-            created_at: Utc::now(),
-        })
-    }
-
-    async fn get_request(
-        &self,
-        _id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("FixtureTokenizer: mint fixture never calls get_request")
-    }
-
-    fn redemption_wallet(&self) -> Option<Address> {
-        Some(self.redemption_wallet)
-    }
-
-    async fn wait_for_block(&self, _block: u64) -> Result<(), st0x_evm::EvmError> {
-        Ok(())
-    }
-
-    async fn send_for_redemption(
-        &self,
-        _token: Address,
-        _amount: U256,
-    ) -> Result<TxHash, TokenizerError> {
-        Ok(TxHash::left_padding_from(
-            simulated_transfer_uuid("redeem-send-tx", self.day).as_bytes(),
-        ))
-    }
-
-    async fn poll_for_redemption(
-        &self,
-        _tx_hash: &TxHash,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("FixtureTokenizer: mint fixture never calls poll_for_redemption")
-    }
-
-    async fn find_redemption_by_tx(
-        &self,
-        _tx_hash: &TxHash,
-    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
-        unimplemented!("FixtureTokenizer: mint fixture never calls find_redemption_by_tx")
-    }
-
-    async fn poll_redemption_until_complete(
-        &self,
-        _id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("FixtureTokenizer: mint fixture never calls poll_redemption_until_complete")
-    }
-
-    async fn verify_mint_tx(
-        &self,
-        _tx_hash: TxHash,
-        _token_address: Address,
-        _wallet: Address,
-        _expected_amount: U256,
-    ) -> Result<(), st0x_tokenization::MintVerificationError> {
-        unimplemented!("FixtureTokenizer: mint fixture never calls verify_mint_tx")
-    }
-
-    async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
-        unimplemented!("FixtureTokenizer: mint fixture never calls list_pending_requests")
-    }
-}
 
 /// Deterministic UUID for this module's fixtures, namespaced separately from
 /// `super::simulated_latency_uuid` so the two fixtures' synthetic ids never
@@ -707,318 +538,15 @@ async fn seed_base_to_alpaca(
     Ok(())
 }
 
-/// Builds a synthetic, always-`status: true` transaction receipt whose logs
-/// are exactly `logs`. Mirrors `src/onchain/mock.rs`'s `successful_receipt`
-/// (that copy is `#[cfg(test)]`-only, so unusable from a `test-support` e2e
-/// build; this is its `test-support`-gated counterpart).
-fn successful_receipt(tx_hash: TxHash, block_number: u64, logs: Vec<Log>) -> TransactionReceipt {
-    TransactionReceipt {
-        inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
-            receipt: Receipt {
-                status: true.into(),
-                cumulative_gas_used: 0,
-                logs,
-            },
-            logs_bloom: Bloom::default(),
-        }),
-        transaction_hash: tx_hash,
-        transaction_index: Some(0),
-        block_hash: None,
-        block_number: Some(block_number),
-        gas_used: 21_000,
-        effective_gas_price: 1,
-        blob_gas_used: None,
-        blob_gas_price: None,
-        from: Address::ZERO,
-        to: Some(Address::ZERO),
-        contract_address: None,
-    }
-}
-
-/// Builds a decodable ERC20 `Transfer` log, mirroring `src/onchain/mock.rs`'s
-/// `transfer_log` (see `successful_receipt` above for why this can't just
-/// reuse that `#[cfg(test)]`-only copy).
-fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
-    let event = IERC20::Transfer {
-        from: Address::ZERO,
-        to,
-        value: amount,
-    };
-    let inner = PrimitiveLog {
-        address: token,
-        data: event.encode_log_data(),
-    };
-
-    Log {
-        inner,
-        transaction_hash: None,
-        transaction_index: None,
-        block_hash: None,
-        block_number: None,
-        block_timestamp: None,
-        log_index: None,
-        removed: false,
-    }
-}
-
-/// Minimal [`Raindex`] for one [`seed_simulated_equity_redemption_history`]
-/// cycle. Scoped to a single redemption (a fresh instance per day, not
-/// shared across the seeding loop), so `submit_withdraw`'s single-slot
-/// `pending_withdraw` is always populated by the time `confirm_tx_receipt`
-/// reads it -- the redemption fixture always calls them in that order.
-/// `withdraw`/`submit_deposit` are unreachable from `EquityRedemption`'s
-/// happy path (it only ever calls `submit_withdraw`/`confirm_tx_receipt`).
-struct FixtureRaindex {
-    /// Recipient the synthetic withdrawal's `Transfer` log credits -- must
-    /// match `FixtureWrapper::owner()`, since `ConfirmWithdraw`'s handler
-    /// reads `services.wrapper.owner()` as the expected recipient.
-    recipient: Address,
-    block_number: u64,
-    pending_withdraw: Mutex<Option<(Address, U256)>>,
-    /// Feeds `submit_withdraw`'s synthetic tx hash through
-    /// `simulated_transfer_uuid`, keeping it deterministic across runs like
-    /// every other id in this module.
-    day: u32,
-}
-
-impl FixtureRaindex {
-    fn new(recipient: Address, block_number: u64, day: u32) -> Self {
-        Self {
-            recipient,
-            block_number,
-            pending_withdraw: Mutex::new(None),
-            day,
-        }
-    }
-}
-
-#[async_trait]
-impl Raindex for FixtureRaindex {
-    async fn withdraw(
-        &self,
-        _token: Address,
-        _vault_id: RaindexVaultId,
-        _target_amount: U256,
-        _decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
-        unimplemented!("FixtureRaindex: redemption fixture never calls withdraw")
-    }
-
-    async fn submit_deposit(
-        &self,
-        _token: Address,
-        _vault_id: RaindexVaultId,
-        _amount: U256,
-        _decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
-        unimplemented!("FixtureRaindex: redemption fixture never calls submit_deposit")
-    }
-
-    async fn submit_withdraw(
-        &self,
-        token: Address,
-        _vault_id: RaindexVaultId,
-        target_amount: U256,
-        _decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
-        *self.pending_withdraw.lock().await = Some((token, target_amount));
-        Ok(TxHash::left_padding_from(
-            simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
-        ))
-    }
-
-    async fn confirm_tx_receipt(
-        &self,
-        tx_hash: TxHash,
-    ) -> Result<TransactionReceipt, RaindexError> {
-        let (token, amount) = self
-            .pending_withdraw
-            .lock()
-            .await
-            .ok_or(RaindexError::ScanInconclusive { from_block: 0 })?;
-
-        Ok(successful_receipt(
-            tx_hash,
-            self.block_number,
-            vec![transfer_log(token, self.recipient, amount)],
-        ))
-    }
-}
-
-/// Minimal [`VaultLookup`] for one redemption cycle: resolves every token to
-/// the same fixed vault id. `vault_token_for_symbol` is unreachable from
-/// `EquityRedemption`'s happy path.
-struct FixtureVaultLookup {
-    vault_id: RaindexVaultId,
-}
-
-impl FixtureVaultLookup {
-    fn new(vault_id: RaindexVaultId) -> Self {
-        Self { vault_id }
-    }
-}
-
-#[async_trait]
-impl VaultLookup for FixtureVaultLookup {
-    async fn vault_id_for_token(
-        &self,
-        _token: Address,
-    ) -> Result<RaindexVaultId, VaultLookupError> {
-        Ok(self.vault_id)
-    }
-
-    async fn vault_token_for_symbol(&self, _symbol: &Symbol) -> Result<Address, VaultLookupError> {
-        unimplemented!("FixtureVaultLookup: redemption fixture never calls vault_token_for_symbol")
-    }
-}
-
-/// Minimal [`Wrapper`] for one [`seed_simulated_equity_redemption_history`]
-/// cycle. Scoped to a single redemption, same reasoning as [`FixtureRaindex`]:
-/// `submit_unwrap`'s single-slot `pending_unwrap` is always populated by the
-/// time `confirm_unwrap` reads it. 1:1 unwrap ratio, matching
-/// `st0x_wrapper::mock::MockWrapper`'s convention. Every method beyond
-/// `owner`/`lookup_underlying`/`submit_unwrap`/`confirm_unwrap`/
-/// `wait_for_block` is unreachable from `EquityRedemption`'s happy path.
-struct FixtureWrapper {
-    owner: Address,
-    underlying_token: Address,
-    unwrap_block: u64,
-    pending_unwrap: Mutex<Option<U256>>,
-    /// Feeds `submit_unwrap`'s synthetic tx hash through
-    /// `simulated_transfer_uuid`, keeping it deterministic across runs like
-    /// every other id in this module.
-    day: u32,
-}
-
-impl FixtureWrapper {
-    fn new(owner: Address, underlying_token: Address, unwrap_block: u64, day: u32) -> Self {
-        Self {
-            owner,
-            underlying_token,
-            unwrap_block,
-            pending_unwrap: Mutex::new(None),
-            day,
-        }
-    }
-}
-
-#[async_trait]
-impl Wrapper for FixtureWrapper {
-    async fn get_ratio_for_symbol(
-        &self,
-        _symbol: &Symbol,
-    ) -> Result<UnderlyingPerWrapped, WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls get_ratio_for_symbol")
-    }
-
-    fn lookup_underlying(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
-        Ok(self.underlying_token)
-    }
-
-    fn lookup_derivative(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls lookup_derivative")
-    }
-
-    async fn to_wrapped(
-        &self,
-        _wrapped_token: Address,
-        _underlying_amount: U256,
-        _receiver: Address,
-    ) -> Result<(TxHash, U256), WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls to_wrapped")
-    }
-
-    async fn to_underlying(
-        &self,
-        _wrapped_token: Address,
-        _wrapped_amount: U256,
-        _receiver: Address,
-        _owner: Address,
-    ) -> Result<(TxHash, U256), WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls to_underlying")
-    }
-
-    async fn donate(
-        &self,
-        _wrapped_token: Address,
-        _underlying_amount: U256,
-    ) -> Result<TxHash, WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls donate")
-    }
-
-    async fn submit_wrap(
-        &self,
-        _wrapped_token: Address,
-        _underlying_amount: U256,
-        _receiver: Address,
-    ) -> Result<TxHash, WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls submit_wrap")
-    }
-
-    async fn confirm_wrap(
-        &self,
-        _wrapped_token: Address,
-        _tx_hash: TxHash,
-    ) -> Result<WrapConfirmation, WrapperError> {
-        unimplemented!("FixtureWrapper: redemption fixture never calls confirm_wrap")
-    }
-
-    async fn submit_unwrap(
-        &self,
-        _wrapped_token: Address,
-        wrapped_amount: U256,
-        _receiver: Address,
-        _owner: Address,
-    ) -> Result<TxHash, WrapperError> {
-        *self.pending_unwrap.lock().await = Some(wrapped_amount);
-        Ok(TxHash::left_padding_from(
-            simulated_transfer_uuid("redeem-unwrap-tx", self.day).as_bytes(),
-        ))
-    }
-
-    async fn confirm_unwrap(
-        &self,
-        _wrapped_token: Address,
-        _tx_hash: TxHash,
-    ) -> Result<UnwrapConfirmation, WrapperError> {
-        let assets = self
-            .pending_unwrap
-            .lock()
-            .await
-            .ok_or(WrapperError::MissingWithdrawEvent)?;
-
-        Ok(UnwrapConfirmation {
-            assets,
-            block: self.unwrap_block,
-        })
-    }
-
-    async fn wait_for_block(&self, _block: u64) -> Result<(), WrapperError> {
-        Ok(())
-    }
-
-    fn owner(&self) -> Address {
-        self.owner
-    }
-}
-
 /// Seeds deterministic equity-redemption history for local dashboard
 /// simulation.
 ///
 /// Drives the `EquityRedemption` aggregate's happy path (`RedeemAt` ->
 /// `SubmitWithdrawAt` -> `ConfirmWithdrawAt` -> `UnwrapTokensAt` ->
 /// `SubmitUnwrapAt` -> `ConfirmUnwrapAt` -> `PrepareSendAt` ->
-/// `SendTokensAt` -> `DetectAt` -> `CompleteAt`), one redemption per day
-/// alternating between the same dedicated fixture symbols
+/// `SubmitSendAt` -> `ConfirmSendAt` -> `DetectAt` -> `CompleteAt`), one
+/// redemption per day alternating between the same dedicated fixture symbols
 /// (`AAPL.SIM`/`TSLA.SIM`) used by [`super::seed_simulated_hedge_latency_history`].
-///
-/// Unlike the mint/USDC fixtures, `EquityRedemption`'s service-calling
-/// commands (`SubmitWithdraw`/`ConfirmWithdraw`/`SubmitUnwrap`/
-/// `ConfirmUnwrap`/`SendTokens`) drive the side effect FROM WITHIN
-/// `transition()` itself (mint's analogous commands take the service
-/// result as command input instead), so a fresh, single-cycle-scoped
-/// [`FixtureRaindex`]/[`FixtureVaultLookup`]/[`FixtureWrapper`] triple is
-/// built for every redemption.
 pub async fn seed_simulated_equity_redemption_history(
     pool: &SqlitePool,
     now: DateTime<Utc>,
@@ -1029,7 +557,6 @@ pub async fn seed_simulated_equity_redemption_history(
     let range_start = now - Duration::days(i64::from(days)) - Duration::days(1);
     let aapl = Symbol::new("AAPL.SIM")?;
     let tsla = Symbol::new("TSLA.SIM")?;
-    let owner = Address::repeat_byte(0x5A);
     let redemption_wallet = Address::repeat_byte(0xA1);
 
     for day in 0..days {
@@ -1039,29 +566,14 @@ pub async fn seed_simulated_equity_redemption_history(
         let underlying_token = Address::left_padding_from(
             simulated_transfer_uuid("redeem-underlying", day).as_bytes(),
         );
-        let vault_id = RaindexVaultId(B256::left_padding_from(
-            simulated_transfer_uuid("redeem-vault", day).as_bytes(),
-        ));
         let withdraw_block = 4_000_000_u64 + u64::from(day) * 10;
         let unwrap_block = withdraw_block + 5;
-
-        let services = EquityTransferServices {
-            raindex: Arc::new(FixtureRaindex::new(owner, withdraw_block, day)),
-            vault_lookup: Arc::new(FixtureVaultLookup::new(vault_id)),
-            tokenizer: Arc::new(FixtureTokenizer::new(redemption_wallet, day)),
-            wrapper: Arc::new(FixtureWrapper::new(
-                owner,
-                underlying_token,
-                unwrap_block,
-                day,
-            )),
-        };
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(Arc::new(RetryOnBusy {
                 inner: EquityTimingProjection::new(pool.clone()),
             }))
-            .build(services)
+            .build(())
             .await?;
 
         let id = RedemptionAggregateId(simulated_transfer_uuid("redemption", day));
@@ -1095,14 +607,23 @@ pub async fn seed_simulated_equity_redemption_history(
         redemption
             .send(
                 &id,
-                EquityRedemptionCommand::SubmitWithdrawAt { submitted_at },
+                EquityRedemptionCommand::SubmitWithdrawAt {
+                    tx_hash: TxHash::left_padding_from(
+                        simulated_transfer_uuid("redeem-withdraw-tx", day).as_bytes(),
+                    ),
+                    submitted_at,
+                },
             )
             .await?;
 
         redemption
             .send(
                 &id,
-                EquityRedemptionCommand::ConfirmWithdrawAt { withdrawn_at },
+                EquityRedemptionCommand::ConfirmWithdrawAt {
+                    actual_wrapped_amount: wrapped_amount,
+                    raindex_withdraw_block: withdraw_block,
+                    withdrawn_at,
+                },
             )
             .await?;
 
@@ -1119,6 +640,9 @@ pub async fn seed_simulated_equity_redemption_history(
             .send(
                 &id,
                 EquityRedemptionCommand::SubmitUnwrapAt {
+                    unwrap_tx_hash: TxHash::left_padding_from(
+                        simulated_transfer_uuid("redeem-unwrap-tx", day).as_bytes(),
+                    ),
                     submitted_at: unwrap_submitted_at,
                 },
             )
@@ -1127,7 +651,12 @@ pub async fn seed_simulated_equity_redemption_history(
         redemption
             .send(
                 &id,
-                EquityRedemptionCommand::ConfirmUnwrapAt { unwrapped_at },
+                EquityRedemptionCommand::ConfirmUnwrapAt {
+                    underlying_token,
+                    unwrapped_amount: wrapped_amount,
+                    unwrap_block,
+                    unwrapped_at,
+                },
             )
             .await?;
 
@@ -1141,7 +670,20 @@ pub async fn seed_simulated_equity_redemption_history(
             .await?;
 
         redemption
-            .send(&id, EquityRedemptionCommand::SendTokensAt { sent_at })
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitSendAt {
+                    redemption_wallet,
+                    redemption_tx: TxHash::left_padding_from(
+                        simulated_transfer_uuid("redeem-send-tx", day).as_bytes(),
+                    ),
+                    submitted_at: sent_at,
+                },
+            )
+            .await?;
+
+        redemption
+            .send(&id, EquityRedemptionCommand::ConfirmSendAt { sent_at })
             .await?;
 
         redemption

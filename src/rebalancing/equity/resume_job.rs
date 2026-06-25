@@ -105,10 +105,9 @@ mod tests {
 
     use super::*;
     use crate::equity_redemption::{
-        EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
+        EquityRedemption, EquityRedemptionCommand, SendOutcome, redemption_aggregate_id,
     };
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
 
@@ -140,15 +139,8 @@ mod tests {
         let vault_lookup =
             Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
 
-        let transfer_services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: vault_lookup.clone(),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
-        };
-
         let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool, transfer_services));
+        let redemption_store = Arc::new(test_store(pool, ()));
 
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex,
@@ -317,8 +309,7 @@ mod tests {
 
         // Drive redemption to Completed: Redeem -> SubmitWithdraw ->
         // ConfirmWithdraw -> UnwrapTokens -> SubmitUnwrap -> ConfirmUnwrap ->
-        // PrepareSend -> SendTokens -> (TokensSent). Then detect via DetectSend.
-        // MockRaindex and MockWrapper complete synchronously.
+        // PrepareSend -> RecordSendOutcome -> (TokensSent). Then detect.
         redemption_store
             .send(
                 &id,
@@ -332,22 +323,67 @@ mod tests {
             .await
             .unwrap();
 
-        // Drive through intermediate states to SendPending.
-        for cmd in [
-            EquityRedemptionCommand::SubmitWithdraw,
-            EquityRedemptionCommand::ConfirmWithdraw,
-            EquityRedemptionCommand::UnwrapTokens,
-            EquityRedemptionCommand::SubmitUnwrap,
-            EquityRedemptionCommand::ConfirmUnwrap,
-            EquityRedemptionCommand::PrepareSend,
-        ] {
-            redemption_store.send(&id, cmd).await.unwrap();
-        }
-
-        // SendTokens uses MockTokenizer.send_for_redemption which succeeds.
-        // Drives SendPending -> TokensSent.
+        // Drive through intermediate states to SendPending, supplying the
+        // values the orchestrator would normally derive from its onchain steps.
         redemption_store
-            .send(&id, EquityRedemptionCommand::SendTokens)
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitWithdraw {
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::ConfirmWithdraw {
+                    actual_wrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                    raindex_withdraw_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitUnwrap {
+                    unwrap_tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::ConfirmUnwrap {
+                    underlying_token: Address::ZERO,
+                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                    unwrap_block: 101,
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(&id, EquityRedemptionCommand::PrepareSend)
+            .await
+            .unwrap();
+
+        // Record a successful send: SendPending -> TokensSent.
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordSendOutcome {
+                    outcome: SendOutcome::Sent {
+                        redemption_wallet: Address::ZERO,
+                        redemption_tx: TxHash::random(),
+                    },
+                },
+            )
             .await
             .unwrap();
 
@@ -519,16 +555,53 @@ mod tests {
             )
             .await
             .unwrap();
-        for cmd in [
-            EquityRedemptionCommand::SubmitWithdraw,
-            EquityRedemptionCommand::ConfirmWithdraw,
-            EquityRedemptionCommand::UnwrapTokens,
-            EquityRedemptionCommand::SubmitUnwrap,
-            EquityRedemptionCommand::ConfirmUnwrap,
-            EquityRedemptionCommand::PrepareSend,
-        ] {
-            redemption_store.send(&id, cmd).await.unwrap();
-        }
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitWithdraw {
+                    tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::ConfirmWithdraw {
+                    actual_wrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                    raindex_withdraw_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::SubmitUnwrap {
+                    unwrap_tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::ConfirmUnwrap {
+                    underlying_token: Address::ZERO,
+                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                    unwrap_block: 101,
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(&id, EquityRedemptionCommand::PrepareSend)
+            .await
+            .unwrap();
 
         let seeded = redemption_store.load(&id).await.unwrap();
         assert!(
