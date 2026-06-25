@@ -598,6 +598,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
+            wrapped_equity_recovery_services,
             unwrapped_equity_recovery_store,
             unwrapped_equity_recovery_services,
             mint_store,
@@ -665,6 +666,7 @@ impl Conductor {
             &job_queue,
             EquityRecoveryInputs {
                 wrapped_store: wrapped_equity_recovery_store,
+                wrapped_services: wrapped_equity_recovery_services,
                 unwrapped_store: unwrapped_equity_recovery_store,
                 unwrapped_services: unwrapped_equity_recovery_services,
                 rebalancing_service: rebalancing_service.clone(),
@@ -876,6 +878,7 @@ fn configured_inventory_sources(
 /// job needs is present; returns `None` (recovery wiring absent) if any is not.
 fn build_wrapped_equity_recovery_ctx(
     store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    services: Option<WrappedEquityRecoveryServices>,
     service: Option<Arc<RebalancingService>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
@@ -883,8 +886,8 @@ fn build_wrapped_equity_recovery_ctx(
     queue: WrappedEquityRecoveryJobQueue,
     reschedule_interval: Duration,
 ) -> Option<Arc<WrappedEquityRecoveryCtx>> {
-    let (Some(store), Some(service), Some(mint_store), Some(redemption_store)) =
-        (store, service, mint_store, redemption_store)
+    let (Some(store), Some(services), Some(service), Some(mint_store), Some(redemption_store)) =
+        (store, services, service, mint_store, redemption_store)
     else {
         return None;
     };
@@ -892,6 +895,7 @@ fn build_wrapped_equity_recovery_ctx(
     Some(Arc::new(WrappedEquityRecoveryCtx {
         inventory,
         store,
+        services,
         mint_store,
         redemption_store,
         equity_in_progress: service.equity_in_progress.clone(),
@@ -1179,6 +1183,7 @@ struct RebalancingInfrastructure {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
+    wrapped_equity_recovery_services: WrappedEquityRecoveryServices,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     unwrapped_equity_recovery_services: UnwrappedEquityRecoveryServices,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1217,6 +1222,7 @@ struct PositionAndRebalancing {
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    wrapped_equity_recovery_services: Option<WrappedEquityRecoveryServices>,
     unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
     unwrapped_equity_recovery_services: Option<UnwrappedEquityRecoveryServices>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
@@ -1271,6 +1277,7 @@ impl PositionAndRebalancing {
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
+                wrapped_equity_recovery_services: Some(infra.wrapped_equity_recovery_services),
                 unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
                 unwrapped_equity_recovery_services: Some(infra.unwrapped_equity_recovery_services),
                 mint_store: Some(infra.mint_store),
@@ -1311,6 +1318,7 @@ impl PositionAndRebalancing {
                 service: None,
                 recovery_transfer: None,
                 wrapped_equity_recovery_store: None,
+                wrapped_equity_recovery_services: None,
                 unwrapped_equity_recovery_store: None,
                 unwrapped_equity_recovery_services: None,
                 mint_store: None,
@@ -1575,6 +1583,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         // mint/redemption stores produced by the manifest above.
         let (
             wrapped_equity_recovery_store,
+            wrapped_equity_recovery_services,
             unwrapped_equity_recovery_store,
             unwrapped_equity_recovery_services,
         ) = build_equity_recovery_stores(
@@ -1684,6 +1693,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
+            wrapped_equity_recovery_services,
             unwrapped_equity_recovery_store,
             unwrapped_equity_recovery_services,
             mint_store: built.mint,
@@ -1751,21 +1761,24 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
     wallet: Address,
 ) -> anyhow::Result<(
     Arc<Store<WrappedEquityRecovery>>,
+    WrappedEquityRecoveryServices,
     Arc<Store<UnwrappedEquityRecovery>>,
     UnwrappedEquityRecoveryServices,
 )> {
+    // Both recovery aggregates are pure event recorders; their onchain side
+    // effects run in the recovery jobs, which hold these services on their ctx
+    // rather than on the store.
+    let wrapped_services = WrappedEquityRecoveryServices {
+        raindex: raindex.clone(),
+        vault_lookup: vault_lookup.clone(),
+        wrapper: wrapper.clone(),
+        transfer: transfer.clone(),
+    };
+
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
-        .build(WrappedEquityRecoveryServices {
-            raindex: raindex.clone(),
-            vault_lookup: vault_lookup.clone(),
-            wrapper: wrapper.clone(),
-            transfer: transfer.clone(),
-        })
+        .build(())
         .await?;
 
-    // The unwrapped-recovery aggregate is a pure event recorder; its onchain
-    // side effects run in the recovery job, which holds these services on its
-    // ctx rather than on the store.
     let unwrapped_services = UnwrappedEquityRecoveryServices {
         raindex,
         vault_lookup,
@@ -1778,7 +1791,12 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
         .build(())
         .await?;
 
-    Ok((wrapped_store, unwrapped_store, unwrapped_services))
+    Ok((
+        wrapped_store,
+        wrapped_services,
+        unwrapped_store,
+        unwrapped_services,
+    ))
 }
 
 /// Recovers inflight state from event history at startup.
