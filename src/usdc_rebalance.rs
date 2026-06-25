@@ -139,6 +139,15 @@ pub(crate) enum ReconcileReason {
     DepositCreditedOffline,
 }
 
+impl Display for ReconcileReason {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FundsMovedManually => formatter.write_str("funds moved manually"),
+            Self::DepositCreditedOffline => formatter.write_str("deposit credited offline"),
+        }
+    }
+}
+
 /// Errors that can occur during USDC rebalance operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum UsdcRebalanceError {
@@ -518,6 +527,11 @@ pub(crate) enum UsdcRebalanceEvent {
     /// be absent after a restart), plus `amount` and `initiated_at` so the
     /// projection preserves the real post-burn transfer instead of defaulting
     /// it to a zero-value transfer starting at reconciliation time.
+    ///
+    /// `failure_reason` is intentionally absent from the event (unlike the
+    /// first-pass design): `apply()` derives it from the prior `Failed` state
+    /// so historical events (persisted before the field was introduced) are
+    /// recovered correctly on replay without a serde-default migration.
     OperatorReconciled {
         direction: RebalanceDirection,
         amount: Usdc,
@@ -754,6 +768,10 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         reason: ReconcileReason,
+        /// The original failure message from the source terminal state.
+        /// `None` for aggregates reconciled before this field was added.
+        #[serde(default)]
+        failure_reason: Option<String>,
         initiated_at: DateTime<Utc>,
         reconciled_at: DateTime<Utc>,
     },
@@ -1013,14 +1031,17 @@ impl UsdcRebalance {
             Self::Reconciled {
                 direction,
                 amount,
+                reason,
+                failure_reason,
                 initiated_at,
                 reconciled_at,
-                ..
             } => (
                 direction,
                 *amount,
-                UsdcBridgeStatus::Completed {
-                    completed_at: *reconciled_at,
+                UsdcBridgeStatus::Reconciled {
+                    reconciled_at: *reconciled_at,
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reason.to_string(),
                 },
                 *initiated_at,
                 *reconciled_at,
@@ -1487,7 +1508,13 @@ impl EventSourced for UsdcRebalance {
     // v5: added the terminal `Reconciled` state (and `OperatorReconciled` event)
     // for operator reconciliation of a post-burn `DepositFailed`. Bumped to
     // clear stale snapshots so they rebuild from events under the new schema.
-    const SCHEMA_VERSION: u64 = 5;
+    // v6: added `failure_reason: Option<String>` to the `Reconciled` state.
+    // Existing v5 snapshots of a `Reconciled` aggregate would deserialize
+    // `failure_reason` as `None` via serde default and the historical-recovery
+    // in `evolve()` would never run for them. Bumped to invalidate stale
+    // snapshots, forcing a rebuild from events so `failure_reason` is derived
+    // from the prior failed state on replay.
+    const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1999,6 +2026,15 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
+            // OperatorReconciled: derive failure_reason from the prior state and
+            // transition to Reconciled, or return Ok(None) for non-reconcilable
+            // states. The nested match enumerates every UsdcRebalance variant
+            // exhaustively (no wildcard), so adding a new variant forces a
+            // conscious classification here at compile time.
+            //
+            // Deriving failure_reason on replay also covers historical
+            // OperatorReconciled events persisted before failure_reason was
+            // tracked: the correct reason is recovered regardless of event age.
             (
                 OperatorReconciled {
                     direction,
@@ -2007,28 +2043,67 @@ impl EventSourced for UsdcRebalance {
                     initiated_at,
                     reconciled_at,
                 },
-                // Mirrors the states `transition_reconcile_stuck_rebalance`
-                // accepts: a post-burn terminal failure that strands the guard.
-                Self::DepositFailed { .. }
-                | Self::BridgingFailed {
-                    burn_tx_hash: Some(_),
-                    ..
+                state,
+            ) => {
+                match state {
+                    // DepositFailed and ConversionFailed(BaseToAlpaca): post-burn/post-mint,
+                    // manually reconcilable.
+                    Self::DepositFailed {
+                        reason: failure_reason,
+                        ..
+                    }
+                    | Self::ConversionFailed {
+                        reason: failure_reason,
+                        direction: RebalanceDirection::BaseToAlpaca,
+                        ..
+                    } => Self::Reconciled {
+                        direction: *direction,
+                        amount: *amount,
+                        reason: *reason,
+                        failure_reason: Some(failure_reason.clone()),
+                        initiated_at: *initiated_at,
+                        reconciled_at: *reconciled_at,
+                    },
+
+                    // BridgingFailed with a burn tx or cctp nonce: post-burn, manually
+                    // reconcilable.
+                    Self::BridgingFailed {
+                        reason: failure_reason,
+                        burn_tx_hash,
+                        cctp_nonce,
+                        ..
+                    } if burn_tx_hash.is_some() || cctp_nonce.is_some() => Self::Reconciled {
+                        direction: *direction,
+                        amount: *amount,
+                        reason: *reason,
+                        failure_reason: Some(failure_reason.clone()),
+                        initiated_at: *initiated_at,
+                        reconciled_at: *reconciled_at,
+                    },
+
+                    // All remaining states are not reconcilable. Enumerated without a
+                    // wildcard so the compiler rejects unclassified new variants.
+                    Self::Converting { .. }
+                    | Self::ConversionComplete { .. }
+                    | Self::ConversionFailed {
+                        direction: RebalanceDirection::AlpacaToBase,
+                        ..
+                    }
+                    | Self::WithdrawalSubmitting { .. }
+                    | Self::Withdrawing { .. }
+                    | Self::WithdrawalComplete { .. }
+                    | Self::WithdrawalFailed { .. }
+                    | Self::BridgingSubmitting { .. }
+                    | Self::Bridging { .. }
+                    | Self::AwaitingAttestation { .. }
+                    | Self::Attested { .. }
+                    | Self::BridgingFailed { .. }
+                    | Self::Bridged { .. }
+                    | Self::DepositInitiated { .. }
+                    | Self::DepositConfirmed { .. }
+                    | Self::Reconciled { .. } => return Ok(None),
                 }
-                | Self::BridgingFailed {
-                    cctp_nonce: Some(_),
-                    ..
-                }
-                | Self::ConversionFailed {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    ..
-                },
-            ) => Self::Reconciled {
-                direction: *direction,
-                amount: *amount,
-                reason: *reason,
-                initiated_at: *initiated_at,
-                reconciled_at: *reconciled_at,
-            },
+            }
 
             _ => return Ok(None),
         };
@@ -6498,35 +6573,41 @@ mod tests {
     /// Drives `ReconcileStuckRebalance` against a history that ends in a
     /// guard-stranding post-burn failure and asserts it emits a single
     /// `OperatorReconciled` preserving the source amount and initiation
-    /// timestamp, then materializes the clearing terminal `Reconciled`.
+    /// timestamp, then materializes the clearing terminal `Reconciled` with
+    /// the source failure reason recovered from the prior state.
     async fn assert_reconcile_emits_operator_reconciled(
         history: Vec<UsdcRebalanceEvent>,
         expected_direction: RebalanceDirection,
     ) {
-        // The source failure carries the real post-burn amount and original
-        // initiation timestamp; reconciliation must preserve both so the
-        // projection does not collapse the transfer to a zero-value one.
-        let (source_amount, source_initiated_at) = match replay::<UsdcRebalance>(history.clone())
-            .expect("history should replay")
-            .expect("history should materialize a failure state")
-        {
-            UsdcRebalance::DepositFailed {
-                amount,
-                initiated_at,
-                ..
-            }
-            | UsdcRebalance::BridgingFailed {
-                amount,
-                initiated_at,
-                ..
-            }
-            | UsdcRebalance::ConversionFailed {
-                amount,
-                initiated_at,
-                ..
-            } => (amount, initiated_at),
-            other => panic!("fixture should end in a post-burn failure, got {other:?}"),
-        };
+        // The source failure carries the real post-burn amount, original
+        // initiation timestamp, and failure reason; reconciliation must
+        // preserve all three so the projection does not collapse the transfer
+        // to a zero-value one and does not lose the failure context.
+        let (source_amount, source_initiated_at, source_failure_reason) =
+            match replay::<UsdcRebalance>(history.clone())
+                .expect("history should replay")
+                .expect("history should materialize a failure state")
+            {
+                UsdcRebalance::DepositFailed {
+                    amount,
+                    initiated_at,
+                    reason,
+                    ..
+                }
+                | UsdcRebalance::BridgingFailed {
+                    amount,
+                    initiated_at,
+                    reason,
+                    ..
+                }
+                | UsdcRebalance::ConversionFailed {
+                    amount,
+                    initiated_at,
+                    reason,
+                    ..
+                } => (amount, initiated_at, reason),
+                other => panic!("fixture should end in a post-burn failure, got {other:?}"),
+            };
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(history.clone())
@@ -6553,13 +6634,17 @@ mod tests {
         assert_eq!(*initiated_at, source_initiated_at);
 
         // Applying the event must drive the aggregate to the clearing terminal
-        // Reconciled state -- the evolve arm, not just the command handler.
+        // Reconciled state with failure_reason recovered from the prior state.
         let state = replay::<UsdcRebalance>([history, events].concat())
             .expect("event stream should replay")
             .expect("event stream should materialize aggregate state");
-        assert!(
-            matches!(state, UsdcRebalance::Reconciled { .. }),
-            "reconciled aggregate should be Reconciled, got {state:?}"
+        let UsdcRebalance::Reconciled { failure_reason, .. } = state else {
+            panic!("reconciled aggregate should be Reconciled, got {state:?}");
+        };
+        assert_eq!(
+            failure_reason,
+            Some(source_failure_reason),
+            "reconciled state must carry the source failure reason"
         );
     }
 
@@ -6593,12 +6678,14 @@ mod tests {
             .await
             .events();
 
-        // The DepositFailed source state carries the real post-burn amount and
-        // original initiation timestamp; reconciliation must preserve both so
-        // the projection does not collapse the transfer to a zero-value one.
+        // The DepositFailed source state carries the real post-burn amount,
+        // original initiation timestamp, and failure reason; reconciliation
+        // must preserve all three so the projection does not collapse the
+        // transfer to a zero-value one and does not lose the failure context.
         let UsdcRebalance::DepositFailed {
             amount: failed_amount,
             initiated_at: failed_initiated_at,
+            reason: failed_reason,
             ..
         } = replay::<UsdcRebalance>(history.clone())
             .expect("history should replay")
@@ -6624,20 +6711,25 @@ mod tests {
         assert_eq!(*initiated_at, failed_initiated_at);
 
         // Applying the event must drive the aggregate to the clearing terminal
-        // Reconciled state -- the evolve arm, not just the command handler.
+        // Reconciled state with failure_reason recovered from the prior state.
         let state = replay::<UsdcRebalance>([history, events].concat())
             .expect("event stream should replay")
             .expect("event stream should materialize aggregate state");
-        assert!(
-            matches!(
-                state,
-                UsdcRebalance::Reconciled {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    reason: ReconcileReason::FundsMovedManually,
-                    ..
-                }
-            ),
-            "reconciled aggregate should be Reconciled, got {state:?}"
+        let UsdcRebalance::Reconciled {
+            direction: reconciled_direction,
+            reason: reconciled_reason,
+            failure_reason,
+            ..
+        } = state
+        else {
+            panic!("reconciled aggregate should be Reconciled, got {state:?}");
+        };
+        assert_eq!(reconciled_direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(reconciled_reason, ReconcileReason::FundsMovedManually);
+        assert_eq!(
+            failure_reason,
+            Some(failed_reason),
+            "reconciled state must carry the source failure reason"
         );
     }
 
@@ -6647,6 +6739,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100.00)),
             reason: ReconcileReason::FundsMovedManually,
+            failure_reason: None,
             initiated_at: Utc::now(),
             reconciled_at: Utc::now(),
         };
@@ -6662,10 +6755,85 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100.00)),
             reason: ReconcileReason::DepositCreditedOffline,
+            failure_reason: None,
             initiated_at: Utc::now(),
             reconciled_at: Utc::now(),
         };
         assert_eq!(reconciled.direction(), RebalanceDirection::AlpacaToBase);
+    }
+
+    /// Reconciling from a `DepositFailed` state with `DepositCreditedOffline`
+    /// reason must surface `reconcileReason = "deposit credited offline"` in
+    /// the DTO -- an integration test covering the full
+    /// command -> state -> to_dto pipeline for the `DepositCreditedOffline`
+    /// variant, which is the operator's signal that the deposit settled
+    /// out-of-band without needing a retry.
+    #[tokio::test]
+    async fn reconcile_deposit_credited_offline_surfaces_in_dto() {
+        let history = deposit_failed_history();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(history.clone())
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::DepositCreditedOffline,
+            })
+            .await
+            .events();
+
+        let reconciled_state = replay::<UsdcRebalance>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize aggregate state");
+
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let TransferOperation::UsdcBridge(bridge) = reconciled_state.to_dto(&id) else {
+            panic!("expected UsdcBridge variant");
+        };
+        let serialized =
+            serde_json::to_value(&bridge.status).expect("status serialization should succeed");
+        assert_eq!(serialized["status"], serde_json::json!("reconciled"));
+        assert_eq!(
+            serialized["reconcileReason"],
+            serde_json::json!("deposit credited offline"),
+            "DepositCreditedOffline must surface the human-readable string in the DTO"
+        );
+        assert_eq!(
+            serialized["failureReason"],
+            serde_json::json!("deposit rejected"),
+            "failure_reason must be recovered from the prior DepositFailed state"
+        );
+    }
+
+    /// Simulates replaying a HISTORICAL `OperatorReconciled` event that was
+    /// persisted before `failure_reason` was introduced (old events have no
+    /// such field in their JSON). `apply()` must recover the failure reason
+    /// from the prior `DepositFailed` state, so the replayed `Reconciled`
+    /// state carries the correct context even without it in the event.
+    #[tokio::test]
+    async fn historical_operator_reconciled_event_recovers_failure_reason_from_prior_state() {
+        // Build a history: DepositFailed then a legacy-style OperatorReconciled
+        // (no failure_reason field -- matches what old persisted events look like).
+        let mut history = deposit_failed_history();
+        history.push(UsdcRebalanceEvent::OperatorReconciled {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100.00)),
+            reason: ReconcileReason::FundsMovedManually,
+            initiated_at: Utc::now(),
+            reconciled_at: Utc::now(),
+        });
+
+        let state = replay::<UsdcRebalance>(history)
+            .expect("event stream should replay")
+            .expect("event stream should materialize aggregate state");
+
+        let UsdcRebalance::Reconciled { failure_reason, .. } = state else {
+            panic!("should be Reconciled, got {state:?}");
+        };
+        // "deposit rejected" is the reason set in deposit_failed_history().
+        assert_eq!(
+            failure_reason,
+            Some("deposit rejected".to_string()),
+            "historical replay must recover failure_reason from prior DepositFailed state"
+        );
     }
 
     #[tokio::test]
@@ -8138,14 +8306,15 @@ mod tests {
     }
 
     #[test]
-    fn to_dto_reconciled_preserves_amount_and_original_initiated_at() {
+    fn to_dto_reconciled_carries_reconcile_reason_and_preserves_amount() {
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let initiated_at = Utc::now();
-        let reconciled_at = initiated_at + chrono::Duration::seconds(120);
+        let initiated_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let state = UsdcRebalance::Reconciled {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
             reason: ReconcileReason::FundsMovedManually,
+            failure_reason: Some("deposit timed out after max retries".to_string()),
             initiated_at,
             reconciled_at,
         };
@@ -8161,10 +8330,20 @@ mod tests {
         assert_eq!(bridge.amount, Usdc::new(float!(750)));
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, reconciled_at);
-        assert!(matches!(
-            bridge.status,
-            UsdcBridgeStatus::Completed { completed_at } if completed_at == reconciled_at
-        ));
+        let serialized = serde_json::to_value(&bridge.status).expect("serialization failed");
+        assert_eq!(serialized["status"], serde_json::json!("reconciled"));
+        assert_eq!(
+            serialized["reconciledAt"],
+            serde_json::json!("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(
+            serialized["failureReason"],
+            serde_json::json!("deposit timed out after max retries")
+        );
+        assert_eq!(
+            serialized["reconcileReason"],
+            serde_json::json!("funds moved manually")
+        );
     }
 
     #[test]
@@ -8885,6 +9064,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 reason: ReconcileReason::FundsMovedManually,
+                failure_reason: None,
                 initiated_at: now,
                 reconciled_at: now,
             }

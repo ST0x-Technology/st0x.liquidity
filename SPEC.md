@@ -3133,9 +3133,11 @@ pre-send redemption failures settle inventory at failure time, so they need no
 such clearing. `Reconciled` is valid ONLY from `Failed`; every other state is
 rejected. The `Reconciled` state retains the identifying fields (symbol,
 quantity, original failure reason, request/redemption identifiers) so the
-dashboard projection still reports the real transfer, and maps to the existing
-terminal `Completed` DTO status (no new status). The CLI surface is
-`transfer reconcile --kind mint|redemption` (alongside `--kind usdc`).
+dashboard projection still reports the real transfer, and maps to a distinct
+terminal `Reconciled` DTO status carrying `reconciled_at`, `failure_reason`, and
+`reconcile_reason` -- distinguishable from genuine success (`Completed`) at the
+DTO level. The CLI surface is `transfer reconcile --kind mint|redemption`
+(alongside `--kind usdc`).
 
 The operator-facing verb vocabulary that this command and the rest of the
 recovery CLI follow is defined in the "Operator Recovery Surface" section below.

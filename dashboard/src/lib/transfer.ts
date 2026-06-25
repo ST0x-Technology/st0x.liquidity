@@ -54,15 +54,32 @@ export const transferTypeLabel = (transfer: {
 /// Maps a status string to colour classes.  Works for both DTO statuses
 /// (snake_case, used in the table) and raw event names (PascalCase,
 /// used in the detail modal timeline).
+///
+/// Note: `lower.includes('reconciled')` also matches the raw event name
+/// `OperatorReconciled` from the timeline -- this is intentional since that
+/// event IS a reconciliation step and should render amber.
 export const statusStyle = (status: string): StatusStyle => {
   const lower = status.toLowerCase()
 
   if (lower.includes('completed') || lower.includes('deposited') || lower.includes('confirmed')) {
-    return { text: 'text-green-500', dot: 'bg-green-500' }
+    return {
+      text: 'text-green-500',
+      dot: 'bg-green-500',
+    }
+  }
+
+  if (lower.includes('reconciled')) {
+    return {
+      text: 'text-amber-500',
+      dot: 'bg-amber-500',
+    }
   }
 
   if (lower.includes('failed') || lower.includes('rejected')) {
-    return { text: 'text-destructive', dot: 'bg-destructive' }
+    return {
+      text: 'text-destructive',
+      dot: 'bg-destructive',
+    }
   }
 
   return { text: 'text-muted-foreground', dot: 'bg-muted-foreground' }
@@ -238,11 +255,11 @@ const commandPrefix = (deployment: DeploymentContext): string | null => {
 /// recovery verbs.
 const isFailedStatus = (status: string): boolean => status.toLowerCase() === 'failed'
 
-/// Whether a transfer status is a terminal state (failed or completed); no
-/// recovery commands apply to a completed transfer.
-const isTerminalStatus = (status: string): boolean => {
+/// Whether a transfer status is a terminal state (failed, completed, or
+/// reconciled); no recovery commands apply to a reconciled transfer.
+export const isTerminalStatus = (status: string): boolean => {
   const lower = status.toLowerCase()
-  return lower === 'failed' || lower === 'completed'
+  return lower === 'failed' || lower === 'completed' || lower === 'reconciled'
 }
 
 /// Builds the full set of recovery commands an operator could legitimately run
@@ -273,7 +290,11 @@ export const transferRecoveryCommands = (params: {
   const prefix = commandPrefix(params.deployment)
   if (prefix === null) return []
 
-  if (params.status.toLowerCase() === 'completed') return []
+  if (
+    params.status.toLowerCase() === 'completed' ||
+    params.status.toLowerCase() === 'reconciled'
+  )
+    return []
 
   if (params.kind === 'usdc_bridge') {
     return usdcBridgeRecoveryCommands(

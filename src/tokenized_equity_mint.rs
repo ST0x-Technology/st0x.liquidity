@@ -1331,21 +1331,21 @@ impl TokenizedEquityMint {
                 updated_at: *failed_at,
             }),
 
-            // Reconciliation is a terminal operator resolution, so it maps to the
-            // existing `Completed` DTO status (no new status needed) -- mirrors the
-            // USDC `Reconciled -> Completed` mapping.
             Self::Reconciled {
                 symbol,
                 quantity,
+                failure_reason,
+                reconcile_reason,
                 requested_at,
                 reconciled_at,
-                ..
             } => TransferOperation::EquityMint(EquityMintOperation {
                 id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: Completed {
-                    completed_at: *reconciled_at,
+                status: Reconciled {
+                    reconciled_at: *reconciled_at,
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reconcile_reason.clone(),
                 },
                 started_at: *requested_at,
                 updated_at: *reconciled_at,
@@ -3645,7 +3645,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciled_to_dto_reports_completed_preserving_quantity() {
+    fn to_dto_reconciled_carries_failure_and_reconcile_reason() {
         let requested_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled = TokenizedEquityMint::Reconciled {
@@ -3662,13 +3662,17 @@ mod tests {
         else {
             panic!("expected an EquityMint operation");
         };
-        let EquityMintStatus::Completed { completed_at } = operation.status else {
-            panic!(
-                "reconciled mint must map to the Completed DTO status, got {:?}",
-                operation.status
-            );
-        };
-        assert_eq!(completed_at, reconciled_at);
+        let serialized = serde_json::to_value(&operation.status).expect("serialization failed");
+        assert_eq!(serialized["status"], serde_json::json!("reconciled"));
+        assert_eq!(
+            serialized["reconciledAt"],
+            serde_json::json!("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(serialized["failureReason"], serde_json::json!("timed out"));
+        assert_eq!(
+            serialized["reconcileReason"],
+            serde_json::json!("credited offline")
+        );
         assert_eq!(operation.started_at, requested_at);
         assert_eq!(operation.updated_at, reconciled_at);
         assert_eq!(
