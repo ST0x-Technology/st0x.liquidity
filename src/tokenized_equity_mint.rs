@@ -1198,6 +1198,26 @@ impl TokenizedEquityMint {
         }
     }
 
+    /// Returns `true` when the aggregate has reached a terminal state and no
+    /// further job-driven processing is expected.
+    ///
+    /// An exhaustive `match` is intentional: adding a new variant to the enum
+    /// without updating this function causes a compile error, preventing silent
+    /// mis-classification of new states.
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            Self::DepositedIntoRaindex { .. } | Self::Failed { .. } | Self::Reconciled { .. } => {
+                true
+            }
+            Self::MintRequested { .. }
+            | Self::MintAccepted { .. }
+            | Self::TokensReceived { .. }
+            | Self::WrapSubmitted { .. }
+            | Self::TokensWrapped { .. }
+            | Self::VaultDepositSubmitted { .. } => false,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &IssuerRequestId) -> TransferOperation {
         use EquityMintStatus::*;
 
@@ -3654,6 +3674,141 @@ mod tests {
         assert_eq!(
             operation.quantity.to_string(),
             FractionalShares::new(float!(10)).to_string()
+        );
+    }
+
+    #[test]
+    fn is_terminal_classifies_every_variant() {
+        // Exhaustively checks every TokenizedEquityMint variant so that adding a
+        // new variant without updating is_terminal causes a compile error (the
+        // exhaustive match) AND a test failure (unexpected true/false here).
+        let now = Utc::now();
+        let sym = Symbol::new("tAAPL").unwrap();
+        let id = issuer_request_id("ISS001");
+        let tok = TokenizationRequestId("TOK001".to_string());
+
+        assert!(
+            !TokenizedEquityMint::MintRequested {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                requested_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !TokenizedEquityMint::MintAccepted {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                issuer_request_id: id.clone(),
+                tokenization_request_id: tok.clone(),
+                requested_at: now,
+                accepted_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !TokenizedEquityMint::TokensReceived {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                issuer_request_id: id.clone(),
+                tokenization_request_id: tok.clone(),
+                tx_hash: TxHash::default(),
+                shares_minted: U256::ZERO,
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !TokenizedEquityMint::WrapSubmitted {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                issuer_request_id: id.clone(),
+                tokenization_request_id: tok.clone(),
+                tx_hash: TxHash::default(),
+                shares_minted: U256::ZERO,
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::default(),
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !TokenizedEquityMint::TokensWrapped {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                issuer_request_id: id.clone(),
+                tokenization_request_id: tok.clone(),
+                tx_hash: TxHash::default(),
+                shares_minted: U256::ZERO,
+                wrap_tx_hash: TxHash::default(),
+                wrapped_shares: U256::ZERO,
+                wrap_block: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrapped_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !TokenizedEquityMint::VaultDepositSubmitted {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                issuer_request_id: id.clone(),
+                tokenization_request_id: tok.clone(),
+                tx_hash: TxHash::default(),
+                shares_minted: U256::ZERO,
+                wrap_tx_hash: TxHash::default(),
+                wrapped_shares: U256::ZERO,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrapped_at: now,
+                vault_deposit_tx_hash: TxHash::default(),
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            TokenizedEquityMint::DepositedIntoRaindex {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                issuer_request_id: id,
+                tokenization_request_id: tok,
+                token_tx_hash: TxHash::default(),
+                wrap_tx_hash: TxHash::default(),
+                vault_deposit_tx_hash: TxHash::default(),
+                requested_at: now,
+                deposited_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            TokenizedEquityMint::Failed {
+                symbol: sym,
+                quantity: float!(1),
+                reason: "test".to_string(),
+                requested_at: now,
+                failed_at: now,
+            }
+            .is_terminal(),
         );
     }
 }

@@ -979,6 +979,27 @@ impl EquityRedemption {
         }
     }
 
+    /// Returns `true` when the aggregate has reached a terminal state and no
+    /// further job-driven processing is expected.
+    ///
+    /// An exhaustive `match` is intentional: adding a new variant to the enum
+    /// without updating this function causes a compile error, preventing silent
+    /// mis-classification of new states.
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            Self::Completed { .. } | Self::Failed { .. } | Self::Reconciled { .. } => true,
+            Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitted { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. }
+            | Self::TokensSent { .. }
+            | Self::Pending { .. } => false,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
             Self::VaultWithdrawPending {
@@ -5189,6 +5210,178 @@ mod tests {
         assert_eq!(
             operation.quantity.to_string(),
             FractionalShares::new(float!(50.25)).to_string()
+        );
+    }
+
+    #[test]
+    fn is_terminal_classifies_every_variant() {
+        // Exhaustively checks every EquityRedemption variant so that adding a new
+        // variant without updating is_terminal causes a compile error (the
+        // exhaustive match) AND a test failure (unexpected true/false here).
+        let now = Utc::now();
+        let sym = Symbol::new("tAAPL").unwrap();
+        let tok = TokenizationRequestId("TOK001".to_string());
+
+        assert!(
+            !EquityRedemption::VaultWithdrawPending {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                wrapped_amount: U256::ZERO,
+                pending_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::VaultWithdrawSubmitted {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                wrapped_amount: U256::ZERO,
+                tx_hash: TxHash::default(),
+                submitted_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::WithdrawnFromRaindex {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                wrapped_amount: U256::ZERO,
+                raindex_withdraw_tx: TxHash::default(),
+                raindex_withdraw_block: None,
+                withdrawn_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::UnwrapPending {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                wrapped_amount: U256::ZERO,
+                raindex_withdraw_tx: TxHash::default(),
+                raindex_withdraw_block: None,
+                withdrawn_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::UnwrapSubmitted {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                wrapped_amount: U256::ZERO,
+                raindex_withdraw_tx: TxHash::default(),
+                raindex_withdraw_block: None,
+                unwrap_tx_hash: TxHash::default(),
+                withdrawn_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::TokensUnwrapped {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                underlying_token: Address::ZERO,
+                raindex_withdraw_tx: TxHash::default(),
+                unwrap_tx_hash: TxHash::default(),
+                unwrapped_amount: U256::ZERO,
+                unwrap_block: None,
+                withdrawn_at: now,
+                unwrapped_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::SendPending {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                underlying_token: Address::ZERO,
+                raindex_withdraw_tx: TxHash::default(),
+                unwrap_tx_hash: TxHash::default(),
+                unwrapped_amount: U256::ZERO,
+                unwrap_block: None,
+                withdrawn_at: now,
+                unwrapped_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::TokensSent {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                token: Address::ZERO,
+                raindex_withdraw_tx: TxHash::default(),
+                unwrap_tx_hash: None,
+                redemption_wallet: Address::ZERO,
+                redemption_tx: TxHash::default(),
+                sent_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            !EquityRedemption::Pending {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                redemption_tx: TxHash::default(),
+                tokenization_request_id: tok.clone(),
+                sent_at: now,
+                detected_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            EquityRedemption::Completed {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                redemption_tx: TxHash::default(),
+                tokenization_request_id: tok,
+                started_at: now,
+                completed_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            EquityRedemption::Reconciled {
+                symbol: sym.clone(),
+                quantity: float!(1),
+                raindex_withdraw_tx: None,
+                redemption_tx: None,
+                tokenization_request_id: None,
+                failure_reason: None,
+                reconcile_reason: "deposited manually".to_string(),
+                started_at: now,
+                reconciled_at: now,
+            }
+            .is_terminal(),
+        );
+
+        assert!(
+            EquityRedemption::Failed {
+                symbol: sym,
+                quantity: float!(1),
+                raindex_withdraw_tx: None,
+                redemption_tx: None,
+                tokenization_request_id: None,
+                reason: None,
+                started_at: now,
+                failed_at: now,
+            }
+            .is_terminal(),
         );
     }
 }

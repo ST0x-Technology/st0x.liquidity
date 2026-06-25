@@ -106,6 +106,28 @@ mid-execution reset their own orphaned rows at startup, before the monitor
 spawns (where every `Running` row is by definition orphaned): see
 `JobQueue::requeue_orphaned`, wired for the Base->Alpaca USDC transfer.
 
+### apalis Jobs table: status semantics and payload encoding
+
+**Status lifecycle** (apalis-sqlite v1.0.0-rc.8, source-verified via
+`fetch_next.sql` and `ack.sql`):
+
+- `Pending`/`Queued`/`Running` -> in-flight; will be processed.
+- `Done`/`Killed` -> terminal; will not be processed again.
+- `Failed` -> **terminal only when `attempts >= max_attempts`**. A `Failed` row
+  with `attempts < max_attempts` is STILL LIVE: `fetch_next.sql` re-selects it
+  (`status='Failed' AND attempts < max_attempts`, ignoring `done_at`) and a
+  polling worker will re-run it. `ack.sql` writes `Failed` in place without
+  rescheduling; `done_at` being set does NOT make a `Failed` row terminal.
+
+Dedupe/guard queries that want to detect all live rows must therefore use:
+`status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts)`.
+
+**Payload encoding**: the `job` column is the JSON-serialized payload stored as
+a SQL BLOB (apalis `JsonCodec`). Read it as `Vec<u8>` and parse with
+`serde_json::from_slice`, or use `json_extract(job, '$.field')` in SQL. Decoding
+directly as a Rust `String` fails at runtime: "Rust type String (as TEXT) is not
+compatible with SQL type BLOB".
+
 ### Job trait
 
 Defined in `src/conductor/job.rs`. Wraps apalis's function-based handler API
