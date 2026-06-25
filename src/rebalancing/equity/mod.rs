@@ -202,11 +202,12 @@ pub(crate) struct EquityTransferServices {
 impl EquityTransferServices {
     /// Constructs a services instance whose methods all panic.
     ///
-    /// Safe for sending commands that never invoke services (e.g., the
-    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, `FailTransfer`,
-    /// and `Reconcile` commands). Used by the CLI `transfer fail` and
-    /// `transfer reconcile` subcommands where no real broker/RPC connection
-    /// exists.
+    /// Only the redemption aggregate (`EquityRedemption`) still takes
+    /// `EquityTransferServices`; its failure and `Reconcile` commands never
+    /// invoke them, so the panicking stub is safe for the CLI `transfer fail`
+    /// and `transfer reconcile` subcommands where no real broker/RPC connection
+    /// exists. Mint commands use `()` services directly -- `TokenizedEquityMint`
+    /// performs no I/O in its handlers.
     pub(crate) fn panicking() -> Self {
         Self {
             raindex: Arc::new(PanickingRaindex),
@@ -432,6 +433,24 @@ pub(crate) enum MintError {
     VaultLookup(#[from] VaultLookupError),
     #[error("Onchain mint verification failed: {0}")]
     Verification(#[from] MintVerificationError),
+    #[error("Tokenization provider error: {0}")]
+    Tokenizer(#[from] TokenizerError),
+    #[error("Mint {tokenization_request_id} remained pending after polling")]
+    MintStillPending {
+        tokenization_request_id: TokenizationRequestId,
+    },
+    #[error("Completed mint {tokenization_request_id} is missing its onchain tx hash")]
+    CompletedMintMissingTxHash {
+        tokenization_request_id: TokenizationRequestId,
+    },
+    #[error(
+        "Completed mint {tokenization_request_id} returned token symbol {actual:?}; expected {expected}"
+    )]
+    CompletedMintTokenSymbolMismatch {
+        tokenization_request_id: TokenizationRequestId,
+        expected: String,
+        actual: Option<String>,
+    },
     #[error(
         "Entity not found after command: expected {expected_state} \
          for {issuer_request_id}"
@@ -882,11 +901,56 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintError> {
         loop {
             match self.load_mint_entity(issuer_request_id).await? {
-                TokenizedEquityMint::MintAccepted { .. } => {
-                    info!(%issuer_request_id, "Resuming accepted mint");
-                    self.mint_store
-                        .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
-                        .await?;
+                TokenizedEquityMint::MintAccepted {
+                    symbol,
+                    tokenization_request_id,
+                    ..
+                } => {
+                    info!(%issuer_request_id, "Polling accepted mint");
+                    match self
+                        .tokenizer
+                        .poll_mint_until_complete(&tokenization_request_id)
+                        .await
+                    {
+                        Ok(completed) => match completed.status {
+                            TokenizationRequestStatus::Completed => {
+                                self.record_completed_mint(issuer_request_id, &symbol, completed)
+                                    .await?;
+                            }
+                            TokenizationRequestStatus::Rejected => {
+                                warn!(target: "rebalance", %symbol, "Mint rejected by Alpaca after acceptance");
+                                self.mint_store
+                                    .send(
+                                        issuer_request_id,
+                                        TokenizedEquityMintCommand::FailAcceptance {
+                                            reason: "Rejected by Alpaca after acceptance"
+                                                .to_string(),
+                                        },
+                                    )
+                                    .await?;
+                            }
+                            TokenizationRequestStatus::Pending => {
+                                warn!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    %tokenization_request_id,
+                                    "Mint remained pending after polling; leaving it in flight for retry"
+                                );
+                                return Err(MintError::MintStillPending {
+                                    tokenization_request_id,
+                                });
+                            }
+                        },
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %error,
+                                %symbol,
+                                "Mint polling failed; leaving the accepted mint in flight for retry"
+                            );
+                            return Err(error.into());
+                        }
+                    }
                 }
                 TokenizedEquityMint::TokensReceived { .. } => {
                     info!(%issuer_request_id, "Resuming received mint");
@@ -987,6 +1051,41 @@ impl CrossVenueEquityTransfer {
                 }
             }
         }
+    }
+
+    /// Records the provider's completion payload against the mint aggregate.
+    ///
+    /// An unusable completion payload must leave the accepted mint in flight.
+    /// The provider reported completion, so failing acceptance would restore
+    /// shares to available inventory even though tokens may already exist
+    /// onchain. Propagate the aggregate rejection for retry and operator alerting
+    /// instead of manufacturing a safe-to-remint terminal state.
+    async fn record_completed_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        completed: TokenizationRequest,
+    ) -> Result<(), MintError> {
+        self.mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: completed.tx_hash,
+                    token_symbol: completed.token_symbol,
+                    fees: completed.fees,
+                },
+            )
+            .await
+            .inspect_err(|error| {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    ?error,
+                    "Provider completion payload was unusable; leaving the accepted mint in flight"
+                );
+            })?;
+
+        Ok(())
     }
 
     /// Sends the Redeem command to submit vault withdrawal, then
@@ -1670,19 +1769,28 @@ impl CrossVenueEquityTransfer {
             Some(
                 TokenizedEquityMint::MintRequested { .. }
                 | TokenizedEquityMint::MintAccepted { .. },
-            ) => {
-                if let Err(error) = self.resume_mint(issuer_request_id).await {
-                    let reached = self.load_mint_entity(issuer_request_id).await;
-                    return Err(classify_mint_resume_error(reached, error));
-                }
-
-                Ok(())
-            }
+            ) => self.resume_mint_classified(issuer_request_id).await,
             Some(_) => self
                 .resume_mint(issuer_request_id)
                 .await
                 .map_err(MintTransferError::PostReceipt),
         }
+    }
+
+    /// Runs `resume_mint` and, on failure, reloads the aggregate to bucket the
+    /// error as pre- or post-receipt. `resume_mint`'s error is only actionable
+    /// once classified by how far the aggregate advanced, so the resume and the
+    /// classification are coupled here rather than repeated at each call site.
+    async fn resume_mint_classified(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<(), MintTransferError> {
+        if let Err(error) = self.resume_mint(issuer_request_id).await {
+            let reached = self.load_mint_entity(issuer_request_id).await;
+            return Err(classify_mint_resume_error(reached, error));
+        }
+
+        Ok(())
     }
 
     async fn start_mint(
@@ -1693,36 +1801,182 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintTransferError> {
         debug!(target: "rebalance", %issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
-        // Pre-receipt: no tokens exist yet, safe to retry on failure.
+        // Pre-receipt I/O: no tokens exist yet, so this stage is safe to retry.
+        // issuer_request_id is the provider-side dedup key: if the process
+        // crashes after request_mint returns but before the RecordMintRequested
+        // commit, the retry re-enters start_mint and re-calls request_mint with
+        // the same id, and Alpaca deduplicates on issuer_request_id so no
+        // duplicate mint request is created.
+        let request = self
+            .tokenizer
+            .request_mint(
+                symbol.clone(),
+                quantity,
+                self.wallet,
+                issuer_request_id.clone(),
+            )
+            .await
+            .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
+
+        if matches!(request.status, TokenizationRequestStatus::Rejected) {
+            warn!(target: "rebalance", %symbol, "Mint request rejected by Alpaca");
+            self.mint_store
+                .send(
+                    issuer_request_id,
+                    TokenizedEquityMintCommand::RejectMintRequest {
+                        symbol: symbol.clone(),
+                        quantity: quantity.inner(),
+                        wallet: self.wallet,
+                        reason: "Rejected by Alpaca".to_string(),
+                    },
+                )
+                .await
+                .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
+
+            // Aggregate is now Failed; nothing further to drive.
+            return Ok(());
+        }
+
+        info!(target: "rebalance", %symbol, request_id = %request.id, "Mint request accepted, polling for completion");
+
+        // A concurrent worker or operator may advance the aggregate while the
+        // provider request is in flight. Reconcile every persisted state before
+        // recording the provider acceptance: blindly sending RecordMintRequested
+        // can lose an accepted provider request behind a terminal aggregate.
+        match self
+            .mint_store
+            .load(issuer_request_id)
+            .await
+            .map_err(|error| MintTransferError::PreReceipt(error.into()))?
+        {
+            Some(TokenizedEquityMint::MintAccepted {
+                tokenization_request_id: accepted,
+                ..
+            }) => {
+                if accepted != request.id {
+                    error!(
+                        target: "rebalance",
+                        %symbol,
+                        persisted_request_id = %accepted,
+                        duplicate_request_id = %request.id,
+                        "Alpaca returned a second tokenization_request_id for an already-accepted \
+                         mint; resuming the persisted request. The duplicate needs operator cleanup."
+                    );
+                }
+
+                return self.resume_mint_classified(issuer_request_id).await;
+            }
+            Some(TokenizedEquityMint::Failed { .. }) => {
+                return self
+                    .recover_racing_accepted_mint(issuer_request_id, symbol, request)
+                    .await;
+            }
+            Some(entity @ TokenizedEquityMint::Reconciled { .. }) => {
+                error!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    provider_request_id = %request.id,
+                    "Provider accepted a mint after the aggregate was reconciled; retaining the \
+                     guard for operator resolution"
+                );
+                return Err(MintTransferError::PostReceipt(MintError::UnexpectedState {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_state: "non-terminal state after provider acceptance",
+                    entity: Box::new(entity),
+                }));
+            }
+            Some(
+                TokenizedEquityMint::TokensReceived { .. }
+                | TokenizedEquityMint::WrapSubmitted { .. }
+                | TokenizedEquityMint::TokensWrapped { .. }
+                | TokenizedEquityMint::VaultDepositSubmitted { .. }
+                | TokenizedEquityMint::DepositedIntoRaindex { .. },
+            ) => {
+                return self.resume_mint_classified(issuer_request_id).await;
+            }
+            None | Some(TokenizedEquityMint::MintRequested { .. }) => {}
+        }
+
         self.mint_store
             .send(
                 issuer_request_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity: quantity.inner(),
                     wallet: self.wallet,
+                    tokenization_request_id: request.id,
                 },
             )
             .await
             .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
-        info!(target: "rebalance", "Mint request accepted, polling for completion");
+        // resume_mint drives poll -> finalize; resume_mint_classified buckets
+        // its failure by how far the aggregate advanced (pre- vs post-receipt).
+        self.resume_mint_classified(issuer_request_id).await
+    }
+
+    /// A provider acceptance raced with a transition to terminal `Failed`.
+    /// Poll the accepted request under the same provider deduplication key and
+    /// recover completion into the aggregate instead of discarding the request
+    /// or permitting a fresh mint.
+    async fn recover_racing_accepted_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        request: TokenizationRequest,
+    ) -> Result<(), MintTransferError> {
+        let provider_request_id = request.id;
+        let completed = self
+            .tokenizer
+            .poll_mint_until_complete(&provider_request_id)
+            .await
+            .map_err(|error| MintTransferError::PostReceipt(error.into()))?;
+
+        match completed.status {
+            TokenizationRequestStatus::Rejected => return Ok(()),
+            TokenizationRequestStatus::Pending => {
+                return Err(MintTransferError::PostReceipt(
+                    MintError::MintStillPending {
+                        tokenization_request_id: provider_request_id,
+                    },
+                ));
+            }
+            TokenizationRequestStatus::Completed => {}
+        }
+
+        let expected_token_symbol = format!("t{symbol}");
+        if completed.token_symbol.as_deref() != Some(expected_token_symbol.as_str()) {
+            return Err(MintTransferError::PostReceipt(
+                MintError::CompletedMintTokenSymbolMismatch {
+                    tokenization_request_id: provider_request_id,
+                    expected: expected_token_symbol,
+                    actual: completed.token_symbol,
+                },
+            ));
+        }
+
+        let tx_hash = completed.tx_hash.ok_or_else(|| {
+            MintTransferError::PostReceipt(MintError::CompletedMintMissingTxHash {
+                tokenization_request_id: provider_request_id.clone(),
+            })
+        })?;
 
         self.mint_store
-            .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::RecoverProviderCompletion {
+                    issuer_request_id: issuer_request_id.clone(),
+                    wallet: self.wallet,
+                    tokenization_request_id: provider_request_id,
+                    tx_hash,
+                    fees: completed.fees,
+                },
+            )
             .await
-            .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
+            .map_err(|error| MintTransferError::PostReceipt(error.into()))?;
 
-        // Post-receipt: tokens exist in wallet from this point on.
-        let tokens_received = self
-            .load_tokens_received(issuer_request_id)
-            .await
-            .map_err(MintTransferError::PostReceipt)?;
-
-        self.finalize_received_mint(issuer_request_id, tokens_received)
-            .await
-            .map_err(MintTransferError::PostReceipt)
+        self.resume_mint_classified(issuer_request_id).await
     }
 }
 
@@ -1797,7 +2051,8 @@ mod tests {
     use st0x_config::{AssetsConfig, EquitiesConfig};
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::{
-        MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
+        MockCompletionOutcome, MockDetectionOutcome, MockMintPollOutcome, MockMintRequestOutcome,
+        MockTokenizer, MockVerificationOutcome,
     };
     use st0x_tokenization::tokenization_request_id;
     use st0x_wrapper::MockWrapper;
@@ -1987,7 +2242,7 @@ mod tests {
         // events to the reactor's `on_mint`.
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(())
             .await
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -2134,7 +2389,7 @@ mod tests {
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(())
             .await
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -2207,11 +2462,12 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("test-req-id"),
                 },
             )
             .await
@@ -2326,11 +2582,12 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("test-req-id"),
                 },
             )
             .await
@@ -2461,7 +2718,7 @@ mod tests {
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(())
             .await
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -2509,10 +2766,8 @@ mod tests {
     ) -> (CrossVenueEquityTransfer, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let services = mock_services();
-
-        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool.clone(), services));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
+        let redemption_store = Arc::new(test_store(pool.clone(), mock_services()));
         let vault_lookup = mock_vault_lookup();
 
         let transfer = CrossVenueEquityTransfer::new(
@@ -2548,6 +2803,473 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_mint_request_api_error_is_pre_receipt() {
+        let transfer = create_equity_transfer(
+            Arc::new(
+                MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError),
+            ),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-REQ-ERR"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintTransferError::PreReceipt(MintError::Tokenizer(_))
+            ),
+            "request_mint failure must be pre-receipt, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_mint_alpaca_rejection_records_failed_and_returns_ok() {
+        let transfer = create_equity_transfer(
+            Arc::new(
+                MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::Rejected),
+            ),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-REQ-REJECT");
+        // A fresh Alpaca rejection is terminal, not retryable: the job entry
+        // point returns Ok so apalis marks it done rather than retrying forever.
+        transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "rejected mint must be Failed, got: {entity:?}"
+        );
+    }
+
+    /// The issuer_request_id is the provider-side dedup key: a job retry must
+    /// resume the persisted aggregate rather than issue a second Alpaca mint
+    /// request for the same transfer. Proven by re-entering the entry point with
+    /// the same id and asserting request_mint ran exactly once.
+    #[tokio::test]
+    async fn retry_resumes_without_a_second_mint_request() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-DEDUP");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // First pass: a fresh transfer issues exactly one mint request, keyed by
+        // the issuer_request_id, and drives the mint to completion.
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10.0)))
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.request_mint_count(), 1);
+        assert_eq!(tokenizer.last_issuer_request_id(), Some(id.clone()));
+
+        // Retry with the same id: the resume path takes over and must NOT issue a
+        // second Alpaca mint request -- otherwise the dedup key bought nothing.
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10.0)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokenizer.request_mint_count(),
+            1,
+            "a retry must resume the persisted mint, not request a duplicate"
+        );
+    }
+
+    /// A concurrent worker (or overlapping retry) can initialize the aggregate
+    /// while request_mint is in flight. If Alpaca then returns a different,
+    /// non-deduplicated tokenization_request_id, start_mint must resume the
+    /// persisted request rather than wedge on AlreadyInProgress.
+    #[tokio::test]
+    async fn start_mint_with_conflicting_request_id_resumes_persisted_mint() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-CONFLICT-ID");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Stand in for the concurrent worker: the aggregate is already accepted
+        // under a different tokenization_request_id than the mock's request_mint
+        // hands back (MOCK_REQ_ID).
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordMintRequested {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("ORIGINAL_REQ"),
+                },
+            )
+            .await
+            .unwrap();
+
+        // start_mint requests a (duplicate) mint, sees the already-accepted
+        // aggregate, and resumes the persisted request rather than re-recording.
+        transfer
+            .start_mint(&id, &symbol, FractionalShares::new(float!(10)))
+            .await
+            .expect("a conflicting request id must resume, not wedge");
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::DepositedIntoRaindex {
+            tokenization_request_id: persisted_request_id,
+            ..
+        } = entity
+        else {
+            panic!("Expected the persisted mint to complete, got: {entity:?}");
+        };
+        assert_eq!(
+            persisted_request_id,
+            tokenization_request_id("ORIGINAL_REQ"),
+            "the persisted request id must survive -- the duplicate must not overwrite it"
+        );
+    }
+
+    /// If a failure command lands while request_mint is in flight, a provider
+    /// acceptance must be polled and recovered rather than discarded behind the
+    /// terminal aggregate.
+    #[tokio::test]
+    async fn start_mint_recovers_acceptance_that_raced_with_failed_state() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = issuer_request_id("ISS-FAILED-RACE");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordMintRequested {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("STALE_REQ"),
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "operator timed out the request".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .start_mint(&id, &symbol, FractionalShares::new(float!(10)))
+            .await
+            .expect("the accepted provider request must recover the raced failure");
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "the raced provider acceptance must complete, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_race_rejects_missing_or_wrong_provider_token_symbol() {
+        for (suffix, tokenizer) in [
+            ("missing", MockTokenizer::new().with_no_token_symbol()),
+            (
+                "wrong",
+                MockTokenizer::new().with_token_symbol_override("tMSFT"),
+            ),
+        ] {
+            let transfer = create_equity_transfer(
+                Arc::new(tokenizer),
+                Arc::new(MockRaindex::new()),
+                Arc::new(MockWrapper::new()),
+            )
+            .await;
+            let id = issuer_request_id(&format!("ISS-FAILED-RACE-{suffix}"));
+            let symbol = Symbol::new("AAPL").unwrap();
+
+            transfer
+                .mint_store
+                .send(
+                    &id,
+                    TokenizedEquityMintCommand::RecordMintRequested {
+                        issuer_request_id: id.clone(),
+                        symbol: symbol.clone(),
+                        quantity: float!(10),
+                        wallet: transfer.wallet,
+                        tokenization_request_id: tokenization_request_id("STALE_REQ"),
+                    },
+                )
+                .await
+                .unwrap();
+            transfer
+                .mint_store
+                .send(
+                    &id,
+                    TokenizedEquityMintCommand::FailAcceptance {
+                        reason: "operator timed out the request".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let error = transfer
+                .start_mint(&id, &symbol, FractionalShares::new(float!(10)))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MintTransferError::PostReceipt(MintError::CompletedMintTokenSymbolMismatch { .. })
+            ));
+
+            let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(entity, TokenizedEquityMint::Failed { .. }),
+                "an invalid completion must not recover the failed aggregate: {entity:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_mint_poll_rejected_records_failed() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected)),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-POLL-REJECT");
+        transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "poll rejection must mark the mint Failed, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_poll_pending_keeps_accepted_mint_inflight_for_retry() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Pending)),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-POLL-PENDING");
+        let error = transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintTransferError::PreReceipt(MintError::MintStillPending { .. })
+        ));
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintAccepted { .. }),
+            "a still-pending provider request must stay in flight, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_poll_error_keeps_accepted_mint_inflight_for_retry() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::PollError)),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-POLL-ERR");
+        let error = transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintTransferError::PreReceipt(MintError::Tokenizer(_))
+        ));
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintAccepted { .. }),
+            "an unconfirmable provider outcome must stay in flight, got: {entity:?}"
+        );
+    }
+
+    /// After a poll rejection drives the mint to `Failed`, the apalis retry
+    /// re-enters the job entry point. A terminal aggregate must be a clean
+    /// no-op so the retry does not loop on the rejected mint.
+    #[tokio::test]
+    async fn resume_equity_to_market_making_is_noop_on_failed_mint() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected)),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-POLL-REJECT-NOOP");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10.0)))
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "poll rejection must mark the mint Failed, got: {entity:?}"
+        );
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10.0)))
+            .await
+            .expect("a Failed mint must be a clean no-op for the job retry");
+    }
+
+    #[tokio::test]
+    async fn resume_mint_poll_wrong_token_symbol_keeps_accepted_mint_inflight() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_token_symbol_override("tGME")),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-WRONG-SYM");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10.0)))
+            .await
+            .expect_err("an unusable completion payload must fail closed for retry and alerting");
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintAccepted { .. }),
+            "a reported completion may have minted tokens, so it must stay in flight: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_poll_missing_token_symbol_keeps_accepted_mint_inflight() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_no_token_symbol()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-MISSING-SYM");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10.0)))
+            .await
+            .expect_err("an unusable completion payload must fail closed for retry and alerting");
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintAccepted { .. }),
+            "a reported completion may have minted tokens, so it must stay in flight: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_records_provider_fees() {
+        // Wrap fails so the flow halts right after TokensReceived is recorded,
+        // letting us inspect the persisted fees forwarded from the provider.
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new().with_fees(float!(0.25))),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-FEES");
+        transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .unwrap_err();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::TokensReceived {
+            fees: Some(fees), ..
+        } = entity
+        else {
+            panic!("expected TokensReceived carrying fees, got: {entity:?}");
+        };
+        assert!(
+            fees.eq(float!(0.25)).unwrap(),
+            "provider fees must propagate to TokensReceived"
+        );
+    }
+
+    #[tokio::test]
     async fn resume_mint_from_accepted_completes_workflow() {
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
@@ -2561,11 +3283,12 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
@@ -2601,18 +3324,19 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
             .unwrap();
 
         // The re-enqueued job runs the same entry point with the same id; a
-        // fresh RequestMint here would fail with AlreadyInProgress, so
+        // fresh RecordMintRequested here would fail with AlreadyInProgress, so
         // completing proves the resume path was taken.
         transfer
             .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
@@ -3453,26 +4177,34 @@ mod tests {
         let id = issuer_request_id("ISS-REVERT-RECOVERY");
 
         // Advance the aggregate to TokensWrapped state manually:
-        // RequestMint -> MintAccepted -> TokensReceived -> WrapSubmitted
-        // -> TokensWrapped
+        // RecordMintRequested -> MintAccepted -> RecordTokensReceived ->
+        // TokensReceived -> WrapSubmitted -> TokensWrapped
         transfer
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
             .unwrap();
 
-        // Poll advances to TokensReceived
+        // RecordTokensReceived advances to TokensReceived
         transfer
             .mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::ZERO),
+                    token_symbol: Some("tAAPL".to_string()),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3548,16 +4280,18 @@ mod tests {
         let id = issuer_request_id("ISS-WRAP-SUBMITTED-RECOVERY");
 
         // Advance aggregate to WrapSubmitted state:
-        // RequestMint -> MintAccepted -> TokensReceived -> WrapSubmitted
+        // RecordMintRequested -> MintAccepted -> RecordTokensReceived ->
+        // TokensReceived -> WrapSubmitted
         transfer
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
@@ -3565,7 +4299,14 @@ mod tests {
 
         transfer
             .mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::ZERO),
+                    token_symbol: Some("tAAPL".to_string()),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3636,11 +4377,12 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
@@ -3648,7 +4390,14 @@ mod tests {
 
         transfer
             .mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::ZERO),
+                    token_symbol: Some("tAAPL".to_string()),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3729,11 +4478,12 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
@@ -3741,7 +4491,14 @@ mod tests {
 
         transfer
             .mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::ZERO),
+                    token_symbol: Some("tAAPL".to_string()),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3836,11 +4593,12 @@ mod tests {
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
@@ -3848,7 +4606,14 @@ mod tests {
 
         transfer
             .mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::ZERO),
+                    token_symbol: Some("tAAPL".to_string()),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3926,16 +4691,18 @@ mod tests {
 
         let id = issuer_request_id("ISS-WRAP-SUBMITTED-WAIT-FAIL");
 
-        // Advance to WrapSubmitted: RequestMint -> Poll -> SubmitWrap
+        // Advance to WrapSubmitted: RecordMintRequested ->
+        // RecordTokensReceived -> SubmitWrap
         transfer
             .mint_store
             .send(
                 &id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     wallet: transfer.wallet,
+                    tokenization_request_id: tokenization_request_id("tok-1"),
                 },
             )
             .await
@@ -3943,7 +4710,14 @@ mod tests {
 
         transfer
             .mint_store
-            .send(&id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::ZERO),
+                    token_symbol: Some("tAAPL".to_string()),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
