@@ -2864,16 +2864,14 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
     ));
-    let store = Arc::new(test_store(
-        pool.clone(),
-        UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
-            transfer,
-            wallet: Address::ZERO,
-        },
-    ));
+    let services = UnwrappedEquityRecoveryServices {
+        raindex,
+        vault_lookup,
+        wrapper,
+        transfer,
+        wallet: Address::ZERO,
+    };
+    let store = Arc::new(test_store::<UnwrappedEquityRecovery>(pool.clone(), ()));
 
     // Inventory reports UNWRAPPED balance: wrap failed, tokens are raw tSTOCK
     // in the base wallet.
@@ -2894,6 +2892,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     let ctx = UnwrappedEquityRecoveryCtx {
         inventory,
         store: Arc::clone(&store),
+        services,
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
@@ -2981,16 +2980,14 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
     ));
-    let store = Arc::new(test_store(
-        pool.clone(),
-        UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
-            transfer,
-            wallet: Address::ZERO,
-        },
-    ));
+    let services = UnwrappedEquityRecoveryServices {
+        raindex,
+        vault_lookup,
+        wrapper,
+        transfer,
+        wallet: Address::ZERO,
+    };
+    let store = Arc::new(test_store::<UnwrappedEquityRecovery>(pool.clone(), ()));
 
     // Seed the mint aggregate in TokensReceived (the persisted pre-wrap state)
     // with quantity matching the unwrapped wallet balance, so resume_mint can
@@ -3041,6 +3038,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let ctx = UnwrappedEquityRecoveryCtx {
         inventory,
         store: Arc::clone(&store),
+        services,
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
