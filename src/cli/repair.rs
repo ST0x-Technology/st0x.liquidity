@@ -462,6 +462,10 @@ mod tests {
     use crate::position::TradeId;
     use crate::test_utils::{positive_shares, setup_test_db};
 
+    fn repair_order_placer() -> Arc<dyn OrderPlacer> {
+        Arc::new(RepairOrderPlacer)
+    }
+
     /// Seeds a standalone OffchainOrder aggregate for `order_id` into the
     /// non-terminal `Submitted` state (Place -> Placed + Submitted via the noop
     /// placer), so repair can drive it to `Failed`.
@@ -660,7 +664,7 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -719,7 +723,7 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -769,7 +773,7 @@ mod tests {
                 avg_price: Usd::new(float!(100)),
                 partially_filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -842,7 +846,7 @@ mod tests {
                 avg_price: Usd::new(float!(100)),
                 partially_filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -864,7 +868,7 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -886,7 +890,7 @@ mod tests {
                 error: "bot failed it".to_string(),
                 failed_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -933,7 +937,7 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -975,7 +979,7 @@ mod tests {
                 error: "bot failed it concurrently".to_string(),
                 failed_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -1027,7 +1031,7 @@ mod tests {
                 error: "pre-failed".to_string(),
                 failed_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -1219,7 +1223,7 @@ mod tests {
                 avg_price: Usd::new(float!(100)),
                 partially_filled_at: chrono::Utc::now(),
             },
-            crate::offchain::order::noop_order_placer(),
+            repair_order_placer(),
         )
         .await
         .unwrap();

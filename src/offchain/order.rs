@@ -609,6 +609,15 @@ async fn cancel_order_events(
                 }
             }
 
+            if reason == CancellationReason::MarketOpenReplacement {
+                tracing::info!(
+                    target: "hedge",
+                    symbol = %entity.symbol(),
+                    %executor_order_id,
+                    "Regular hours: cancelling extended-hours limit order for market-order replacement"
+                );
+            }
+
             Ok(events)
         }
         OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
@@ -1562,6 +1571,31 @@ pub(crate) fn position_command_for_finalization(
     }
 }
 
+pub(crate) async fn finalize_cancelled_position_or_log_unpriced(
+    position: &Store<Position>,
+    symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+    cancelled: &OffchainOrder,
+) -> Result<(), st0x_event_sorcery::SendError<Position>> {
+    let command = terminal_position_finalization(cancelled).and_then(|finalization| {
+        position_command_for_finalization(finalization, offchain_order_id)
+    });
+
+    if let Some(command) = command {
+        position.send(symbol, command).await?;
+    } else {
+        tracing::error!(
+            symbol = %symbol,
+            %offchain_order_id,
+            "Cancelled order after Place retains an unpriced fill; \
+             position left pending -- no automated path can finalize \
+             this, operator intervention required"
+        );
+    }
+
+    Ok(())
+}
+
 /// Classifies a terminal [`OffchainOrder`] (`Filled`/`Cancelled`/`Failed`) into
 /// the [`TerminalPositionFinalization`] it implies. Returns `None` for
 /// non-terminal states (the caller leaves the position pending and retries).
@@ -1968,9 +2002,9 @@ pub struct OrderPlacementResult {
 
 /// Type-erased order placement capability used by the durable placement path
 /// ([`place_offchain_order_at_broker`]) -- the trade-processing context, the
-/// hedge job, and the CLI each hold one. It is no longer a cqrs-es `Service` of
-/// the `OffchainOrder` aggregate: the broker call was lifted out of the now-pure
-/// `Place` handler, whose `Services` is `()`.
+/// hedge job, and the CLI each hold one. The `OffchainOrder` aggregate keeps
+/// this as its service type for cancel pre-reconciliation and placement-adjacent
+/// recovery paths, while `Place` itself remains a pure intent-recording command.
 ///
 /// This trait exists because the `Executor` trait has associated types
 /// (`Error`, `OrderId`, `Ctx`) which make it non-object-safe - you cannot
@@ -4364,16 +4398,16 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_order_on_failed_returns_already_completed() {
-        // failing_order_placer drives the aggregate straight to Failed; cancel
-        // on a terminal state must reject with AlreadyCompleted.
-        let store = TestStore::<OffchainOrder>::new(failing_order_placer());
+        // Placement feedback drives the aggregate to Failed; cancel on a
+        // terminal state must reject with AlreadyCompleted.
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
         store.send(&id, place_command()).await.unwrap();
         store
             .send(
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
-                    error: "placement failed".to_string(),
+                    error: "broker rejected".to_string(),
                 },
             )
             .await
@@ -5260,22 +5294,7 @@ mod tests {
         let store = TestStore::<OffchainOrder>::new(noop_order_placer());
         let id = OffchainOrderId::new();
 
-        store.send(&id, place_command()).await.unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::MarkAccepted {
-                    executor_order_id: ExecutorOrderId::new("TEST-SUBMITTED"),
-                    placed_shares: noop_placed_shares(
-                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
-                    ),
-                    submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
-                    limit_price: None,
-                },
-            )
-            .await
-            .unwrap();
+        place_and_submit(&store, &id).await;
 
         let err = store
             .send(

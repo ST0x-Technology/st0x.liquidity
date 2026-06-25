@@ -231,8 +231,8 @@ pub(crate) enum TradeAccountingError {
     // TODO: TradeAccountingError should not be coupled to a concrete executor error type.
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
-    #[error("Failed to enqueue PollOrderStatus job: {0}")]
-    EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
+    #[error("Failed to enqueue follow-up job: {0}")]
+    EnqueueJob(#[from] crate::conductor::job::QueuePushError),
     #[error("Position fill lookup failed: {0}")]
     PositionFillLookup(#[from] crate::conductor::PositionFillLookupError),
     #[error("Missing block_timestamp for fill {trade_id}; cannot account for it")]
@@ -251,6 +251,22 @@ pub(crate) enum TradeAccountingError {
     InconsistentOnChainTradeState {
         trade_id: crate::onchain_trade::OnChainTradeId,
     },
+    #[error("Failed to determine market session before placing hedge for {symbol}")]
+    MarketSessionCheck {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("Failed to fetch latest trade price for {symbol}")]
+    LimitPriceFetch {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("Executor does not support fetching trade prices for {symbol}")]
+    LimitPriceUnavailable { symbol: st0x_execution::Symbol },
+    #[error("Slippage calculation failed")]
+    SlippageCalculation(#[from] crate::trading::offchain::hedge::SlippageError),
 }
 
 #[cfg(test)]
@@ -351,6 +367,7 @@ mod tests {
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
@@ -480,6 +497,7 @@ mod tests {
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);

@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use st0x_config::{Ctx, ExecutionThreshold};
+use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Executor, Symbol};
@@ -144,6 +144,9 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
 }
 
 /// Wires all runtime components and returns a running [`Conductor`].
+// Straight-line builder that wires every runtime context; splitting it would
+// scatter the wiring across helpers without reducing complexity.
+#[allow(clippy::too_many_lines)]
 #[bon::builder]
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
@@ -281,7 +284,12 @@ where
         offchain_order: context.frameworks.offchain_order.clone(),
         order_placer: order_placer.clone(),
         poll_status_queue: poll_status_queue.clone(),
+        assets: context.ctx.assets.clone(),
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
+        counter_trade_slippage_bps: match &context.ctx.broker {
+            BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => alpaca_ctx.counter_trade_slippage_bps,
+            BrokerCtx::DryRun => st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        },
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
@@ -311,6 +319,7 @@ where
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
+        hedge_queue: hedge_queue.clone(),
     };
 
     let maintenance_interval = context.executor.maintenance_interval();
