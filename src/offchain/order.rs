@@ -35,12 +35,13 @@ use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+#[cfg(test)]
 use std::sync::Arc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use st0x_dto::{Direction, Trade, TradingVenue};
-use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil, SendError, Store, Table};
 use st0x_execution::{
     AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, ExecutionError, Executor,
     ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, MarketSession, OrderState,
@@ -80,6 +81,8 @@ pub(crate) enum JobError {
     Enqueue(#[from] QueuePushError),
     #[error("Offchain order invariant violation: {0}")]
     OffchainOrder(#[from] OffchainOrderError),
+    #[error("Offchain order cancellation error: {0}")]
+    Cancel(#[from] CancelOffchainOrderError),
 }
 
 #[derive(Debug, Clone)]
@@ -545,88 +548,143 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
     }
 }
 
-async fn cancel_order_events(
-    entity: &OffchainOrder,
-    services: &dyn OrderPlacer,
+/// Why [`cancel_offchain_order`] failed: either the store rejected a command
+/// (including the pure handler's state guards) or the broker I/O around it
+/// failed (`PreCancelStatusFetchFailed`, `CancelFailed`, ...).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CancelOffchainOrderError {
+    #[error(transparent)]
+    Send(#[from] SendError<OffchainOrder>),
+    #[error(transparent)]
+    Domain(#[from] OffchainOrderError),
+}
+
+/// Broker-side cancellation flow for a live order, invoked by the durable
+/// callers that decide to cancel (the market-open replacement sweep, the poll
+/// loop's unrequested-cancel recovery). The jobs-model handlers are pure, so
+/// the pre-cancel reconciliation and the broker `DELETE` live here, mirroring
+/// the placement path ([`place_offchain_order_at_broker`]); each discovered
+/// outcome is recorded through the aggregate's idempotent outcome commands.
+///
+/// Reconciles the broker's state before cancelling so a fill that landed
+/// between the last poll and the cancel attempt is never dropped:
+/// - a newer broker partial fill is recorded ahead of the cancel request;
+/// - broker `Filled`/`Failed`/`Cancelled` drives the order terminal directly
+///   (any priced fill preserved) and skips the `DELETE`;
+/// - otherwise the broker `DELETE` is issued and `CancelRequested` recorded
+///   (`Cancelling` until the poller confirms); a broker that no longer
+///   recognises the order resolves it terminally cancelled.
+pub(crate) async fn cancel_offchain_order(
+    store: &Store<OffchainOrder>,
+    order_placer: &dyn OrderPlacer,
+    offchain_order_id: &OffchainOrderId,
     reason: CancellationReason,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
-    match entity {
-        OffchainOrder::Submitted {
-            executor_order_id, ..
-        }
-        | OffchainOrder::PartiallyFilled {
-            executor_order_id, ..
-        } => {
-            let mut events = Vec::new();
-            let local_filled = match entity {
-                OffchainOrder::PartiallyFilled { shares_filled, .. } => Some(*shares_filled),
-                _ => None,
-            };
-            let pre_cancel_events =
-                reconcile_pre_cancel(services, executor_order_id, local_filled, reason).await?;
-            let cancel_short_circuit = pre_cancel_events.iter().any(|event| {
-                matches!(
-                    event,
-                    OffchainOrderEvent::Filled { .. }
-                        | OffchainOrderEvent::Failed { .. }
-                        | OffchainOrderEvent::Cancelled { .. }
+) -> Result<(), CancelOffchainOrderError> {
+    let order = store.load(offchain_order_id).await?;
+    let (symbol, executor_order_id, local_filled) = match &order {
+        Some(OffchainOrder::Submitted {
+            symbol,
+            executor_order_id,
+            ..
+        }) => (symbol.clone(), executor_order_id.clone(), None),
+        Some(OffchainOrder::PartiallyFilled {
+            symbol,
+            executor_order_id,
+            shares_filled,
+            ..
+        }) => (
+            symbol.clone(),
+            executor_order_id.clone(),
+            Some(*shares_filled),
+        ),
+        // Any other state: send the pure command so the handler returns the
+        // canonical response for it (no-op from `Cancelling`, `NotSubmitted`
+        // from `Pending`, `AlreadyCompleted` from terminal states, `NotPlaced`
+        // when the aggregate does not exist).
+        Some(
+            OffchainOrder::Pending { .. }
+            | OffchainOrder::Cancelling { .. }
+            | OffchainOrder::Filled { .. }
+            | OffchainOrder::Failed { .. }
+            | OffchainOrder::Cancelled { .. },
+        )
+        | None => {
+            store
+                .send(
+                    offchain_order_id,
+                    OffchainOrderCommand::CancelOrder { reason },
                 )
-            });
-            events.extend(pre_cancel_events);
+                .await?;
+            return Ok(());
+        }
+    };
 
-            if cancel_short_circuit {
-                return Ok(events);
-            }
-
-            match services
-                .cancel_order(executor_order_id)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        %executor_order_id,
-                        %error,
-                        "Failed to cancel order via broker; will retry"
-                    );
-                    OffchainOrderError::CancelFailed {
-                        executor_order_id: executor_order_id.clone(),
-                    }
-                })? {
-                CancellationOutcome::Requested => {
-                    events.push(OffchainOrderEvent::CancelRequested {
-                        reason,
-                        cancel_requested_at: Utc::now(),
-                    });
+    let fill_updates =
+        match reconcile_pre_cancel(order_placer, &executor_order_id, local_filled, reason).await? {
+            PreCancelReconciliation::AlreadyTerminal(commands) => {
+                for command in commands {
+                    store.send(offchain_order_id, command).await?;
                 }
-                CancellationOutcome::OrderNotFound => {
-                    tracing::warn!(
-                        %executor_order_id,
-                        ?reason,
-                        "Broker no longer recognises order on cancel; resolving as terminally cancelled"
-                    );
-                    events.push(OffchainOrderEvent::Cancelled {
+                return Ok(());
+            }
+            PreCancelReconciliation::Proceed(commands) => commands,
+        };
+
+    for command in fill_updates {
+        store.send(offchain_order_id, command).await?;
+    }
+
+    let outcome = order_placer
+        .cancel_order(&executor_order_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                %executor_order_id,
+                %error,
+                "Failed to cancel order via broker; will retry"
+            );
+            OffchainOrderError::CancelFailed {
+                executor_order_id: executor_order_id.clone(),
+            }
+        })?;
+
+    match outcome {
+        CancellationOutcome::Requested => {
+            store
+                .send(
+                    offchain_order_id,
+                    OffchainOrderCommand::CancelOrder { reason },
+                )
+                .await?;
+        }
+        CancellationOutcome::OrderNotFound => {
+            tracing::warn!(
+                %executor_order_id,
+                ?reason,
+                "Broker no longer recognises order on cancel; resolving as terminally cancelled"
+            );
+            store
+                .send(
+                    offchain_order_id,
+                    OffchainOrderCommand::RecordBrokerCancellation {
                         reason,
                         cancelled_at: Utc::now(),
-                    });
-                }
-            }
-
-            if reason == CancellationReason::MarketOpenReplacement {
-                tracing::info!(
-                    target: "hedge",
-                    symbol = %entity.symbol(),
-                    %executor_order_id,
-                    "Regular hours: cancelling extended-hours limit order for market-order replacement"
-                );
-            }
-
-            Ok(events)
+                    },
+                )
+                .await?;
         }
-        OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-        OffchainOrder::Cancelling { .. } => Ok(Vec::new()),
-        OffchainOrder::Filled { .. }
-        | OffchainOrder::Failed { .. }
-        | OffchainOrder::Cancelled { .. } => Err(OffchainOrderError::AlreadyCompleted),
     }
+
+    if reason == CancellationReason::MarketOpenReplacement {
+        tracing::info!(
+            target: "hedge",
+            %symbol,
+            %executor_order_id,
+            "Regular hours: cancelling extended-hours limit order for market-order replacement"
+        );
+    }
+
+    Ok(())
 }
 
 /// Why an [`OffchainOrder`] was cancelled. Carried on
@@ -647,13 +705,12 @@ pub enum CancellationReason {
     Unrequested,
 }
 
-#[async_trait]
 impl EventSourced for OffchainOrder {
     type Id = OffchainOrderId;
     type Event = OffchainOrderEvent;
     type Command = OffchainOrderCommand;
     type Error = OffchainOrderError;
-    type Services = Arc<dyn OrderPlacer>;
+    type Jobs = Nil;
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
@@ -761,9 +818,9 @@ impl EventSourced for OffchainOrder {
         }
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use OffchainOrderCommand::*;
         match command {
@@ -811,10 +868,10 @@ impl EventSourced for OffchainOrder {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             // Idempotent against a placement retry: the durable path re-sends
@@ -844,9 +901,35 @@ impl EventSourced for OffchainOrder {
                 placed_at: _,
             } => validate_place_replay(self, &symbol, direction, executor),
 
-            OffchainOrderCommand::CancelOrder { reason } => {
-                cancel_order_events(self, services.as_ref(), reason).await
-            }
+            OffchainOrderCommand::CancelOrder { reason } => match self {
+                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::CancelRequested {
+                        reason,
+                        cancel_requested_at: Utc::now(),
+                    }])
+                }
+                Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Self::Cancelling { .. } => Ok(Vec::new()),
+                Self::Filled { .. } | Self::Failed { .. } | Self::Cancelled { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+
+            OffchainOrderCommand::RecordBrokerCancellation {
+                reason,
+                cancelled_at,
+            } => match self {
+                Self::Submitted { .. } | Self::PartiallyFilled { .. } | Self::Cancelling { .. } => {
+                    Ok(vec![OffchainOrderEvent::Cancelled {
+                        reason,
+                        cancelled_at,
+                    }])
+                }
+                Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Self::Filled { .. } | Self::Failed { .. } | Self::Cancelled { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
 
             OffchainOrderCommand::ConfirmCancellation { cancelled_at } => match self {
                 Self::Cancelling { reason, .. } => Ok(vec![OffchainOrderEvent::Cancelled {
@@ -1763,21 +1846,30 @@ fn broker_fill_exceeds_local(
         })
 }
 
+/// Outcome of pre-cancel reconciliation: either the broker already drove the
+/// order terminal (record the commands and skip the `DELETE`) or the cancel
+/// may proceed after recording any newer broker fill.
+enum PreCancelReconciliation {
+    AlreadyTerminal(Vec<OffchainOrderCommand>),
+    Proceed(Vec<OffchainOrderCommand>),
+}
+
 /// Queries the broker for the current state of an order before cancellation
-/// and emits the appropriate partial-fill / fill events so the local
-/// aggregate is reconciled with the broker before the terminal Cancelled
-/// event. `local_filled` is the cumulative quantity already recorded in
-/// the local PartiallyFilled state (None if the local state is Submitted).
+/// and returns the outcome commands that reconcile the local aggregate with
+/// the broker before the terminal Cancelled event. `local_filled` is the
+/// cumulative quantity already recorded in the local PartiallyFilled state
+/// (None if the local state is Submitted).
 ///
-/// Returns the events that should be emitted *before* the cancel attempt.
-/// If the returned vec contains `Filled`, the caller MUST short-circuit
-/// and not attempt the DELETE (the broker already filled).
+/// The commands must be sent *before* the cancel attempt; an
+/// [`PreCancelReconciliation::AlreadyTerminal`] result means the caller MUST
+/// short-circuit and not attempt the DELETE (the broker already settled the
+/// order).
 async fn reconcile_pre_cancel(
     services: &dyn OrderPlacer,
     executor_order_id: &ExecutorOrderId,
     local_filled: Option<FractionalShares>,
     cancellation_reason: CancellationReason,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+) -> Result<PreCancelReconciliation, OffchainOrderError> {
     // Propagate read failures so the aggregate stays in its prior state
     // and the caller can retry. Silently bypassing reconciliation would
     // re-introduce the partial-fill loss bug the function exists to fix
@@ -1807,7 +1899,7 @@ async fn reconcile_pre_cancel(
         } => {
             if Positive::new(broker_filled).is_err() {
                 if broker_filled == FractionalShares::ZERO {
-                    return Ok(Vec::new());
+                    return Ok(PreCancelReconciliation::Proceed(Vec::new()));
                 }
 
                 return Err(OffchainOrderError::InvalidTerminalFillQuantity {
@@ -1831,7 +1923,7 @@ async fn reconcile_pre_cancel(
                     %executor_order_id,
                     "Broker partial-fill <= local; skipping pre-cancel reconcile"
                 );
-                return Ok(Vec::new());
+                return Ok(PreCancelReconciliation::Proceed(Vec::new()));
             }
 
             // We need an avg_price for the event. If the broker did not
@@ -1850,11 +1942,13 @@ async fn reconcile_pre_cancel(
                 });
             };
 
-            Ok(vec![OffchainOrderEvent::PartiallyFilled {
-                shares_filled: broker_filled,
-                avg_price: price,
-                partially_filled_at,
-            }])
+            Ok(PreCancelReconciliation::Proceed(vec![
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: broker_filled,
+                    avg_price: price,
+                    partially_filled_at,
+                },
+            ]))
         }
 
         OrderState::Filled {
@@ -1868,10 +1962,12 @@ async fn reconcile_pre_cancel(
                 %executor_order_id,
                 "Broker reports order fully Filled at cancel time; reconciling without DELETE"
             );
-            Ok(vec![OffchainOrderEvent::Filled {
-                price,
-                filled_at: executed_at,
-            }])
+            Ok(PreCancelReconciliation::AlreadyTerminal(vec![
+                OffchainOrderCommand::CompleteFill {
+                    price,
+                    filled_at: executed_at,
+                },
+            ]))
         }
 
         OrderState::Failed {
@@ -1898,8 +1994,9 @@ async fn reconcile_pre_cancel(
                 shares_filled,
                 avg_price,
                 failed_at,
-                OffchainOrderEvent::Failed { error, failed_at },
+                OffchainOrderCommand::MarkFailed { error, failed_at },
             )
+            .map(PreCancelReconciliation::AlreadyTerminal)
         }
 
         OrderState::Cancelled {
@@ -1919,14 +2016,17 @@ async fn reconcile_pre_cancel(
                 Some(shares_filled),
                 avg_price,
                 cancelled_at,
-                OffchainOrderEvent::Cancelled {
+                OffchainOrderCommand::RecordBrokerCancellation {
                     reason: cancellation_reason,
                     cancelled_at,
                 },
             )
+            .map(PreCancelReconciliation::AlreadyTerminal)
         }
 
-        OrderState::Pending | OrderState::Submitted { .. } => Ok(Vec::new()),
+        OrderState::Pending | OrderState::Submitted { .. } => {
+            Ok(PreCancelReconciliation::Proceed(Vec::new()))
+        }
     }
 }
 
@@ -1935,7 +2035,7 @@ async fn reconcile_pre_cancel(
 ///
 /// Encodes two invariants that must not drift between the arms:
 /// - cumulative fills never regress -- a broker fill no newer than the local
-///   record emits only the terminal event;
+///   record emits only the terminal command;
 /// - a positive fill without an average price must NOT be dropped -- it
 ///   blocks with [`OffchainOrderError::PreCancelPartialFillMissingAvgPrice`]
 ///   so the cancel retries once the broker returns a priced fill, instead of
@@ -1949,8 +2049,8 @@ fn reconcile_terminal_fill(
     shares_filled: Option<FractionalShares>,
     avg_price: Option<Usd>,
     broker_timestamp: DateTime<Utc>,
-    terminal_event: OffchainOrderEvent,
-) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    terminal_command: OffchainOrderCommand,
+) -> Result<Vec<OffchainOrderCommand>, OffchainOrderError> {
     if let (Some(broker_filled), Some(avg_price)) = (shares_filled, avg_price) {
         // A zero priced fill carries nothing to record; anything else
         // non-positive is a corrupt broker value and must not be persisted
@@ -1958,7 +2058,7 @@ fn reconcile_terminal_fill(
         // NoFill, under-accounting the position).
         if Positive::new(broker_filled).is_err() {
             if broker_filled == FractionalShares::ZERO {
-                return Ok(vec![terminal_event]);
+                return Ok(vec![terminal_command]);
             }
             return Err(OffchainOrderError::InvalidTerminalFillQuantity {
                 executor_order_id: executor_order_id.clone(),
@@ -1969,23 +2069,23 @@ fn reconcile_terminal_fill(
         if let Some(local) = local_filled
             && !broker_fill_exceeds_local(broker_filled, local)?
         {
-            return Ok(vec![terminal_event]);
+            return Ok(vec![terminal_command]);
         }
 
         return Ok(vec![
-            OffchainOrderEvent::PartiallyFilled {
+            OffchainOrderCommand::UpdatePartialFill {
                 shares_filled: broker_filled,
                 avg_price,
                 partially_filled_at: broker_timestamp,
             },
-            terminal_event,
+            terminal_command,
         ]);
     }
 
     if let (Some(shares_filled), None) = (shares_filled, avg_price) {
         if Positive::new(shares_filled).is_err() {
             if shares_filled == FractionalShares::ZERO {
-                return Ok(vec![terminal_event]);
+                return Ok(vec![terminal_command]);
             }
 
             return Err(OffchainOrderError::InvalidTerminalFillQuantity {
@@ -1997,11 +2097,11 @@ fn reconcile_terminal_fill(
         // An unpriced broker fill only blocks when it reports MORE than the
         // local aggregate has already recorded (priced): an equal-or-smaller
         // unpriced fill carries no new information -- the local priced fill
-        // already covers it, so the terminal event can proceed.
+        // already covers it, so the terminal command can proceed.
         if let Some(local) = local_filled
             && !broker_fill_exceeds_local(shares_filled, local)?
         {
-            return Ok(vec![terminal_event]);
+            return Ok(vec![terminal_command]);
         }
 
         return Err(OffchainOrderError::PreCancelPartialFillMissingAvgPrice {
@@ -2010,7 +2110,7 @@ fn reconcile_terminal_fill(
         });
     }
 
-    Ok(vec![terminal_event])
+    Ok(vec![terminal_command])
 }
 
 /// Result of a successful order placement, with the executor-assigned ID
@@ -2281,6 +2381,16 @@ pub enum OffchainOrderCommand {
     CancelOrder {
         reason: CancellationReason,
     },
+    /// Outcome command: the broker reports the order already cancelled --
+    /// discovered by pre-cancel reconciliation, an `OrderNotFound` cancel
+    /// response, or an unrequested broker-side cancel. Unlike
+    /// `ConfirmCancellation` it is valid from the live
+    /// `Submitted`/`PartiallyFilled` states (no local cancel request was
+    /// recorded), carrying the reason explicitly.
+    RecordBrokerCancellation {
+        reason: CancellationReason,
+        cancelled_at: DateTime<Utc>,
+    },
     ConfirmCancellation {
         cancelled_at: DateTime<Utc>,
     },
@@ -2540,10 +2650,13 @@ pub enum OffchainOrderError {
 mod tests {
     use serde_json::json;
 
-    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestStore, replay};
+    use st0x_event_sorcery::{
+        AggregateError, LifecycleError, StoreBuilder, TestStore, replay, test_store,
+    };
+    use st0x_float_macro::float;
 
     use super::*;
-    use st0x_float_macro::float;
+    use crate::test_utils::setup_test_db;
 
     fn failing_order_placer() -> Arc<dyn OrderPlacer> {
         struct Failing;
@@ -2625,6 +2738,27 @@ mod tests {
     /// `MarkAccepted`. The accepted quantity is `noop_placed_shares(100)`, so
     /// the resulting `Submitted` carries the broker-working amount, not 100.
     async fn place_and_submit(store: &TestStore<OffchainOrder>, id: &OffchainOrderId) {
+        let requested = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        store.send(id, place_command()).await.unwrap();
+        store
+            .send(
+                id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
+                    placed_shares: noop_placed_shares(requested),
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// [`place_and_submit`] against a pool-backed [`Store`], for tests that
+    /// drive the broker-I/O cancel helper ([`cancel_offchain_order`] takes
+    /// `&Store`, which `TestStore` cannot provide).
+    async fn place_and_submit_pooled(store: &Store<OffchainOrder>, id: &OffchainOrderId) {
         let requested = Positive::new(FractionalShares::new(float!(100))).unwrap();
         store.send(id, place_command()).await.unwrap();
         store
@@ -2857,7 +2991,7 @@ mod tests {
     ) -> Option<OffchainOrder> {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
 
@@ -3130,7 +3264,7 @@ mod tests {
     async fn place_retry_with_divergent_payload_is_rejected() {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
         let id = OffchainOrderId::new();
@@ -3165,7 +3299,7 @@ mod tests {
     async fn place_at_broker_skips_broker_when_order_left_pending() {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
         let id = OffchainOrderId::new();
@@ -3241,7 +3375,7 @@ mod tests {
     async fn place_at_broker_skips_markfailed_when_order_advanced_concurrently() {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
         let id = OffchainOrderId::new();
@@ -3325,7 +3459,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_is_idempotent_once_placed() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // The durable placement path re-sends `Place` on retry; an existing
@@ -3365,7 +3499,7 @@ mod tests {
     /// rather than silently falling back to `Utc::now()`.
     #[tokio::test]
     async fn place_at_uses_supplied_timestamp() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         let placed_at = Utc::now() - chrono::Duration::hours(2);
 
@@ -3398,7 +3532,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_accepted_is_idempotent_on_submitted() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // The durable placement path re-sends `MarkAccepted` on retry (the broker
@@ -3430,7 +3564,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_is_idempotent_on_failed() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -3468,7 +3602,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_accepted_after_failed_is_noop() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -3509,7 +3643,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_from_submitted_records_broker_timestamp() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         // A timestamp distinct from any wall clock the handler could stamp:
         // the persisted event must carry the broker's fill time, not
@@ -3545,7 +3679,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_updates_shares() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         let latest_partially_filled_at = Utc::now();
@@ -3600,7 +3734,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3621,7 +3755,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_partially_filled() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3656,7 +3790,7 @@ mod tests {
         // Process-isolated under nextest; only this fill is sampled. The default
         // Prometheus summary rendering emits a `_count` series we can assert on.
         let handle = crate::metrics::setup().expect("install Prometheus recorder");
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3680,7 +3814,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_uninitialized_order() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         let err = store
@@ -3701,7 +3835,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_already_filled() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3734,7 +3868,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3755,7 +3889,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_partially_filled() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3801,7 +3935,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_placement_failed_fails_a_pending_order() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // The placement path's broker call errored while the order was still
@@ -3823,7 +3957,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_placement_failed_leaves_a_live_order_untouched() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // A stale placement attempt's broker error must never fail a live order a
@@ -3853,7 +3987,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fail_already_filled() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -3886,7 +4020,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_order_from_submitted_transitions_to_cancelling() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         place_and_submit(&store, &id).await;
 
@@ -3983,12 +4117,11 @@ mod tests {
     #[tokio::test]
     async fn cancel_order_from_partially_filled_reconciles_newer_broker_fill() {
         let broker_partially_filled_at = Utc::now() - chrono::Duration::minutes(2);
-        let store = TestStore::<OffchainOrder>::new(broker_partial_fill_placer(
-            float!(60),
-            broker_partially_filled_at,
-        ));
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = broker_partial_fill_placer(float!(60), broker_partially_filled_at);
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
         store
             .send(
                 &id,
@@ -4001,15 +4134,14 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -4038,10 +4170,11 @@ mod tests {
     /// order proceeds to Cancelling carrying the local 50-share fill.
     #[tokio::test]
     async fn cancel_order_from_partially_filled_skips_stale_broker_fill() {
-        let store =
-            TestStore::<OffchainOrder>::new(broker_partial_fill_placer(float!(30), Utc::now()));
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = broker_partial_fill_placer(float!(30), Utc::now());
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
         store
             .send(
                 &id,
@@ -4054,15 +4187,14 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -4085,7 +4217,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_cancellation_transitions_cancelling_to_cancelled() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         place_and_submit(&store, &id).await;
         store
@@ -4174,19 +4306,20 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(already_cancelled_zero_fill_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = already_cancelled_zero_fill_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -4247,19 +4380,20 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(already_cancelled_priced_fill_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = already_cancelled_priced_fill_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -4336,26 +4470,25 @@ mod tests {
             Arc::new(CancelFailing)
         }
 
-        let store = TestStore::<OffchainOrder>::new(cancel_failing_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = cancel_failing_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
-                    OffchainOrderError::CancelFailed { .. }
-                ))
+                CancelOffchainOrderError::Domain(OffchainOrderError::CancelFailed { .. })
             ),
             "Expected CancelFailed, got: {err:?}"
         );
@@ -4424,19 +4557,20 @@ mod tests {
             Arc::new(OrderGone)
         }
 
-        let store = TestStore::<OffchainOrder>::new(order_not_found_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = order_not_found_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -4473,9 +4607,8 @@ mod tests {
                 OffchainOrderCommand::CancelOrder {
                     reason: CancellationReason::MarketOpenReplacement,
                 },
-                &noop_order_placer(),
+                &mut JobQueue::default(),
             )
-            .await
             .unwrap_err();
 
         assert!(
@@ -4488,7 +4621,7 @@ mod tests {
     async fn cancel_order_on_failed_returns_already_completed() {
         // Placement feedback drives the aggregate to Failed; cancel on a
         // terminal state must reject with AlreadyCompleted.
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         store.send(&id, place_command()).await.unwrap();
         store
@@ -4600,7 +4733,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_order_on_filled_returns_already_completed() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         place_and_submit(&store, &id).await;
         store
@@ -4689,19 +4822,20 @@ mod tests {
             Arc::new(PartialFillPlacer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(partial_fill_reconciling_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = partial_fill_reconciling_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         // Must be Cancelling, but the partial-fill event should have been
@@ -4785,26 +4919,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(failed_unpriced_fill_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = failed_unpriced_fill_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::PreCancelPartialFillMissingAvgPrice { .. }
-                ))
+                )
             ),
             "Expected PreCancelPartialFillMissingAvgPrice, got: {err:?}"
         );
@@ -4876,26 +5011,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(cancelled_unpriced_fill_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = cancelled_unpriced_fill_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::PreCancelPartialFillMissingAvgPrice { .. }
-                ))
+                )
             ),
             "Expected PreCancelPartialFillMissingAvgPrice, got: {err:?}"
         );
@@ -4964,26 +5100,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(partially_filled_unpriced_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = partially_filled_unpriced_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::PreCancelPartialFillMissingAvgPrice { .. }
-                ))
+                )
             ),
             "Expected PreCancelPartialFillMissingAvgPrice, got: {err:?}"
         );
@@ -5053,10 +5190,12 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(cancelled_covered_fill_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = cancelled_covered_fill_placer();
         let id = OffchainOrderId::new();
         let fill_time = Utc::now();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
         store
             .send(
                 &id,
@@ -5069,15 +5208,14 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         let OffchainOrder::Cancelled { retained_fill, .. } = inner else {
@@ -5150,26 +5288,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(status_fetch_failing_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = status_fetch_failing_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::PreCancelStatusFetchFailed { .. }
-                ))
+                )
             ),
             "Expected PreCancelStatusFetchFailed, got: {err:?}"
         );
@@ -5236,19 +5375,20 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(already_filled_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = already_filled_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -5259,7 +5399,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_order_on_already_cancelling_is_idempotent_noop() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
         place_and_submit(&store, &id).await;
         store
@@ -5379,7 +5519,7 @@ mod tests {
     // FIX 3: ConfirmCancellation on a non-Cancelling state must return CancellationNotRequested.
     #[tokio::test]
     async fn confirm_cancellation_on_submitted_returns_cancellation_not_requested() {
-        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -5460,26 +5600,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(negative_fill_cancelled_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = negative_fill_cancelled_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::InvalidTerminalFillQuantity { .. }
-                ))
+                )
             ),
             "Negative broker fill quantity must return InvalidTerminalFillQuantity, got: {err:?}"
         );
@@ -5537,26 +5678,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(negative_unpriced_cancelled_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = negative_unpriced_cancelled_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::InvalidTerminalFillQuantity { .. }
-                ))
+                )
             ),
             "Negative unpriced broker fill must return InvalidTerminalFillQuantity, got: {err:?}"
         );
@@ -5614,26 +5756,27 @@ mod tests {
             Arc::new(Placer)
         }
 
-        let store = TestStore::<OffchainOrder>::new(negative_partial_fill_placer());
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = negative_partial_fill_placer();
         let id = OffchainOrderId::new();
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
 
-        let err = store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 err,
-                AggregateError::UserError(LifecycleError::Apply(
+                CancelOffchainOrderError::Domain(
                     OffchainOrderError::InvalidTerminalFillQuantity { .. }
-                ))
+                )
             ),
             "Negative pre-cancel partial fill must return InvalidTerminalFillQuantity, got: {err:?}"
         );
@@ -5645,13 +5788,12 @@ mod tests {
         // Broker reports the same 50-share fill as the local state (stale read);
         // pre-cancel reconciliation skips the update and the order reaches
         // Cancelling carrying the locally-recorded fill.
-        let store = TestStore::<OffchainOrder>::new(broker_partial_fill_placer(
-            float!(50),
-            partially_filled_at,
-        ));
+        let pool = setup_test_db().await;
+        let store = test_store::<OffchainOrder>(pool);
+        let placer = broker_partial_fill_placer(float!(50), partially_filled_at);
         let id = OffchainOrderId::new();
 
-        place_and_submit(&store, &id).await;
+        place_and_submit_pooled(&store, &id).await;
         store
             .send(
                 &id,
@@ -5663,15 +5805,14 @@ mod tests {
             )
             .await
             .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
+        cancel_offchain_order(
+            &store,
+            placer.as_ref(),
+            &id,
+            CancellationReason::MarketOpenReplacement,
+        )
+        .await
+        .unwrap();
         store
             .send(
                 &id,

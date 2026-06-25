@@ -38,7 +38,7 @@ use st0x_dto::{
     EquityOperationKind, EquityOperationTiming, EquityStageName, EquityStageStats,
     EquityStageTiming, RebalanceTimingStatus, StageOutcome,
 };
-use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, deps};
+use st0x_event_sorcery::{EntityList, EventSourced, Reactor, deps};
 use st0x_execution::Symbol;
 use st0x_finance::FractionalShares;
 use st0x_tokenization::IssuerRequestId;
@@ -564,8 +564,6 @@ impl Reactor for EquityTimingProjection {
             .await
     }
 }
-
-impl IdempotentReactor for EquityTimingProjection {}
 
 /// Accumulated per-operation timing state, persisted as JSON.
 ///
@@ -1230,7 +1228,7 @@ mod tests {
         // Seed events directly through a store with NO projection attached,
         // simulating history that accumulated before this projection existed.
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let operation_id = issuer_request_id("catch-up-mint");

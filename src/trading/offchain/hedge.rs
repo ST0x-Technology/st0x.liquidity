@@ -704,13 +704,13 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer.clone())
+                .build()
                 .await
                 .unwrap();
 
@@ -1167,13 +1167,13 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(placer.clone())
+                .build()
                 .await
                 .unwrap();
 
@@ -1909,13 +1909,13 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(placer.clone())
+                .build()
                 .await
                 .unwrap();
 

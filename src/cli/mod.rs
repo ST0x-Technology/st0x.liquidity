@@ -2657,7 +2657,7 @@ mod tests {
         // the exact event shapes/sequence the live system would produce. It
         // emits both `MintRequested` and `MintAccepted`.
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store

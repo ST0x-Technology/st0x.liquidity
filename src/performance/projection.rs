@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use st0x_event_sorcery::{EntityList, IdempotentReactor, Reactor, deps};
+use st0x_event_sorcery::{EntityList, Reactor, deps};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -393,8 +393,6 @@ impl Reactor for HedgeLatencyProjection {
             .await
     }
 }
-
-impl IdempotentReactor for HedgeLatencyProjection {}
 
 #[cfg(test)]
 mod tests {

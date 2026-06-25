@@ -458,7 +458,7 @@ mod tests {
         recovery_mode: OperationMode,
     ) -> TransferEquityToMarketMakingCtx {
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let mint_store = Arc::new(test_store(pool, ()));
+        let mint_store = Arc::new(test_store(pool));
 
         let aapl_config = EquityAssetConfig {
             tokenized_equity: Address::ZERO,

@@ -83,7 +83,7 @@ async fn build_equity_transfer_services(
 
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
+            .build()
             .await?;
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
@@ -106,11 +106,11 @@ async fn build_equity_transfer_services(
     ));
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     let transfer = CrossVenueEquityTransfer::new(
@@ -444,7 +444,7 @@ async fn run_usdc_transfer<Writer: Write>(
     };
 
     let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     // A resume must target an existing transfer, checked up front before any
@@ -696,7 +696,7 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     writeln!(stdout, "Failing pre-burn USDC transfer {id}")?;
 
     let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     let Some(state) = usdc_store.load(&id).await? else {
@@ -922,7 +922,7 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
     )?;
 
     let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     let Some(state) = usdc_store.load(&id).await? else {
@@ -1015,7 +1015,7 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     writeln!(stdout, "Reconciling stuck USDC transfer id: {id}")?;
 
     let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     let Some(state) = usdc_store.load(&id).await? else {
@@ -1432,7 +1432,7 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 }
             };
 
-            st0x_event_sorcery::send_command::<TokenizedEquityMint>(pool, &mint_id, command, ())
+            st0x_event_sorcery::send_command::<TokenizedEquityMint>(pool, &mint_id, command)
                 .await
                 .map_err(|error| stale_state_context("Mint", id, error))?;
 
@@ -1494,7 +1494,7 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 }
             };
 
-            st0x_event_sorcery::send_command::<EquityRedemption>(pool, &redemption_id, command, ())
+            st0x_event_sorcery::send_command::<EquityRedemption>(pool, &redemption_id, command)
                 .await
                 .map_err(|error| stale_state_context("Redemption", id, error))?;
 
@@ -1556,7 +1556,6 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 pool,
                 &mint_id,
                 TokenizedEquityMintCommand::Reconcile { reason },
-                (),
             )
             .await?;
 
@@ -1584,7 +1583,6 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 pool,
                 &redemption_id,
                 EquityRedemptionCommand::Reconcile { reason },
-                (),
             )
             .await?;
 
@@ -2315,7 +2313,7 @@ mod tests {
         let id = Uuid::from_u128(7777);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store
@@ -2360,7 +2358,7 @@ mod tests {
         let id = Uuid::from_u128(99);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store
@@ -2401,7 +2399,7 @@ mod tests {
         let id = Uuid::from_u128(123);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store
@@ -2755,7 +2753,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0001);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging(&store, id).await;
@@ -2778,7 +2776,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0002);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging(&store, id).await;
@@ -2811,7 +2809,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0002_000B);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging(&store, id).await;
@@ -2848,7 +2846,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0003);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2886,7 +2884,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0004);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging_submitting(&store, id).await;
@@ -2922,7 +2920,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0005);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging_submitting(&store, id).await;
@@ -2974,7 +2972,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0009);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging_submitting(&store, id).await;
@@ -3024,7 +3022,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000C);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging_submitting(&store, id).await;
@@ -3072,7 +3070,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000D);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridging_submitting(&store, id).await;
@@ -3124,7 +3122,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0006);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_withdrawal_complete(&store, id).await;
@@ -3289,7 +3287,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000B);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_bridged(&store, id).await;
@@ -3311,7 +3309,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000C);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_deposit_initiated(&store, id).await;
@@ -3333,7 +3331,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000D);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_deposit_confirmed(&store, id).await;
@@ -3385,7 +3383,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000E);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_conversion_failed_base_to_alpaca(&store, id).await;
@@ -3411,7 +3409,7 @@ mod tests {
     async fn classify_fail_bridging_reload_distinguishes_pre_and_post_burn() {
         let pool = setup_test_db().await;
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3482,7 +3480,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0008);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3517,7 +3515,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0009);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_deposit_failed(&store, id).await;
@@ -3540,7 +3538,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000A);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3603,7 +3601,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_000F);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_conversion_failed_alpaca_to_base(&store, id).await;
@@ -3658,7 +3656,7 @@ mod tests {
         let id = Uuid::from_u128(0xBEEF_0010);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         seed_to_withdrawal_failed(&store, id).await;
@@ -3858,7 +3856,7 @@ mod tests {
         use EquityRedemptionCommand::*;
 
         let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3904,7 +3902,7 @@ mod tests {
         seed_redemption_to_withdrawn(pool, id).await;
 
         let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store.send(id, UnwrapTokens).await.unwrap();
@@ -3949,7 +3947,7 @@ mod tests {
         command: EquityRedemptionCommand,
     ) {
         let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store.send(id, command).await.unwrap();
@@ -4195,7 +4193,7 @@ mod tests {
     /// `TokenizedEquityMint` performs no I/O in its handlers.
     async fn seed_mint_to_failed(pool: &SqlitePool, id: &IssuerRequestId) {
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store
@@ -4228,7 +4226,7 @@ mod tests {
         command: TokenizedEquityMintCommand,
     ) {
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         store.send(id, command).await.unwrap();

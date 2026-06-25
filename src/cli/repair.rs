@@ -1,53 +1,18 @@
 //! Repair CLI commands for manually recovering stuck local CQRS state.
 
 use anyhow::{Context, bail};
-use async_trait::async_trait;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
-use std::sync::Arc;
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
-use st0x_execution::{
-    CancellationOutcome, ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, Symbol,
-};
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
-    OrderPlacer,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId,
 };
 use crate::position::{Position, PositionCommand};
-
-/// An [`OrderPlacer`] for repair commands that must never place or cancel an
-/// order: `MarkFailed` is a pure terminal transition that never touches the
-/// placer. Returns an error on the unreachable placement/cancellation paths
-/// rather than panicking.
-struct RepairOrderPlacer;
-
-#[async_trait]
-impl OrderPlacer for RepairOrderPlacer {
-    async fn place_market_order(
-        &self,
-        _order: MarketOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
-    }
-
-    async fn place_limit_order(
-        &self,
-        _order: LimitOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
-    }
-
-    async fn cancel_order(
-        &self,
-        _executor_order_id: &ExecutorOrderId,
-    ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not cancel offchain orders; MarkFailed is terminal-only".into())
-    }
-}
 
 /// Fails a position's pending offchain order pointer and drives the orphaned
 /// `OffchainOrder` aggregate to `Failed`.
@@ -64,7 +29,7 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
     reason: String,
 ) -> anyhow::Result<()> {
     let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
+        .build()
         .await
         .context("failed to build position store")?;
 
@@ -313,7 +278,7 @@ async fn fail_offchain_order_aggregate<W: Write>(
     // projection updates immediately -- a stale 'Submitted' row in the view is
     // the very symptom this command exists to repair.
     let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(Arc::new(RepairOrderPlacer))
+        .build()
         .await
         .context("failed to build offchain order store")?;
     let send_result = store
@@ -403,7 +368,7 @@ pub(super) async fn set_position_command<W: Write>(
     }
 
     let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
+        .build()
         .await
         .context("failed to build position store")?;
 
@@ -462,10 +427,6 @@ mod tests {
     use crate::position::TradeId;
     use crate::test_utils::{positive_shares, setup_test_db};
 
-    fn repair_order_placer() -> Arc<dyn OrderPlacer> {
-        Arc::new(RepairOrderPlacer)
-    }
-
     /// Seeds a standalone OffchainOrder aggregate for `order_id` into the
     /// non-terminal `Submitted` state (Place -> Placed + Submitted via the noop
     /// placer), so repair can drive it to `Failed`.
@@ -481,7 +442,6 @@ mod tests {
                 client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 kind: crate::offchain::order::CounterTradeOrderKind::Market,
             },
-            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -499,7 +459,6 @@ mod tests {
                 market_session: st0x_execution::MarketSession::Regular,
                 limit_price: None,
             },
-            crate::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -511,7 +470,7 @@ mod tests {
         offchain_order_id: OffchainOrderId,
     ) {
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let threshold = ExecutionThreshold::whole_share();
@@ -569,7 +528,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -602,7 +561,7 @@ mod tests {
 
         // Position pointer cleared.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -664,7 +623,6 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -685,7 +643,7 @@ mod tests {
             "expected a filled-order refusal; got: {error}"
         );
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -723,7 +681,6 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -773,7 +730,6 @@ mod tests {
                 avg_price: Usd::new(float!(100)),
                 partially_filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -846,7 +802,6 @@ mod tests {
                 avg_price: Usd::new(float!(100)),
                 partially_filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -868,7 +823,6 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -890,7 +844,6 @@ mod tests {
                 error: "bot failed it".to_string(),
                 failed_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -915,7 +868,7 @@ mod tests {
 
         // Partial prior run cleared the pointer...
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         position
@@ -937,7 +890,6 @@ mod tests {
                 price: Usd::new(float!(100)),
                 filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -979,7 +931,6 @@ mod tests {
                 error: "bot failed it concurrently".to_string(),
                 failed_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -1031,7 +982,6 @@ mod tests {
                 error: "pre-failed".to_string(),
                 failed_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -1055,7 +1005,7 @@ mod tests {
 
         // The pointer must still be cleared even when the order needed no fix.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -1085,7 +1035,7 @@ mod tests {
 
         // Simulate the partial prior run: pointer cleared, order untouched.
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         position
@@ -1155,12 +1105,12 @@ mod tests {
         // Symbol A has a position with a clear pointer; the order belongs to B.
         seed_pending_position(&pool, &symbol_a, OffchainOrderId::new()).await;
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = {
             let (_pos, projection) = StoreBuilder::<Position>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
             projection.load(&symbol_a).await.unwrap().unwrap()
@@ -1223,7 +1173,6 @@ mod tests {
                 avg_price: Usd::new(float!(100)),
                 partially_filled_at: chrono::Utc::now(),
             },
-            repair_order_placer(),
         )
         .await
         .unwrap();
@@ -1255,7 +1204,7 @@ mod tests {
             "order must remain PartiallyFilled, got {order:?}"
         );
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -1280,7 +1229,7 @@ mod tests {
         seed_pending_position(&pool, &symbol, order_id).await;
 
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         position
@@ -1332,7 +1281,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -1421,7 +1370,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1433,7 +1382,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("MSTR").unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1493,7 +1442,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1512,7 +1461,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("SPYM").unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1550,7 +1499,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1590,7 +1539,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -1623,7 +1572,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -1654,7 +1603,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1690,7 +1639,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();

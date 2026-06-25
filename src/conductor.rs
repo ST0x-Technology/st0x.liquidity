@@ -36,7 +36,7 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, LifecycleError, Projection, RetryOnBusy, SendError, Store,
+    AggregateError, EventSourced, LifecycleError, Projection, SendError, Store,
     StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
@@ -183,13 +183,9 @@ where
     let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .with(Arc::new(RetryOnBusy {
-                inner: HedgeLatencyProjection::new(pool.clone()),
-            }))
-            .with(Arc::new(RetryOnBusy {
-                inner: LifecycleFailureProjection::new(pool.clone()),
-            }))
-            .build(order_placer.clone())
+            .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+            .with(Arc::new(LifecycleFailureProjection::new(pool.clone())))
+            .build()
             .await?;
 
     // Startup recovery runs before any job worker starts, so no concurrent
@@ -554,12 +550,12 @@ impl Conductor {
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await?;
 
         let (vault_registry, vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
+                .build()
                 .await?;
 
         let seed_vault_registry_queue = SeedVaultRegistryJobQueue::new(&apalis_pool);
@@ -1306,7 +1302,7 @@ impl PositionAndRebalancing {
             let inventory_projection = Arc::new(InventoryProjection::new(inventory));
             let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                 .with(inventory_projection)
-                .build(())
+                .build()
                 .await?;
 
             Ok(Self {
@@ -1776,7 +1772,7 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
     };
 
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     let unwrapped_services = UnwrappedEquityRecoveryServices {
@@ -1788,7 +1784,7 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
     };
 
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     Ok((
@@ -2269,10 +2265,8 @@ async fn build_position_cqrs(
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
     let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(broadcaster)
-        .with(Arc::new(RetryOnBusy {
-            inner: HedgeLatencyProjection::new(pool.clone()),
-        }))
-        .build(())
+        .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+        .build()
         .await?;
 
     // Seed the position_shares gauge for already-open positions: a normal
@@ -3808,7 +3802,7 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool, ()));
+        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool));
 
         Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -3845,8 +3839,8 @@ mod tests {
             Arc::new(st0x_tokenization::mock::MockTokenizer::new());
         let vault_lookup = Arc::new(crate::vault_lookup::MockVaultLookup::new());
 
-        let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool, ()));
+        let mint_store = Arc::new(test_store(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool));
 
         CrossVenueEquityTransfer::new(
             raindex,
@@ -4019,8 +4013,8 @@ mod tests {
 
         let tokenizer = Arc::new(MockTokenizer::new());
 
-        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let seeding_redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+        let seeding_redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
 
         seeding_mint_store
             .send(
@@ -4054,7 +4048,7 @@ mod tests {
             crate::inventory::InventoryView::default(),
             event_sender,
         ));
-        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
                 equity: crate::inventory::ImbalanceThreshold {
@@ -4122,8 +4116,8 @@ mod tests {
         // The recover function only calls store.load() (event replay); it does
         // not invoke tokenizer methods. Use the same services for the function
         // call -- MockTokenizer methods are never called during load().
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
         let calls_before = tokenizer.call_count();
 
         // Must complete in under 1 second: no issuer poll blocking.
@@ -4212,8 +4206,8 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+            Arc::new(test_store::<EquityRedemption>(pool.clone())),
             &mut resume_queue,
         )
         .await
@@ -4230,8 +4224,8 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+            Arc::new(test_store::<EquityRedemption>(pool.clone())),
             &mut resume_queue,
         )
         .await
@@ -4288,8 +4282,8 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+            Arc::new(test_store::<EquityRedemption>(pool.clone())),
             &mut resume_queue,
         )
         .await
@@ -4371,8 +4365,8 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+            Arc::new(test_store::<EquityRedemption>(pool.clone())),
             &mut resume_queue,
         )
         .await
@@ -4420,8 +4414,8 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+            Arc::new(test_store::<EquityRedemption>(pool.clone())),
             &mut resume_queue,
         )
         .await
@@ -4442,8 +4436,8 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+            Arc::new(test_store::<EquityRedemption>(pool.clone())),
             &mut resume_queue,
         )
         .await
@@ -4496,7 +4490,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let mint_id = issuer_request_id("pre-wrap-held-mint");
 
-        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
+        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
 
         // RecordMintRequested -> MintAccepted state.
         // RecordTokensReceived -> TokensReceived state (pre-wrap).
@@ -4533,7 +4527,7 @@ mod tests {
             crate::inventory::InventoryView::default(),
             event_sender,
         ));
-        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
                 equity: crate::inventory::ImbalanceThreshold {
@@ -4561,8 +4555,8 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         );
 
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
         let mut resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
 
         recover_interrupted_tokenization_aggregates(
@@ -4587,7 +4581,7 @@ mod tests {
         let (pool2, apalis_pool2) = setup_test_pools().await;
         let mint_id2 = issuer_request_id("pre-wrap-active-mint");
 
-        let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone(), ()));
+        let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone()));
 
         seeding_mint_store2
             .send(
@@ -4622,7 +4616,7 @@ mod tests {
             crate::inventory::InventoryView::default(),
             event_sender2.clone(),
         ));
-        let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
+        let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone()));
         let rebalancing_service2 = RebalancingService::new(
             RebalancingServiceConfig {
                 equity: crate::inventory::ImbalanceThreshold {
@@ -4650,8 +4644,8 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         );
 
-        let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone(), ()));
-        let redemption_store2 = Arc::new(test_store::<EquityRedemption>(pool2.clone(), ()));
+        let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone()));
+        let redemption_store2 = Arc::new(test_store::<EquityRedemption>(pool2.clone()));
         let mut resume_queue2 = ResumeTokenizationJobQueue::new(&apalis_pool2);
 
         recover_interrupted_tokenization_aggregates(
@@ -5271,7 +5265,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -5296,7 +5290,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -5321,7 +5315,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let queued_event = create_emitted_take_event(order);
@@ -5352,7 +5346,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_inventory_trade_discovers_nothing() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let queued_event = create_emitted_inventory_event();
         let trade = create_test_trade("MSFT");
@@ -5373,7 +5367,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -5396,7 +5390,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -5419,7 +5413,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -5500,36 +5494,29 @@ mod tests {
     async fn create_cqrs_frameworks(
         pool: &SqlitePool,
     ) -> (CqrsFrameworks, Arc<Projection<OffchainOrder>>) {
-        create_cqrs_frameworks_with_order_placer(pool, noop_order_placer()).await
-    }
-
-    async fn create_cqrs_frameworks_with_order_placer(
-        pool: &SqlitePool,
-        order_placer: Arc<dyn OrderPlacer>,
-    ) -> (CqrsFrameworks, Arc<Projection<OffchainOrder>>) {
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build()
                 .await
                 .unwrap();
 
         let (vault_registry, _) = StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -7079,8 +7066,7 @@ mod tests {
     #[tokio::test]
     async fn extended_hours_trade_skips_immediate_hedge_without_offchain_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let cqrs = trade_processing_cqrs_with_assets(
             &frameworks,
@@ -7150,8 +7136,7 @@ mod tests {
         // job (which has the OrderPlacer for the limit order) rather than place
         // inline or wait for the next CheckPositions scan.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = TradeProcessingCqrs {
             pool: pool.clone(),
             onchain_trade: frameworks.onchain_trade.clone(),
@@ -7266,8 +7251,7 @@ mod tests {
     #[tokio::test]
     async fn extended_hours_trade_enqueues_clamped_immediate_hedge_job() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let cqrs = trade_processing_cqrs_with_assets(
             &frameworks,
@@ -7331,8 +7315,7 @@ mod tests {
     #[tokio::test]
     async fn extended_hours_enqueue_failure_leaves_position_ready_for_check_positions() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let cqrs = trade_processing_cqrs_with_assets(
             &frameworks,
@@ -8064,7 +8047,7 @@ mod tests {
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // Seed vault registry so the trigger can resolve the token address.
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
         vault_registry
             .send(
                 &VaultRegistryId {
@@ -8088,7 +8071,7 @@ mod tests {
             event_sender,
         ));
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -8121,7 +8104,7 @@ mod tests {
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(Arc::clone(&reactor))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -8206,7 +8189,7 @@ mod tests {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -8233,7 +8216,7 @@ mod tests {
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(Arc::clone(&reactor))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -8322,7 +8305,7 @@ mod tests {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -8355,7 +8338,7 @@ mod tests {
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(reactor.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -8412,7 +8395,7 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone());
         vault_registry
             .send(
                 &VaultRegistryId {
@@ -8463,7 +8446,7 @@ mod tests {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -8496,7 +8479,7 @@ mod tests {
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(Arc::clone(&reactor))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -8736,7 +8719,7 @@ mod tests {
         ));
         let (vault_registry, vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
@@ -9119,13 +9102,13 @@ mod tests {
     async fn recover_orphaned_pending_clears_filled_order() {
         let pool = setup_test_db().await;
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
@@ -9248,13 +9231,13 @@ mod tests {
     async fn recover_orphaned_pending_clears_missing_order_aggregate() {
         let pool = setup_test_db().await;
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
@@ -9369,13 +9352,13 @@ mod tests {
         let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> = Arc::new(BlockingPlacer);
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
@@ -9473,13 +9456,13 @@ mod tests {
         let order_placer = noop_order_placer();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
@@ -9619,13 +9602,13 @@ mod tests {
         let order_placer = rejecting_order_placer();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
@@ -9718,13 +9701,13 @@ mod tests {
     async fn recover_orphaned_pending_clears_failed_order() {
         let pool = setup_test_db().await;
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
@@ -9822,16 +9805,14 @@ mod tests {
     #[tokio::test]
     async fn recover_orphaned_pending_clears_cancelled_order() {
         let pool = setup_test_db().await;
-        let order_placer = crate::offchain::order::noop_order_placer();
-
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build()
                 .await
                 .unwrap();
 
@@ -9968,16 +9949,14 @@ mod tests {
     #[tokio::test]
     async fn recover_orphaned_pending_skips_cancelling_order() {
         let pool = setup_test_db().await;
-        let order_placer = crate::offchain::order::noop_order_placer();
-
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build()
                 .await
                 .unwrap();
 
@@ -10093,16 +10072,14 @@ mod tests {
     #[tokio::test]
     async fn recover_orphaned_pending_completes_cancelled_order_with_partial_fill() {
         let pool = setup_test_db().await;
-        let order_placer = crate::offchain::order::noop_order_placer();
-
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build()
                 .await
                 .unwrap();
 
@@ -10410,8 +10387,7 @@ mod tests {
         // failure/idempotency anchor stays unset, so the replacement is a
         // fresh order instead of a broker-deduped retry against a dead key.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
@@ -10810,8 +10786,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_post_place_state_cancelling_enqueues_poll() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
@@ -10867,8 +10842,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_post_place_state_cancelled_partial_fill_completes_position() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,

@@ -24,7 +24,7 @@ use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
+use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_execution::{AlpacaTransferId, ClientOrderId, Symbol};
 use st0x_finance::Usdc;
 use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
@@ -39,7 +39,6 @@ use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
     UsdcRebalanceId,
 };
-
 
 /// Deterministic UUID for this module's fixtures, namespaced separately from
 /// `super::simulated_latency_uuid` so the two fixtures' synthetic ids never
@@ -71,10 +70,8 @@ pub async fn seed_simulated_mint_history(
     sqlx::migrate!().set_ignore_missing(true).run(pool).await?;
 
     let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-        .with(Arc::new(RetryOnBusy {
-            inner: EquityTimingProjection::new(pool.clone()),
-        }))
-        .build(())
+        .with(Arc::new(EquityTimingProjection::new(pool.clone())))
+        .build()
         .await?;
 
     let range_start = now - Duration::days(i64::from(days)) - Duration::days(1);
@@ -177,10 +174,8 @@ pub async fn seed_simulated_usdc_rebalance_history(
     // `Materialized = Table`, which returns a `(Store, Projection)` pair) --
     // the reactor is wired into the store's dispatch either way.
     let rebalance = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .with(Arc::new(RetryOnBusy {
-            inner: RebalanceTimingProjection::new(pool.clone()),
-        }))
-        .build(())
+        .with(Arc::new(RebalanceTimingProjection::new(pool.clone())))
+        .build()
         .await?;
 
     let range_start = now - Duration::days(i64::from(days)) - Duration::days(1);
@@ -539,7 +534,6 @@ async fn seed_base_to_alpaca(
     Ok(())
 }
 
-
 /// Seeds deterministic equity-redemption history for local dashboard
 /// simulation.
 ///
@@ -572,10 +566,8 @@ pub async fn seed_simulated_equity_redemption_history(
         let unwrap_block = withdraw_block + 5;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(Arc::new(RetryOnBusy {
-                inner: EquityTimingProjection::new(pool.clone()),
-            }))
-            .build(())
+            .with(Arc::new(EquityTimingProjection::new(pool.clone())))
+            .build()
             .await?;
 
         let id = RedemptionAggregateId(simulated_transfer_uuid("redemption", day));

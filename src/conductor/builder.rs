@@ -1228,7 +1228,7 @@ mod tests {
         Arc::new(TransferEquityToMarketMakingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            mint_store: Arc::new(test_store(cqrs_pool, ())),
+            mint_store: Arc::new(test_store(cqrs_pool)),
             equities_config: EquitiesConfig::default(),
         })
     }

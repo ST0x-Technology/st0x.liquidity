@@ -4843,21 +4843,21 @@ mod tests {
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
         let (vault_registry, _vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
@@ -4919,11 +4919,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -4993,11 +4993,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5098,11 +5098,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5180,11 +5180,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5244,11 +5244,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5335,11 +5335,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5457,11 +5457,11 @@ mod tests {
     async fn backfill_block_hash_mismatch_reverses_then_reapplies_reorg() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5559,11 +5559,11 @@ mod tests {
     async fn record_reorg_reverses_then_reapplies_a_reincluded_fill() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5651,11 +5651,11 @@ mod tests {
     async fn record_reorg_reapply_is_idempotent_across_redelivery() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5742,11 +5742,11 @@ mod tests {
     async fn record_reorg_resumes_reapply_after_reversal_but_before_rewitness() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5860,11 +5860,11 @@ mod tests {
     async fn backfill_matching_block_hash_is_not_a_reorg() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5912,11 +5912,11 @@ mod tests {
     async fn backfill_block_hash_check_skips_when_nothing_to_compare() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -5999,11 +5999,11 @@ mod tests {
     async fn detect_block_hash_reorg_anchors_on_persisted_block_number() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -6189,11 +6189,11 @@ mod tests {
     async fn dropped_fill_with_orphaned_block_is_flagged_reverse_only() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -6262,11 +6262,11 @@ mod tests {
     async fn still_canonical_fill_is_noop() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -6317,11 +6317,11 @@ mod tests {
     async fn re_mined_same_key_is_left_to_block_hash_detector() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -6380,11 +6380,11 @@ mod tests {
     async fn already_reorg_acknowledged_fill_is_idempotent_noop() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -6457,11 +6457,11 @@ mod tests {
     async fn canonical_block_absent_is_deferred_not_reversed() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -6509,11 +6509,11 @@ mod tests {
     async fn finalized_fill_is_outside_the_reverification_window() {
         let pool = setup_test_db().await;
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 

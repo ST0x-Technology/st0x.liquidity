@@ -25,9 +25,9 @@ use crate::offchain::order::handle_rejection::{
 };
 use crate::offchain::order::reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 use crate::offchain::order::{
-    CancellationReason, JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
-    RetainedFill, TerminalPositionFinalization, position_command_for_finalization,
-    terminal_position_finalization,
+    CancellationReason, ExecutorOrderPlacer, JobError, OffchainOrder, OffchainOrderCommand,
+    OffchainOrderId, RetainedFill, TerminalPositionFinalization, cancel_offchain_order,
+    position_command_for_finalization, terminal_position_finalization,
 };
 use crate::position::Position;
 
@@ -572,14 +572,13 @@ impl PollOrderStatus {
         // local reason -- mislabelling a 2pm manual cancel as a market-open
         // replacement would corrupt the cancellation analytics the reason
         // field exists for.
-        ctx.offchain_order_store
-            .send(
-                &self.offchain_order_id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: CancellationReason::Unrequested,
-                },
-            )
-            .await?;
+        cancel_offchain_order(
+            &ctx.offchain_order_store,
+            &ExecutorOrderPlacer(ctx.executor.clone()),
+            &self.offchain_order_id,
+            CancellationReason::Unrequested,
+        )
+        .await?;
 
         let Some(recovered) = ctx
             .offchain_order_store
@@ -883,7 +882,7 @@ mod tests {
 
     use super::*;
     use crate::offchain::order::{
-        NoFillOutcome, OffchainOrderCommand, TerminalPositionFinalization, noop_order_placer,
+        NoFillOutcome, OffchainOrderCommand, TerminalPositionFinalization,
         terminal_position_finalization,
     };
     use crate::position::{Position, PositionCommand, TradeId};
@@ -905,12 +904,12 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
         let (position, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 

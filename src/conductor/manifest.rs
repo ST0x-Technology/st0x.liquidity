@@ -16,7 +16,7 @@
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-use st0x_event_sorcery::{Projection, RetryOnBusy, Store, StoreBuilder};
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
@@ -38,10 +38,10 @@ use crate::usdc_rebalance::UsdcRebalance;
 pub(super) struct QueryManifest {
     rebalancing_service: Arc<RebalancingService>,
     broadcaster: Arc<Broadcaster>,
-    hedge_latency: Arc<RetryOnBusy<HedgeLatencyProjection>>,
-    rebalance_timing: Arc<RetryOnBusy<RebalanceTimingProjection>>,
-    equity_timing: Arc<RetryOnBusy<EquityTimingProjection>>,
-    lifecycle_failure: Arc<RetryOnBusy<LifecycleFailureProjection>>,
+    hedge_latency: Arc<HedgeLatencyProjection>,
+    rebalance_timing: Arc<RebalanceTimingProjection>,
+    equity_timing: Arc<EquityTimingProjection>,
+    lifecycle_failure: Arc<LifecycleFailureProjection>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -70,18 +70,10 @@ impl QueryManifest {
         Self {
             rebalancing_service,
             broadcaster,
-            hedge_latency: Arc::new(RetryOnBusy {
-                inner: hedge_latency,
-            }),
-            rebalance_timing: Arc::new(RetryOnBusy {
-                inner: rebalance_timing,
-            }),
-            equity_timing: Arc::new(RetryOnBusy {
-                inner: equity_timing,
-            }),
-            lifecycle_failure: Arc::new(RetryOnBusy {
-                inner: lifecycle_failure,
-            }),
+            hedge_latency: Arc::new(hedge_latency),
+            rebalance_timing: Arc::new(rebalance_timing),
+            equity_timing: Arc::new(equity_timing),
+            lifecycle_failure: Arc::new(lifecycle_failure),
         }
     }
 
@@ -104,7 +96,7 @@ impl QueryManifest {
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(hedge_latency)
-            .build(())
+            .build()
             .await?;
 
         let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -112,7 +104,7 @@ impl QueryManifest {
             .with(broadcaster.clone())
             .with(equity_timing.clone())
             .with(lifecycle_failure.clone())
-            .build(())
+            .build()
             .await?;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -120,7 +112,7 @@ impl QueryManifest {
             .with(broadcaster.clone())
             .with(equity_timing)
             .with(lifecycle_failure.clone())
-            .build(())
+            .build()
             .await?;
 
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
@@ -128,14 +120,14 @@ impl QueryManifest {
             .with(broadcaster)
             .with(rebalance_timing)
             .with(lifecycle_failure)
-            .build(())
+            .build()
             .await?;
 
         // The reactor's underlying trigger owns the snapshot projection
         // internally, so it's the sole subscriber here.
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
             .with(rebalancing_service)
-            .build(())
+            .build()
             .await?;
 
         Ok(BuiltFrameworks {
@@ -201,7 +193,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
@@ -257,7 +249,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
 
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
@@ -332,7 +324,7 @@ mod tests {
         let orderbook = Address::repeat_byte(0xAB);
         let owner = Address::repeat_byte(0xCD);
         let token = Address::repeat_byte(0xEF);
-        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store(pool.clone()));
         vault_registry
             .send(
                 &VaultRegistryId { orderbook, owner },

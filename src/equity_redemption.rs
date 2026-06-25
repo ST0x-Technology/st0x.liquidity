@@ -51,7 +51,6 @@
 //! - All state transitions are captured as events for complete audit trail
 
 use alloy::primitives::{Address, TxHash, U256};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
@@ -63,7 +62,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
 use st0x_tokenization::TokenizationRequestId;
@@ -1296,13 +1295,12 @@ impl EquityRedemption {
     }
 }
 
-#[async_trait]
 impl EventSourced for EquityRedemption {
     type Id = RedemptionAggregateId;
     type Event = EquityRedemptionEvent;
     type Command = EquityRedemptionCommand;
     type Error = EquityRedemptionError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
@@ -1896,9 +1894,9 @@ impl EventSourced for EquityRedemption {
         })
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use EquityRedemptionCommand::*;
         use EquityRedemptionEvent::*;
@@ -1969,10 +1967,10 @@ impl EventSourced for EquityRedemption {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use EquityRedemptionCommand::*;
         use EquityRedemptionEvent::*;
@@ -2359,14 +2357,15 @@ impl EquityRedemption {
             Self::UnwrapSubmitted { unwrap_tx_hash, .. } => {
                 // Financial precision validation stays at the aggregate
                 // boundary (fail-fast, no defaults).
-                let quantity = Float::from_fixed_decimal(unwrapped_amount, TOKENIZED_EQUITY_DECIMALS)
-                    .map_err(|error| {
-                        EquityRedemptionError::RaindexWithdrawQuantityConversionFailed {
-                            tx_hash: *unwrap_tx_hash,
-                            amount: unwrapped_amount,
-                            error_message: error.to_string(),
-                        }
-                    })?;
+                let quantity =
+                    Float::from_fixed_decimal(unwrapped_amount, TOKENIZED_EQUITY_DECIMALS)
+                        .map_err(|error| {
+                            EquityRedemptionError::RaindexWithdrawQuantityConversionFailed {
+                                tx_hash: *unwrap_tx_hash,
+                                amount: unwrapped_amount,
+                                error_message: error.to_string(),
+                            }
+                        })?;
 
                 Ok(vec![TokensUnwrapped {
                     quantity: Some(quantity),
@@ -2902,7 +2901,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeem_from_uninitialized_produces_vault_withdraw_pending() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Redeem {
                 symbol: Symbol::new("AAPL").unwrap(),
@@ -2922,7 +2921,7 @@ mod tests {
 
     #[tokio::test]
     async fn detect_after_tokens_sent_produces_detected() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::Detect {
                 tokenization_request_id: tokenization_request_id("REQ789"),
@@ -2936,7 +2935,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_from_pending_produces_completed() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_sent_event(),
@@ -2952,7 +2951,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_redemption_flow_end_to_end() {
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("end-to-end");
 
         store
@@ -3061,7 +3060,7 @@ mod tests {
     async fn submit_withdraw_at_uses_supplied_timestamp() {
         let submitted_at = Utc::now() - chrono::Duration::hours(3);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![vault_withdraw_pending_event()])
             .when(EquityRedemptionCommand::SubmitWithdrawAt {
                 tx_hash: TxHash::random(),
@@ -3086,7 +3085,7 @@ mod tests {
         let withdrawn_at = Utc::now() - chrono::Duration::hours(2);
         let amount = U256::from(50_250_000_000_000_000_000_u128);
 
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("confirm-withdraw-at");
 
         store
@@ -3138,7 +3137,7 @@ mod tests {
     async fn submit_unwrap_at_uses_supplied_timestamp() {
         let submitted_at = Utc::now() - chrono::Duration::hours(1);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event(), unwrap_pending_event()])
             .when(EquityRedemptionCommand::SubmitUnwrapAt {
                 unwrap_tx_hash: TxHash::random(),
@@ -3163,7 +3162,7 @@ mod tests {
         let unwrapped_at = Utc::now() - chrono::Duration::minutes(30);
         let amount = U256::from(50_250_000_000_000_000_000_u128);
 
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("confirm-unwrap-at");
 
         store
@@ -3239,7 +3238,7 @@ mod tests {
     async fn submit_send_at_uses_supplied_timestamp() {
         let submitted_at = Utc::now() - chrono::Duration::minutes(20);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
@@ -3270,7 +3269,7 @@ mod tests {
     async fn confirm_send_at_uses_supplied_timestamp() {
         let sent_at = Utc::now() - chrono::Duration::minutes(15);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
@@ -3302,7 +3301,7 @@ mod tests {
     async fn redeem_at_uses_supplied_timestamp() {
         let pending_at = Utc::now() - chrono::Duration::hours(4);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::RedeemAt {
                 symbol: Symbol::new("AAPL").unwrap(),
@@ -3329,7 +3328,7 @@ mod tests {
     async fn unwrap_tokens_at_uses_supplied_timestamp() {
         let pending_at = Utc::now() - chrono::Duration::hours(3);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event()])
             .when(EquityRedemptionCommand::UnwrapTokensAt { pending_at })
             .await
@@ -3349,7 +3348,7 @@ mod tests {
     async fn prepare_send_at_uses_supplied_timestamp() {
         let pending_at = Utc::now() - chrono::Duration::hours(2);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
@@ -3372,7 +3371,7 @@ mod tests {
     async fn detect_at_uses_supplied_timestamp() {
         let detected_at = Utc::now() - chrono::Duration::hours(1);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::DetectAt {
                 tokenization_request_id: tokenization_request_id("REQ789"),
@@ -3396,7 +3395,7 @@ mod tests {
     async fn complete_at_uses_supplied_timestamp() {
         let completed_at = Utc::now() - chrono::Duration::minutes(45);
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_sent_event(),
@@ -3422,7 +3421,7 @@ mod tests {
     async fn send_records_underlying_token_not_wrapped_token() {
         let wrapped_token = Address::random();
         let underlying_token = Address::random();
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("underlying-token-fix");
 
         store
@@ -3524,7 +3523,7 @@ mod tests {
     async fn confirm_withdraw_collapses_state_amount_to_actual_receipt_amount() {
         let requested = U256::from(37_143_292_455_000_000_000_u128);
         let actual = U256::from(33_681_456_848_531_939_569_u128);
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("partial-withdraw");
 
         store
@@ -3574,7 +3573,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_withdraw_rejects_zero_actual_amount() {
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("zero-withdraw");
 
         store
@@ -3623,7 +3622,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_unwrap_rejects_zero_amount() {
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("zero-unwrap");
 
         store
@@ -3696,7 +3695,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_detect_before_sending_tokens() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Detect {
                 tokenization_request_id: tokenization_request_id("REQ789"),
@@ -3712,7 +3711,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_complete_before_pending() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Complete)
             .await
@@ -3728,7 +3727,7 @@ mod tests {
     async fn fail_detection_from_tokens_sent_state() {
         let history = vec![withdrawn_from_raindex_event(), tokens_sent_event()];
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(history.clone())
             .when(EquityRedemptionCommand::FailDetection {
                 failure: DetectionFailure::Timeout,
@@ -3794,7 +3793,7 @@ mod tests {
         // the replayed `Failed` state.
         let history = vec![withdrawn_from_raindex_event(), tokens_sent_event()];
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(history.clone())
             .when(EquityRedemptionCommand::FailDetection {
                 failure: DetectionFailure::Operator {
@@ -3836,7 +3835,7 @@ mod tests {
             detected_event(),
         ];
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(history.clone())
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "test rejection".to_string(),
@@ -3865,7 +3864,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_reject_redemption_before_pending() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "test rejection".to_string(),
@@ -3934,7 +3933,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fail_detection_before_sending() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::FailDetection {
                 failure: DetectionFailure::Timeout,
@@ -3950,7 +3949,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_reject_redemption_before_sending() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "test rejection".to_string(),
@@ -4087,7 +4086,7 @@ mod tests {
     /// covered separately in `rebalancing::equity`'s `send_to_alpaca` tests.
     #[tokio::test]
     async fn record_send_failed_outcome_records_provider_failure_reason() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
@@ -4111,7 +4110,7 @@ mod tests {
     /// `TransferFailed`.
     #[tokio::test]
     async fn record_wallet_not_configured_outcome_records_configuration_reason() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
@@ -4133,7 +4132,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeem_when_already_started_returns_already_started() {
-        let store = TestStore::<EquityRedemption>::new(());
+        let store = TestStore::<EquityRedemption>::new();
         let id = redemption_aggregate_id("redemption-1");
 
         store
@@ -4170,7 +4169,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeem_when_pending_returns_already_started() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_sent_event(),
@@ -4962,7 +4961,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_provider_completion_rejected_for_active_redemption() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event()])
             .when(EquityRedemptionCommand::RecoverProviderCompletion {
                 tokenization_request_id: tokenization_request_id("TOK001"),
@@ -4981,7 +4980,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_provider_completion_rejected_for_completed_redemption() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_sent_event(),
@@ -5013,7 +5012,7 @@ mod tests {
             reconciled_at: Utc::now(),
         });
 
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(history)
             .when(EquityRedemptionCommand::RecoverProviderCompletion {
                 tokenization_request_id: tokenization_request_id("TOK001"),
@@ -5032,7 +5031,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_transfer_from_withdrawn_transitions_to_failed() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event()])
             .when(EquityRedemptionCommand::FailTransfer {
                 reason: "Transfer timed out".to_string(),
@@ -5049,7 +5048,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_transfer_from_unwrapped_transitions_to_failed() {
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
@@ -5069,7 +5068,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_transfer_rejected_from_tokens_sent() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::FailTransfer {
                 reason: "should not work".to_string(),
@@ -5085,7 +5084,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_transfer_rejected_before_start() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given_no_previous_events()
             .when(EquityRedemptionCommand::FailTransfer {
                 reason: "should not work".to_string(),
@@ -5103,7 +5102,7 @@ mod tests {
     async fn reconcile_from_failed_emits_operator_reconciled_and_replays_to_reconciled() {
         let history = failed_redemption_history();
 
-        let events = TestHarness::<EquityRedemption>::with(())
+        let events = TestHarness::<EquityRedemption>::with()
             .given(history.clone())
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "deposited manually via vault-deposit".to_string(),
@@ -5145,7 +5144,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_from_non_failed_is_rejected() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "should be rejected".to_string(),
@@ -5164,7 +5163,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_with_blank_reason_is_rejected() {
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(failed_redemption_history())
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "   ".to_string(),
@@ -5189,7 +5188,7 @@ mod tests {
             reconciled_at: Utc::now(),
         });
 
-        let error = TestHarness::<EquityRedemption>::with(())
+        let error = TestHarness::<EquityRedemption>::with()
             .given(history)
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "second attempt".to_string(),

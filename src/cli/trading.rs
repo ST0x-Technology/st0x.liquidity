@@ -629,13 +629,12 @@ pub(super) async fn process_found_trade<W: Write>(
     // Build stores. CLI path: per-invocation instances are fine (single-instance
     // rule applies to the server path only; see AGENTS.md).
     let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
-    let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
-        .await?;
+    let (position_store, position_projection) =
+        StoreBuilder::<Position>::new(pool.clone()).build().await?;
     let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(order_placer.clone())
+        .build()
         .await?;
 
     let Some(block_number) = onchain_trade.block_number else {
@@ -1116,7 +1115,7 @@ mod tests {
         TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
         process_queued_trade,
     };
-    use crate::offchain::order::{CancellationReason, PollOrderStatusJobQueue, noop_order_placer};
+    use crate::offchain::order::{CancellationReason, PollOrderStatusJobQueue};
     use crate::onchain::trade::RaindexTradeEvent;
     use crate::onchain_trade::{OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand};
     use crate::test_utils::{
@@ -1934,7 +1933,7 @@ mod tests {
 
         // Pre-seed 1: witness + acknowledge the OnChainTrade aggregate.
         let onchain_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1962,7 +1961,7 @@ mod tests {
         // Pre-seed 2: apply the fill to the Position aggregate so there is live
         // unhedged exposure that could trigger hedge placement if we fell through.
         let (pre_position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2034,7 +2033,7 @@ mod tests {
 
         // Pre-seed: witness only (not acknowledged — simulates crash window).
         let store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2119,7 +2118,7 @@ mod tests {
 
         // The OnChainTrade aggregate must be acknowledged.
         let store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let state = store
@@ -2171,15 +2170,15 @@ mod tests {
         // Step 2: Construct TradeProcessingCqrs backed by the same pool so the
         // acknowledged OnChainTrade record written by the CLI is visible.
         let onchain_trade_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
 
@@ -2373,7 +2372,7 @@ mod tests {
         // pending_offchain_order_id must be cleared: the position must not be
         // permanently stuck after a failed broker placement.
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2397,7 +2396,7 @@ mod tests {
         let block_timestamp = Utc::now();
 
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let onchain_trade = OnchainTradeBuilder::default()
@@ -2475,11 +2474,11 @@ mod tests {
             .expect("test trade should have a block timestamp");
 
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
 
@@ -2545,7 +2544,7 @@ mod tests {
             .expect("test trade should have a block timestamp");
 
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2633,7 +2632,7 @@ mod tests {
             .expect("test trade should have a block timestamp");
 
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2732,7 +2731,7 @@ mod tests {
         // process_found_trade's internal store loads the aggregate, it will see
         // Some(Witnessed) and resume rather than re-witness.
         let store_a = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2829,7 +2828,7 @@ mod tests {
 
         // Simulate a concurrent writer that has fully processed the fill.
         let store_a = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2857,7 +2856,7 @@ mod tests {
         // Apply the fill to the position so there is live unhedged exposure that
         // could trigger hedge placement if we fell through.
         let (pre_position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -2948,11 +2947,11 @@ mod tests {
         };
 
         let onchain_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3094,11 +3093,11 @@ mod tests {
         };
 
         let onchain_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3228,7 +3227,7 @@ mod tests {
         // pending_offchain_order_id must be set: the order is submitted to the
         // broker and in flight; only the order-status sweep will clear it.
         let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -3243,7 +3242,7 @@ mod tests {
             .expect("pending_offchain_order_id must be set after successful broker submission");
 
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build()
             .await
             .unwrap();
         let offchain_order = offchain_order_store

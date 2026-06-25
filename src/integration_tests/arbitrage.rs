@@ -845,10 +845,10 @@ async fn create_test_cqrs_with_assets(
     Arc<Store<crate::offchain::order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
-    let onchain_trade = Arc::new(test_store(pool.clone(), ()));
+    let onchain_trade = Arc::new(test_store(pool.clone()));
 
     let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
+        .build()
         .await
         .unwrap();
 
@@ -857,7 +857,7 @@ async fn create_test_cqrs_with_assets(
 
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(order_placer.clone())
+            .build()
             .await
             .unwrap();
 
@@ -2031,7 +2031,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     trade1.submit(&cqrs).await?;
 
     // Run vault discovery using the same trade data
-    let vault_registry = test_store(pool.clone(), ());
+    let vault_registry = test_store(pool.clone());
     let context = VaultDiscoveryCtx {
         vault_registry: &vault_registry,
         orderbook: orderbook.orderbook_addr,

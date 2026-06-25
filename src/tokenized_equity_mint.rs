@@ -43,7 +43,6 @@
 //! - All state transitions are captured as events for complete audit trail
 
 use alloy::primitives::{Address, TxHash, U256};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
@@ -51,7 +50,7 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
@@ -1403,13 +1402,12 @@ fn quantity_to_u256_18_decimals(value: Float) -> Result<U256, TokenizedEquityMin
         .map_err(TokenizedEquityMintError::from)
 }
 
-#[async_trait]
 impl EventSourced for TokenizedEquityMint {
     type Id = IssuerRequestId;
     type Event = TokenizedEquityMintEvent;
     type Command = TokenizedEquityMintCommand;
     type Error = TokenizedEquityMintError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
@@ -1823,9 +1821,9 @@ impl EventSourced for TokenizedEquityMint {
         })
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use TokenizedEquityMintEvent::*;
 
@@ -1930,10 +1928,10 @@ impl EventSourced for TokenizedEquityMint {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use TokenizedEquityMintEvent::*;
         match command {
@@ -2409,7 +2407,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_emits_requested_and_accepted() {
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given_no_previous_events()
             .when(mint_command())
             .await
@@ -2434,7 +2432,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_tokens_received_after_acceptance_emits_tokens_received() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
 
         let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
@@ -2450,7 +2448,7 @@ mod tests {
     #[tokio::test]
     async fn record_tokens_received_with_fees_propagates_to_tokens_received() {
         let expected_fees = float!("0.25");
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
 
         let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
@@ -2482,7 +2480,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_tokens_received_with_wrong_token_symbol_errors() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2521,7 +2519,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_tokens_received_with_missing_token_symbol_errors() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2558,7 +2556,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_tokens_received_with_missing_tx_hash_errors() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2593,7 +2591,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_mint_requested_is_idempotent_when_redelivered() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         // At-least-once jobs can re-deliver the accept outcome after the
@@ -2611,7 +2609,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_mint_requested_with_conflicting_request_id_errors() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2642,7 +2640,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_tokens_received_is_idempotent_when_redelivered() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2659,7 +2657,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_tokens_received_redelivered_with_different_tx_hash_errors() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2705,7 +2703,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_mint_request_is_idempotent_when_already_failed() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         let reject = || TokenizedEquityMintCommand::RejectMintRequest {
@@ -2729,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_mint_request_on_accepted_mint_errors_already_in_progress() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -2768,7 +2766,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_mint_request_on_completed_mint_errors_already_completed() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3025,7 +3023,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_mint_request_emits_rejected() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store
@@ -3105,7 +3103,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_tokens_is_pure_state_transition() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3131,7 +3129,7 @@ mod tests {
 
     #[tokio::test]
     async fn deposit_to_vault_is_pure_state_transition() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3168,7 +3166,7 @@ mod tests {
     async fn record_tokens_received_at_uses_supplied_timestamp() {
         let received_at = Utc::now() - chrono::Duration::hours(2);
 
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![mint_requested_event(), mint_accepted_event()])
             .when(TokenizedEquityMintCommand::RecordTokensReceivedAt {
                 tx_hash: Some(TxHash::ZERO),
@@ -3194,7 +3192,7 @@ mod tests {
     async fn wrap_tokens_at_uses_supplied_timestamp() {
         let wrapped_at = Utc::now() - chrono::Duration::hours(3);
 
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![
                 mint_requested_event(),
                 mint_accepted_event(),
@@ -3224,7 +3222,7 @@ mod tests {
     async fn deposit_to_vault_at_uses_supplied_timestamp() {
         let deposited_at = Utc::now() - chrono::Duration::hours(4);
 
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![
                 mint_requested_event(),
                 mint_accepted_event(),
@@ -3253,7 +3251,7 @@ mod tests {
     async fn record_mint_requested_at_uses_supplied_timestamp() {
         let requested_at = Utc::now() - chrono::Duration::hours(5);
 
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given_no_previous_events()
             .when(TokenizedEquityMintCommand::RecordMintRequestedAt {
                 issuer_request_id: issuer_request_id("ISS001"),
@@ -3585,7 +3583,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_provider_completion_rejected_for_active_mint() {
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![mint_requested_event()])
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
                 issuer_request_id: issuer_request_id("ISS001"),
@@ -3608,7 +3606,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_provider_completion_rejected_for_completed_mint() {
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![
                 mint_requested_event(),
                 mint_accepted_event(),
@@ -3643,7 +3641,7 @@ mod tests {
             reconciled_at: Utc::now(),
         });
 
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(history)
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
                 issuer_request_id: issuer_request_id("ISS001"),
@@ -3666,7 +3664,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_acceptance_from_accepted_transitions_to_failed() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3696,7 +3694,7 @@ mod tests {
         let history = vec![mint_requested_event()];
 
         let reason = "stuck pre-acceptance; operator force-fail";
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given(history.clone())
             .when(TokenizedEquityMintCommand::FailAcceptance {
                 reason: reason.to_string(),
@@ -3735,7 +3733,7 @@ mod tests {
         // FailAcceptance broadened to accept MintRequested/MintAccepted; a mint
         // that moved past acceptance (TokensReceived) must still be rejected, so
         // the success arm did not over-widen.
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![
                 mint_requested_event(),
                 mint_accepted_event(),
@@ -3758,7 +3756,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_wrapping_from_tokens_received_transitions_to_failed() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3783,7 +3781,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_raindex_deposit_from_tokens_wrapped_transitions_to_failed() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3819,7 +3817,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_wrapping_rejected_from_wrong_state() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         // MintAccepted state -- FailWrapping requires TokensReceived
@@ -3842,7 +3840,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_acceptance_rejected_from_terminal_state() {
-        let store = TestStore::<TokenizedEquityMint>::new(());
+        let store = TestStore::<TokenizedEquityMint>::new();
         let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3886,7 +3884,7 @@ mod tests {
     async fn reconcile_from_failed_emits_operator_reconciled_and_replays_to_reconciled() {
         let history = failed_mint_history();
 
-        let events = TestHarness::<TokenizedEquityMint>::with(())
+        let events = TestHarness::<TokenizedEquityMint>::with()
             .given(history.clone())
             .when(TokenizedEquityMintCommand::Reconcile {
                 reason: "wrapped manually via wrap-equity".to_string(),
@@ -3951,7 +3949,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_from_non_failed_is_rejected() {
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(vec![mint_requested_event(), mint_accepted_event()])
             .when(TokenizedEquityMintCommand::Reconcile {
                 reason: "should be rejected".to_string(),
@@ -3970,7 +3968,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_with_blank_reason_is_rejected() {
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(failed_mint_history())
             .when(TokenizedEquityMintCommand::Reconcile {
                 reason: "   ".to_string(),
@@ -3995,7 +3993,7 @@ mod tests {
             reconciled_at: Utc::now(),
         });
 
-        let error = TestHarness::<TokenizedEquityMint>::with(())
+        let error = TestHarness::<TokenizedEquityMint>::with()
             .given(history)
             .when(TokenizedEquityMintCommand::Reconcile {
                 reason: "second attempt".to_string(),

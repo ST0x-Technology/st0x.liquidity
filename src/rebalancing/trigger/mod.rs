@@ -5452,7 +5452,7 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -5498,7 +5498,7 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
         let service = RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -5556,7 +5556,7 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
         let service = RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -5614,7 +5614,7 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
         let service = RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -5734,7 +5734,7 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::new());
         Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -7356,7 +7356,7 @@ mod tests {
                     cash: None,
                 },
             },
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -7745,7 +7745,7 @@ mod tests {
     }
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let store = test_store::<VaultRegistry>(pool.clone(), ());
+        let store = test_store::<VaultRegistry>(pool.clone());
         let vault_registry_id = VaultRegistryId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -7811,7 +7811,7 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -8096,7 +8096,7 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -8171,7 +8171,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -11482,7 +11482,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_relatch_for_reconciled() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
@@ -13742,11 +13742,8 @@ mod tests {
     ) {
         service
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool,
-                    (),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+                Arc::new(test_store::<EquityRedemption>(pool)),
                 Arc::new(usdc_store),
             )
             .await;
@@ -13757,7 +13754,7 @@ mod tests {
         // A Failed+attempts<max row whose aggregate is already terminal (zombie)
         // must be killed and must NOT suppress a new hedging transfer.
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_terminal_usdc_aggregate(&usdc_store, &id).await;
 
@@ -13805,7 +13802,7 @@ mod tests {
     async fn failed_usdc_zombie_with_terminal_aggregate_does_not_block_market_making_enqueue() {
         // Symmetric: a zombie hedging job must not block a market-making enqueue.
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_terminal_usdc_aggregate(&usdc_store, &id).await;
 
@@ -13856,7 +13853,7 @@ mod tests {
         // A Failed+attempts<max row whose aggregate is still live (genuine retry)
         // must block enqueue even after the zombie check.
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_nonterminal_usdc_aggregate(&usdc_store, &id).await;
 
@@ -13940,7 +13937,7 @@ mod tests {
         // The guard must conservatively treat the row as in-flight.
         let pool = crate::test_utils::setup_test_db().await;
         // Do NOT seed any aggregate -- store is empty.
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
 
         let service = make_trigger_with_inventory(InventoryView::default()).await;
         service
@@ -13983,7 +13980,7 @@ mod tests {
         // store-not-wired check fires first and returns early, so without wiring
         // the test would exercise the wrong branch.
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
 
         let service = make_trigger_with_inventory(InventoryView::default()).await;
         service
@@ -14023,7 +14020,7 @@ mod tests {
         // Two Failed+attempts<max rows with terminal aggregates and no Pending row:
         // both must be killed and enqueue must succeed.
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
         let id1 = UsdcRebalanceId(Uuid::new_v4());
         let id2 = UsdcRebalanceId(Uuid::new_v4());
         seed_terminal_usdc_aggregate(&usdc_store, &id1).await;
@@ -14175,7 +14172,7 @@ mod tests {
         // This verifies that `in_flight_usdc_transfer` re-queries after killing a
         // zombie rather than blindly treating the cleared zombie as "all clear".
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone());
 
         let zombie_id = UsdcRebalanceId(Uuid::new_v4());
         seed_terminal_usdc_aggregate(&usdc_store, &zombie_id).await;
@@ -14336,7 +14333,7 @@ mod tests {
     /// `RecordMintRequested` emits `MintRequested` + `MintAccepted` without
     /// calling any service, then `FailAcceptance` drives it to `Failed`.
     async fn seed_terminal_mint_aggregate(pool: &SqlitePool, mint_id: &IssuerRequestId) {
-        let store = test_store::<TokenizedEquityMint>(pool.clone(), ());
+        let store = test_store::<TokenizedEquityMint>(pool.clone());
         store
             .send(
                 mint_id,
@@ -14366,7 +14363,7 @@ mod tests {
     /// Same seeding as `seed_terminal_mint_aggregate`; stops before the failure
     /// so the aggregate is still live and holds the duplicate-protection guard.
     async fn seed_nonterminal_mint_aggregate(pool: &SqlitePool, mint_id: &IssuerRequestId) {
-        let store = test_store::<TokenizedEquityMint>(pool.clone(), ());
+        let store = test_store::<TokenizedEquityMint>(pool.clone());
         store
             .send(
                 mint_id,
@@ -14391,8 +14388,7 @@ mod tests {
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
     ) {
-        let store =
-            test_store::<EquityRedemption>(pool.clone(), ());
+        let store = test_store::<EquityRedemption>(pool.clone());
         store
             .send(
                 redemption_id,
@@ -14422,8 +14418,7 @@ mod tests {
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
     ) {
-        let store =
-            test_store::<EquityRedemption>(pool.clone(), ());
+        let store = test_store::<EquityRedemption>(pool.clone());
         store
             .send(
                 redemption_id,
@@ -14450,7 +14445,7 @@ mod tests {
             .set_stores(
                 Arc::new(mint_store),
                 Arc::new(redemption_store),
-                Arc::new(test_store::<UsdcRebalance>(pool, ())),
+                Arc::new(test_store::<UsdcRebalance>(pool)),
             )
             .await;
     }
@@ -14557,8 +14552,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14615,8 +14610,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14673,8 +14668,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14727,8 +14722,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14820,8 +14815,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14881,8 +14876,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14933,8 +14928,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -14985,8 +14980,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -15062,8 +15057,8 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), ()),
-            test_store::<EquityRedemption>(pool.clone(), ()),
+            test_store::<TokenizedEquityMint>(pool.clone()),
+            test_store::<EquityRedemption>(pool.clone()),
         )
         .await;
 
@@ -15294,7 +15289,7 @@ mod tests {
 
         // Drive a BaseToAlpaca aggregate all the way to DepositFailed, then
         // reconcile it (simulating what the CLI does in a separate process).
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_deposit_failed(
             &store,
@@ -15339,8 +15334,8 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+                Arc::new(test_store::<EquityRedemption>(pool.clone())),
                 Arc::new(store),
             )
             .await;
@@ -15418,7 +15413,7 @@ mod tests {
 
         // Drive to DepositFailed then reconcile (simulating CLI in separate
         // process).
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_deposit_failed(
             &store,
@@ -15459,8 +15454,8 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+                Arc::new(test_store::<EquityRedemption>(pool.clone())),
                 Arc::new(store),
             )
             .await;
@@ -15525,7 +15520,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         // Drive aggregate to DepositFailed but do NOT reconcile it.
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_deposit_failed(
             &store,
@@ -15554,8 +15549,8 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+                Arc::new(test_store::<EquityRedemption>(pool.clone())),
                 Arc::new(store),
             )
             .await;
@@ -15677,7 +15672,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         // Drive to DepositFailed then Reconciled.
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_deposit_failed(
             &store,
@@ -15720,8 +15715,8 @@ mod tests {
         let store = Arc::new(store);
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone())),
+                Arc::new(test_store::<EquityRedemption>(pool.clone())),
                 Arc::clone(&store),
             )
             .await;
@@ -15819,12 +15814,11 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(unmigrated_pool.clone(), ())),
+                >(unmigrated_pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     unmigrated_pool.clone(),
-                    (),
                 )),
-                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone(), ())),
+                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone())),
             )
             .await;
 
@@ -15891,12 +15885,11 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(unmigrated_pool.clone(), ())),
+                >(unmigrated_pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     unmigrated_pool.clone(),
-                    (),
                 )),
-                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone(), ())),
+                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone())),
             )
             .await;
 
@@ -15964,7 +15957,7 @@ mod tests {
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
         // Drive an AlpacaToBase aggregate to DepositFailed then Reconciled.
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_deposit_failed(
             &store,
@@ -16005,10 +15998,9 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(pool.clone(), ())),
+                >(pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    (),
                 )),
                 Arc::new(store),
             )
@@ -16076,7 +16068,7 @@ mod tests {
     async fn sweep_rearms_withdrawing_alpaca_to_base_instead_of_clearing() {
         let now = Utc::now();
         let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -16162,7 +16154,7 @@ mod tests {
     async fn sweep_does_not_duplicate_withdrawing_alpaca_to_base_retryable_failed_job() {
         let now = Utc::now();
         let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -16220,7 +16212,7 @@ mod tests {
     async fn sweep_rearms_withdrawal_complete_alpaca_to_base_instead_of_clearing() {
         let now = Utc::now();
         let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -16285,7 +16277,7 @@ mod tests {
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
 
         // Drive a BaseToAlpaca aggregate to DepositFailed (not yet reconciled).
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_deposit_failed(
             &store,
@@ -16352,10 +16344,9 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(pool.clone(), ())),
+                >(pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    (),
                 )),
                 Arc::clone(&store),
             )
@@ -16420,7 +16411,7 @@ mod tests {
         // Path: Initiate -> ConfirmWithdrawal -> InitiateBridging ->
         //   ReceiveAttestation -> ConfirmBridging -> InitiateDeposit ->
         //   ConfirmDeposit -> InitiatePostDepositConversion -> FailConversion.
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         store
@@ -16549,10 +16540,9 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(pool.clone(), ())),
+                >(pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    (),
                 )),
                 Arc::clone(&store),
             )
@@ -16611,7 +16601,7 @@ mod tests {
         // Drive an AlpacaToBase aggregate to BridgingFailed with burn_tx set
         // (post-burn). Path: Initiate{AtB} -> ConfirmWithdrawal ->
         // InitiateBridging -> FailBridging.
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         store
@@ -16700,10 +16690,9 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(pool.clone(), ())),
+                >(pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    (),
                 )),
                 Arc::clone(&store),
             )
@@ -16757,7 +16746,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000030");
 
         // Drive a BaseToAlpaca aggregate to BridgingFailed with burn_tx set.
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone()));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         seed_post_burn_bridging_failed(
@@ -16945,7 +16934,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_reasserts_guard_for_post_burn_bridging_failure() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000aa");
@@ -17003,7 +16992,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_reasserts_guard_for_bridging_submitting() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
@@ -17274,10 +17263,9 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(pool.clone(), ())),
+                >(pool.clone())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    (),
                 )),
                 store,
             )
@@ -17304,7 +17292,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_withdrawing_alpaca_to_base() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -17378,7 +17366,7 @@ mod tests {
     #[tokio::test]
     async fn recovered_conversion_complete_initiated_event_does_not_debit_snapshot_twice() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let requested = usdc(400);
         let received = usdc(390);
@@ -17459,7 +17447,7 @@ mod tests {
     #[tokio::test]
     async fn recovered_reservation_does_not_overwrite_conflicting_inventory_owner() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let recovered_id = UsdcRebalanceId(Uuid::new_v4());
         let active_id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
@@ -17500,7 +17488,7 @@ mod tests {
     #[tokio::test]
     async fn recovered_reservation_rejects_a_different_job_owner() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let recovered_id = UsdcRebalanceId(Uuid::new_v4());
         let different_id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -17526,7 +17514,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_rejects_multiple_alpaca_to_base_reservation_owners() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let first = UsdcRebalanceId(Uuid::new_v4());
         let second = UsdcRebalanceId(Uuid::new_v4());
 
@@ -17554,7 +17542,7 @@ mod tests {
     #[tokio::test]
     async fn recovered_reservation_settles_terminal_success_without_inflight_underflow() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let initiated = usdc(400);
         let received = usdc(398);
@@ -17617,7 +17605,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_withdrawal_complete_alpaca_to_base() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -17658,7 +17646,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_withdrawing_alpaca_to_base_with_live_job() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -17699,7 +17687,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_withdrawing_alpaca_to_base_with_queued_job() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -17747,7 +17735,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_withdrawing_alpaca_to_base_with_terminal_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -17799,7 +17787,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_withdrawing_alpaca_to_base_with_running_job() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(400);
 
@@ -17848,7 +17836,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_withdrawal_submitting_alpaca_to_base() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(300);
 
@@ -17881,7 +17869,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_alerts_on_stranded_withdrawal_submitting_alpaca_to_base() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(300);
 
@@ -17921,7 +17909,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_bridging_submitting_base_to_alpaca() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -18037,7 +18025,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_bridging_submitting_alpaca_to_base() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let withdrawal_tx =
             fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -18109,7 +18097,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_withdrawal_submitting() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(300);
 
@@ -18140,7 +18128,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_bridging_submitting_with_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -18176,7 +18164,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_bridging_submitting_with_failed_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
@@ -18220,7 +18208,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_alerts_on_bridging_submitting_with_exhausted_failed_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
@@ -18290,7 +18278,7 @@ mod tests {
     async fn recover_usdc_guard_alerts_on_bridging_submitting_alpaca_to_base_with_exhausted_failed_job_row()
      {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let withdrawal_tx =
             fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -18363,7 +18351,7 @@ mod tests {
     async fn recover_usdc_guard_does_not_rearm_or_alert_bridging_submitting_with_retryable_failed_job_row()
      {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
@@ -18423,7 +18411,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_alert_stranded_state_with_live_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc(300);
 
@@ -18642,7 +18630,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_stranded_awaiting_attestation() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
@@ -18686,7 +18674,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_skips_rearm_when_job_already_in_flight() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000ee");
@@ -18732,7 +18720,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_when_job_already_failed() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
@@ -18780,7 +18768,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_post_burn_bridging_failed() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000901");
@@ -18827,7 +18815,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_post_burn_bridging_failed_despite_terminal_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000902");
@@ -18880,7 +18868,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_skips_rearm_for_bridging_failed_when_failed_job_retryable() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000904");
@@ -18929,7 +18917,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_post_burn_bridging_failed_despite_done_job_row() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000905");
@@ -18976,7 +18964,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_skips_rearm_for_bridging_failed_when_in_flight() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000903");
@@ -19020,7 +19008,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_rearms_stranded_awaiting_attestation_alpaca_to_base() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
@@ -19065,7 +19053,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_leaves_guard_clear_for_pre_burn_failure() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let withdrawal =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
@@ -19115,7 +19103,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_holds_defensively_when_candidate_cannot_load() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         // Persist a guard-relevant event that cannot originate an aggregate (the
@@ -19157,7 +19145,7 @@ mod tests {
     #[tokio::test]
     async fn recover_usdc_guard_holds_defensively_when_candidate_id_is_unparseable() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
 
         // Persist a guard-relevant event whose aggregate_id is not a valid UUID --
         // a corrupt/partially-written durable row. The candidate query surfaces it
@@ -19589,7 +19577,7 @@ mod tests {
                     cash: None,
                 },
             },
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -19988,7 +19976,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: Address::ZERO,
                 owner: Address::ZERO,
@@ -20217,7 +20205,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -20286,7 +20274,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -20365,7 +20353,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -20428,7 +20416,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -23163,7 +23151,7 @@ mod tests {
         // Persist two positions through the real command path: AAPL gets a
         // pending offchain hedge order; TSLA only has an onchain fill.
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<Position>(pool.clone(), ());
+        let store = test_store::<Position>(pool.clone());
 
         store
             .send(
@@ -24030,7 +24018,7 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::new());
         let trigger = Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
@@ -24113,7 +24101,7 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::new());
         let trigger = Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool)),
             VaultRegistryId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,

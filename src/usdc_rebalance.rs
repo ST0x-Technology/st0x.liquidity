@@ -73,7 +73,6 @@
 //! [`AlpacaWalletService`]: st0x_execution::AlpacaWalletService
 
 use alloy::primitives::{B256, TxHash};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -83,7 +82,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Id, Usdc};
 
@@ -1716,13 +1715,12 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
     Ok(InterruptedUsdcRebalances { ids, unparseable })
 }
 
-#[async_trait]
 impl EventSourced for UsdcRebalance {
     type Id = UsdcRebalanceId;
     type Event = UsdcRebalanceEvent;
     type Command = UsdcRebalanceCommand;
     type Error = UsdcRebalanceError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
@@ -2366,9 +2364,9 @@ impl EventSourced for UsdcRebalance {
         Ok(Some(next))
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use UsdcRebalanceCommand::*;
         use UsdcRebalanceEvent::*;
@@ -2487,10 +2485,10 @@ impl EventSourced for UsdcRebalance {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use UsdcRebalanceCommand::*;
         match command {
@@ -3626,7 +3624,7 @@ mod tests {
     async fn test_initiate_alpaca_to_base() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -3658,7 +3656,7 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -3689,7 +3687,7 @@ mod tests {
     async fn test_cannot_initiate_twice() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -3746,7 +3744,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_withdrawal_from_uninitialized_records_intent_with_chain_head() {
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::BeginWithdrawal {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -3773,7 +3771,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_withdrawal_from_uninitialized_rejects_alpaca_to_base() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::BeginWithdrawal {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -3794,7 +3792,7 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000abc");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
@@ -3821,7 +3819,7 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000abc");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
@@ -3844,7 +3842,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_bridging_from_withdrawal_complete_records_intent_with_chain_head() {
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -3878,7 +3876,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000bad");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -3934,7 +3932,7 @@ mod tests {
             },
         ];
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(staged.clone())
             .when(UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
             .await
@@ -4015,7 +4013,7 @@ mod tests {
             },
         ];
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(staged.clone())
             .when(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: burn_tx_2 })
             .await
@@ -4052,7 +4050,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -4114,7 +4112,7 @@ mod tests {
             },
         ];
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(staged.clone())
             .when(UsdcRebalanceCommand::ClearPendingBurn)
             .await
@@ -4151,7 +4149,7 @@ mod tests {
     async fn clear_pending_burn_when_already_none_is_noop() {
         // On the FIRST burn there is no recorded hash yet, so `ClearPendingBurn`
         // must be a no-op that emits ZERO events rather than churning the stream.
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -4189,7 +4187,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -4229,7 +4227,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -4338,7 +4336,7 @@ mod tests {
     async fn begin_bridging_with_some_burn_amount_propagates_through_event_and_state() {
         let received = Usdc::new(float!(998.00));
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4493,7 +4491,7 @@ mod tests {
         let nominal = Usdc::new(float!(1000.00));
         let above = Usdc::new(float!(1000.01));
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4530,7 +4528,7 @@ mod tests {
         let nominal = Usdc::new(float!(1000.00));
         let zero = Usdc::new(float!(0));
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4564,7 +4562,7 @@ mod tests {
     async fn test_confirm_withdrawal() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -4586,7 +4584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_withdrawal_before_initiating() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ConfirmWithdrawal {
                 withdrawal_tx: None,
@@ -4604,7 +4602,7 @@ mod tests {
     async fn test_cannot_confirm_withdrawal_twice() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4633,7 +4631,7 @@ mod tests {
     async fn test_fail_withdrawal_after_initiation() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -4655,7 +4653,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_withdrawal_before_initiating() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::FailWithdrawal {
                 reason: "Test failure".to_string(),
@@ -4673,7 +4671,7 @@ mod tests {
     async fn test_cannot_fail_already_confirmed_withdrawal() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4702,7 +4700,7 @@ mod tests {
     async fn test_cannot_fail_already_failed_withdrawal() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4733,7 +4731,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4771,7 +4769,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let retry_deadline_at = Utc::now() + chrono::Duration::hours(24);
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4905,7 +4903,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateBridging {
                 burn_tx: burn_tx_hash,
@@ -4925,7 +4923,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -4950,7 +4948,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -4981,7 +4979,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5018,7 +5016,7 @@ mod tests {
         let attestation = vec![0x01, 0x02, 0x03, 0x04];
         let message = vec![0x05, 0x06, 0x07, 0x08];
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5425,7 +5423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_receive_attestation_before_bridging() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
@@ -5446,7 +5444,7 @@ mod tests {
     async fn test_cannot_receive_attestation_while_withdrawing() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -5472,7 +5470,7 @@ mod tests {
     async fn test_cannot_receive_attestation_after_withdrawal_complete() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5504,7 +5502,7 @@ mod tests {
     async fn test_cannot_receive_attestation_after_withdrawal_failed() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5538,7 +5536,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5585,7 +5583,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5637,7 +5635,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5672,7 +5670,7 @@ mod tests {
     async fn test_fail_bridging_from_withdrawal_complete() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5713,7 +5711,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5763,7 +5761,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5814,7 +5812,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = TEST_CCTP_NONCE;
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5866,7 +5864,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0xabababababababababababababababababababababababababababababababab");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5917,7 +5915,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -5971,7 +5969,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6019,7 +6017,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6065,7 +6063,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6125,7 +6123,7 @@ mod tests {
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let deposit_ref = TransferRef::OnchainTx(deposit_tx_hash);
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -6180,7 +6178,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6227,7 +6225,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6281,7 +6279,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6332,7 +6330,7 @@ mod tests {
         let mint_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -6398,7 +6396,7 @@ mod tests {
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let deposit_ref = TransferRef::OnchainTx(onchain_tx);
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6460,7 +6458,7 @@ mod tests {
         let deposit_tx =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6515,7 +6513,7 @@ mod tests {
             fixed_bytes!("0x5555555555555555555555555555555555555555555555555555555555555555");
         let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -6562,7 +6560,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_withdrawal_failed_rejects_confirm_withdrawal() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6592,7 +6590,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6620,7 +6618,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6665,7 +6663,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -6736,7 +6734,7 @@ mod tests {
             },
         ];
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(history.clone())
             .when(UsdcRebalanceCommand::RecoverBridging {
                 mint_tx,
@@ -6791,7 +6789,7 @@ mod tests {
 
         // A pre-burn BridgingFailed (no burn tx) has no mint to adopt; recovery
         // must be rejected -- the transfer should be re-initiated, not un-failed.
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -6834,7 +6832,7 @@ mod tests {
         // RecoverBridging is only valid from a post-burn BridgingFailed. From a
         // non-failed state (here mid-bridge, after the burn) it must be rejected
         // as an invalid command, never silently adopting a second mint.
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -7045,7 +7043,7 @@ mod tests {
                 other => panic!("fixture should end in a post-burn failure, got {other:?}"),
             };
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(history.clone())
             .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
                 reason: ReconcileReason::FundsMovedManually,
@@ -7106,7 +7104,7 @@ mod tests {
     async fn reconcile_stuck_rebalance_from_deposit_failed_emits_operator_reconciled() {
         let history = deposit_failed_history();
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(history.clone())
             .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
                 reason: ReconcileReason::FundsMovedManually,
@@ -7208,7 +7206,7 @@ mod tests {
     async fn reconcile_deposit_credited_offline_surfaces_in_dto() {
         let history = deposit_failed_history();
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(history.clone())
             .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
                 reason: ReconcileReason::DepositCreditedOffline,
@@ -7279,7 +7277,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -7328,7 +7326,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -7376,7 +7374,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_stuck_rebalance_rejected_from_initiated() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
@@ -7408,7 +7406,7 @@ mod tests {
             reconciled_at: Utc::now(),
         });
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(history)
             .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
                 reason: ReconcileReason::DepositCreditedOffline,
@@ -7431,7 +7429,7 @@ mod tests {
         // burned funds: the failure already reconciles to source, so reconcile
         // must reject it rather than zero source inflight without crediting
         // available (which would lose the never-burned funds).
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -7467,7 +7465,7 @@ mod tests {
         // AlpacaToBase ConversionFailed is the pre-withdrawal (pre-burn)
         // USD->USDC leg: no funds left the source, so reconcile must reject it.
         // It reconciles to source on its own via the normal failure path.
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7499,7 +7497,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7555,7 +7553,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7614,7 +7612,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7666,7 +7664,7 @@ mod tests {
     async fn test_initiate_conversion_from_uninitialized() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -7696,7 +7694,7 @@ mod tests {
     async fn test_cannot_initiate_conversion_twice() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -7722,7 +7720,7 @@ mod tests {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let conversion = par_conversion(Usdc::new(float!(998)));
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -7742,7 +7740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_conversion_before_initiating() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ConfirmConversion {
                 conversion: par_conversion(Usdc::new(float!(998))),
@@ -7760,7 +7758,7 @@ mod tests {
     async fn test_cannot_confirm_conversion_twice() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7790,7 +7788,7 @@ mod tests {
     async fn test_fail_conversion_from_converting_state() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -7812,7 +7810,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_conversion_before_initiating() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::FailConversion {
                 reason: "Test failure".to_string(),
@@ -7830,7 +7828,7 @@ mod tests {
     async fn test_cannot_fail_already_completed_conversion() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7862,7 +7860,7 @@ mod tests {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let received_amount = Usdc::new(float!(998));
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7894,7 +7892,7 @@ mod tests {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let received_amount = Usdc::new(float!(998));
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -7934,7 +7932,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8003,7 +8001,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -8056,7 +8054,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_post_deposit_conversion_before_deposit_confirmed() {
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -8078,7 +8076,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let error = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8143,7 +8141,7 @@ mod tests {
         let initiated_at = Utc::now() - chrono::Duration::hours(3);
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateConversionAt {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -8171,7 +8169,7 @@ mod tests {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let conversion = par_conversion(Usdc::new(float!(998)));
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
@@ -8204,7 +8202,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let initiated_at = Utc::now() - chrono::Duration::hours(1);
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8265,7 +8263,7 @@ mod tests {
     async fn begin_withdrawal_at_uses_supplied_timestamp() {
         let submitting_at = Utc::now() - chrono::Duration::hours(4);
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::BeginWithdrawalAt {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -8292,7 +8290,7 @@ mod tests {
         let initiated_at = Utc::now() - chrono::Duration::hours(5);
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
@@ -8324,7 +8322,7 @@ mod tests {
         let confirmed_at = Utc::now() - chrono::Duration::hours(6);
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
@@ -8354,7 +8352,7 @@ mod tests {
         let submitting_at = Utc::now() - chrono::Duration::hours(7);
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8393,7 +8391,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8428,7 +8426,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8475,7 +8473,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8528,7 +8526,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8585,7 +8583,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -8644,7 +8642,7 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -10052,7 +10050,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_usdc_rebalance_ids_excludes_clearable_terminals() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
         let amount = Usdc::new(float!(400.0));
 
         // Clearable terminal (withdrawal failed, pre-burn) -- must be excluded,
@@ -10204,7 +10202,7 @@ mod tests {
             fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(100.00)),
@@ -10245,7 +10243,7 @@ mod tests {
     async fn confirm_withdrawal_with_none_produces_withdrawal_complete_with_none_tx() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![UsdcRebalanceEvent::Initiated {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
@@ -10396,7 +10394,7 @@ mod tests {
     async fn begin_bridging_from_withdrawal_complete_alpaca_to_base_transitions_correctly() {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -10457,7 +10455,7 @@ mod tests {
             fixed_bytes!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let events = TestHarness::<UsdcRebalance>::with()
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
                     direction: RebalanceDirection::AlpacaToBase,
@@ -10747,7 +10745,7 @@ mod tests {
         // Apply the Initiate command; transition_initiate_withdrawal emits
         // Initiated { initiated_at: Utc::now() } at the withdrawal moment.
         let before_initiate = Utc::now();
-        let new_events = TestHarness::<UsdcRebalance>::with(())
+        let new_events = TestHarness::<UsdcRebalance>::with()
             .given(prior_events.clone())
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::AlpacaToBase,

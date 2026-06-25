@@ -139,8 +139,8 @@ mod tests {
         let vault_lookup =
             Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
 
-        let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool, ()));
+        let mint_store = Arc::new(test_store(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool));
 
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex,

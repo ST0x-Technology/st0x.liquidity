@@ -498,24 +498,24 @@ mod tests {
         Node: Provider + Clone,
     {
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(noop_order_placer())
+                .build()
                 .await
                 .unwrap();
 
         let (vault_registry, _vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 

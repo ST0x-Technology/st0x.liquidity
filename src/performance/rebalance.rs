@@ -44,7 +44,7 @@ use st0x_dto::{
     AttestationSample, RebalanceOperationTiming, RebalanceStageName, RebalanceStageStats,
     RebalanceStageTiming, RebalanceTimingStatus, RebalanceTimings, StageOutcome,
 };
-use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, deps};
+use st0x_event_sorcery::{EntityList, EventSourced, Reactor, deps};
 use st0x_finance::Usdc;
 
 use super::{PerformanceError, ReportRange, latency_stats};
@@ -445,8 +445,6 @@ impl Reactor for RebalanceTimingProjection {
             .await
     }
 }
-
-impl IdempotentReactor for RebalanceTimingProjection {}
 
 /// Accumulated per-operation timing state, persisted as JSON.
 ///
@@ -1156,7 +1154,7 @@ mod tests {
             .with(std::sync::Arc::new(RebalanceTimingProjection::new(
                 pool.clone(),
             )))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1258,7 +1256,7 @@ mod tests {
         let pool = setup_test_db().await;
         // No reactor registered: `send` persists events to the store but never
         // writes the read model, leaving it behind the log.
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
 
         let amount = Usdc::new(float!(400.0));
         let burn_tx =
@@ -1390,7 +1388,7 @@ mod tests {
             .with(std::sync::Arc::new(RebalanceTimingProjection::new(
                 pool.clone(),
             )))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1503,7 +1501,7 @@ mod tests {
             .with(std::sync::Arc::new(RebalanceTimingProjection::new(
                 pool.clone(),
             )))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1599,7 +1597,7 @@ mod tests {
         let pool = setup_test_db().await;
         // No reactor: events persist but the read model stays behind, exactly what
         // catch_up reconciles.
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
 
         let amount = Usdc::new(float!(400.0));
         let burn_tx =
@@ -1728,7 +1726,7 @@ mod tests {
     #[tokio::test]
     async fn catch_up_holds_checkpoint_behind_a_mid_stream_poison_event() {
         let pool = setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = test_store::<UsdcRebalance>(pool.clone());
 
         let amount = Usdc::new(float!(400.0));
         let burn_tx =

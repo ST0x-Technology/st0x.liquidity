@@ -1410,13 +1410,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1469,13 +1469,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1535,13 +1535,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1594,13 +1594,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1643,13 +1643,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1697,13 +1697,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             reserved,
@@ -1758,13 +1758,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             reserved,
@@ -1817,13 +1817,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1875,13 +1875,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1914,13 +1914,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -1988,13 +1988,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2037,13 +2037,13 @@ mod tests {
         let service = InventoryPollingService::new(
             create_test_raindex_service(provider),
             MockExecutor::new().with_inventory(inventory),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2094,13 +2094,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2144,13 +2144,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2185,7 +2185,7 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let store = test_store::<VaultRegistry>(pool.clone(), ());
+        let store = test_store::<VaultRegistry>(pool.clone());
         let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
@@ -2211,7 +2211,7 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let store = test_store::<VaultRegistry>(pool.clone(), ());
+        let store = test_store::<VaultRegistry>(pool.clone());
         let vault_registry_id = VaultRegistryId {
             orderbook,
             owner: order_owner,
@@ -2242,13 +2242,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2296,13 +2296,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2351,13 +2351,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2414,13 +2414,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: snapshot_owner,
             },
             vault_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2467,13 +2467,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2513,13 +2513,13 @@ mod tests {
         let service = InventoryPollingService::new(
             create_test_raindex_service(provider),
             MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2558,13 +2558,13 @@ mod tests {
         let service = InventoryPollingService::new(
             create_test_raindex_service(provider),
             MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool, ())),
+            Arc::new(test_store(pool)),
             None,
             None,
             Usd::ZERO,
@@ -2599,13 +2599,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2661,13 +2661,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2713,13 +2713,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2762,13 +2762,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2813,10 +2813,10 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             snapshot_id.clone(),
             snapshot_id.owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2857,10 +2857,10 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             snapshot_id.clone(),
             snapshot_id.owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -2901,13 +2901,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -2981,13 +2981,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
                 ..mock_wallet_polling_ctx(&server)
@@ -3030,13 +3030,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 ..mock_wallet_polling_ctx(&server)
@@ -3074,13 +3074,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -3116,13 +3116,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -3162,13 +3162,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
                 ..mock_wallet_polling_ctx(&server)
@@ -3202,13 +3202,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 ..mock_wallet_polling_ctx(&server)
@@ -3248,13 +3248,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
                 ..mock_wallet_polling_ctx(&server)
@@ -3305,13 +3305,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 unwrapped_equity_token_addresses: equity_tokens,
@@ -3359,13 +3359,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -3415,13 +3415,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 unwrapped_equity_token_addresses: equity_tokens,
@@ -3468,13 +3468,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 unwrapped_equity_token_addresses: equity_tokens,
@@ -3523,13 +3523,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
@@ -3596,13 +3596,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
@@ -3647,13 +3647,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -3703,13 +3703,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
@@ -3759,13 +3759,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             Some(WalletPollingCtx {
                 base: base_wallet,
                 wrapped_equity_token_addresses: wrapped_equity_tokens,
@@ -3807,13 +3807,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -3946,13 +3946,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -3999,13 +3999,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -4045,13 +4045,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             None,
             Usd::ZERO,
@@ -4085,13 +4085,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -4145,13 +4145,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -4212,13 +4212,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -4280,13 +4280,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,
@@ -4345,13 +4345,13 @@ mod tests {
         let service = InventoryPollingService::new(
             raindex_service,
             executor,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
             order_owner,
-            Arc::new(test_store(pool.clone(), ())),
+            Arc::new(test_store(pool.clone())),
             None,
             Some(tokenizer),
             Usd::ZERO,

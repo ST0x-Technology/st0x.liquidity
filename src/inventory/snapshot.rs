@@ -6,7 +6,6 @@
 
 use alloy::hex::FromHexError;
 use alloy::primitives::Address;
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,7 +15,7 @@ use thiserror::Error;
 
 use super::BroadcastingInventory;
 
-use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, Never, Nil};
+use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, JobQueue, Never, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
@@ -135,13 +134,12 @@ pub(crate) struct InventorySnapshot {
     pub(crate) last_updated: DateTime<Utc>,
 }
 
-#[async_trait]
 impl EventSourced for InventorySnapshot {
     type Id = InventorySnapshotId;
     type Event = InventorySnapshotEvent;
     type Command = InventorySnapshotCommand;
     type Error = Never;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
@@ -184,9 +182,9 @@ impl EventSourced for InventorySnapshot {
         Ok(Some(snapshot))
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use InventorySnapshotCommand::*;
         let now = Utc::now();
@@ -286,10 +284,10 @@ impl EventSourced for InventorySnapshot {
         }])
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use InventorySnapshotCommand::*;
         let now = Utc::now();
@@ -1031,7 +1029,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OnchainEquity {
                 balances: balances.clone(),
@@ -1056,7 +1054,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
@@ -1083,7 +1081,7 @@ mod tests {
     async fn record_onchain_usdc_emits_event() {
         let usdc_balance = Usdc::from_str("10000.50").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OnchainUsdc { usdc_balance })
             .await
@@ -1106,7 +1104,7 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert(test_symbol("AAPL"), test_shares(75));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OffchainEquity {
                 positions: positions.clone(),
@@ -1130,7 +1128,7 @@ mod tests {
     async fn record_offchain_usd_emits_event() {
         let usd_balance_cents = 50_000_000; // $500,000.00
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OffchainUsd {
                 usd_balance_cents,
@@ -1155,7 +1153,7 @@ mod tests {
     async fn offchain_cash_buying_power_skips_unchanged_value() {
         let cash_buying_power_cents = Some(3_000_000);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::OffchainCashBuyingPower {
                 cash_buying_power_cents,
                 fetched_at: Utc::now(),
@@ -1218,7 +1216,7 @@ mod tests {
         ];
 
         for (given, command) in cases {
-            let events = TestHarness::<InventorySnapshot>::with(())
+            let events = TestHarness::<InventorySnapshot>::with()
                 .given(given)
                 .when(command)
                 .await
@@ -1234,7 +1232,7 @@ mod tests {
         let previous_observed_at = Utc::now();
         let observed_at = previous_observed_at + chrono::Duration::seconds(1);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::SourceObserved {
                 source,
                 observed_at: previous_observed_at,
@@ -1262,7 +1260,7 @@ mod tests {
         let alpaca_usdc = Usdc::from_str("125").unwrap();
         let observed_at = Utc::now();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::RecordOffchainObservation {
                 positions: positions.clone(),
@@ -1342,7 +1340,7 @@ mod tests {
             },
         ];
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(previous_events)
             .when(InventorySnapshotCommand::RecordOffchainObservation {
                 positions,
@@ -1371,7 +1369,7 @@ mod tests {
         let observed_at = Utc::now();
         let stale_observed_at = observed_at - chrono::Duration::seconds(1);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::SourceObserved {
                 source,
                 observed_at,
@@ -1464,7 +1462,7 @@ mod tests {
     async fn ethereum_usdc_command_initializes_aggregate() {
         let usdc_balance = Usdc::from_str("5000.50").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::EthereumUsdc { usdc_balance })
             .await
@@ -1486,7 +1484,7 @@ mod tests {
     async fn ethereum_usdc_command_emits_event_on_existing_aggregate() {
         let usdc_balance = Usdc::from_str("2500").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
@@ -1511,7 +1509,7 @@ mod tests {
     async fn ethereum_usdc_command_skips_event_when_unchanged() {
         let usdc_balance = Usdc::from_str("5000").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance,
                 fetched_at: Utc::now(),
@@ -1544,7 +1542,7 @@ mod tests {
     async fn base_wallet_usdc_initializes_on_first_command() {
         let usdc_balance = Usdc::from_str("500").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::BaseWalletUsdc { usdc_balance })
             .await
@@ -1566,7 +1564,7 @@ mod tests {
         let old_balance = Usdc::from_str("500").unwrap();
         let new_balance = Usdc::from_str("750").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletUsdc {
                 usdc_balance: old_balance,
                 fetched_at: Utc::now(),
@@ -1592,7 +1590,7 @@ mod tests {
     async fn base_wallet_usdc_skips_when_unchanged() {
         let balance = Usdc::from_str("500").unwrap();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletUsdc {
                 usdc_balance: balance,
                 fetched_at: Utc::now(),
@@ -1625,7 +1623,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity {
                 balances: balances.clone(),
@@ -1655,7 +1653,7 @@ mod tests {
         let mut new_balances = BTreeMap::new();
         new_balances.insert(test_symbol("AAPL"), test_shares(750));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
                 balances: old_balances,
                 fetched_at: Utc::now(),
@@ -1685,7 +1683,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
@@ -1718,7 +1716,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
                 balances: balances.clone(),
@@ -1748,7 +1746,7 @@ mod tests {
         let mut new_balances = BTreeMap::new();
         new_balances.insert(test_symbol("AAPL"), test_shares(750));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
                 balances: old_balances,
                 fetched_at: Utc::now(),
@@ -1778,7 +1776,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(500));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
@@ -1798,7 +1796,7 @@ mod tests {
         let mut new_balances = BTreeMap::new();
         new_balances.insert(test_symbol("AAPL"), test_shares(0));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
                 balances: old_balances,
                 fetched_at: Utc::now(),
@@ -1847,7 +1845,7 @@ mod tests {
         let mut redemptions = BTreeMap::new();
         redemptions.insert(test_symbol("TSLA"), test_shares(5));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: mints.clone(),
@@ -1880,7 +1878,7 @@ mod tests {
 
         let mints = BTreeMap::new();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: mints.clone(),
                 redemptions: initial_redemptions,
@@ -1911,7 +1909,7 @@ mod tests {
         mints.insert(test_symbol("AAPL"), test_shares(10));
         let fetched_at = Utc::now();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
@@ -1938,7 +1936,7 @@ mod tests {
         let first_fetched_at = Utc::now();
         let second_fetched_at = first_fetched_at + chrono::Duration::seconds(30);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
@@ -1964,7 +1962,7 @@ mod tests {
         let first_fetched_at = Utc::now();
         let second_fetched_at = first_fetched_at + chrono::Duration::seconds(30);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
@@ -1991,7 +1989,7 @@ mod tests {
         let current_fetched_at = Utc::now();
         let stale_fetched_at = current_fetched_at - chrono::Duration::seconds(30);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
@@ -2022,7 +2020,7 @@ mod tests {
         let current_fetched_at = Utc::now();
         let stale_fetched_at = current_fetched_at - chrono::Duration::seconds(30);
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: initial_mints,
                 redemptions: BTreeMap::new(),
@@ -2057,7 +2055,7 @@ mod tests {
         let mut updated_mints = BTreeMap::new();
         updated_mints.insert(test_symbol("AAPL"), test_shares(5));
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: initial_mints,
                 redemptions: BTreeMap::new(),
@@ -2105,7 +2103,7 @@ mod tests {
     async fn initialize_inflight_equity_preserves_fetched_at() {
         let fetched_at = Utc::now();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given_no_previous_events()
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: BTreeMap::new(),
@@ -2134,7 +2132,7 @@ mod tests {
 
         let fetched_at = Utc::now();
 
-        let events = TestHarness::<InventorySnapshot>::with(())
+        let events = TestHarness::<InventorySnapshot>::with()
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),

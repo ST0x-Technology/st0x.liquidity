@@ -24,8 +24,8 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::conductor::{clamp_shares_to_reservation, recover_orphaned_pending_offchain_orders};
 use crate::equity_redemption::symbols_with_active_transfers;
 use crate::offchain::order::{
-    CancellationReason, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
-    PollOrderStatusJobQueue, TerminalPositionFinalization, position_command_for_finalization,
+    CancellationReason, OffchainOrder, OffchainOrderId, OrderPlacer, PollOrderStatusJobQueue,
+    TerminalPositionFinalization, cancel_offchain_order, position_command_for_finalization,
     recover_submitted_offchain_orders, terminal_position_finalization,
 };
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
@@ -464,15 +464,13 @@ where
                 }
             }
 
-            if let Err(error) = self
-                .offchain_order
-                .send(
-                    &offchain_order_id,
-                    OffchainOrderCommand::CancelOrder {
-                        reason: CancellationReason::MarketOpenReplacement,
-                    },
-                )
-                .await
+            if let Err(error) = cancel_offchain_order(
+                &self.offchain_order,
+                self.order_placer.as_ref(),
+                &offchain_order_id,
+                CancellationReason::MarketOpenReplacement,
+            )
+            .await
             {
                 warn!(%symbol, %offchain_order_id, %error, "Failed to request cancellation of extended-hours order; will retry next tick");
             }
@@ -639,7 +637,7 @@ mod tests {
         Arc<st0x_event_sorcery::Store<Position>>,
     ) {
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -648,7 +646,7 @@ mod tests {
         );
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer.clone())
+                .build()
                 .await
                 .unwrap();
 
@@ -857,7 +855,7 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -876,7 +874,7 @@ mod tests {
         );
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer.clone())
+                .build()
                 .await
                 .unwrap();
 

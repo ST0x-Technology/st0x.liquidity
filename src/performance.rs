@@ -33,8 +33,6 @@
 #[cfg(any(test, feature = "test-support"))]
 use alloy::primitives::TxHash;
 #[cfg(any(test, feature = "test-support"))]
-use async_trait::async_trait;
-#[cfg(any(test, feature = "test-support"))]
 use chrono::Duration;
 use chrono::{DateTime, Utc};
 #[cfg(any(test, feature = "test-support"))]
@@ -47,12 +45,12 @@ use tracing::warn;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
-use st0x_event_sorcery::{RetryOnBusy, StoreBuilder};
+use st0x_event_sorcery::StoreBuilder;
 use st0x_execution::Symbol;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::{
-    CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares, LimitOrder,
-    MarketOrder, MarketSession, Positive, SupportedExecutor,
+    ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketSession, Positive,
+    SupportedExecutor,
 };
 #[cfg(any(test, feature = "test-support"))]
 use st0x_finance::Usd;
@@ -62,7 +60,6 @@ use st0x_float_macro::float;
 #[cfg(any(test, feature = "test-support"))]
 use crate::offchain::order::{
     CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
-    OrderPlacementResult, OrderPlacer,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -84,40 +81,6 @@ pub(crate) use projection::HedgeLatencyProjection;
 pub(crate) use report::{
     PerformanceError, ReportRange, hedge_latency_report, load_hedge_performance,
 };
-
-/// Minimal [`OrderPlacer`] for [`seed_simulated_hedge_latency_history`]'s
-/// temporary `Store<OffchainOrder>`. The fixture drives the aggregate
-/// directly via `Store::send` (never through
-/// `crate::offchain::order::place_offchain_order_at_broker`), so none of
-/// these methods are ever actually invoked -- they exist only to satisfy
-/// `OffchainOrder::Services`.
-#[cfg(any(test, feature = "test-support"))]
-struct FixtureOrderPlacer;
-
-#[cfg(any(test, feature = "test-support"))]
-#[async_trait]
-impl OrderPlacer for FixtureOrderPlacer {
-    async fn place_market_order(
-        &self,
-        _order: MarketOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("FixtureOrderPlacer never places live orders".into())
-    }
-
-    async fn place_limit_order(
-        &self,
-        _order: LimitOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("FixtureOrderPlacer never places live orders".into())
-    }
-
-    async fn cancel_order(
-        &self,
-        _executor_order_id: &ExecutorOrderId,
-    ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        Err("FixtureOrderPlacer never cancels orders".into())
-    }
-}
 
 /// Seeds deterministic hedge history for local dashboard simulation.
 ///
@@ -168,23 +131,18 @@ pub async fn seed_simulated_hedge_latency_history(
     sqlx::migrate!().set_ignore_missing(true).run(pool).await?;
 
     let (position, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-        .with(Arc::new(RetryOnBusy {
-            inner: HedgeLatencyProjection::new(pool.clone()),
-        }))
-        .build(())
+        .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+        .build()
         .await?;
 
-    let order_placer: Arc<dyn OrderPlacer> = Arc::new(FixtureOrderPlacer);
     let (offchain_order, _offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .with(Arc::new(RetryOnBusy {
-                inner: HedgeLatencyProjection::new(pool.clone()),
-            }))
-            .build(order_placer)
+            .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+            .build()
             .await?;
 
     let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     // The dashboard's rolling window queries with `to = now()`, which keeps
