@@ -1065,7 +1065,7 @@
       <details class="mb-3 rounded-xl border bg-card/40 p-3 text-sm">
         <summary class="cursor-pointer select-none font-semibold">Docs</summary>
         <div class="mt-3 space-y-4 text-xs leading-5 text-muted-foreground">
-          <div class="grid gap-3 lg:grid-cols-3">
+          <div class="grid gap-3 lg:grid-cols-4">
             <div class="rounded-lg border bg-background/50 p-3">
               <div class="font-semibold text-foreground">Scope</div>
               <p class="mt-2">
@@ -1081,6 +1081,14 @@
                 Net realized PnL deducts explicit tracked costs and adds tracked revenues. Costs or
                 revenues without a symbol are included at the account level and are not artificially
                 allocated into individual asset rows.
+              </p>
+            </div>
+            <div class="rounded-lg border bg-background/50 p-3">
+              <div class="font-semibold text-foreground">Current Exposure</div>
+              <p class="mt-2">
+                Open inventory and unmatched offchain-origin exposure are current replay state from
+                all loaded fills. They are not reconstructed as-of snapshots for the selected
+                historical date range.
               </p>
             </div>
             <div class="rounded-lg border bg-background/50 p-3">
