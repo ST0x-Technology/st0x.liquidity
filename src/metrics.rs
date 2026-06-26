@@ -1,12 +1,16 @@
 //! Prometheus metrics export for the st0x-hedge service.
-//!
-//! Call [`setup`] once at startup before any `counter!`/`gauge!`/`histogram!`
-//! invocations. The returned [`PrometheusHandle`] is managed by Rocket so the
-//! `/metrics` endpoint can render the current state on demand.
+
+use std::sync::OnceLock;
 
 use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 
+static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
 pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
+    if let Some(handle) = HANDLE.get() {
+        return Ok(handle.clone());
+    }
+
     let handle = PrometheusBuilder::new().install_recorder()?;
 
     metrics::describe_counter!(
@@ -31,6 +35,7 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Broker API errors, by symbol and kind"
     );
 
+    let _ = HANDLE.set(handle.clone());
     Ok(handle)
 }
 

@@ -164,8 +164,8 @@ impl TelemetryCtx {
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
 
         let fmt_layer = tracing_subscriber::fmt::layer().with_filter(mk_env_filter(log_level));
-        let telemetry_layer = telemetry_layer.with_filter(mk_telemetry_filter(log_level));
-        let otel_log_layer = otel_log_layer.with_filter(mk_telemetry_filter(log_level));
+        let telemetry_layer = telemetry_layer.with_filter(mk_crate_filter(log_level));
+        let otel_log_layer = otel_log_layer.with_filter(mk_crate_filter(log_level));
 
         let file_guard = if let Some(dir) = log_dir {
             let file_appender = tracing_appender::rolling::daily(dir, "st0x-hedge.log");
@@ -301,10 +301,6 @@ pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {
     let fallback_filter = mk_crate_filter(level);
 
     EnvFilter::try_from_default_env().unwrap_or(fallback_filter)
-}
-
-fn mk_telemetry_filter(level: tracing::Level) -> EnvFilter {
-    mk_crate_filter(level)
 }
 
 fn mk_crate_filter(level: tracing::Level) -> EnvFilter {

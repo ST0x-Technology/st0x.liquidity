@@ -55,9 +55,13 @@ impl std::fmt::Debug for Position {
     }
 }
 
+// Called from evolve(), so it runs on both live events and event-store replay.
+// Safe for a gauge (set is idempotent); after replay the value correctly
+// reflects the current position.
 fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
-    if let Ok(value) = net.to_string().parse::<f64>() {
-        gauge!("position_shares", "symbol" => symbol.to_string()).set(value);
+    match net.to_string().parse::<f64>() {
+        Ok(value) => gauge!("position_shares", "symbol" => symbol.to_string()).set(value),
+        Err(err) => warn!(%symbol, %err, "position_shares gauge skipped: could not parse net position as f64"),
     }
 }
 
