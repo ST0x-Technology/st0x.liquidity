@@ -943,13 +943,17 @@ fn stuck_mint_info(rows: &[(String, String, i64)]) -> Option<StuckTransferInfo> 
                 ));
             }
 
-            // Neither strands equity: a rejected mint never left the issuer,
-            // and a deposited mint completed successfully.
-            MintRejected { .. } | DepositedIntoRaindex { .. } => return None,
-
-            // Recovery un-failed the mint and put it back on the success path,
-            // so any stuck state observed before it no longer applies; the
-            // mint is re-derived from subsequent events (it may fail again).
+            // Terminal "not stuck" states with no further events to scan: a
+            // rejected mint never left the issuer, a deposited mint completed
+            // successfully, and an operator-reconciled mint was resolved
+            // out-of-band (drives to the `Reconciled` terminal).
+            MintRejected { .. } | DepositedIntoRaindex { .. } | OperatorReconciled { .. } => {
+                return None;
+            }
+            // ProviderCompletionRecovered un-failed the mint and put it back on
+            // the success path, so any stuck state observed before it no longer
+            // applies; the mint is re-derived from subsequent events (it may fail
+            // again), hence a soft reset rather than an early return.
             ProviderCompletionRecovered { .. } => terminal = None,
             MintAcceptanceFailed { .. }
             | TokensReceived { .. }
@@ -1032,8 +1036,11 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
             }
 
             // A terminal success (including recovery, which evolves straight to
-            // Completed) means nothing is stranded.
-            TransferFailed { .. } | Completed { .. } | ProviderCompletionRecovered { .. } => {
+            // Completed) or an operator reconciliation means nothing is stranded.
+            TransferFailed { .. }
+            | Completed { .. }
+            | ProviderCompletionRecovered { .. }
+            | OperatorReconciled { .. } => {
                 return None;
             }
 
@@ -1856,6 +1863,68 @@ mod tests {
         assert!(
             stuck_transfer_info(TransferKind::EquityRedemption, &rows).is_none(),
             "a recovered redemption must not be reported as stranded"
+        );
+    }
+
+    #[test]
+    fn stuck_mint_info_cleared_after_operator_reconciled() {
+        let rows = vec![
+            event_row(
+                "TokenizedEquityMintEvent::MintRequested",
+                r#"{"MintRequested":{"symbol":"AAPL","quantity":"12.5","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::MintAccepted",
+                r#"{"MintAccepted":{"issuer_request_id":"mint-1","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+                1,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::MintAcceptanceFailed",
+                r#"{"MintAcceptanceFailed":{"reason":"timeout","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                2,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::OperatorReconciled",
+                r#"{"OperatorReconciled":{"reason":"wrapped manually via wrap-equity","reconciled_at":"2026-01-01T00:02:00Z"}}"#,
+                3,
+            ),
+        ];
+
+        assert!(
+            stuck_transfer_info(TransferKind::EquityMint, &rows).is_none(),
+            "an operator-reconciled mint must not be reported as stranded"
+        );
+    }
+
+    #[test]
+    fn stuck_redemption_info_cleared_after_operator_reconciled() {
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::VaultWithdrawPending",
+                r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensSent",
+                r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000003","redemption_tx":"0x2222222222222222222222222222222222222222222222222222222222222222","sent_at":"2026-01-01T00:00:02Z"}}"#,
+                1,
+            ),
+            event_row(
+                "EquityRedemptionEvent::RedemptionRejected",
+                r#"{"RedemptionRejected":{"reason":"rejected","rejected_at":"2026-01-01T00:01:00Z"}}"#,
+                2,
+            ),
+            event_row(
+                "EquityRedemptionEvent::OperatorReconciled",
+                r#"{"OperatorReconciled":{"reason":"deposited manually via vault-deposit","reconciled_at":"2026-01-01T00:02:00Z"}}"#,
+                3,
+            ),
+        ];
+
+        assert!(
+            stuck_transfer_info(TransferKind::EquityRedemption, &rows).is_none(),
+            "an operator-reconciled redemption must not be reported as stranded"
         );
     }
 

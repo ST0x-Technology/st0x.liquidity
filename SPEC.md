@@ -2987,6 +2987,27 @@ pre-burn failure already reconciles to source on its own. Because `Reconciled`
 is a clearable terminal, a restart does not re-latch the guard, and automatic
 USDC rebalancing resumes.
 
+Reconcile also applies to the equity transfer aggregates (`TokenizedEquityMint`,
+`EquityRedemption`): a mint or redemption stuck in its `Failed` terminal whose
+residue was handled out-of-band (e.g. via `wrap-equity` / `vault-deposit`) is
+declared resolved by sending the `Reconcile { reason }` command, which emits
+`OperatorReconciled` and drives the aggregate to a terminal `Reconciled` state.
+Unlike USDC, the equity aggregates hold no in-progress guard, so the `Reconcile`
+command emits **no reactor effect and dispatches no inventory update** -- it is
+a pure bookkeeping terminal transition. One nuance for redemptions: a redemption
+that ended in `DetectionFailed` / `RedemptionRejected` has its stranded exposure
+seeded into live inflight at startup (see `symbols_with_stuck_redemptions`).
+Reconcile moves the latest event to `OperatorReconciled`, so that redemption is
+no longer seeded as stuck on the **next** restart; the running process's live
+inflight retains the startup-seeded amount until then. Mint failures and
+pre-send redemption failures settle inventory at failure time, so they need no
+such clearing. `Reconciled` is valid ONLY from `Failed`; every other state is
+rejected. The `Reconciled` state retains the identifying fields (symbol,
+quantity, original failure reason, request/redemption identifiers) so the
+dashboard projection still reports the real transfer, and maps to the existing
+terminal `Completed` DTO status (no new status). The CLI surface is
+`transfer reconcile --kind mint|redemption` (alongside `--kind usdc`).
+
 The operator-facing verb vocabulary that this command and the rest of the
 recovery CLI follow is defined in the "Operator Recovery Surface" section below.
 
@@ -3068,10 +3089,14 @@ named exemptions defined after the list:**
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
-  out-of-band, releasing its guard and inflight accounting. Applies once funds
-  have left the source venue, whether stuck in transit or failed after arrival
-  (the terminal state strands a guard); pre-departure failures strand nothing
-  and need no reconcile; `--reason` required.
+  out-of-band. For the USDC realization this releases the guard and inflight
+  accounting the failed state stranded; it applies once funds have left the
+  source venue, whether stuck in transit or failed after arrival, while a
+  pre-departure failure strands nothing and needs no reconcile. For the equity
+  realization (`mint`/`redemption`) the `Failed` state holds no guard or
+  surviving inflight, so reconcile is a pure bookkeeping terminal transition
+  declaring the residue -- already handled out-of-band -- resolved; `--reason`
+  required.
 - `set` -- overwrite aggregate-derived state to an operator-asserted value, with
   a mandatory audit reason.
 - `rebuild` -- recompute a projection from the event log; emits no events.
@@ -3117,8 +3142,10 @@ effect rather than a generic intent:
   no-silent-defaults rule. Earlier transitional steps carried defaulted reasons
   on now-removed legacy command names; with those names deleted, every grouped
   destructive verb requires an explicit `--reason`, and a present-but-blank
-  value is rejected (at parse time for the string-valued verbs, by the enum
-  domain for `reconcile`).
+  value is rejected at parse time. `reconcile --kind usdc` additionally
+  constrains its reason to a fixed vocabulary (`funds-moved-manually` /
+  `deposit-credited-offline`); `mint`/`redemption` reconcile reasons are free
+  text.
 - **`fail` and `reconcile` are distinct and must not be conflated.** `fail` is
   for an operation the system is still waiting on (force it to a clean
   terminal); `reconcile` is for an operation that already failed and whose guard
