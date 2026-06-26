@@ -370,6 +370,12 @@ pub enum CctpError {
     /// rather than a true absence. Retryable -- the caller must NOT re-burn on it.
     #[error("burn scan inconclusive: node not caught up past block {from_block}")]
     ScanInconclusive { from_block: u64 },
+    /// A durably-recorded burn tx is still pending: no receipt yet, but the tx
+    /// is still visible via `get_transaction_by_hash` (broadcast but unmined). A
+    /// crash/timeout resume returns this so the caller delayed-redrives and
+    /// never re-burns a tx that may still land. Retryable -- not a revert.
+    #[error("recorded burn tx {burn_tx} still pending: broadcast but not yet mined")]
+    BurnTxPending { burn_tx: TxHash },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -432,9 +438,9 @@ impl CctpError {
     /// to a transport failure or other non-revert EVM error).
     ///
     /// Revert classification is an intentional, supported part of `CctpError`'s
-    /// public contract: the main crate's burn paths (`burn_on_base` /
-    /// `burn_on_ethereum`) call it to distinguish a redrivable revert-class burn
-    /// failure from a terminal one.
+    /// public contract: a two-phase burn consumer that records the returned burn
+    /// tx before confirmation calls it to distinguish a redrivable revert-class
+    /// burn failure from a terminal one.
     ///
     /// Used by `burn_internal` to gate the allowance-check retry: only reverts
     /// can be allowance-related; transport errors and other non-revert errors
@@ -468,6 +474,7 @@ impl CctpError {
             Self::RpcTransport(_)
             | Self::SolType(_)
             | Self::ScanInconclusive { .. }
+            | Self::BurnTxPending { .. }
             | Self::Http(_)
             | Self::AttestationTimeout { .. }
             | Self::MalformedAttestation { .. }
@@ -603,6 +610,21 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         #[cfg(not(any(test, feature = "test-support")))]
         Self::new(ethereum, base)
+    }
+
+    /// Applies the zero-grace, single-miss fast drop policy to both endpoints'
+    /// `burn_status`. Test-only seam: lets downstream consumers' resume tests
+    /// classify an absent recorded burn tx as `Dropped` immediately rather than
+    /// waiting out the production 30 s grace window, without exposing
+    /// `BurnDropConfig` across the crate boundary.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_fast_burn_drop_policy(mut self) -> Self {
+        self.ethereum = self
+            .ethereum
+            .with_burn_drop_config(evm::BurnDropConfig::fast());
+        self.base = self.base.with_burn_drop_config(evm::BurnDropConfig::fast());
+        self
     }
 
     fn new(
@@ -1086,6 +1108,69 @@ where
             .await
     }
 
+    /// Broadcasts the burn and returns its tx hash without awaiting the receipt.
+    /// Re-runs `ensure_standing_allowance` and re-queries the Circle fast-transfer
+    /// fee on every call (matching `burn_internal`'s cold-path ordering), so a
+    /// caller's one-shot retry re-broadcasts with a fresh allowance and fee.
+    async fn submit_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<TxHash, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.ethereum
+                    .submit_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.base
+                    .submit_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+        }
+    }
+
+    async fn confirm_burn(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+        amount: U256,
+    ) -> Result<crate::BurnReceipt, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .confirm_burn::<OpenChainErrorRegistry>(tx_hash, amount)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .confirm_burn::<OpenChainErrorRegistry>(tx_hash, amount)
+                    .await
+            }
+        }
+    }
+
+    async fn burn_status(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<crate::BurnTxStatus, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.burn_status(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.burn_status(tx_hash).await,
+        }
+    }
+
     async fn poll_attestation(
         &self,
         direction: BridgeDirection,
@@ -1279,6 +1364,18 @@ mod tests {
     #[test]
     fn is_revert_false_for_scan_inconclusive() {
         assert!(!CctpError::ScanInconclusive { from_block: 0 }.is_revert());
+    }
+
+    /// `BurnTxPending` is not revert-class: a still-pending recorded burn is a
+    /// retryable settlement-wait, never an on-chain revert.
+    #[test]
+    fn is_revert_false_for_burn_tx_pending() {
+        assert!(
+            !CctpError::BurnTxPending {
+                burn_tx: TxHash::ZERO
+            }
+            .is_revert()
+        );
     }
 
     /// `PlaceholderNonce` is not revert-class.
@@ -4349,6 +4446,257 @@ mod tests {
         assert_eq!(
             confs_after_2, 3,
             "tx has 3 confirmations after 2 blocks mined (inclusion block + 2)"
+        );
+    }
+
+    /// The two-phase burn split (`submit_burn` -> `confirm_burn`) completes a real
+    /// CCTP burn: `submit_burn` returns the broadcast tx hash WITHOUT awaiting the
+    /// receipt, and `confirm_burn` then awaits it and returns a `BurnReceipt`
+    /// carrying that tx and the burned amount.
+    #[tokio::test]
+    async fn submit_burn_returns_hash_then_confirm_burn_validates_receipt() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_000_000u64); // 1 USDC
+
+        let burn_tx =
+            Bridge::submit_burn(&bridge, BridgeDirection::EthereumToBase, amount, recipient)
+                .await
+                .unwrap();
+
+        assert!(
+            !burn_tx.is_zero(),
+            "submit_burn must return the broadcast burn tx hash"
+        );
+
+        let burn_receipt =
+            Bridge::confirm_burn(&bridge, BridgeDirection::EthereumToBase, burn_tx, amount)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            burn_receipt.tx, burn_tx,
+            "confirm_burn must return the same tx hash submit_burn broadcast"
+        );
+        assert_eq!(
+            burn_receipt.amount, amount,
+            "confirm_burn must carry the burned input amount through onto the receipt"
+        );
+    }
+
+    /// `confirm_burn` returns `MessageSentEventNotFound` when the burn receipt
+    /// mines successfully but emits no `MessageSent` event (the post-commit error
+    /// class). Uses a STOP-only TokenMessenger so the tx succeeds (status = 1) with
+    /// no logs.
+    #[tokio::test]
+    async fn confirm_burn_returns_message_sent_event_not_found_when_log_absent() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let no_wallet_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        no_wallet_provider
+            .anvil_set_code(TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        let fee_server = MockServer::start();
+        fee_server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(fee_server.base_url());
+
+        let recipient = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+        let amount = U256::from(1_000u64);
+
+        let burn_tx =
+            Bridge::submit_burn(&bridge, BridgeDirection::EthereumToBase, amount, recipient)
+                .await
+                .unwrap();
+
+        let error = Bridge::confirm_burn(&bridge, BridgeDirection::EthereumToBase, burn_tx, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::MessageSentEventNotFound { .. }),
+            "confirm_burn must return MessageSentEventNotFound when the receipt has \
+             no MessageSent event; got: {error:?}"
+        );
+    }
+
+    /// `burn_status` maps a mined-success and a mined-revert receipt to the right
+    /// variants, regardless of the drop policy (a present receipt short-circuits).
+    #[tokio::test]
+    async fn burn_status_maps_mined_receipts_to_success_and_revert() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        // STOP contract: a tx to it mines successfully (status = 1).
+        let stop_addr = address!("0x00000000000000000000000000000000000000aa");
+        provider
+            .anvil_set_code(stop_addr, alloy::primitives::Bytes::from(vec![0x00u8]))
+            .await
+            .unwrap();
+        let success_receipt = provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(stop_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(success_receipt.status(), "STOP tx must mine successfully");
+
+        // REVERT contract (PUSH1 0, PUSH1 0, REVERT): explicit gas skips estimation
+        // so the reverting tx is broadcast and mines with status = 0.
+        let revert_addr = address!("0x00000000000000000000000000000000000000bb");
+        provider
+            .anvil_set_code(
+                revert_addr,
+                alloy::primitives::Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+            )
+            .await
+            .unwrap();
+        let reverted_receipt = provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(revert_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(!reverted_receipt.status(), "REVERT tx must mine reverted");
+
+        assert_eq!(
+            bridge
+                .ethereum
+                .burn_status(success_receipt.transaction_hash)
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::MinedSuccess
+        );
+        assert_eq!(
+            bridge
+                .ethereum
+                .burn_status(reverted_receipt.transaction_hash)
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::MinedReverted
+        );
+    }
+
+    /// The CRITICAL case for double-burn safety: a tx with no receipt that is
+    /// still visible in the mempool classifies as `Pending`, NEVER `Dropped`, so
+    /// the caller never re-burns a still-pending burn. Uses `--no-mining` anvil so
+    /// the tx is accepted into the mempool but never mined.
+    #[tokio::test]
+    async fn burn_status_reports_pending_for_mempool_visible_tx() {
+        let anvil = Anvil::new().arg("--no-mining").spawn();
+        let endpoint = anvil.endpoint();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        // Submitted to the mempool but never mined (no auto-mining): the receipt
+        // is absent while get_transaction_by_hash returns the pending tx.
+        let pending = provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(address!("0x00000000000000000000000000000000000000cc").into()),
+                value: Some(U256::from(1u64)),
+                gas: Some(21_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pending_tx = *pending.tx_hash();
+
+        // Even with a zero-grace, single-miss config (which would conclude Dropped
+        // for a truly-absent tx), a mempool-visible tx must be Pending.
+        let status = bridge
+            .ethereum
+            .burn_status_with_config(pending_tx, super::evm::BurnDropConfig::fast())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::BurnTxStatus::Pending,
+            "a mempool-visible (still-pending) burn must classify as Pending, never Dropped"
+        );
+    }
+
+    /// A tx absent from both the receipt lookup and the mempool, observed past the
+    /// grace window and the consecutive-miss threshold, classifies as `Dropped`
+    /// so the caller can fail closed and require operator verification. Uses a
+    /// zero grace + single miss to keep the test fast.
+    #[tokio::test]
+    async fn burn_status_reports_dropped_for_absent_tx_past_grace() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        let unknown_tx =
+            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let status = bridge
+            .ethereum
+            .burn_status_with_config(unknown_tx, super::evm::BurnDropConfig::fast())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::BurnTxStatus::Dropped,
+            "an absent tx past the grace + consecutive-miss threshold must classify as Dropped"
         );
     }
 

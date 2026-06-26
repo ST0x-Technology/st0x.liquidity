@@ -2226,8 +2226,30 @@ misclassified error cannot cause a double-burn because the scan adopts any
 existing burn.
 
 A per-attempt wall-clock timeout is similarly reclassified: the hung attempt is
-aborted and the job re-enqueues with a 30 s delay. On re-pickup, if the burn
-landed during the timeout, the scan adopts it rather than re-burning.
+aborted and the job re-enqueues with a 30 s delay. The scan alone is
+mempool-blind -- it adopts only a MINED burn, not one that was broadcast but not
+yet mined -- so the two-phase burn records the tx hash as soon as it is
+broadcast: `submit_burn` broadcasts and returns the hash without awaiting the
+receipt, `RecordPendingBurn` commits it to the `BridgingSubmitting` aggregate
+(`pending_burn_tx`), then `confirm_burn` awaits and validates the receipt. The
+`submit_burn -> RecordPendingBurn` critical section runs on a detached task so
+the per-attempt timeout can never cancel it between broadcasting the burn and
+recording its hash. A process crash in that same window is NOT prevented -- the
+hash is lost -- but it cannot double-burn: resume then finds no recorded hash,
+the mempool-blind scan adopts the burn only if it already mined, and otherwise
+the transfer fails closed (`BurnSubmitInconclusive`) for operator reconciliation
+rather than reburning a possibly-still-pending burn. On re-pickup,
+`resume_bridging_submitting` checks the recorded tx's on-chain status
+(`burn_status`) before the scan: a mined burn is adopted (re-validated via
+`confirm_burn`), a still-pending burn yields a delayed redrive (never a reburn),
+and a reverted burn (which moved no funds) falls through to the scan-or-reburn
+path. A burn classified **dropped** does **not** auto-reburn: once a burn tx
+hash is durably recorded, an ambiguous "dropped" classification pages the
+operator (a terminal `BurnTxDropped` error) for manual on-chain verification,
+because a load-balanced RPC could misreport a still-pending burn as dropped and
+a reburn there would double-burn. `burn_status` mirrors the wallet's
+`wait_for_receipt` drop policy (a grace window plus consecutive mempool-absence
+misses) so a still-pending tx is never misclassified as dropped.
 
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across
@@ -2255,8 +2277,8 @@ transfer ID has not yet been persisted in that state (it is persisted only when
 `ResumeDirectionMismatch` and cannot reconstruct which Alpaca withdrawal to
 poll. When a crash leaves an aggregate in this state, `recover_usdc_guard`
 latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
-alert via `self.notifier` so the operator is paged to run `resume-usdc-transfer`
-or `reconcile-usdc-transfer` manually.
+alert via `self.notifier` so the operator is paged to run `transfer resume` or
+`transfer reconcile` manually.
 
 These states do NOT receive a tracking seed (unlike `DepositFailed` /
 `ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a

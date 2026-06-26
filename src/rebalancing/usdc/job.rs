@@ -41,14 +41,17 @@ const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 const BURN_REVERT_REDRIVE_DELAY: Duration = Duration::from_secs(15);
 
 /// Delay before re-enqueueing a Base->Alpaca job after a per-attempt timeout.
-/// 30 s gives a hung RPC time to settle before the job re-enters the
-/// scan-or-reburn path. NOTE: the scan (`find_recent_burn`) is a mempool-blind
-/// log scan -- it adopts only a MINED burn, not a still-pending (broadcast but
-/// unmined) one. So this delay must be long enough that a burn broadcast just
-/// before the timeout has mined (and become visible to the scan) or been evicted
-/// from the mempool before the redrive scans. Fully closing that residual
-/// double-burn window requires durably recording the in-flight burn tx hash; it
-/// is tracked as a dedicated follow-up.
+/// 30 s gives a hung RPC time to settle before the job re-enters the resume
+/// path. On re-pickup the resume FIRST checks the durably-recorded
+/// `pending_burn_tx` via `burn_status` (mempool-aware): a still-pending burn is
+/// adopted or waited on, never reburned, and a `Dropped` classification pages the
+/// operator. Only when NO pending tx was recorded does it fall back to the
+/// mempool-blind `find_recent_burn` scan -- which is reached automatically ONLY
+/// for a genuine first-burn attempt (no prior broadcast). Any ambiguous burn
+/// submission (timed-out/non-revert broadcast, or a broadcast whose hash failed
+/// to record) instead fails closed terminally and latches at `BridgingSubmitting`
+/// for operator reconciliation, so a possibly-in-flight burn is never
+/// automatically reburned.
 const TIMEOUT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 
 /// Delay before re-enqueueing an Alpaca->Base job when on-chain settlement has
@@ -203,17 +206,18 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
         let resume = ctx.transfer.resume_base_to_alpaca(&self.id, self.amount);
         let Ok(result) = tokio::time::timeout(ctx.timeout, resume).await else {
             // A timeout fires while a burn tx may have been broadcast -- the RPC
-            // just did not return the receipt in time. The redrive re-enters
-            // `resume_bridging_submitting`, whose `find_recent_burn` probe is a
-            // mempool-blind LOG SCAN: it adopts only a MINED burn, never a
-            // still-pending (broadcast-but-unmined) one. So double-burn safety on
-            // the timeout path depends on the per-attempt timeout plus
-            // `TIMEOUT_REDRIVE_DELAY` being long enough that a broadcast burn has
-            // mined (and become scan-visible) or been evicted before the redrive
-            // scans. Fully closing that residual window requires durably recording
-            // the in-flight burn tx hash and is tracked as a dedicated follow-up.
-            // Count against the shared redrive budget so repeated timeouts (e.g., a
-            // permanently hung RPC) eventually surface for operator review.
+            // just did not return the receipt in time. The redrive re-enters the
+            // bridging resume, which FIRST checks the durably-recorded
+            // `pending_burn_tx` via `burn_status` (mempool-aware): a still-pending
+            // burn is adopted or waited on (never reburned) and a `Dropped`
+            // classification pages the operator. The burn broadcast itself is
+            // separately bounded by `BURN_BROADCAST_TIMEOUT` (<< this per-attempt
+            // timeout) and fails closed on ambiguity, so this per-attempt timeout
+            // realistically only fires during the post-record confirm/receipt
+            // wait, where `pending_burn_tx` is already set -- the resume adopts it
+            // rather than reburning. Count against the shared redrive budget so
+            // repeated timeouts (e.g., a permanently hung RPC) eventually surface
+            // for operator review.
             return self.handle_hedging_timeout_redrive(ctx).await;
         };
 
@@ -286,6 +290,70 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // guarantee is the scan, NOT this classification.
             Err(UsdcTransferError::BurnRevert(_)) => {
                 return self.handle_hedging_burn_revert_redrive(ctx).await;
+            }
+            // Fail-closed burn-submission terminals. The burn's on-chain fate is
+            // unknown -- the broadcast may have landed (submit timed out / errored
+            // non-revert), its hash was not durably recorded, or a recorded burn
+            // was classified dropped. Returning `Ok(())` ends the apalis job with
+            // NO retry, so the aggregate stays latched at `BridgingSubmitting`
+            // (the guard stays held) and NO automatic reburn occurs -- an
+            // automatic reburn could double-burn a still-pending burn. The
+            // operator verifies on-chain and uses resume-/fail-usdc-transfer. The
+            // alert fires exactly once because this attempt does not redrive.
+            Err(UsdcTransferError::BurnTxDropped { id, burn_tx }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Base->Alpaca USDC transfer: recorded burn classified dropped; latched at \
+                     BridgingSubmitting for operator reconciliation (no auto-reburn)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: recorded burn {burn_tx} classified dropped (not mined, \
+                     absent from mempool past grace). Latched for operator reconciliation; \
+                     verify on-chain before any reburn."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging dropped-burn alert");
+                }
+            }
+            Err(UsdcTransferError::BurnRecordFailed { id, burn_tx }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Base->Alpaca USDC transfer: burn broadcast but its hash could not be durably \
+                     recorded; latched at BridgingSubmitting for operator reconciliation \
+                     (no auto-reburn)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: burn {burn_tx} broadcast but its hash could not be \
+                     durably recorded; a burn is in flight. Latched for operator reconciliation; \
+                     verify on-chain before any reburn."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging record-failed-burn alert");
+                }
+            }
+            Err(
+                UsdcTransferError::BurnSubmitInconclusive { id }
+                | UsdcTransferError::BurnRecordTaskFailed { id },
+            ) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    "Base->Alpaca USDC transfer: burn submission inconclusive or its hash was \
+                     not durably recorded; latched at BridgingSubmitting for operator \
+                     reconciliation (no auto-reburn)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: burn submission inconclusive or its hash was not \
+                     durably recorded; a burn may be in flight. Latched for operator \
+                     reconciliation; verify on-chain before any reburn."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging inconclusive-burn alert");
+                }
             }
             Err(error) => {
                 // Terminal non-redriven error: fire notifier before surfacing
@@ -712,6 +780,68 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             Err(UsdcTransferError::BurnRevert(_)) => {
                 return self.handle_mm_burn_revert_redrive(ctx).await;
             }
+            // Fail-closed burn-submission terminals (see the hedging direction for
+            // the full rationale). The burn's on-chain fate is unknown -- the
+            // broadcast may have landed, its hash was not durably recorded, or a
+            // recorded burn was classified dropped. Returning `Ok(())` ends the
+            // apalis job with NO retry, so the aggregate stays latched at
+            // `BridgingSubmitting` (guard held) and NO automatic reburn occurs.
+            // The operator verifies on-chain and uses resume-/fail-usdc-transfer.
+            Err(UsdcTransferError::BurnTxDropped { id, burn_tx }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Alpaca->Base USDC transfer: recorded burn classified dropped; latched at \
+                     BridgingSubmitting for operator reconciliation (no auto-reburn)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: recorded burn {burn_tx} classified dropped (not mined, \
+                     absent from mempool past grace). Latched for operator reconciliation; \
+                     verify on-chain before any reburn."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making dropped-burn alert");
+                }
+            }
+            Err(UsdcTransferError::BurnRecordFailed { id, burn_tx }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Alpaca->Base USDC transfer: burn broadcast but its hash could not be durably \
+                     recorded; latched at BridgingSubmitting for operator reconciliation \
+                     (no auto-reburn)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: burn {burn_tx} broadcast but its hash could not be \
+                     durably recorded; a burn is in flight. Latched for operator reconciliation; \
+                     verify on-chain before any reburn."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making record-failed-burn alert");
+                }
+            }
+            Err(
+                UsdcTransferError::BurnSubmitInconclusive { id }
+                | UsdcTransferError::BurnRecordTaskFailed { id },
+            ) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    "Alpaca->Base USDC transfer: burn submission inconclusive or its hash was \
+                     not durably recorded; latched at BridgingSubmitting for operator \
+                     reconciliation (no auto-reburn)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: burn submission inconclusive or its hash was not \
+                     durably recorded; a burn may be in flight. Latched for operator \
+                     reconciliation; verify on-chain before any reburn."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making inconclusive-burn alert");
+                }
+            }
             Err(error) => {
                 // Terminal non-redriven error: fire notifier before surfacing
                 // to apalis so the operator is alerted before the circuit opens.
@@ -933,6 +1063,12 @@ mod tests {
         DeadlineElapsed,
         PreviouslyFailed,
         AmbientBalance,
+        /// Fail-closed burn-submission terminals: a burn may be in flight, so the
+        /// job must NOT auto-redrive (a redrive could reburn).
+        BurnSubmitInconclusive,
+        BurnRecordFailed,
+        BurnRecordTaskFailed,
+        BurnTxDropped,
     }
 
     impl TerminalOutcome {
@@ -948,6 +1084,20 @@ mod tests {
                     id: id.clone(),
                     balance: Usdc::new(float!(1)),
                     nominal: Usdc::new(float!(1)),
+                },
+                Self::BurnSubmitInconclusive => {
+                    UsdcTransferError::BurnSubmitInconclusive { id: id.clone() }
+                }
+                Self::BurnRecordFailed => UsdcTransferError::BurnRecordFailed {
+                    id: id.clone(),
+                    burn_tx: TxHash::from([0xCD; 32]),
+                },
+                Self::BurnRecordTaskFailed => {
+                    UsdcTransferError::BurnRecordTaskFailed { id: id.clone() }
+                }
+                Self::BurnTxDropped => UsdcTransferError::BurnTxDropped {
+                    id: id.clone(),
+                    burn_tx: TxHash::from([0xAB; 32]),
                 },
             }
         }
@@ -1308,6 +1458,187 @@ mod tests {
             0,
             "an ambient-balance failure must not be redriven and must not trip the breaker"
         );
+    }
+
+    /// Fail-closed burn-submission terminals MUST end the apalis job cleanly
+    /// (`Ok`, never a retryable `Err`) with NO redrive and exactly one operator
+    /// alert. Auto-redriving any of these could reburn a possibly-in-flight burn
+    /// (double burn), which is the precise hazard this PR closes.
+    async fn assert_hedging_fail_closed(
+        outcome: TerminalOutcome,
+        label: &str,
+        expect_burn_tx: Option<TxHash>,
+    ) {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(TerminalBaseToAlpaca(outcome)),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx).await.unwrap_or_else(|error| {
+            panic!("{label} must end the job cleanly (Ok), never an apalis-retryable error; got: {error:?}")
+        });
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            0,
+            "{label} must NOT redrive -- an auto-redrive could reburn a possibly-in-flight burn"
+        );
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "{label} must fire exactly one operator alert"
+        );
+        assert!(
+            messages[0].contains(&job.id.to_string()),
+            "{label} alert must include the transfer id; got: {:?}",
+            messages[0]
+        );
+        if let Some(burn_tx) = expect_burn_tx {
+            assert!(
+                messages[0].contains(&burn_tx.to_string()),
+                "{label} alert must include the burn tx hash; got: {:?}",
+                messages[0]
+            );
+        }
+    }
+
+    async fn assert_market_making_fail_closed(
+        outcome: TerminalOutcome,
+        label: &str,
+        expect_burn_tx: Option<TxHash>,
+    ) {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(outcome)),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx).await.unwrap_or_else(|error| {
+            panic!("{label} must end the job cleanly (Ok), never an apalis-retryable error; got: {error:?}")
+        });
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "{label} must NOT redrive -- an auto-redrive could reburn a possibly-in-flight burn"
+        );
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "{label} must fire exactly one operator alert"
+        );
+        assert!(
+            messages[0].contains(&job.id.to_string()),
+            "{label} alert must include the transfer id; got: {:?}",
+            messages[0]
+        );
+        if let Some(burn_tx) = expect_burn_tx {
+            assert!(
+                messages[0].contains(&burn_tx.to_string()),
+                "{label} alert must include the burn tx hash; got: {:?}",
+                messages[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_burn_submit_inconclusive() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::BurnSubmitInconclusive,
+            "BurnSubmitInconclusive (hedging)",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_burn_record_failed() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::BurnRecordFailed,
+            "BurnRecordFailed (hedging)",
+            Some(TxHash::from([0xCD; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_burn_record_task_failed() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::BurnRecordTaskFailed,
+            "BurnRecordTaskFailed (hedging)",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_burn_tx_dropped() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::BurnTxDropped,
+            "BurnTxDropped (hedging)",
+            Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_burn_submit_inconclusive() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::BurnSubmitInconclusive,
+            "BurnSubmitInconclusive (market-making)",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_burn_record_failed() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::BurnRecordFailed,
+            "BurnRecordFailed (market-making)",
+            Some(TxHash::from([0xCD; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_burn_record_task_failed() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::BurnRecordTaskFailed,
+            "BurnRecordTaskFailed (market-making)",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_burn_tx_dropped() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::BurnTxDropped,
+            "BurnTxDropped (market-making)",
+            Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
     }
 
     /// Records the resume call and returns a configurable outcome, so the
@@ -1762,10 +2093,10 @@ mod tests {
         );
     }
 
-    /// Returns a revert-class burn error. This simulates what `burn_on_base` /
-    /// `burn_on_ethereum` emit when the burn EVM call reverts: `BurnRevert`, not
-    /// `Cctp`. Only the burn call sites emit `BurnRevert`; the mint path and other
-    /// CCTP failures emit `Cctp`.
+    /// Returns a revert-class burn error. This simulates what
+    /// `burn_recording_pending` emits when the burn EVM call reverts: `BurnRevert`,
+    /// not `Cctp`. Only the burn call site emits `BurnRevert`; the mint path and
+    /// other CCTP failures emit `Cctp`.
     fn revert_burn_error() -> UsdcTransferError {
         UsdcTransferError::BurnRevert(Box::new(CctpError::Evm(EvmError::Reverted {
             tx_hash: TxHash::ZERO,

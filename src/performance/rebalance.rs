@@ -672,9 +672,16 @@ impl StoredOperation {
                 );
                 self.open_once(Mint, *attested_at);
             }
-            // Recoverable stall: the attestation stage simply stays open
-            // until BridgeAttestationReceived or BridgingFailed.
-            UsdcRebalanceEvent::AttestationTimedOut { .. } => {}
+            // None of these events advance stage timing:
+            // - `PendingBurnRecorded` / `PendingBurnCleared`: the Burn stage is
+            //   already open (from `BridgingSubmitting`) and is closed by
+            //   `BridgingInitiated`; recording/clearing the pending hash stays in
+            //   `BridgingSubmitting`.
+            // - `AttestationTimedOut`: a recoverable stall; the Attestation stage
+            //   stays open until `BridgeAttestationReceived` or `BridgingFailed`.
+            UsdcRebalanceEvent::PendingBurnRecorded { .. }
+            | UsdcRebalanceEvent::PendingBurnCleared { .. }
+            | UsdcRebalanceEvent::AttestationTimedOut { .. } => {}
             UsdcRebalanceEvent::Bridged { minted_at, .. } => {
                 self.close(
                     operation_id,
@@ -951,6 +958,8 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         UsdcRebalanceEvent::WithdrawalSubmitting { submitting_at, .. }
         | UsdcRebalanceEvent::BridgingSubmitting { submitting_at, .. } => *submitting_at,
         UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at, .. } => *confirmed_at,
+        UsdcRebalanceEvent::PendingBurnRecorded { recorded_at, .. } => *recorded_at,
+        UsdcRebalanceEvent::PendingBurnCleared { cleared_at } => *cleared_at,
         UsdcRebalanceEvent::BridgingInitiated { burned_at, .. } => *burned_at,
         UsdcRebalanceEvent::BridgeAttestationReceived { attested_at, .. } => *attested_at,
         UsdcRebalanceEvent::AttestationTimedOut { timed_out_at, .. } => *timed_out_at,

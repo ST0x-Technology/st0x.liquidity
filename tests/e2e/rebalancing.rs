@@ -872,9 +872,9 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
 ///
 /// Expected CQRS event flow:
 /// - `UsdcRebalance`: ConversionInitiated -> ConversionConfirmed
-///   -> Initiated -> WithdrawalConfirmed -> BridgingSubmitting -> BridgingInitiated
-///   -> BridgeAttestationReceived -> Bridged -> DepositInitiated
-///   -> DepositConfirmed
+///   -> Initiated -> WithdrawalConfirmed -> BridgingSubmitting
+///   -> PendingBurnRecorded -> BridgingInitiated -> BridgeAttestationReceived
+///   -> Bridged -> DepositInitiated -> DepositConfirmed
 ///
 /// Infrastructure: Deploys CCTP contracts fresh on two plain Anvil chains
 /// (no mainnet fork required). A background watcher auto-signs attestations
@@ -1034,9 +1034,9 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 ///
 /// Expected CQRS event flow:
 /// - `UsdcRebalance`: WithdrawalSubmitting -> Initiated -> WithdrawalConfirmed
-///   -> BridgingSubmitting -> BridgingInitiated -> BridgeAttestationReceived
-///   -> Bridged -> DepositInitiated -> DepositConfirmed -> ConversionInitiated
-///   -> ConversionConfirmed
+///   -> BridgingSubmitting -> PendingBurnRecorded -> BridgingInitiated
+///   -> BridgeAttestationReceived -> Bridged -> DepositInitiated
+///   -> DepositConfirmed -> ConversionInitiated -> ConversionConfirmed
 ///
 /// Infrastructure: Same as `usdc_imbalance_triggers_alpaca_to_base` but the
 /// Raindex USDC vault is pre-funded so the bot can withdraw from it.

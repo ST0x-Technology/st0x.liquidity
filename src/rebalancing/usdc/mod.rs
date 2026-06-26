@@ -17,6 +17,7 @@ pub(crate) use manager::{CrossVenueCashTransfer, UsdcSettlementParams, u256_to_u
 
 use std::time::Duration;
 
+use alloy::primitives::TxHash;
 use rain_math_float::FloatError;
 use thiserror::Error;
 
@@ -38,10 +39,10 @@ pub(crate) enum UsdcTransferError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] Box<CctpError>),
-    /// Emitted only by burn call sites (`burn_on_base`, `burn_on_ethereum`) when
-    /// the burn fails with a revert-class error: EVM execution reverts and
-    /// pre-flight rejections that produce no on-chain state change. Safe to
-    /// redrive via the scan-or-reburn path in `resume_bridging_submitting` /
+    /// Emitted by the two-phase burn path (`burn_recording_pending`) when the
+    /// burn fails with a revert-class error: EVM execution reverts and pre-flight
+    /// rejections that produce no on-chain state change. Safe to redrive via the
+    /// scan-or-reburn path in `resume_bridging_submitting` /
     /// `resume_bridging_submitting_ethereum`.
     ///
     /// IMPORTANT: The double-burn safety guarantee does NOT come from this
@@ -174,7 +175,7 @@ pub(crate) enum UsdcTransferError {
     )]
     WithdrawalTxUnderconfirmed {
         id: UsdcRebalanceId,
-        tx: alloy::primitives::TxHash,
+        tx: TxHash,
         required: u64,
         actual: u64,
     },
@@ -191,6 +192,60 @@ pub(crate) enum UsdcTransferError {
         id: UsdcRebalanceId,
         #[source]
         source: Box<CctpError>,
+    },
+    /// The detached submit-and-record burn task (spawned so a cancelling job
+    /// timeout cannot drop the broadcast->record critical section) panicked and
+    /// failed to join. The burn may or may not have broadcast. TERMINAL and
+    /// fail-closed at the job layer: the transfer latches at `BridgingSubmitting`
+    /// for operator reconciliation rather than auto-redriving, because a redrive
+    /// with no recorded tx would fall to the mempool-blind scan and could reburn a
+    /// still-pending burn.
+    #[error("USDC rebalance {id}: burn submit-and-record task panicked")]
+    BurnRecordTaskFailed { id: UsdcRebalanceId },
+    /// The burn was broadcast but `RecordPendingBurn` failed to commit after
+    /// retries, so the burn tx hash was NOT durably recorded. TERMINAL and
+    /// fail-closed at the job layer: rather than proceeding to confirm (or letting
+    /// an Apalis retry treat the burn as un-broadcast and reburn off a
+    /// mempool-blind scan), the transfer latches at `BridgingSubmitting` for
+    /// operator reconciliation. The broadcast burn hash is in the logs; manual
+    /// on-chain verification is required before any further action.
+    #[error(
+        "USDC rebalance {id}: burn broadcast but RecordPendingBurn could not be \
+         committed; failed for operator reconciliation (burn tx {burn_tx})"
+    )]
+    BurnRecordFailed {
+        id: UsdcRebalanceId,
+        burn_tx: TxHash,
+    },
+    /// The CCTP burn submission did not return a usable tx hash: it either timed
+    /// out (the broadcast may still have reached the network) or failed with a
+    /// non-revert (transport/RPC) error after the request was sent. The burn may
+    /// or may not be on-chain, so its fate is INCONCLUSIVE. TERMINAL and
+    /// fail-closed at the job layer: the transfer latches at `BridgingSubmitting`
+    /// for operator reconciliation rather than auto-reburning, since a reburn
+    /// could double-burn if the original submission did land. A clean revert (no
+    /// funds moved) is NOT this error -- that stays on the bounded revert-redrive
+    /// path.
+    #[error(
+        "USDC rebalance {id}: CCTP burn submission inconclusive (timed out or \
+         non-revert transport error after broadcast); failed for operator \
+         reconciliation (verify on-chain before any reburn)"
+    )]
+    BurnSubmitInconclusive { id: UsdcRebalanceId },
+    /// A durably-recorded burn tx was classified `Dropped` (no receipt and absent
+    /// from the mempool past the grace window): the recorded burn is not mined and
+    /// is no longer in the mempool. TERMINAL: once a burn tx hash is durably
+    /// recorded the system NEVER auto-issues a second burn for an ambiguous
+    /// "dropped" classification (a load-balanced RPC could misreport a still-pending
+    /// burn as dropped, causing a double-burn). The operator must manually verify
+    /// on-chain whether the burn landed before any reburn.
+    #[error(
+        "USDC rebalance {id}: recorded burn tx {burn_tx} not mined and no longer in \
+         the mempool; manual on-chain verification required before any reburn"
+    )]
+    BurnTxDropped {
+        id: UsdcRebalanceId,
+        burn_tx: TxHash,
     },
 }
 

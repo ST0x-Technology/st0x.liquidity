@@ -56,8 +56,8 @@ use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
-    connect_db, count_events, poll_for_broker_fills, poll_for_events, poll_for_events_with_timeout,
-    poll_for_ready, spawn_bot_with_event_channel,
+    connect_db, count_events, count_events_of_type, poll_for_broker_fills, poll_for_events,
+    poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
 use crate::test_infra::TestInfra;
@@ -751,11 +751,22 @@ async fn full_system() -> anyhow::Result<()> {
     let pool = connect_db(&infra.db_path).await?;
     let usdc_events = count_events(&pool, "UsdcRebalance").await?;
     assert!(
-        usdc_events >= 11,
+        usdc_events >= 12,
         "USDC rebalance should emit at least WithdrawalSubmitting + Initiated + \
-         WithdrawalConfirmed + BridgingSubmitting + BridgingInitiated + \
-         BridgeAttestationReceived + Bridged + DepositInitiated + DepositConfirmed + \
-         ConversionInitiated + ConversionConfirmed, got {usdc_events}",
+         WithdrawalConfirmed + BridgingSubmitting + PendingBurnRecorded + \
+         BridgingInitiated + BridgeAttestationReceived + Bridged + DepositInitiated + \
+         DepositConfirmed + ConversionInitiated + ConversionConfirmed, got {usdc_events}",
+    );
+
+    // The total-count assertion above can pass even if the in-flight burn tx hash
+    // was never durably recorded, so verify PendingBurnRecorded fired explicitly:
+    // the happy path records exactly one burn hash before awaiting its receipt.
+    let pending_burn_recorded =
+        count_events_of_type(&pool, "UsdcRebalanceEvent::PendingBurnRecorded").await?;
+    assert_eq!(
+        pending_burn_recorded, 1,
+        "USDC rebalance must durably record the in-flight burn tx hash exactly once \
+         (PendingBurnRecorded), got {pending_burn_recorded}",
     );
     pool.close().await;
 

@@ -196,6 +196,24 @@ pub(crate) enum UsdcRebalanceError {
     /// Bridging has already completed or failed
     #[error("Bridging has already completed")]
     BridgingAlreadyCompleted,
+    /// A CCTP burn tx hash was durably recorded (`pending_burn_tx`), so a burn may
+    /// already be on-chain. Failing as pre-burn (`burn_tx_hash: None`) would clear
+    /// the double-burn guard and strand the funds; the operator must instead resume
+    /// (to adopt/await the recorded burn) or verify on-chain.
+    #[error(
+        "a CCTP burn tx was already recorded for this transfer; cannot fail it as \
+         pre-burn -- resume to adopt/await the recorded burn"
+    )]
+    BurnAlreadyRecorded,
+    /// A pending-burn command (`RecordPendingBurn` / `ClearPendingBurn`) arrived
+    /// after bridging already advanced past `BridgingSubmitting`. The burn is
+    /// settled and the pending-burn slot no longer exists, so there is nothing to
+    /// record or clear.
+    #[error(
+        "bridging already advanced past BridgingSubmitting; cannot record or clear \
+         a pending burn"
+    )]
+    BridgingAlreadyStarted,
     /// Bridging has not been completed yet
     #[error("Bridging has not been completed")]
     BridgingNotCompleted,
@@ -275,6 +293,15 @@ pub(crate) enum UsdcRebalanceCommand {
     },
     /// Record the CCTP burn transaction. Valid only from `BridgingSubmitting` state.
     InitiateBridging { burn_tx: TxHash },
+    /// Record the broadcast CCTP burn tx hash while still in `BridgingSubmitting`,
+    /// BEFORE awaiting its receipt, so a crash/timeout redrive checks that exact
+    /// tx instead of a mempool-blind log scan. Valid only from `BridgingSubmitting`.
+    RecordPendingBurn { burn_tx: TxHash },
+    /// Clear any durably-recorded pending burn tx, returning `BridgingSubmitting` to
+    /// `pending_burn_tx: None`. Emitted before a (re)broadcast so that if recording the
+    /// new burn's hash fails, the resume path sees None and fails closed instead of
+    /// reburning off a stale (reverted) hash. Valid only from `BridgingSubmitting`.
+    ClearPendingBurn,
     /// Record the Circle attestation. Valid from `Bridging` or
     /// `AwaitingAttestation` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
@@ -406,6 +433,16 @@ pub(crate) enum UsdcRebalanceEvent {
         burn_tx_hash: TxHash,
         burned_at: DateTime<Utc>,
     },
+    /// A CCTP burn tx hash was broadcast and recorded while still in
+    /// `BridgingSubmitting`, before its receipt was awaited. Lets a crash/timeout
+    /// redrive check that exact tx instead of a mempool-blind log scan.
+    PendingBurnRecorded {
+        burn_tx: TxHash,
+        recorded_at: DateTime<Utc>,
+    },
+    /// The recorded pending burn tx was cleared (back to `pending_burn_tx: None`)
+    /// before a (re)broadcast, so a failed re-record fails closed rather than reburning.
+    PendingBurnCleared { cleared_at: DateTime<Utc> },
     /// Circle attestation received. Enables minting on destination chain.
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
     /// `mint_scan_from_block` is the destination chain head captured before the mint,
@@ -502,6 +539,8 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::WithdrawalFailed { .. } => "UsdcRebalanceEvent::WithdrawalFailed",
             Self::BridgingSubmitting { .. } => "UsdcRebalanceEvent::BridgingSubmitting",
             Self::BridgingInitiated { .. } => "UsdcRebalanceEvent::BridgingInitiated",
+            Self::PendingBurnRecorded { .. } => "UsdcRebalanceEvent::PendingBurnRecorded",
+            Self::PendingBurnCleared { .. } => "UsdcRebalanceEvent::PendingBurnCleared",
             Self::BridgeAttestationReceived { .. } => {
                 "UsdcRebalanceEvent::BridgeAttestationReceived"
             }
@@ -605,6 +644,13 @@ pub(crate) enum UsdcRebalance {
         /// `None` for aggregates persisted before this field existed.
         #[serde(default)]
         burn_amount: Option<Usdc>,
+        /// CCTP burn tx hash broadcast before its receipt was awaited, recorded
+        /// via `RecordPendingBurn`. A crash/timeout redrive checks this exact tx
+        /// (`burn_status`) instead of a mempool-blind log scan, closing the
+        /// double-burn window. `None` until the burn is broadcast, and for
+        /// aggregates persisted before this field existed.
+        #[serde(default)]
+        pending_burn_tx: Option<TxHash>,
     },
     /// CCTP bridging has been initiated (burn transaction submitted)
     /// Note: cctp_nonce is not available here - it's only known after attestation.
@@ -1375,6 +1421,8 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::WithdrawalSubmitting', \
                'UsdcRebalanceEvent::WithdrawalConfirmed', \
                'UsdcRebalanceEvent::BridgingSubmitting', \
+               'UsdcRebalanceEvent::PendingBurnRecorded', \
+               'UsdcRebalanceEvent::PendingBurnCleared', \
                'UsdcRebalanceEvent::BridgingInitiated', \
                'UsdcRebalanceEvent::BridgeAttestationReceived', \
                'UsdcRebalanceEvent::AttestationTimedOut', \
@@ -1625,6 +1673,10 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
+            // Two transitions converge on `BridgingSubmitting` with no pending burn
+            // tx: opening the bridging phase from `WithdrawalComplete`, and clearing
+            // a recorded pending burn (via `ClearPendingBurn`) before a (re)broadcast
+            // so a failed re-record fails closed instead of reburning off a stale hash.
             (
                 BridgingSubmitting {
                     from_block,
@@ -1637,12 +1689,43 @@ impl EventSourced for UsdcRebalance {
                     initiated_at,
                     ..
                 },
+            )
+            | (
+                PendingBurnCleared { .. },
+                Self::BridgingSubmitting {
+                    direction,
+                    amount,
+                    from_block,
+                    initiated_at,
+                    burn_amount,
+                    ..
+                },
             ) => Self::BridgingSubmitting {
                 direction: *direction,
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
                 burn_amount: *burn_amount,
+                pending_burn_tx: None,
+            },
+
+            (
+                PendingBurnRecorded { burn_tx, .. },
+                Self::BridgingSubmitting {
+                    direction,
+                    amount,
+                    from_block,
+                    initiated_at,
+                    burn_amount,
+                    ..
+                },
+            ) => Self::BridgingSubmitting {
+                direction: *direction,
+                amount: *amount,
+                from_block: *from_block,
+                initiated_at: *initiated_at,
+                burn_amount: *burn_amount,
+                pending_burn_tx: Some(*burn_tx),
             },
 
             (
@@ -2020,9 +2103,10 @@ impl EventSourced for UsdcRebalance {
                 Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
 
-            BeginBridging { .. } | InitiateBridging { .. } => {
-                Err(UsdcRebalanceError::WithdrawalNotConfirmed)
-            }
+            BeginBridging { .. }
+            | InitiateBridging { .. }
+            | RecordPendingBurn { .. }
+            | ClearPendingBurn => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
 
             ReceiveAttestation { .. }
             | TimeoutAttestation { .. }
@@ -2076,6 +2160,8 @@ impl EventSourced for UsdcRebalance {
                 burn_amount,
             } => self.transition_begin_bridging(from_block, burn_amount),
             InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
+            RecordPendingBurn { burn_tx } => self.transition_record_pending_burn(burn_tx),
+            ClearPendingBurn => self.transition_clear_pending_burn(),
             ReceiveAttestation {
                 attestation,
                 cctp_nonce,
@@ -2431,6 +2517,75 @@ impl UsdcRebalance {
         }
     }
 
+    /// Records the broadcast CCTP burn tx hash while still in `BridgingSubmitting`,
+    /// before its receipt is awaited, so a crash/timeout redrive checks that exact
+    /// tx instead of a mempool-blind log scan. Valid only from `BridgingSubmitting`.
+    fn transition_record_pending_burn(
+        &self,
+        burn_tx: TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            Self::BridgingSubmitting { .. } => Ok(vec![PendingBurnRecorded {
+                burn_tx,
+                recorded_at: Utc::now(),
+            }]),
+            Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::BridgingAlreadyStarted),
+        }
+    }
+
+    /// Clears any durably-recorded pending burn tx, returning `BridgingSubmitting` to
+    /// `pending_burn_tx: None` before a (re)broadcast. A failed re-record then leaves
+    /// `pending_burn_tx: None`, so the resume path fails closed instead of reburning off
+    /// a stale (reverted) hash. A no-op (no event) when already clear. Valid only from
+    /// `BridgingSubmitting`.
+    fn transition_clear_pending_burn(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            Self::BridgingSubmitting {
+                pending_burn_tx: Some(_),
+                ..
+            } => Ok(vec![PendingBurnCleared {
+                cleared_at: Utc::now(),
+            }]),
+            Self::BridgingSubmitting {
+                pending_burn_tx: None,
+                ..
+            } => Ok(vec![]),
+            Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::BridgingAlreadyStarted),
+        }
+    }
+
     fn transition_receive_attestation(
         &self,
         attestation: Vec<u8>,
@@ -2551,18 +2706,29 @@ impl UsdcRebalance {
             | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-            // Pre-burn failure: withdrawal succeeded and (for BridgingSubmitting)
-            // the burn intent was recorded, but no burn tx exists yet -- e.g. a
-            // USDC-to-U256 conversion error or a burn that failed before the
-            // BridgingInitiated event was persisted.
-            Self::WithdrawalComplete { .. } | Self::BridgingSubmitting { .. } => {
-                Ok(vec![BridgingFailed {
-                    burn_tx_hash: None,
-                    cctp_nonce: None,
-                    reason,
-                    failed_at: Utc::now(),
-                }])
-            }
+            // A burn tx hash was durably recorded (`pending_burn_tx: Some`), so a
+            // CCTP burn may already be on-chain. Failing as pre-burn would emit
+            // `BridgingFailed { burn_tx_hash: None }`, clearing the guard and
+            // stranding the burned funds. Reject -- the operator must resume (to
+            // adopt/await the recorded burn) or verify on-chain.
+            Self::BridgingSubmitting {
+                pending_burn_tx: Some(_),
+                ..
+            } => Err(UsdcRebalanceError::BurnAlreadyRecorded),
+            // Pre-burn failure: withdrawal succeeded and (for BridgingSubmitting
+            // with no recorded burn) the burn intent was recorded but no burn tx
+            // exists yet -- e.g. a USDC-to-U256 conversion error or a burn that
+            // failed before any `RecordPendingBurn`/`BridgingInitiated` event.
+            Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting {
+                pending_burn_tx: None,
+                ..
+            } => Ok(vec![BridgingFailed {
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                reason,
+                failed_at: Utc::now(),
+            }]),
             Self::Bridging { burn_tx_hash, .. }
             | Self::AwaitingAttestation { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
                 burn_tx_hash: Some(*burn_tx_hash),
@@ -2797,7 +2963,7 @@ mod tests {
     use std::collections::HashSet;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{LifecycleError, TestHarness, replay, test_store};
+    use st0x_event_sorcery::{LifecycleError, Store, TestHarness, replay, test_store};
     use st0x_float_macro::float;
 
     use super::*;
@@ -3230,6 +3396,392 @@ mod tests {
             panic!("Expected BridgingInitiated event, got {:?}", events[0]);
         };
         assert_eq!(*burn_tx_hash, burn_tx);
+    }
+
+    #[tokio::test]
+    async fn record_pending_burn_from_bridging_submitting_emits_event_and_sets_pending_tx() {
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
+
+        let staged = vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 99,
+                submitting_at: Utc::now(),
+                burn_amount: None,
+            },
+        ];
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::PendingBurnRecorded {
+            burn_tx: recorded, ..
+        } = &events[0]
+        else {
+            panic!("Expected PendingBurnRecorded event, got {:?}", events[0]);
+        };
+        assert_eq!(*recorded, burn_tx);
+
+        // Replaying the emitted event must leave the aggregate in
+        // BridgingSubmitting with pending_burn_tx populated (not advance state).
+        let mut replayed = staged;
+        replayed.push(events[0].clone());
+        let state = replay::<UsdcRebalance>(replayed).unwrap();
+
+        let Some(UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx,
+            from_block,
+            ..
+        }) = state
+        else {
+            panic!("Expected BridgingSubmitting state, got {state:?}");
+        };
+        assert_eq!(pending_burn_tx, Some(burn_tx));
+        assert_eq!(
+            from_block, 99,
+            "BridgingSubmitting fields must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_record_pending_burn_overwrites_the_first_hash() {
+        // The revert-retry loop in `burn_recording_pending` records burn1's hash,
+        // sees `confirm_burn` revert, then records burn2's hash -- so the
+        // aggregate receives TWO `PendingBurnRecorded` events while still in
+        // `BridgingSubmitting`. The second hash MUST win: a resume that read the
+        // stale first (reverted) hash would see `MinedReverted` and fall through
+        // to the scan instead of checking the live second burn.
+        let burn_tx_1 =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000011111111");
+        let burn_tx_2 =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000022222222");
+
+        let staged = vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 99,
+                submitting_at: Utc::now(),
+                burn_amount: None,
+            },
+            UsdcRebalanceEvent::PendingBurnRecorded {
+                burn_tx: burn_tx_1,
+                recorded_at: Utc::now(),
+            },
+            // Production always sends `ClearPendingBurn` (which emits `PendingBurnCleared`)
+            // BEFORE each (re)broadcast. The second `RecordPendingBurn` therefore arrives
+            // after the aggregate's `pending_burn_tx` has been reset to `None`, not
+            // directly on top of the first hash. Staging this event here mirrors the
+            // actual event stream so the test covers production ordering.
+            UsdcRebalanceEvent::PendingBurnCleared {
+                cleared_at: Utc::now(),
+            },
+        ];
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: burn_tx_2 })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::PendingBurnRecorded {
+            burn_tx: recorded, ..
+        } = &events[0]
+        else {
+            panic!("Expected PendingBurnRecorded event, got {:?}", events[0]);
+        };
+        assert_eq!(*recorded, burn_tx_2);
+
+        let mut replayed = staged;
+        replayed.push(events[0].clone());
+        let state = replay::<UsdcRebalance>(replayed).unwrap();
+
+        let Some(UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx, ..
+        }) = state
+        else {
+            panic!("Expected BridgingSubmitting state, got {state:?}");
+        };
+        assert_eq!(
+            pending_burn_tx,
+            Some(burn_tx_2),
+            "the second RecordPendingBurn must overwrite the first hash, not be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_pending_burn_from_non_bridging_submitting_state_errors() {
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotConfirmed)
+            ),
+            "RecordPendingBurn from WithdrawalComplete must error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_burn_resets_pending_tx_to_none() {
+        // A reburn clears the stale recorded hash BEFORE re-broadcasting. The
+        // aggregate is in `BridgingSubmitting` carrying a recorded burn hash;
+        // `ClearPendingBurn` must emit one `PendingBurnCleared` event that resets
+        // `pending_burn_tx` to None, so a failed re-record fails closed instead of
+        // reburning off the stale (reverted) hash.
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000011111111");
+
+        let staged = vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 99,
+                submitting_at: Utc::now(),
+                burn_amount: None,
+            },
+            UsdcRebalanceEvent::PendingBurnRecorded {
+                burn_tx,
+                recorded_at: Utc::now(),
+            },
+        ];
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::ClearPendingBurn)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::PendingBurnCleared { .. } = &events[0] else {
+            panic!("Expected PendingBurnCleared event, got {:?}", events[0]);
+        };
+
+        let mut replayed = staged;
+        replayed.push(events[0].clone());
+        let state = replay::<UsdcRebalance>(replayed).unwrap();
+
+        let Some(UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx,
+            from_block,
+            ..
+        }) = state
+        else {
+            panic!("Expected BridgingSubmitting state, got {state:?}");
+        };
+        assert_eq!(
+            pending_burn_tx, None,
+            "ClearPendingBurn must reset pending_burn_tx to None"
+        );
+        assert_eq!(
+            from_block, 99,
+            "BridgingSubmitting fields must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_burn_when_already_none_is_noop() {
+        // On the FIRST burn there is no recorded hash yet, so `ClearPendingBurn`
+        // must be a no-op that emits ZERO events rather than churning the stream.
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingSubmitting {
+                    from_block: 99,
+                    submitting_at: Utc::now(),
+                    burn_amount: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::ClearPendingBurn)
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            0,
+            "ClearPendingBurn with no recorded hash must emit no events, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_burn_from_non_bridging_submitting_errors() {
+        // Once the burn is broadcast and the aggregate has advanced to `Bridging`,
+        // clearing the pending burn is invalid: the bridge is already underway.
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ClearPendingBurn)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyStarted)
+            ),
+            "ClearPendingBurn from Bridging must error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_pending_burn_from_bridging_errors() {
+        // Once the burn is broadcast and the aggregate has advanced to `Bridging`,
+        // recording a pending burn is invalid: the burn is settled and the
+        // pending-burn slot no longer exists.
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000feedface");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::BridgingAlreadyStarted)
+            ),
+            "RecordPendingBurn from Bridging must error, got {error:?}"
+        );
+    }
+
+    /// A `BridgingSubmitting` snapshot persisted before `pending_burn_tx` existed
+    /// must still load, defaulting the field to `None` via `#[serde(default)]`.
+    #[test]
+    fn bridging_submitting_snapshot_without_pending_burn_tx_deserializes_to_none() {
+        let mut snapshot = to_value(UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100.00)),
+            from_block: 42,
+            initiated_at: Utc::now(),
+            burn_amount: None,
+            pending_burn_tx: Some(fixed_bytes!(
+                "0x00000000000000000000000000000000000000000000000000000000feedface"
+            )),
+        })
+        .expect("BridgingSubmitting state serializes");
+
+        snapshot
+            .get_mut("BridgingSubmitting")
+            .and_then(|value| value.as_object_mut())
+            .expect("externally-tagged BridgingSubmitting object")
+            .remove("pending_burn_tx");
+
+        let state = from_value::<UsdcRebalance>(snapshot)
+            .expect("pre-field BridgingSubmitting snapshot must still load");
+
+        let UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx, ..
+        } = state
+        else {
+            panic!("expected BridgingSubmitting, got {state:?}");
+        };
+        assert_eq!(pending_burn_tx, None);
     }
 
     #[test]
@@ -4134,6 +4686,7 @@ mod tests {
             from_block: 100,
             initiated_at: now,
             burn_amount: None,
+            pending_burn_tx: None,
         };
         assert_eq!(
             submitting.resumable_post_burn_transfer(),
@@ -4311,6 +4864,7 @@ mod tests {
             from_block: 100,
             initiated_at: now,
             burn_amount: Some(Usdc::new(float!(318))),
+            pending_burn_tx: None,
         };
         assert_eq!(
             bridging_submitting_with_burn.amount(),
@@ -4324,6 +4878,7 @@ mod tests {
             from_block: 100,
             initiated_at: now,
             burn_amount: None,
+            pending_burn_tx: None,
         };
         assert_eq!(
             bridging_submitting_legacy.amount(),
@@ -8289,6 +8844,7 @@ mod tests {
                 from_block: 1,
                 initiated_at: now,
                 burn_amount: None,
+                pending_burn_tx: None,
             }
             .guard_recovery_tracking_data(),
             None,
@@ -8351,156 +8907,99 @@ mod tests {
         );
     }
 
+    /// Seeds a fresh aggregate by sending `commands` in order, returning its id.
+    async fn seed_through(
+        store: &Store<UsdcRebalance>,
+        commands: Vec<UsdcRebalanceCommand>,
+    ) -> UsdcRebalanceId {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in commands {
+            store.send(&id, command).await.unwrap();
+        }
+        id
+    }
+
     #[tokio::test]
     async fn interrupted_usdc_rebalance_ids_excludes_clearable_terminals() {
         let pool = crate::test_utils::setup_test_db().await;
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
         let amount = Usdc::new(float!(400.0));
 
-        // Clearable terminal (withdrawal failed, pre-burn) -- must be excluded.
-        let withdrawal_failed = UsdcRebalanceId(Uuid::new_v4());
-        store
-            .send(
-                &withdrawal_failed,
+        // Clearable terminal (withdrawal failed, pre-burn) -- must be excluded,
+        // so its id is intentionally unbound after seeding.
+        let _withdrawal_failed = seed_through(
+            &store,
+            vec![
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &withdrawal_failed,
                 UsdcRebalanceCommand::FailWithdrawal {
                     reason: "x".to_string(),
                 },
-            )
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
 
         // Post-burn bridge failure -- must be included.
-        let bridge_failed = UsdcRebalanceId(Uuid::new_v4());
-        store
-            .send(
-                &bridge_failed,
+        let bridge_failed = seed_through(
+            &store,
+            vec![
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &bridge_failed,
                 UsdcRebalanceCommand::ConfirmWithdrawal {
                     withdrawal_tx: None,
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &bridge_failed,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &bridge_failed,
                 UsdcRebalanceCommand::FailBridging {
                     reason: "x".to_string(),
                 },
-            )
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
 
         // Awaiting attestation after a post-burn timeout -- must be included.
-        let awaiting_attestation = UsdcRebalanceId(Uuid::new_v4());
-        store
-            .send(
-                &awaiting_attestation,
+        let awaiting_attestation = seed_through(
+            &store,
+            vec![
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &awaiting_attestation,
                 UsdcRebalanceCommand::ConfirmWithdrawal {
                     withdrawal_tx: None,
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &awaiting_attestation,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &awaiting_attestation,
                 UsdcRebalanceCommand::TimeoutAttestation {
                     retry_deadline_at: Utc::now() + chrono::Duration::hours(24),
                 },
-            )
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
 
         // Recovered post-burn bridge (latest event BridgingCompletionRecovered,
         // state Bridged) -- mid-flight after un-fail, holds the guard, must be
         // included so a crash before the deposit leg reasserts usdc_in_progress.
-        let recovered = UsdcRebalanceId(Uuid::new_v4());
-        store
-            .send(
-                &recovered,
+        let recovered = seed_through(
+            &store,
+            vec![
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &recovered,
                 UsdcRebalanceCommand::ConfirmWithdrawal {
                     withdrawal_tx: None,
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &recovered,
                 UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &recovered,
                 UsdcRebalanceCommand::FailBridging {
                     reason: "transient receipt error".to_string(),
                 },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &recovered,
                 UsdcRebalanceCommand::RecoverBridging {
                     mint_tx: fixed_bytes!(
                         "0x2222222222222222222222222222222222222222222222222222222222222222"
@@ -8508,30 +9007,56 @@ mod tests {
                     amount_received: Usdc::new(float!(399.99)),
                     fee_collected: Usdc::new(float!(0.01)),
                 },
-            )
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
 
-        // In-progress (mid-withdrawal) -- must be included.
-        let withdrawing = UsdcRebalanceId(Uuid::new_v4());
-        store
-            .send(
-                &withdrawing,
+        // Pre-burn mid-flight whose LATEST event is PendingBurnRecorded (the burn
+        // hash was recorded before its receipt) -- must be included, else the guard
+        // latches with no driving job (the double-burn-safe redrive never runs).
+        let pending_burn_recorded = seed_through(
+            &store,
+            vec![
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
                 },
-            )
-            .await
-            .unwrap();
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 1,
+                    burn_amount: None,
+                },
+                UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX },
+            ],
+        )
+        .await;
+
+        // In-progress (mid-withdrawal) -- must be included.
+        let withdrawing = seed_through(
+            &store,
+            vec![UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(BURN_TX),
+            }],
+        )
+        .await;
 
         let interrupted = interrupted_usdc_rebalance_ids(&pool).await.unwrap();
         let got: HashSet<UsdcRebalanceId> = interrupted.ids.into_iter().collect();
 
         assert_eq!(
             got,
-            HashSet::from([bridge_failed, awaiting_attestation, recovered, withdrawing])
+            HashSet::from([
+                bridge_failed,
+                awaiting_attestation,
+                recovered,
+                pending_burn_recorded,
+                withdrawing
+            ])
         );
         assert!(
             interrupted.unparseable.is_empty(),
@@ -8713,6 +9238,7 @@ mod tests {
             from_block: 42,
             initiated_at: Utc::now(),
             burn_amount: Some(Usdc::new(float!(99.99))),
+            pending_burn_tx: None,
         })
         .expect("BridgingSubmitting state serializes");
 
@@ -8870,6 +9396,7 @@ mod tests {
             from_block: 1,
             initiated_at: Utc::now(),
             burn_amount: None,
+            pending_burn_tx: None,
         }
     }
 
@@ -8880,6 +9407,7 @@ mod tests {
             from_block: 1,
             initiated_at: Utc::now(),
             burn_amount: None,
+            pending_burn_tx: None,
         }
     }
 

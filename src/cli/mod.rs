@@ -387,6 +387,36 @@ pub enum Commands {
         reason: String,
     },
 
+    /// Clear a recorded pending CCTP burn hash on a transfer stuck at
+    /// `BridgingSubmitting` after a `Dropped` burn classification.
+    ///
+    /// A burn classified `Dropped` latches the aggregate at
+    /// `BridgingSubmitting { pending_burn_tx: Some(dropped_tx) }`: it holds the
+    /// rebalancing guard and no other recovery command can release it
+    /// (`fail-usdc-transfer` rejects it as post-burn, `transfer resume`
+    /// re-derives `Dropped`, `transfer reconcile` rejects
+    /// `BridgingSubmitting`). This clears the recorded hash, returning the
+    /// aggregate to `BridgingSubmitting { pending_burn_tx: None }` so the pre-burn
+    /// `fail-usdc-transfer` path can then release the guard.
+    ///
+    /// ONLY run this AFTER verifying on-chain that the burn never landed (the USDC
+    /// never left the market-maker wallet); clearing the hash while a burn is
+    /// actually live would let `fail-usdc-transfer` release the guard mid-bridge
+    /// and strand the burned funds. Then run `fail-usdc-transfer` to clear the
+    /// guard.
+    ClearPendingBurn {
+        /// USDC rebalance aggregate ID (UUID)
+        #[arg(short = 'i', long = "id")]
+        id: Uuid,
+        /// Why the pending burn is being cleared (shown in CLI output for audit)
+        #[arg(
+            short = 'r',
+            long = "reason",
+            default_value = "Burn verified absent on-chain via CLI"
+        )]
+        reason: String,
+    },
+
     /// Deposit USDC directly to Alpaca from Ethereum (bypasses vault/CCTP)
     ///
     /// This is a simplified command for testing Alpaca integration.
@@ -660,8 +690,8 @@ pub enum TransferCommand {
     /// `--kind usdc` re-drives a single USDC transfer whose CLI invocation was
     /// interrupted after the burn: pass `--id` (printed by `transfer-usdc`) and
     /// the original `--direction`. An unknown id is rejected (never starts a
-    /// fresh burn); the resume uses the persisted amount, so any `--amount` is
-    /// ignored. Operates on the local CQRS state plus a live RPC provider
+    /// fresh burn); the resume uses the persisted amount. Operates on the local
+    /// CQRS state plus a live RPC provider
     /// (re-drives the on-chain burn/mint/deposit flow itself); the bot must not
     /// be concurrently driving the same id.
     ///
@@ -683,10 +713,6 @@ pub enum TransferCommand {
         /// Direction of the original USDC transfer (required for `--kind usdc`)
         #[arg(short = 'd', long = "direction", required_if_eq("kind", "usdc"))]
         direction: Option<TransferDirection>,
-        /// Accepted for compatibility with old `resume-usdc-transfer` runbooks;
-        /// ignored -- the resume always uses the aggregate's persisted amount.
-        #[arg(short = 'a', long = "amount", hide = true)]
-        amount: Option<Usdc>,
     },
 
     /// Reconcile a transfer stuck in a terminal failure to a resolved terminal.
@@ -963,6 +989,10 @@ enum SimpleCommand {
     ReconcileEquityTransfer {
         transfer_type: TransferType,
         id: String,
+        reason: String,
+    },
+    ClearPendingBurn {
+        id: Uuid,
         reason: String,
     },
 }
@@ -1324,9 +1354,6 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
                 kind: TransferResumeKind::Usdc,
                 id: Some(id),
                 direction: Some(direction),
-                // Ignored: a resume always uses the persisted aggregate amount.
-                // Accepted only so old `--amount` runbook invocations still parse.
-                amount: _,
             } => Err(ProviderCommand::ResumeUsdcTransfer { id, direction }),
             TransferCommand::Resume {
                 kind: TransferResumeKind::Usdc,
@@ -1379,6 +1406,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
                 source_chain,
             }),
         },
+        Commands::ClearPendingBurn { id, reason } => {
+            Ok(SimpleCommand::ClearPendingBurn { id, reason })
+        }
     }
 }
 
@@ -1570,6 +1600,9 @@ async fn run_simple_command<W: Write>(
         } => {
             rebalancing::reconcile_equity_transfer_command(stdout, transfer_type, &id, reason, pool)
                 .await
+        }
+        SimpleCommand::ClearPendingBurn { id, reason } => {
+            rebalancing::clear_pending_burn_command(stdout, id, &reason, pool).await
         }
     }
 }
@@ -2135,6 +2168,75 @@ mod tests {
     }
 
     #[test]
+    fn classify_clear_pending_burn_routes_without_provider() {
+        // clear-pending-burn only loads + sends to the event store, so it
+        // must route without an RPC provider.
+        let command = Commands::ClearPendingBurn {
+            id: Uuid::from_u128(456),
+            reason: "test reason".to_string(),
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::ClearPendingBurn { .. }) => {}
+            Ok(_) => panic!("expected clear-pending-burn simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification, got provider command"),
+        }
+    }
+
+    #[test]
+    fn clear_pending_burn_parses() {
+        let id = Uuid::from_u128(0x12_34_56);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "clear-pending-burn",
+            "--id",
+            &id.to_string(),
+            "--reason",
+            "burn verified absent",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ClearPendingBurn {
+                id: parsed_id,
+                reason,
+            } => {
+                assert_eq!(parsed_id, id);
+                assert_eq!(reason, "burn verified absent");
+            }
+            other => panic!("expected clear-pending-burn command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_pending_burn_uses_default_reason_when_omitted() {
+        let id = Uuid::from_u128(0xFE_ED);
+        let cli = Cli::try_parse_from(["st0x-cli", "clear-pending-burn", "--id", &id.to_string()])
+            .unwrap();
+
+        match cli.command {
+            Commands::ClearPendingBurn { reason, .. } => {
+                assert_eq!(
+                    reason, "Burn verified absent on-chain via CLI",
+                    "omitting --reason must use the default"
+                );
+            }
+            other => panic!("expected clear-pending-burn command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn position_release_hedge_requires_reason() {
         let order_id = OffchainOrderId::new();
         let error = Cli::try_parse_from([
@@ -2632,9 +2734,9 @@ mod tests {
     }
 
     #[test]
-    fn transfer_resume_usdc_accepts_and_ignores_legacy_amount_flag() {
+    fn transfer_resume_usdc_rejects_removed_amount_flag() {
         let id = Uuid::from_u128(44);
-        let cli = Cli::try_parse_from([
+        let error = Cli::try_parse_from([
             "st0x-cli",
             "transfer",
             "resume",
@@ -2647,18 +2749,13 @@ mod tests {
             "--amount",
             "100",
         ])
-        .unwrap();
+        .unwrap_err();
 
-        match classify_command(cli.command) {
-            Err(ProviderCommand::ResumeUsdcTransfer {
-                id: parsed_id,
-                direction,
-            }) => {
-                assert_eq!(parsed_id, id);
-                assert!(matches!(direction, TransferDirection::ToRaindex));
-            }
-            _ => panic!("expected resume provider command despite legacy --amount"),
-        }
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "the removed --amount flag must no longer parse; got: {error}",
+        );
     }
 
     #[test]
@@ -2673,7 +2770,6 @@ mod tests {
                 kind: TransferResumeKind::Usdc,
                 id: None,
                 direction: None,
-                amount: None,
             },
         };
 
@@ -3029,7 +3125,6 @@ mod tests {
                 kind: TransferResumeKind::Usdc,
                 id: None,
                 direction: None,
-                amount: None,
             },
         };
 
