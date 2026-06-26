@@ -33,6 +33,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::providers::WsConnect;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
+use metrics::counter;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use task_supervisor::{SupervisedTask, TaskResult};
@@ -311,6 +312,12 @@ impl OrderFillMonitor {
                     (RaindexTradeEvent::TakeOrderV3(Box::new(event)), log)
                 }
             };
+
+            let event_type = match &event {
+                RaindexTradeEvent::ClearV3(_) => "clear",
+                RaindexTradeEvent::TakeOrderV3(_) => "take_order",
+            };
+            counter!("onchain_events_total", "event_type" => event_type).increment(1);
 
             self.handle_log(event, &log, &mut watermarks, &mut buffer)
                 .await?;

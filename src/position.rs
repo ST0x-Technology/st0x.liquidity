@@ -8,6 +8,7 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use metrics::gauge;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -51,6 +52,12 @@ impl std::fmt::Debug for Position {
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
             .finish()
+    }
+}
+
+fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
+    if let Ok(value) = net.to_string().parse::<f64>() {
+        gauge!("position_shares", "symbol" => symbol.to_string()).set(value);
     }
 }
 
@@ -100,13 +107,18 @@ impl EventSourced for Position {
                 price_usdc,
                 seen_at,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net + *amount)?,
-                accumulated_long: (entity.accumulated_long + *amount)?,
-                last_price_usdc: Some(*price_usdc),
-                last_updated: Some(*seen_at),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net + *amount)?;
+                let new_accumulated_long = (entity.accumulated_long + *amount)?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    accumulated_long: new_accumulated_long,
+                    last_price_usdc: Some(*price_usdc),
+                    last_updated: Some(*seen_at),
+                    ..entity.clone()
+                }))
+            }
 
             OnChainOrderFilled {
                 direction: Sell,
@@ -114,13 +126,18 @@ impl EventSourced for Position {
                 price_usdc,
                 seen_at,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net - *amount)?,
-                accumulated_short: (entity.accumulated_short + *amount)?,
-                last_price_usdc: Some(*price_usdc),
-                last_updated: Some(*seen_at),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net - *amount)?;
+                let new_accumulated_short = (entity.accumulated_short + *amount)?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    accumulated_short: new_accumulated_short,
+                    last_price_usdc: Some(*price_usdc),
+                    last_updated: Some(*seen_at),
+                    ..entity.clone()
+                }))
+            }
 
             OffChainOrderPlaced { .. } if entity.pending_offchain_order_id.is_some() => Ok(None),
 
@@ -143,24 +160,32 @@ impl EventSourced for Position {
                 shares_filled,
                 broker_timestamp,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net + shares_filled.inner())?,
-                pending_offchain_order_id: None,
-                last_updated: Some(*broker_timestamp),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net + shares_filled.inner())?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    pending_offchain_order_id: None,
+                    last_updated: Some(*broker_timestamp),
+                    ..entity.clone()
+                }))
+            }
 
             OffChainOrderFilled {
                 direction: Sell,
                 shares_filled,
                 broker_timestamp,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net - shares_filled.inner())?,
-                pending_offchain_order_id: None,
-                last_updated: Some(*broker_timestamp),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net - shares_filled.inner())?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    pending_offchain_order_id: None,
+                    last_updated: Some(*broker_timestamp),
+                    ..entity.clone()
+                }))
+            }
 
             OffChainOrderFailed {
                 offchain_order_id, ..

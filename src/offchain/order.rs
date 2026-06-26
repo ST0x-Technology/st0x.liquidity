@@ -32,6 +32,7 @@ pub(crate) use reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -337,6 +338,9 @@ impl EventSourced for OffchainOrder {
                     direction,
                 };
 
+                let direction_label = format!("{direction:?}").to_lowercase();
+                let symbol_label = symbol.to_string();
+
                 match services.place_market_order(market_order).await {
                     Ok(result) => {
                         if result.placed_shares > shares {
@@ -345,6 +349,13 @@ impl EventSourced for OffchainOrder {
                                 requested: shares,
                             });
                         }
+
+                        counter!(
+                            "hedge_trades_total",
+                            "symbol" => symbol_label,
+                            "direction" => direction_label
+                        )
+                        .increment(1);
 
                         Ok(vec![
                             OffchainOrderEvent::Placed {
@@ -360,19 +371,28 @@ impl EventSourced for OffchainOrder {
                             },
                         ])
                     }
-                    Err(error) => Ok(vec![
-                        OffchainOrderEvent::Placed {
-                            symbol,
-                            shares,
-                            direction,
-                            executor,
-                            placed_at: now,
-                        },
-                        OffchainOrderEvent::Failed {
-                            error: error.to_string(),
-                            failed_at: now,
-                        },
-                    ]),
+                    Err(error) => {
+                        counter!(
+                            "broker_errors_total",
+                            "symbol" => symbol_label,
+                            "kind" => "place_order_failed"
+                        )
+                        .increment(1);
+
+                        Ok(vec![
+                            OffchainOrderEvent::Placed {
+                                symbol,
+                                shares,
+                                direction,
+                                executor,
+                                placed_at: now,
+                            },
+                            OffchainOrderEvent::Failed {
+                                error: error.to_string(),
+                                failed_at: now,
+                            },
+                        ])
+                    }
                 }
             }
 

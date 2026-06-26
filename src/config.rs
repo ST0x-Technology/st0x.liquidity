@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
 use crate::rebalancing::{RebalancingConfig, RebalancingCtx, RebalancingCtxError};
-use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
+use crate::telemetry::{TelemetryConfig, TelemetryCtx};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 use st0x_float_macro::float;
 
@@ -173,7 +173,6 @@ struct Config {
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
-    #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
     tokenization: Option<TokenizationConfig>,
@@ -338,8 +337,6 @@ impl std::fmt::Debug for TravelRuleConfig {
 struct Secrets {
     evm: EvmSecrets,
     broker: BrokerSecrets,
-    #[serde(rename = "hyperdx")]
-    telemetry: Option<TelemetrySecrets>,
     wallet: Option<toml::Value>,
     rest_api: Option<RestApiSecrets>,
 }
@@ -601,7 +598,7 @@ fn parse_and_validate(
         })?;
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
-    let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
+    let telemetry = config.telemetry.map(TelemetryCtx::new);
 
     // Execution threshold is determined by broker capabilities:
     // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
@@ -1037,8 +1034,6 @@ pub enum CtxError {
          expected {min}..={max}"
     )]
     CounterTradeSlippageBpsOutOfRange { configured: u16, min: u16, max: u16 },
-    #[error(transparent)]
-    Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
     #[error(
@@ -1105,7 +1100,6 @@ impl CtxError {
             Self::CounterTradeSlippageBpsOutOfRange { .. } => {
                 "counter trade slippage bps out of range"
             }
-            Self::Telemetry(_) => "telemetry assembly error",
             Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
                 "cash operational limit below minimum withdrawal"
             }
@@ -1873,7 +1867,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn telemetry_ctx_assembled_from_config_and_secrets() {
+    async fn telemetry_ctx_assembled_from_config() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -1891,96 +1885,29 @@ pub(crate) mod tests {
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
 
-            [hyperdx]
+            [telemetry]
             service_name = "test-service"
+            traces_endpoint = "http://100.0.0.1:10428"
+            logs_endpoint = "http://100.0.0.1:9428"
         "#,
         );
 
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [broker]
-            type = "dry-run"
-
-            [wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-            [hyperdx]
-            api_key = "test-api-key"
-        "#,
-        );
-
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), dry_run_secrets_toml().path())
             .await
             .unwrap();
         let telemetry = ctx.telemetry.as_ref().expect("telemetry should be Some");
-        assert_eq!(telemetry.api_key, "test-api-key");
         assert_eq!(telemetry.service_name, "test-service");
+        assert_eq!(telemetry.traces_endpoint, "http://100.0.0.1:10428");
+        assert_eq!(telemetry.logs_endpoint, "http://100.0.0.1:9428");
     }
 
     #[tokio::test]
-    async fn telemetry_config_without_secrets_fails() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-            apalis_finished_job_cleanup_interval_secs = 3600
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-
-            deployment_block = 1
-            required_confirmations = 3
-
-            [hyperdx]
-            service_name = "test-service"
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
-        assert!(
-            matches!(
-                result,
-                Err(CtxError::Telemetry(
-                    crate::telemetry::TelemetryAssemblyError::SecretsMissing
-                ))
-            ),
-            "Expected TelemetryAssemblyError::SecretsMissing error, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn telemetry_secrets_without_config_fails() {
+    async fn telemetry_absent_when_config_section_missing() {
         let config = minimal_config_toml();
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "dry-run"
-
-            [hyperdx]
-            api_key = "test-api-key"
-        "#,
-        );
-
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
-        assert!(
-            matches!(
-                result,
-                Err(CtxError::Telemetry(
-                    crate::telemetry::TelemetryAssemblyError::ConfigMissing
-                ))
-            ),
-            "Expected TelemetryAssemblyError::ConfigMissing error, got {result:?}"
-        );
+        let ctx = Ctx::load_files(config.path(), dry_run_secrets_toml().path())
+            .await
+            .unwrap();
+        assert!(ctx.telemetry.is_none());
     }
 
     #[tokio::test]

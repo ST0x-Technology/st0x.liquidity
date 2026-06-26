@@ -5,6 +5,7 @@
 //! traditional brokerages.
 
 use anyhow::Context;
+use metrics_exporter_prometheus::PrometheusHandle;
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
 mod alpaca_wallet;
 pub mod api;
+pub(crate) mod metrics;
 #[cfg(any(test, feature = "test-support"))]
 pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
@@ -97,6 +99,8 @@ pub async fn run_bot_session_with_event_channel(
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
 
+    let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
+
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
         event_sender.clone(),
@@ -111,6 +115,7 @@ pub async fn run_bot_session_with_event_channel(
         event_sender.clone(),
         inventory.clone(),
         recovery_cell.clone(),
+        metrics_handle,
     );
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
@@ -133,6 +138,7 @@ fn spawn_server_task(
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
     recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
+    metrics_handle: PrometheusHandle,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
         .merge(("port", ctx.server_port))
@@ -140,6 +146,7 @@ fn spawn_server_task(
 
     let rocket = rocket::custom(rocket_config)
         .mount("/", api::routes())
+        .mount("/", metrics::routes())
         .mount("/api", dashboard::routes())
         .manage(pool.clone())
         .manage(ctx.clone())
@@ -152,7 +159,8 @@ fn spawn_server_task(
             settings: dashboard::settings_from_ctx(ctx),
         })
         .manage(recovery_cell)
-        .manage(api::ResumeLock(tokio::sync::Mutex::new(())));
+        .manage(api::ResumeLock(tokio::sync::Mutex::new(())))
+        .manage(metrics_handle);
 
     tokio::spawn(rocket.launch())
 }

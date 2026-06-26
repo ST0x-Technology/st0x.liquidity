@@ -2,7 +2,10 @@ server_port = 8080
 log_level = "debug"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
-hyperdx.service_name = "st0x-hedge"
+[telemetry]
+service_name = "st0x-hedge"
+traces_endpoint = "http://100.x.x.x:10428"
+logs_endpoint = "http://100.x.x.x:9428"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).
 # Only needed when using Alpaca Broker API.
