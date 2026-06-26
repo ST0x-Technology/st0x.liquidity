@@ -211,13 +211,39 @@ fn report_with(
     query: PnlQuery,
     symbols: BTreeSet<String>,
 ) -> PnlResponse {
-    build_pnl_response_from_rows(
+    struct ReportInput {
+        events: Vec<PositionEventRow>,
+        position_rows: Vec<PositionViewRow>,
+        cost_rows: Vec<CostEventRow>,
+        alpaca_activities: Vec<AccountActivity>,
+        query: PnlQuery,
+        symbols: BTreeSet<String>,
+    }
+
+    let input = ReportInput {
         events,
         position_rows,
         cost_rows,
         alpaca_activities,
-        &query,
+        query,
         symbols,
+    };
+    let ReportInput {
+        events,
+        position_rows,
+        cost_rows,
+        alpaca_activities,
+        query,
+        symbols,
+    } = input;
+
+    build_pnl_response_from_rows(
+        events,
+        &position_rows,
+        &cost_rows,
+        &alpaca_activities,
+        &query,
+        &symbols,
         vec![
             ATTRIBUTION_WARNING.to_owned(),
             BASELINE_WARNING.to_owned(),

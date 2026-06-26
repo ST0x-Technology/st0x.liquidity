@@ -41,7 +41,7 @@ pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<Pnl
                 market_sessions
                     .iter()
                     .next()
-                    .map_or("mixed".to_owned(), |session| (*session).to_owned())
+                    .map_or_else(|| "mixed".to_owned(), |session| (*session).to_owned())
             } else {
                 "mixed".to_owned()
             };
@@ -49,7 +49,7 @@ pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<Pnl
                 counter_sessions
                     .iter()
                     .next()
-                    .map_or("mixed".to_owned(), |session| (*session).to_owned())
+                    .map_or_else(|| "mixed".to_owned(), |session| (*session).to_owned())
             } else {
                 "mixed".to_owned()
             };

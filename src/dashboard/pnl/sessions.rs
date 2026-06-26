@@ -113,10 +113,11 @@ pub(crate) fn matches_cost_symbol_filter(
     entry: &CostEntryInternal,
     symbols: &BTreeSet<String>,
 ) -> bool {
-    match &entry.symbol {
-        Some(symbol) => symbols.is_empty() || symbols.contains(symbol),
-        None => symbols.is_empty(),
-    }
+    symbols.is_empty()
+        || entry
+            .symbol
+            .as_ref()
+            .is_some_and(|symbol| symbols.contains(symbol))
 }
 
 pub(crate) fn seconds_between(start_iso: &str, end_iso: &str) -> i64 {

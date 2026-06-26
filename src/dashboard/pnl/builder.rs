@@ -23,14 +23,14 @@ use super::windows::build_windows;
 
 pub(crate) fn build_pnl_response_from_rows(
     event_rows: Vec<PositionEventRow>,
-    position_rows: Vec<PositionViewRow>,
-    cost_rows: Vec<CostEventRow>,
-    alpaca_activities: Vec<AccountActivity>,
+    position_rows: &[PositionViewRow],
+    cost_rows: &[CostEventRow],
+    alpaca_activities: &[AccountActivity],
     query: &PnlQuery,
-    symbols: BTreeSet<String>,
+    symbols: &BTreeSet<String>,
     mut warnings: Vec<String>,
 ) -> PnlResponse {
-    let (position_nets, position_symbols) = parse_position_view(&position_rows, &mut warnings);
+    let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings);
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
     let mut books: HashMap<String, SymbolBook> = HashMap::new();
     let mut entries = Vec::new();
@@ -50,7 +50,7 @@ pub(crate) fn build_pnl_response_from_rows(
         match row.event_type.as_str() {
             "PositionEvent::OnChainOrderFilled" => {
                 if let Some(fill) = parse_onchain_fill(&row, &mut warnings) {
-                    apply_onchain_fill(book, fill, &mut entries, &mut warnings);
+                    apply_onchain_fill(book, &fill, &mut entries, &mut warnings);
                 }
             }
             "PositionEvent::OffChainOrderPlaced" => {
@@ -60,7 +60,7 @@ pub(crate) fn build_pnl_response_from_rows(
                 if let Some(fill) = parse_offchain_fill(&row, &mut warnings) {
                     apply_offchain_fill(
                         book,
-                        fill,
+                        &fill,
                         &mut entries,
                         &mut warnings,
                         &mut unmatched_offchain_allocations,
@@ -110,8 +110,8 @@ pub(crate) fn build_pnl_response_from_rows(
     let end = (start + query.normalized_limit()).min(total);
     let page_entries = filtered_entries[start..end].to_vec();
 
-    let mut cost_replay = build_cost_entries(&cost_rows, &mut warnings);
-    let alpaca_entries = build_alpaca_activity_cost_entries(&alpaca_activities);
+    let mut cost_replay = build_cost_entries(cost_rows, &mut warnings);
+    let alpaca_entries = build_alpaca_activity_cost_entries(alpaca_activities);
     if !alpaca_entries.is_empty() {
         warnings.push(format!(
             "Cost coverage note: {} Alpaca account activity rows were fetched from the broker API \
@@ -124,7 +124,7 @@ pub(crate) fn build_pnl_response_from_rows(
     let mut filtered_cost_entries: Vec<_> = cost_replay
         .entries
         .into_iter()
-        .filter(|entry| matches_cost_symbol_filter(entry, &symbols))
+        .filter(|entry| matches_cost_symbol_filter(entry, symbols))
         .filter(|entry| matches_cost_date_filter(entry, query))
         .collect();
     filtered_cost_entries.sort_by(|left, right| {

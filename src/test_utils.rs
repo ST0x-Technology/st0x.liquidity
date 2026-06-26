@@ -49,6 +49,7 @@ impl Drop for AnvilPermit {
             Err(poisoned) => poisoned.into_inner(),
         };
         *in_use = in_use.saturating_sub(1);
+        drop(in_use);
         available.notify_one();
     }
 }

@@ -182,7 +182,7 @@ fn open_residual_lot(book: &mut SymbolBook, fill: &Fill, remaining: Num) {
 
 pub(crate) fn apply_onchain_fill(
     book: &mut SymbolBook,
-    fill: Fill,
+    fill: &Fill,
     entries: &mut Vec<PnlEntry>,
     warnings: &mut Vec<String>,
 ) {
@@ -202,7 +202,7 @@ pub(crate) fn apply_onchain_fill(
         &mut book.long_lots
     };
     let remaining = match_fill_against_lots(
-        &fill,
+        fill,
         source_lots,
         &mut book.summary,
         &mut book.matched_onchain_shares,
@@ -218,7 +218,7 @@ pub(crate) fn apply_onchain_fill(
         .entry(fill.id.clone())
         .or_default();
     *original += &remaining;
-    open_residual_lot(book, &fill, remaining);
+    open_residual_lot(book, fill, remaining);
 }
 
 pub(crate) fn apply_offchain_placement(
@@ -243,7 +243,7 @@ pub(crate) fn apply_offchain_placement(
 
 pub(crate) fn apply_offchain_fill(
     book: &mut SymbolBook,
-    fill: Fill,
+    fill: &Fill,
     entries: &mut Vec<PnlEntry>,
     warnings: &mut Vec<String>,
     unmatched_offchain_allocations: &mut Vec<UnmatchedOffchainAllocation>,
@@ -264,7 +264,7 @@ pub(crate) fn apply_offchain_fill(
         &mut book.long_lots
     };
     let remaining = match_fill_against_lots(
-        &fill,
+        fill,
         source_lots,
         &mut book.summary,
         &mut book.matched_onchain_shares,
@@ -278,7 +278,7 @@ pub(crate) fn apply_offchain_fill(
             fill_id: fill.id.clone(),
             shares: remaining.clone(),
         });
-        open_residual_lot(book, &fill, remaining);
+        open_residual_lot(book, fill, remaining);
     }
 }
 

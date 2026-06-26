@@ -30,11 +30,11 @@ pub(crate) async fn build_pnl_report(
 
     Ok(build_pnl_response_from_rows(
         event_rows,
-        position_rows,
-        cost_rows,
-        alpaca_activities,
+        &position_rows,
+        &cost_rows,
+        &alpaca_activities,
         query,
-        symbols,
+        &symbols,
         warnings,
     ))
 }

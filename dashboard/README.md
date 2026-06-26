@@ -6,9 +6,8 @@ Real-time monitoring dashboard for the st0x liquidity system.
 
 - Dashboard: inventory, recent trades, and transfers.
 - Orders: active Raindex order view.
-- PnL: backend-computed persisted fill replay for counter-trade PnL,
-  directional exposure PnL, total PnL, current replay exposure, and tracked
-  costs/revenues.
+- PnL: backend-computed persisted fill replay for counter-trade PnL, directional
+  exposure PnL, total PnL, current replay exposure, and tracked costs/revenues.
 - Logs: structured production log browser.
 
 ## Development
@@ -45,8 +44,8 @@ PUBLIC_BACKEND_API_URL=https://st0x-liquidity-nixos.taile5cf8a.ts.net \
 bun run dev
 ```
 
-In local dev, `PUBLIC_BACKEND_API_URL` points the Vite proxy at a backend origin.
-The browser calls same-origin dashboard paths such as `/pnl`, `/health`,
+In local dev, `PUBLIC_BACKEND_API_URL` points the Vite proxy at a backend
+origin. The browser calls same-origin dashboard paths such as `/pnl`, `/health`,
 `/trades`, and `/transfers`; Vite forwards those requests to the configured
 backend. Production uses the same browser contract through the Nginx dashboard
 proxy.

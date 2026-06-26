@@ -551,9 +551,8 @@ pub(crate) fn build_cost_entries(rows: &[CostEventRow], warnings: &mut Vec<Strin
 
     if missing_cost_observation_count > 0 {
         warnings.push(format!(
-            "Cost coverage note: {} tokenization completion events did not report a fee value; \
+            "Cost coverage note: {missing_cost_observation_count} tokenization completion events did not report a fee value; \
              those observations are treated as zero because no fee amount is persisted.",
-            missing_cost_observation_count
         ));
     }
 

@@ -92,8 +92,7 @@ pub(crate) fn ordered_position_events(
             let timestamp_ms = timestamp
                 .as_deref()
                 .and_then(parse_timestamp)
-                .map(|parsed| parsed.timestamp_millis())
-                .unwrap_or(i64::MAX);
+                .map_or(i64::MAX, |parsed| parsed.timestamp_millis());
             if timestamp.is_some() && timestamp_ms == i64::MAX {
                 warnings.push(format!(
                     "PnL audit note: invalid replay timestamp for {} row {}; using event row order",

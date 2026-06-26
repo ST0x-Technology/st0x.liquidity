@@ -26,7 +26,7 @@ impl AccountActivitiesQuery {
         Self {
             activity_types: PNL_ACTIVITY_TYPES
                 .iter()
-                .map(|value| value.to_string())
+                .map(std::string::ToString::to_string)
                 .collect(),
             after,
             until,
