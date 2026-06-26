@@ -658,22 +658,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_session_closed_at_session_close_boundary() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        mock_trading_day(&server, "2025-01-06");
-
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let session_close = et_time_as_utc("2025-01-06", 20, 0);
-
-        assert_eq!(
-            market_session_at(&client, session_close).await.unwrap(),
-            MarketSession::Closed,
-            "Exactly at session_close should be Closed"
-        );
-    }
-
-    #[tokio::test]
     async fn market_session_uses_early_close_calendar_boundaries() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
@@ -757,6 +741,25 @@ mod tests {
             market_session_at(&client, at_close).await.unwrap(),
             MarketSession::Extended,
             "Exactly at regular close transitions to Extended (after-hours)"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_closed_at_session_close_boundary() {
+        // The extended window is half-open: `now < session_close`, so 20:00 ET
+        // exactly (the documented after-hours close) is already Closed. Pins the
+        // top edge of the session so a `<=` regression would be caught.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let at_session_close = et_time_as_utc("2025-01-06", 20, 0);
+
+        assert_eq!(
+            market_session_at(&client, at_session_close).await.unwrap(),
+            MarketSession::Closed,
+            "Exactly at session_close (20:00 ET) the extended session has ended -> Closed"
         );
     }
 }

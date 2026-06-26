@@ -325,6 +325,20 @@ the broker calendar:
   placed. The exposure is left for the next scan to hedge once the venue
   reopens, rather than failing a durable job against a multi-hour closure.
 
+**External contract (Alpaca).** The session windows (pre-market 04:00–09:30 ET,
+after-hours 16:00–20:00 ET), the extended-hours order constraints (only `limit`
+orders with `time_in_force` of `day` or `gtc` and `extended_hours = true` are
+accepted; market orders are rejected during extended hours), and the minimum
+price variance (limit prices at or above $1.00 must be in $0.01 increments — two
+decimal places — and below $1.00 may go to $0.0001 — four decimals — with a
+sub-penny increment rejected at submission, error code `42210000`) are all
+specified by Alpaca's order documentation:
+<https://docs.alpaca.markets/us/docs/orders-at-alpaca>. The regular
+`open`/`close` edges are read from Alpaca's `/v1/calendar`; the extended
+`session_open`/ `session_close` edges are also read from the calendar but
+cross-checked against the documented 04:00/20:00 window (a mismatch is logged),
+since Alpaca's reference does not formally define those two fields.
+
 The session is re-checked at execution time, immediately before placement, so a
 hedge job that was enqueued in one session but runs after a 9:30/16:00 boundary
 places the order type appropriate to the _current_ session, not the stale
