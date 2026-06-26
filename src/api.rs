@@ -1275,13 +1275,15 @@ async fn interrupted_transfers(
     }))
 }
 
-#[derive(Serialize)]
+/// Wire contract for `/transfers/resume`, shared with the CLI wrapper so the
+/// two cannot drift.
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ResumeResponse {
-    mints_attempted: usize,
-    mints_failed: usize,
-    redemptions_attempted: usize,
-    redemptions_failed: usize,
+pub(crate) struct ResumeResponse {
+    pub(crate) mints_attempted: usize,
+    pub(crate) mints_failed: usize,
+    pub(crate) redemptions_attempted: usize,
+    pub(crate) redemptions_failed: usize,
 }
 
 async fn resume_transfers(

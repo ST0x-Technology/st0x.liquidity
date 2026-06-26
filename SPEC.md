@@ -3057,6 +3057,9 @@ named exemptions defined after the list:**
 
 - `resume` -- drive an interrupted, non-terminal operation forward along its
   normal path. Never forces a transition and is idempotent against double-spend.
+  Realized per-id for USDC transfers (`--kind usdc`) and as a bulk resume of ALL
+  interrupted mints and redemptions for equity (`--kind equity`, via the running
+  bot's REST API; each transfer succeeds or fails independently).
 - `recheck` -- re-query the external provider for ground truth and apply it; may
   un-fail a terminal `Failed` operation or resume a non-terminal one along its
   normal path. Requires the running bot (REST). Realized today for equity mints
@@ -3104,11 +3107,12 @@ effect rather than a generic intent:
 - **Execution mode is part of each command's contract.** Help text states which
   mode the command uses: direct-DB (the operator must ensure the bot is not
   concurrently driving the same id); direct-DB plus a live RPC provider
-  (`transfer resume`, today `resume-usdc-transfer`, drives the on-chain flow
-  against the local aggregate store, with the same no-concurrent-bot caveat);
-  live RPC only (`cctp complete-mint` touches no database state -- the caveat is
-  the bot concurrently driving the same on-chain mint); or the running bot
-  (REST). `recheck` is the only command that requires the bot.
+  (`transfer resume --kind usdc`, today `resume-usdc-transfer`, drives the
+  on-chain flow against the local aggregate store, with the same
+  no-concurrent-bot caveat); live RPC only (`cctp complete-mint` touches no
+  database state -- the caveat is the bot concurrently driving the same on-chain
+  mint); or the running bot (REST). `recheck` and
+  `transfer resume --kind equity` are the only commands that require the bot.
 - **`--reason` MUST be required, with no default, on every event-emitting
   destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
   A defaulted reason is an audit-hostile record and violates the
