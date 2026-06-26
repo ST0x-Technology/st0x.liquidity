@@ -1096,7 +1096,9 @@
               <p class="mt-2">
                 Counter-trading on maps to the current Alpaca hedge readiness window. The deployed
                 hotpath uses regular-hours market orders, so RTH is active and pre-market,
-                post-market, overnight, and weekend are inactive.
+                post-market, overnight, and weekend are inactive. Historical rows are classified by
+                timestamp using this current session model; this does not replay a persisted
+                historical enabled/disabled config flag.
               </p>
             </div>
           </div>
