@@ -406,7 +406,7 @@ impl RebalanceTimingProjection {
                         %operation_id,
                         sequence,
                         %error,
-                        "Skipping rebalance event: corrupt stored timing row (repair with rebuild-view --all)"
+                        "Skipping rebalance event: corrupt stored timing row (repair with view rebuild --all)"
                     );
                     poisoned_aggregates.insert(aggregate_id);
                     continue;

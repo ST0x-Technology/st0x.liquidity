@@ -917,7 +917,7 @@ impl RebalancingService {
         //   The durable-Reconciled check is safe to run at any age: it only
         //   fires when the store already shows Reconciled, and clearing the guard
         //   at that point is always correct. This ensures that a CLI
-        //   `reconcile-usdc-transfer` issued before the failed transfer ages past
+        //   `transfer reconcile` issued before the failed transfer ages past
         //   `transfer_timeout` still takes effect on the next sweep tick.
         //
         // - Pre-burn entries (not yet post-burn) are only selected after the
@@ -1075,7 +1075,7 @@ impl RebalancingService {
     /// re-arming it would re-drive a known-failing transfer on every restart and
     /// bypass the retry budget, contradicting [`JobQueue::requeue_orphaned`]'s
     /// policy of leaving `Failed` rows latched. The operator path for such a
-    /// transfer is the manual `resume-usdc-transfer` CLI, not an automatic re-arm.
+    /// transfer is the manual `transfer resume --kind usdc` CLI, not an automatic re-arm.
     ///
     /// A recoverable post-burn `BridgingFailed` is the exception: it gates on
     /// [`Self::transfer_in_flight_for_id`] instead (only an in-flight row blocks),
@@ -1311,7 +1311,7 @@ impl RebalancingService {
             // The Reconciled check is always safe: it only fires when the
             // aggregate is actually Reconciled and clearing the guard at that
             // point is always correct. Running it before the timeout gate means
-            // that a CLI `reconcile-usdc-transfer` issued before the failed
+            // that a CLI `transfer reconcile` issued before the failed
             // transfer ages past `transfer_timeout` takes effect on the next
             // sweep tick rather than waiting for the full timeout window.
             let usdc_store_guard = self.usdc_store.read().await;
@@ -3515,7 +3515,7 @@ impl RebalancingService {
     }
 
     /// Rebuilds in-memory tracking for a failed mint being recovered via
-    /// `recheck-transfer`, so the live reactor applies the
+    /// `transfer recheck`, so the live reactor applies the
     /// `ProviderCompletionRecovered` inventory effect and the terminal
     /// cleanup once the recovery event is dispatched.
     ///
@@ -3559,7 +3559,7 @@ impl RebalancingService {
         // A third shape the timeout/explicit branches below do not cover: the
         // failure left the in-flight already established (a `Start` ran but the
         // failure never cancelled it back to available -- e.g. an out-of-process
-        // `fail-transfer`, or a reactor that recorded the failure without
+        // `transfer fail`, or a reactor that recorded the failure without
         // running `cancel`). That is already the canonical pre-complete shape,
         // so re-establishing it with another `Start` would double-count
         // (quantity -> 2*quantity) and strand the quantity in-flight after the
@@ -3695,7 +3695,7 @@ impl RebalancingService {
     }
 
     /// Rebuilds in-memory tracking for a failed redemption being recovered
-    /// via `recheck-transfer`. See [`Self::rebuild_mint_tracking_for_recovery`]
+    /// via `transfer recheck`. See [`Self::rebuild_mint_tracking_for_recovery`]
     /// for why inventory balances are left untouched on the explicit-failure
     /// path: a failed redemption never cancelled its in-flight transfer, so the
     /// recovery event's inventory arm completes that still-pending transfer.
@@ -11283,7 +11283,7 @@ mod tests {
     }
 
     /// The main RAI-1017 regression test: the operator runs
-    /// `reconcile-usdc-transfer` in a separate CLI process, which writes
+    /// `transfer reconcile` in a separate CLI process, which writes
     /// `OperatorReconciled` to durable storage. The live server's
     /// `usdc_in_progress` guard must clear on the next sweep tick without
     /// requiring a restart.
@@ -11414,7 +11414,7 @@ mod tests {
 
     /// Reconciled check fires even when `last_progress_at` is RECENT (within
     /// `transfer_timeout`). This is the key correctness invariant: a CLI
-    /// `reconcile-usdc-transfer` run before the failure has aged past the
+    /// `transfer reconcile` run before the failure has aged past the
     /// timeout must still clear the guard on the next sweep tick, not wait
     /// for the full timeout window to elapse.
     #[tokio::test]
@@ -12016,7 +12016,7 @@ mod tests {
     /// Exercises the real restart-then-CLI-reconcile path end-to-end:
     /// `recover_usdc_guard` seeds tracking for a stranded `DepositFailed`
     /// aggregate (path 1), then the sweep detects the operator's CLI
-    /// `reconcile-usdc-transfer` via durable `Reconciled` state and clears
+    /// `transfer reconcile` via durable `Reconciled` state and clears
     /// the guard (path 2). Calling `recover_usdc_guard` directly (rather than
     /// manually planting tracking) ensures both paths are regression-tested
     /// together: a break in path 1 is caught here, not silently missed.
@@ -12079,7 +12079,7 @@ mod tests {
         // which is well above the 1s test timeout, regardless of how fast the
         // store.send calls completed.
 
-        // Simulate the operator running `reconcile-usdc-transfer` in a
+        // Simulate the operator running `transfer reconcile` in a
         // separate CLI process (the store emits OperatorReconciled).
 
         store
@@ -12151,7 +12151,7 @@ mod tests {
 
     /// Restart + CLI reconcile for `ConversionFailed{BaseToAlpaca}`:
     /// the post-deposit USDC->USD conversion failure that holds the guard,
-    /// cannot self-recover, and accepts `reconcile-usdc-transfer`.
+    /// cannot self-recover, and accepts `transfer reconcile`.
     /// After restart, `recover_usdc_guard` must seed tracking for it so the
     /// sweep can detect the CLI-emitted `Reconciled` state and clear the guard
     /// without a second restart.
@@ -12280,7 +12280,7 @@ mod tests {
             "recover_usdc_guard must latch the guard for ConversionFailed(BtA)"
         );
 
-        // Simulate the operator running `reconcile-usdc-transfer` in a
+        // Simulate the operator running `transfer reconcile` in a
         // separate CLI process.
         store
             .send(
@@ -12434,7 +12434,7 @@ mod tests {
             "non-resumable AlpacaToBase BridgingFailed must not be re-armed"
         );
 
-        // Simulate the operator running `reconcile-usdc-transfer` in a
+        // Simulate the operator running `transfer reconcile` in a
         // separate CLI process.
         store
             .send(
@@ -12966,7 +12966,8 @@ mod tests {
     /// retry budget (a terminal `Failed` row) must NOT be re-armed -- re-driving
     /// it every restart would bypass the retry budget and silently retry a
     /// known-failing transfer. It latches for operator reconciliation (recoverable
-    /// via the `resume-usdc-transfer` CLI), matching `requeue_orphaned`'s policy of
+    /// via the `transfer resume --kind usdc` CLI), matching `requeue_orphaned`'s
+    /// policy of
     /// leaving `Failed` rows alone.
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_when_job_already_failed() {

@@ -635,7 +635,7 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         anyhow::bail!(
             "fail-usdc-transfer: transfer {id} is in a post-burn state. \
              A CCTP burn may have already been broadcast. Refusing to act -- \
-             use reconcile-usdc-transfer for post-burn failures."
+             use transfer reconcile for post-burn failures."
         );
     }
 
@@ -733,8 +733,8 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         FailBridgingOutcome::ConcurrentBurn => {
             anyhow::bail!(
                 "fail-usdc-transfer: a CCTP burn was recorded concurrently for transfer {id}. \
-                 The guard was NOT cleared. Use reconcile-usdc-transfer for this post-burn \
-                 failure. NOTE: reconcile-usdc-transfer must only be used after confirming \
+                 The guard was NOT cleared. Use transfer reconcile for this post-burn \
+                 failure. NOTE: transfer reconcile must only be used after confirming \
                  on-chain that the CCTP burn did NOT complete (or the minted USDC was \
                  accounted for out-of-band); premature reconciliation on an in-flight bridge \
                  strands the arriving funds."
@@ -2840,7 +2840,7 @@ mod tests {
     async fn fail_usdc_transfer_rejects_conversion_failed_base_to_alpaca() {
         // ConversionFailed{BaseToAlpaca} is post-deposit/post-burn and holds the
         // rebalancing guard (per holds_rebalance_guard()). The is_post_burn gate
-        // must reject it so the operator is routed to reconcile-usdc-transfer.
+        // must reject it so the operator is routed to transfer reconcile.
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000E);
 
@@ -3283,7 +3283,7 @@ mod tests {
         store.send(id, command).await.unwrap();
     }
 
-    /// `fail-transfer --type redemption` on a redemption stuck in `TokensSent`
+    /// `transfer fail --kind redemption` on a redemption stuck in `TokensSent`
     /// must dispatch `FailDetection { Operator }` and persist the operator's
     /// `--reason`, recoverable from the replayed `Failed` state.
     #[tokio::test]
@@ -3326,7 +3326,7 @@ mod tests {
         );
     }
 
-    /// `fail-transfer --type redemption` on a redemption stuck in `Pending`
+    /// `transfer fail --kind redemption` on a redemption stuck in `Pending`
     /// (Alpaca detected the transfer but never completed it) must dispatch
     /// `RejectRedemption` and persist the operator's `--reason`.
     #[tokio::test]
