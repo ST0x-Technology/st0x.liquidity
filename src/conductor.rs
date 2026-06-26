@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
+use std::num::TryFromIntError;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
@@ -34,8 +35,8 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    AggregateError, LifecycleError, Projection, SendError, Store, StoreBuilder, compact_events,
-    incremental_vacuum, load_all_ids, load_entity,
+    AggregateError, EventSourced, LifecycleError, Projection, SendError, Store, StoreBuilder,
+    compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::{
@@ -73,7 +74,7 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError,
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
-use crate::position::{Position, PositionCommand, PositionError, TradeId};
+use crate::position::{Position, PositionCommand, PositionError, PositionEvent, TradeId};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
     ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
@@ -154,6 +155,7 @@ pub(crate) async fn setup_apalis_tables(
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
 pub(crate) struct TradeProcessingCqrs {
+    pub(crate) pool: SqlitePool,
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) position_projection: Arc<Projection<Position>>,
@@ -2228,28 +2230,83 @@ pub(crate) async fn execute_settle_fill(
     position.send(base_symbol, command).await
 }
 
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) async fn process_queued_trade<E: Executor>(
-    executor: &E,
-    trade_event: &EmittedOnChain<RaindexTradeEvent>,
-    trade: OnchainTrade,
-    cqrs: &TradeProcessingCqrs,
-    asset_enabled: bool,
-) -> Result<Option<OffchainOrderId>, TradeAccountingError>
-where
-    TradeAccountingError: From<E::Error>,
-{
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PositionFillLookupError {
+    #[error("Failed to convert log_index for fill {trade_id}: {source}")]
+    LogIndex {
+        trade_id: OnChainTradeId,
+        #[source]
+        source: TryFromIntError,
+    },
+    #[error("Failed to query durable position fill guard for {trade_id}: {source}")]
+    Query {
+        trade_id: OnChainTradeId,
+        #[source]
+        source: sqlx::Error,
+    },
+}
+
+/// Returns `true` when the `Position` aggregate already has a durable
+/// `OnChainOrderFilled` event for the given `(tx_hash, log_index)`.
+///
+/// Used by the CLI's `process-tx` resume path to guard against
+/// double-counting a witnessed-but-unacknowledged fill. The Position's
+/// single-slot `last_acknowledged_trade_id` guard only deduplicates the
+/// immediately preceding fill; if a newer fill has since advanced the
+/// slot, a CLI retry would re-apply the old fill without this durable check.
+pub(crate) async fn position_fill_already_recorded(
+    pool: &SqlitePool,
+    symbol: &Symbol,
+    trade_id: &OnChainTradeId,
+) -> Result<bool, PositionFillLookupError> {
+    let tx_hash_str = trade_id.tx_hash.to_string();
+    let log_index =
+        i64::try_from(trade_id.log_index).map_err(|source| PositionFillLookupError::LogIndex {
+            trade_id: trade_id.clone(),
+            source,
+        })?;
+
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_type = ? \
+         AND aggregate_id = ? \
+         AND event_type = ? \
+         AND json_extract(payload, '$.OnChainOrderFilled.trade_id.tx_hash') = ? \
+         AND CAST(json_extract(payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = ?",
+    )
+    .bind(Position::AGGREGATE_TYPE)
+    .bind(symbol.to_string())
+    .bind(PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
+    .bind(tx_hash_str)
+    .bind(log_index)
+    .fetch_one(pool)
+    .await
+    .map_err(|source| PositionFillLookupError::Query {
+        trade_id: trade_id.clone(),
+        source,
+    })?;
+
+    Ok(count > 0)
+}
+
+pub(crate) enum FillAccountingOutcome {
+    AlreadyAcknowledged,
+    Accounted { trade_id: OnChainTradeId },
+}
+
+pub(crate) async fn account_for_onchain_fill(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    block_number: u64,
+    threshold: ExecutionThreshold,
+) -> Result<FillAccountingOutcome, TradeAccountingError> {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
     };
 
-    // A fill we cannot timestamp can be neither witnessed nor acknowledged.
-    // Fail loudly so the apalis retry surfaces it as an operator-visible
-    // failure instead of completing the job and dropping the fill silently.
-    // The timestamp is baked into the job payload, so retries cannot resolve
-    // it -- they burn the (small) retry budget before the terminal-failure
-    // alert fires, which is an acceptable cost for not silently losing a fill.
     let Some(block_timestamp) = trade.block_timestamp else {
         error!(
             ?trade_id,
@@ -2261,12 +2318,7 @@ where
         });
     };
 
-    // The dedupe is step-grained (ADR 0005): only a trade the position
-    // has acknowledged is fully processed. A trade that exists but is
-    // not acknowledged means a previous delivery died between the
-    // witness and acknowledge writes -- resume the acknowledge pair
-    // instead of skipping the fill into permanent loss.
-    match cqrs.onchain_trade.load(&trade_id).await {
+    match onchain_trade.load(&trade_id).await {
         Ok(Some(state)) if state.is_acknowledged() => {
             debug!(
                 ?trade_id,
@@ -2277,8 +2329,8 @@ where
             // between MARK and SETTLE leaves the trade marked but still in
             // the pending set. The marker is durable, so prune it now. A
             // no-op when already pruned.
-            execute_settle_fill(&cqrs.position, &trade).await?;
-            return Ok(None);
+            execute_settle_fill(position, trade).await?;
+            return Ok(FillAccountingOutcome::AlreadyAcknowledged);
         }
         Ok(Some(state)) => {
             info!(
@@ -2287,43 +2339,74 @@ where
                 "Trade witnessed but not acknowledged; resuming fill accounting"
             );
 
-            // A crash in the witness->enrich window leaves the trade
-            // witnessed but un-enriched. Enrich now so the acknowledged
-            // trade is not permanently stuck with `enrichment: None` --
-            // mirroring the fresh-trade path. Best-effort: enrichment is
-            // observability data, not financial state.
             if !state.is_enriched() {
-                execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
+                execute_enrich_trade(onchain_trade, trade).await;
             }
         }
         Ok(None) => {
-            let witnessed = execute_witness_trade(
-                &cqrs.onchain_trade,
-                &trade,
-                trade_event.block_number,
-                block_timestamp,
-            )
-            .await?;
+            let witnessed =
+                execute_witness_trade(onchain_trade, trade, block_number, block_timestamp).await?;
 
-            if !witnessed {
-                return Ok(None);
+            if witnessed {
+                execute_enrich_trade(onchain_trade, trade).await;
+            } else {
+                match onchain_trade.load(&trade_id).await? {
+                    Some(reloaded) if reloaded.is_acknowledged() => {
+                        execute_settle_fill(position, trade).await?;
+                        return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+                    }
+                    Some(reloaded) => {
+                        info!(
+                            ?trade_id,
+                            symbol = %trade.symbol,
+                            "Concurrent witness detected; resuming fill accounting"
+                        );
+                        if !reloaded.is_enriched() {
+                            execute_enrich_trade(onchain_trade, trade).await;
+                        }
+                    }
+                    None => {
+                        return Err(TradeAccountingError::InconsistentOnChainTradeState {
+                            trade_id,
+                        });
+                    }
+                }
             }
-
-            execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
         }
-        // A failed read must not masquerade as "not a duplicate": the
-        // witness write would also fail on a healthy dedupe path, but
-        // propagating here keeps the retry contract explicit.
         Err(error) => return Err(error.into()),
     }
 
-    execute_acknowledge_fill(
+    if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+        execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
+    }
+
+    Ok(FillAccountingOutcome::Accounted { trade_id })
+}
+
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+pub(crate) async fn process_queued_trade<E: Executor>(
+    executor: &E,
+    trade_event: &EmittedOnChain<RaindexTradeEvent>,
+    trade: OnchainTrade,
+    cqrs: &TradeProcessingCqrs,
+    asset_enabled: bool,
+) -> Result<Option<OffchainOrderId>, TradeAccountingError>
+where
+    TradeAccountingError: From<E::Error>,
+{
+    let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
+        &cqrs.pool,
+        &cqrs.onchain_trade,
         &cqrs.position,
         &trade,
+        trade_event.block_number,
         cqrs.execution_threshold,
-        block_timestamp,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
+
     execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await?;
     // Prune the pending-acknowledgement entry now that the marker is durable
     // (ADR 0010), before any early return below, so the threshold-not-met and
@@ -2331,6 +2414,11 @@ where
     execute_settle_fill(&cqrs.position, &trade).await?;
 
     let base_symbol = trade.symbol.base();
+
+    match reconcile_existing_pending_order(base_symbol, cqrs).await? {
+        ExistingPendingOrderOutcome::NoPending | ExistingPendingOrderOutcome::Cleared => {}
+        ExistingPendingOrderOutcome::InFlight => return Ok(None),
+    }
 
     let executor_type = executor.to_supported_executor();
 
@@ -2349,7 +2437,13 @@ where
 
     let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
-    match preflight_counter_trade_submission(executor, &execution, None).await? {
+    let counter_trade_submission =
+        match preflight_counter_trade_submission(executor, &execution, None).await {
+            Ok(check) => check,
+            Err(error) => return Err(error),
+        };
+
+    match counter_trade_submission {
         CounterTradeSubmissionCheck::Skipped => return Ok(None),
         CounterTradeSubmissionCheck::Allowed { reservation } => {
             clamp_shares_to_reservation(&mut execution, reservation.as_ref());
@@ -2583,7 +2677,7 @@ async fn place_offchain_order(
     // reused as `client_order_id`, not on aggregate identity.
     let offchain_order_id = OffchainOrderId::new();
 
-    if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
+    if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await? {
         // `PendingExecution`: the position is already claimed by a prior
         // placement attempt that may not have completed (e.g. it placed the
         // broker order but crashed/was retried before enqueuing the poll).
@@ -2608,7 +2702,58 @@ async fn place_offchain_order(
             );
         })?;
 
-    dispatch_post_place_state(loaded, execution, cqrs, offchain_order_id).await
+    match dispatch_post_place_state(loaded, &execution.symbol, cqrs, offchain_order_id).await? {
+        PostPlaceOutcome::InFlight(order_id) | PostPlaceOutcome::Failed(order_id) => {
+            Ok(Some(order_id))
+        }
+        PostPlaceOutcome::ClearedNoOrder => Ok(None),
+    }
+}
+
+enum ExistingPendingOrderOutcome {
+    NoPending,
+    InFlight,
+    Cleared,
+}
+
+async fn reconcile_existing_pending_order(
+    symbol: &Symbol,
+    cqrs: &TradeProcessingCqrs,
+) -> Result<ExistingPendingOrderOutcome, TradeAccountingError> {
+    let Some(position) = cqrs.position.load(symbol).await? else {
+        return Ok(ExistingPendingOrderOutcome::NoPending);
+    };
+
+    let Some(offchain_order_id) = position.pending_offchain_order_id else {
+        return Ok(ExistingPendingOrderOutcome::NoPending);
+    };
+
+    let loaded = cqrs
+        .offchain_order
+        .load(&offchain_order_id)
+        .await
+        .inspect_err(|error| {
+            error!(
+                %offchain_order_id,
+                %symbol,
+                %error,
+                "Failed to load existing pending offchain order; cannot safely acknowledge fill"
+            );
+        })?;
+
+    match dispatch_post_place_state(loaded, symbol, cqrs, offchain_order_id).await? {
+        PostPlaceOutcome::InFlight(_) => Ok(ExistingPendingOrderOutcome::InFlight),
+        PostPlaceOutcome::Failed(_) | PostPlaceOutcome::ClearedNoOrder => {
+            Ok(ExistingPendingOrderOutcome::Cleared)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostPlaceOutcome {
+    InFlight(OffchainOrderId),
+    Failed(OffchainOrderId),
+    ClearedNoOrder,
 }
 
 /// Recovers the order a position is already claimed by when a fresh placement
@@ -2692,7 +2837,12 @@ async fn recover_claimed_offchain_order(
             )
             .await?;
 
-            dispatch_post_place_state(placed, execution, cqrs, pending_id).await
+            match dispatch_post_place_state(placed, &execution.symbol, cqrs, pending_id).await? {
+                PostPlaceOutcome::InFlight(order_id) | PostPlaceOutcome::Failed(order_id) => {
+                    Ok(Some(order_id))
+                }
+                PostPlaceOutcome::ClearedNoOrder => Ok(None),
+            }
         }
         // Terminal and absent orders were resolved by
         // `resolve_terminal_claimed_order` above.
@@ -2701,23 +2851,19 @@ async fn recover_claimed_offchain_order(
 }
 
 /// Routes the freshly-loaded `OffchainOrder` post-`Place` to either the
-/// rejection-cleanup or poll-enqueue path. Returns the order id wrapped in
-/// `Some` when the order is real and recorded, `None` when no usable order
-/// exists (Place silently failed or persisted state is a lifecycle bug), or
-/// propagates infrastructure errors so DB / queue failures cannot be
-/// silently swallowed.
+/// rejection-cleanup or poll-enqueue path.
 async fn dispatch_post_place_state(
     loaded: Option<OffchainOrder>,
-    execution: &ExecutionCtx,
+    symbol: &Symbol,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
-) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+) -> Result<PostPlaceOutcome, TradeAccountingError> {
     use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
     match loaded {
         Some(Failed { error, .. }) => {
             cqrs.position
                 .send(
-                    &execution.symbol,
+                    symbol,
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error,
@@ -2725,7 +2871,7 @@ async fn dispatch_post_place_state(
                 )
                 .await?;
 
-            Ok(Some(offchain_order_id))
+            Ok(PostPlaceOutcome::Failed(offchain_order_id))
         }
 
         Some(Submitted { .. } | PartiallyFilled { .. }) => {
@@ -2737,13 +2883,13 @@ async fn dispatch_post_place_state(
                 .inspect_err(|error| {
                     error!(
                         %offchain_order_id,
-                        symbol = %execution.symbol,
+                        %symbol,
                         %error,
                         "Failed to enqueue PollOrderStatus job for newly-submitted order"
                     );
                 })?;
 
-            Ok(Some(offchain_order_id))
+            Ok(PostPlaceOutcome::InFlight(offchain_order_id))
         }
 
         // No order exists after a successful Place -- a serious inconsistency,
@@ -2753,7 +2899,7 @@ async fn dispatch_post_place_state(
         None => {
             cqrs.position
                 .send(
-                    &execution.symbol,
+                    symbol,
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_string(),
@@ -2761,7 +2907,7 @@ async fn dispatch_post_place_state(
                 )
                 .await?;
 
-            Ok(None)
+            Ok(PostPlaceOutcome::ClearedNoOrder)
         }
 
         // With the pure `Place` handler, `Place` only records intent (entering
@@ -2783,12 +2929,21 @@ async fn dispatch_post_place_state(
 
 /// Returns `true` if the Position aggregate accepted the order, `false` if it
 /// was rejected (e.g. already has a pending execution).
+pub(crate) fn is_expected_place_offchain_order_rejection(error: &SendError<Position>) -> bool {
+    matches!(
+        error,
+        AggregateError::UserError(LifecycleError::Apply(
+            PositionError::PendingExecution { .. } | PositionError::ThresholdNotMet { .. },
+        ))
+    )
+}
+
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn execute_place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
-) -> bool {
+) -> Result<bool, SendError<Position>> {
     let command = PositionCommand::PlaceOffChainOrder {
         offchain_order_id,
         shares: execution.shares,
@@ -2804,16 +2959,17 @@ async fn execute_place_offchain_order(
                 symbol = %execution.symbol,
                 "Position::PlaceOffChainOrder succeeded"
             );
-            true
+            Ok(true)
         }
-        Err(error) => {
+        Err(error) if is_expected_place_offchain_order_rejection(&error) => {
             warn!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder rejected: {error}"
+                "Position::PlaceOffChainOrder rejected by domain state: {error}"
             );
-            false
+            Ok(false)
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -2949,6 +3105,11 @@ where
             "Executing accumulated position"
         );
 
+        let anchor = position
+            .load(&execution.symbol)
+            .await?
+            .and_then(|loaded| loaded.last_failed_offchain_order_id);
+
         let command = PositionCommand::PlaceOffChainOrder {
             offchain_order_id,
             shares: execution.shares,
@@ -2957,14 +3118,18 @@ where
             threshold: *threshold,
         };
 
-        if let Err(error) = position.send(&execution.symbol, command).await {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder rejected (likely pending execution), \
-                 skipping OffchainOrder creation: {error}"
-            );
-            continue;
+        match position.send(&execution.symbol, command).await {
+            Ok(()) => {}
+            Err(error) if is_expected_place_offchain_order_rejection(&error) => {
+                warn!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    "Position::PlaceOffChainOrder rejected by domain state; \
+                     skipping OffchainOrder creation: {error}"
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         }
 
         debug!(
@@ -2973,30 +3138,6 @@ where
             "Position::PlaceOffChainOrder succeeded"
         );
 
-        // Derive the broker-side client_order_id from the live position aggregate,
-        // reusing a prior failed attempt's stashed OffchainOrderId as the
-        // idempotency anchor (mirroring `execute_create_offchain_order`) so this
-        // path exercises the same broker dedupe the production reactor relies on.
-        let anchor = match position.load(&execution.symbol).await {
-            Ok(loaded) => loaded.and_then(|loaded| loaded.last_failed_offchain_order_id),
-            Err(error) => {
-                // Financial-integrity: never place under a fresh idempotency key when the
-                // anchor cannot be read. A stashed `last_failed_offchain_order_id` may
-                // front a live broker order, so a fresh key would double-hedge (this is
-                // why `execute_create_offchain_order` fails fast here). The position is
-                // already claimed above but no OffchainOrder aggregate exists yet, so the
-                // runtime orphaned-pending recovery (ADR 0014) clears the stale claim and
-                // a later CheckPositions scan re-attempts the placement.
-                warn!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    %error,
-                    "Failed to load position for the idempotency anchor; deferring \
-                     placement to runtime recovery instead of using a fresh key"
-                );
-                continue;
-            }
-        };
         let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
 
         let place_result = place_offchain_order_at_broker(
@@ -3067,7 +3208,7 @@ mod tests {
         create_test_ctx_with_order_owner,
     };
     use st0x_dto::Statement;
-    use st0x_event_sorcery::{StoreBuilder, test_store};
+    use st0x_event_sorcery::{DomainEvent, StoreBuilder, test_store};
     use st0x_execution::{
         Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
         MockExecutor, Positive, Symbol,
@@ -4558,10 +4699,12 @@ mod tests {
 
     fn trade_processing_cqrs_with_threshold(
         frameworks: &CqrsFrameworks,
+        pool: &SqlitePool,
         threshold: ExecutionThreshold,
         apalis_pool: &apalis_sqlite::SqlitePool,
     ) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
+            pool: pool.clone(),
             onchain_trade: frameworks.onchain_trade.clone(),
             position: frameworks.position.clone(),
             position_projection: frameworks.position_projection.clone(),
@@ -4601,12 +4744,55 @@ mod tests {
         EmittedOnChain::from_log(RaindexTradeEvent::ClearV3(Box::new(event)), &log).unwrap()
     }
 
+    #[test]
+    fn position_fill_guard_matches_position_event_json_contract() {
+        let trade_id = TradeId {
+            tx_hash: fixed_bytes!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            log_index: 17,
+        };
+        let event = PositionEvent::OnChainOrderFilled {
+            trade_id: trade_id.clone(),
+            amount: FractionalShares::new(float!(1)),
+            direction: Direction::Buy,
+            price_usdc: float!(100),
+            block_timestamp: Utc::now(),
+            seen_at: Utc::now(),
+        };
+
+        assert_eq!(
+            event.event_type(),
+            PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+            "durable duplicate query must use the aggregate event type"
+        );
+
+        let payload = serde_json::to_value(&event).unwrap();
+        let tx_hash = trade_id.tx_hash.to_string();
+
+        assert_eq!(
+            payload
+                .pointer("/OnChainOrderFilled/trade_id/tx_hash")
+                .and_then(|value| value.as_str()),
+            Some(tx_hash.as_str()),
+            "durable duplicate query depends on this tx_hash JSON path"
+        );
+        assert_eq!(
+            payload
+                .pointer("/OnChainOrderFilled/trade_id/log_index")
+                .and_then(serde_json::Value::as_u64),
+            Some(trade_id.log_index),
+            "durable duplicate query depends on this log_index JSON path"
+        );
+    }
+
     #[tokio::test]
     async fn trade_below_threshold_does_not_place_order() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -4646,6 +4832,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -4704,6 +4891,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -4800,6 +4988,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -4839,6 +5028,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5003,6 +5193,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5089,6 +5280,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5211,6 +5403,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5240,6 +5433,22 @@ mod tests {
         execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id)
             .await
             .expect("re-driving the marker must be idempotent, not propagate an error");
+
+        let (acknowledged_markers,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = ? AND aggregate_id = ? AND event_type = ?",
+        )
+        .bind(OnChainTrade::AGGREGATE_TYPE)
+        .bind(trade_id.to_string())
+        .bind("OnChainTradeEvent::Acknowledged")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            acknowledged_markers, 1,
+            "re-driving the marker must not emit a second Acknowledged event"
+        );
     }
 
     /// Exactly-once across multiple same-symbol fills: once a fill is
@@ -5255,6 +5464,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5338,6 +5548,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5424,6 +5635,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5473,6 +5685,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5506,6 +5719,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5603,6 +5817,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5685,6 +5900,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5735,6 +5951,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5798,6 +6015,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5843,6 +6061,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5887,6 +6106,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -5936,6 +6156,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -6032,6 +6253,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -6093,6 +6315,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -6157,6 +6380,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -6256,6 +6480,7 @@ mod tests {
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let mut cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -7102,6 +7327,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let mut cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -7137,6 +7363,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -7197,6 +7424,7 @@ mod tests {
         let (frameworks, _) = create_cqrs_frameworks(&pool).await;
         let mut cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -7270,6 +7498,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -7321,6 +7550,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -8036,24 +8266,13 @@ mod tests {
         offchain_order_id
     }
 
-    fn execution_ctx_for(
-        symbol: &Symbol,
-        shares: Positive<FractionalShares>,
-    ) -> crate::onchain::accumulator::ExecutionCtx {
-        crate::onchain::accumulator::ExecutionCtx {
-            symbol: symbol.clone(),
-            direction: Direction::Sell,
-            shares,
-            executor: st0x_execution::SupportedExecutor::DryRun,
-        }
-    }
-
     #[tokio::test]
     async fn dispatch_post_place_state_none_clears_position_pending() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -8071,12 +8290,12 @@ mod tests {
             .unwrap();
         assert_eq!(position.pending_offchain_order_id, Some(offchain_order_id));
 
-        let execution = execution_ctx_for(&symbol, shares);
-        let result = dispatch_post_place_state(None, &execution, &cqrs, offchain_order_id)
+        let result = dispatch_post_place_state(None, &symbol, &cqrs, offchain_order_id)
             .await
             .unwrap();
         assert_eq!(
-            result, None,
+            result,
+            PostPlaceOutcome::ClearedNoOrder,
             "None state must report no order placed so caller does not pretend a phantom \
              id is real"
         );
@@ -8099,6 +8318,7 @@ mod tests {
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -8119,9 +8339,8 @@ mod tests {
             placed_at: Utc::now(),
         };
 
-        let execution = execution_ctx_for(&symbol, shares);
         let error =
-            dispatch_post_place_state(Some(pending_state), &execution, &cqrs, offchain_order_id)
+            dispatch_post_place_state(Some(pending_state), &symbol, &cqrs, offchain_order_id)
                 .await
                 .unwrap_err();
         assert!(
@@ -8231,6 +8450,7 @@ mod tests {
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -8254,9 +8474,8 @@ mod tests {
             filled_at: Utc::now(),
         };
 
-        let execution = execution_ctx_for(&symbol, shares);
         let error =
-            dispatch_post_place_state(Some(filled_state), &execution, &cqrs, offchain_order_id)
+            dispatch_post_place_state(Some(filled_state), &symbol, &cqrs, offchain_order_id)
                 .await
                 .unwrap_err();
         assert!(
@@ -8289,6 +8508,7 @@ mod tests {
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -8307,14 +8527,13 @@ mod tests {
             failed_at: Utc::now(),
         };
 
-        let execution = execution_ctx_for(&symbol, shares);
         let result =
-            dispatch_post_place_state(Some(failed_state), &execution, &cqrs, offchain_order_id)
+            dispatch_post_place_state(Some(failed_state), &symbol, &cqrs, offchain_order_id)
                 .await
                 .unwrap();
         assert_eq!(
             result,
-            Some(offchain_order_id),
+            PostPlaceOutcome::Failed(offchain_order_id),
             "Failed state must report the order id so caller records it"
         );
 
@@ -8336,6 +8555,7 @@ mod tests {
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
+            &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
@@ -8402,7 +8622,12 @@ mod tests {
             .unwrap();
         assert_eq!(position.pending_offchain_order_id, Some(offchain_order_id));
 
-        let execution = execution_ctx_for(&symbol, shares);
+        let execution = ExecutionCtx {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares,
+            executor: st0x_execution::SupportedExecutor::DryRun,
+        };
         let result = recover_claimed_offchain_order(&execution, &cqrs)
             .await
             .unwrap();

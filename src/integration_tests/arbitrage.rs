@@ -33,7 +33,7 @@ use st0x_finance::Usd;
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
-use super::{ExpectedEvent, assert_events, fetch_events};
+use super::{ExpectedEvent, StoredEvent, assert_events, fetch_events};
 use crate::bindings::IRaindexV6::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, Parser, RaindexV6, Store as RainStore,
@@ -60,6 +60,29 @@ const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";
 const AAPL_PRICE: u32 = 100;
 const MSFT_PRICE: u32 = 200;
+
+fn nth_matching_event<'event>(
+    events: &'event [StoredEvent],
+    aggregate_type: &str,
+    aggregate_id: &str,
+    event_type: &str,
+    ordinal: usize,
+) -> &'event StoredEvent {
+    events
+        .iter()
+        .filter(|event| {
+            event.aggregate_type == aggregate_type
+                && event.aggregate_id == aggregate_id
+                && event.event_type == event_type
+        })
+        .nth(ordinal)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected {aggregate_type}/{aggregate_id}/{event_type} event \
+                 at ordinal {ordinal}"
+            )
+        })
+}
 
 // Rainlang interpreter components deploy to deterministic "zoltu" addresses; the
 // expression deployer references the parser/store/interpreter by these hardcoded
@@ -711,6 +734,7 @@ async fn create_test_cqrs_with_assets(
             .unwrap();
 
     let cqrs = TradeProcessingCqrs {
+        pool: pool.clone(),
         onchain_trade,
         position: position.clone(),
         position_projection: position_projection.clone(),
@@ -832,8 +856,14 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let events = assert_events(&pool, &expected).await;
 
     // Payload spot-checks: financial values in OnChainOrderFilled events
-    assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
-    let trade1_filled = &events[2].payload["OnChainOrderFilled"];
+    let trade1_filled = &nth_matching_event(
+        &events,
+        "Position",
+        TEST_AAPL,
+        "PositionEvent::OnChainOrderFilled",
+        0,
+    )
+    .payload["OnChainOrderFilled"];
     assert_eq!(trade1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(trade1_filled["direction"].as_str().unwrap(), "sell");
     assert_eq!(trade1_filled["price_usdc"].as_str().unwrap(), "100");
@@ -1437,8 +1467,14 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let events = assert_events(&pool, &expected).await;
 
     // Verify financial values in OnChainOrderFilled events (Buy direction)
-    assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
-    let trade1_filled = &events[2].payload["OnChainOrderFilled"];
+    let trade1_filled = &nth_matching_event(
+        &events,
+        "Position",
+        TEST_AAPL,
+        "PositionEvent::OnChainOrderFilled",
+        0,
+    )
+    .payload["OnChainOrderFilled"];
     assert_eq!(trade1_filled["amount"].as_str().unwrap(), "0.5");
     assert_eq!(trade1_filled["direction"].as_str().unwrap(), "buy");
     assert_eq!(trade1_filled["price_usdc"].as_str().unwrap(), "100");
@@ -1546,8 +1582,14 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let events = assert_events(&pool, &expected).await;
 
     // Payload spot-checks: financial values in the single-trade threshold crossing
-    assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
-    let filled = &events[2].payload["OnChainOrderFilled"];
+    let filled = &nth_matching_event(
+        &events,
+        "Position",
+        TEST_AAPL,
+        "PositionEvent::OnChainOrderFilled",
+        0,
+    )
+    .payload["OnChainOrderFilled"];
     assert_eq!(filled["amount"].as_str().unwrap(), "1");
     assert_eq!(filled["direction"].as_str().unwrap(), "sell");
     assert_eq!(filled["price_usdc"].as_str().unwrap(), "100");

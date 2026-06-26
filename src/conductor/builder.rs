@@ -299,6 +299,7 @@ where
     });
 
     let trade_cqrs = super::TradeProcessingCqrs {
+        pool: context.pool.clone(),
         onchain_trade: context.frameworks.onchain_trade,
         position: context.frameworks.position,
         position_projection: context.frameworks.position_projection,

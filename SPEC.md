@@ -3307,6 +3307,17 @@ effect rather than a generic intent:
   must clear because the funds were handled out-of-band. The USDC
   `ReconcileStuckRebalance` command (see above) is the first realization of the
   `reconcile` verb.
+- **`process-tx` implements the ADR-0005 exactly-once fill accounting
+  protocol.** It fails closed (with a clear operator message) if the fill is
+  already acknowledged, resumes if it was witnessed but not yet acknowledged
+  (crash- recovery window), and creates the full witness/acknowledge record for
+  genuinely missed fills — so every subsequent re-delivery, whether from another
+  CLI run or the normal pipeline, hits the dedup guard and skips cleanly.
+  **Operational precondition**: run with exclusive processing for that fill:
+  stop the live bot, drain any apalis accounting job for the fill, and do not
+  run another `process-tx` for the same `(tx_hash, log_index)` concurrently. The
+  durable dedup guard and the CQRS apply are separate transactions, so any
+  concurrent actor processing the same fill can slip through the TOCTOU window.
 
 ### Event Processing Flow
 

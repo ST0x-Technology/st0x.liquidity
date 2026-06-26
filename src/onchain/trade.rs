@@ -281,11 +281,15 @@ impl OnchainTrade {
         };
         let equity_symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse(&equity_symbol_str)?;
 
+        let block_number = log.block_number.or(receipt_block_number);
+        let block_timestamp =
+            resolve_block_timestamp(evm.provider(), log.block_timestamp, block_number).await?;
+
         let pyth_price = enrich_with_pyth_price(
             evm.provider(),
             pyth_feed_ids,
             equity_symbol.base(),
-            log.block_number.or(receipt_block_number),
+            block_number,
             tx_hash,
         )
         .await;
@@ -300,11 +304,8 @@ impl OnchainTrade {
             amount: trade_details.equity_amount(),
             direction: trade_details.direction(),
             price,
-            block_number: log.block_number.or(receipt_block_number),
-            block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
-                let secs: i64 = timestamp_secs.try_into().ok()?;
-                DateTime::from_timestamp(secs, 0)
-            }),
+            block_timestamp,
+            block_number,
             gas_used,
             effective_gas_price,
             pyth_price,
@@ -418,6 +419,36 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     Ok(None)
 }
 
+async fn resolve_block_timestamp<P: Provider>(
+    provider: &P,
+    log_timestamp: Option<u64>,
+    block_number: Option<u64>,
+) -> Result<Option<DateTime<Utc>>, OnChainError> {
+    if let Some(timestamp_secs) = log_timestamp {
+        return timestamp_from_secs(timestamp_secs);
+    }
+
+    let Some(block_number) = block_number else {
+        return Ok(None);
+    };
+
+    let Some(block) = provider.get_block_by_number(block_number.into()).await? else {
+        warn!(
+            block_number,
+            "Block header unavailable while resolving onchain trade timestamp; \
+             provider may be lagging or the block may have reorged"
+        );
+        return Ok(None);
+    };
+
+    timestamp_from_secs(block.header.timestamp)
+}
+
+fn timestamp_from_secs(timestamp_secs: u64) -> Result<Option<DateTime<Utc>>, OnChainError> {
+    let secs = i64::try_from(timestamp_secs)?;
+    Ok(DateTime::from_timestamp(secs, 0))
+}
+
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TradeValidationError {
@@ -479,6 +510,7 @@ mod tests {
 
     use alloy::primitives::{Address, Bytes, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::rpc::types::{Block, Transaction};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
 
@@ -491,6 +523,26 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_float_macro::float;
+
+    #[tokio::test]
+    async fn resolve_block_timestamp_fetches_header_when_log_timestamp_missing() {
+        let asserter = Asserter::new();
+        let mut block = Block::<Transaction>::default();
+        block.header.inner.number = 12_345;
+        block.header.inner.timestamp = 1_700_000_123;
+        asserter.push_success(&block);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let timestamp = resolve_block_timestamp(&provider, None, Some(12_345))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timestamp,
+            DateTime::from_timestamp(1_700_000_123, 0),
+            "receipt logs without block_timestamp should use the block header timestamp"
+        );
+    }
 
     #[tokio::test]
     async fn enrich_with_pyth_price_returns_price_when_feed_configured() {
