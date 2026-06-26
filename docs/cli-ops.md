@@ -199,10 +199,10 @@ stox alpaca-tokenization-requests
 
 ### Rechecking Failed Equity Transfers
 
-Use `recheck-transfer` when the bot marked an equity mint or redemption as
+Use `transfer recheck` when the bot marked an equity mint or redemption as
 failed, but Alpaca later shows the same provider request as completed.
 
-**The bot must be running.** `recheck-transfer` delegates to the bot's REST API
+**The bot must be running.** `transfer recheck` delegates to the bot's REST API
 (`POST /transfers/recheck/<kind>/<id>` on the configured `server_port`) rather
 than mutating the database directly. Recovery has to run inside the bot process
 so the recovery event dispatches through the in-process inventory reactor (which
@@ -219,22 +219,22 @@ Recoverable cases:
 
 - Mint failed at acceptance (accepted by Alpaca, but tokens never received),
   then Alpaca later reports the mint completed.
-  `stox recheck-transfer --type mint --id <issuer-request-id>` records provider
+  `stox transfer recheck --kind mint --id <issuer-request-id>` records provider
   completion and resumes wrapping/depositing to Raindex. A mint that already
   received tokens and then failed while wrapping or depositing is **not**
   recoverable this way (recovery would re-wrap tokens that already moved); the
   command reports it as not recoverable.
 - Redemption failed after tokens were sent, with a redemption tx in the
   aggregate.
-  `stox recheck-transfer --type redemption --id <redemption-aggregate-id>`
+  `stox transfer recheck --kind redemption --id <redemption-aggregate-id>`
   completes it if Alpaca now reports completed.
-- Non-failed active mints/redemptions can also be passed to `recheck-transfer`;
+- Non-failed active mints/redemptions can also be passed to `transfer recheck`;
   the command resumes the normal workflow instead of forcing recovery.
 
 The command prints the recovery outcome: `recovered`, `resumed`,
 `already_completed`, `left_unchanged`, `not_detected_yet`, or `not_recoverable`.
 
-Not covered by `recheck-transfer` yet:
+Not covered by `transfer recheck` yet:
 
 - Mint requests rejected before Alpaca acceptance. There is no provider
   completion to discover.
@@ -248,14 +248,12 @@ Not covered by `recheck-transfer` yet:
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
   their own recovery commands. A manual `transfer-usdc` prints its transfer id
   and, if interrupted after the burn, is resumed with
-  `stox resume-usdc-transfer --id <id> --direction <to-raindex|to-alpaca>
-  --amount <amount>`.
-  The `--direction` must match the original (a mismatch is rejected to avoid
+  `stox transfer resume --id <id> --direction <to-raindex|to-alpaca>`. The
+  `--direction` must match the original (a mismatch is rejected to avoid
   mis-driving) and an unknown id is rejected rather than starting a fresh burn;
-  the `--amount` is required for symmetry with `transfer-usdc` but a resume uses
-  the aggregate's persisted amount. Run it only when the bot is not concurrently
-  driving that same id, since it drives the aggregate directly rather than
-  through the bot's resume lock.
+  a resume uses the aggregate's persisted amount, so no amount is taken. Run it
+  only when the bot is not concurrently driving that same id, since it drives
+  the aggregate directly rather than through the bot's resume lock.
 
 ### Clearing a pre-burn guard latch
 
@@ -283,13 +281,15 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
 - **If no burn is found**: run `fail-usdc-transfer` to clear the guard.
 - **If a burn IS found** while the aggregate is still `BridgingSubmitting`: do
   NOT run `fail-usdc-transfer` (strands the burned funds) and do NOT run
-  `reconcile-usdc-transfer` (its preflight rejects `BridgingSubmitting` -- it
-  only accepts persisted post-burn terminals such as `DepositFailed`). Instead,
-  run `resume-usdc-transfer`: its `find_recent_burn` scan adopts the orphan
-  burn, persists `BridgingInitiated`, and the transfer continues normally.
+  `transfer reconcile` (its preflight rejects `BridgingSubmitting` -- it only
+  accepts persisted post-burn terminals such as `DepositFailed`). Instead, run
+  `transfer resume`: its `find_recent_burn` scan adopts the orphan burn,
+  persists `BridgingInitiated`, and the transfer continues normally.
 
-`reconcile-usdc-transfer` is the path for persisted post-burn terminal failures
-(e.g. `DepositFailed`, `BridgingFailed` with a burn tx recorded).
+`transfer reconcile` is the path for persisted post-burn terminal failures (e.g.
+`DepositFailed`, `BridgingFailed` with a burn tx recorded). The legacy flat
+`resume-usdc-transfer` / `reconcile-usdc-transfer` names remain valid until
+deprecation.
 
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
@@ -300,5 +300,6 @@ nix run .#simulate-failures
 ```
 
 The backend creates failed mint and redemption transfers whose mock Alpaca
-provider later completes, then prints the exact `recheck-transfer` commands for
-that run's generated config, secrets, database, and mock API port.
+provider later completes, then prints the exact (legacy-named)
+`recheck-transfer` commands for that run's generated config, secrets, database,
+and mock API port.
