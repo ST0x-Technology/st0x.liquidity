@@ -135,12 +135,9 @@ pub enum PositionRecoveryCommand {
         /// Pending offchain order ID recorded on the position
         #[arg(short = 'o', long = "order-id")]
         order_id: OffchainOrderId,
-        /// Reason to persist on the Position::FailOffChainOrder event
-        #[arg(
-            short = 'r',
-            long = "reason",
-            default_value = "Manually failed pending offchain order via CLI"
-        )]
+        /// Reason to persist on the Position::FailOffChainOrder event (required;
+        /// the audit record for this manual intervention)
+        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
         reason: String,
     },
     /// Set a position's net exposure after an operator manual correction.
@@ -171,7 +168,7 @@ pub enum PositionRecoveryCommand {
         #[arg(long = "price", value_parser = parse_positive_price)]
         price: Option<Float>,
         /// Operator reason to persist on the Position::ManualPositionAdjusted event
-        #[arg(short = 'r', long = "reason")]
+        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
         reason: String,
     },
 }
@@ -195,6 +192,19 @@ fn parse_positive_price(input: &str) -> Result<Float, String> {
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
     let shares: FractionalShares = input.parse().map_err(|err| format!("{err}"))?;
     Positive::new(shares).map_err(|err| format!("{err}"))
+}
+
+/// Rejects a blank `--reason` on event-emitting destructive verbs. clap already
+/// requires the flag be present once its default is removed, but a present-but-
+/// empty value (`--reason ""` or `--reason "   "`, easy to hit when a shell
+/// expands `--reason "$REASON"` to nothing) would persist the same audit-hostile
+/// blank reason the requirement exists to prevent.
+fn parse_non_empty_reason(input: &str) -> Result<String, String> {
+    if input.trim().is_empty() {
+        return Err("--reason must not be blank; it is persisted as the audit record".to_string());
+    }
+
+    Ok(input.to_string())
 }
 
 #[derive(Debug, Parser)]
@@ -794,8 +804,8 @@ pub enum TransferCommand {
         /// Id of the stuck transfer to reconcile
         #[arg(long = "id")]
         id: Uuid,
-        /// Why the transfer is being reconciled
-        #[arg(short = 'r', long = "reason", default_value = "funds-moved-manually")]
+        /// Why the transfer is being reconciled (required; persisted as the audit record)
+        #[arg(short = 'r', long = "reason")]
         reason: ReconcileReasonArg,
     },
 
@@ -812,12 +822,8 @@ pub enum TransferCommand {
         /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
         #[arg(short = 'i', long = "id")]
         id: String,
-        /// Reason for failure
-        #[arg(
-            short = 'r',
-            long = "reason",
-            default_value = "Manually failed via CLI"
-        )]
+        /// Reason for failure (required; persisted as the audit record)
+        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
         reason: String,
     },
 
@@ -2160,8 +2166,10 @@ mod tests {
         }
     }
 
+    /// The hidden legacy flat command keeps its default reason so existing
+    /// runbooks/scripts that omit --reason still work.
     #[test]
-    fn reconcile_usdc_transfer_command_defaults_reason_to_funds_moved_manually() {
+    fn legacy_reconcile_usdc_transfer_keeps_default_reason() {
         let id = Uuid::from_u128(78);
         let cli = Cli::try_parse_from([
             "st0x-cli",
@@ -2316,6 +2324,153 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn transfer_fail_requires_reason() {
+        // Destructive verbs persist `--reason` as the audit record, so the new
+        // grouped name must require it (no default).
+        let error = Cli::try_parse_from([
+            "st0x-cli", "transfer", "fail", "--kind", "mint", "--id", "m1",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(
+            error.to_string().contains("reason"),
+            "the missing argument must be --reason, got: {error}",
+        );
+    }
+
+    #[test]
+    fn transfer_reconcile_requires_reason() {
+        let id = Uuid::from_u128(7);
+        let error =
+            Cli::try_parse_from(["st0x-cli", "transfer", "reconcile", "--id", &id.to_string()])
+                .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(
+            error.to_string().contains("reason"),
+            "the missing argument must be --reason, got: {error}",
+        );
+    }
+
+    #[test]
+    fn position_release_hedge_requires_reason() {
+        let order_id = OffchainOrderId::new();
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "position",
+            "release-hedge",
+            "--symbol",
+            "MSTR",
+            "--order-id",
+            &order_id.to_string(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(
+            error.to_string().contains("reason"),
+            "the missing argument must be --reason, got: {error}",
+        );
+    }
+
+    #[test]
+    fn transfer_fail_rejects_blank_reason() {
+        // A present-but-empty --reason persists the same audit-hostile blank
+        // reason the requirement exists to prevent.
+        let error = Cli::try_parse_from([
+            "st0x-cli", "transfer", "fail", "--kind", "mint", "--id", "m1", "--reason", "   ",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains("must not be blank"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn position_set_rejects_blank_reason() {
+        let error = Cli::try_parse_from([
+            "st0x-cli", "position", "set", "--symbol", "MSTR", "--zero", "--reason", "   ",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains("must not be blank"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn position_release_hedge_rejects_blank_reason() {
+        let order_id = OffchainOrderId::new();
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "position",
+            "release-hedge",
+            "--symbol",
+            "MSTR",
+            "--order-id",
+            &order_id.to_string(),
+            "--reason",
+            "",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains("must not be blank"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn legacy_fail_pending_offchain_order_alias_requires_reason() {
+        // The legacy alias shares the canonical command's arguments, so it
+        // loses the defaulted reason along with `position release-hedge`.
+        let order_id = OffchainOrderId::new();
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "fail-pending-offchain-order",
+            "--symbol",
+            "MSTR",
+            "--order-id",
+            &order_id.to_string(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(
+            error.to_string().contains("reason"),
+            "the missing argument must be --reason, got: {error}",
+        );
+    }
+
+    #[test]
+    fn legacy_fail_transfer_keeps_default_reason() {
+        // The hidden legacy flat command keeps its default reason so existing
+        // runbooks/scripts that omit --reason still work.
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "fail-transfer", "--type", "mint", "--id", "m1"])
+                .unwrap();
+        match cli.command {
+            Commands::FailTransfer { reason, .. } => {
+                assert_eq!(reason, "Manually failed via CLI");
+            }
+            _ => panic!("expected legacy FailTransfer command"),
+        }
     }
 
     #[test]
@@ -2968,6 +3123,8 @@ mod tests {
             "MSTR",
             "--order-id",
             &order_id.to_string(),
+            "--reason",
+            "operator repair",
         ])
         .unwrap();
 
@@ -2983,8 +3140,8 @@ mod tests {
                 assert_eq!(symbol, Symbol::new("MSTR").unwrap());
                 assert_eq!(parsed_order_id, order_id);
                 assert_eq!(
-                    reason, "Manually failed pending offchain order via CLI",
-                    "omitted --reason must fall back to the documented legacy default",
+                    reason, "operator repair",
+                    "the supplied --reason must survive classify_command",
                 );
             }
             _ => panic!("expected position release-hedge to classify as a simple position command"),
@@ -3273,7 +3430,7 @@ mod tests {
     #[test]
     fn grouped_transfer_commands_accept_legacy_type_flag() {
         let fail_long = Cli::try_parse_from([
-            "st0x-cli", "transfer", "fail", "--type", "mint", "--id", "ISS001",
+            "st0x-cli", "transfer", "fail", "--type", "mint", "--id", "ISS001", "--reason", "stuck",
         ])
         .unwrap();
         assert!(matches!(
@@ -3282,7 +3439,7 @@ mod tests {
         ));
 
         let fail_short = Cli::try_parse_from([
-            "st0x-cli", "transfer", "fail", "-t", "mint", "--id", "ISS001",
+            "st0x-cli", "transfer", "fail", "-t", "mint", "--id", "ISS001", "-r", "stuck",
         ])
         .unwrap();
         assert!(matches!(
@@ -3319,37 +3476,6 @@ mod tests {
             classify_command(recheck_short.command),
             Ok(SimpleCommand::RecheckTransfer { .. })
         ));
-    }
-
-    /// The new grouped destructive commands keep the documented legacy default
-    /// reasons until the next epic step removes them.
-    #[test]
-    fn grouped_transfer_commands_keep_legacy_default_reasons() {
-        let fail = Cli::try_parse_from([
-            "st0x-cli", "transfer", "fail", "--kind", "mint", "--id", "ISS001",
-        ])
-        .unwrap();
-        match classify_command(fail.command) {
-            Ok(SimpleCommand::FailTransfer { reason, .. }) => {
-                assert_eq!(reason, "Manually failed via CLI");
-            }
-            _ => panic!("expected transfer fail to classify as FailTransfer"),
-        }
-
-        let reconcile = Cli::try_parse_from([
-            "st0x-cli",
-            "transfer",
-            "reconcile",
-            "--id",
-            &Uuid::from_u128(9).to_string(),
-        ])
-        .unwrap();
-        match classify_command(reconcile.command) {
-            Ok(SimpleCommand::ReconcileUsdcTransfer { reason, .. }) => {
-                assert!(matches!(reason, ReconcileReasonArg::FundsMovedManually));
-            }
-            _ => panic!("expected transfer reconcile to classify as ReconcileUsdcTransfer"),
-        }
     }
 
     #[tokio::test]
