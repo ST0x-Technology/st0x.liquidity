@@ -1095,14 +1095,20 @@ impl Ctx {
             })
             .collect()
     }
+}
 
+/// Per-symbol equity config guards. All six live on `AssetsConfig` (the owner
+/// of the `[assets.equities]` map) so callers use one convention --
+/// `assets.X(symbol)` or `ctx.assets.X(symbol)` -- rather than mixing
+/// `ctx.X(symbol)` with `ctx.assets.X(symbol)`. Code that holds only an
+/// `&AssetsConfig` (e.g. the accumulator) can reach every guard without a `Ctx`.
+impl AssetsConfig {
     /// Returns whether trading is enabled for the given equity.
     ///
     /// Fail-closed: assets not present in the config are treated as
     /// trading-disabled.
     pub fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
-        self.assets
-            .equities
+        self.equities
             .symbols
             .get(symbol)
             .is_some_and(|config| config.trading == OperationMode::Enabled)
@@ -1113,8 +1119,7 @@ impl Ctx {
     /// Assets not present in the config are treated as rebalancing-disabled
     /// by default.
     pub fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
-        self.assets
-            .equities
+        self.equities
             .symbols
             .get(symbol)
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
@@ -1127,8 +1132,7 @@ impl Ctx {
     /// keeping automatic rebalancing disabled. Assets not present in the
     /// config are treated as recovery-disabled by default.
     pub fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
-        self.assets
-            .equities
+        self.equities
             .symbols
             .get(symbol)
             .is_some_and(|config| config.wrapped_equity_recovery == OperationMode::Enabled)
@@ -1139,15 +1143,12 @@ impl Ctx {
     /// `[assets.equities]`. Lets operator commands resolve the token from the
     /// ticker instead of taking an error-prone address argument.
     pub fn tokenized_equity(&self, symbol: &Symbol) -> Option<Address> {
-        self.assets
-            .equities
+        self.equities
             .symbols
             .get(symbol)
             .map(|config| config.tokenized_equity)
     }
-}
 
-impl AssetsConfig {
     /// Returns whether extended-hours counter-trading is enabled for the
     /// given equity.
     ///
@@ -4272,7 +4273,7 @@ mod tests {
         };
 
         assert!(
-            !ctx.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
+            !ctx.assets.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
             "RKLB trading should be disabled"
         );
     }
@@ -4284,7 +4285,8 @@ mod tests {
         ));
 
         assert!(
-            !ctx.is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            !ctx.assets
+                .is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
             "Unknown assets should default to trading disabled (fail-closed)"
         );
     }
@@ -4383,7 +4385,8 @@ mod tests {
         };
 
         assert!(
-            ctx.is_rebalancing_enabled(&Symbol::new("RKLB").unwrap()),
+            ctx.assets
+                .is_rebalancing_enabled(&Symbol::new("RKLB").unwrap()),
             "RKLB rebalancing should be enabled"
         );
     }
@@ -4395,7 +4398,8 @@ mod tests {
         ));
 
         assert!(
-            !ctx.is_rebalancing_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            !ctx.assets
+                .is_rebalancing_enabled(&Symbol::new("UNKNOWN").unwrap()),
             "Unknown assets should default to rebalancing disabled"
         );
     }
@@ -4433,15 +4437,16 @@ mod tests {
 
         let aapl = Symbol::new("AAPL").unwrap();
         assert!(
-            ctx.is_wrapped_equity_recovery_enabled(&aapl),
+            ctx.assets.is_wrapped_equity_recovery_enabled(&aapl),
             "Recovery should follow wrapped_equity_recovery config"
         );
         assert!(
-            !ctx.is_rebalancing_enabled(&aapl),
+            !ctx.assets.is_rebalancing_enabled(&aapl),
             "Recovery-enabled symbol must not imply rebalancing is enabled"
         );
         assert!(
-            !ctx.is_wrapped_equity_recovery_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            !ctx.assets
+                .is_wrapped_equity_recovery_enabled(&Symbol::new("UNKNOWN").unwrap()),
             "Unknown assets should default to recovery disabled"
         );
     }
@@ -4482,7 +4487,7 @@ mod tests {
 
         // The lookup uses base symbol "SPYM" which matches the config key
         assert!(
-            !ctx.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
+            !ctx.assets.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
             "SPYM trading should be disabled per config"
         );
     }

@@ -171,7 +171,7 @@ where
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
 
-        let trading_enabled = ctx.ctx.is_trading_enabled(trade.symbol.base());
+        let trading_enabled = ctx.ctx.assets.is_trading_enabled(trade.symbol.base());
 
         process_queued_trade(
             &ctx.executor,

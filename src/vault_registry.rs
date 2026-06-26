@@ -570,7 +570,7 @@ impl SeedVaultRegistryCtx {
         ctx: &Ctx,
     ) -> Result<Self, Box<CtxError>> {
         for (symbol, equity_config) in &ctx.assets.equities.symbols {
-            if equity_config.vault_ids.is_empty() && ctx.is_rebalancing_enabled(symbol) {
+            if equity_config.vault_ids.is_empty() && ctx.assets.is_rebalancing_enabled(symbol) {
                 return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 }));

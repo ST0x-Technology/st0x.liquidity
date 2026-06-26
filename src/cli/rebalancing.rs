@@ -975,6 +975,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     writeln!(stdout, "   Quantity: {quantity}")?;
 
     let token = ctx
+        .assets
         .tokenized_equity(&symbol)
         .ok_or_else(|| anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]"))?;
     writeln!(stdout, "   Token: {token}")?;
@@ -1109,6 +1110,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     writeln!(stdout, "   Quantity: {quantity}")?;
 
     let token = ctx
+        .assets
         .tokenized_equity(&symbol)
         .ok_or_else(|| anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]"))?;
     writeln!(stdout, "   Token: {token}")?;
@@ -3534,12 +3536,12 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.tokenized_equity(&Symbol::new("COIN").unwrap()),
+            ctx.assets.tokenized_equity(&Symbol::new("COIN").unwrap()),
             Some(token),
             "a configured symbol must resolve to its tokenized_equity address",
         );
         assert_eq!(
-            ctx.tokenized_equity(&Symbol::new("AAPL").unwrap()),
+            ctx.assets.tokenized_equity(&Symbol::new("AAPL").unwrap()),
             None,
             "an unconfigured symbol must resolve to None, never a default address",
         );

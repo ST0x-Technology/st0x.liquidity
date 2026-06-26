@@ -892,9 +892,9 @@ fn build_unwrapped_equity_recovery_ctx(
 }
 
 fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
-    ctx.is_trading_enabled(symbol)
-        || ctx.is_rebalancing_enabled(symbol)
-        || ctx.is_wrapped_equity_recovery_enabled(symbol)
+    ctx.assets.is_trading_enabled(symbol)
+        || ctx.assets.is_rebalancing_enabled(symbol)
+        || ctx.assets.is_wrapped_equity_recovery_enabled(symbol)
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
@@ -949,7 +949,9 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         .equities
         .symbols
         .keys()
-        .filter(|symbol| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .filter(|symbol| {
+            ctx.assets.is_trading_enabled(symbol) || ctx.assets.is_rebalancing_enabled(symbol)
+        })
         .cloned();
 
     let targets = build_approval_targets(&wrapper, symbols, ctx.evm.orderbook, USDC_BASE)?;

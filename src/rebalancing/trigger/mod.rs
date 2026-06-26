@@ -1774,7 +1774,7 @@ impl RebalancingService {
                     if *amount == FractionalShares::ZERO {
                         continue;
                     }
-                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                    if !self.config.assets.is_wrapped_equity_recovery_enabled(symbol) {
                         continue;
                     }
 
@@ -1844,7 +1844,7 @@ impl RebalancingService {
                     if *amount == FractionalShares::ZERO {
                         continue;
                     }
-                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                    if !self.config.assets.is_wrapped_equity_recovery_enabled(symbol) {
                         continue;
                     }
 
@@ -2508,15 +2508,6 @@ impl RebalancingService {
             } => FractionalShares::from_u256_18_decimals(*unwrapped_amount),
             Completed { .. } | Failed { .. } | Reconciled { .. } => Ok(FractionalShares::ZERO),
         }
-    }
-
-    fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
-        self.config
-            .assets
-            .equities
-            .symbols
-            .get(symbol)
-            .is_some_and(|config| config.wrapped_equity_recovery == OperationMode::Enabled)
     }
 
     /// Checks inventory for equity imbalance and triggers operation if needed.
@@ -4041,7 +4032,11 @@ impl RebalancingService {
                 let is_pre_wrap_post_receipt_state =
                     matches!(entity, TokensReceived { .. } | WrapSubmitted { .. });
 
-                if is_pre_wrap_post_receipt_state && self.is_wrapped_equity_recovery_enabled(symbol)
+                if is_pre_wrap_post_receipt_state
+                    && self
+                        .config
+                        .assets
+                        .is_wrapped_equity_recovery_enabled(symbol)
                 {
                     self.mark_equity_held_for_recovery(symbol);
                 } else {
