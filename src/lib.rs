@@ -39,7 +39,6 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
 mod alerts;
 pub mod api;
-pub(crate) mod metrics;
 #[cfg(any(test, feature = "test-support"))]
 pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
@@ -49,6 +48,7 @@ mod conductor;
 pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
+pub(crate) mod metrics;
 mod offchain;
 mod onchain;
 mod onchain_trade;
