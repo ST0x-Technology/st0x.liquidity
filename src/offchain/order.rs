@@ -340,7 +340,10 @@ impl EventSourced for OffchainOrder {
                     client_order_id,
                 };
 
-                let direction_label = format!("{direction:?}").to_lowercase();
+                let direction_label = match direction {
+                    Direction::Buy => "buy",
+                    Direction::Sell => "sell",
+                };
                 let symbol_label = symbol.to_string();
 
                 match services.place_market_order(market_order).await {
