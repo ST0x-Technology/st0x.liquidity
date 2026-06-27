@@ -1164,7 +1164,10 @@ pub(crate) async fn fail_transfer_command<W: Write>(
             use TokenizedEquityMint::*;
             use TokenizedEquityMintCommand::*;
             let command = match entity {
-                MintAccepted { .. } => FailAcceptance {
+                // A mint stuck at MintRequested (requested at the provider but
+                // never accepted) is force-failed via FailAcceptance, which the
+                // aggregate now accepts from MintRequested.
+                MintRequested { .. } | MintAccepted { .. } => FailAcceptance {
                     reason: reason.to_string(),
                 },
                 TokensReceived { .. } | WrapSubmitted { .. } => FailWrapping {
@@ -1173,9 +1176,6 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 TokensWrapped { .. } | VaultDepositSubmitted { .. } => FailRaindexDeposit {
                     reason: reason.to_string(),
                 },
-                MintRequested { .. } => {
-                    anyhow::bail!("Mint {id} is at MintRequested -- cannot fail before acceptance");
-                }
                 DepositedIntoRaindex { .. } => {
                     anyhow::bail!("Mint {id} already completed (DepositedIntoRaindex)");
                 }
@@ -3794,6 +3794,94 @@ mod tests {
         assert!(
             err_msg.contains("already reconciled"),
             "failing an already-reconciled mint must refuse; got: {err_msg}"
+        );
+    }
+
+    /// Inserts a raw event row for a `TokenizedEquityMint` aggregate. The
+    /// `MintRequested`-only state is unreachable via commands by design (the bot
+    /// requests and accepts/rejects in one atomic command), so a mint genuinely
+    /// stuck pre-acceptance only exists in an abnormal event log and must be
+    /// seeded as a raw event -- the established test-only pattern for states
+    /// unreachable via commands, mirroring this aggregate's own test module.
+    /// Sequences are 1-based (the snapshot-aware loader reads `sequence > 0`).
+    async fn insert_mint_event(
+        pool: &SqlitePool,
+        id: &IssuerRequestId,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('TokenizedEquityMint', ?, ?, ?, '1.0', ?, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_mint_force_fails_from_requested() {
+        // RAI-999: a mint stuck at MintRequested (requested at the provider but
+        // never accepted) must force-fail via the CLI -- previously the CLI
+        // bailed with "cannot fail before acceptance". The state is unreachable
+        // via commands, so seed a bare MintRequested raw event.
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-requested");
+        insert_mint_event(
+            &pool,
+            &id,
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // Guard: the precondition must actually be MintRequested, so the test
+        // cannot silently drift to exercising a different dispatch arm.
+        let seeded = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(seeded, TokenizedEquityMint::MintRequested { .. }),
+            "precondition must be MintRequested, got: {seeded:?}"
+        );
+
+        let mut stdout = Vec::new();
+        fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Mint,
+            &id.to_string(),
+            "stuck at provider, never accepted",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Mint {id} marked as failed\n"),
+            "the operator-facing confirmation message must be printed"
+        );
+
+        let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let TokenizedEquityMint::Failed { reason, .. } = entity else {
+            panic!(
+                "a force-failed MintRequested mint must reach the Failed terminal, got: {entity:?}"
+            );
+        };
+        assert_eq!(
+            reason, "stuck at provider, never accepted",
+            "the operator reason must survive the full CLI dispatch into the Failed state"
         );
     }
 
