@@ -95,7 +95,7 @@ fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
     match net.to_string().parse::<f64>() {
         Ok(value) => gauge!("position_shares", "symbol" => symbol.to_string()).set(value),
         Err(err) => {
-            warn!(%symbol, %err, "position_shares gauge skipped: could not parse net position as f64")
+            warn!(%symbol, %err, "position_shares gauge skipped: could not parse net position as f64");
         }
     }
 }

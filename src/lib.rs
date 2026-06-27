@@ -210,17 +210,17 @@ async fn run_bot_session_inner(
         apalis: apalis_pool,
     };
 
-    let server_supervisor = spawn_server_supervisor(
-        &ctx,
-        &pools,
-        event_sender.clone(),
-        inventory.clone(),
-        recovery_cell.clone(),
+    let state = AppState {
+        ctx: ctx.clone(),
+        pool: pools.cqrs.clone(),
+        event_sender: event_sender.clone(),
+        inventory: inventory.clone(),
+        settings: dashboard::settings_from_ctx(&ctx),
+        recovery: recovery_cell.clone(),
         resume_lock,
-        main_listener,
-        board_listener,
         metrics_handle,
-    );
+    };
+    let server_supervisor = spawn_server_supervisor(state, &pools, main_listener, board_listener);
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pools,
@@ -327,27 +327,11 @@ impl SupervisedTask for ServerTask {
 }
 
 fn spawn_server_supervisor(
-    ctx: &Ctx,
+    state: AppState,
     pools: &DatabasePools,
-    event_sender: broadcast::Sender<Statement>,
-    inventory: Arc<inventory::BroadcastingInventory>,
-    recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
-    resume_lock: Arc<api::ResumeLock>,
     main_listener: TcpListener,
     board_listener: TcpListener,
-    metrics_handle: PrometheusHandle,
 ) -> SupervisorHandle {
-    let state = AppState {
-        ctx: ctx.clone(),
-        pool: pools.cqrs.clone(),
-        event_sender,
-        inventory,
-        settings: dashboard::settings_from_ctx(ctx),
-        recovery,
-        resume_lock,
-        metrics_handle,
-    };
-
     let main_router = Router::new()
         .merge(api::routes())
         .nest("/api", dashboard::routes())
