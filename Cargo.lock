@@ -4101,16 +4101,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metrics"
-version = "0.24.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
-dependencies = [
- "portable-atomic",
- "rapidhash",
-]
-
-[[package]]
 name = "metrics-exporter-prometheus"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4123,7 +4113,7 @@ dependencies = [
  "hyper-util",
  "indexmap 2.14.0",
  "ipnet",
- "metrics 0.23.1",
+ "metrics",
  "metrics-util",
  "quanta",
  "thiserror 1.0.69",
@@ -4140,7 +4130,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "metrics 0.23.1",
+ "metrics",
  "num_cpus",
  "quanta",
  "sketches-ddsketch",
@@ -7208,7 +7198,7 @@ dependencies = [
  "httpmock",
  "itertools 0.14.0",
  "lazy_static",
- "metrics 0.24.6",
+ "metrics",
  "metrics-exporter-prometheus",
  "num-traits",
  "opentelemetry",
