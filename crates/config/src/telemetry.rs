@@ -18,7 +18,7 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::{BatchLogProcessor, SdkLoggerProvider};
+use opentelemetry_sdk::logs::{BatchConfigBuilder as LogBatchConfigBuilder, BatchLogProcessor, SdkLoggerProvider};
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
 use serde::Deserialize;
 use std::time::Duration;
@@ -133,7 +133,17 @@ impl TelemetryCtx {
                 .build()?;
 
             SdkLoggerProvider::builder()
-                .with_log_processor(BatchLogProcessor::builder(log_exporter).build())
+                .with_log_processor(
+                    BatchLogProcessor::builder(log_exporter)
+                        .with_batch_config(
+                            LogBatchConfigBuilder::default()
+                                .with_max_export_batch_size(512)
+                                .with_max_queue_size(2048)
+                                .with_scheduled_delay(Duration::from_secs(3))
+                                .build(),
+                        )
+                        .build(),
+                )
                 .with_resource(resource)
                 .build()
         };

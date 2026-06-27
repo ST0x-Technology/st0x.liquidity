@@ -86,6 +86,11 @@ impl std::fmt::Debug for Position {
 // Called from evolve(), so it runs on both live events and event-store replay.
 // Safe for a gauge (set is idempotent); after replay the value correctly
 // reflects the current position.
+//
+// f64 precision: Prometheus gauges are natively f64 so lossless export is not
+// possible. The precision loss is intentional and acceptable here — this gauge
+// is for monitoring dashboards only. All financial accounting uses the lossless
+// Float arithmetic in the Position aggregate itself.
 fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
     match net.to_string().parse::<f64>() {
         Ok(value) => gauge!("position_shares", "symbol" => symbol.to_string()).set(value),
