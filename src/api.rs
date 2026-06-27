@@ -1705,6 +1705,7 @@ mod tests {
             )),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            metrics_handle: crate::metrics::setup().expect("metrics setup"),
         }
     }
 
