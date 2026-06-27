@@ -197,7 +197,7 @@ itertools.workspace = true
 lazy_static.workspace = true
 num-traits.workspace = true
 metrics = "0.23"
-metrics-exporter-prometheus = "0.15"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true

@@ -10,8 +10,10 @@ log_dir = "/mnt/data/logs"
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
 # How often (seconds) Apalis purges finished background jobs.
 apalis_finished_job_cleanup_interval_secs = 3600
-# OpenTelemetry service name sent to HyperDX.
-hyperdx.service_name = "st0x-liquidity"
+[telemetry]
+service_name = "st0x-liquidity"
+traces_endpoint = "http://100.x.x.x:10428"
+logs_endpoint = "http://100.x.x.x:9428"
 
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.
