@@ -11,7 +11,9 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     if let Some(handle) = HANDLE.get() {
         return Ok(handle.clone());
     }
-    let _guard = INIT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(handle) = HANDLE.get() {
         return Ok(handle.clone());
     }
