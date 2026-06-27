@@ -13,8 +13,10 @@ on any specific command.
 
 ## Token Address Reference
 
-The `-t` flag on tokenization/redemption commands expects the **unwrapped**
-token contract address for that equity. Current addresses:
+The **unwrapped** tokenized-equity contract address per symbol. The tokenization
+and redemption commands resolve this from `-s` via `[assets.equities]`, so it no
+longer has to be passed by hand; the table is kept for reference and
+cross-checking. Current addresses:
 
 | Symbol | Unwrapped Token Address                      |
 | ------ | -------------------------------------------- |
@@ -36,8 +38,11 @@ token contract address for that equity. Current addresses:
 
 ### Buying and Minting (Acquiring Tokenized Shares)
 
-To get tokenized shares into a wallet, buy offchain shares via the broker and
-then tokenize them onchain.
+To get tokenized shares into the **market-making** wallet, buy offchain shares
+via the broker and then tokenize them onchain. These run as the market-making
+bot (`stox`). For a dividend bump, use `s01 dividend-bump` instead (it runs as
+the issuer -- see below); do not follow the steps here with the liquidity
+wallet.
 
 **Step 1: Buy shares offchain**
 
@@ -52,14 +57,47 @@ Alpaca dashboard to confirm the order filled before proceeding.
 
 ```
 stox alpaca-tokenize -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38 \
   -r 0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6
 ```
 
-- `-t` is the unwrapped token contract address (see table above)
+- The tokenized-equity address is resolved from `-s` via `[assets.equities]`, so
+  it never has to be entered by hand
 - `-r` is the wallet that receives the minted tokens -- **always specify this**.
   Use the Fireblocks liquidity address
   (`0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6`)
+
+### Applying a Dividend NAV Bump (Donating into the Wrapper)
+
+When a dividend or corporate action revalues an equity, bump the wtStock
+wrapper's NAV with a single `dividend-bump` command: it buys the equivalent
+shares with the dividend cash, tokenizes them onchain, and **donates** the
+tokenized shares into the wrapper, waiting for each step to settle before the
+next. A bare ERC-20 transfer into the ERC-4626 vault raises its
+`convertToAssets` ratio without minting any wrapped shares -- see
+[wrapper-nav-bump.md](wrapper-nav-bump.md) for why.
+
+Run it as the **issuer** with `s01` -- the issuer-config counterpart of `stox`
+(same binary, but defaulting to the issuer's `[wallet]` turnkey signer, Alpaca
+account, and database) -- so the buy, tokenize, and donate are funded and signed
+by the issuer rather than the market-making wallet:
+
+```
+s01 dividend-bump -s COIN -q 10
+```
+
+`s01` defaults to `/run/st0x/s01-issuer.config` and
+`/run/agenix/s01-issuer.toml`; override with `S01_CONFIG`/`S01_SECRETS`.
+**Always run a dividend bump as the issuer:** a plain `stox dividend-bump` would
+buy, tokenize, and donate from the **market-making** wallet, not the issuer. To
+use `stox` you must pass the issuer `--config`/`--secrets` explicitly.
+
+The command buys 10 COIN offchain and waits for the fill, tokenizes the shares
+to the configured wallet and waits for them to arrive onchain, then transfers
+them into the wrapper and waits for confirmation. No wrapped shares are minted
+-- every existing wtCOIN holder's shares are simply worth more. The standalone
+`buy`, `alpaca-tokenize`, and `donate-equity` subcommands remain for running a
+single step in isolation; use `wrap-equity` only when you want to _receive_
+wrapped shares (a deposit), never for a dividend bump.
 
 ### Selling and Redeeming (Liquidating Tokenized Shares)
 
@@ -68,8 +106,7 @@ Reverse of buying and minting: redeem tokens offchain, then sell the shares.
 **Step 1: Redeem tokens**
 
 ```
-stox alpaca-redeem -s COIN -q 10 \
-  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38
+stox alpaca-redeem -s COIN -q 10
 ```
 
 **Step 2: Sell shares offchain**
@@ -83,6 +120,42 @@ stox sell -s COIN -q 10
 ```
 stox order-status --order-id <order-id>
 ```
+
+### Moving Stranded Raindex Equity Vault Funds
+
+Use this when an equity vault ID was removed from config but inventory polling
+warns that the retired vault still has a positive balance. After the bot has
+restarted with the new config, new deposits and rebalancing paths use the first
+entry in the configured vault list (config file order), but the old vault
+remains registered for balance visibility.
+
+Use the token address stored in
+`assets.equities.symbols.<SYMBOL>.tokenized_equity_derivative`, not the
+unwrapped token address table above. For the symbol you are moving, confirm the
+configured destination vault ID in the current config before moving funds.
+
+**Step 1: Withdraw from the retired vault**
+
+```bash
+stox vault-withdraw \
+  --amount <shares> \
+  --token <tokenized-equity-derivative-address> \
+  --vault-id <retired-vault-id>
+```
+
+**Step 2: Deposit the same tokens into the configured vault**
+
+```bash
+stox vault-deposit \
+  --amount <shares> \
+  --token <tokenized-equity-derivative-address> \
+  --vault-id <configured-vault-id>
+```
+
+The commands print the amount, token, wallet, orderbook, vault ID, decimals, and
+smallest-unit amount before submitting the transaction. Verify those values
+match the retired source vault and configured destination vault before relying
+on the printed transaction hash.
 
 ## Alpaca Crypto Wallet Management
 
@@ -126,10 +199,10 @@ stox alpaca-tokenization-requests
 
 ### Rechecking Failed Equity Transfers
 
-Use `recheck-transfer` when the bot marked an equity mint or redemption as
+Use `transfer recheck` when the bot marked an equity mint or redemption as
 failed, but Alpaca later shows the same provider request as completed.
 
-**The bot must be running.** `recheck-transfer` delegates to the bot's REST API
+**The bot must be running.** `transfer recheck` delegates to the bot's REST API
 (`POST /transfers/recheck/<kind>/<id>` on the configured `server_port`) rather
 than mutating the database directly. Recovery has to run inside the bot process
 so the recovery event dispatches through the in-process inventory reactor (which
@@ -146,22 +219,22 @@ Recoverable cases:
 
 - Mint failed at acceptance (accepted by Alpaca, but tokens never received),
   then Alpaca later reports the mint completed.
-  `stox recheck-transfer --type mint --id <issuer-request-id>` records provider
+  `stox transfer recheck --kind mint --id <issuer-request-id>` records provider
   completion and resumes wrapping/depositing to Raindex. A mint that already
   received tokens and then failed while wrapping or depositing is **not**
   recoverable this way (recovery would re-wrap tokens that already moved); the
   command reports it as not recoverable.
 - Redemption failed after tokens were sent, with a redemption tx in the
   aggregate.
-  `stox recheck-transfer --type redemption --id <redemption-aggregate-id>`
+  `stox transfer recheck --kind redemption --id <redemption-aggregate-id>`
   completes it if Alpaca now reports completed.
-- Non-failed active mints/redemptions can also be passed to `recheck-transfer`;
+- Non-failed active mints/redemptions can also be passed to `transfer recheck`;
   the command resumes the normal workflow instead of forcing recovery.
 
 The command prints the recovery outcome: `recovered`, `resumed`,
 `already_completed`, `left_unchanged`, `not_detected_yet`, or `not_recoverable`.
 
-Not covered by `recheck-transfer` yet:
+Not covered by `transfer recheck` yet:
 
 - Mint requests rejected before Alpaca acceptance. There is no provider
   completion to discover.
@@ -172,8 +245,96 @@ Not covered by `recheck-transfer` yet:
   request id to look up, so this needs a retry/resume-send style CLI.
 - Provider rejections. These remain failed unless an operator performs a
   separate manual reconciliation.
-- USDC rebalancing failures. Those use the USDC/CCTP state machine and need
-  separate recovery commands.
+- USDC rebalancing failures. Those use the USDC/CCTP state machine and have
+  their own recovery commands. A manual `transfer-usdc` prints its transfer id
+  and, if interrupted after the burn, is resumed with
+  `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
+  The `--direction` must match the original (a mismatch is rejected to avoid
+  mis-driving) and an unknown id is rejected rather than starting a fresh burn;
+  a resume uses the aggregate's persisted amount, so no amount is taken. Run it
+  only when the bot is not concurrently driving that same id, since it drives
+  the aggregate directly rather than through the bot's resume lock.
+- Interrupted equity transfers (mints/redemptions) are resumed in bulk with
+  `stox transfer resume --kind equity`, which calls the running bot's
+  `/transfers/resume` endpoint (always resumes ALL interrupted transfers, no
+  per-id filter; each succeeds or fails independently and failures are reported
+  as counts with a non-zero exit). Requires the bot to be running.
+
+### Clearing a pre-burn guard latch
+
+Use `fail-usdc-transfer` when a USDC rebalance is stranded at
+`WithdrawalComplete` or `BridgingSubmitting` and the guard must be released.
+This transitions the aggregate to `BridgingFailed` (pre-burn,
+`burn_tx_hash: None`), which is non-guard-holding. The rebalancing guard clears
+on the next bot restart.
+
+**Stop the bot before running this command** to eliminate the race where the bot
+advances the transfer to `Bridging` between the preflight and the send.
+
+`WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
+broadcast yet. However, the Alpaca->on-chain USDC withdrawal has already
+completed, so the USDC is sitting in the market-maker wallet. After clearing the
+guard with this command, reconcile or handle those funds separately as needed.
+The command is safe to run once the bot is stopped.
+
+`BridgingSubmitting` is NOT unconditionally safe. A crash at this state may have
+already broadcast a CCTP burn whose `BridgingInitiated` event never persisted.
+Before running this command on a `BridgingSubmitting` transfer, verify on-chain
+that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
+`cast` against the Circle CCTP contract or by inspecting recent wallet txs).
+
+- **If no burn is found**: run `fail-usdc-transfer` to clear the guard.
+- **If a burn IS found** while the aggregate is still `BridgingSubmitting`: do
+  NOT run `fail-usdc-transfer` (strands the burned funds) and do NOT run
+  `transfer reconcile` (its preflight rejects `BridgingSubmitting` -- it only
+  accepts persisted post-burn terminals such as `DepositFailed`). Instead, run
+  `transfer resume --kind usdc`: its `find_recent_burn` scan adopts the orphan
+  burn, persists `BridgingInitiated`, and the transfer continues normally.
+
+`transfer reconcile` is the path for persisted post-burn terminal failures (e.g.
+`DepositFailed`, `BridgingFailed` with a burn tx recorded). The legacy flat
+`resume-usdc-transfer` / `reconcile-usdc-transfer` names have been removed; only
+the grouped `transfer resume` / `transfer reconcile` forms exist.
+
+    stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
+
+### Reconciling Stuck Failed Transfers
+
+Use `transfer reconcile` when an operation is stranded in a terminal failure and
+its residue was already handled out-of-band, so it should be declared resolved
+rather than re-driven. It operates directly on the local CQRS state (the bot
+need not be running) and goes through the aggregate command flow. `--reason` is
+required and persisted as the audit record.
+
+```
+# USDC rebalance stuck in a post-burn DepositFailed (minted USDC moved manually)
+stox transfer reconcile --kind usdc --id <usdc-rebalance-id> \
+  --reason funds-moved-manually        # or deposit-credited-offline
+
+# Equity mint stuck in Failed (tokens were wrapped/deposited manually)
+stox transfer reconcile --kind mint --id <issuer-request-id> \
+  --reason "wrapped + deposited via wrap-equity/vault-deposit"
+
+# Equity redemption stuck in Failed (equity resolved out-of-band)
+stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
+  --reason "redeemed manually"
+```
+
+- `--kind usdc` drives a stuck post-burn USDC rebalance to the clearing terminal
+  `Reconciled` state, releasing the rebalancing guard. It is accepted from any
+  of the post-burn terminal failures: `DepositFailed` (any direction), a
+  post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
+  and a `BaseToAlpaca` `ConversionFailed`. Its `--reason` must be one of
+  `funds-moved-manually` or `deposit-credited-offline`; any other value is
+  rejected. Valid only from a post-burn terminal failure.
+- `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
+  as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
+  reactor effect and dispatches no inventory update. One nuance for redemptions
+  that ended in `DetectionFailed` / `RedemptionRejected` -- their stranded
+  exposure is seeded into live inflight at startup, and reconcile clears that
+  seeding only on the **next** bot restart (the running process keeps the seeded
+  amount until then). Valid only from `Failed`; a transfer in any other state is
+  rejected. The `--reason` is free text.
 
 For local dashboard testing, run:
 
@@ -182,5 +343,5 @@ nix run .#simulate-failures
 ```
 
 The backend creates failed mint and redemption transfers whose mock Alpaca
-provider later completes, then prints the exact `recheck-transfer` commands for
+provider later completes, then prints the exact `transfer recheck` commands for
 that run's generated config, secrets, database, and mock API port.

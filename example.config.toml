@@ -1,7 +1,13 @@
 server_port = 8080
+board_port = 8081
 log_level = "debug"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
+# Interval (seconds) between continuous eth_getLogs polls for orderbook fills.
+# Each tick enqueues a backfill range over the unprocessed blocks, capped at the
+# configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
+order_fill_poll_interval = 5
+
 [telemetry]
 service_name = "st0x-hedge"
 traces_endpoint = "http://100.x.x.x:10428"
@@ -18,14 +24,25 @@ beneficiary_entity_name = "Acme Corp"
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
-# Number of block confirmations required before an event is considered
-# safe to ingest. Naive reorg protection (NOT real chain finality):
-# backfill caps `to_block` at `latest - required_confirmations`, and live
-# ingestion defers persistence until events are this many blocks deep.
-# A deep reorg exceeding this depth will still corrupt state; the
-# monitor surfaces that case loudly rather than masking it. Set
-# explicitly per chain based on observed reorg behavior.
+# Block-confirmation depth required before a transaction this bot submits is
+# treated as settled (the primary gate for USDC rebalancing withdrawals). This
+# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
+# at the configured ingestion_cutoff block, not this depth. Set explicitly per
+# chain based on observed confirmation behavior.
 required_confirmations = 3
+# Block tag used as the fill-ingestion cutoff. REQUIRED -- must be set
+# explicitly to "safe" or "finalized"; omitting this field fails startup.
+# "safe"      -- OP-Stack safe block: sequencer batch posted to L1, not yet
+#                L1-finalized. Cuts hedging lag to ~seconds on Base.
+#                Tradeoff: an L1 reorg dropping the batch tx could in principle
+#                invalidate a safe-ingested fill (no reversal path exists; full
+#                reorg handling is tracked separately in the Reorg protection
+#                project). Also, when safe regresses within the quiet-skew band,
+#                the checkpoint is frozen and newly-canonical fills in the
+#                reorged range are not ingested (same no-reversal-path tradeoff).
+# "finalized" -- L1-finalized block (Casper FFG). Full reorg protection but
+#                ~20 min hedging lag on Base.
+ingestion_cutoff = "safe"
 
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
@@ -55,14 +72,32 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.
 transfer_timeout_secs = 1800
+# Per-attempt wall-clock bound for a single Base->Alpaca transfer job attempt.
+# A hung RPC inside the transfer is aborted after this so the attempt fails and
+# retries instead of wedging forever. Must exceed the worst-case single resume
+# (CCTP attestation + Alpaca deposit polling); only trips on a true hang.
+# 3600 = 60 minutes.
+transfer_attempt_timeout_secs = 3600
+# CCTP attestation polling timeouts stay retryable until this deadline.
+# 86400 = 24 hours.
+attestation_retry_deadline_secs = 86400
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# Optional Pyth price feed ID (full 32-byte hex) used to record a reference
+# price for trade enrichment. When omitted, enrichment is skipped for this
+# symbol (hedging is unaffected). Must match the feed the order reads; refresh
+# it if the order migrates to a different Pyth feed.
+# pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
 trading = "enabled"
 rebalancing = "disabled"
+# Auto-recovery for wrapped equity tokens detected in bot wallets:
+# resumes a stalled mint/redemption that owns the balance, or
+# deposits orphaned tokens back into the Raindex vault.
+wrapped_equity_recovery = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0
@@ -78,3 +113,19 @@ rebalancing = "enabled"
 # Credentials go in the secrets file under [rest_api].
 # [rest_api]
 # url = "https://api.example.com"
+
+# Optional — low-gas balance alerting for the bot wallet. When absent, no gas
+# monitor runs. When present, every field is required (no silent defaults) and
+# the Telegram bot_token must be set under [alerts] in the secrets file.
+# [alerts]
+# Telegram chat the alerts are delivered to (a negative id for group/channel).
+# chat_id = -1001234567890
+# Native-ETH balance below which an alert fires, as a decimal-ETH string.
+# low_balance_threshold = "0.05"
+# Seconds between native-balance polls.
+# poll_interval = 300
+# Minimum seconds between repeated low-balance alerts while still low.
+# realert_interval = 3600
+# Optional forum topic to deliver alerts into (a forum supergroup's
+# message_thread_id). Omit to post to the chat's default (General) topic.
+# message_thread_id = 42

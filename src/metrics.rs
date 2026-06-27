@@ -39,11 +39,8 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     Ok(handle)
 }
 
-#[rocket::get("/metrics")]
-pub(crate) fn endpoint(handle: &rocket::State<PrometheusHandle>) -> String {
-    handle.render()
-}
-
-pub(crate) fn routes() -> Vec<rocket::Route> {
-    rocket::routes![endpoint]
+pub(crate) async fn endpoint(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> String {
+    state.metrics_handle.render()
 }

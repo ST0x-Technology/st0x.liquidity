@@ -15,7 +15,14 @@ use super::journal::{JournalRequest, JournalResponse};
 use super::order::{
     CryptoOrderRequest, CryptoOrderResponse, LimitOrderRequest, OrderRequest, OrderResponse,
 };
-use crate::{FractionalShares, Positive, Symbol};
+use crate::{ClientOrderId, FractionalShares, Positive, Symbol};
+
+/// Request timeout applied to every Alpaca Broker API HTTP call.
+///
+/// Exposed so timing-sensitive tests can derive their boundary delays from
+/// this single source of truth instead of duplicating the literal -- a
+/// change here then cannot silently invalidate those tests.
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -51,7 +58,7 @@ impl AlpacaBrokerApiClient {
         let http_client = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?;
         let api_key_header = HeaderName::from_static("apca-api-key-id");
         let api_secret_header = HeaderName::from_static("apca-api-secret-key");
@@ -63,7 +70,7 @@ impl AlpacaBrokerApiClient {
         let market_data_http_client = reqwest::Client::builder()
             .default_headers(market_data_headers)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?;
 
         Ok(Self {
@@ -167,6 +174,35 @@ impl AlpacaBrokerApiClient {
         self.get(&url).await
     }
 
+    /// Get an order by its `client_order_id`. Returns `None` if Alpaca has no
+    /// such order (404) -- i.e. it was never recorded. Used to reconcile a
+    /// placement that the broker rejected as a duplicate `client_order_id`
+    /// (it already accepted the original attempt, whose response was lost).
+    pub(super) async fn get_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<OrderResponse>, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders:by_client_order_id?client_order_id={}",
+            self.base_url, self.account_id, client_order_id
+        );
+
+        debug!(
+            "Fetching order by client_order_id {} from {}",
+            client_order_id, url
+        );
+
+        match self.get::<OrderResponse>(&url).await {
+            Ok(order) => Ok(Some(order)),
+            Err(AlpacaBrokerApiError::ApiError { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Get asset information by symbol
     pub(super) async fn get_asset(
         &self,
@@ -205,6 +241,39 @@ impl AlpacaBrokerApiClient {
         debug!("Fetching crypto order {} from {}", order_id, url);
 
         self.get(&url).await
+    }
+
+    /// Get a crypto order by its `client_order_id`. Returns `None` only on a 404
+    /// (Alpaca's documented not-found response for this lookup) -- i.e. the order
+    /// was never placed.
+    ///
+    /// Every other error status is propagated rather than mapped to `None`. This is
+    /// deliberate: a transient failure (5xx, rate limit) on an order that WAS placed
+    /// must retry, not be mistaken for "never placed" -- mapping it to `None` would
+    /// wrongly fail a still-settling conversion and lose the converted USDC.
+    pub(crate) async fn get_crypto_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders:by_client_order_id?client_order_id={}",
+            self.base_url, self.account_id, client_order_id
+        );
+
+        debug!(
+            "Fetching crypto order by client_order_id {} from {}",
+            client_order_id, url
+        );
+
+        match self.get::<CryptoOrderResponse>(&url).await {
+            Ok(order) => Ok(Some(order)),
+            Err(AlpacaBrokerApiError::ApiError { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Create a security journal (JNLS) to transfer equities between accounts.

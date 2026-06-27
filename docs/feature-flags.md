@@ -48,6 +48,27 @@ correctness guarantees and/or code quality.
 method won't exist in unit test builds but will exist in e2e builds where
 dev-deps enable `test-support`.
 
+### Dead code across a stacked PR: forward vs backward
+
+When work is split into a Graphite stack, `deny(dead_code)` forces a choice
+about temporarily-unused code. Distinguish code that is _not yet born_ from code
+that _has died_:
+
+- **Forward-dead** — introduced ahead of its consumer, which lands in the next
+  upstack PR. Acceptable to keep behind `#[allow(dead_code)]` **only** with a
+  comment naming the exact upstack issue + branch (and the PR once it exists)
+  that consumes it. That upstack PR must be the _immediate next_ one in the
+  stack, so the allow is never stranded. This is how a stack stays small: a base
+  PR can introduce a type/trait/method whose first caller arrives one PR later.
+- **Backward-dead** — superseded, i.e. a new path replaced it. MUST be removed
+  in the same PR that introduces the replacement. Never annotate-and-keep
+  superseded code; an `#[allow(dead_code)]` on a corpse is forbidden. When the
+  replacement lands, the replaced code dies with it.
+
+The test is simple: is the code waiting to be _born_ (a consumer is coming) or
+has it _died_ (its consumers left)? Forward-dead may wait one PR behind an
+attributed allow; backward-dead goes now.
+
 ### Pattern: zero-size prod / functional test type
 
 When a type needs to exist in all builds (to avoid `#[cfg]` on every function

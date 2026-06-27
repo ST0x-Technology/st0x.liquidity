@@ -7,16 +7,14 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::debug;
 
+use st0x_config::EvmCtx;
 use st0x_evm::Evm;
 
 use super::OnChainError;
-use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::TradeValidationError;
-use crate::onchain::{
-    EvmCtx,
-    pyth::FeedIdCache,
-    trade::{OnchainTrade, OrderFill},
-};
+use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
@@ -28,7 +26,7 @@ impl OnchainTrade {
         evm: &E,
         event: ClearV3,
         log: Log,
-        feed_id_cache: &FeedIdCache,
+        pyth_feed_ids: &PythFeedIds,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
         let ClearV3 {
@@ -96,7 +94,7 @@ impl OnchainTrade {
         };
 
         let result =
-            Self::try_from_order_and_fill_details(cache, evm, order, fill, log, feed_id_cache)
+            Self::try_from_order_and_fill_details(cache, evm, order, fill, log, pyth_feed_ids)
                 .await;
 
         if let Ok(Some(ref trade)) = result {
@@ -236,15 +234,17 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
 
+    use st0x_config::IngestionCutoff;
+
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV6;
-    use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
+    use crate::bindings::IRaindexV6;
+    use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::io::WrappedTokenizedShares;
-    use crate::onchain::pyth::FeedIdCache;
+    use crate::onchain::pyth::PythFeedIds;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
@@ -252,16 +252,17 @@ mod tests {
 
     fn create_test_ctx() -> EvmCtx {
         EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         }
     }
 
     fn create_clear_event(
-        alice_order: IOrderBookV6::OrderV4,
-        bob_order: IOrderBookV6::OrderV4,
+        alice_order: IRaindexV6::OrderV4,
+        bob_order: IRaindexV6::OrderV4,
     ) -> ClearV3 {
         ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
@@ -377,7 +378,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -385,7 +386,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -461,7 +462,7 @@ mod tests {
             &"USDC".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -469,7 +470,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -506,7 +507,7 @@ mod tests {
 
         let asserter = Asserter::new();
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -514,7 +515,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -542,7 +543,7 @@ mod tests {
 
         let asserter = Asserter::new();
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -550,7 +551,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -597,7 +598,7 @@ mod tests {
         asserter.push_success(&json!([])); // No after clear logs found
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -605,7 +606,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -669,7 +670,7 @@ mod tests {
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong transaction hash
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -677,7 +678,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -739,7 +740,7 @@ mod tests {
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong log index ordering
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -747,7 +748,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -814,7 +815,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -822,7 +823,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -969,7 +970,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -977,7 +978,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1042,7 +1043,7 @@ mod tests {
         asserter.push_success(&json!([after_clear_log_equal_index])); // get_logs returns log with equal index (not valid)
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt has no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1050,7 +1051,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1117,7 +1118,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1125,7 +1126,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1189,7 +1190,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1197,7 +1198,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1267,7 +1268,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1275,7 +1276,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1324,7 +1325,7 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has log but wrong contract address
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1332,7 +1333,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1377,7 +1378,7 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has AfterClearV2 but log_index < clear's
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1385,7 +1386,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1426,7 +1427,7 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has ClearV3 but no AfterClearV2
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1434,7 +1435,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1482,7 +1483,7 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has log but unrecognized event signature
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1490,7 +1491,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1554,7 +1555,7 @@ mod tests {
             &"wtAAPL".to_string(),
         ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1562,7 +1563,7 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &feed_id_cache,
+            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await

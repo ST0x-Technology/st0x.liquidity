@@ -7,7 +7,6 @@ use std::sync::{
 use async_trait::async_trait;
 use rain_math_float::Float;
 use st0x_float_macro::float;
-use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 /// Hardcoded mock price returned by `MockExecutor::get_order_status`.
@@ -24,12 +23,20 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct MockExecutorCtx;
 
+/// Whether the mock executes operations or fails them. Couples the
+/// failure flag to its message so a message without a failure (or a
+/// failure without a message) is unrepresentable.
+#[derive(Debug, Clone)]
+enum Health {
+    Healthy,
+    Failing { message: String },
+}
+
 /// Unified test executor for dry-run mode and testing that logs operations without executing real trades
 #[derive(Debug, Clone)]
 pub struct MockExecutor {
     order_counter: Arc<AtomicU64>,
-    should_fail: bool,
-    failure_message: String,
+    health: Health,
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
     market_open: bool,
@@ -40,8 +47,7 @@ impl MockExecutor {
     pub fn new() -> Self {
         Self {
             order_counter: Arc::new(AtomicU64::new(1)),
-            should_fail: false,
-            failure_message: String::new(),
+            health: Health::Healthy,
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
             market_open: true,
@@ -51,13 +57,10 @@ impl MockExecutor {
 
     pub fn with_failure(message: impl Into<String>) -> Self {
         Self {
-            order_counter: Arc::new(AtomicU64::new(1)),
-            should_fail: true,
-            failure_message: message.into(),
-            inventory_result: InventoryResult::Unimplemented,
-            order_status_override: None,
-            market_open: true,
-            preflight_price: *MOCK_FILL_PRICE,
+            health: Health::Failing {
+                message: message.into(),
+            },
+            ..Self::new()
         }
     }
 
@@ -75,11 +78,24 @@ impl MockExecutor {
         self
     }
 
-    /// Configures whether the market is considered open.
+    /// Configures the executor to report the market as closed (open is
+    /// the default).
     #[must_use]
-    pub fn with_market_open(mut self, open: bool) -> Self {
-        self.market_open = open;
+    pub fn with_market_closed(mut self) -> Self {
+        self.market_open = false;
         self
+    }
+
+    /// Returns the failure error when the executor is configured to
+    /// fail, shared by every fallible operation.
+    fn fail_if_unhealthy(&self) -> Result<(), ExecutionError> {
+        if let Health::Failing { message } = &self.health {
+            return Err(ExecutionError::MockFailure {
+                message: message.clone(),
+            });
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -120,11 +136,7 @@ impl Executor for MockExecutor {
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
-        if self.should_fail {
-            return Err(ExecutionError::MockFailure {
-                message: self.failure_message.clone(),
-            });
-        }
+        self.fail_if_unhealthy()?;
 
         let order_id = self.generate_order_id();
 
@@ -144,11 +156,7 @@ impl Executor for MockExecutor {
     }
 
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error> {
-        if self.should_fail {
-            return Err(ExecutionError::OrderNotFound {
-                order_id: order_id.clone(),
-            });
-        }
+        self.fail_if_unhealthy()?;
 
         if let Some(ref override_state) = self.order_status_override {
             debug!(target: "broker", "[TEST] Checking status for order: {}", order_id);
@@ -178,16 +186,8 @@ impl Executor for MockExecutor {
         Ok(order_id_str.to_string())
     }
 
-    async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
-        None
-    }
-
     async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
-        if self.should_fail {
-            return Err(ExecutionError::MockFailure {
-                message: self.failure_message.clone(),
-            });
-        }
+        self.fail_if_unhealthy()?;
 
         Ok(self.inventory_result.clone())
     }
@@ -196,11 +196,7 @@ impl Executor for MockExecutor {
         &self,
         order: MarketOrder,
     ) -> Result<CounterTradePreflight, Self::Error> {
-        if self.should_fail {
-            return Err(ExecutionError::MockFailure {
-                message: self.failure_message.clone(),
-            });
-        }
+        self.fail_if_unhealthy()?;
 
         let InventoryResult::Fetched(inventory) = &self.inventory_result else {
             return Ok(CounterTradePreflight::Allowed { reservation: None });
@@ -259,8 +255,10 @@ impl TryIntoExecutor for MockExecutorCtx {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
-    use crate::{Direction, FractionalShares, Positive, Symbol};
+    use crate::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
 
     fn shares(value: &str) -> FractionalShares {
         FractionalShares::new(Float::parse(value.to_string()).unwrap())
@@ -273,8 +271,10 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_ctx_success() {
         let executor = MockExecutor::try_from_ctx(MockExecutorCtx).await.unwrap();
-        assert!(!executor.should_fail);
-        assert_eq!(executor.failure_message, "");
+
+        // A constructed executor is operational: a fallible op succeeds
+        // rather than returning the unhealthy MockFailure.
+        executor.get_inventory().await.unwrap();
     }
 
     #[tokio::test]
@@ -298,6 +298,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("10"),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let placement = executor.place_market_order(order).await.unwrap();
@@ -315,6 +316,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("10"),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         assert!(matches!(
@@ -340,7 +342,7 @@ mod tests {
 
         assert!(matches!(
             executor.get_order_status(&"TEST_1".to_string()).await.unwrap_err(),
-            ExecutionError::OrderNotFound { order_id } if order_id == "TEST_1"
+            ExecutionError::MockFailure { message } if message == "Test failure"
         ));
     }
 
@@ -366,6 +368,7 @@ mod tests {
             }],
             usd_balance_cents: 5_000_000,
             cash_buying_power_cents: Some(5_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
 
@@ -403,12 +406,15 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 10_000,
             cash_buying_power_cents: Some(10_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
 
         let executor = MockExecutor::new().with_inventory(inventory);
 
-        assert!(!executor.should_fail);
+        // `with_inventory` leaves the executor healthy: a fallible op still
+        // succeeds rather than returning the unhealthy MockFailure.
+        executor.get_inventory().await.unwrap();
         assert_eq!(executor.to_supported_executor(), SupportedExecutor::DryRun);
     }
 
@@ -418,6 +424,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 50_000,
             cash_buying_power_cents: Some(50_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -426,6 +433,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("2"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -449,6 +457,7 @@ mod tests {
             }],
             usd_balance_cents: 50_000,
             cash_buying_power_cents: Some(50_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -457,6 +466,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("20"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -485,6 +495,7 @@ mod tests {
             }],
             usd_balance_cents: 50_000,
             cash_buying_power_cents: Some(50_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -493,6 +504,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("5"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -513,6 +525,7 @@ mod tests {
                 positions: vec![],
                 usd_balance_cents: 10_000,
                 cash_buying_power_cents: Some(10_000),
+                alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));
@@ -522,6 +535,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("2"),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -545,6 +559,7 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     shares: positive_shares("2"),
                     direction: Direction::Buy,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 })
                 .await
                 .unwrap_err(),

@@ -2,6 +2,7 @@
   pkgs,
   craneLib,
   abiEnv,
+  rainMathFloatAbiEnv,
   rainMathFloat,
 }:
 
@@ -46,11 +47,40 @@ let
     outputHashes = {
       "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
-      "git+https://github.com/ST0x-Technology/event-sorcery.git?branch=docs/examples#262d12b3f797a0b7445ee62d846119d3d7110dc7" =
-        "sha256-bpj3QE2z2F8RLH4O++5gor1SrDFGf23CnzGgATUE5OQ=";
+      "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=1557172049c8a43add209a86c7d809e89a5fbc82#1557172049c8a43add209a86c7d809e89a5fbc82" =
+        "sha256-GkQaR+cp09NJBarrz8VeJV/6DVFz+EhMsu2y8jP0Uck=";
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
     };
+
+    # st0x.issuance is a Solidity repo with a deep git submodule tree
+    # (ethgild -> rain.* -> openzeppelin-contracts), but the st0x-issuance-dto
+    # and st0x-issuance-client crates we depend on are pure Rust. Crane's git
+    # fetcher (downloadCargoPackageFromGit) pulls submodules unconditionally, so
+    # the default vendor recursively clones that whole tree -- slow and a
+    # recurring CI flake. Override the issuance checkout to skip submodules.
+    # The rev is read from Cargo.lock (`issuanceRev` below) so it cannot drift
+    # from the st0x-issuance-* pins. Only `hash` is hand-maintained: regenerate
+    # it with `nix-prefetch-git --fetch-lfs` (without submodules) when re-pinning.
+    overrideVendorGitCheckout =
+      packages: drv:
+      if
+        pkgs.lib.any (
+          package:
+          pkgs.lib.hasPrefix "git+https://github.com/ST0x-Technology/st0x.issuance.git" package.source
+        ) packages
+      then
+        drv.overrideAttrs (_: {
+          src = pkgs.fetchgit {
+            url = "https://github.com/ST0x-Technology/st0x.issuance.git";
+            rev = issuanceRev;
+            hash = "sha256-r3U9nZ0y8u1kLM4BJO11aHR/O1t6OsZefc9VcfcUpuA=";
+            fetchSubmodules = false;
+            fetchLFS = true;
+          };
+        })
+      else
+        drv;
   };
 
   # sqlite-es uses sqlx::migrate!("../../migrations") which resolves inside
@@ -61,6 +91,14 @@ let
     builtins.filter (p: p.name or "" == "sqlite-es") cargoLock.package
   );
   sqliteEsRev = builtins.head (builtins.match ".*#([a-f0-9]+)" sqliteEsPackage.source);
+
+  # Issuance vendor override (above) reuses the rev Cargo.lock locks for the
+  # st0x-issuance-* crates, so the rev can never drift from the Cargo.toml pins.
+  # Both crates resolve to the same checkout; read it from either one.
+  issuancePackage = builtins.head (
+    builtins.filter (p: p.name or "" == "st0x-issuance-dto") cargoLock.package
+  );
+  issuanceRev = builtins.head (builtins.match ".*#([a-f0-9]+)" issuancePackage.source);
 
   sqliteEsMigrations =
     builtins.fetchGit {
@@ -118,6 +156,10 @@ let
   # exercising any tests the matrix doesn't already cover.
   commonArgs = depsArgs // abiEnv // { doCheck = false; };
 
+  # DTO only needs rain-math-float's ABI env through its Float dependency; keep
+  # dashboard builds from realizing backend contract ABIs.
+  dtoArgs = depsArgs // rainMathFloatAbiEnv // { doCheck = false; };
+
   # Build only dependencies (cached separately from source changes).
   # Crane's mkDummySrc internally strips to manifests + dummy crate roots,
   # so we feed it fullSrc rather than pre-stripping ourselves -- our prior
@@ -131,7 +173,8 @@ in
   # source at crates/dto/default.nix; rust.nix only supplies shared crane
   # infra.
   st0x-dto = import ./crates/dto {
-    inherit craneLib commonArgs cargoArtifacts;
+    inherit craneLib cargoArtifacts;
+    commonArgs = dtoArgs;
   };
 
   # Server binary for deployment

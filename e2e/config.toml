@@ -1,4 +1,5 @@
 server_port = 8001
+board_port = 8002
 log_level = "trace"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
@@ -7,6 +8,7 @@ hyperdx.service_name = "st0x-hedge-e2e"
 [assets.equities.EXAMPLE]
 trading = "enabled"
 rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
@@ -14,6 +16,7 @@ tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 required_confirmations = 0
+ingestion_cutoff = "safe"
 
 [rest_api]
 url = "http://localhost:8099"

@@ -1,14 +1,10 @@
-//! Onchain event processing: EVM configuration, trade
-//! parsing, event backfilling, position accumulation, and
-//! vault management.
+//! Onchain event processing: trade parsing, event backfilling,
+//! position accumulation, and vault management.
 
 use alloy::primitives::ruint::FromUintError;
-use alloy::primitives::{Address, address};
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
-use serde::Deserialize;
 use std::num::TryFromIntError;
-use url::Url;
 
 use st0x_event_sorcery::ProjectionError;
 use st0x_execution::order::status::ParseOrderStatusError;
@@ -20,77 +16,18 @@ use st0x_execution::{
 use crate::position::{Position, PositionError};
 
 pub(crate) mod accumulator;
+pub(crate) mod approvals;
 pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;
 #[cfg(test)]
 pub(crate) mod mock;
 pub(crate) mod pyth;
-pub(crate) mod raindex;
 mod take_order;
 pub(crate) mod trade;
 
 pub(crate) use trade::OnchainTrade;
 pub(crate) use trade::TradeValidationError;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EvmConfig {
-    pub(crate) orderbook: Address,
-    pub(crate) deployment_block: u64,
-    /// Number of confirmations a block must have before its events are
-    /// ingested. Naive reorg protection: both backfill and live
-    /// ingestion treat the latest tip block minus this value as the
-    /// highest safe block. This is a heuristic, not real chain finality
-    /// -- a deep reorg crossing this depth will still corrupt state.
-    /// Must be set explicitly -- no silent default.
-    pub(crate) required_confirmations: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EvmSecrets {
-    #[serde(rename = "ws_rpc_url")]
-    pub(crate) ws: Url,
-    /// Base chain RPC URL for wallet operations. Required when `[wallet]`
-    /// is configured.
-    #[serde(rename = "base_rpc_url")]
-    pub(crate) base: Option<Url>,
-    /// Ethereum mainnet RPC URL for wallet operations. Required when
-    /// `[wallet]` is configured.
-    #[serde(rename = "ethereum_rpc_url")]
-    pub(crate) ethereum: Option<Url>,
-}
-
-#[derive(Clone)]
-pub(crate) struct EvmCtx {
-    pub(crate) ws_rpc_url: Url,
-    pub(crate) orderbook: Address,
-    pub(crate) deployment_block: u64,
-    pub(crate) required_confirmations: u64,
-}
-
-impl std::fmt::Debug for EvmCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EvmCtx")
-            .field("ws_rpc_url", &"[REDACTED]")
-            .field("orderbook", &self.orderbook)
-            .field("deployment_block", &self.deployment_block)
-            .field("required_confirmations", &self.required_confirmations)
-            .finish()
-    }
-}
-
-impl EvmCtx {
-    pub(crate) fn new(config: &EvmConfig, secrets: EvmSecrets) -> Self {
-        Self {
-            ws_rpc_url: secrets.ws,
-            orderbook: config.orderbook,
-            deployment_block: config.deployment_block,
-            required_confirmations: config.required_confirmations,
-        }
-    }
-}
 
 /// Unified error type for onchain trade processing with clear domain boundaries.
 /// Provides error mapping between layers while maintaining separation of concerns.
@@ -142,9 +79,17 @@ pub(crate) enum OnChainError {
     MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Failed to push job into queue: {0}")]
     JobQueue(#[from] crate::conductor::job::QueuePushError),
+    /// The RPC node answered an `eth_getLogs` for a block range it has
+    /// not finished indexing -- the node's reported tip is behind the
+    /// requested `to_block`. Returning this error lets the retry loop
+    /// reissue the request so a load-balancer routes to a different
+    /// upstream node that has caught up.
+    #[error(
+        "RPC node tip {observed_tip} is behind the requested to_block \
+         {required_tip}; the getLogs response cannot be trusted"
+    )]
+    NodeLaggingBehindRequest {
+        observed_tip: u64,
+        required_tip: u64,
+    },
 }
-
-pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
-pub(crate) const USDC_ETHEREUM_SEPOLIA: Address =
-    address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");

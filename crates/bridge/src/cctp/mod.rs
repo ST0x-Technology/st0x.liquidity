@@ -71,8 +71,9 @@ pub use test_contracts::{
 use std::mem::size_of;
 use std::time::Duration;
 
-use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::sol;
+use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use backon::Retryable;
 use rain_math_float::Float;
@@ -178,39 +179,56 @@ pub struct AttestationResponse {
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
     attestation: Bytes,
-    /// The real CCTP nonce pre-validated as u64 at construction time.
-    validated_nonce: u64,
-}
-
-impl AttestationResponse {
-    /// Constructs an `AttestationResponse`, validating that the 32-byte
-    /// nonce fits in a u64 at construction time rather than deferring to
-    /// runtime.
-    fn new(message: Bytes, attestation: Bytes, nonce: FixedBytes<32>) -> Result<Self, CctpError> {
-        let bytes: &[u8; 32] = nonce.as_ref();
-        let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
-
-        if padding.iter().any(|&b| b != 0) {
-            return Err(CctpError::NonceOverflow { nonce });
-        }
-
-        let validated_nonce = u64::from_be_bytes(value.try_into()?);
-
-        Ok(Self {
-            message,
-            attestation,
-            validated_nonce,
-        })
-    }
+    /// The real 32-byte CCTP V2 nonce extracted from the attested message.
+    nonce: B256,
 }
 
 impl crate::Attestation for AttestationResponse {
-    fn nonce(&self) -> u64 {
-        self.validated_nonce
+    fn nonce(&self) -> B256 {
+        self.nonce
     }
 
     fn as_bytes(&self) -> &[u8] {
         &self.attestation
+    }
+
+    fn message_bytes(&self) -> &[u8] {
+        &self.message
+    }
+}
+
+impl AttestationResponse {
+    /// Reconstructs a response from a persisted message envelope and signature,
+    /// re-deriving the nonce from the message so a stored attestation is
+    /// self-validating (an all-zero placeholder nonce is rejected, mirroring a
+    /// fresh poll).
+    ///
+    /// Validates that the message reaches the CCTP body offset
+    /// (`MESSAGE_BODY_INDEX`) -- the same bound [`parse_received_message`] uses --
+    /// not merely enough to extract a nonce. A truncated envelope that still
+    /// carried a non-zero nonce would otherwise construct and then revert in
+    /// `receiveMessage` on-chain instead of failing here, where the caller routes
+    /// it to operator reconciliation. This is the shared constructor for both a
+    /// fresh poll and a persisted-envelope resume, so both enforce identical
+    /// rules. (It does not guarantee a mintable body, only a complete header.)
+    ///
+    /// Module-private: external callers reconstruct via
+    /// [`crate::Bridge::reconstruct_attestation`] so they never depend on this
+    /// concrete representation.
+    fn from_parts(message: Bytes, attestation: Bytes) -> Result<Self, CctpError> {
+        if message.len() < MESSAGE_BODY_INDEX {
+            return Err(CctpError::MessageTooShortForRecovery {
+                length: message.len(),
+            });
+        }
+
+        let nonce = extract_nonce_from_message(&message)?;
+
+        Ok(Self {
+            message,
+            attestation,
+            nonce,
+        })
     }
 }
 
@@ -224,11 +242,19 @@ impl crate::Attestation for AttestationResponse {
 const NONCE_INDEX: usize = 12;
 const NONCE_SIZE: usize = size_of::<FixedBytes<32>>();
 const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + NONCE_SIZE;
+const SOURCE_DOMAIN_INDEX: usize = 4;
+const DESTINATION_DOMAIN_INDEX: usize = 8;
+const DOMAIN_SIZE: usize = size_of::<u32>();
+const MESSAGE_BODY_INDEX: usize = 148;
 
 /// Extracts the 32-byte nonce from a CCTP V2 message.
 ///
 /// Used to extract the real nonce from the attested message returned by Circle's API.
-/// The nonce in the original MessageSent event is always bytes32(0) in CCTP V2.
+/// The nonce in the original MessageSent event is always bytes32(0) in CCTP V2;
+/// Circle's attestation service fills in the real nonce. An all-zero nonce in an
+/// attested message therefore means Circle has not filled it in (or the response
+/// is malformed), so we reject it rather than advancing the bridge with a bogus
+/// placeholder nonce.
 fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpError> {
     if message.len() < MIN_MESSAGE_LENGTH {
         return Err(CctpError::MessageTooShort {
@@ -236,9 +262,48 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
         });
     }
 
-    Ok(FixedBytes::<32>::from_slice(
-        &message[NONCE_INDEX..NONCE_INDEX + 32],
-    ))
+    let nonce = FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + 32]);
+
+    if nonce.is_zero() {
+        return Err(CctpError::PlaceholderNonce);
+    }
+
+    Ok(nonce)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CctpReceivedMessage<'a> {
+    source_domain: u32,
+    destination_domain: u32,
+    nonce: B256,
+    message_body: &'a [u8],
+}
+
+fn extract_domain(message: &[u8], index: usize) -> Result<u32, CctpError> {
+    let Some(domain) = message.get(index..index + DOMAIN_SIZE) else {
+        return Err(CctpError::MessageTooShortForRecovery {
+            length: message.len(),
+        });
+    };
+
+    Ok(u32::from_be_bytes([
+        domain[0], domain[1], domain[2], domain[3],
+    ]))
+}
+
+fn parse_received_message(message: &[u8]) -> Result<CctpReceivedMessage<'_>, CctpError> {
+    if message.len() < MESSAGE_BODY_INDEX {
+        return Err(CctpError::MessageTooShortForRecovery {
+            length: message.len(),
+        });
+    }
+
+    Ok(CctpReceivedMessage {
+        source_domain: extract_domain(message, SOURCE_DOMAIN_INDEX)?,
+        destination_domain: extract_domain(message, DESTINATION_DOMAIN_INDEX)?,
+        nonce: FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE]),
+        message_body: &message[MESSAGE_BODY_INDEX..],
+    })
 }
 
 /// Runtime context for constructing a [`CctpBridge`].
@@ -296,6 +361,15 @@ pub enum CctpError {
     Evm(#[from] EvmError),
     #[error("Contract view error: {0}")]
     Contract(#[from] alloy::contract::Error),
+    #[error("RPC transport error: {0}")]
+    RpcTransport(#[from] RpcError<TransportErrorKind>),
+    #[error("ABI decode error: {0}")]
+    SolType(#[from] alloy::sol_types::Error),
+    /// A burn scan could not confirm presence or absence: the queried node is not
+    /// confirmations-deep past `from_block`, so an empty result may be RPC lag
+    /// rather than a true absence. Retryable -- the caller must NOT re-burn on it.
+    #[error("burn scan inconclusive: node not caught up past block {from_block}")]
+    ScanInconclusive { from_block: u64 },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -303,12 +377,42 @@ pub enum CctpError {
         attempts: usize,
         source: AttestationError,
     },
-    #[error("MessageSent event not found in transaction receipt")]
-    MessageSentEventNotFound,
+    /// A `status == "complete"` attestation came back malformed (a required
+    /// field absent, or hex that does not decode). Unlike `AttestationTimeout`
+    /// this is a definitively-hard error: retrying cannot fix a complete-but-bad
+    /// response, so it short-circuits the retry loop and is routed to immediate
+    /// bridge failure rather than retried to the deadline.
+    #[error("malformed complete attestation: {source}")]
+    MalformedAttestation { source: AttestationError },
+    #[error("MessageSent event not found in burn receipt {tx_hash}")]
+    MessageSentEventNotFound { tx_hash: TxHash },
     #[error("MintAndWithdraw event not found in transaction receipt")]
     MintAndWithdrawEventNotFound,
+    #[error("transaction {tx_hash} receipt has no block number")]
+    TxReceiptMissingBlock { tx_hash: TxHash },
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
+    #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
+    MessageTooShortForRecovery { length: usize },
+    #[error("CCTP message destination domain mismatch: expected {expected}, got {actual}")]
+    MessageDestinationDomainMismatch { expected: u32, actual: u32 },
+    #[error("already-minted CCTP nonce {nonce} had no matching MessageReceived log")]
+    AlreadyMintedMessageNotFound { nonce: B256 },
+    #[error(
+        "recovered CCTP MessageReceived log for nonce {nonce} did not match the attested message"
+    )]
+    RecoveredMintMessageMismatch { nonce: B256 },
+    #[error("recovered CCTP mint log for nonce {nonce} is missing transaction hash or log index")]
+    RecoveredMintLogMissingTxHash { nonce: B256 },
+    #[error("recovered CCTP mint transaction reverted: {tx_hash}")]
+    RecoveredMintReceiptReverted { tx_hash: TxHash },
+    #[error("MintAndWithdraw event not found in recovered CCTP mint transaction: {tx_hash}")]
+    RecoveredMintAndWithdrawEventNotFound { tx_hash: TxHash },
+    #[error(
+        "Attested message carries the all-zero placeholder nonce; Circle has not \
+         filled in the real nonce yet or the response is malformed"
+    )]
+    PlaceholderNonce,
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
     #[error("Float operation error: {0}")]
@@ -321,10 +425,6 @@ pub enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
-    #[error("Nonce exceeds u64: upper 24 bytes are non-zero")]
-    NonceOverflow { nonce: FixedBytes<32> },
-    #[error("Slice conversion error: {0}")]
-    SliceConversion(#[from] std::array::TryFromSliceError),
 }
 
 /// Errors specific to attestation polling from Circle's API.
@@ -340,10 +440,52 @@ pub enum AttestationError {
     Pending { status: String },
     #[error("No messages in attestation response")]
     NoMessages,
-    #[error("Attestation response missing required field: {field}")]
+    #[error("Attestation response missing or non-string required field: {field}")]
     MissingField { field: &'static str },
     #[error("Attestation not yet available (HTTP {status})")]
     NotYetAvailable { status: u16 },
+}
+
+impl AttestationError {
+    /// Whether polling should keep retrying on this error.
+    ///
+    /// Transient sources -- the attestation simply has not landed yet (`Pending`,
+    /// `NotYetAvailable`, `NoMessages`) or a transport hiccup (`Http`, which also
+    /// wraps any `reqwest` JSON-decode failure) -- are retryable. `MissingField`
+    /// and `HexDecode` are not: they only arise *after* the `status == "complete"`
+    /// check, so they mean Circle returned a complete-but-malformed response that
+    /// retrying cannot fix. Failing fast on those surfaces a terminal bridge
+    /// failure for operator reconciliation instead of retrying to the 24h deadline.
+    /// (`JsonParse` is classified retryable too, for completeness -- it is not
+    /// produced on the current poll path, where `reqwest`'s `.json()` surfaces
+    /// decode errors as `Http`.)
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http(_)
+            | Self::JsonParse(_)
+            | Self::Pending { .. }
+            | Self::NoMessages
+            | Self::NotYetAvailable { .. } => true,
+            Self::HexDecode(_) | Self::MissingField { .. } => false,
+        }
+    }
+
+    /// Maps the error that ended the poll loop to its terminal [`CctpError`],
+    /// single-sourcing the retry-vs-malformed decision the `.when` gate uses: a
+    /// retryable error here means the loop exhausted `attempts` (a timeout), while
+    /// a non-retryable one short-circuited the loop (a definitively-malformed
+    /// complete response). They route differently downstream -- a timeout is
+    /// retried to the deadline, a malformed attestation fails the bridge fast.
+    fn into_terminal(self, attempts: usize) -> CctpError {
+        if self.is_retryable() {
+            CctpError::AttestationTimeout {
+                attempts,
+                source: self,
+            }
+        } else {
+            CctpError::MalformedAttestation { source: self }
+        }
+    }
 }
 
 /// Fee entry from Circle's `/v2/burn/USDC/fees/{source}/{dest}` API.
@@ -492,8 +634,16 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
         struct MessageEntry {
-            attestation: Option<String>,
-            message: Option<String>,
+            // Parsed leniently as raw `Value`, not `Option<String>`: a complete
+            // response carrying a non-string `message`/`attestation` (e.g. a JSON
+            // number) is a definitively-malformed complete attestation. Strong
+            // `Option<String>` deserialization would instead fail the whole
+            // `response.json()` as a retryable transport/JSON error, letting that
+            // bad complete response retry to the deadline. Keeping the fields raw
+            // defers the string check to *after* the `status == "complete"` gate,
+            // where a missing-or-non-string field becomes a terminal failure.
+            attestation: Option<serde_json::Value>,
+            message: Option<serde_json::Value>,
             status: String,
         }
 
@@ -524,16 +674,17 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 });
             }
 
-            let attestation_hex =
-                entry
-                    .attestation
-                    .as_ref()
-                    .ok_or(AttestationError::MissingField {
-                        field: "attestation",
-                    })?;
+            let attestation_hex = entry
+                .attestation
+                .as_ref()
+                .and_then(|value| value.as_str())
+                .ok_or(AttestationError::MissingField {
+                    field: "attestation",
+                })?;
             let message_hex = entry
                 .message
                 .as_ref()
+                .and_then(|value| value.as_str())
                 .ok_or(AttestationError::MissingField { field: "message" })?;
 
             let message = Bytes::from(alloy::hex::decode(message_hex)?);
@@ -544,6 +695,10 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         let (message, attestation) = fetch_attestation
             .retry(backoff)
+            // A complete-but-malformed response cannot be fixed by retrying, so
+            // stop the loop immediately on a non-retryable error; transient
+            // sources keep retrying until `MAX_ATTEMPTS`.
+            .when(AttestationError::is_retryable)
             .notify(|err, dur| match err {
                 AttestationError::Pending { status } => {
                     debug!(target: "bridge", %status, ?dur, "Attestation pending, retrying");
@@ -554,14 +709,23 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 err => warn!(target: "bridge", ?err, ?dur, "Attestation error, retrying"),
             })
             .await
-            .map_err(|err| CctpError::AttestationTimeout {
-                attempts: MAX_ATTEMPTS,
-                source: err,
+            .map_err(|err| err.into_terminal(MAX_ATTEMPTS))
+            // The `.when` short-circuit returns without invoking `.notify`, so the
+            // bridge layer is otherwise silent on a fast-fail. Log it here so a
+            // terminal malformed-attestation failure is traceable at the bridge
+            // target, distinct from an exhausted-retry timeout.
+            .inspect_err(|error| {
+                if let CctpError::MalformedAttestation { .. } = error {
+                    warn!(target: "bridge", ?error, "Malformed complete attestation; failing bridge fast");
+                }
             })?;
 
-        let nonce = extract_nonce_from_message(&message)?;
-
-        AttestationResponse::new(message, attestation, nonce)
+        // Validate through the same constructor a persisted-envelope resume uses,
+        // so a fresh poll and a reconstruction enforce identical rules: a
+        // truncated envelope or an all-zero placeholder nonce (the bytes32(0) the
+        // MessageSent event leaks) fails fast here rather than being recorded and
+        // then rejected on a later resume.
+        AttestationResponse::from_parts(message, attestation)
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
@@ -603,10 +767,14 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     ) -> Result<MintReceipt, CctpError> {
         match direction {
             BridgeDirection::EthereumToBase => {
-                self.base.claim::<Registry>(message, attestation).await
+                self.base
+                    .claim::<Registry>(direction, message, attestation)
+                    .await
             }
             BridgeDirection::BaseToEthereum => {
-                self.ethereum.claim::<Registry>(message, attestation).await
+                self.ethereum
+                    .claim::<Registry>(direction, message, attestation)
+                    .await
             }
         }
     }
@@ -615,6 +783,131 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     fn with_circle_api_base(mut self, base_url: String) -> Self {
         self.circle_api_base = base_url;
         self
+    }
+
+    /// Returns the receipt of an already-executed mint for the attested
+    /// `message` on the destination chain of `direction`, or `None` if its nonce
+    /// is unused.
+    ///
+    /// Used by crash-recovery resume to avoid re-submitting `receiveMessage`
+    /// (which reverts on a consumed nonce) when a mint already landed but its
+    /// confirming event was not yet persisted. Passing the full message (not
+    /// just the nonce) lets the reconstruction match the on-chain log against
+    /// the attested source domain and body.
+    pub async fn find_existing_mint(
+        &self,
+        direction: BridgeDirection,
+        message: &[u8],
+    ) -> Result<Option<crate::MintReceipt>, CctpError> {
+        let receipt = match direction {
+            BridgeDirection::EthereumToBase => {
+                self.base
+                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .await?
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.ethereum
+                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .await?
+            }
+        };
+
+        Ok(receipt.map(|receipt| crate::MintReceipt {
+            tx: receipt.tx,
+            amount: receipt.amount,
+            fee: receipt.fee_collected,
+        }))
+    }
+
+    /// Returns `holder`'s USDC balance on Base, the destination chain for
+    /// AlpacaToBase mints.
+    ///
+    /// Used as an idempotency guard before re-depositing on resume from `Bridged`:
+    /// if the freshly minted USDC is no longer in the wallet, the vault deposit
+    /// already landed, so re-submitting it would double-deposit (or revert).
+    pub async fn base_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+        self.base
+            .usdc_balance::<OpenChainErrorRegistry>(holder)
+            .await
+    }
+
+    /// Returns `holder`'s USDC balance on Ethereum, the source chain for
+    /// AlpacaToBase burns.
+    ///
+    /// Used as a fallback settlement gate before executing the CCTP burn:
+    /// verifies that withdrawn USDC is present in the market-maker wallet
+    /// before attempting to burn it. Delegates to the Ethereum endpoint,
+    /// not Base.
+    pub async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+        self.ethereum
+            .usdc_balance::<OpenChainErrorRegistry>(holder)
+            .await
+    }
+
+    /// Returns the number of confirmations `tx_hash` has on Ethereum, or `None`
+    /// if the transaction is not yet mined.
+    ///
+    /// Used to gate the AlpacaToBase CCTP burn on the Alpaca withdrawal tx
+    /// being settled on Ethereum: Alpaca reports "Complete" before the
+    /// on-chain tx is visible network-wide on load-balanced nodes, so waiting
+    /// for the required confirmations prevents burning against a balance
+    /// that only exists on a lagging node. The returned count follows the
+    /// repo-wide `required_confirmations` contract: the inclusion block counts
+    /// as confirmation 1 (so a mined-in-head tx returns 1, not 0).
+    pub async fn ethereum_tx_confirmations(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<u64>, CctpError> {
+        self.ethereum.tx_confirmations(tx_hash).await
+    }
+
+    /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
+    /// where BaseToEthereum mints land.
+    ///
+    /// The BaseToAlpaca deposit leg uses this to bound
+    /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) from the
+    /// known mint tx: the deposit send to Alpaca lands at or after the mint, so
+    /// the mint's block is the scan lower bound.
+    pub async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+        self.ethereum.tx_block(tx_hash).await
+    }
+
+    /// Sends `amount` (USDC smallest unit, 6 decimals) of Ethereum USDC from the
+    /// bot wallet to `to`, waiting for confirmation, and returns the tx hash.
+    ///
+    /// Used by the BaseToAlpaca deposit leg to forward minted USDC to Alpaca's
+    /// deposit address. The CCTP mint credits the bot's own wallet, so an explicit
+    /// transfer is required to fund Alpaca -- the mint alone does not deposit.
+    pub async fn send_usdc_on_ethereum(
+        &self,
+        to: Address,
+        amount: U256,
+    ) -> Result<TxHash, CctpError> {
+        self.ethereum
+            .send_usdc::<OpenChainErrorRegistry>(to, amount)
+            .await
+    }
+
+    /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` at or
+    /// after `from_block`, returning the most recent matching tx hash.
+    ///
+    /// Pre-send idempotency guard for the BaseToAlpaca deposit leg: a crash
+    /// between the deposit send and recording it lands the aggregate back in
+    /// `Bridged`, and this detects the already-submitted send so resume adopts it
+    /// instead of forwarding the minted USDC a second time. Returns a retryable
+    /// [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the queried node
+    /// is not confirmations-deep past `from_block`, so the caller never re-sends
+    /// off a stale empty scan.
+    pub async fn find_recent_usdc_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, CctpError> {
+        self.ethereum
+            .find_recent_usdc_transfer(from, to, amount, from_block)
+            .await
     }
 }
 
@@ -664,6 +957,81 @@ where
             fee: internal.fee_collected,
         })
     }
+
+    fn reconstruct_attestation(
+        &self,
+        message: Vec<u8>,
+        attestation: Vec<u8>,
+    ) -> Result<Self::Attestation, Self::Error> {
+        AttestationResponse::from_parts(Bytes::from(message), Bytes::from(attestation))
+    }
+
+    /// Scans the burn source chain for an already-submitted burn matching
+    /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
+    /// crash-safe resume. Delegates to the source endpoint for the given
+    /// direction.
+    async fn find_recent_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, Self::Error> {
+        let dest_domain = direction.dest_domain();
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .await
+            }
+        }
+    }
+
+    /// Scans the mint destination chain for an already-submitted mint to
+    /// `recipient` strictly after `from_block`, for crash-safe resume. Delegates
+    /// to the destination endpoint for the given direction.
+    async fn find_recent_mint(
+        &self,
+        direction: BridgeDirection,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Option<crate::MintReceipt>, Self::Error> {
+        let receipt = match direction {
+            BridgeDirection::EthereumToBase => {
+                self.base.find_recent_mint(recipient, from_block).await?
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.ethereum
+                    .find_recent_mint(recipient, from_block)
+                    .await?
+            }
+        };
+
+        Ok(receipt.map(|receipt| crate::MintReceipt {
+            tx: receipt.tx,
+            amount: receipt.amount,
+            fee: receipt.fee_collected,
+        }))
+    }
+
+    async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.base.current_block().await,
+            BridgeDirection::BaseToEthereum => self.ethereum.current_block().await,
+        }
+    }
+
+    async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.current_block().await,
+            BridgeDirection::BaseToEthereum => self.base.current_block().await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +1040,7 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::address;
     use alloy::primitives::{B256, b256, keccak256};
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
@@ -682,11 +1051,10 @@ mod tests {
     use rand::Rng;
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 
     use super::*;
-
-    const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-    const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    use crate::{Attestation, Bridge};
 
     fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
@@ -845,6 +1213,333 @@ mod tests {
             mock.calls() == 4,
             "Expected exactly 4 attempts (1 initial + 3 retries)"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_rejects_all_zero_nonce() {
+        let server = MockServer::start();
+
+        // Complete attestation whose message carries the placeholder bytes32(0) nonce that
+        // CCTP V2 emits in the MessageSent event. Circle should never return this on a complete
+        // attestation; the bridge must fail fast rather than thread it through as a real nonce.
+        // Full-length so it reaches the nonce check rather than the envelope-length guard.
+        let zero_nonce_message =
+            build_nonce_message(&[0u8; NONCE_INDEX], [0u8; 32], &[0u8; MESSAGE_BODY_INDEX]);
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": alloy::hex::encode_prefixed(&zero_nonce_message),
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::PlaceholderNonce),
+            "Expected CctpError::PlaceholderNonce, got: {error:?}"
+        );
+        assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_malformed_complete_response() {
+        let server = MockServer::start();
+
+        // A `complete` attestation that is missing the required `message` field.
+        // This is a definitively-hard error (a complete response cannot become
+        // well-formed by retrying), so the poll must fail fast with
+        // `MalformedAttestation` after a single call -- NOT retry to the 60-attempt
+        // timeout (which at the real 5s interval would take 5 minutes).
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::MissingField { field: "message" }
+                }
+            ),
+            "Expected CctpError::MalformedAttestation for a complete-but-missing-field \
+             response, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a malformed complete response must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_non_string_complete_field() {
+        let server = MockServer::start();
+
+        // A `complete` response whose `message` is a JSON number, not a hex
+        // string. Strong `Option<String>` deserialization would fail the whole
+        // `response.json()` as a retryable transport error, letting this
+        // definitively-malformed complete response retry to the 60-attempt
+        // timeout. The lenient `Value` parse instead classifies it as a terminal
+        // `MalformedAttestation` after a single call.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": 123,
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::MissingField { field: "message" }
+                }
+            ),
+            "Expected CctpError::MalformedAttestation for a complete-but-non-string \
+             field, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a non-string complete field must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_non_string_attestation_field() {
+        let server = MockServer::start();
+
+        // The `attestation` field is extracted before `message`, so a non-string
+        // `attestation` on a complete response must fail fast and report the
+        // `attestation` field label (not `message`). Guards the symmetric arm of
+        // the lenient-parse validation.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": 123,
+                    "message": "0x1234567890abcdef",
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::MissingField {
+                        field: "attestation"
+                    }
+                }
+            ),
+            "Expected MalformedAttestation reporting the `attestation` field, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a non-string attestation field must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_invalid_hex_complete_field() {
+        let server = MockServer::start();
+
+        // A `complete` response whose `message` is a string but not valid hex.
+        // Hex decoding only happens after the `status == "complete"` gate, so this
+        // is a terminal `MalformedAttestation` (HexDecode), not a retryable error.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": "not-hex-at-all",
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::HexDecode(_)
+                }
+            ),
+            "Expected CctpError::MalformedAttestation with a HexDecode source for an \
+             invalid-hex complete field, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "an invalid-hex complete field must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_returns_real_nonce_from_attested_message() {
+        let server = MockServer::start();
+
+        let expected_nonce = [0xABu8; 32];
+        let message = build_nonce_message(
+            &[0u8; NONCE_INDEX],
+            expected_nonce,
+            &[0u8; MESSAGE_BODY_INDEX],
+        );
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": alloy::hex::encode_prefixed(&message),
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let response = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(response.nonce, FixedBytes::from(expected_nonce));
+        assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
     }
 
     // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
@@ -1255,7 +1950,7 @@ mod tests {
     /// Full CCTP test infrastructure with two chains (simulating Ethereum and Base)
     struct LocalCctp {
         _ethereum_anvil: AnvilInstance,
-        _base_anvil: AnvilInstance,
+        base_anvil: AnvilInstance,
         ethereum_endpoint: String,
         base_endpoint: String,
         ethereum: DeployedCctpChain,
@@ -1361,7 +2056,7 @@ mod tests {
 
             Ok(Self {
                 _ethereum_anvil: ethereum_anvil,
-                _base_anvil: base_anvil,
+                base_anvil,
                 ethereum_endpoint,
                 base_endpoint,
                 ethereum,
@@ -1567,15 +2262,30 @@ mod tests {
             >,
             Box<dyn std::error::Error>,
         > {
+            self.create_bridge_with_key(&self.deployer_key).await
+        }
+
+        /// Builds a bridge whose wallet is `private_key` rather than the deployer.
+        /// Used to simulate a burn submitted by a different depositor so the
+        /// depositor clause in `find_recent_burn`'s predicate can be exercised.
+        async fn create_bridge_with_key(
+            &self,
+            private_key: &B256,
+        ) -> Result<
+            CctpBridge<
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            >,
+            Box<dyn std::error::Error>,
+        > {
             let ethereum_provider = ProviderBuilder::new()
                 .connect(&self.ethereum_endpoint)
                 .await?;
 
             let base_provider = ProviderBuilder::new().connect(&self.base_endpoint).await?;
 
-            let ethereum_wallet =
-                RawPrivateKeyWallet::new(&self.deployer_key, ethereum_provider, 1)?;
-            let base_wallet = RawPrivateKeyWallet::new(&self.deployer_key, base_provider, 1)?;
+            let ethereum_wallet = RawPrivateKeyWallet::new(private_key, ethereum_provider, 1)?;
+            let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
             let ethereum = CctpEndpoint::new(
                 self.ethereum.usdc,
@@ -1803,7 +2513,11 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .base
-            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce,
+                attestation,
+            )
             .await
             .unwrap();
 
@@ -1842,7 +2556,11 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .ethereum
-            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                attestation,
+            )
             .await
             .unwrap();
 
@@ -1855,6 +2573,189 @@ mod tests {
             mint_receipt.fee_collected,
             U256::ZERO,
             "fee should be 0 in mock"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_existing_mint_returns_none_before_mint_and_recovers_receipt_after() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(2_500_000u64); // 2.5 USDC
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Before the mint the nonce is unconsumed, so there is nothing to recover.
+        let before = bridge
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .await
+            .unwrap();
+        assert_eq!(
+            before, None,
+            "unused nonce must report no existing mint, got: {before:?}"
+        );
+
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // After the mint the nonce is consumed; recovery reconstructs the exact
+        // receipt (tx + net amount + fee) from the on-chain events without re-minting.
+        let recovered = bridge
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .await
+            .unwrap()
+            .expect("consumed nonce must report the existing mint");
+
+        assert_eq!(
+            recovered.tx, mint_receipt.tx,
+            "recovered mint tx must match"
+        );
+        assert_eq!(
+            recovered.amount, mint_receipt.amount,
+            "recovered net amount must match the MintAndWithdraw event"
+        );
+        assert_eq!(
+            recovered.fee, mint_receipt.fee_collected,
+            "recovered fee must match the MintAndWithdraw event"
+        );
+
+        // Wrong destination domain: this message was minted to Base, so trying to
+        // reconstruct it as a Base->Ethereum transfer must reject, not recover.
+        let wrong_direction_error = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                &message_with_nonce,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                wrong_direction_error,
+                CctpError::MessageDestinationDomainMismatch {
+                    expected: TEST_ETHEREUM_DOMAIN,
+                    actual: TEST_BASE_DOMAIN,
+                }
+            ),
+            "wrong destination domain must not recover: {wrong_direction_error:?}"
+        );
+
+        // A message whose body no longer matches the on-chain MessageReceived log
+        // for its (consumed) nonce must not be recovered.
+        let nonce = extract_nonce_from_message(&message_with_nonce).unwrap();
+        let mut mismatched_message = message_with_nonce.to_vec();
+        assert!(
+            mismatched_message.len() > MESSAGE_BODY_INDEX,
+            "test CCTP message must include a body byte to mutate"
+        );
+        mismatched_message[MESSAGE_BODY_INDEX] ^= 0xFF;
+
+        let mismatched_message_error = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &mismatched_message,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                mismatched_message_error,
+                CctpError::RecoveredMintMessageMismatch { nonce: event_nonce }
+                    if event_nonce == nonce
+            ),
+            "message-body mismatch must not recover: {mismatched_message_error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_recovers_when_receive_message_nonce_already_used() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(3_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let first_mint = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation.clone(),
+            )
+            .await
+            .unwrap();
+
+        // A second mint of the same attested message hits the already-used-nonce
+        // revert; claim() recovers the original mint instead of failing.
+        let recovered_mint = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered_mint.tx, first_mint.tx,
+            "recovery must return the original mint transaction"
+        );
+        assert_eq!(recovered_mint.amount, first_mint.amount);
+        assert_eq!(recovered_mint.fee_collected, first_mint.fee_collected);
+
+        // A revert whose nonce is NOT marked used on-chain is not an already-minted
+        // case: the reactive path must re-surface the original submit error rather
+        // than fabricate a recovery outcome. Mutating the nonce yields a
+        // never-minted nonce on a structurally valid message (usedNonces == 0).
+        let sentinel_error = || EvmError::Reverted {
+            tx_hash: TxHash::repeat_byte(0xEE),
+        };
+        let mut unused_nonce_message = message_with_nonce.to_vec();
+        unused_nonce_message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE].fill(0xAB);
+
+        let unused_nonce_error = bridge
+            .base
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &unused_nonce_message,
+                sentinel_error(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                unused_nonce_error,
+                CctpError::Evm(EvmError::Reverted { tx_hash })
+                    if tx_hash == TxHash::repeat_byte(0xEE)
+            ),
+            "unused nonce must propagate the original submit error: {unused_nonce_error:?}"
         );
     }
 
@@ -1948,6 +2849,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_received_message_extracts_recovery_fields() {
+        let nonce = [0xAB; 32];
+        let body = [0x01, 0x02, 0x03];
+        let mut message = vec![0u8; MESSAGE_BODY_INDEX + body.len()];
+        message[SOURCE_DOMAIN_INDEX..SOURCE_DOMAIN_INDEX + DOMAIN_SIZE]
+            .copy_from_slice(&TEST_ETHEREUM_DOMAIN.to_be_bytes());
+        message[DESTINATION_DOMAIN_INDEX..DESTINATION_DOMAIN_INDEX + DOMAIN_SIZE]
+            .copy_from_slice(&TEST_BASE_DOMAIN.to_be_bytes());
+        message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE].copy_from_slice(&nonce);
+        message[MESSAGE_BODY_INDEX..].copy_from_slice(&body);
+
+        let parsed = parse_received_message(&message).unwrap();
+
+        assert_eq!(parsed.source_domain, TEST_ETHEREUM_DOMAIN);
+        assert_eq!(parsed.destination_domain, TEST_BASE_DOMAIN);
+        assert_eq!(parsed.nonce, FixedBytes::from(nonce));
+        assert_eq!(parsed.message_body, body);
+    }
+
+    #[test]
+    fn parse_received_message_rejects_messages_without_body_offset() {
+        let message = [0u8; MESSAGE_BODY_INDEX - 1];
+
+        let err = parse_received_message(&message).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CctpError::MessageTooShortForRecovery {
+                    length
+                } if length == MESSAGE_BODY_INDEX - 1
+            ),
+            "expected MessageTooShortForRecovery, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn extract_nonce_from_empty_message_returns_message_too_short() {
         let err = extract_nonce_from_message(&[]).unwrap_err();
 
@@ -1993,12 +2931,121 @@ mod tests {
 
     #[test]
     fn extract_nonce_ignores_bytes_before_nonce_index() {
-        let expected_nonce = [0x00; 32];
-        let message = build_nonce_message(&[0xAB; NONCE_INDEX], expected_nonce, &[]);
+        let expected_nonce = [0xAB; 32];
+        let message = build_nonce_message(&[0xCD; NONCE_INDEX], expected_nonce, &[]);
 
         let nonce = extract_nonce_from_message(&message).unwrap();
 
         assert_eq!(nonce, FixedBytes::from(expected_nonce));
+    }
+
+    #[test]
+    fn extract_nonce_rejects_all_zero_placeholder() {
+        // The CCTP V2 MessageSent event carries an all-zero placeholder nonce.
+        // Circle's attestation service fills in the real nonce; an all-zero nonce
+        // in an attested message means it was never filled (or the response is
+        // malformed), so extraction must reject it rather than advance the bridge
+        // with a bogus nonce.
+        let message = build_nonce_message(&[0xCD; NONCE_INDEX], [0u8; 32], &[0xEF; 56]);
+
+        let err = extract_nonce_from_message(&message).unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::PlaceholderNonce),
+            "Expected PlaceholderNonce, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_parts_reconstructs_response_with_message_derived_nonce() {
+        // A persisted envelope resumes a mint offline: `from_parts` must rebuild
+        // the response with the nonce re-derived from the message (not trusting a
+        // separately-stored copy) and preserve the attestation signature verbatim.
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        // A full CCTP envelope: header + nonce + body, length >= MESSAGE_BODY_INDEX.
+        let body = vec![0xCD; MESSAGE_BODY_INDEX];
+        let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &body);
+        let attestation = vec![0xAB; 65];
+
+        let response = AttestationResponse::from_parts(
+            Bytes::from(message.clone()),
+            Bytes::from(attestation.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(response.nonce(), B256::from(expected_nonce));
+        assert_eq!(response.as_bytes(), attestation.as_slice());
+        assert_eq!(response.message_bytes(), message.as_slice());
+    }
+
+    #[test]
+    fn from_parts_accepts_message_at_body_index_boundary() {
+        // A message of exactly MESSAGE_BODY_INDEX bytes is the shortest envelope
+        // `from_parts` accepts: one byte shorter is rejected (see
+        // from_parts_rejects_truncated_envelope_with_valid_nonce). This pins the
+        // boundary to MESSAGE_BODY_INDEX, not MIN_MESSAGE_LENGTH.
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        let trailer_len = MESSAGE_BODY_INDEX - MIN_MESSAGE_LENGTH;
+        let message =
+            build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &vec![0u8; trailer_len]);
+        assert_eq!(message.len(), MESSAGE_BODY_INDEX);
+
+        let response = AttestationResponse::from_parts(
+            Bytes::from(message.clone()),
+            Bytes::from(vec![0xAB; 65]),
+        )
+        .unwrap();
+
+        assert_eq!(response.nonce(), B256::from(expected_nonce));
+        assert_eq!(response.message_bytes(), message.as_slice());
+    }
+
+    #[test]
+    fn from_parts_rejects_truncated_envelope_with_valid_nonce() {
+        // A nonce-bearing but truncated envelope (long enough to extract a nonce,
+        // too short to be a full CCTP message) is corrupt persisted data. It must
+        // be rejected at reconstruction rather than reconstructing and reverting
+        // in `receiveMessage` on-chain.
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        let truncated_len = MESSAGE_BODY_INDEX - 1;
+        let body_len = truncated_len - MIN_MESSAGE_LENGTH;
+        let message =
+            build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &vec![0u8; body_len]);
+        assert_eq!(message.len(), truncated_len);
+
+        let err =
+            AttestationResponse::from_parts(Bytes::from(message), Bytes::from(vec![0xAB; 65]))
+                .unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::MessageTooShortForRecovery { length } if length == truncated_len),
+            "Expected MessageTooShortForRecovery, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_placeholder_nonce() {
+        // An all-zero nonce means the attested message was never filled in by
+        // Circle; reconstructing from it must fail rather than mint with a bogus
+        // nonce, mirroring a fresh poll. The envelope is full-length so it reaches
+        // the nonce check rather than the length check.
+        let message =
+            build_nonce_message(&[0xCD; NONCE_INDEX], [0u8; 32], &[0xEF; MESSAGE_BODY_INDEX]);
+
+        let err =
+            AttestationResponse::from_parts(Bytes::from(message), Bytes::from(vec![0xAB; 65]))
+                .unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::PlaceholderNonce),
+            "Expected PlaceholderNonce, got: {err:?}"
+        );
     }
 
     #[test]
@@ -2035,6 +3082,8 @@ mod tests {
             nonce in any::<[u8; 32]>(),
             trailer_len in 0usize..100,
         ) {
+            // The all-zero nonce is the CCTP placeholder and is rejected, not extracted.
+            prop_assume!(nonce != [0u8; 32]);
             let trailer = vec![0u8; trailer_len];
             let message = build_nonce_message(&header, nonce, &trailer);
 
@@ -2049,6 +3098,8 @@ mod tests {
             nonce in any::<[u8; 32]>(),
             trailer in prop::collection::vec(any::<u8>(), 0..100),
         ) {
+            // The all-zero nonce is the CCTP placeholder and is rejected, not extracted.
+            prop_assume!(nonce != [0u8; 32]);
             let message = build_nonce_message(&header, nonce, &trailer);
 
             let extracted = extract_nonce_from_message(&message).unwrap();
@@ -2218,6 +3269,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_recent_mint_returns_receipt_of_real_mint() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner();
+        let burn_amount = U256::from(5_000_000u64);
+
+        // Capture the destination (Ethereum) head before minting, exactly as the
+        // resume path does via `Bridge::destination_block`.
+        let from_block = bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                burn_amount,
+                recipient,
+            )
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, false)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let found = bridge
+            .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, from_block)
+            .await
+            .unwrap()
+            .expect("scan must find the submitted mint");
+
+        assert_eq!(
+            found.tx, mint_receipt.tx,
+            "scan must return the real mint's tx"
+        );
+        assert_eq!(
+            found.amount, mint_receipt.amount,
+            "adopted amount must match the mint",
+        );
+        assert_eq!(
+            found.fee, mint_receipt.fee_collected,
+            "adopted fee must match the mint",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_mint_returns_none_for_wrong_recipient_or_below_scan_bound() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner();
+        let burn_amount = U256::from(5_000_000u64);
+
+        let from_block = bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                burn_amount,
+                recipient,
+            )
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, false)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
+
+        assert_eq!(
+            bridge
+                .find_recent_mint(BridgeDirection::BaseToEthereum, other_recipient, from_block)
+                .await
+                .unwrap(),
+            None,
+            "a mint to a different recipient must not be adopted",
+        );
+
+        // Advance the Ethereum head past the mint with an unrelated burn, then
+        // scan from the new head: the mint now sits below the scan bound and must
+        // not be adopted (as a prior transfer's mint would be excluded on resume).
+        bridge
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                burn_amount,
+                recipient,
+            )
+            .await
+            .unwrap();
+
+        let head_above_mint = bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bridge
+                .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, head_above_mint)
+                .await
+                .unwrap(),
+            None,
+            "a mint below the scan bound must not be adopted",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_usdc_transfer_matches_on_from_to_value_and_scan_bound() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let sender = bridge.ethereum.owner();
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let never_funded = address!("0x000000000000000000000000000000000000dEaD");
+        let amount = U256::from(7_000_000u64); // 7 USDC
+
+        // Capture the head before the send, exactly as the deposit leg captures
+        // the mint's block as the scan lower bound.
+        let from_block = bridge.ethereum.current_block().await.unwrap();
+
+        let send_tx = bridge
+            .ethereum
+            .send_usdc::<NoOpErrorRegistry>(recipient, amount)
+            .await
+            .unwrap();
+
+        // The deposit send (`>= from_block`) lands at `send_block`; the first
+        // block strictly above it is the exclusion bound for the below-bound case.
+        let above_block = bridge.ethereum.current_block().await.unwrap() + 1;
+
+        // The scan is finality-gated: it returns Ok(None) only once the head is
+        // a small margin past the bound. Advance the head with unrelated sends so
+        // the absence assertions resolve to None, not a retryable ScanInconclusive.
+        for _ in 0..4 {
+            bridge
+                .ethereum
+                .send_usdc::<NoOpErrorRegistry>(never_funded, amount)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, recipient, amount, from_block)
+                .await
+                .unwrap(),
+            Some(send_tx),
+            "scan must adopt the exact (from, to, value) transfer at/after the bound",
+        );
+
+        let other_recipient = address!("0x000000000000000000000000000000000000Cafe");
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, other_recipient, amount, from_block)
+                .await
+                .unwrap(),
+            None,
+            "a transfer to a different recipient must not be adopted",
+        );
+
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, recipient, amount + U256::from(1), from_block)
+                .await
+                .unwrap(),
+            None,
+            "a transfer whose value differs must not be adopted",
+        );
+
+        // Scanning from a bound above the send's block excludes it (mirroring the
+        // find_recent_mint below-bound exclusion); the head is already far enough
+        // past `above_block` for the absence to resolve to None.
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, recipient, amount, above_block)
+                .await
+                .unwrap(),
+            None,
+            "a transfer below the scan bound must not be adopted",
+        );
+    }
+
+    #[tokio::test]
     async fn multiple_sequential_burns_on_base_succeed() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
@@ -2238,5 +3513,356 @@ mod tests {
             assert!(!receipt.tx.is_zero(), "Burn {i}: tx hash should be set");
             assert_eq!(receipt.amount, amount, "Burn {i}: amount should match");
         }
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_returns_tx_of_real_burn() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        let receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+
+        let found = bridge
+            .find_recent_burn(
+                BridgeDirection::BaseToEthereum,
+                amount,
+                recipient,
+                from_block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found,
+            Some(receipt.tx),
+            "scan must return the real burn's tx for the matching amount + recipient",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_returns_none_for_wrong_amount_or_recipient() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        // Burn a few times to advance the Base head past from_block + the scan
+        // finality margin so the non-matching scans below conclude a true absence.
+        for _ in 0..3 {
+            bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+        }
+
+        let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    U256::from(999u64),
+                    recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn of a different amount must not be adopted",
+        );
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    other_recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn to a different mintRecipient must not be adopted",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_ignores_burn_from_a_different_depositor() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        // A different EOA burns the same amount to the same recipient on Base.
+        // Depositor is the only field separating it from our own burn, so this
+        // pins the depositor clause in find_recent_burn's predicate: dropping it
+        // would let us adopt another sender's burn and mint against a burn we
+        // never made.
+        let other_key = B256::from_slice(&cctp.base_anvil.keys()[2].to_bytes());
+        let other_address = PrivateKeySigner::from_bytes(&other_key).unwrap().address();
+        LocalCctp::mint_usdc(
+            &cctp.base_endpoint,
+            &cctp.deployer_key,
+            cctp.base.usdc,
+            other_address,
+        )
+        .await
+        .unwrap();
+        let other_bridge = cctp.create_bridge_with_key(&other_key).await.unwrap();
+
+        // Burn a few times so the Base head advances past from_block + the scan
+        // finality margin, so the scan below concludes a true absence rather than
+        // a retryable ScanInconclusive.
+        for _ in 0..3 {
+            other_bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn from a different depositor must not be adopted",
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ethereum_usdc_balance and ethereum_tx_confirmations delegation tests
+    // -------------------------------------------------------------------------
+
+    /// Hypothesis: ethereum_usdc_balance reads from the Ethereum endpoint, not
+    /// Base. Deploy USDC on one chain but not the other; the call must succeed
+    /// on the one that has the contract (Ethereum) and reflect the minted amount.
+    #[tokio::test]
+    async fn ethereum_usdc_balance_reads_from_ethereum_endpoint() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        // Deploy USDC only on the Ethereum endpoint.
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let holder = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+
+        let balance = bridge.ethereum_usdc_balance(holder).await.unwrap();
+
+        // deploy_mock_usdc mints 1_000_000_000_000 to the deployer.
+        assert_eq!(
+            balance,
+            U256::from(1_000_000_000_000u64),
+            "ethereum_usdc_balance must return the Ethereum USDC balance, not Base"
+        );
+    }
+
+    /// Hypothesis: ethereum_tx_confirmations returns None for a tx hash that
+    /// does not exist on-chain (unmined).
+    #[tokio::test]
+    async fn ethereum_tx_confirmations_returns_none_for_unmined_tx() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap();
+
+        let nonexistent_tx =
+            b256!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let result = bridge
+            .ethereum_tx_confirmations(nonexistent_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "ethereum_tx_confirmations must return None for an unmined tx"
+        );
+    }
+
+    /// Hypothesis: ethereum_tx_confirmations returns Some(N) where N >= 1 after
+    /// mining a tx and advancing the chain head.
+    #[tokio::test]
+    async fn ethereum_tx_confirmations_counts_confirmations_correctly() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer.clone()))
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        let token = MockMintBurnToken::new(usdc_address, &provider);
+
+        // Mine a tx (mint to self) so we have a real tx hash.
+        let receipt = token
+            .mint(signer.address(), U256::from(1u64))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let tx_hash = receipt.transaction_hash;
+
+        // Immediately after mining: 1 confirmation (the inclusion block counts).
+        let confs_immediate = bridge
+            .ethereum_tx_confirmations(tx_hash)
+            .await
+            .unwrap()
+            .expect("tx is mined");
+
+        assert_eq!(
+            confs_immediate, 1,
+            "tx in the current head has 1 confirmation (inclusion block counts)"
+        );
+
+        // After 2 more blocks: 3 confirmations (inclusion block + 2).
+        provider.anvil_mine(Some(2), None).await.unwrap();
+
+        let confs_after_2 = bridge
+            .ethereum_tx_confirmations(tx_hash)
+            .await
+            .unwrap()
+            .expect("tx is still mined");
+
+        assert_eq!(
+            confs_after_2, 3,
+            "tx has 3 confirmations after 2 blocks mined (inclusion block + 2)"
+        );
+    }
+
+    /// Hypothesis: deposit_for_burn (via burn()) returns
+    /// CctpError::MessageSentEventNotFound when the token messenger accepts the
+    /// call and mines a receipt (tx succeeds) but emits no MessageSent log.
+    ///
+    /// This is the post-commit error class: the burn tx IS on-chain. Callers
+    /// must NOT retry the burn on this error -- they must surface it for
+    /// operator reconciliation.
+    #[tokio::test]
+    async fn burn_returns_message_sent_event_not_found_when_receipt_has_no_event() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        // Deploy real USDC so ensure_usdc_approval succeeds.
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        // Place a STOP-only contract at the TokenMessenger address: any call to
+        // it succeeds (receipt status = 1) with empty return data and no events,
+        // triggering MessageSentEventNotFound after the receipt is confirmed.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let no_wallet_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        no_wallet_provider
+            .anvil_set_code(TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        // Mock the Circle fee endpoint so burn() can proceed past query_fast_transfer_fee.
+        let fee_server = MockServer::start();
+        fee_server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(fee_server.base_url());
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let recipient = signer.address();
+        let amount = U256::from(1_000u64);
+
+        let error = Bridge::burn(&bridge, BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::MessageSentEventNotFound { .. }),
+            "burn must return MessageSentEventNotFound when the receipt has no \
+             MessageSent event (post-commit error); got: {error:?}"
+        );
     }
 }

@@ -1,18 +1,13 @@
-//! Solidity contract ABI bindings for raindex orderbook, ERC20,
-//! and Pyth oracle contracts.
+//! Solidity contract ABI bindings for the raindex orderbook and related
+//! rainlang contracts. Shared EVM primitives (`IERC20`, `IPyth`) live in
+//! `st0x-evm`.
 
 use alloy::sol;
 
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV6, env!("ST0X_IORDERBOOK_V6_ABI")
-);
-
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    IERC20, env!("ST0X_IERC20_ABI")
+    IRaindexV6, env!("ST0X_IORDERBOOK_V6_ABI")
 );
 
 sol!(
@@ -32,7 +27,7 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    OrderBook, env!("ST0X_ORDERBOOK_ABI")
+    RaindexV6, env!("ST0X_ORDERBOOK_ABI")
 );
 
 #[cfg(any(test, feature = "test-support"))]
@@ -73,11 +68,4 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     Deployer, env!("ST0X_DEPLOYER_ABI")
-);
-
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[allow(clippy::too_many_arguments)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    IPyth, env!("ST0X_IPYTH_ABI")
 );

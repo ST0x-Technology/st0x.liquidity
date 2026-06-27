@@ -16,6 +16,7 @@ st0x-float-serde.workspace = true
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror.workspace = true
 ts-rs.workspace = true
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 alloy-primitives.workspace = true

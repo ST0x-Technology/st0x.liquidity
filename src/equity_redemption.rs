@@ -64,15 +64,18 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_evm::{EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
+use st0x_wrapper::WrapperError;
 
-use crate::bindings::IERC20;
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizationRequestId;
@@ -81,27 +84,39 @@ use crate::tokenized_equity_mint::TokenizationRequestId;
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
+///
+/// Mirrors [`crate::tokenized_equity_mint::IssuerRequestId`]: a UUID chosen at
+/// enqueue time so apalis retries and bot restarts always target the same
+/// aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct RedemptionAggregateId(pub(crate) String);
+pub(crate) struct RedemptionAggregateId(pub(crate) Uuid);
 
 impl RedemptionAggregateId {
-    pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
     }
 }
 
-impl std::fmt::Display for RedemptionAggregateId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl Display for RedemptionAggregateId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 
 impl FromStr for RedemptionAggregateId {
-    type Err = std::convert::Infallible;
+    type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(value.to_string()))
+        Ok(Self(Uuid::parse_str(value)?))
     }
+}
+
+/// Deterministic redemption aggregate id for tests. Maps a human-readable label
+/// to a UUID v5 so test aggregate ids stay valid [`RedemptionAggregateId`]
+/// values.
+#[cfg(test)]
+pub(crate) fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
+    RedemptionAggregateId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
 
 /// Errors that can occur during equity redemption operations.
@@ -209,6 +224,30 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to modify a failed redemption operation
     #[error("Already failed")]
     AlreadyFailed,
+    /// RPC node did not catch up to the required block before the wait budget
+    /// was exhausted. This is a retryable failure; the job should be retried
+    /// once the node has indexed the required block.
+    #[error(
+        "RPC node did not catch up to required block {required_block} \
+         after {attempts} polls"
+    )]
+    NodeSyncFailed { required_block: u64, attempts: u32 },
+    /// The Raindex withdrawal receipt did not include a block number.
+    /// Fresh receipts must carry a block number so the node-sync guard in
+    /// SubmitUnwrap can wait for the correct block before submitting the
+    /// unwrap. A None block number on a freshly confirmed receipt indicates
+    /// an RPC edge case (e.g. pending or uncle-block receipt).
+    #[error("Raindex withdrawal receipt for {tx_hash} is missing block number")]
+    MissingWithdrawBlock { tx_hash: TxHash },
+    /// Attempted to reconcile a redemption that is not in the `Failed` state
+    #[error("Cannot reconcile: redemption is not in the Failed state")]
+    NotFailed,
+    /// Attempted to act on a redemption already resolved out-of-band (`Reconciled`)
+    #[error("Already reconciled")]
+    AlreadyReconciled,
+    /// Attempted to reconcile without an operator-supplied reason.
+    #[error("Cannot reconcile: reason is required")]
+    ReconcileReasonRequired,
 }
 
 #[derive(Debug, Clone)]
@@ -256,13 +295,26 @@ pub(crate) enum EquityRedemptionCommand {
     /// Prepares sending tokens (pure, no side effects).
     /// Valid from `TokensUnwrapped`.
     PrepareSend,
+    /// Reconcile a redemption stranded in the terminal `Failed` state to the
+    /// terminal `Reconciled` state. The residual equity was handled out-of-band
+    /// (e.g. via wrap-equity/vault-deposit), so this is a bookkeeping resolution
+    /// rather than a re-drive. Valid ONLY from `Failed`.
+    Reconcile { reason: String },
 }
 
-/// Reason for detection failure when polling Alpaca for redemption detection.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Why redemption detection failed.
+///
+/// `Timeout` and `ApiError` are emitted automatically by the detection-polling
+/// reactor. `Operator` marks an operator-initiated force-fail of a redemption
+/// stuck in `TokensSent` (the tokens reached Alpaca but detection never fired),
+/// distinguishing a manual intervention from an automated polling failure in
+/// the event log; it carries the operator's `--reason` so the audit trail
+/// records why the redemption was force-failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum DetectionFailure {
     Timeout,
     ApiError { status_code: Option<u16> },
+    Operator { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +359,13 @@ pub(crate) enum EquityRedemptionEvent {
         #[serde(default)]
         actual_wrapped_amount: Option<U256>,
         raindex_withdraw_tx: TxHash,
+        /// Block number in which the Raindex withdrawal tx confirmed.
+        ///
+        /// `None` for events emitted before this field was added (schema
+        /// backward-compatibility). When `None`, the RPC node-sync wait is
+        /// skipped in `SubmitUnwrap`.
+        #[serde(default)]
+        raindex_withdraw_block: Option<u64>,
         withdrawn_at: DateTime<Utc>,
     },
     /// ERC-4626 wrapped tokens have been unwrapped.
@@ -320,6 +379,13 @@ pub(crate) enum EquityRedemptionEvent {
         underlying_token: Address,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
+        /// Block number in which the unwrap tx confirmed.
+        ///
+        /// `None` for events emitted before this field was added (schema
+        /// backward-compatibility). When `None`, the RPC node-sync wait is
+        /// skipped in `SendTokens`.
+        #[serde(default)]
+        unwrap_block: Option<u64>,
         unwrapped_at: DateTime<Utc>,
     },
     /// Unwrap requested, awaiting submission.
@@ -375,6 +441,12 @@ pub(crate) enum EquityRedemptionEvent {
     ProviderCompletionRecovered {
         tokenization_request_id: TokenizationRequestId,
         recovered_at: DateTime<Utc>,
+    },
+    /// An operator reconciled a terminal `Failed` redemption out-of-band. Marks
+    /// the transfer resolved without re-driving the failed leg.
+    OperatorReconciled {
+        reason: String,
+        reconciled_at: DateTime<Utc>,
     },
 }
 
@@ -494,6 +566,7 @@ impl PartialEq for EquityRedemptionEvent {
                     wrapped_amount: w1,
                     actual_wrapped_amount: aw1,
                     raindex_withdraw_tx: r1,
+                    raindex_withdraw_block: rb1,
                     withdrawn_at: wa1,
                 },
                 Self::WithdrawnFromRaindex {
@@ -503,6 +576,7 @@ impl PartialEq for EquityRedemptionEvent {
                     wrapped_amount: w2,
                     actual_wrapped_amount: aw2,
                     raindex_withdraw_tx: r2,
+                    raindex_withdraw_block: rb2,
                     withdrawn_at: wa2,
                 },
             ) => {
@@ -512,6 +586,7 @@ impl PartialEq for EquityRedemptionEvent {
                     && w1 == w2
                     && aw1 == aw2
                     && r1 == r2
+                    && rb1 == rb2
                     && wa1 == wa2
             }
             (
@@ -520,6 +595,7 @@ impl PartialEq for EquityRedemptionEvent {
                     underlying_token: u1,
                     unwrap_tx_hash: h1,
                     unwrapped_amount: a1,
+                    unwrap_block: b1,
                     unwrapped_at: t1,
                 },
                 Self::TokensUnwrapped {
@@ -527,6 +603,7 @@ impl PartialEq for EquityRedemptionEvent {
                     underlying_token: u2,
                     unwrap_tx_hash: h2,
                     unwrapped_amount: a2,
+                    unwrap_block: b2,
                     unwrapped_at: t2,
                 },
             ) => {
@@ -536,6 +613,7 @@ impl PartialEq for EquityRedemptionEvent {
                         .is_none_or(|(q1, q2)| q1.eq(q2).unwrap_or(false))
                     && u1 == u2
                     && h1 == h2
+                    && b1 == b2
                     && a1 == a2
                     && t1 == t2
             }
@@ -606,6 +684,16 @@ impl PartialEq for EquityRedemptionEvent {
                     recovered_at: t2,
                 },
             ) => id1 == id2 && t1 == t2,
+            (
+                Self::OperatorReconciled {
+                    reason: r1,
+                    reconciled_at: t1,
+                },
+                Self::OperatorReconciled {
+                    reason: r2,
+                    reconciled_at: t2,
+                },
+            ) => r1 == r2 && t1 == t2,
             _ => false,
         }
     }
@@ -639,6 +727,7 @@ impl DomainEvent for EquityRedemptionEvent {
             ProviderCompletionRecovered { .. } => {
                 "EquityRedemptionEvent::ProviderCompletionRecovered".to_string()
             }
+            OperatorReconciled { .. } => "EquityRedemptionEvent::OperatorReconciled".to_string(),
         }
     }
 
@@ -691,6 +780,9 @@ pub(crate) enum EquityRedemption {
         token: Address,
         wrapped_amount: U256,
         raindex_withdraw_tx: TxHash,
+        /// Block in which the Raindex withdrawal tx confirmed; `None` for pre-fix aggregates.
+        #[serde(default)]
+        raindex_withdraw_block: Option<u64>,
         withdrawn_at: DateTime<Utc>,
     },
 
@@ -705,6 +797,9 @@ pub(crate) enum EquityRedemption {
         token: Address,
         wrapped_amount: U256,
         raindex_withdraw_tx: TxHash,
+        /// Block in which the Raindex withdrawal tx confirmed; `None` for pre-fix aggregates.
+        #[serde(default)]
+        raindex_withdraw_block: Option<u64>,
         withdrawn_at: DateTime<Utc>,
     },
 
@@ -719,6 +814,9 @@ pub(crate) enum EquityRedemption {
         token: Address,
         wrapped_amount: U256,
         raindex_withdraw_tx: TxHash,
+        /// Block in which the Raindex withdrawal tx confirmed; `None` for pre-fix aggregates.
+        #[serde(default)]
+        raindex_withdraw_block: Option<u64>,
         unwrap_tx_hash: TxHash,
         withdrawn_at: DateTime<Utc>,
     },
@@ -736,6 +834,9 @@ pub(crate) enum EquityRedemption {
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
+        /// Block in which the unwrap tx confirmed; `None` for pre-fix aggregates.
+        #[serde(default)]
+        unwrap_block: Option<u64>,
         withdrawn_at: DateTime<Utc>,
         unwrapped_at: DateTime<Utc>,
     },
@@ -753,6 +854,13 @@ pub(crate) enum EquityRedemption {
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
+        /// Block in which the unwrap tx confirmed; `None` for pre-fix aggregates.
+        ///
+        /// `None` disables the RPC node-sync wait in `SendTokens` for
+        /// backward-compatibility with in-flight aggregates that were
+        /// persisted before this field was added.
+        #[serde(default)]
+        unwrap_block: Option<u64>,
         withdrawn_at: DateTime<Utc>,
         unwrapped_at: DateTime<Utc>,
     },
@@ -826,9 +934,51 @@ pub(crate) enum EquityRedemption {
         started_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+
+    /// An operator reconciled a terminal `Failed` redemption out-of-band
+    /// (terminal state). Retains the identifying fields carried by `Failed` so
+    /// the projection still reports the real transfer instead of a zero-value
+    /// record.
+    Reconciled {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
+        raindex_withdraw_tx: Option<TxHash>,
+        redemption_tx: Option<TxHash>,
+        tokenization_request_id: Option<TokenizationRequestId>,
+        /// The failure reason carried over from the `Failed` state.
+        failure_reason: Option<String>,
+        /// The operator-supplied reconciliation reason.
+        reconcile_reason: String,
+        started_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
+    },
 }
 
 impl EquityRedemption {
+    /// Returns the requested quantity carried by the aggregate in every
+    /// state. Wrapped-equity recovery compares this against the wallet
+    /// snapshot so an audit mismatch surfaces before dispatch.
+    pub(crate) fn quantity(&self) -> Float {
+        match self {
+            Self::VaultWithdrawPending { quantity, .. }
+            | Self::VaultWithdrawSubmitted { quantity, .. }
+            | Self::WithdrawnFromRaindex { quantity, .. }
+            | Self::UnwrapPending { quantity, .. }
+            | Self::UnwrapSubmitted { quantity, .. }
+            | Self::TokensUnwrapped { quantity, .. }
+            | Self::SendPending { quantity, .. }
+            | Self::TokensSent { quantity, .. }
+            | Self::Pending { quantity, .. }
+            | Self::Completed { quantity, .. }
+            | Self::Failed { quantity, .. }
+            | Self::Reconciled { quantity, .. } => *quantity,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
             Self::VaultWithdrawPending {
@@ -837,7 +987,7 @@ impl EquityRedemption {
                 pending_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -851,7 +1001,7 @@ impl EquityRedemption {
                 submitted_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -865,7 +1015,7 @@ impl EquityRedemption {
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -885,7 +1035,7 @@ impl EquityRedemption {
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Unwrapping,
@@ -907,7 +1057,7 @@ impl EquityRedemption {
                 unwrapped_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Unwrapping,
@@ -921,7 +1071,7 @@ impl EquityRedemption {
                 sent_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Sending,
@@ -936,7 +1086,7 @@ impl EquityRedemption {
                 detected_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::PendingConfirmation,
@@ -951,7 +1101,7 @@ impl EquityRedemption {
                 completed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Completed {
@@ -968,7 +1118,7 @@ impl EquityRedemption {
                 failed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Failed {
@@ -976,6 +1126,26 @@ impl EquityRedemption {
                 },
                 started_at: *started_at,
                 updated_at: *failed_at,
+            }),
+
+            // Reconciliation is a terminal operator resolution, so it maps to the
+            // existing `Completed` DTO status (no new status needed) -- mirrors the
+            // USDC `Reconciled -> Completed` mapping.
+            Self::Reconciled {
+                symbol,
+                quantity,
+                started_at,
+                reconciled_at,
+                ..
+            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                id: Id::new(id.to_string()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityRedemptionStatus::Completed {
+                    completed_at: *reconciled_at,
+                },
+                started_at: *started_at,
+                updated_at: *reconciled_at,
             }),
         }
     }
@@ -994,7 +1164,15 @@ impl EventSourced for EquityRedemption {
     const PROJECTION: Nil = Nil;
     // v3: added the `ProviderCompletionRecovered` event for in-process
     // failed-transfer recovery.
-    const SCHEMA_VERSION: u64 = 3;
+    // v4: `Failed.reason` is now materialized from `DetectionFailed`
+    // (`Operator` failures) and `RedemptionRejected` events instead of always
+    // `None`. Bumped to clear stale snapshots so historical rejections rebuild
+    // from events under the corrected evolve logic.
+    // v5: added the terminal `Reconciled` state and the `OperatorReconciled`
+    // event for operator reconciliation of stuck `Failed` redemptions. Additive
+    // only; bumped to clear stale snapshots so they rebuild from events under the
+    // new schema (existing events replay unchanged).
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1036,6 +1214,7 @@ impl EventSourced for EquityRedemption {
                 wrapped_amount,
                 actual_wrapped_amount,
                 raindex_withdraw_tx,
+                raindex_withdraw_block,
                 withdrawn_at,
             } => Some(Self::WithdrawnFromRaindex {
                 symbol: symbol.clone(),
@@ -1046,6 +1225,7 @@ impl EventSourced for EquityRedemption {
                     *actual_wrapped_amount,
                 ),
                 raindex_withdraw_tx: *raindex_withdraw_tx,
+                raindex_withdraw_block: *raindex_withdraw_block,
                 withdrawn_at: *withdrawn_at,
             }),
             _ => None,
@@ -1084,6 +1264,7 @@ impl EventSourced for EquityRedemption {
                 wrapped_amount,
                 actual_wrapped_amount,
                 raindex_withdraw_tx,
+                raindex_withdraw_block,
                 withdrawn_at,
             } => match entity {
                 Self::VaultWithdrawPending { .. } | Self::VaultWithdrawSubmitted { .. } => {
@@ -1096,6 +1277,7 @@ impl EventSourced for EquityRedemption {
                             *actual_wrapped_amount,
                         ),
                         raindex_withdraw_tx: *raindex_withdraw_tx,
+                        raindex_withdraw_block: *raindex_withdraw_block,
                         withdrawn_at: *withdrawn_at,
                     })
                 }
@@ -1193,6 +1375,7 @@ impl EventSourced for EquityRedemption {
                     token,
                     wrapped_amount,
                     raindex_withdraw_tx,
+                    raindex_withdraw_block,
                     withdrawn_at,
                 } => Some(Self::UnwrapPending {
                     symbol: symbol.clone(),
@@ -1200,6 +1383,7 @@ impl EventSourced for EquityRedemption {
                     token: *token,
                     wrapped_amount: *wrapped_amount,
                     raindex_withdraw_tx: *raindex_withdraw_tx,
+                    raindex_withdraw_block: *raindex_withdraw_block,
                     withdrawn_at: *withdrawn_at,
                 }),
                 _ => None,
@@ -1215,6 +1399,7 @@ impl EventSourced for EquityRedemption {
                     token,
                     wrapped_amount,
                     raindex_withdraw_tx,
+                    raindex_withdraw_block,
                     withdrawn_at,
                 }
                 | Self::UnwrapPending {
@@ -1223,6 +1408,7 @@ impl EventSourced for EquityRedemption {
                     token,
                     wrapped_amount,
                     raindex_withdraw_tx,
+                    raindex_withdraw_block,
                     withdrawn_at,
                 } => Some(Self::UnwrapSubmitted {
                     symbol: symbol.clone(),
@@ -1230,6 +1416,7 @@ impl EventSourced for EquityRedemption {
                     token: *token,
                     wrapped_amount: *wrapped_amount,
                     raindex_withdraw_tx: *raindex_withdraw_tx,
+                    raindex_withdraw_block: *raindex_withdraw_block,
                     unwrap_tx_hash: *unwrap_tx_hash,
                     withdrawn_at: *withdrawn_at,
                 }),
@@ -1241,6 +1428,7 @@ impl EventSourced for EquityRedemption {
                 underlying_token,
                 unwrap_tx_hash,
                 unwrapped_amount,
+                unwrap_block,
                 unwrapped_at,
             } => match entity {
                 Self::WithdrawnFromRaindex {
@@ -1274,6 +1462,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     unwrap_tx_hash: *unwrap_tx_hash,
                     unwrapped_amount: *unwrapped_amount,
+                    unwrap_block: *unwrap_block,
                     withdrawn_at: *withdrawn_at,
                     unwrapped_at: *unwrapped_at,
                 }),
@@ -1289,6 +1478,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx,
                     unwrap_tx_hash,
                     unwrapped_amount,
+                    unwrap_block,
                     withdrawn_at,
                     unwrapped_at,
                 } => Some(Self::SendPending {
@@ -1299,6 +1489,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     unwrap_tx_hash: *unwrap_tx_hash,
                     unwrapped_amount: *unwrapped_amount,
+                    unwrap_block: *unwrap_block,
                     withdrawn_at: *withdrawn_at,
                     unwrapped_at: *unwrapped_at,
                 }),
@@ -1379,10 +1570,7 @@ impl EventSourced for EquityRedemption {
                 })
             }
 
-            DetectionFailed {
-                failure: _,
-                failed_at,
-            } => {
+            DetectionFailed { failure, failed_at } => {
                 let Self::TokensSent {
                     symbol,
                     quantity,
@@ -1395,13 +1583,18 @@ impl EventSourced for EquityRedemption {
                     return Ok(None);
                 };
 
+                let reason = match failure {
+                    DetectionFailure::Operator { reason } => Some(reason.clone()),
+                    DetectionFailure::Timeout | DetectionFailure::ApiError { .. } => None,
+                };
+
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
                     raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: None,
-                    reason: None,
+                    reason,
                     started_at: *sent_at,
                     failed_at: *failed_at,
                 })
@@ -1430,7 +1623,10 @@ impl EventSourced for EquityRedemption {
                 })
             }
 
-            RedemptionRejected { rejected_at, .. } => {
+            RedemptionRejected {
+                reason,
+                rejected_at,
+            } => {
                 let Self::Pending {
                     symbol,
                     quantity,
@@ -1449,7 +1645,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: None,
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: Some(tokenization_request_id.clone()),
-                    reason: None,
+                    reason: Some(reason.clone()),
                     started_at: *sent_at,
                     failed_at: *rejected_at,
                 })
@@ -1477,6 +1673,37 @@ impl EventSourced for EquityRedemption {
                     tokenization_request_id: tokenization_request_id.clone(),
                     started_at: *started_at,
                     completed_at: *recovered_at,
+                })
+            }
+
+            OperatorReconciled {
+                reason,
+                reconciled_at,
+            } => {
+                let Self::Failed {
+                    symbol,
+                    quantity,
+                    raindex_withdraw_tx,
+                    redemption_tx,
+                    tokenization_request_id,
+                    reason: failure_reason,
+                    started_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    raindex_withdraw_tx: *raindex_withdraw_tx,
+                    redemption_tx: *redemption_tx,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reason.clone(),
+                    started_at: *started_at,
+                    reconciled_at: *reconciled_at,
                 })
             }
         })
@@ -1513,6 +1740,7 @@ impl EventSourced for EquityRedemption {
             | Complete
             | RejectRedemption { .. }
             | RecoverProviderCompletion { .. }
+            | Reconcile { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
@@ -1529,6 +1757,7 @@ impl EventSourced for EquityRedemption {
             Redeem { .. } => match self {
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
@@ -1540,10 +1769,10 @@ impl EventSourced for EquityRedemption {
                     wrapped_amount,
                     ..
                 } => {
-                    let vault_id = match services.raindex.lookup_vault_id(*token).await {
+                    let vault_id = match services.vault_lookup.vault_id_for_token(*token).await {
                         Ok(id) => id,
                         Err(error) => {
-                            warn!(target: "rebalance", %error, %token, "Raindex vault lookup failed");
+                            warn!(target: "rebalance", %error, %token, "Vault lookup failed");
                             return Err(EquityRedemptionError::RaindexVaultNotFound(*token));
                         }
                     };
@@ -1582,6 +1811,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
@@ -1603,6 +1833,9 @@ impl EventSourced for EquityRedemption {
                             amount: *wrapped_amount,
                             error_message: error.to_string(),
                         })?;
+                    let raindex_withdraw_block = receipt
+                        .block_number
+                        .ok_or(EquityRedemptionError::MissingWithdrawBlock { tx_hash: *tx_hash })?;
                     let recipient = services.wrapper.owner();
                     let actual_wrapped_amount =
                         actual_withdrawn_amount_from_receipt(&receipt, *token, recipient)?;
@@ -1613,11 +1846,13 @@ impl EventSourced for EquityRedemption {
                         wrapped_amount: *wrapped_amount,
                         actual_wrapped_amount: Some(actual_wrapped_amount),
                         raindex_withdraw_tx: *tx_hash,
+                        raindex_withdraw_block: Some(raindex_withdraw_block),
                         withdrawn_at: Utc::now(),
                     }])
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
@@ -1627,6 +1862,7 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
             },
 
@@ -1634,8 +1870,22 @@ impl EventSourced for EquityRedemption {
                 Self::UnwrapPending {
                     token,
                     wrapped_amount,
+                    raindex_withdraw_block,
                     ..
                 } => {
+                    // Wait for the RPC node to catch up to the block where the
+                    // Raindex withdrawal tx confirmed before submitting the unwrap.
+                    // Without this, a load-balanced backend that hasn't indexed
+                    // the withdrawal may simulate the unwrap against a stale
+                    // wrapped-token balance. `raindex_withdraw_block` is None for
+                    // pre-fix aggregates; skip the wait for backward-compatibility.
+                    if let Some(block) = raindex_withdraw_block {
+                        services
+                            .wrapper
+                            .wait_for_block(*block)
+                            .await
+                            .map_err(|error| node_sync_failed(*block, &error))?;
+                    }
                     let owner = services.wrapper.owner();
                     let unwrap_tx_hash = services
                         .wrapper
@@ -1657,6 +1907,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
             },
 
@@ -1679,7 +1930,7 @@ impl EventSourced for EquityRedemption {
                             error_message: error.to_string(),
                         })?;
 
-                    let unwrapped_amount = services
+                    let unwrap_confirmation = services
                         .wrapper
                         .confirm_unwrap(*token, *unwrap_tx_hash)
                         .await
@@ -1691,6 +1942,8 @@ impl EventSourced for EquityRedemption {
                             wrapped_amount: *wrapped_amount,
                             error_message: error.to_string(),
                         })?;
+                    let unwrapped_amount = unwrap_confirmation.assets;
+                    let unwrap_block = unwrap_confirmation.block;
                     let quantity =
                         Float::from_fixed_decimal(unwrapped_amount, TOKENIZED_EQUITY_DECIMALS)
                             .map_err(|error| {
@@ -1706,11 +1959,13 @@ impl EventSourced for EquityRedemption {
                         underlying_token,
                         unwrap_tx_hash: *unwrap_tx_hash,
                         unwrapped_amount,
+                        unwrap_block: Some(unwrap_block),
                         unwrapped_at: Utc::now(),
                     }])
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
             },
 
@@ -1720,6 +1975,7 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotUnwrapped),
             },
 
@@ -1728,6 +1984,7 @@ impl EventSourced for EquityRedemption {
                     symbol,
                     underlying_token,
                     unwrapped_amount,
+                    unwrap_block,
                     ..
                 } => {
                     let token = *underlying_token;
@@ -1743,6 +2000,25 @@ impl EventSourced for EquityRedemption {
                             failed_at: Utc::now(),
                         }]);
                     };
+
+                    // Wait for the RPC node to catch up to the block where the
+                    // unwrap tx confirmed before sending the transfer. Without
+                    // this, a load-balanced backend that hasn't indexed the
+                    // unwrap block yet sees the wallet balance as zero and the
+                    // send_for_redemption call reverts with
+                    // ERC20InsufficientBalance. The wait runs on the tokenizer's
+                    // provider -- the same one that performs the transfer -- so
+                    // a caught-up wrapper provider can't mask a lagging
+                    // tokenizer provider. `unwrap_block` is None for aggregates
+                    // persisted before this field was added; in that case the
+                    // wait is skipped for backward-compatibility.
+                    if let Some(block) = unwrap_block {
+                        services
+                            .tokenizer
+                            .wait_for_block(*block)
+                            .await
+                            .map_err(|error| node_sync_failed_from_evm(*block, &error))?;
+                    }
 
                     info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
 
@@ -1766,6 +2042,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotUnwrapped),
             },
 
@@ -1785,14 +2062,22 @@ impl EventSourced for EquityRedemption {
                 | Self::SendPending { .. } => Err(EquityRedemptionError::TokensNotSent),
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
             FailDetection { failure } => match self {
-                Self::TokensSent { .. } => Ok(vec![DetectionFailed {
-                    failure,
-                    failed_at: Utc::now(),
-                }]),
+                Self::TokensSent { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, ?failure,
+                        "Marking redemption as detection-failed"
+                    );
+                    Ok(vec![DetectionFailed {
+                        failure,
+                        failed_at: Utc::now(),
+                    }])
+                }
                 Self::VaultWithdrawPending { .. }
                 | Self::VaultWithdrawSubmitted { .. }
                 | Self::WithdrawnFromRaindex { .. }
@@ -1802,6 +2087,7 @@ impl EventSourced for EquityRedemption {
                 | Self::SendPending { .. } => Err(EquityRedemptionError::TokensNotSent),
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
@@ -1819,6 +2105,7 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
             },
 
             RejectRedemption { reason } => match self {
@@ -1830,12 +2117,20 @@ impl EventSourced for EquityRedemption {
                 | Self::TokensUnwrapped { .. }
                 | Self::SendPending { .. }
                 | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPendingForRejection),
-                Self::Pending { .. } => Ok(vec![RedemptionRejected {
-                    reason,
-                    rejected_at: Utc::now(),
-                }]),
+                Self::Pending { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Rejecting detected redemption"
+                    );
+                    Ok(vec![RedemptionRejected {
+                        reason,
+                        rejected_at: Utc::now(),
+                    }])
+                }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
             },
 
             RecoverProviderCompletion {
@@ -1849,6 +2144,7 @@ impl EventSourced for EquityRedemption {
                     recovered_at: Utc::now(),
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotSent),
             },
 
@@ -1873,7 +2169,28 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
+            },
+
+            Reconcile { reason } => match self {
+                Self::Failed { symbol, .. } => {
+                    if reason.trim().is_empty() {
+                        return Err(EquityRedemptionError::ReconcileReasonRequired);
+                    }
+
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Reconciling stuck failed redemption out-of-band"
+                    );
+                    Ok(vec![OperatorReconciled {
+                        reason,
+                        reconciled_at: Utc::now(),
+                    }])
+                }
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+                _ => Err(EquityRedemptionError::NotFailed),
             },
         }
     }
@@ -1968,16 +2285,20 @@ pub(crate) async fn symbols_with_stuck_redemptions(
 
     let mut result: HashMap<Symbol, FractionalShares> = HashMap::new();
 
-    for (aggregate_id, raw_symbol, raw_quantity, raw_wrapped_amount) in rows {
-        let Some(symbol) = parse_stuck_symbol(&aggregate_id, raw_symbol) else {
+    for (raw_aggregate_id, raw_symbol, raw_quantity, raw_wrapped_amount) in rows {
+        let Ok(aggregate_id) = RedemptionAggregateId::from_str(&raw_aggregate_id) else {
+            warn!(target: "rebalance",
+                %raw_aggregate_id,
+                "Stuck redemption has invalid aggregate id, skipping"
+            );
             continue;
         };
 
-        let Some(quantity) = parse_stuck_quantity(
-            RedemptionAggregateId::new(&aggregate_id),
-            raw_quantity,
-            raw_wrapped_amount,
-        )?
+        let Some(symbol) = parse_stuck_symbol(&raw_aggregate_id, raw_symbol) else {
+            continue;
+        };
+
+        let Some(quantity) = parse_stuck_quantity(aggregate_id, raw_quantity, raw_wrapped_amount)?
         else {
             continue;
         };
@@ -1988,7 +2309,7 @@ pub(crate) async fn symbols_with_stuck_redemptions(
             Err(error) => {
                 warn!(target: "rebalance",
                     %error,
-                    %aggregate_id,
+                    %raw_aggregate_id,
                     "Float overflow summing stuck redemption quantities, \
                      keeping accumulated value"
                 );
@@ -2115,7 +2436,21 @@ pub(crate) async fn interrupted_redemption_ids(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(RedemptionAggregateId::new).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|aggregate_id| {
+            aggregate_id
+                .parse::<RedemptionAggregateId>()
+                .inspect_err(|error| {
+                    warn!(target: "rebalance",
+                        %error,
+                        %aggregate_id,
+                        "Interrupted redemption has invalid aggregate id, skipping"
+                    );
+                })
+                .ok()
+        })
+        .collect())
 }
 
 fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol> {
@@ -2183,25 +2518,66 @@ fn parse_requested_stuck_quantity(
     Ok(Some(FractionalShares::new(quantity)))
 }
 
+/// Constructs a [`EquityRedemptionError::NodeSyncFailed`] from a `required_block` and a
+/// [`WrapperError`] returned by `wait_for_block`.
+///
+/// Delegates attempt extraction to [`st0x_wrapper::node_sync_attempts`] so
+/// both the equity-redemption and orphan-recovery paths share the same
+/// extraction logic and stay in sync when new error variants are added.
+fn node_sync_failed(required_block: u64, error: &WrapperError) -> EquityRedemptionError {
+    EquityRedemptionError::NodeSyncFailed {
+        required_block,
+        attempts: st0x_wrapper::node_sync_attempts(error),
+    }
+}
+
+/// Constructs a [`EquityRedemptionError::NodeSyncFailed`] from a node-sync
+/// [`EvmError`] raised by [`Tokenizer::wait_for_block`].
+///
+/// Returns the recorded attempt count for `NodeBehindRequiredBlock`; every
+/// other variant signals the full polling budget was consumed without a
+/// recorded count, so it falls back to [`NODE_SYNC_MAX_ATTEMPTS`]. The match is
+/// non-exhaustive because `EvmError` has feature-gated variants that cannot be
+/// enumerated here.
+fn node_sync_failed_from_evm(required_block: u64, error: &EvmError) -> EquityRedemptionError {
+    let attempts = match error {
+        EvmError::NodeBehindRequiredBlock { attempts, .. } => *attempts,
+        _ => NODE_SYNC_MAX_ATTEMPTS,
+    };
+
+    EquityRedemptionError::NodeSyncFailed {
+        required_block,
+        attempts,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-    use alloy::primitives::{Bloom, Bytes, Log as PrimitiveLog, LogData};
+    use alloy::primitives::{B256, Bloom, Bytes, Log as PrimitiveLog, LogData};
     use alloy::rpc::types::Log;
     use st0x_dto::EquityRedemptionStatus;
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
+    use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
+    use st0x_float_macro::float;
+    use st0x_raindex::RaindexVaultId;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{ConfirmTxBehavior, MockRaindex};
     use crate::tokenization::mock::MockTokenizer;
-    use crate::wrapper::mock::MockWrapper;
-    use st0x_float_macro::float;
+    use crate::vault_lookup::MockVaultLookup;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         }
@@ -2279,6 +2655,7 @@ mod tests {
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             actual_wrapped_amount: None,
             raindex_withdraw_tx: TxHash::random(),
+            raindex_withdraw_block: None,
             withdrawn_at: Utc::now(),
         }
     }
@@ -2297,6 +2674,7 @@ mod tests {
             underlying_token: Address::random(),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            unwrap_block: None,
             unwrapped_at: Utc::now(),
         }
     }
@@ -2374,7 +2752,7 @@ mod tests {
     #[tokio::test]
     async fn complete_redemption_flow_end_to_end() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
-        let id = RedemptionAggregateId::new("end-to-end");
+        let id = redemption_aggregate_id("end-to-end");
 
         store
             .send(
@@ -2450,12 +2828,13 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("underlying-token-fix");
+        let id = redemption_aggregate_id("underlying-token-fix");
 
         store
             .send(
@@ -2523,11 +2902,12 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual_amount)),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("partial-withdraw");
+        let id = redemption_aggregate_id("partial-withdraw");
 
         store
             .send(
@@ -2570,11 +2950,12 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual_amount)),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("unwrap-partial-withdraw");
+        let id = redemption_aggregate_id("unwrap-partial-withdraw");
 
         store
             .send(
@@ -2628,11 +3009,12 @@ mod tests {
     async fn confirm_withdraw_fails_without_matching_receipt_transfer() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(U256::ZERO)),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("missing-withdraw-transfer");
+        let id = redemption_aggregate_id("missing-withdraw-transfer");
 
         store
             .send(
@@ -2665,6 +3047,61 @@ mod tests {
                 ))
             ),
             "Expected missing transfer error, got: {error:?}"
+        );
+    }
+
+    /// Verifies that `ConfirmWithdraw` returns `MissingWithdrawBlock` when the
+    /// Raindex receipt does not carry a block number.
+    ///
+    /// A fresh receipt with `block_number: None` (e.g. from a load-balanced RPC
+    /// returning a pending receipt) must fail hard; silently storing `None`
+    /// would bypass the `SubmitUnwrap` node-sync guard, re-introducing the
+    /// stale-RPC regression this PR was created to prevent.
+    #[tokio::test]
+    async fn confirm_withdraw_fails_when_receipt_has_no_block_number() {
+        let services = EquityTransferServices {
+            raindex: Arc::new(
+                MockRaindex::new()
+                    .with_confirm_behavior(ConfirmTxBehavior::SucceedWithoutBlockNumber),
+            ),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+        let store = TestStore::<EquityRedemption>::new(services);
+        let id = redemption_aggregate_id("no-block-number");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("COIN").unwrap(),
+                    quantity: float!(10),
+                    token: Address::random(),
+                    amount: U256::from(10_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+
+        let error = store
+            .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::MissingWithdrawBlock { .. }
+                ))
+            ),
+            "Expected MissingWithdrawBlock when receipt has no block number, got: {error:?}"
         );
     }
 
@@ -2739,8 +3176,10 @@ mod tests {
 
     #[tokio::test]
     async fn fail_detection_from_tokens_sent_state() {
+        let history = vec![withdrawn_from_raindex_event(), tokens_sent_event()];
+
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
+            .given(history.clone())
             .when(EquityRedemptionCommand::FailDetection {
                 failure: DetectionFailure::Timeout,
             })
@@ -2755,16 +3194,100 @@ mod tests {
                 ..
             }
         ));
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Failed { reason, .. } = state else {
+            panic!("timeout detection failure must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            reason, None,
+            "automated timeout failures carry no operator reason",
+        );
+    }
+
+    #[test]
+    fn detection_failure_operator_serde_roundtrip() {
+        let failure = DetectionFailure::Operator {
+            reason: "ticket 42".to_string(),
+        };
+
+        let json = serde_json::to_string(&failure).unwrap();
+        assert_eq!(json, r#"{"Operator":{"reason":"ticket 42"}}"#);
+
+        let back: DetectionFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, failure);
+    }
+
+    #[test]
+    fn detection_failed_operator_event_deserializes_from_raw_json() {
+        let raw = r#"{"DetectionFailed":{"failure":{"Operator":{"reason":"ticket 42"}},"failed_at":"2026-01-01T00:00:00Z"}}"#;
+
+        let event: EquityRedemptionEvent = serde_json::from_str(raw).unwrap();
+        let EquityRedemptionEvent::DetectionFailed { failure, .. } = event else {
+            panic!("expected DetectionFailed, got {event:?}");
+        };
+        assert_eq!(
+            failure,
+            DetectionFailure::Operator {
+                reason: "ticket 42".to_string(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_detection_operator_from_tokens_sent_reaches_failed() {
+        // Operator force-fail of a redemption stuck in TokensSent: unlike an
+        // automated `Timeout`, the `Operator` failure carries the operator's
+        // reason, which must be persisted on the event and recoverable from
+        // the replayed `Failed` state.
+        let history = vec![withdrawn_from_raindex_event(), tokens_sent_event()];
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history.clone())
+            .when(EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Operator {
+                    reason: "tokens stuck at Alpaca, support ticket 42".to_string(),
+                },
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::DetectionFailed { failure, .. } = &events[0] else {
+            panic!("expected DetectionFailed, got {:?}", events[0]);
+        };
+        assert_eq!(
+            *failure,
+            DetectionFailure::Operator {
+                reason: "tokens stuck at Alpaca, support ticket 42".to_string(),
+            },
+        );
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Failed { reason, .. } = state else {
+            panic!("operator detection failure must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("tokens stuck at Alpaca, support ticket 42"),
+            "operator reason must be recoverable from the replayed Failed state",
+        );
     }
 
     #[tokio::test]
     async fn reject_redemption_from_pending_state() {
+        let history = vec![
+            withdrawn_from_raindex_event(),
+            tokens_sent_event(),
+            detected_event(),
+        ];
+
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                tokens_sent_event(),
-                detected_event(),
-            ])
+            .given(history.clone())
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "test rejection".to_string(),
             })
@@ -2772,10 +3295,22 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::RedemptionRejected { .. }
-        ));
+        let EquityRedemptionEvent::RedemptionRejected { reason, .. } = &events[0] else {
+            panic!("expected RedemptionRejected, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "test rejection");
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Failed { reason, .. } = state else {
+            panic!("rejected redemption must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("test rejection"),
+            "rejection reason must be recoverable from the replayed Failed state",
+        );
     }
 
     #[tokio::test]
@@ -2807,6 +3342,7 @@ mod tests {
                 wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
                 actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::random(),
+                raindex_withdraw_block: None,
                 withdrawn_at: Utc::now(),
             },
             EquityRedemptionEvent::TokensSent {
@@ -3000,12 +3536,13 @@ mod tests {
     async fn send_tokens_with_failure_emits_transfer_failed() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
             wrapper: Arc::new(MockWrapper::new()),
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("send-fail");
+        let id = redemption_aggregate_id("send-fail");
 
         store
             .send(
@@ -3066,12 +3603,13 @@ mod tests {
     async fn send_tokens_without_redemption_wallet_emits_transfer_failed() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
             wrapper: Arc::new(MockWrapper::new()),
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("no-wallet");
+        let id = redemption_aggregate_id("no-wallet");
 
         store
             .send(
@@ -3132,6 +3670,7 @@ mod tests {
     async fn unwrap_failure_returns_unwrap_failed_error() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_unwrap()),
         };
@@ -3157,6 +3696,7 @@ mod tests {
     async fn underlying_lookup_failure_returns_underlying_lookup_failed_error() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_lookup()),
         };
@@ -3184,7 +3724,7 @@ mod tests {
     #[tokio::test]
     async fn redeem_when_already_started_returns_already_started() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
-        let id = RedemptionAggregateId::new("redemption-1");
+        let id = redemption_aggregate_id("redemption-1");
 
         store
             .send(
@@ -3221,7 +3761,7 @@ mod tests {
     #[tokio::test]
     async fn redeem_when_pending_returns_already_started() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
-        let id = RedemptionAggregateId::new("redemption-1");
+        let id = redemption_aggregate_id("redemption-1");
 
         store
             .send(
@@ -3303,7 +3843,7 @@ mod tests {
     /// Insert a minimal event row into the events table.
     async fn insert_event(
         pool: &SqlitePool,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         sequence: i64,
         event_type: &str,
         payload: &str,
@@ -3314,7 +3854,7 @@ mod tests {
               event_version, payload, metadata) \
              VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
         )
-        .bind(aggregate_id)
+        .bind(aggregate_id.to_string())
         .bind(sequence)
         .bind(event_type)
         .bind(payload)
@@ -3342,7 +3882,7 @@ mod tests {
         // AAPL: WithdrawnFromRaindex -> DetectionFailed (stuck)
         insert_event(
             &pool,
-            "redemption-1",
+            &redemption_aggregate_id("redemption-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3350,7 +3890,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-1",
+            &redemption_aggregate_id("redemption-1"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3374,7 +3914,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "partial-redemption",
+            &redemption_aggregate_id("partial-redemption"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("COIN"),
@@ -3382,7 +3922,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "partial-redemption",
+            &redemption_aggregate_id("partial-redemption"),
             1,
             "EquityRedemptionEvent::TokensUnwrapped",
             &tokens_unwrapped_payload("7.5", "7500000000000000000"),
@@ -3390,7 +3930,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "partial-redemption",
+            &redemption_aggregate_id("partial-redemption"),
             2,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3413,7 +3953,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "invalid-actual",
+            &redemption_aggregate_id("invalid-actual"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("COIN"),
@@ -3421,7 +3961,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "invalid-actual",
+            &redemption_aggregate_id("invalid-actual"),
             1,
             "EquityRedemptionEvent::TokensUnwrapped",
             &tokens_unwrapped_payload("invalid", "invalid"),
@@ -3429,7 +3969,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "invalid-actual",
+            &redemption_aggregate_id("invalid-actual"),
             2,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3451,7 +3991,7 @@ mod tests {
         // TSLA: WithdrawnFromRaindex -> RedemptionRejected (stuck)
         insert_event(
             &pool,
-            "redemption-2",
+            &redemption_aggregate_id("redemption-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3459,7 +3999,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-2",
+            &redemption_aggregate_id("redemption-2"),
             1,
             "EquityRedemptionEvent::RedemptionRejected",
             r#"{"RedemptionRejected":{"reason":"test","rejected_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3484,7 +4024,7 @@ mod tests {
         // AAPL: DetectionFailed (stuck)
         insert_event(
             &pool,
-            "stuck",
+            &redemption_aggregate_id("stuck"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3492,7 +4032,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "stuck",
+            &redemption_aggregate_id("stuck"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3502,7 +4042,7 @@ mod tests {
         // MSFT: Completed (not stuck)
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("MSFT"),
@@ -3510,7 +4050,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             1,
             "EquityRedemptionEvent::Completed",
             r#"{"Completed":{"completed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3520,7 +4060,7 @@ mod tests {
         // GOOG: TransferFailed (not stuck — tokens still in our wallet)
         insert_event(
             &pool,
-            "transfer-failed",
+            &redemption_aggregate_id("transfer-failed"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("GOOG"),
@@ -3528,7 +4068,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "transfer-failed",
+            &redemption_aggregate_id("transfer-failed"),
             1,
             "EquityRedemptionEvent::TransferFailed",
             r#"{"TransferFailed":{"tx_hash":null,"failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3546,13 +4086,17 @@ mod tests {
         );
     }
 
+    /// A redemption that was `DetectionFailed` and then operator-reconciled must
+    /// not re-seed stranded inflight at the next startup: its latest event is
+    /// `OperatorReconciled`, which the query's terminal allowlist excludes.
     #[tokio::test]
-    async fn interrupted_redemption_ids_returns_only_non_terminal_redemptions() {
+    async fn stuck_redemptions_excludes_operator_reconciled() {
         let pool = crate::test_utils::setup_test_db().await;
 
+        // AAPL: DetectionFailed, still stuck.
         insert_event(
             &pool,
-            "resume-me",
+            &redemption_aggregate_id("stuck"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3560,7 +4104,67 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "resume-me",
+            &redemption_aggregate_id("stuck"),
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // MSFT: DetectionFailed then operator-reconciled, no longer stuck.
+        insert_event(
+            &pool,
+            &redemption_aggregate_id("reconciled"),
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("MSFT"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &redemption_aggregate_id("reconciled"),
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            &redemption_aggregate_id("reconciled"),
+            2,
+            "EquityRedemptionEvent::OperatorReconciled",
+            r#"{"OperatorReconciled":{"reason":"deposited manually via vault-deposit","reconciled_at":"2026-01-01T00:01:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "only the un-reconciled DetectionFailed redemption should seed inflight: {result:?}"
+        );
+        assert!(result.contains_key(&Symbol::new("AAPL").unwrap()));
+        assert!(
+            !result.contains_key(&Symbol::new("MSFT").unwrap()),
+            "an operator-reconciled redemption must not re-seed stranded inflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_redemption_ids_returns_only_non_terminal_redemptions() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        insert_event(
+            &pool,
+            &redemption_aggregate_id("resume-me"),
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &redemption_aggregate_id("resume-me"),
             1,
             "EquityRedemptionEvent::TokensSent",
             r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000001","redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000002","sent_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3569,7 +4173,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3577,7 +4181,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             1,
             "EquityRedemptionEvent::Completed",
             r#"{"Completed":{"completed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3585,7 +4189,7 @@ mod tests {
         .await;
 
         let result = interrupted_redemption_ids(&pool).await.unwrap();
-        assert_eq!(result, vec![RedemptionAggregateId::new("resume-me")]);
+        assert_eq!(result, vec![redemption_aggregate_id("resume-me")]);
     }
 
     #[tokio::test]
@@ -3603,7 +4207,7 @@ mod tests {
         // AAPL: valid stuck redemption (DetectionFailed)
         insert_event(
             &pool,
-            "valid-stuck",
+            &redemption_aggregate_id("valid-stuck"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3611,7 +4215,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "valid-stuck",
+            &redemption_aggregate_id("valid-stuck"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3621,7 +4225,7 @@ mod tests {
         // NULL symbol: malformed WithdrawnFromRaindex payload missing symbol
         insert_event(
             &pool,
-            "null-symbol",
+            &redemption_aggregate_id("null-symbol"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             r#"{"WithdrawnFromRaindex":{"quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3629,7 +4233,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "null-symbol",
+            &redemption_aggregate_id("null-symbol"),
             1,
             "EquityRedemptionEvent::RedemptionRejected",
             r#"{"RedemptionRejected":{"reason":"test","rejected_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3639,7 +4243,7 @@ mod tests {
         // Invalid symbol: symbol fails Symbol::new validation
         insert_event(
             &pool,
-            "invalid-symbol",
+            &redemption_aggregate_id("invalid-symbol"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload(""),
@@ -3647,7 +4251,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "invalid-symbol",
+            &redemption_aggregate_id("invalid-symbol"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3673,7 +4277,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_in_progress_variants() {
-        let id = RedemptionAggregateId::new("REDEEM-001");
+        let id = redemption_aggregate_id("REDEEM-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -3684,6 +4288,7 @@ mod tests {
             token: Address::random(),
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             raindex_withdraw_tx: TxHash::random(),
+            raindex_withdraw_block: None,
             withdrawn_at: now,
         };
         let TransferOperation::EquityRedemption(op) = withdrawn.to_dto(&id) else {
@@ -3692,7 +4297,7 @@ mod tests {
                 withdrawn.to_dto(&id)
             );
         };
-        assert_eq!(op.id, Id::new("REDEEM-001"));
+        assert_eq!(op.id, Id::new(id.to_string()));
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(float!(50.25)));
         assert!(
@@ -3711,6 +4316,7 @@ mod tests {
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            unwrap_block: None,
             withdrawn_at: now,
             unwrapped_at: later,
         };
@@ -3773,7 +4379,7 @@ mod tests {
         // AAPL: latest event is WithdrawnFromRaindex (active)
         insert_event(
             &pool,
-            "redemption-active-1",
+            &redemption_aggregate_id("redemption-active-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3783,7 +4389,7 @@ mod tests {
         // TSLA: latest event is Detected (active)
         insert_event(
             &pool,
-            "redemption-active-2",
+            &redemption_aggregate_id("redemption-active-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3791,7 +4397,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-active-2",
+            &redemption_aggregate_id("redemption-active-2"),
             1,
             "EquityRedemptionEvent::TokensSent",
             r#"{"TokensSent":{"sent_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3799,7 +4405,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-active-2",
+            &redemption_aggregate_id("redemption-active-2"),
             2,
             "EquityRedemptionEvent::Detected",
             r#"{"Detected":{"tokenization_request_id":"TOK001","detected_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3819,7 +4425,7 @@ mod tests {
         // AAPL: completed (terminal) — should be excluded
         insert_event(
             &pool,
-            "redemption-terminal-1",
+            &redemption_aggregate_id("redemption-terminal-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3827,7 +4433,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-terminal-1",
+            &redemption_aggregate_id("redemption-terminal-1"),
             1,
             "EquityRedemptionEvent::Completed",
             r#"{"Completed":{"redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","tokenization_request_id":"TOK001","completed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3837,7 +4443,7 @@ mod tests {
         // TSLA: detection failed (terminal) — should be excluded
         insert_event(
             &pool,
-            "redemption-terminal-2",
+            &redemption_aggregate_id("redemption-terminal-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3845,7 +4451,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-terminal-2",
+            &redemption_aggregate_id("redemption-terminal-2"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3866,7 +4472,7 @@ mod tests {
         // Two active redemptions for the same symbol
         insert_event(
             &pool,
-            "redemption-dup-1",
+            &redemption_aggregate_id("redemption-dup-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3874,7 +4480,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-dup-2",
+            &redemption_aggregate_id("redemption-dup-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3893,7 +4499,7 @@ mod tests {
         // Row with NULL symbol in payload (corrupt data)
         insert_event(
             &pool,
-            "redemption-null",
+            &redemption_aggregate_id("redemption-null"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             r#"{"WithdrawnFromRaindex":{}}"#,
@@ -3903,7 +4509,7 @@ mod tests {
         // Valid row alongside the corrupt one
         insert_event(
             &pool,
-            "redemption-valid",
+            &redemption_aggregate_id("redemption-valid"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("NVDA"),
@@ -3917,7 +4523,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_terminal_variants() {
-        let id = RedemptionAggregateId::new("REDEEM-001");
+        let id = redemption_aggregate_id("REDEEM-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -4049,6 +4655,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_provider_completion_rejected_for_reconciled_redemption() {
+        let mut history = failed_redemption_history();
+        history.push(EquityRedemptionEvent::OperatorReconciled {
+            reason: "deposited manually".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history)
+            .when(EquityRedemptionCommand::RecoverProviderCompletion {
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::AlreadyReconciled)
+            ),
+            "a reconciled redemption must report AlreadyReconciled, not recover, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_transfer_from_withdrawn_transitions_to_failed() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![withdrawn_from_raindex_event()])
@@ -4115,5 +4746,449 @@ mod tests {
             error,
             LifecycleError::Apply(EquityRedemptionError::NotStarted)
         ));
+    }
+
+    /// Verifies that `SendTokens` calls `wait_for_block` with the unwrap
+    /// block number before submitting the transfer, ensuring the RPC node
+    /// has indexed the unwrap tx's effects before the send is attempted.
+    #[tokio::test]
+    async fn send_tokens_waits_for_block_before_sending() {
+        let unwrap_block = 1234u64;
+        let mock_tokenizer = Arc::new(MockTokenizer::new());
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: mock_tokenizer.clone(),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(1.0)),
+                    underlying_token: Address::ZERO,
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
+                    unwrap_block: Some(unwrap_block),
+                    unwrapped_at: Utc::now(),
+                },
+                EquityRedemptionEvent::SendPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event from SendTokens"
+        );
+        assert!(
+            matches!(events[0], EquityRedemptionEvent::TokensSent { .. }),
+            "expected TokensSent, got {:?}",
+            events[0]
+        );
+
+        let calls = mock_tokenizer.wait_for_block_calls();
+
+        assert_eq!(
+            calls,
+            vec![unwrap_block],
+            "wait_for_block must be called once with the unwrap block number"
+        );
+    }
+
+    /// Verifies the backward-compat path: when `unwrap_block` is `None`
+    /// (aggregates persisted before this field was added), `SendTokens`
+    /// skips `wait_for_block` entirely and proceeds to `send_for_redemption`.
+    #[tokio::test]
+    async fn send_tokens_skips_wait_for_block_when_unwrap_block_is_none() {
+        let mock_tokenizer = Arc::new(MockTokenizer::new());
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: mock_tokenizer.clone(),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(1.0)),
+                    underlying_token: Address::ZERO,
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+                EquityRedemptionEvent::SendPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event from SendTokens"
+        );
+        assert!(
+            matches!(events[0], EquityRedemptionEvent::TokensSent { .. }),
+            "expected TokensSent to succeed without wait_for_block, got {:?}",
+            events[0]
+        );
+
+        let calls = mock_tokenizer.wait_for_block_calls();
+
+        assert_eq!(
+            calls,
+            Vec::<u64>::new(),
+            "wait_for_block must NOT be called when unwrap_block is None, got calls: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_tokens_fails_with_node_sync_failed_when_wait_for_block_fails() {
+        let required_block = 42u64;
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new().failing_wait_for_block()),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(1.0)),
+                    underlying_token: Address::ZERO,
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
+                    unwrap_block: Some(required_block),
+                    unwrapped_at: Utc::now(),
+                },
+                EquityRedemptionEvent::SendPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::NodeSyncFailed {
+                    required_block: 42,
+                    attempts: NODE_SYNC_MAX_ATTEMPTS,
+                })
+            ),
+            "expected NodeSyncFailed {{ required_block: 42, attempts: {NODE_SYNC_MAX_ATTEMPTS} }}, got: {error:?}",
+        );
+    }
+
+    /// Verifies SubmitUnwrap waits for the Raindex withdrawal block before submitting.
+    #[tokio::test]
+    async fn submit_unwrap_waits_for_block_before_submitting() {
+        let withdraw_block = 5555u64;
+        let mock_wrapper = Arc::new(MockWrapper::new());
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: mock_wrapper.clone(),
+        };
+
+        let token = Address::ZERO;
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                EquityRedemptionEvent::WithdrawnFromRaindex {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1.0),
+                    token,
+                    wrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
+                    actual_wrapped_amount: Some(U256::from(1_000_000_000_000_000_000_u64)),
+                    raindex_withdraw_tx: TxHash::random(),
+                    raindex_withdraw_block: Some(withdraw_block),
+                    withdrawn_at: Utc::now(),
+                },
+                EquityRedemptionEvent::UnwrapPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SubmitUnwrap)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1, "expected exactly one event");
+        assert!(
+            matches!(events[0], EquityRedemptionEvent::UnwrapSubmitted { .. }),
+            "expected UnwrapSubmitted, got {:?}",
+            events[0]
+        );
+
+        let calls = mock_wrapper.wait_for_block_calls();
+        assert_eq!(
+            calls,
+            vec![withdraw_block],
+            "wait_for_block must be called once with the withdraw block before submitting unwrap"
+        );
+    }
+
+    /// Verifies that when raindex_withdraw_block is None (legacy aggregate),
+    /// SubmitUnwrap skips wait_for_block and proceeds directly.
+    #[tokio::test]
+    async fn submit_unwrap_skips_wait_for_block_when_withdraw_block_is_none() {
+        let mock_wrapper = Arc::new(MockWrapper::new());
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: mock_wrapper.clone(),
+        };
+
+        let token = Address::ZERO;
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                EquityRedemptionEvent::WithdrawnFromRaindex {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1.0),
+                    token,
+                    wrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
+                    actual_wrapped_amount: Some(U256::from(1_000_000_000_000_000_000_u64)),
+                    raindex_withdraw_tx: TxHash::random(),
+                    raindex_withdraw_block: None,
+                    withdrawn_at: Utc::now(),
+                },
+                EquityRedemptionEvent::UnwrapPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SubmitUnwrap)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1, "expected exactly one event");
+        assert!(
+            matches!(events[0], EquityRedemptionEvent::UnwrapSubmitted { .. }),
+            "expected UnwrapSubmitted, got {:?}",
+            events[0]
+        );
+
+        assert_eq!(
+            mock_wrapper.wait_for_block_calls(),
+            Vec::<u64>::new(),
+            "wait_for_block must NOT be called when raindex_withdraw_block is None"
+        );
+    }
+
+    /// Verifies that `SubmitUnwrap` propagates a `wait_for_block` failure as
+    /// `NodeSyncFailed` when `raindex_withdraw_block` is `Some`.
+    ///
+    /// Symmetric to `send_tokens_fails_with_node_sync_failed_when_wait_for_block_fails`.
+    /// A copy-paste or refactor error in the `SubmitUnwrap` error-mapping arm
+    /// would mis-classify the error, breaking the retry-logic that depends on
+    /// receiving `NodeSyncFailed`.
+    #[tokio::test]
+    async fn submit_unwrap_fails_with_node_sync_failed_when_wait_for_block_fails() {
+        let required_block = 42u64;
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::failing_wait_for_block()),
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                EquityRedemptionEvent::WithdrawnFromRaindex {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1.0),
+                    token: Address::ZERO,
+                    wrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
+                    actual_wrapped_amount: Some(U256::from(1_000_000_000_000_000_000_u64)),
+                    raindex_withdraw_tx: TxHash::random(),
+                    raindex_withdraw_block: Some(required_block),
+                    withdrawn_at: Utc::now(),
+                },
+                EquityRedemptionEvent::UnwrapPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SubmitUnwrap)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::NodeSyncFailed {
+                    required_block: 42,
+                    attempts: NODE_SYNC_MAX_ATTEMPTS,
+                })
+            ),
+            "expected NodeSyncFailed {{ required_block: 42, attempts: {NODE_SYNC_MAX_ATTEMPTS} }}, got: {error:?}",
+        );
+    }
+
+    fn failed_redemption_history() -> Vec<EquityRedemptionEvent> {
+        vec![
+            withdrawn_from_raindex_event(),
+            tokens_sent_event(),
+            EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::Operator {
+                    reason: "operator forced terminal".to_string(),
+                },
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_failed_emits_operator_reconciled_and_replays_to_reconciled() {
+        let history = failed_redemption_history();
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history.clone())
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "deposited manually via vault-deposit".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::OperatorReconciled { reason, .. } = &events[0] else {
+            panic!("Expected OperatorReconciled, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "deposited manually via vault-deposit");
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Reconciled {
+            reconcile_reason,
+            quantity,
+            ..
+        } = state
+        else {
+            panic!("reconciled redemption should be Reconciled, got {state:?}");
+        };
+        assert_eq!(reconcile_reason, "deposited manually via vault-deposit");
+        assert!(
+            quantity.eq(float!(50.25)).unwrap(),
+            "reconciled state must preserve the requested quantity, got {quantity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_non_failed_is_rejected() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "should be rejected".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::NotFailed)
+            ),
+            "reconcile from a non-failed redemption must be rejected, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_blank_reason_is_rejected() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(failed_redemption_history())
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "   ".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::ReconcileReasonRequired)
+            ),
+            "reconcile with a blank reason must be rejected as ReconcileReasonRequired, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_reconciled_state_is_rejected() {
+        let mut history = failed_redemption_history();
+        history.push(EquityRedemptionEvent::OperatorReconciled {
+            reason: "already reconciled".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history)
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "second attempt".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::AlreadyReconciled)
+            ),
+            "reconcile from an already-reconciled redemption reports AlreadyReconciled, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn reconciled_to_dto_reports_completed_preserving_quantity() {
+        let started_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled = EquityRedemption::Reconciled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(50.25),
+            raindex_withdraw_tx: Some(TxHash::random()),
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: None,
+            failure_reason: None,
+            reconcile_reason: "deposited manually".to_string(),
+            started_at,
+            reconciled_at,
+        };
+
+        let TransferOperation::EquityRedemption(operation) =
+            reconciled.to_dto(&redemption_aggregate_id("RED-001"))
+        else {
+            panic!("expected an EquityRedemption operation");
+        };
+        let EquityRedemptionStatus::Completed { completed_at } = operation.status else {
+            panic!(
+                "reconciled redemption must map to the Completed DTO status, got {:?}",
+                operation.status
+            );
+        };
+        assert_eq!(completed_at, reconciled_at);
+        assert_eq!(operation.updated_at, reconciled_at);
+        assert_eq!(operation.started_at, started_at);
+        assert_eq!(
+            operation.quantity.to_string(),
+            FractionalShares::new(float!(50.25)).to_string()
+        );
     }
 }

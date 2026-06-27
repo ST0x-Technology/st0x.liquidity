@@ -2,6 +2,7 @@
 
 use rain_math_float::Float;
 use serde::Deserialize;
+use st0x_finance::{HasZero, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 use tracing::{debug, error, trace};
@@ -25,11 +26,23 @@ pub(super) struct AccountFunds {
 #[derive(Deserialize)]
 struct PositionResponse {
     symbol: String,
+    asset_class: Option<String>,
+    exchange: Option<String>,
     #[serde(
         rename = "qty_available",
         deserialize_with = "deserialize_float_from_number_or_string"
     )]
     quantity: Float,
+    /// Total position size including quantity locked by open orders or pending
+    /// transfers. Only read for Alpaca-held USDC, which stays at Alpaca until a
+    /// withdrawal to Ethereum settles even while the withdrawal locks it; equity
+    /// positions use `quantity` (the tradeable amount) instead.
+    #[serde(
+        default,
+        rename = "qty",
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    total_quantity: Option<Float>,
     #[serde(
         default,
         deserialize_with = "deserialize_option_float_from_number_or_string"
@@ -41,9 +54,32 @@ impl std::fmt::Debug for PositionResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PositionResponse")
             .field("symbol", &self.symbol)
+            .field("asset_class", &self.asset_class)
+            .field("exchange", &self.exchange)
             .field("quantity", &DebugFloat(&self.quantity))
+            .field("total_quantity", &DebugOptionFloat(&self.total_quantity))
             .field("market_value", &DebugOptionFloat(&self.market_value))
             .finish()
+    }
+}
+
+impl PositionResponse {
+    fn is_non_equity(&self) -> bool {
+        // USDCUSD is Alpaca's USDC/USD crypto pair, captured separately as
+        // Alpaca-held USDC by symbol. Exclude it from equity by symbol too, so
+        // it never reaches equity/vault reconciliation (TokenNotInRegistry) even
+        // if Alpaca omits the asset_class/exchange metadata on the position.
+        if self.symbol == "USDCUSD" {
+            return true;
+        }
+
+        if let Some(asset_class) = &self.asset_class {
+            return !asset_class.eq_ignore_ascii_case("us_equity");
+        }
+
+        self.exchange
+            .as_deref()
+            .is_some_and(|exchange| exchange.eq_ignore_ascii_case("CRYPTO"))
     }
 }
 
@@ -78,19 +114,19 @@ pub(super) async fn fetch_inventory(
 ) -> Result<Inventory, AlpacaBrokerApiError> {
     let positions = list_positions(client).await?;
     let account_funds = get_account_funds(client).await?;
+    let alpaca_usdc = alpaca_usdc_balance(&positions)?;
 
     let broker_positions = positions
         .into_iter()
         .filter(|position| {
-            // USDCUSD is Alpaca's crypto pair for USDC/USD conversion during
-            // rebalancing. It's not an equity position and has no vault in the
-            // registry -- filtering it here prevents downstream
-            // TokenNotInRegistry errors.
-            if position.symbol == "USDCUSD" {
+            if position.is_non_equity() {
                 trace!(
                     target: "broker",
+                    symbol = %position.symbol,
+                    asset_class = ?position.asset_class,
+                    exchange = ?position.exchange,
                     quantity = ?position.quantity,
-                    "Skipping USDCUSD crypto position from inventory"
+                    "Skipping non-equity Alpaca position from equity inventory"
                 );
                 return false;
             }
@@ -121,10 +157,31 @@ pub(super) async fn fetch_inventory(
 
     Ok(Inventory {
         positions: broker_positions,
+        alpaca_usdc: Some(alpaca_usdc),
         usd_balance_cents: account_funds.balance,
         cash_buying_power_cents: Some(account_funds.buying_power),
         cash_withdrawable_cents: account_funds.withdrawable,
     })
+}
+
+fn alpaca_usdc_balance(positions: &[PositionResponse]) -> Result<Usdc, AlpacaBrokerApiError> {
+    let Some(position) = positions
+        .iter()
+        .find(|position| position.symbol == "USDCUSD")
+    else {
+        return Ok(Usdc::ZERO);
+    };
+
+    // Track total USDC held at Alpaca, including any amount locked by an
+    // in-flight withdrawal -- it has not left Alpaca until the withdrawal
+    // settles. `qty_available` would under-report it mid-withdrawal. Alpaca
+    // always returns `qty` for a real position, so a missing value is a
+    // malformed response we must surface rather than silently treat as zero.
+    let total_quantity = position
+        .total_quantity
+        .ok_or(AlpacaBrokerApiError::MissingPositionQuantity)?;
+
+    Ok(Usdc::new(total_quantity))
 }
 
 pub(super) async fn get_account_funds(
@@ -202,6 +259,7 @@ fn to_cash_value_cents(cash: Float) -> Result<i64, AlpacaBrokerApiError> {
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
+    use uuid::uuid;
 
     use super::*;
     use crate::alpaca_broker_api::TimeInForce;
@@ -223,7 +281,7 @@ mod tests {
     }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
@@ -278,6 +336,7 @@ mod tests {
         account_mock.assert();
 
         assert_eq!(state.positions.len(), 2);
+        assert_eq!(state.alpaca_usdc, Some(Usdc::ZERO));
         assert_eq!(state.usd_balance_cents, 5_000_000);
         assert_eq!(state.cash_buying_power_cents, Some(5_000_000));
 
@@ -684,7 +743,10 @@ mod tests {
                         "market_value": "1500.00"
                     },
                     {
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
                         "symbol": "USDCUSD",
+                        "qty": "5000.0",
                         "qty_available": "5000.0",
                         "market_value": "5000.00"
                     },
@@ -717,5 +779,309 @@ mod tests {
 
         assert_eq!(symbols, vec!["AAPL", "RKLB"]);
         assert_eq!(inventory.positions.len(), 2);
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::new(float!(5000.0))));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_reads_real_alpaca_usdcusd_position_shape() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset_class": "crypto",
+                        "avg_entry_price": "0.999912891",
+                        "cost_basis": "0.788445",
+                        "current_price": "0.9995",
+                        "exchange": "CRYPTO",
+                        "market_value": "0.78812",
+                        "qty": "0.788514",
+                        "qty_available": "0.788514",
+                        "side": "long",
+                        "symbol": "USDCUSD"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        assert!(inventory.positions.is_empty());
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::new(float!(0.788514))));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_uses_total_qty_not_available_for_usdc() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        // Mid-withdrawal Alpaca locks part of the USDC, so qty_available drops
+        // below the total qty still held at Alpaca. We must report the total.
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
+                        "symbol": "USDCUSD",
+                        "qty": "5000.0",
+                        "qty_available": "1500.0",
+                        "market_value": "5000.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::new(float!(5000.0))));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_errors_when_usdc_position_missing_total_qty() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
+                        "symbol": "USDCUSD",
+                        "qty_available": "5000.0",
+                        "market_value": "5000.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaBrokerApiError::MissingPositionQuantity),
+            "Expected MissingPositionQuantity, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_excludes_usdcusd_from_equity_without_metadata() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        // USDCUSD with qty present but no asset_class/exchange must still be
+        // captured as Alpaca USDC and kept out of equity positions, so it never
+        // reaches vault reconciliation as a phantom equity holding.
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "USDCUSD",
+                        "qty": "5000.0",
+                        "qty_available": "5000.0",
+                        "market_value": "5000.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        assert!(
+            inventory.positions.is_empty(),
+            "USDCUSD must never appear as an equity position"
+        );
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::new(float!(5000.0))));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_reports_zero_for_fully_locked_usdc_position() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
+                        "symbol": "USDCUSD",
+                        "qty": "0.0",
+                        "qty_available": "0.0",
+                        "market_value": "0.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::ZERO));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_ignores_other_crypto_positions() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
+                        "market_value": "1.00",
+                        "qty_available": "0.00001",
+                        "symbol": "BTC/USD"
+                    },
+                    {
+                        "symbol": "AAPL",
+                        "qty_available": "10.0",
+                        "market_value": "1500.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        let symbols: Vec<String> = inventory
+            .positions
+            .iter()
+            .map(|position| position.symbol.to_string())
+            .collect();
+
+        assert_eq!(symbols, vec!["AAPL"]);
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::ZERO));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_ignores_non_equity_asset_classes() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "asset_class": "option",
+                        "exchange": "OPRA",
+                        "market_value": "1.00",
+                        "qty_available": "1",
+                        "symbol": "AAPL250117C00150000"
+                    },
+                    {
+                        "asset_class": "us_equity",
+                        "symbol": "AAPL",
+                        "qty_available": "10.0",
+                        "market_value": "1500.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        let symbols: Vec<String> = inventory
+            .positions
+            .iter()
+            .map(|position| position.symbol.to_string())
+            .collect();
+
+        assert_eq!(symbols, vec!["AAPL"]);
+        assert_eq!(inventory.alpaca_usdc, Some(Usdc::ZERO));
     }
 }

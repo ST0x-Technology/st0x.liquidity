@@ -102,6 +102,7 @@ struct MockOrder {
     status: OrderStatus,
     poll_count: usize,
     filled_price: Option<Float>,
+    client_order_id: Option<String>,
 }
 
 /// A single calendar entry controlling market open/close times.
@@ -144,6 +145,24 @@ struct MockState {
     wallet_balances: HashMap<String, Float>,
     /// Whitelisted withdrawal addresses.
     whitelisted_addresses: Vec<WhitelistEntry>,
+    /// Number of upcoming `place_order` requests that should be answered
+    /// with a 5xx *after* the order has already been recorded in
+    /// [`MockState::orders`]. Models the adversarial case where the
+    /// broker processes the request but the response is lost in flight:
+    /// any caller-side retry creates a second order even though one
+    /// already exists. Decrements per request until zero.
+    transient_placement_failures_remaining: usize,
+    /// Number of upcoming `/v1/calendar` requests answered with a 503
+    /// before the endpoint resumes serving [`MockState::calendar_entries`].
+    /// Models a transient market-hours data outage. Decrements per
+    /// request until zero.
+    calendar_failures_remaining: usize,
+    /// Number of upcoming `place_order` requests answered with a 401
+    /// *before* the order is recorded -- the complement of
+    /// [`MockState::transient_placement_failures_remaining`]. Models a
+    /// session/credential expiry mid-request where the broker never
+    /// processed the placement. Decrements per request until zero.
+    unauthorized_placement_failures_remaining: usize,
 }
 
 /// Status of a whitelisted address.
@@ -305,6 +324,9 @@ impl AlpacaBrokerMock {
             alpaca_deposit_address: String::new(),
             wallet_balances: HashMap::new(),
             whitelisted_addresses: Vec::new(),
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         }));
 
         let server = MockServer::start_async().await;
@@ -336,6 +358,44 @@ impl AlpacaBrokerMock {
     /// Changes the mock mode for subsequent requests.
     pub fn set_mode(&self, mode: MockMode) {
         lock(&self.state).mode = mode;
+    }
+
+    /// Arms the mock to answer the next `count` `place_order` requests
+    /// with a 5xx *after* the order has already been recorded in the
+    /// mock's internal state. Models adversarial broker behaviour where
+    /// the request reaches the upstream and is processed but the
+    /// response is lost in flight; any caller-side retry creates a
+    /// second order with the same intent.
+    pub fn set_transient_placement_failures(&self, count: usize) {
+        lock(&self.state).transient_placement_failures_remaining = count;
+    }
+
+    /// Arms the mock to answer the next `count` `/v1/calendar` requests
+    /// with a 503 before resuming normal calendar service. Models a
+    /// transient market-hours data outage.
+    pub fn set_calendar_failures(&self, count: usize) {
+        lock(&self.state).calendar_failures_remaining = count;
+    }
+
+    /// Remaining armed calendar failures. Tests assert this reached zero
+    /// to prove the outage actually hit the market-hours path.
+    pub fn calendar_failures_remaining(&self) -> usize {
+        lock(&self.state).calendar_failures_remaining
+    }
+
+    /// Arms the mock to answer the next `count` `place_order` requests
+    /// with a 401 *before* recording anything -- the broker never
+    /// processed the placement. Models a session/credential expiry
+    /// mid-request, the complement of
+    /// [`AlpacaBrokerMock::set_transient_placement_failures`].
+    pub fn set_unauthorized_placement_failures(&self, count: usize) {
+        lock(&self.state).unauthorized_placement_failures_remaining = count;
+    }
+
+    /// Remaining armed unauthorized placement failures. Tests assert
+    /// this reached zero to prove the 401 was actually served.
+    pub fn unauthorized_placement_failures_remaining(&self) -> usize {
+        lock(&self.state).unauthorized_placement_failures_remaining
     }
 
     /// Sets a per-symbol fill delay: the order stays "new" for
@@ -446,6 +506,18 @@ impl AlpacaBrokerMock {
             .collect()
     }
 
+    /// Records the on-chain tx hash for an outgoing wallet transfer by
+    /// transfer_id. Used by test infrastructure to inject the real Ethereum
+    /// mint tx hash so the bot's withdrawal-confirmation check can verify it.
+    pub fn set_transfer_tx_hash(&self, transfer_id: &str, tx_hash_hex: String) {
+        lock(&self.state)
+            .wallet_transfers
+            .iter_mut()
+            .find(|transfer| transfer.transfer_id == transfer_id)
+            .unwrap_or_else(|| panic!("set_transfer_tx_hash: no transfer with id {transfer_id}"))
+            .tx_hash = tx_hash_hex;
+    }
+
     /// Returns a snapshot of all current positions.
     pub fn positions(&self) -> Vec<MockPositionSnapshot> {
         let state = lock(&self.state);
@@ -495,20 +567,22 @@ impl AlpacaBrokerMock {
         Ok(())
     }
 
-    /// Starts a background watcher that monitors the Ethereum chain for USDC
-    /// mints to the bot's wallet. When detected, it auto-creates INCOMING
-    /// wallet transfer records in mock state so the bot's deposit polling
-    /// succeeds.
+    /// Starts a background watcher that monitors the Ethereum chain for the USDC
+    /// deposit SEND to Alpaca's deposit address. When detected, it auto-creates
+    /// an INCOMING wallet transfer record (keyed on the send tx) in mock state so
+    /// the bot's deposit polling by the send tx succeeds.
     ///
-    /// In the BaseToAlpaca flow, CCTP mints USDC to `mint_recipient` (the
-    /// bot's Ethereum wallet). The bot then polls Alpaca for a deposit
-    /// matching the mint tx hash. This watcher simulates Alpaca detecting
-    /// the on-chain mint and creating the corresponding transfer record.
+    /// In the BaseToAlpaca flow, CCTP mints USDC to the bot's Ethereum wallet
+    /// (`sender`), and the bot then SENDS that USDC to Alpaca's per-account
+    /// deposit address and polls Alpaca for a deposit matching the SEND tx hash
+    /// (not the mint tx). This watcher detects that on-chain
+    /// `Transfer(sender -> alpaca_deposit_address)` and creates the corresponding
+    /// transfer record, simulating Alpaca crediting the deposit.
     pub async fn start_deposit_watcher<P>(
         &self,
         provider: P,
         usdc_address: Address,
-        mint_recipient: Address,
+        sender: Address,
     ) -> anyhow::Result<JoinHandle<()>>
     where
         P: Provider + Clone + Send + Sync + 'static,
@@ -536,7 +610,7 @@ impl AlpacaBrokerMock {
                     last_block + 1,
                     current,
                     usdc_address,
-                    mint_recipient,
+                    sender,
                 )
                 .await;
 
@@ -548,21 +622,29 @@ impl AlpacaBrokerMock {
     }
 }
 
-/// Scans a single block for USDC Transfer events to `mint_recipient`
-/// and records them as incoming wallet transfers in mock state.
+/// Scans a single block for the USDC deposit SEND
+/// (`Transfer(sender -> alpaca_deposit_address)`) and records it as an incoming
+/// wallet transfer (keyed on the send tx) in mock state.
 /// Returns `true` if the block was fully processed, `false` on RPC error.
 ///
-/// Only records transfers where `from == Address::ZERO` (a mint event),
-/// filtering out regular transfers that happen to target `mint_recipient`.
+/// Matches `from == sender` and `to == alpaca_deposit_address` so the recorded
+/// tx hash is the bot's fund-moving deposit send -- exactly the tx the bot polls
+/// by -- not the upstream CCTP mint (whose `to` is the bot wallet itself).
 async fn scan_block_for_deposits<P: Provider>(
     provider: &P,
     state: &Mutex<MockState>,
     block_num: u64,
     usdc_address: Address,
-    mint_recipient: Address,
+    sender: Address,
 ) -> bool {
     let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).full().await else {
         return false;
+    };
+
+    let Ok(deposit_address) = lock(state).alpaca_deposit_address.parse::<Address>() else {
+        // The deposit address is only set once `register_wallet_endpoints` runs;
+        // until then there is nothing to match, so treat the block as processed.
+        return true;
     };
 
     for tx_hash in block.transactions.hashes() {
@@ -575,9 +657,7 @@ async fn scan_block_for_deposits<P: Provider>(
                 continue;
             };
 
-            if log.address() != usdc_address
-                || event.to != mint_recipient
-                || event.from != Address::ZERO
+            if log.address() != usdc_address || event.from != sender || event.to != deposit_address
             {
                 continue;
             }
@@ -610,7 +690,7 @@ async fn scan_block_for_deposits<P: Provider>(
                 amount,
                 asset: "USDC".to_string(),
                 from_address: event.from,
-                to_address: mint_recipient,
+                to_address: deposit_address,
                 status: TransferStatus::Complete,
                 tx_hash: tx_hash_hex,
                 poll_count: 0,
@@ -622,7 +702,7 @@ async fn scan_block_for_deposits<P: Provider>(
     true
 }
 
-/// Scans a range of blocks for deposits, returning true only if
+/// Scans a range of blocks for the deposit send, returning true only if
 /// every block in the range was fully processed.
 async fn scan_deposit_range<P: Provider>(
     provider: &P,
@@ -630,11 +710,10 @@ async fn scan_deposit_range<P: Provider>(
     from: u64,
     to: u64,
     usdc_address: Address,
-    mint_recipient: Address,
+    sender: Address,
 ) -> bool {
     for block_num in from..=to {
-        if !scan_block_for_deposits(provider, state, block_num, usdc_address, mint_recipient).await
-        {
+        if !scan_block_for_deposits(provider, state, block_num, usdc_address, sender).await {
             return false;
         }
     }
@@ -694,6 +773,7 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_latest_trade_endpoint(server, state);
     register_asset_endpoint(server);
     register_order_placement_endpoint(server, state);
+    register_order_by_client_order_id_endpoint(server, state);
     register_order_status_endpoint(server, state);
 }
 
@@ -727,7 +807,18 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
     server.mock(|when, then| {
         when.method(GET).path("/v1/calendar");
         then.respond_with(move |_request: &HttpMockRequest| {
-            let entries: Vec<Value> = lock(&state)
+            let mut state = lock(&state);
+
+            if state.calendar_failures_remaining > 0 {
+                state.calendar_failures_remaining -= 1;
+                drop(state);
+                return json_response(
+                    503,
+                    &json!({"message": "calendar temporarily unavailable (chaos)"}),
+                );
+            }
+
+            let entries: Vec<Value> = state
                 .calendar_entries
                 .iter()
                 .map(|entry| {
@@ -738,6 +829,7 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
                     })
                 })
                 .collect();
+            drop(state);
             json_response(200, &Value::Array(entries))
         });
     });
@@ -749,9 +841,9 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
         when.method(GET)
             .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/positions"));
         then.respond_with(move |_request: &HttpMockRequest| {
-            let result: Result<Vec<Value>, rain_math_float::FloatError> = {
+            let result = (|| -> Result<Vec<Value>, rain_math_float::FloatError> {
                 let state = lock(&state);
-                state
+                let mut positions = state
                     .account
                     .positions
                     .values()
@@ -761,7 +853,7 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                             .lt(Float::from_raw(alloy::primitives::B256::ZERO))?;
                         let side = if is_neg { "short" } else { "long" };
                         let abs_qty = pos.quantity.abs()?;
-                        Ok(json!({
+                        Ok::<Value, rain_math_float::FloatError>(json!({
                             "symbol": pos.symbol,
                             "qty_available": format_float_with_fallback(&abs_qty),
                             "market_value": format_float_with_fallback(&pos.market_value),
@@ -769,8 +861,30 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                             "avg_entry_price": "0",
                         }))
                     })
-                    .collect()
-            };
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let usdc_balance = state
+                    .wallet_balances
+                    .get("USDC")
+                    .copied()
+                    .unwrap_or_else(|| float!(0));
+                drop(state);
+
+                if !usdc_balance.is_zero()? {
+                    positions.push(json!({
+                        "symbol": "USDCUSD",
+                        "qty_available": format_float_with_fallback(&usdc_balance),
+                        "qty": format_float_with_fallback(&usdc_balance),
+                        "market_value": format_float_with_fallback(&usdc_balance),
+                        "side": "long",
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
+                        "avg_entry_price": "1",
+                    }));
+                }
+
+                Ok(positions)
+            })();
 
             match result {
                 Ok(positions) => json_response(200, &Value::Array(positions)),
@@ -885,9 +999,21 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     );
                 }
             };
+            let client_order_id = body["client_order_id"].as_str().map(str::to_owned);
             let order_id = Uuid::new_v4().to_string();
 
             let mut state = lock(&state);
+
+            // Session/credential expiry: reject before recording anything,
+            // so the caller's retry must place fresh rather than dedupe.
+            if state.unauthorized_placement_failures_remaining > 0 {
+                state.unauthorized_placement_failures_remaining -= 1;
+                drop(state);
+                return json_response(
+                    401,
+                    &json!({"message": "request is not authorized (chaos)"}),
+                );
+            }
 
             if matches!(state.mode, MockMode::PlacementFails) {
                 return json_response(422, &json!({"message": "order rejected"}));
@@ -895,6 +1021,25 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
 
             if symbol.to_string() == "USDCUSD" {
                 return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
+            }
+
+            // Real Alpaca rejects a re-used `client_order_id` on an active order
+            // with a 422 ("client_order_id must be unique") rather than deduping
+            // to a 2xx. Mirror that so the executor's recovery path -- look the
+            // order up by client_order_id and adopt it -- is exercised
+            // end-to-end instead of being papered over by a mock-only 200.
+            if let Some(client_id) = client_order_id.as_deref() {
+                let already_recorded = state
+                    .orders
+                    .values()
+                    .any(|order| order.client_order_id.as_deref() == Some(client_id));
+                if already_recorded {
+                    drop(state);
+                    return json_response(
+                        422,
+                        &json!({"message": "client_order_id must be unique"}),
+                    );
+                }
             }
 
             state.orders.insert(
@@ -906,8 +1051,19 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     status: OrderStatus::New,
                     poll_count: 0,
                     filled_price: None,
+                    client_order_id: client_order_id.clone(),
                 },
             );
+
+            if state.transient_placement_failures_remaining > 0 {
+                state.transient_placement_failures_remaining -= 1;
+                drop(state);
+                return json_response(
+                    503,
+                    &json!({"message": "transient upstream failure (chaos)"}),
+                );
+            }
+
             drop(state);
             json_response(
                 200,
@@ -918,6 +1074,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     "side": side.to_string(),
                     "status": "new",
                     "filled_avg_price": null,
+                    "client_order_id": client_order_id,
                 }),
             )
         });
@@ -1046,6 +1203,7 @@ fn handle_crypto_order(
             status: OrderStatus::Filled,
             poll_count: 0,
             filled_price: Some(fill_price),
+            client_order_id: None,
         },
     );
 
@@ -1061,6 +1219,49 @@ fn handle_crypto_order(
             "created_at": "2025-01-06T12:00:00Z"
         })
     })
+}
+
+fn register_order_by_client_order_id_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+    let path = format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders:by_client_order_id");
+
+    server.mock(|when, then| {
+        when.method(GET).path(path.clone());
+        then.respond_with(move |request: &HttpMockRequest| {
+            let Some(client_order_id) = request.uri().query().and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("client_order_id=").map(str::to_owned))
+            }) else {
+                return json_response(
+                    400,
+                    &json!({"message": "missing client_order_id query param"}),
+                );
+            };
+
+            let found = lock(&state).orders.iter().find_map(|(id, order)| {
+                (order.client_order_id.as_deref() == Some(client_order_id.as_str())).then(|| {
+                    json!({
+                        "id": id,
+                        "symbol": order.symbol.to_string(),
+                        "qty": format_float_with_fallback(&order.quantity),
+                        "side": order.side.to_string(),
+                        "status": order.status.to_string(),
+                        "filled_avg_price": order
+                            .filled_price
+                            .as_ref()
+                            .map(format_float_with_fallback),
+                        "client_order_id": client_order_id,
+                    })
+                })
+            });
+
+            found.map_or_else(
+                || json_response(404, &json!({"message": "order not found"})),
+                |payload| json_response(200, &payload),
+            )
+        });
+    });
 }
 
 fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -1369,25 +1570,13 @@ fn register_wallet_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState
                     );
                 }
 
-                let (deposit_addr, balance) = {
-                    let state = lock(&state);
-                    (
-                        state.alpaca_deposit_address.clone(),
-                        state
-                            .wallet_balances
-                            .get(asset)
-                            .copied()
-                            .unwrap_or_else(|| float!(0)),
-                    )
-                };
+                let deposit_addr = lock(&state).alpaca_deposit_address.clone();
 
                 return json_response(
                     200,
                     &json!({
                         "asset_id": "00000000-0000-0000-0000-000000000000",
-                        "asset": asset,
                         "address": deposit_addr,
-                        "balance": format_float_with_fallback(&balance),
                         "created_at": "2025-01-01T00:00:00Z"
                     }),
                 );
@@ -1685,6 +1874,9 @@ mod tests {
             alpaca_deposit_address: format!("{:#x}", Address::ZERO),
             wallet_balances: HashMap::new(),
             whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
@@ -1729,6 +1921,9 @@ mod tests {
             alpaca_deposit_address: format!("{:#x}", Address::ZERO),
             wallet_balances: HashMap::from([("USDC".to_string(), float!(20))]),
             whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
@@ -1780,6 +1975,9 @@ mod tests {
             alpaca_deposit_address: format!("{:#x}", Address::ZERO),
             wallet_balances: HashMap::new(),
             whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(

@@ -9,26 +9,28 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
+    MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
+    TryIntoExecutor,
 };
 
-use crate::config::{BrokerCtx, Ctx};
 use crate::offchain::order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacementResult, OrderPlacer,
     build_offchain_order_cqrs,
 };
 use crate::onchain::accumulator::check_execution_readiness;
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
-use crate::threshold::ExecutionThreshold;
+use st0x_config::ExecutionThreshold;
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_float_serde::format_float_with_fallback;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
@@ -264,6 +266,10 @@ async fn execute_market_order<W: Write>(
         symbol: request.symbol.clone(),
         shares: request.shares,
         direction: request.direction,
+        // Manual CLI placement; generate a fresh idempotency key so an
+        // operator-issued retry cannot accidentally dedupe against an
+        // unrelated earlier placement.
+        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
     };
 
     execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
@@ -356,7 +362,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let evm_ctx = &ctx.evm;
-    let feed_id_cache = FeedIdCache::new();
+    let pyth_feed_ids = PythFeedIds::new(ctx.pyth_feed_ids());
     let order_owner = ctx.order_owner();
     let read_evm = ReadOnlyEvm::new(provider.clone());
 
@@ -365,7 +371,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         &read_evm,
         cache,
         evm_ctx,
-        &feed_id_cache,
+        &pyth_feed_ids,
         order_owner,
     )
     .await
@@ -441,6 +447,72 @@ pub(super) async fn execute_broker_order<W: Write>(
             Ok(placement)
         }
     }
+}
+
+/// Poll cadence for the dividend-bump buy-fill wait. Mirrors the tokenization
+/// poll loop in `alpaca_tokenize_command`: a market buy normally fills quickly,
+/// but the composite flow must not tokenize against an unfilled order.
+const BUY_FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const BUY_FILL_MAX_ATTEMPTS: u32 = 150;
+
+/// Places a market buy and blocks until the broker reports it filled, so the
+/// dividend NAV bump can act on the acquired shares instead of racing an
+/// unfilled order into the tokenization step.
+pub(super) async fn execute_market_buy_until_filled<W: Write>(
+    ctx: &Ctx,
+    symbol: Symbol,
+    shares: Positive<FractionalShares>,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let market_order = MarketOrder {
+        symbol,
+        shares,
+        direction: Direction::Buy,
+        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+    };
+
+    match &ctx.broker {
+        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            place_market_order_until_filled(&broker, market_order, stdout).await
+        }
+        BrokerCtx::DryRun => {
+            let broker = MockExecutorCtx.try_into_executor().await?;
+            place_market_order_until_filled(&broker, market_order, stdout).await
+        }
+    }
+}
+
+async fn place_market_order_until_filled<Exec: Executor, W: Write>(
+    broker: &Exec,
+    market_order: MarketOrder,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let placement = broker.place_market_order(market_order).await?;
+    writeln!(stdout, "   Buy order placed: {}", placement.order_id)?;
+
+    for attempt in 1..=BUY_FILL_MAX_ATTEMPTS {
+        match broker.get_order_status(&placement.order_id).await? {
+            OrderState::Filled { order_id, .. } => {
+                writeln!(stdout, "   Buy filled (order {order_id})")?;
+                return Ok(());
+            }
+            OrderState::Failed { error_reason, .. } => {
+                anyhow::bail!("buy order failed: {error_reason:?}");
+            }
+            OrderState::Pending | OrderState::Submitted { .. } => {
+                if attempt % 10 == 0 {
+                    writeln!(
+                        stdout,
+                        "   Waiting for buy fill... (attempt {attempt}/{BUY_FILL_MAX_ATTEMPTS})"
+                    )?;
+                }
+                tokio::time::sleep(BUY_FILL_POLL_INTERVAL).await;
+            }
+        }
+    }
+
+    anyhow::bail!("timed out waiting for the buy order to fill")
 }
 
 pub(super) async fn process_found_trade<W: Write>(
@@ -520,6 +592,19 @@ pub(super) async fn process_found_trade<W: Write>(
         error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {error}");
     }
 
+    // Reuse a prior failed attempt's stashed OffchainOrderId as the broker-side
+    // idempotency anchor (mirroring the automated `execute_create_offchain_order`
+    // path) so a CLI retry after a transient broker failure dedupes instead of
+    // placing a second order. Fall back to this attempt's id when there is none.
+    let anchor = match position_store.load(&params.symbol).await {
+        Ok(position) => position.and_then(|position| position.last_failed_offchain_order_id),
+        Err(error) => {
+            error!(%offchain_order_id, symbol = %params.symbol, %error, "Failed to load position for the idempotency anchor; placing under a fresh key");
+            None
+        }
+    };
+    let client_order_id_source = anchor.unwrap_or(offchain_order_id);
+
     if let Err(error) = offchain_order_store
         .send(
             &offchain_order_id,
@@ -528,6 +613,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 shares: params.shares,
                 direction: params.direction,
                 executor: params.executor,
+                client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
             },
         )
         .await
@@ -640,18 +726,23 @@ fn display_trade_details<W: Write>(
 mod tests {
     use alloy::primitives::{Address, address};
     use httpmock::MockServer;
+    use regex::Regex;
     use serde_json::json;
     use url::Url;
+    use uuid::uuid;
 
-    use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
-    use crate::onchain::EvmCtx;
-    use crate::test_utils::{positive_shares, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::create_test_issuance_ctx;
+    use st0x_config::{
+        AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, IngestionCutoff,
+        LogLevel, TradingMode,
+    };
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
+    use super::*;
+    use crate::test_utils::{positive_shares, setup_test_db};
+
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_base_test_ctx() -> Ctx {
         Ctx {
@@ -659,19 +750,23 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port: 8080,
+            board_port: 8081,
             evm: EvmCtx {
-                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -683,9 +778,8 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -788,17 +882,32 @@ mod tests {
                 }));
         });
 
+        // The broker-side `client_order_id` is a fresh UUID per CLI invocation,
+        // so its exact value cannot be pinned. Assert the value is a well-formed
+        // CLI idempotency key (`cli-{uuid}`) so a placement can never be issued
+        // with a missing or malformed key (the chaos tests use the broker mock,
+        // not this httpmock, so they do not cover it); `json_body_includes`
+        // covers the static fields.
+        let client_order_id_pattern = Regex::new(
+            r#""client_order_id":"cli-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""#,
+        )
+        .unwrap();
+
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body(json!({
-                    "symbol": symbol,
-                    "qty": quantity,
-                    "side": side,
-                    "type": "market",
-                    "time_in_force": "day",
-                    "extended_hours": false
-                }));
+                .body_matches(client_order_id_pattern.clone())
+                .json_body_includes(
+                    json!({
+                        "symbol": symbol,
+                        "qty": quantity,
+                        "side": side,
+                        "type": "market",
+                        "time_in_force": "day",
+                        "extended_hours": false
+                    })
+                    .to_string(),
+                );
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -1123,6 +1232,54 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--time-in-force is not supported with --limit-price"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_returns_once_the_broker_reports_filled() {
+        // MockExecutor reports Filled by default, so the poll resolves on the
+        // first status check.
+        let broker = MockExecutor::new();
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .expect("a filled order must resolve the buy-fill wait");
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Buy filled"),
+            "the buy-fill wait must report the fill, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_fails_when_the_broker_rejects_the_order() {
+        let broker = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at: Utc::now(),
+            error_reason: Some("rejected".to_string()),
+        });
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("buy order failed"),
+            "a rejected order must fail the buy-fill wait, got: {error}"
         );
     }
 }

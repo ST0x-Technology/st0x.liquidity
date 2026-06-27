@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::alpaca_market_data::AlpacaMarketDataError;
-use crate::{CounterTradeCostError, FractionalShares, Positive, Symbol, Usd};
+use crate::{ClientOrderId, CounterTradeCostError, FractionalShares, Positive, Symbol, Usd};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -50,12 +50,29 @@ pub enum AssetStatus {
 }
 
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+// Exposed as the single source of truth for the broker HTTP request timeout so
+// timing-sensitive integration tests derive their boundaries from it.
+pub use client::HTTP_REQUEST_TIMEOUT;
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
 pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderResponse,
-    ParseAlpacaLimitPriceError,
+    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderOutcome,
+    CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
+
+impl fmt::Display for CryptoOrderFailureReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Canceled => formatter.write_str("Canceled"),
+            Self::Expired => formatter.write_str("Expired"),
+            Self::Rejected => formatter.write_str("Rejected"),
+            Self::DoneForDay => formatter.write_str("DoneForDay"),
+            Self::Replaced => formatter.write_str("Replaced"),
+            Self::Suspended => formatter.write_str("Suspended"),
+            Self::Calculated => formatter.write_str("Calculated"),
+        }
+    }
+}
 
 impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,12 +113,20 @@ impl TimeInForce {
     }
 }
 
-/// Terminal failure states for crypto orders
+/// Terminal failure states for crypto orders.
+///
+/// Every non-fill terminal `BrokerOrderStatus` maps to one of these so the
+/// conversion resume path never treats an unexpected terminal status as
+/// still-pending (which would retry forever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoOrderFailureReason {
     Canceled,
     Expired,
     Rejected,
+    DoneForDay,
+    Replaced,
+    Suspended,
+    Calculated,
 }
 
 #[derive(Debug, Error)]
@@ -136,11 +161,18 @@ pub enum AlpacaBrokerApiError {
         status: AccountStatus,
     },
 
-    #[error("Crypto order {order_id} failed: {reason:?}")]
+    #[error("Crypto order {order_id} failed: {reason}")]
     CryptoOrderFailed {
         order_id: Uuid,
         reason: CryptoOrderFailureReason,
     },
+
+    #[error(
+        "Broker rejected client_order_id {client_order_id} as a duplicate (422) but no \
+         order with that id was found on lookup; broker state is inconsistent and the \
+         placement must be retried"
+    )]
+    DuplicateOrderNotFound { client_order_id: ClientOrderId },
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
@@ -168,6 +200,9 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
+
+    #[error("Alpaca USDCUSD position is missing the required total quantity (qty) field")]
+    MissingPositionQuantity,
 
     #[error(
         "Order quantity {shares} is below Alpaca's \

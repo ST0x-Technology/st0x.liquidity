@@ -2,6 +2,7 @@
 
 use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
+use thiserror::Error;
 use tracing::warn;
 
 use std::fmt::{self, Debug, Display};
@@ -44,15 +45,21 @@ impl Display for TransferKind {
     }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum InvalidTransferKind {
+    #[error("unknown transfer kind: {0}")]
+    Unknown(String),
+}
+
 impl FromStr for TransferKind {
-    type Err = String;
+    type Err = InvalidTransferKind;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "equity_mint" => Ok(Self::EquityMint),
             "equity_redemption" => Ok(Self::EquityRedemption),
             "usdc_bridge" => Ok(Self::UsdcBridge),
-            other => Err(format!("unknown transfer kind: {other}")),
+            other => Err(InvalidTransferKind::Unknown(other.to_owned())),
         }
     }
 }
@@ -344,13 +351,17 @@ mod tests {
         EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, TransferWarning,
         UsdcBridgeDirection, UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
     };
-    use st0x_execution::{FractionalShares, Symbol};
+    use st0x_execution::{ClientOrderId, FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::equity_redemption::EquityRedemptionEvent;
-    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
+    use crate::equity_redemption::{
+        EquityRedemptionEvent, RedemptionAggregateId, redemption_aggregate_id,
+    };
+    use crate::tokenized_equity_mint::{
+        IssuerRequestId, TokenizedEquityMintEvent, issuer_request_id,
+    };
     use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 
     fn mint_transfer(status: EquityMintStatus) -> TransferOperation {
@@ -444,19 +455,28 @@ mod tests {
         .unwrap();
     }
 
+    struct SeededTransferIds {
+        active_mint: IssuerRequestId,
+        failed_mint: IssuerRequestId,
+        active_redemption: RedemptionAggregateId,
+        usdc: Uuid,
+    }
+
     /// Seeds the database with transfer events spanning all three aggregate
     /// types and covering active, recent-terminal, and old-terminal cases.
-    /// Returns the UUID used for the USDC rebalance aggregate.
-    async fn seed_transfer_events(pool: &SqlitePool) -> Uuid {
+    async fn seed_transfer_events(pool: &SqlitePool) -> SeededTransferIds {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
         let two_days_ago = now - Duration::hours(48);
+
+        let active_mint_id = issuer_request_id("active-mint-1");
+        let failed_mint_id = issuer_request_id("failed-mint-1");
 
         // 1. Active mint (non-terminal: only MintRequested)
         insert_event(
             pool,
             "TokenizedEquityMint",
-            "active-mint-1",
+            &active_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
@@ -473,7 +493,7 @@ mod tests {
         insert_event(
             pool,
             "TokenizedEquityMint",
-            "failed-mint-1",
+            &failed_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
@@ -489,7 +509,7 @@ mod tests {
         insert_event(
             pool,
             "TokenizedEquityMint",
-            "failed-mint-1",
+            &failed_mint_id.to_string(),
             2,
             "TokenizedEquityMintEvent::MintRejected",
             serde_json::to_value(TokenizedEquityMintEvent::MintRejected {
@@ -500,11 +520,14 @@ mod tests {
         )
         .await;
 
+        let old_redemption_id = redemption_aggregate_id("old-redemption-1");
+        let active_redemption_id = redemption_aggregate_id("active-redemption-1");
+
         // 3. Old failed redemption (terminal, >24h ago -- should NOT appear)
         insert_event(
             pool,
             "EquityRedemption",
-            "old-redemption-1",
+            &old_redemption_id.to_string(),
             1,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             serde_json::to_value(EquityRedemptionEvent::WithdrawnFromRaindex {
@@ -514,6 +537,7 @@ mod tests {
                 wrapped_amount: alloy::primitives::U256::from(20),
                 actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::ZERO,
+                raindex_withdraw_block: None,
                 withdrawn_at: two_days_ago,
             })
             .unwrap(),
@@ -523,7 +547,7 @@ mod tests {
         insert_event(
             pool,
             "EquityRedemption",
-            "old-redemption-1",
+            &old_redemption_id.to_string(),
             2,
             "EquityRedemptionEvent::TransferFailed",
             serde_json::to_value(EquityRedemptionEvent::TransferFailed {
@@ -539,7 +563,7 @@ mod tests {
         insert_event(
             pool,
             "EquityRedemption",
-            "active-redemption-1",
+            &active_redemption_id.to_string(),
             1,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             serde_json::to_value(EquityRedemptionEvent::WithdrawnFromRaindex {
@@ -549,6 +573,7 @@ mod tests {
                 wrapped_amount: alloy::primitives::U256::from(15),
                 actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::ZERO,
+                raindex_withdraw_block: None,
                 withdrawn_at: now,
             })
             .unwrap(),
@@ -567,7 +592,7 @@ mod tests {
             serde_json::to_value(UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500)),
-                order_id: usdc_id,
+                order_id: ClientOrderId::from_uuid(usdc_id),
                 initiated_at: one_hour_ago,
             })
             .unwrap(),
@@ -588,7 +613,12 @@ mod tests {
         )
         .await;
 
-        usdc_id
+        SeededTransferIds {
+            active_mint: active_mint_id,
+            failed_mint: failed_mint_id,
+            active_redemption: active_redemption_id,
+            usdc: usdc_id,
+        }
     }
 
     #[tokio::test]
@@ -596,7 +626,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        let usdc_id = seed_transfer_events(&pool).await;
+        let seeded = seed_transfer_events(&pool).await;
         let loaded = load_transfers(&pool).await;
 
         // Active should contain the in-progress mint and in-progress redemption
@@ -624,7 +654,10 @@ mod tests {
             .find(|transfer| matches!(transfer, TransferOperation::EquityMint(_)))
             .unwrap();
         if let TransferOperation::EquityMint(op) = active_mint {
-            assert_eq!(op.id, Id::<EquityMintTag>::new("active-mint-1".to_string()));
+            assert_eq!(
+                op.id,
+                Id::<EquityMintTag>::new(seeded.active_mint.to_string())
+            );
         }
 
         let has_active_redemption = loaded.active.iter().any(|transfer| {
@@ -649,7 +682,7 @@ mod tests {
         if let TransferOperation::EquityRedemption(op) = active_redemption {
             assert_eq!(
                 op.id,
-                Id::<EquityRedemptionTag>::new("active-redemption-1".to_string())
+                Id::<EquityRedemptionTag>::new(seeded.active_redemption.to_string())
             );
         }
 
@@ -715,7 +748,7 @@ mod tests {
         {
             assert_eq!(
                 usdc_op.id,
-                Id::<UsdcBridgeTag>::new(usdc_id.to_string()),
+                Id::<UsdcBridgeTag>::new(seeded.usdc.to_string()),
                 "USDC bridge ID should match the aggregate_id"
             );
         }
@@ -728,7 +761,7 @@ mod tests {
         {
             assert_eq!(
                 mint_op.id,
-                Id::<EquityMintTag>::new("failed-mint-1".to_string()),
+                Id::<EquityMintTag>::new(seeded.failed_mint.to_string()),
                 "failed mint ID should match the aggregate_id"
             );
         }
@@ -777,10 +810,12 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
+        let bad_mint_id = issuer_request_id("bad-mint-1");
+
         insert_event(
             &pool,
             "TokenizedEquityMint",
-            "bad-mint-1",
+            &bad_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::json!({"malformed": true}),
@@ -793,7 +828,7 @@ mod tests {
         assert_eq!(result.warnings.len(), 1, "expected one warning");
         match result.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new("bad-mint-1".to_string()));
+                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }
@@ -828,12 +863,14 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
+        let bad_mint_id = issuer_request_id("bad-mint-1");
+
         // Insert an event with a payload that can't be deserialized as a
         // TokenizedEquityMintEvent — this triggers a MintReplayFailed warning.
         insert_event(
             &pool,
             "TokenizedEquityMint",
-            "bad-mint-1",
+            &bad_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::json!({"malformed": true}),
@@ -847,7 +884,7 @@ mod tests {
         assert_eq!(loaded.warnings.len(), 1, "expected one replay warning");
         match loaded.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new("bad-mint-1".to_string()));
+                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }

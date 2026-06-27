@@ -1,49 +1,58 @@
-//! Spawns the rebalancing infrastructure.
+//! Builds the rebalancing transfer infrastructure.
 
 use alloy::primitives::Address;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_config::EquityAssetConfig;
 use st0x_event_sorcery::Store;
-use st0x_evm::Wallet;
-use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
-};
+use st0x_evm::{USDC_BASE, USDC_ETHEREUM, Wallet};
+use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
+use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_wrapper::WrappedEquity;
 
-use super::equity::CrossVenueEquityTransfer;
-use super::usdc::CrossVenueCashTransfer;
-use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
-use crate::alpaca_wallet::AlpacaWalletService;
-use crate::config::EquityAssetConfig;
-use crate::equity_redemption::EquityRedemption;
-use crate::onchain::raindex::{RaindexService, RaindexVaultId};
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::tokenization::Tokenizer;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use super::usdc::{
+    CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
+};
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::wrapper::WrapperService;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnRebalancerError {
-    #[error("failed to create Alpaca broker API: {0}")]
-    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
 }
 
-pub(crate) struct RebalancingCqrsFrameworks {
-    pub(crate) mint: Arc<Store<TokenizedEquityMint>>,
-    pub(crate) redemption: Arc<Store<EquityRedemption>>,
-    pub(crate) usdc: Arc<Store<UsdcRebalance>>,
+/// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
+/// [`WrapperService`] needs, keeping `st0x-wrapper` independent of `st0x-config`.
+pub(crate) fn to_wrapped_equities(
+    equities: &HashMap<Symbol, EquityAssetConfig>,
+) -> HashMap<Symbol, WrappedEquity> {
+    equities
+        .iter()
+        .map(|(symbol, asset)| {
+            (
+                symbol.clone(),
+                WrappedEquity {
+                    underlying: asset.tokenized_equity,
+                    derivative: asset.tokenized_equity_derivative,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Trait-erased resume entry points for the cash transfer, so the conductor
+/// can build apalis job ctxs without leaking the wallet `Chain` generic
+/// upstream.
+pub(crate) struct UsdcTransferResumeHandles {
+    pub(crate) resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca>,
+    pub(crate) resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase>,
 }
 
 /// External service clients for rebalancing operations.
@@ -51,12 +60,11 @@ pub(crate) struct RebalancingCqrsFrameworks {
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 /// Providers for both chains are obtained from the wallets on `RebalancingCtx`.
 pub(crate) struct RebalancerServices<Chain: Wallet> {
-    broker: Arc<AlpacaBrokerApi>,
+    broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<Chain, Chain>>,
     raindex: Arc<RaindexService<Chain>>,
-    tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<WrapperService<Chain>>,
+    settlement: UsdcSettlementParams,
 }
 
 impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
@@ -65,102 +73,71 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// RaindexService is passed in rather than created here because it is
     /// needed for CQRS framework initialization in the conductor, which
     /// must happen before this constructor is called.
-    pub(crate) async fn new(
-        ctx: RebalancingCtx,
-        broker_auth: AlpacaBrokerApiCtx,
+    pub(crate) fn new(
+        broker: InstrumentedAlpacaBroker,
         wallet: Arc<AlpacaWalletService>,
-        equities: HashMap<Symbol, EquityAssetConfig>,
         ethereum_wallet: Chain,
         base_wallet: Chain,
         raindex: Arc<RaindexService<Chain>>,
-        tokenizer: Arc<dyn Tokenizer>,
+        settlement: UsdcSettlementParams,
     ) -> Result<Self, SpawnRebalancerError> {
-        // ctx is only consumed behind #[cfg(feature = "test-support")]
-        #[cfg(not(feature = "test-support"))]
-        let _ = ctx;
-
-        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth).await?);
-
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
                 usdc_ethereum: USDC_ETHEREUM,
                 usdc_base: USDC_BASE,
                 ethereum_wallet,
-                base_wallet: base_wallet.clone(),
+                base_wallet,
                 #[cfg(feature = "test-support")]
-                circle_api_base: ctx.circle_api_base.clone(),
+                circle_api_base: settlement.circle_api_base.clone(),
                 #[cfg(feature = "test-support")]
-                token_messenger: ctx.token_messenger,
+                token_messenger: settlement.token_messenger,
                 #[cfg(feature = "test-support")]
-                message_transmitter: ctx.message_transmitter,
+                message_transmitter: settlement.message_transmitter,
             })
             .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?,
         );
-
-        let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
 
         Ok(Self {
             broker,
             wallet,
             cctp,
             raindex,
-            tokenizer,
-            wrapper,
+            settlement,
         })
     }
 
-    /// Spawns the rebalancer as a background task.
+    /// Builds the cross-venue cash transfer and returns its trait-erased
+    /// resume entry points for the conductor's apalis job ctxs.
     ///
-    /// All CQRS frameworks are created in the conductor and passed here to
-    /// ensure single-instance initialization with all required query
-    /// processors.
-    pub(crate) fn spawn(
+    /// The `UsdcRebalance` CQRS framework is created in the conductor and
+    /// passed here to ensure single-instance initialization with all
+    /// required query processors.
+    pub(crate) fn into_usdc_transfer_handles(
         self,
         market_maker_wallet: Address,
         usdc_vault_id: RaindexVaultId,
-        operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        frameworks: RebalancingCqrsFrameworks,
-        equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-        usdc_in_progress: Arc<AtomicBool>,
-    ) -> (JoinHandle<()>, CancellationToken) {
-        let equity = Arc::new(CrossVenueEquityTransfer::new(
-            self.raindex.clone(),
-            self.tokenizer,
-            self.wrapper,
-            market_maker_wallet,
-            frameworks.mint,
-            frameworks.redemption,
-        ));
-
+        usdc: Arc<Store<UsdcRebalance>>,
+    ) -> UsdcTransferResumeHandles {
         let usdc = Arc::new(CrossVenueCashTransfer::new(
             self.broker,
             self.wallet,
             self.cctp,
             self.raindex,
-            frameworks.usdc,
+            usdc,
             market_maker_wallet,
             usdc_vault_id,
+            &self.settlement,
         ));
 
-        let shutdown_token = CancellationToken::new();
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&equity) as _,
-            equity as _,
-            Arc::clone(&usdc) as _,
-            usdc as _,
-            operation_receiver,
-            equity_in_progress,
-            usdc_in_progress,
-            shutdown_token.clone(),
-        );
+        let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
+        let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc;
 
         info!(target: "rebalance", "Rebalancing infrastructure initialized");
-        let handle = tokio::spawn(async move {
-            rebalancer.run().await;
-        });
 
-        (handle, shutdown_token)
+        UsdcTransferResumeHandles {
+            resume_base_to_alpaca,
+            resume_alpaca_to_base,
+        }
     }
 }
 
@@ -176,28 +153,56 @@ mod tests {
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{StoreBuilder, test_store};
+    use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode, RebalancingCtx};
+    use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
-        TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+        AlpacaWalletService, Executor, Symbol, TimeInForce,
     };
+    use st0x_float_macro::float;
+    use st0x_wrapper::WrappedEquity;
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaWalletService;
-    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingServiceConfig;
-    use crate::rebalancing::equity::EquityTransferServices;
-    use crate::tokenization::alpaca::AlpacaTokenizationService;
-    use crate::tokenization::mock::MockTokenizer;
-    use crate::vault_registry::VaultRegistry;
-    use crate::wrapper::mock::MockWrapper;
-    use st0x_float_macro::float;
+    use crate::rebalancing::usdc::UsdcSettlementParams;
+    use crate::telemetry::TelemetrySender;
+
+    #[test]
+    fn to_wrapped_equities_maps_underlying_and_derivative() {
+        let underlying = Address::random();
+        let derivative = Address::random();
+        let symbol: Symbol = "AAPL".parse().unwrap();
+
+        let mut config = HashMap::new();
+        config.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: underlying,
+                tokenized_equity_derivative: derivative,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let wrapped = to_wrapped_equities(&config);
+
+        assert_eq!(
+            wrapped.get(&symbol),
+            Some(&WrappedEquity {
+                underlying,
+                derivative,
+            }),
+        );
+    }
 
     type BaseProvider = FillProvider<
         JoinFill<
@@ -235,7 +240,6 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
-            disabled_assets: HashSet::new(),
         };
 
         assert!(trigger_config.equity.target.eq(float!(0.5)).unwrap());
@@ -254,7 +258,6 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
-            disabled_assets: HashSet::new(),
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
@@ -282,15 +285,6 @@ mod tests {
         let ethereum_wallet =
             RawPrivateKeyWallet::new(&evm_private_key, base_provider.clone(), 1).unwrap();
 
-        let tokenization = Arc::new(AlpacaTokenizationService::new(
-            server.base_url(),
-            account_id,
-            "test_key".into(),
-            "test_secret".into(),
-            base_wallet.clone(),
-            Some(address!("0x1234567890123456789012345678901234567890")),
-        ));
-
         let _account_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!("/v1/trading/accounts/{account_id}/account",));
@@ -311,10 +305,11 @@ mod tests {
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
-        let broker = Arc::new(
+        let broker = InstrumentedAlpacaBroker::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
                 .await
                 .expect("Failed to create test broker API"),
+            TelemetrySender::disabled(),
         );
 
         let wallet = Arc::new(AlpacaWalletService::new(
@@ -340,105 +335,44 @@ mod tests {
             .unwrap(),
         );
 
-        let wrapper = Arc::new(WrapperService::new(base_wallet.clone(), HashMap::new()));
-
-        let (_vault_registry_store, vault_registry_projection) =
-            StoreBuilder::<VaultRegistry>::new(crate::test_utils::setup_test_db().await)
-                .build(())
-                .await
-                .unwrap();
         let owner = base_wallet.address();
-        let raindex = Arc::new(RaindexService::new(
-            base_wallet,
-            TEST_ORDERBOOK,
-            vault_registry_projection,
-            owner,
-        ));
+        let raindex = Arc::new(RaindexService::new(base_wallet, TEST_ORDERBOOK, owner));
 
         let services = RebalancerServices {
             broker,
             wallet,
             cctp,
             raindex,
-            tokenizer: tokenization,
-            wrapper,
+            settlement: UsdcSettlementParams {
+                attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+                required_confirmations: 0,
+                #[cfg(feature = "test-support")]
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                #[cfg(feature = "test-support")]
+                token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+                #[cfg(feature = "test-support")]
+                message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+            },
         };
 
         (services, rebalancing_ctx)
     }
 
     #[tokio::test]
-    async fn broker_auth_failure_returns_spawn_error() {
-        let server = MockServer::start();
-
-        let _account_mock = server.mock(|when, then| {
-            when.method(GET).path_includes("/trading/accounts/");
-            then.status(401)
-                .header("content-type", "application/json")
-                .json_body(json!({"message": "Invalid API credentials"}));
-        });
-
-        let broker_auth = AlpacaBrokerApiCtx {
-            api_key: "invalid_key".to_string(),
-            api_secret: "invalid_secret".to_string(),
-            account_id: AlpacaAccountId::new(Uuid::nil()),
-            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
-            asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::default(),
-            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-
-        let spawn_error: SpawnRebalancerError = AlpacaBrokerApi::try_from_ctx(broker_auth)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(
-            matches!(spawn_error, SpawnRebalancerError::AlpacaBrokerApi(_)),
-            "Expected AlpacaBrokerApi error variant, got: {spawn_error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_dispatches_mint_operation() {
+    async fn into_usdc_transfer_handles_produces_resume_handles() {
         let server = MockServer::start();
         let (services, _ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
-        let mock_services = EquityTransferServices {
-            tokenizer: Arc::new(MockTokenizer::new()),
-            raindex: Arc::new(MockRaindex::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        };
-        let mint_cqrs = Arc::new(test_store(pool.clone(), mock_services.clone()));
-        let usdc_cqrs = Arc::new(test_store(pool.clone(), ()));
+        let usdc_store = Arc::new(test_store(pool, ()));
 
-        let redemption_cqrs = Arc::new(test_store(pool.clone(), mock_services));
-
-        let frameworks = RebalancingCqrsFrameworks {
-            mint: mint_cqrs,
-            redemption: redemption_cqrs,
-            usdc: usdc_cqrs,
-        };
-
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
-
-        let (handle, _shutdown_token) = services.spawn(
+        let UsdcTransferResumeHandles {
+            resume_base_to_alpaca: _,
+            resume_alpaca_to_base: _,
+        } = services.into_usdc_transfer_handles(
             Address::random(),
             RaindexVaultId(B256::ZERO),
-            rx,
-            frameworks,
-            Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usdc_store,
         );
-
-        tx.send(TriggeredOperation::Mint {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(float!(10)),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        handle.await.unwrap();
     }
 }

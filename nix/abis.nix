@@ -22,7 +22,7 @@ let
       src = sources.rain-math-float;
     };
     rainOrderbook = import ./rain-orderbook.nix {
-      inherit mkAbi;
+      inherit pkgs mkAbi;
       src = sources.rain-orderbook;
     };
     pyth = import ./pyth.nix { inherit pkgs; };
@@ -60,5 +60,6 @@ let
 in
 {
   abis = builtins.mapAttrs (_: feature: feature.abi) features;
+  abiEnvs = envs;
   abiEnv = mergedEnv;
 }

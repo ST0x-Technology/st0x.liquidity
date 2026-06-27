@@ -1,167 +1,392 @@
-//! Supervised order fill monitor that subscribes to onchain events
-//! and pushes them into apalis storage for processing.
+//! Supervised order fill monitor that drives continuous `eth_getLogs`
+//! polling over a persisted checkpoint.
 //!
-//! On every (re)connect -- both initial startup and supervisor restarts
-//! after a WebSocket disconnect -- the monitor:
-//! 1. Subscribes to fresh `ClearV3` / `TakeOrderV3` streams.
-//! 2. Determines a cutoff block from the provider's latest tip minus
-//!    `required_confirmations`.
-//! 3. Enqueues a `BackfillRange` apalis job covering
-//!    `(checkpoint+1, cutoff)` to recover events emitted while the
-//!    previous subscription was unavailable. The cutoff never exceeds
-//!    the confirmation boundary, so backfill never returns logs from
-//!    blocks that could still reorg (under the assumed reorg depth).
-//! 4. Enters the live listen loop, which buffers events in-memory and
-//!    only flushes (persists, advances checkpoint) once an event is
-//!    `required_confirmations` blocks behind the highest observed tip.
-//!    `removed: true` logs are observed explicitly -- dropped from the
-//!    buffer if present, or surfaced as a loud error if they target an
-//!    already-flushed event (which the confirmation gate should make
-//!    impossible under that assumption).
+//! Every `order_fill_poll_interval` seconds the monitor:
+//! 1. Records a block-lag telemetry sample (chain tip, cutoff block,
+//!    checkpoint) before any skip, so ingestion lag stays observable even
+//!    during a long catch-up while a `BackfillRange` job is still in flight.
+//!    Lag is measured against the cutoff block -- the actual ingestion
+//!    boundary -- so a caught-up system reads zero.
+//! 2. Skips the tick if a `BackfillRange` job is still in flight -- the
+//!    checkpoint has not advanced yet, so re-enqueuing would re-scan the
+//!    same blocks (and during a long catch-up would stack unbounded
+//!    overlapping ranges).
+//! 3. Reads the chain's latest cutoff block (tag configured via the required
+//!    `ingestion_cutoff` setting; production configs use `safe`) and uses it
+//!    as the ingestion boundary. `None` means the node has not yet surfaced
+//!    this block tag; there is nothing safe to ingest, so the tick is skipped.
+//! 4. Enqueues a `BackfillRange` job covering `(checkpoint+1, cutoff)`.
+//!    The `backfill-worker` fetches the logs via HTTP `eth_getLogs`,
+//!    pushes an accounting job per fill, and advances the checkpoint only
+//!    on success -- so a failed range is retried and never silently
+//!    skipped. Downstream dedupes by `(tx_hash, log_index)`.
 //!
-//! Note: `required_confirmations` is a naive reorg-protection heuristic,
-//! not real chain finality. A deep reorg exceeding the configured depth
-//! will still corrupt state; the design surfaces that case loudly
-//! rather than masking it.
+//! Each tick also records a poll-cycle telemetry sample (poll duration,
+//! ticks skipped by `MissedTickBehavior::Skip`, and success/failure outcome)
+//! and periodically prunes expired telemetry rows.
 //!
-//! The supervisor's restart policy provides automatic reconnection;
-//! this design keeps the disconnect-window data loss issue from
-//! recurring on every restart.
+//! This replaces the previous WebSocket `.watch()` filter-polling path.
+//! On a load-balanced RPC, `.watch()` issued `eth_newFilter` once and
+//! `eth_getFilterChanges` every few seconds against a filter that lived
+//! on a single backend node, so most polls were round-robined to nodes
+//! that returned `-32601 method not available` -- thousands of error-log
+//! lines a day plus a second (WS) transport whose silent closures were a
+//! recurring failure mode. `eth_subscribe`/`subscribe_logs` was rejected
+//! for the same reason: push subscriptions are sticky to one WS node and
+//! silently stall. A single HTTP transport with explicit, durable,
+//! visible retries (the apalis job) is the deliberate choice here,
+//! aligning liquidity with the issuance bot's ingestion architecture.
+//!
+//! **Default cutoff: `safe` (configurable via `ingestion_cutoff`)**
+//!
+//! On OP Stack chains (e.g. Base), `safe` is the latest L2 block whose
+//! sequencer batch has been posted to L1. It is typically only a few blocks
+//! behind the chain tip rather than hundreds, cutting hedging lag from ~20 min
+//! (with `finalized`) to ~seconds.
+//!
+//! **Reorg tradeoff (`safe` cutoff):** The `safe` block is not yet
+//! L1-finalized (Casper FFG). A sufficiently deep L1 reorg that drops the
+//! batch transaction before it finalizes could, in principle, cause the L2
+//! block to be reorganized out, invalidating a fill that was ingested against
+//! it. This trades fill-ingestion correctness for latency until full reorg
+//! handling is implemented. In practice, L1 reorgs deep enough to drop a
+//! submitted batch are extremely rare (single-slot reorgs, which are the most
+//! common, do not affect posted batches in the same block). The bot currently
+//! has no reversal path if a fill is invalidated; full cross-chain reorg
+//! handling is tracked separately in the Reorg protection project.
+//!
+//! **Quiet-skew band tradeoff (`safe` cutoff):** When `safe` regresses below
+//! the checkpoint within `SAFE_CUTOFF_QUIET_SKEW` blocks (normal cross-backend
+//! RPC skew on a load-balanced fleet), the checkpoint is left frozen and the
+//! reorged-and-replaced blocks below it are not re-scanned, so any
+//! newly-canonical fills in that range are not ingested. This is consistent
+//! with the no-reversal-path tradeoff above; full reorg handling is tracked
+//! separately in the Reorg protection project.
+//!
+//! Operators who need strict reorg protection at the cost of hedging latency
+//! can set `ingestion_cutoff = "finalized"` in config. `backfill_range` still
+//! surfaces a `removed: true` log as a warning rather than masking it, as
+//! defense in depth.
 
+use std::time::{Duration, Instant};
+
+use alloy::eips::BlockNumberOrTag;
 use alloy::providers::Provider;
-use alloy::providers::ProviderBuilder;
-use alloy::providers::WsConnect;
-use alloy::sol_types;
-use futures_util::{Stream, StreamExt};
-use metrics::counter;
+use alloy::transports::{RpcError, TransportErrorKind};
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
 use task_supervisor::{SupervisedTask, TaskResult};
-use tracing::{debug, error, info, trace, warn};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, info, warn};
 
-use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::onchain::EvmCtx;
+use st0x_config::{EvmCtx, IngestionCutoff};
+
+use crate::conductor::job::QueuePushError;
+use crate::onchain::OnChainError;
 use crate::onchain::backfill::{
-    BackfillJobQueue, BackfillRange, backfill_start_block, save_backfill_checkpoint,
+    BackfillJobQueue, BackfillRange, backfill_start_from_checkpoint, load_backfill_checkpoint,
 };
-use crate::onchain::trade::RaindexTradeEvent;
-use crate::trading::onchain::inclusion::EmittedOnChain;
-use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
+use crate::telemetry::{
+    BlockLagSample, Monitor, prune_expired, record_block_lag, record_poll_cycle,
+};
 
-/// Monitors DEX WebSocket streams and pushes
-/// [`AccountForDexTrade`] jobs into apalis storage.
+/// Polls the orderbook chain for `ClearV3` / `TakeOrderV3` fills on a
+/// fixed interval and enqueues durable [`BackfillRange`] jobs that the
+/// `backfill-worker` processes.
 ///
-/// Implements [`SupervisedTask`] so the supervisor restarts it on
-/// WebSocket disconnection or errors. On every invocation -- first
-/// run and every restart -- the monitor opens a fresh WS subscription,
-/// determines a cutoff block, enqueues a [`BackfillRange`] job for
-/// the gap since the last checkpoint, and then enters the live
-/// listen loop.
+/// Implements [`SupervisedTask`] so the supervisor restarts it on a
+/// panic. Transient errors (RPC blips, a momentarily unreachable node)
+/// are logged and swallowed -- the next tick retries from the same
+/// checkpoint -- so a hiccup never halts ingestion.
 #[derive(Clone)]
-pub(crate) struct OrderFillMonitor {
+pub(crate) struct OrderFillMonitor<P> {
     evm_ctx: EvmCtx,
-    job_queue: DexTradeAccountingJobQueue,
     backfill_queue: BackfillJobQueue,
     pool: SqlitePool,
+    provider: P,
+    poll_interval: Duration,
 }
 
-impl OrderFillMonitor {
+impl<P> OrderFillMonitor<P> {
     pub(crate) fn new(
         evm_ctx: EvmCtx,
-        job_queue: DexTradeAccountingJobQueue,
         backfill_queue: BackfillJobQueue,
         pool: SqlitePool,
+        provider: P,
+        poll_interval: Duration,
     ) -> Self {
         Self {
             evm_ctx,
-            job_queue,
             backfill_queue,
             pool,
+            provider,
+            poll_interval,
         }
     }
 }
 
-impl SupervisedTask for OrderFillMonitor {
+impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMonitor<P> {
     async fn run(&mut self) -> TaskResult {
-        self.connect_and_listen().await
+        info!(
+            target: "orderbook",
+            interval_secs = self.poll_interval.as_secs(),
+            "Order fill monitor started (continuous eth_getLogs polling)"
+        );
+
+        let mut interval = tokio::time::interval(self.poll_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut previous_tick: Option<Instant> = None;
+        let mut last_prune = Instant::now();
+
+        loop {
+            interval.tick().await;
+            let tick = Instant::now();
+            let elapsed = previous_tick.map(|previous| tick.duration_since(previous));
+            let skipped = skipped_ticks(elapsed, self.poll_interval);
+            previous_tick = Some(tick);
+
+            let sampled_at = Utc::now();
+            let result = self.poll_once(sampled_at).await;
+            // Capture elapsed right after poll_once returns: this measures the
+            // poll cycle's work -- including the in-cycle block-lag write
+            // poll_once performs -- while excluding the poll-cycle telemetry
+            // write below, which would otherwise measure itself.
+            let poll_duration = tick.elapsed();
+
+            // The poll-cycle outcome is a success/failure discriminator, so the
+            // structured PollOutcome on the success path is collapsed to `()`.
+            if let Err(error) = record_poll_cycle(
+                &self.pool,
+                Monitor::OrderFill,
+                self.evm_ctx.orderbook,
+                sampled_at,
+                poll_duration,
+                skipped,
+                result.as_ref().map(|_| ()),
+            )
+            .await
+            {
+                warn!(target: "orderbook", ?error, "Failed to record poll-cycle telemetry");
+            }
+
+            if last_prune.elapsed() >= PRUNE_INTERVAL {
+                last_prune = Instant::now();
+                if let Err(error) = prune_expired(&self.pool, Utc::now()).await {
+                    warn!(target: "orderbook", ?error, "Failed to prune expired telemetry");
+                }
+            }
+
+            if let Err(error) = result {
+                warn!(
+                    target: "orderbook",
+                    ?error,
+                    "Order fill poll failed; retrying on next tick"
+                );
+            }
+        }
     }
+}
+
+/// How often expired telemetry rows are pruned.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Ticks silently dropped by [`MissedTickBehavior::Skip`] since the previous
+/// tick: under Skip a slow poll fires nothing for the missed slots, so the
+/// only evidence is the wall-clock gap between consecutive ticks.
+///
+/// The accounting deliberately resets on a supervised restart
+/// (`previous_tick` starts `None`): downtime across restarts shows up as a
+/// gap in the `sampled_at` series rather than a skipped-tick count.
+fn skipped_ticks(elapsed_since_previous_tick: Option<Duration>, poll_interval: Duration) -> u64 {
+    let Some(elapsed) = elapsed_since_previous_tick else {
+        return 0;
+    };
+    let interval_ms = poll_interval.as_millis().max(1);
+    // Round to the nearest interval count to absorb timer jitter; intervals
+    // beyond the first are skips.
+    let elapsed_intervals = (elapsed.as_millis() + interval_ms / 2) / interval_ms;
+    // Clamp at i64::MAX (not u64::MAX) so the value always survives the
+    // storage layer's i64 conversion instead of failing the sample write.
+    // The clamp guarantees capped <= i64::MAX, so i64::try_from succeeds;
+    // unsigned_abs() then yields the equivalent u64 without sign extension.
+    let capped = elapsed_intervals
+        .saturating_sub(1)
+        .min(u128::from(i64::MAX.unsigned_abs()));
+    i64::try_from(capped)
+        .map(i64::unsigned_abs)
+        .unwrap_or(i64::MAX.unsigned_abs())
 }
 
 #[derive(Debug, thiserror::Error)]
 enum OrderFillMonitorError {
-    #[error("{0} event stream closed unexpectedly")]
-    StreamClosed(&'static str),
-    #[error(
-        "received `removed: true` for log past the confirmation depth \
-         (tx_hash={tx_hash:?}, log_index={log_index}, block={block_number}): \
-         a deep reorg crossed `required_confirmations` blocks; review chain stability"
-    )]
-    RemovedPastConfirmations {
-        tx_hash: alloy::primitives::TxHash,
-        log_index: u64,
-        block_number: u64,
-    },
+    #[error("RPC error reading cutoff block: {0}")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
+    #[error(transparent)]
+    OnChain(#[from] OnChainError),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
+    #[error("failed to query backfill job status: {0}")]
+    JobStatus(#[from] apalis_sqlite::SqlxError),
 }
 
-impl OrderFillMonitor {
-    async fn connect_and_listen(&mut self) -> TaskResult {
-        // Production WS URLs (Infura, Alchemy) embed API keys in the
-        // path or query, so log only scheme/host/port.
-        info!(
-            ws_host = %self.evm_ctx.ws_rpc_url.host_str().unwrap_or("<unknown>"),
-            ws_scheme = %self.evm_ctx.ws_rpc_url.scheme(),
-            "Connecting to DEX WebSocket"
-        );
+/// The branch a single [`OrderFillMonitor::poll_once`] tick took. The supervised
+/// run loop discards it (it reacts only to `Err`); it exists so tests can observe
+/// the cutoff decision -- in particular to tell an expected cold-start skip apart
+/// from a checkpoint-backed skip that signals an RPC cutoff anomaly. Those two
+/// share identical side effects (no enqueue, checkpoint frozen), so without a
+/// typed outcome an inverted checkpoint check could not be caught from the
+/// outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    /// A previous backfill range is still in flight; the tick was skipped.
+    RangeInFlight,
+    /// No cutoff block reported and no checkpoint exists yet -- expected
+    /// cold-start lag on a chain where the block tag is not yet available.
+    NoCutoffColdStart,
+    /// No cutoff block reported while a checkpoint exists -- likely a stale
+    /// or load-balanced RPC node; ingestion is paused.
+    NoCutoffWithCheckpoint,
+    /// A backfill range up to the cutoff block was enqueued.
+    Enqueued { from_block: u64, to_block: u64 },
+    /// Ingestion has reached the cutoff block; nothing to enqueue.
+    CaughtUp,
+    /// A `safe` cutoff block is slightly behind the checkpoint within
+    /// `SAFE_CUTOFF_QUIET_SKEW` (normal cross-backend RPC skew). Ingestion
+    /// skips this tick without the full-pause warning, but a `warn` still
+    /// records the regression so possible reorgs remain observable.
+    CutoffWithinQuietSkew,
+    /// The cutoff block is behind committed ingestion progress under `finalized`,
+    /// or significantly behind under `safe` -- a regression that pauses ingestion.
+    CutoffBehindCheckpoint,
+    /// The cutoff has not yet reached the `deployment_block`: either cold start
+    /// (no checkpoint) or a checkpoint at/below the cutoff with `deployment_block`
+    /// configured ahead of it. Nothing to ingest yet; no committed progress is at
+    /// risk.
+    CutoffBehindDeployment,
+}
 
-        let ws = WsConnect::new(self.evm_ctx.ws_rpc_url.as_str());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
-        let orderbook = IOrderBookV6Instance::new(self.evm_ctx.orderbook, &provider);
+/// Maximum backwards deviation from the checkpoint that is tolerated quietly
+/// under the `safe` cutoff. Cross-backend RPC skew on a load-balanced fleet
+/// (e.g. dRPC on Base) can cause `safe` to momentarily report below the
+/// checkpoint by a handful of blocks when consecutive reads land on backends
+/// at different heads.
+///
+/// 32 is a conservative band chosen to absorb normal cross-backend skew
+/// (typically a few blocks) while staying far below a finality-scale
+/// regression that would indicate a real reorg or persistent RPC anomaly.
+/// The exact value is a deliberate estimate pending measured Base `safe`-tag
+/// skew data from the deployment fleet; it will be revised once measurements
+/// are available. Under `finalized`, finality lag is hundreds of blocks, so
+/// any cutoff < checkpoint is a meaningful regression worth a warning.
+const SAFE_CUTOFF_QUIET_SKEW: u64 = 32;
 
-        let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-        let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
-
-        self.prepare_and_listen(&provider, &mut clear_stream, &mut take_stream)
-            .await
+/// Converts the configured ingestion cutoff to the alloy `BlockNumberOrTag`
+/// used in RPC calls. Factored out so adding a new `IngestionCutoff` variant
+/// produces a single compile error rather than two.
+fn cutoff_block_tag(cutoff: IngestionCutoff) -> BlockNumberOrTag {
+    match cutoff {
+        IngestionCutoff::Safe => BlockNumberOrTag::Safe,
+        IngestionCutoff::Finalized => BlockNumberOrTag::Finalized,
     }
+}
 
-    /// Enqueues a `BackfillRange` job for the gap between the last
-    /// checkpoint and the confirmation boundary, then enters the live
-    /// listen loop. Backfill is enqueued before any awaitable work
-    /// that could be preempted so that the job is durably persisted
-    /// even if the supervisor or runtime aborts the task mid-startup.
-    /// Split out so unit tests can drive the post-subscribe path with
-    /// mocked streams.
-    async fn prepare_and_listen<P, ClearEvents, TakeOrderEvents>(
+impl<P: Provider + Clone> OrderFillMonitor<P> {
+    /// One poll iteration: enqueue a backfill range for the unprocessed
+    /// blocks up to the latest cutoff block, unless a previous range
+    /// is still in flight or there is nothing new to fetch.
+    async fn poll_once(
         &mut self,
-        provider: &P,
-        clear_stream: &mut ClearEvents,
-        take_stream: &mut TakeOrderEvents,
-    ) -> TaskResult
-    where
-        P: Provider + Clone,
-        ClearEvents:
-            Stream<Item = Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
-        TakeOrderEvents:
-            Stream<Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
-    {
-        // Cutoff is the latest confirmed block at (re)connect time:
-        // events at or before this block are caught by backfill (which
-        // is guaranteed not to ingest logs above the confirmation
-        // boundary), events after it are caught by the live stream's
-        // buffer (which defers persistence until the same confirmation
-        // depth). The two ranges may overlap at the boundary;
-        // downstream dedupes by (tx_hash, log_index).
-        let cutoff_block = latest_confirmed_block(provider, self.evm_ctx.required_confirmations)
-            .await?
-            .unwrap_or(0);
-        let from_block = backfill_start_block(&self.pool, &self.evm_ctx).await?;
+        sampled_at: DateTime<Utc>,
+    ) -> Result<PollOutcome, OrderFillMonitorError> {
+        let cutoff_tag = cutoff_block_tag(self.evm_ctx.ingestion_cutoff);
+
+        // Read the chain tip and latest cutoff block up front, before the
+        // overlap guard, so the block-lag sample is recorded even while a
+        // backfill is still in flight -- a long catch-up (or a stuck backfill)
+        // is exactly when growing lag must stay observable. The cutoff block
+        // read here is also the ingestion boundary used below.
+        let chain_tip = self.provider.get_block_number().await?;
+        let cutoff_opt = latest_cutoff_block(&self.provider, cutoff_tag).await?;
+
+        // Block-lag telemetry is best-effort: a failed sample must never fail
+        // the poll. Lag is measured against the cutoff block -- the real
+        // ingestion boundary -- so a caught-up system reads zero rather than a
+        // permanent floor. A null cutoff block records as 0, which saturates
+        // lag to 0.
+        let sampled_checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
+        let sample = BlockLagSample {
+            sampled_at,
+            orderbook: self.evm_ctx.orderbook,
+            chain_tip,
+            cutoff_block: cutoff_opt.unwrap_or(0),
+            last_processed_block: sampled_checkpoint,
+        };
+        if let Err(error) = record_block_lag(&self.pool, &sample).await {
+            warn!(target: "orderbook", ?error, "Failed to record block-lag telemetry");
+        }
+
+        // Overlap guard: while a previous range is still being processed
+        // the checkpoint has not advanced, so a fresh enqueue would
+        // re-scan the same blocks. During a long catch-up this would
+        // otherwise stack one growing range per tick.
+        if self.backfill_queue.has_in_flight().await? {
+            debug!(
+                target: "orderbook",
+                "Skipping poll: a backfill range is still in flight"
+            );
+            return Ok(PollOutcome::RangeInFlight);
+        }
+
+        // Re-read the checkpoint now that the guard has passed: an in-flight job
+        // may have completed (advancing the checkpoint) between the telemetry
+        // read above and the guard, and deriving the range from the stale value
+        // would re-scan blocks that job just processed. This single post-guard
+        // read is the source for both the null-cutoff branch and the range
+        // derivation, keeping those decisions consistent (no intra-tick TOCTOU).
+        let checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
+
+        // Cutoff is the chain's latest block for the configured tag. `None`
+        // means the node has not yet surfaced this block tag (e.g. cold start on
+        // a chain where the tag is not yet available); there is nothing safe to
+        // ingest, so skip the tick.
+        let Some(cutoff_block) = cutoff_opt else {
+            // No cutoff block reported. Once a checkpoint exists the tag was
+            // available before, so a null response is likely an RPC problem worth
+            // a warning -- ingestion stalls until it clears. At cold start it is
+            // expected, so stay quiet.
+            if checkpoint.is_some() {
+                warn!(
+                    target: "orderbook",
+                    "No cutoff block reported while a checkpoint exists; the RPC \
+                     node may be returning a stale response for the configured tag. \
+                     Ingestion paused this tick"
+                );
+                return Ok(PollOutcome::NoCutoffWithCheckpoint);
+            }
+
+            // Cold start: no checkpoint means ingestion has never run, so
+            // the tag being absent is expected and transient. The startup
+            // probe (`probe_cutoff_block_support`) already emits a one-time
+            // warn if the endpoint persistently returns null, so a persistent
+            // unsupported endpoint is not silent. Stay quiet here.
+            let cutoff = self.evm_ctx.ingestion_cutoff;
+            debug!(
+                target: "orderbook",
+                %cutoff,
+                "No cutoff block at cold start; expected briefly -- startup \
+                 probe already surfaced a persistent null"
+            );
+            return Ok(PollOutcome::NoCutoffColdStart);
+        };
+
+        let from_block = backfill_start_from_checkpoint(checkpoint, self.evm_ctx.deployment_block);
 
         if from_block <= cutoff_block {
             info!(
+                target: "orderbook",
                 from_block,
                 cutoff_block,
-                required_confirmations = self.evm_ctx.required_confirmations,
-                "Enqueuing backfill range for missed events on (re)connect"
+                "Enqueuing order-fill backfill range up to the cutoff block"
             );
 
             self.backfill_queue
@@ -170,1026 +395,1299 @@ impl OrderFillMonitor {
                     to_block: cutoff_block,
                 })
                 .await?;
-        } else {
-            debug!(
+
+            return Ok(PollOutcome::Enqueued {
                 from_block,
-                cutoff_block, "Already caught up on (re)connect; skipping backfill enqueue"
-            );
+                to_block: cutoff_block,
+            });
         }
 
-        self.listen(clear_stream, take_stream).await
-    }
-}
+        // Nothing to ingest this tick: the next block is past the cutoff.
+        // Classify why from committed progress (the checkpoint), not from
+        // `from_block` -- the `deployment_block` floor can push `from_block`
+        // past the cutoff even when the checkpoint is well behind it, so
+        // branching on `from_block` would misreport that config case as a
+        // cutoff regression.
+        match checkpoint {
+            // Committed progress is past the cutoff block. Under `finalized`,
+            // any such regression is an RPC anomaly worth a warning (finality
+            // lag is hundreds of blocks, dwarfing any cross-backend skew).
+            // Under `safe`, small backwards steps (within SAFE_CUTOFF_QUIET_SKEW
+            // blocks) are the on-chain signature of either benign cross-backend
+            // RPC skew on a load-balanced fleet OR a small reorg. Either way,
+            // ingestion skips this tick without pausing the monitor. "Quiet"
+            // means "do not pause ingestion", NOT "do not log" -- the regression
+            // is surfaced at warn with magnitude so an in-band reorg is
+            // observable. The regressed range below the frozen checkpoint is
+            // not re-scanned (no reversal path). Larger regressions still warn
+            // via the shared warn! below and pause ingestion.
+            Some(checkpoint) if checkpoint > cutoff_block => {
+                let regression = checkpoint - cutoff_block;
+                let is_safe = match self.evm_ctx.ingestion_cutoff {
+                    IngestionCutoff::Safe => true,
+                    IngestionCutoff::Finalized => false,
+                };
 
-/// Latest block past the configured confirmation depth:
-/// `latest_tip - required_confirmations`. Returns `None` when the chain has
-/// fewer blocks than the requested confirmation depth (no block is
-/// safe to ingest yet). This is a naive reorg-protection heuristic,
-/// not real chain finality.
-pub(crate) async fn latest_confirmed_block<P: Provider>(
-    provider: &P,
-    required_confirmations: u64,
-) -> Result<Option<u64>, alloy::transports::RpcError<alloy::transports::TransportErrorKind>> {
-    let tip = provider.get_block_number().await?;
-    Ok(tip.checked_sub(required_confirmations))
-}
-
-/// Tracks the highest block observed on each WS subscription so the
-/// checkpoint only advances past blocks that both streams have
-/// crossed *and* that are behind the confirmation boundary. `listen()`
-/// merges two unordered subscriptions; advancing solely from the
-/// latest event on one stream would risk skipping straggling events
-/// on the other stream when a future backfill resumes from
-/// `checkpoint+1`.
-#[derive(Default)]
-struct StreamWatermarks {
-    clear_high: Option<u64>,
-    take_high: Option<u64>,
-}
-
-impl StreamWatermarks {
-    fn observe(&mut self, event: &RaindexTradeEvent, block: u64) {
-        let slot = match event {
-            RaindexTradeEvent::ClearV3(_) => &mut self.clear_high,
-            RaindexTradeEvent::TakeOrderV3(_) => &mut self.take_high,
-        };
-        *slot = Some(slot.map_or(block, |existing| existing.max(block)));
-    }
-
-    /// The highest block both streams have provably crossed (returns
-    /// `None` until at least one event has been observed on each
-    /// stream). Caller intersects this with the confirmation boundary.
-    fn observed_on_both(&self) -> Option<u64> {
-        self.clear_high
-            .zip(self.take_high)
-            .map(|(clear, take)| clear.min(take))
-    }
-
-    /// The highest block observed on *any* stream so far. Used as the
-    /// "tip" estimate for the buffer-flush confirmation check, since live
-    /// events implicitly tell us the chain head has at least reached
-    /// their block number.
-    fn highest_observed(&self) -> Option<u64> {
-        match (self.clear_high, self.take_high) {
-            (Some(clear), Some(take)) => Some(clear.max(take)),
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        }
-    }
-}
-
-/// In-memory buffer of events emitted by the live WS subscription
-/// that have not yet reached `required_confirmations` blocks behind the
-/// tip.
-///
-/// Ordering by `(block_number, log_index)` lets us cheaply drain the
-/// prefix of entries whose block is at or below the confirmation
-/// boundary on every iteration. The buffer is local to the running
-/// monitor task; on supervisor restart it's dropped, but reconnect-time
-/// backfill (which also caps at the confirmation boundary) recovers
-/// any unflushed events whose blocks have since cleared the
-/// confirmation depth.
-#[derive(Default)]
-struct LiveEventBuffer {
-    entries: BTreeMap<(u64, u64), EmittedOnChain<RaindexTradeEvent>>,
-}
-
-impl LiveEventBuffer {
-    fn insert(&mut self, event: EmittedOnChain<RaindexTradeEvent>) {
-        self.entries
-            .insert((event.block_number, event.log_index), event);
-    }
-
-    /// Remove a buffered entry if present. Returns whether removal
-    /// happened, so the caller can distinguish "reverted before
-    /// confirmation depth reached" from "reverted after confirmation
-    /// depth reached" (the latter is an error our design should
-    /// prevent under the assumed reorg depth).
-    fn remove(&mut self, block_number: u64, log_index: u64) -> bool {
-        self.entries.remove(&(block_number, log_index)).is_some()
-    }
-
-    /// Drain all entries with `block_number <= boundary`. Returned
-    /// entries are ordered by `(block_number, log_index)`.
-    fn drain_through(&mut self, boundary: u64) -> Vec<EmittedOnChain<RaindexTradeEvent>> {
-        let keep = self.entries.split_off(&(boundary + 1, 0));
-        let drained = std::mem::replace(&mut self.entries, keep);
-        drained.into_values().collect()
-    }
-}
-
-impl OrderFillMonitor {
-    async fn listen<ClearEvents, TakeOrderEvents>(
-        &mut self,
-        clear_stream: &mut ClearEvents,
-        take_stream: &mut TakeOrderEvents,
-    ) -> TaskResult
-    where
-        ClearEvents:
-            Stream<Item = Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
-        TakeOrderEvents:
-            Stream<Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
-    {
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-        loop {
-            let (event, log) = tokio::select! {
-                item = clear_stream.next() => {
-                    let Some(result) = item else {
-                        error!("ClearV3 event stream closed unexpectedly");
-                        return Err(OrderFillMonitorError::StreamClosed("ClearV3").into());
-                    };
-                    let (event, log) = result?;
-                    (RaindexTradeEvent::ClearV3(Box::new(event)), log)
+                if is_safe && regression <= SAFE_CUTOFF_QUIET_SKEW {
+                    // Safe cutoff stepped backwards within the quiet-skew
+                    // window. May be benign cross-backend RPC skew or a small
+                    // reorg. Ingestion skips this tick; the regressed range is
+                    // not re-scanned (no reversal path).
+                    warn!(
+                        target: "orderbook",
+                        checkpoint,
+                        cutoff_block,
+                        regression,
+                        "Safe cutoff block stepped backwards below checkpoint \
+                         (may be RPC skew or small reorg); skipping tick without \
+                         re-scanning the regressed range"
+                    );
+                    return Ok(PollOutcome::CutoffWithinQuietSkew);
                 }
 
-                item = take_stream.next() => {
-                    let Some(result) = item else {
-                        error!("TakeOrderV3 event stream closed unexpectedly");
-                        return Err(OrderFillMonitorError::StreamClosed("TakeOrderV3").into());
-                    };
-                    let (event, log) = result?;
-                    (RaindexTradeEvent::TakeOrderV3(Box::new(event)), log)
-                }
-            };
-
-            let event_type = match &event {
-                RaindexTradeEvent::ClearV3(_) => "clear",
-                RaindexTradeEvent::TakeOrderV3(_) => "take_order",
-            };
-            counter!("onchain_events_total", "event_type" => event_type).increment(1);
-
-            self.handle_log(event, &log, &mut watermarks, &mut buffer)
-                .await?;
-        }
-    }
-
-    /// Handles one log delivered by the live WS subscription:
-    /// observes the watermark, branches on `log.removed`, buffers
-    /// otherwise, and flushes the buffer up to the current
-    /// confirmation boundary derived from the highest observed tip.
-    async fn handle_log(
-        &mut self,
-        event: RaindexTradeEvent,
-        log: &alloy::rpc::types::Log,
-        watermarks: &mut StreamWatermarks,
-        buffer: &mut LiveEventBuffer,
-    ) -> TaskResult {
-        let trade_event = match EmittedOnChain::<RaindexTradeEvent>::from_log(event, log) {
-            Ok(trade_event) => trade_event,
-            Err(err) => {
-                warn!(target: "hedge", %err, "Failed to extract block inclusion metadata from log");
-                return Ok(());
+                warn!(
+                    target: "orderbook",
+                    checkpoint,
+                    cutoff_block,
+                    "Cutoff block is behind committed ingestion progress; ingestion \
+                     paused until the cutoff advances. Expected briefly after \
+                     upgrading from the finalized to safe cutoff; if it persists \
+                     the RPC node may be returning stale data"
+                );
+                Ok(PollOutcome::CutoffBehindCheckpoint)
             }
-        };
-
-        if log.removed {
-            return self.handle_removed(&trade_event, buffer);
+            // The checkpoint has reached the cutoff block; nothing new yet.
+            Some(_) if from_block == cutoff_block.saturating_add(1) => {
+                debug!(
+                    target: "orderbook",
+                    from_block,
+                    cutoff_block,
+                    "Caught up; nothing to enqueue this tick"
+                );
+                Ok(PollOutcome::CaughtUp)
+            }
+            // Either cold start (no checkpoint) or a checkpoint at/below the
+            // cutoff with `deployment_block` configured ahead of it: both are
+            // simply waiting for the cutoff to reach the deployment block, with
+            // no committed progress at risk. Expected, so stay quiet.
+            _ => {
+                debug!(
+                    target: "orderbook",
+                    from_block,
+                    cutoff_block,
+                    "Cutoff has not yet reached the deployment block; nothing to \
+                     ingest this tick"
+                );
+                Ok(PollOutcome::CutoffBehindDeployment)
+            }
         }
+    }
+}
 
-        watermarks.observe(&trade_event.event, trade_event.block_number);
+/// The block number for the given block tag, or `None` when the node has not
+/// yet surfaced that tag (e.g. a fresh chain or a cold-start race).
+///
+/// Relies on the Ethereum execution-API JSON-RPC convention that
+/// `eth_getBlockByNumber` returns a `null` result (not an error) for a tag it
+/// cannot resolve yet -- which alloy maps to `Ok(None)`. A node that instead
+/// errors (unsupported method, wrong-network proxy) surfaces as `Err`, which
+/// [`probe_cutoff_block_support`] rejects at startup and `poll_once` treats as
+/// a transient RPC failure (checkpoint frozen, retried next tick).
+pub(crate) async fn latest_cutoff_block<P: Provider>(
+    provider: &P,
+    tag: BlockNumberOrTag,
+) -> Result<Option<u64>, RpcError<TransportErrorKind>> {
+    Ok(provider
+        .get_block_by_number(tag)
+        .await?
+        .map(|block| block.header.number))
+}
 
-        trace!(
-            target: "hedge",
-            tx_hash = ?trade_event.tx_hash,
-            log_index = trade_event.log_index,
-            block_number = trade_event.block_number,
-            "Buffering trade event pending confirmation depth"
+/// The outcome of [`probe_cutoff_block_support`]. Returned so
+/// [`crate::conductor`]'s startup decision and tests can observe which state the
+/// endpoint is in. An `Err` from the probe is always fatal at the conductor.
+/// [`CutoffProbe::NotYetAvailable`] is the only non-fatal soft signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutoffProbe {
+    /// The endpoint returned a usable block for the configured cutoff tag.
+    Supported,
+    /// The endpoint returned no block for this tag yet (null response) --
+    /// valid at cold start; ingestion is deferred until the tag is available.
+    NotYetAvailable,
+}
+
+/// Error returned by [`probe_cutoff_block_support`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CutoffProbeError {
+    /// RPC transport failure probing the cutoff block tag.
+    #[error("RPC error probing cutoff block tag: {0}")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
+    /// The `finalized` block tag is at or beyond the chain tip, indicating the
+    /// endpoint aliases `finalized` to `latest` and silently disables reorg
+    /// protection.
+    #[error(
+        "finalized block ({cutoff_block}) at or beyond chain tip ({chain_tip}); \
+         endpoint likely aliases `finalized` to `latest`"
+    )]
+    FinalizedAliasesChainTip { cutoff_block: u64, chain_tip: u64 },
+}
+
+/// Verifies at startup that the RPC endpoint can serve the configured cutoff
+/// block tag, so a misconfigured endpoint surfaces at boot instead of letting
+/// the bot run silently degraded.
+///
+/// For `Safe`: confirms the endpoint returns a non-null, non-error response for
+/// the `safe` tag. No aliasing check -- `safe` legitimately reaches or exceeds
+/// the chain tip when the sequencer batch cadence is fast, so a near-tip value
+/// is expected, not an error. The probe only verifies tag support.
+///
+/// For `Finalized`: additionally checks that `finalized < chain_tip`. If
+/// `finalized >= chain_tip` the endpoint is likely aliasing `finalized` to
+/// `latest`, which would silently disable reorg protection. This case is fatal
+/// at the conductor (returned as `Err`). The comparison assumes finality lag
+/// (~hundreds of blocks on Base) dwarfs any cross-backend skew; the caller
+/// passes the tip it read just before this probe so the comparison uses a
+/// consistent read pair.
+///
+/// Outcomes:
+/// - `Err`: RPC error (unsupported method, wrong-network proxy) or detected
+///   `finalized` aliasing -- both are fatal at the conductor.
+/// - `Ok(NotYetAvailable)`: tag not yet available (null response); logged and
+///   allowed through so a fresh chain does not fail startup.
+/// - `Ok(Supported)`: endpoint supports the tag.
+pub(crate) async fn probe_cutoff_block_support<P: Provider>(
+    provider: &P,
+    chain_tip: u64,
+    cutoff: IngestionCutoff,
+) -> Result<CutoffProbe, CutoffProbeError> {
+    let tag = cutoff_block_tag(cutoff);
+
+    let Some(cutoff_block) = latest_cutoff_block(provider, tag).await? else {
+        warn!(
+            target: "orderbook",
+            %cutoff,
+            "RPC endpoint reports no {cutoff} block at startup; order-fill \
+             ingestion will not begin until the endpoint exposes it",
         );
+        return Ok(CutoffProbe::NotYetAvailable);
+    };
 
-        buffer.insert(trade_event);
-
-        self.flush_buffer(buffer, watermarks).await
+    // Only check aliasing for `finalized`: on `finalized`, a value at or
+    // beyond the tip is only possible if the endpoint aliases the tag to
+    // `latest`, disabling reorg protection. On `safe`, the cutoff can
+    // legitimately reach or slightly exceed the tip (fast sequencer batching),
+    // so this check would false-positive on startup.
+    let check_aliasing = match cutoff {
+        IngestionCutoff::Safe => false,
+        IngestionCutoff::Finalized => true,
+    };
+    if check_aliasing && cutoff_block >= chain_tip {
+        return Err(CutoffProbeError::FinalizedAliasesChainTip {
+            cutoff_block,
+            chain_tip,
+        });
     }
 
-    /// Handles a removed log. If the event is still buffered (i.e.,
-    /// reverted before reaching the configured confirmation depth),
-    /// drop it and log info -- the system never persisted it, so no
-    /// follow-up is needed.
-    ///
-    /// If the event is not in the buffer, it was already flushed and
-    /// downstream jobs have run against it. Our confirmation gate
-    /// should make this impossible under the assumed reorg depth; emit
-    /// a loud error tagged with the identifying metadata so the
-    /// deep-reorg case is visible to operators and is surfaced as an
-    /// error rather than silently consumed.
-    fn handle_removed(
-        &self,
-        trade_event: &EmittedOnChain<RaindexTradeEvent>,
-        buffer: &mut LiveEventBuffer,
-    ) -> TaskResult {
-        if buffer.remove(trade_event.block_number, trade_event.log_index) {
-            info!(
-                target: "hedge",
-                tx_hash = ?trade_event.tx_hash,
-                log_index = trade_event.log_index,
-                block_number = trade_event.block_number,
-                "Discarded reverted trade event before persistence (confirmation buffer absorbed reorg)"
-            );
-            return Ok(());
-        }
-
-        error!(
-            target: "hedge",
-            tx_hash = ?trade_event.tx_hash,
-            log_index = trade_event.log_index,
-            block_number = trade_event.block_number,
-            confirmations = self.evm_ctx.required_confirmations,
-            "Received `removed: true` for an already-confirmed trade event -- \
-             deep reorg crossed the confirmation depth"
-        );
-        Err(OrderFillMonitorError::RemovedPastConfirmations {
-            tx_hash: trade_event.tx_hash,
-            log_index: trade_event.log_index,
-            block_number: trade_event.block_number,
-        }
-        .into())
-    }
-
-    /// Flush any buffered events whose blocks are at or below the
-    /// confirmation boundary `highest_observed - confirmations`. Each
-    /// flushed event is pushed to the trade-accounting queue, and the
-    /// backfill checkpoint advances to the highest block that is both
-    /// past the confirmation depth *and* has been observed on both
-    /// subscriptions.
-    async fn flush_buffer(
-        &mut self,
-        buffer: &mut LiveEventBuffer,
-        watermarks: &StreamWatermarks,
-    ) -> TaskResult {
-        let Some(tip) = watermarks.highest_observed() else {
-            trace!(
-                target: "hedge",
-                "Skipping buffer flush: no highest_observed watermark yet"
-            );
-            return Ok(());
-        };
-        let Some(confirmation_boundary) = tip.checked_sub(self.evm_ctx.required_confirmations)
-        else {
-            trace!(
-                target: "hedge",
-                tip,
-                required_confirmations = self.evm_ctx.required_confirmations,
-                "Skipping buffer flush: tip too small for required_confirmations"
-            );
-            return Ok(());
-        };
-
-        let ready = buffer.drain_through(confirmation_boundary);
-        if ready.is_empty() {
-            return Ok(());
-        }
-
-        for trade_event in ready {
-            trace!(
-                target: "hedge",
-                tx_hash = ?trade_event.tx_hash,
-                log_index = trade_event.log_index,
-                block_number = trade_event.block_number,
-                "Flushing confirmed trade event to accounting queue"
-            );
-            self.job_queue
-                .push(AccountForDexTrade { trade: trade_event })
-                .await?;
-        }
-
-        // Apalis storage now durably owns flushed events. Advance the
-        // checkpoint to the highest block that is both past the
-        // confirmation depth and crossed by both streams -- the
-        // monotonic guard intersected with the confirmation boundary.
-        let Some(both_streams) = watermarks.observed_on_both() else {
-            trace!(
-                target: "hedge",
-                clear_high = ?watermarks.clear_high,
-                take_high = ?watermarks.take_high,
-                confirmation_boundary,
-                "Deferring checkpoint advance: only one stream observed so far"
-            );
-            return Ok(());
-        };
-        let advance_to = both_streams.min(confirmation_boundary);
-        if let Some(checkpoint) = advance_to.checked_sub(1) {
-            save_backfill_checkpoint(&self.pool, &self.evm_ctx, checkpoint).await?;
-        }
-
-        Ok(())
-    }
+    Ok(CutoffProbe::Supported)
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address};
-    use futures_util::stream;
-    use sqlx::SqlitePool;
+    use alloy::primitives::address;
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::rpc::types::{Block, Transaction};
+    use serde_json::Value;
+    use sqlx::{ConnectOptions, SqlitePool};
 
     use super::*;
-    use crate::bindings::IOrderBookV6::{ClearConfigV2, TakeOrderConfigV4};
-    use crate::conductor::setup_apalis_tables;
-    use crate::test_utils::{create_log, get_test_order, setup_test_db};
+    use crate::test_utils::setup_test_pools;
 
-    async fn job_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
-            .fetch_one(pool)
+    /// Builds a mock block at `number` for use in mock provider responses.
+    fn finalized_at(number: u64) -> Block {
+        let mut block = Block::<Transaction>::default();
+        block.header.inner.number = number;
+        block
+    }
+
+    /// Single cutoff-block read, for [`probe_cutoff_block_support`] tests
+    /// (the probe reads only the cutoff block; the tip is passed in).
+    fn provider_with_cutoff(number: u64) -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        asserter.push_success(&finalized_at(number));
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    /// A provider whose node reports no cutoff block yet (null response),
+    /// for [`probe_cutoff_block_support`] tests (single cutoff read).
+    fn provider_without_cutoff() -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        asserter.push_success(&Value::Null);
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    /// Queues the two RPC responses a single `poll_once` tick reads, in order:
+    /// `eth_blockNumber` (the chain tip) then `eth_getBlockByNumber(<tag>)`.
+    /// `cutoff: None` queues a JSON null -- a node reporting the tag is not
+    /// yet available.
+    fn push_tick(asserter: &Asserter, chain_tip: u64, cutoff: Option<u64>) {
+        asserter.push_success(&Value::from(chain_tip));
+        match cutoff {
+            Some(number) => asserter.push_success(&finalized_at(number)),
+            None => asserter.push_success(&Value::Null),
+        }
+    }
+
+    /// Mock provider answering a single `poll_once` tick: chain tip `chain_tip`
+    /// then cutoff block `cutoff`.
+    fn provider_at(chain_tip: u64, cutoff: u64) -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        push_tick(&asserter, chain_tip, Some(cutoff));
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    async fn backfill_job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
+    }
+
+    async fn setup<P>(
+        provider: P,
+    ) -> (
+        OrderFillMonitor<P>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+        EvmCtx,
+    ) {
+        setup_with_deployment_block(provider, 1).await
+    }
+
+    async fn setup_with_deployment_block<P>(
+        provider: P,
+        deployment_block: u64,
+    ) -> (
+        OrderFillMonitor<P>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+        EvmCtx,
+    ) {
+        setup_with_deployment_block_and_cutoff(provider, deployment_block, IngestionCutoff::Safe)
             .await
-            .unwrap()
     }
 
-    async fn create_test_monitor_with_pool() -> (OrderFillMonitor, SqlitePool, EvmCtx) {
-        create_test_monitor_with_confirmations(0).await
-    }
-
-    async fn create_test_monitor_with_confirmations(
-        required_confirmations: u64,
-    ) -> (OrderFillMonitor, SqlitePool, EvmCtx) {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
-        let job_queue = DexTradeAccountingJobQueue::new(&pool);
-        let backfill_queue = BackfillJobQueue::new(&pool);
+    async fn setup_with_deployment_block_and_cutoff<P>(
+        provider: P,
+        deployment_block: u64,
+        ingestion_cutoff: IngestionCutoff,
+    ) -> (
+        OrderFillMonitor<P>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+        EvmCtx,
+    ) {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
         let evm_ctx = EvmCtx {
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
-            orderbook: Address::ZERO,
-            deployment_block: 1,
-            required_confirmations,
+            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block,
+            required_confirmations: 0,
+            ingestion_cutoff,
         };
 
-        let monitor =
-            OrderFillMonitor::new(evm_ctx.clone(), job_queue, backfill_queue, pool.clone());
+        let monitor = OrderFillMonitor::new(
+            evm_ctx.clone(),
+            backfill_queue,
+            pool.clone(),
+            provider,
+            Duration::from_secs(5),
+        );
 
-        (monitor, pool, evm_ctx)
+        (monitor, pool, apalis_pool, evm_ctx)
     }
 
-    fn test_clear_event() -> ClearV3 {
-        ClearV3 {
-            sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: get_test_order(),
-            bob: get_test_order(),
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: alloy::primitives::B256::ZERO,
-                bobBountyVaultId: alloy::primitives::B256::ZERO,
-            },
-        }
-    }
-
-    fn test_take_event() -> TakeOrderV3 {
-        TakeOrderV3 {
-            sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
-        }
-    }
-
-    fn log_at_block(block_number: u64) -> alloy::rpc::types::Log {
-        log_at_block_with_index(block_number, 0, false)
-    }
-
-    fn log_at_block_with_index(
-        block_number: u64,
-        log_index: u64,
-        removed: bool,
-    ) -> alloy::rpc::types::Log {
-        alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: Address::ZERO,
-                data: alloy::primitives::LogData::empty(),
-            },
-            block_hash: None,
-            block_number: Some(block_number),
-            block_timestamp: None,
-            transaction_hash: Some(alloy::primitives::B256::ZERO),
-            transaction_index: None,
-            log_index: Some(log_index),
-            removed,
-        }
+    async fn loaded_backfill(apalis_pool: &apalis_sqlite::SqlitePool) -> BackfillRange {
+        let job_payload = sqlx_apalis::query_scalar::<_, Vec<u8>>(
+            "SELECT job FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap();
+        serde_json::from_slice(&job_payload).unwrap()
     }
 
     #[tokio::test]
-    async fn listen_enqueues_clear_event() {
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
-        let log = create_log(0);
-
-        let mut clear_stream = stream::iter(vec![Ok((test_clear_event(), log))]);
-        let mut take_stream =
-            stream::pending::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
-
-        let _result = monitor.listen(&mut clear_stream, &mut take_stream).await;
-
-        assert_eq!(job_count(&pool).await, 1);
-    }
-
-    #[tokio::test]
-    async fn listen_enqueues_take_event() {
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
-        let log = create_log(1);
-
-        let mut clear_stream =
-            stream::pending::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let mut take_stream = stream::iter(vec![Ok((test_take_event(), log))]);
-
-        let _result = monitor.listen(&mut clear_stream, &mut take_stream).await;
-
-        assert_eq!(job_count(&pool).await, 1);
-    }
-
-    #[tokio::test]
-    async fn listen_returns_error_when_both_streams_empty() {
-        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_pool().await;
-
-        let mut clear_stream =
-            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let mut take_stream =
-            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
-
-        let result = monitor.listen(&mut clear_stream, &mut take_stream).await;
-
-        let error = result
-            .unwrap_err()
-            .downcast::<OrderFillMonitorError>()
-            .expect("expected OrderFillMonitorError");
-        assert!(matches!(*error, OrderFillMonitorError::StreamClosed(_)));
-    }
-
-    #[tokio::test]
-    async fn listen_returns_error_when_clear_stream_closes() {
-        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_pool().await;
-
-        let mut clear_stream =
-            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let mut take_stream = stream::pending();
-
-        let result = monitor.listen(&mut clear_stream, &mut take_stream).await;
-
-        let error = result
-            .unwrap_err()
-            .downcast::<OrderFillMonitorError>()
-            .expect("expected OrderFillMonitorError");
-        assert!(matches!(
-            *error,
-            OrderFillMonitorError::StreamClosed("ClearV3")
-        ));
-    }
-
-    #[tokio::test]
-    async fn listen_returns_error_when_take_stream_closes() {
-        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_pool().await;
-
-        let mut clear_stream = stream::pending();
-        let mut take_stream =
-            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
-
-        let result = monitor.listen(&mut clear_stream, &mut take_stream).await;
-
-        let error = result
-            .unwrap_err()
-            .downcast::<OrderFillMonitorError>()
-            .expect("expected OrderFillMonitorError");
-        assert!(matches!(
-            *error,
-            OrderFillMonitorError::StreamClosed("TakeOrderV3")
-        ));
-    }
-
-    #[tokio::test]
-    async fn handle_log_persists_to_storage() {
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
-        let log = create_log(42);
-        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        monitor
-            .handle_log(event, &log, &mut watermarks, &mut buffer)
+    async fn poll_once_enqueues_range_up_to_cutoff_block() {
+        // checkpoint=99, cutoff=102 -> from=100, cutoff=102.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(110, 102)).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
             .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::Enqueued {
+                from_block: 100,
+                to_block: 102
+            }
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 1);
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
+        assert_eq!(job.to_block, 102, "cutoff must equal the cutoff block");
     }
 
     #[tokio::test]
-    async fn handle_log_survives_invalid_log() {
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
+    async fn poll_once_uses_deployment_block_without_checkpoint() {
+        // No checkpoint: from_block falls back to deployment_block (1).
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at(55, 50)).await;
 
-        let invalid_log = alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: Address::ZERO,
-                data: alloy::primitives::LogData::empty(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: None,
-            transaction_index: None,
-            log_index: None,
-            removed: false,
-        };
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
-        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
+        assert_eq!(
+            outcome,
+            PollOutcome::Enqueued {
+                from_block: 1,
+                to_block: 50
+            }
+        );
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 1, "first run resumes from deployment_block");
+        assert_eq!(job.to_block, 50);
+    }
 
-        monitor
-            .handle_log(event, &invalid_log, &mut watermarks, &mut buffer)
+    #[tokio::test]
+    async fn poll_once_skips_when_caught_up() {
+        // checkpoint=102, cutoff=102 -> from=103 > cutoff.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(110, 102)).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
             .await
             .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0, "Invalid log should not persist");
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(outcome, PollOutcome::CaughtUp);
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "nothing to enqueue when the checkpoint has reached the cutoff block"
+        );
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
-    async fn listen_processes_events_from_both_streams() {
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
-
-        let clear_log = create_log(0);
-        let take_log = create_log(1);
-
-        let mut clear_stream =
-            stream::iter(vec![Ok((test_clear_event(), clear_log))]).chain(stream::pending());
-        let mut take_stream =
-            stream::iter(vec![Ok((test_take_event(), take_log))]).chain(stream::pending());
-
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            monitor.listen(&mut clear_stream, &mut take_stream),
+    async fn poll_once_pauses_when_finalized_cutoff_far_behind_checkpoint() {
+        // A load-balanced RPC returns a finalized block (150) far below the
+        // already-persisted checkpoint (200). Under `finalized`, any regression
+        // is significant and must pause with a warning.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(205, 150),
+            1,
+            IngestionCutoff::Finalized,
         )
         .await;
-
-        assert_eq!(job_count(&pool).await, 2);
-    }
-
-    #[tokio::test]
-    async fn handle_log_does_not_advance_until_both_streams_observed() {
-        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
-        let log = log_at_block(100);
-        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        monitor
-            .handle_log(event, &log, &mut watermarks, &mut buffer)
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
             .await
             .unwrap();
 
-        let checkpoint = crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
-            .await
-            .unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
-            checkpoint, None,
-            "checkpoint must not advance until both streams have crossed a block"
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a finalized cutoff block behind the checkpoint is a cutoff regression"
         );
-    }
-
-    #[tokio::test]
-    async fn handle_log_advances_to_min_of_both_streams() {
-        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        let clear_log = log_at_block(200);
-        let take_log = log_at_block(150);
-
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &clear_log,
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await
-            .unwrap();
-
-        // Only clear stream observed: no advance.
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "the cutoff-regression pause must warn operators"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a finalized cutoff behind the checkpoint must not enqueue a range"
+        );
         assert_eq!(
             crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
                 .await
                 .unwrap(),
-            None
+            Some(200),
+            "the checkpoint must not move when the finalized cutoff regresses"
         );
+    }
 
-        monitor
-            .handle_log(
-                RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
-                &take_log,
-                &mut watermarks,
-                &mut buffer,
-            )
+    /// Under `finalized`, even a 1-block regression (checkpoint=200,
+    /// finalized=199) is significant and must pause ingestion with a warning.
+    /// This proves the mode boundary: the same 1-block regression under `safe`
+    /// would quiet-skip (within SAFE_CUTOFF_QUIET_SKEW), but under `finalized`
+    /// any cutoff < checkpoint is a meaningful anomaly.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_pauses_when_finalized_cutoff_one_behind_checkpoint() {
+        // checkpoint=200, finalized=199 (1-block regression). Under `finalized`
+        // any regression must pause with a warning, even a single block.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(205, 199),
+            1,
+            IngestionCutoff::Finalized,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
             .await
             .unwrap();
 
-        // Both observed (clear=200, take=150). With required_confirmations=0,
-        // confirmation_boundary = 200, both_streams = 150,
-        // advance_to = 150, checkpoint = 149.
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a 1-block finalized regression must pause ingestion (no quiet-skew band under finalized)"
+        );
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "a 1-block finalized regression must warn operators"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a 1-block finalized regression must not enqueue a range"
+        );
         assert_eq!(
             crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
                 .await
                 .unwrap(),
-            Some(149),
-            "checkpoint must advance to min(both_streams, confirmation_boundary) - 1"
+            Some(200),
+            "the checkpoint must not move on a 1-block finalized regression"
         );
     }
 
+    /// Under `safe`, a small backwards step (within SAFE_CUTOFF_QUIET_SKEW)
+    /// skips ingestion for the tick and emits a warn (observable for reorg
+    /// detection) without pausing the monitor.
+    #[tracing_test::traced_test]
     #[tokio::test]
-    async fn handle_log_checkpoint_is_monotonic() {
-        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        // Establish initial frontier at block 200 on both streams.
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block(200),
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await
-            .unwrap();
-        monitor
-            .handle_log(
-                RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
-                &log_at_block(200),
-                &mut watermarks,
-                &mut buffer,
-            )
+    async fn poll_once_skips_quietly_when_safe_cutoff_slightly_behind_checkpoint() {
+        // checkpoint=1000, safe=995 (5-block backwards skew). Within
+        // SAFE_CUTOFF_QUIET_SKEW: must return CutoffWithinQuietSkew (not
+        // CutoffBehindCheckpoint) and warn at the stepped-backwards level.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(1005, 995),
+            1,
+            IngestionCutoff::Safe,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 1000)
             .await
             .unwrap();
 
-        // An out-of-order earlier event must not rewind the checkpoint.
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block(50),
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await
-            .unwrap();
-
-        let checkpoint = crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
-            .await
-            .unwrap();
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
-            checkpoint,
-            Some(199),
-            "checkpoint must never rewind when an out-of-order event is observed"
+            outcome,
+            PollOutcome::CutoffWithinQuietSkew,
+            "a small safe-cutoff skew must skip quietly (CutoffWithinQuietSkew), not pause ingestion"
+        );
+        assert!(
+            logs_contain("Safe cutoff block stepped backwards below checkpoint"),
+            "a small safe skew must warn so an in-band reorg is observable"
+        );
+        assert!(
+            !logs_contain("Cutoff block is behind committed ingestion progress"),
+            "a small safe skew must not emit the full-pause warning"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a small safe skew must not enqueue a range"
         );
     }
 
+    /// Under `safe`, a large regression (beyond SAFE_CUTOFF_QUIET_SKEW) still
+    /// pauses ingestion with a warning.
+    #[tracing_test::traced_test]
     #[tokio::test]
-    async fn prepare_and_listen_caps_cutoff_at_confirmation_boundary() {
-        // Backfill cutoff must be `latest - required_confirmations`,
-        // not the raw tip. With required_confirmations=3 and
-        // latest=105, cutoff=102.
-        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_confirmations(3).await;
+    async fn poll_once_pauses_when_safe_cutoff_far_behind_checkpoint() {
+        // checkpoint=200, safe=100 (100-block backwards skew). Exceeds
+        // SAFE_CUTOFF_QUIET_SKEW (32), so ingestion must pause with a warning.
+        let (mut monitor, pool, apalis_pool, evm_ctx) =
+            setup_with_deployment_block_and_cutoff(provider_at(205, 100), 1, IngestionCutoff::Safe)
+                .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 200)
+            .await
+            .unwrap();
 
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a large safe-cutoff regression must pause ingestion"
+        );
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "a large safe-cutoff regression must warn operators"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a large safe regression must not enqueue a range"
+        );
+    }
+
+    /// regression == SAFE_CUTOFF_QUIET_SKEW (32): must quiet-skip with a warn.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_quietly_at_exact_skew_boundary() {
+        // checkpoint=1032, safe=1000 (32-block regression == SAFE_CUTOFF_QUIET_SKEW).
+        // Must return CutoffWithinQuietSkew (not pause) and warn.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(1040, 1000),
+            1,
+            IngestionCutoff::Safe,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 1032)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffWithinQuietSkew,
+            "a regression of exactly SAFE_CUTOFF_QUIET_SKEW must quiet-skip"
+        );
+        assert!(
+            logs_contain("Safe cutoff block stepped backwards below checkpoint"),
+            "exact boundary must warn so an in-band reorg is observable"
+        );
+        assert!(
+            !logs_contain("Cutoff block is behind committed ingestion progress"),
+            "exact boundary must not emit the full-pause warning"
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 0);
+    }
+
+    /// regression == SAFE_CUTOFF_QUIET_SKEW + 1 (33): must pause with a warning.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_pauses_at_one_beyond_skew_boundary() {
+        // checkpoint=1033, safe=1000 (33-block regression > SAFE_CUTOFF_QUIET_SKEW).
+        // Must pause with a warning.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup_with_deployment_block_and_cutoff(
+            provider_at(1040, 1000),
+            1,
+            IngestionCutoff::Safe,
+        )
+        .await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 1033)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindCheckpoint,
+            "a regression of SAFE_CUTOFF_QUIET_SKEW+1 must pause ingestion"
+        );
+        assert!(
+            logs_contain("Cutoff block is behind committed ingestion progress"),
+            "one block beyond the boundary must warn operators"
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_when_cutoff_behind_deployment_block() {
+        // Cold start (no checkpoint): cutoff (genesis block 0) sits below the
+        // deployment block (1), so there is nothing to ingest yet. `from_block`
+        // (1) == `cutoff` (0) + 1, but with no committed progress this is NOT
+        // "caught up" -- it is the deployment block one short of the cutoff, so
+        // the outcome must be CutoffBehindDeployment, not CaughtUp.
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at(5, 0)).await;
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindDeployment,
+            "cold start with cutoff below deployment_block must not report CaughtUp"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "nothing to ingest until the cutoff reaches the deployment block"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_does_not_warn_when_deployment_block_is_ahead_of_cutoff() {
+        // Unusual config: a low stale checkpoint (5) but deployment_block (100)
+        // configured ahead of the cutoff block (10). `from_block` is driven by
+        // the deployment floor to 100 > cutoff + 1, but committed progress (5) is
+        // NOT past the cutoff -- so this must be the quiet deployment-wait, not
+        // the loud cutoff-regression warning that blames the RPC.
+        let (mut monitor, pool, apalis_pool, evm_ctx) =
+            setup_with_deployment_block(provider_at(15, 10), 100).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 5)
+            .await
+            .unwrap();
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::CutoffBehindDeployment,
+            "a deployment_block ahead of the cutoff is not a cutoff regression"
+        );
+        assert!(
+            !logs_contain("behind committed ingestion progress"),
+            "must not blame the RPC for a deployment_block/checkpoint config gap"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "nothing to ingest until the cutoff reaches the deployment block"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_does_not_enqueue_when_no_cutoff_block_yet() {
+        // No cutoff block and no checkpoint (cold start) -> skip the tick
+        // without enqueuing anything. Cold start is expected/transient, so
+        // no warn must fire (the startup probe surfaces persistent nulls).
+        let asserter = Asserter::new();
+        push_tick(&asserter, 50, None);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider).await;
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::NoCutoffColdStart,
+            "no checkpoint + null cutoff is an expected cold-start skip"
+        );
+        assert!(
+            !logs_contain("Ingestion cannot start"),
+            "cold-start null cutoff must not emit the old warn message"
+        );
+        assert!(
+            !logs_contain("No cutoff block reported while a checkpoint exists"),
+            "cold-start null cutoff must not trigger the checkpoint-exists warn"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "no cutoff block available yet -> no enqueue"
+        );
+    }
+
+    /// A null cutoff response while a checkpoint already exists must skip the
+    /// tick without moving the checkpoint (the financial invariant: a skip never
+    /// advances ingestion past unverified blocks), and a later tick that sees a
+    /// real cutoff block must resume from exactly where it left off.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_intermittent_null_without_moving_checkpoint() {
+        // Two ticks: the first reports null cutoff, the second a real cutoff
+        // block. Each tick reads the chain tip then the cutoff block.
+        let asserter = Asserter::new();
+        push_tick(&asserter, 104, None);
+        push_tick(&asserter, 110, Some(105));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
             .unwrap();
 
-        let asserter = alloy::providers::mock::Asserter::new();
-        asserter.push_success(&serde_json::Value::from(105_u64));
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let mut clear_stream =
-            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let mut take_stream =
-            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
-
-        let _ = monitor
-            .prepare_and_listen(&provider, &mut clear_stream, &mut take_stream)
-            .await;
-
-        let job_count = job_count(&pool).await;
+        // First tick: node returns null cutoff -> skip, checkpoint frozen.
+        // A checkpoint exists, so this is the warn branch, distinct from the
+        // cold-start debug branch despite identical side effects.
+        let first = monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
-            job_count, 1,
-            "exactly one job (the BackfillRange) must be enqueued on reconnect"
+            first,
+            PollOutcome::NoCutoffWithCheckpoint,
+            "null cutoff while a checkpoint exists is the warn (regression) branch"
+        );
+        assert!(
+            logs_contain("No cutoff block reported while a checkpoint exists"),
+            "the warn branch must emit an operator-visible warning"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "a null cutoff response must not enqueue a range"
+        );
+        assert_eq!(
+            crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+                .await
+                .unwrap(),
+            Some(99),
+            "the checkpoint must not move when the cutoff block is momentarily null"
         );
 
-        let job_payload = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT job FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        let job: BackfillRange = serde_json::from_slice(&job_payload).unwrap();
-        assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
+        // Second tick: cutoff is back -> resume from exactly checkpoint+1.
+        let second = monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
-            job.to_block, 102,
-            "backfill cutoff must equal latest tip minus required_confirmations"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_and_listen_enqueues_backfill_for_disconnect_window() {
-        // RAI-198 repro: when the monitor (re)connects, it must
-        // enqueue a BackfillRange covering (checkpoint+1, cutoff)
-        // so events emitted during the WS disconnect window are
-        // recovered. Pre-fix: no BackfillRange is enqueued and
-        // those events are silently dropped.
-        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
-
-        // Simulate prior progress: live monitor processed events up
-        // through block 99 before the disconnect.
-        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
-            .await
-            .unwrap();
-
-        // Mock provider returns block 105 from `eth_blockNumber`,
-        // which (with required_confirmations=0) the monitor uses verbatim as
-        // the cutoff.
-        let asserter = alloy::providers::mock::Asserter::new();
-        asserter.push_success(&serde_json::Value::from(105_u64));
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let mut clear_stream =
-            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let mut take_stream =
-            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
-
-        // prepare_and_listen returns Err(StreamsClosed) once it falls
-        // through to the listen loop with empty streams; we don't
-        // care about that -- we only care that the backfill job was
-        // enqueued before the listen loop starts.
-        let _ = monitor
-            .prepare_and_listen(&provider, &mut clear_stream, &mut take_stream)
-            .await;
-
-        let job_count = job_count(&pool).await;
-        assert_eq!(
-            job_count, 1,
-            "exactly one job (the BackfillRange) must be enqueued on reconnect"
-        );
-
-        let job_payload = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT job FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        let job: BackfillRange = serde_json::from_slice(&job_payload).unwrap();
-        assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
-        assert_eq!(job.to_block, 105, "backfill must extend up to the cutoff");
-    }
-
-    #[tokio::test]
-    async fn handle_log_does_not_advance_on_invalid_log() {
-        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
-
-        let invalid_log = alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: Address::ZERO,
-                data: alloy::primitives::LogData::empty(),
+            second,
+            PollOutcome::Enqueued {
+                from_block: 100,
+                to_block: 105
             },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: None,
-            transaction_index: None,
-            log_index: None,
-            removed: false,
+            "a recovered cutoff response resumes from checkpoint+1"
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            1,
+            "a recovered cutoff response must resume ingestion"
+        );
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 100, "resume from exactly checkpoint+1");
+        assert_eq!(
+            job.to_block, 105,
+            "cutoff equals the recovered cutoff block"
+        );
+    }
+
+    /// Same as `poll_once_skips_intermittent_null_without_moving_checkpoint`
+    /// but for the `Finalized` cutoff. The null-handling path is tag-agnostic;
+    /// this test guards against accidental tag-specific divergence.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_intermittent_null_finalized_without_moving_checkpoint() {
+        let asserter = Asserter::new();
+        push_tick(&asserter, 104, None);
+        push_tick(&asserter, 110, Some(105));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) =
+            setup_with_deployment_block_and_cutoff(provider, 1, IngestionCutoff::Finalized).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        let first = monitor.poll_once(Utc::now()).await.unwrap();
+        assert_eq!(first, PollOutcome::NoCutoffWithCheckpoint);
+        assert!(logs_contain(
+            "No cutoff block reported while a checkpoint exists"
+        ));
+        assert_eq!(backfill_job_count(&apalis_pool).await, 0);
+        assert_eq!(
+            crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+                .await
+                .unwrap(),
+            Some(99),
+        );
+
+        let second = monitor.poll_once(Utc::now()).await.unwrap();
+        assert_eq!(
+            second,
+            PollOutcome::Enqueued {
+                from_block: 100,
+                to_block: 105
+            },
+            "a recovered cutoff response resumes from checkpoint+1"
+        );
+        assert_eq!(backfill_job_count(&apalis_pool).await, 1);
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 100, "resume from exactly checkpoint+1");
+        assert_eq!(
+            job.to_block, 105,
+            "cutoff equals the recovered cutoff block"
+        );
+    }
+
+    /// A severed RPC must surface as a typed error -- the run loop's
+    /// warn-and-retry contract depends on it -- and must neither enqueue
+    /// a bogus range nor move the checkpoint, so the post-outage tick
+    /// re-scans exactly the blocks the outage hid.
+    #[tokio::test]
+    async fn poll_once_propagates_rpc_error_without_enqueuing() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection refused");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider).await;
+
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        let result = monitor.poll_once(Utc::now()).await;
+        assert!(
+            matches!(result, Err(OrderFillMonitorError::Rpc(_))),
+            "A severed RPC must surface as a typed RPC error; got: {result:?}",
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "No backfill range may be enqueued off a failed chain-state read"
+        );
+        assert_eq!(
+            crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+                .await
+                .unwrap(),
+            Some(99),
+            "The checkpoint must not move during the outage"
+        );
+    }
+
+    /// A write-locked database during the backfill enqueue must surface
+    /// as a typed error (the run loop logs it and retries next tick),
+    /// leave nothing enqueued, and enqueue cleanly once the lock clears.
+    /// The lock is a second connection holding `BEGIN IMMEDIATE` against
+    /// a file-backed database -- the documented bot-vs-reporter WAL
+    /// write contention -- with the pool's busy timeout scaled down so
+    /// the test waits milliseconds instead of production's 10 seconds.
+    #[tokio::test]
+    async fn poll_once_surfaces_enqueue_error_under_db_lock_and_resumes() {
+        let (pool, apalis_pool, db_path, _dir) =
+            crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
+        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
+        let evm_ctx = EvmCtx {
+            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
-        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
+        // One chain-tip + cutoff-block response pair per poll_once call.
+        let asserter = Asserter::new();
+        push_tick(&asserter, 55, Some(50));
+        push_tick(&asserter, 55, Some(50));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        monitor
-            .handle_log(event, &invalid_log, &mut watermarks, &mut buffer)
-            .await
-            .unwrap();
-
-        let checkpoint = crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            checkpoint, None,
-            "checkpoint must not advance when the log lacks block metadata"
+        let mut monitor = OrderFillMonitor::new(
+            evm_ctx,
+            backfill_queue,
+            pool.clone(),
+            provider,
+            Duration::from_secs(5),
         );
-    }
 
-    #[tokio::test]
-    async fn handle_log_buffers_event_before_confirmations() {
-        // With required_confirmations=3, an event at block N must not be
-        // flushed until the tip advances to N+3. The first event at
-        // block 100 is the only signal we have; tip = 100,
-        // confirmation_boundary = 97. The event sits in the buffer.
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        let log = log_at_block(100);
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log,
-                &mut watermarks,
-                &mut buffer,
-            )
+        let mut locker = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut locker)
             .await
             .unwrap();
 
+        // The block-lag telemetry write blocks then fails under the lock, but
+        // it is best-effort (swallowed). The in-flight check is a read and
+        // succeeds under the WAL write lock; the enqueue INSERT then blocks and
+        // errors after the busy timeout -- that is the error poll_once returns.
+        let result = monitor.poll_once(Utc::now()).await;
+        assert!(
+            matches!(result, Err(OrderFillMonitorError::Enqueue(_))),
+            "A write-locked database must surface as a typed enqueue \
+             error; got: {result:?}",
+        );
         assert_eq!(
-            job_count(&pool).await,
+            backfill_job_count(&apalis_pool).await,
             0,
-            "event at block 100 must not be flushed until tip reaches 103"
+            "No backfill range may be enqueued while the lock is held"
+        );
+
+        sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            1,
+            "The next tick after the lock clears must enqueue the range"
+        );
+
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 1, "checkpoint must not have advanced");
+        assert_eq!(job.to_block, 50);
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_while_backfill_in_flight() {
+        // A pending BackfillRange already exists: the overlap guard must
+        // short-circuit before enqueuing. The block-lag sample IS still
+        // recorded first -- a long catch-up (a backfill in flight) is exactly
+        // when lag must stay observable.
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at(140, 100)).await;
+
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
+            .await
+            .unwrap();
+        let mut other_handle = BackfillJobQueue::new(&apalis_pool);
+        other_handle
+            .push(BackfillRange {
+                from_block: 11,
+                to_block: 20,
+            })
+            .await
+            .unwrap();
+        assert_eq!(backfill_job_count(&apalis_pool).await, 1);
+
+        let outcome = monitor.poll_once(Utc::now()).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PollOutcome::RangeInFlight,
+            "the overlap guard must return RangeInFlight"
         );
         assert_eq!(
-            buffer.entries.len(),
+            backfill_job_count(&apalis_pool).await,
             1,
-            "event must remain buffered pending confirmation depth"
+            "overlap guard must prevent a second enqueue while one is in flight"
+        );
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            lag_blocks,
+            Some(90),
+            "lag (cutoff 100 - checkpoint 10) must be sampled even while a backfill is in flight"
         );
     }
 
     #[tokio::test]
-    async fn handle_log_flushes_when_confirmation_boundary_advances() {
-        // First event at block 100 (buffered). Second event at block
-        // 103 advances the tip to 103, so confirmation_boundary
-        // becomes 100. The block-100 event flushes.
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block(100),
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await
-            .unwrap();
-        monitor
-            .handle_log(
-                RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
-                &log_at_block(103),
-                &mut watermarks,
-                &mut buffer,
-            )
+    async fn orphaned_running_backfill_wedges_poller_until_requeued() {
+        // A `BackfillRange` left `Running` by a dead process keeps
+        // `has_in_flight` true, so the overlap guard suppresses ingestion
+        // indefinitely -- the deterministic worker name means apalis never
+        // ages the orphan out. `requeue_orphaned`, wired at conductor startup,
+        // is what unwedges it.
+        //
+        // Both ticks read the provider (the lag sample is recorded before the
+        // overlap guard): the first while wedged, the second after the orphan
+        // reaches a terminal state.
+        let asserter = Asserter::new();
+        push_tick(&asserter, 110, Some(105));
+        push_tick(&asserter, 110, Some(105));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
             .await
             .unwrap();
 
+        let mut queue = BackfillJobQueue::new(&apalis_pool);
+        queue
+            .push(BackfillRange {
+                from_block: 11,
+                to_block: 20,
+            })
+            .await
+            .unwrap();
+        // Simulate a crash mid-process: the row is stuck `Running` with no
+        // live worker owning it.
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Running' WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+
+        // The wedge: the poller skips while the orphan counts as in flight.
+        // The lag sample is still recorded (reads happen before the guard).
+        monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
-            job_count(&pool).await,
+            backfill_job_count(&apalis_pool).await,
             1,
-            "block-100 event must flush once confirmation_boundary=100 is reached"
+            "orphaned Running range still blocks the overlap guard"
         );
+
+        // Startup recovery resets the orphan so a fresh worker can re-drive it.
+        let reset = queue.requeue_orphaned().await.unwrap();
+        assert_eq!(reset, 1, "the orphaned backfill range is requeued");
+
+        let status = sqlx_apalis::query_scalar::<_, String>(
+            "SELECT status FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "Pending", "requeue makes the orphan re-drivable");
+
+        // A requeued (Pending) job still counts as in flight, so the wedge only
+        // truly lifts once a worker drains it to a terminal state. Simulate that
+        // completion, then confirm the next poll resumes ingestion -- it reaches
+        // the cutoff-block RPC (consuming the mock) and enqueues a fresh range.
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type LIKE '%BackfillRange%'")
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
-            buffer.entries.len(),
-            1,
-            "block-103 event must remain buffered (boundary is 100)"
+            backfill_job_count(&apalis_pool).await,
+            2,
+            "once the orphan reaches a terminal state the poller enqueues a new range"
         );
     }
 
     #[tokio::test]
-    async fn handle_log_removed_pre_confirmation_drops_from_buffer() {
-        // A `removed: true` log for a still-buffered event must drop
-        // it cleanly without erroring -- the confirmation buffer
-        // absorbed the reorg.
-        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block_with_index(100, 0, false),
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await
-            .unwrap();
-        assert_eq!(buffer.entries.len(), 1, "event must be buffered");
-
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block_with_index(100, 0, true),
-                &mut watermarks,
-                &mut buffer,
-            )
+    async fn poll_once_records_block_lag_sample() {
+        // tip=105, cutoff=102, checkpoint=99 -> lag = cutoff - checkpoint = 3.
+        let (mut monitor, pool, _apalis_pool, evm_ctx) = setup(provider_at(105, 102)).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
             .unwrap();
 
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let (chain_tip, cutoff_block, last_processed_block, lag_blocks): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT chain_tip, cutoff_block, last_processed_block, lag_blocks \
+             FROM block_lag_samples",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain_tip, 105);
+        assert_eq!(cutoff_block, 102);
+        assert_eq!(last_processed_block, Some(99));
+        assert_eq!(lag_blocks, Some(3));
+    }
+
+    #[tokio::test]
+    async fn poll_once_reads_zero_lag_when_caught_up() {
+        // checkpoint == cutoff: a healthy caught-up system must read 0, not a
+        // permanent floor.
+        let (mut monitor, pool, _apalis_pool, evm_ctx) = setup(provider_at(105, 102)).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lag_blocks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn poll_once_records_null_lag_without_checkpoint() {
+        let (mut monitor, pool, _apalis_pool, _evm_ctx) = setup(provider_at(55, 50)).await;
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lag_blocks, None);
+    }
+
+    #[test]
+    fn skipped_ticks_is_zero_for_first_and_on_time_ticks() {
+        let interval = Duration::from_secs(5);
+
+        assert_eq!(skipped_ticks(None, interval), 0);
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(5)), interval), 0);
+        // Jitter well under half an interval still counts as on time.
         assert_eq!(
-            buffer.entries.len(),
-            0,
-            "removed log must drop the buffered entry"
+            skipped_ticks(Some(Duration::from_millis(5_400)), interval),
+            0
+        );
+    }
+
+    #[test]
+    fn skipped_ticks_counts_missed_intervals() {
+        let interval = Duration::from_secs(5);
+
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(10)), interval), 1);
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(31)), interval), 5);
+        // The rounding boundary: half an interval past the first tick tips
+        // the count from "on time" to one skip.
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(7_499)), interval),
+            0
         );
         assert_eq!(
-            job_count(&pool).await,
-            0,
-            "removed event must never be flushed to the job queue"
+            skipped_ticks(Some(Duration::from_millis(7_500)), interval),
+            1
+        );
+    }
+
+    #[test]
+    fn skipped_ticks_clamps_at_i64_max_for_storage() {
+        // A pathological gap must clamp at i64::MAX (the storage layer's
+        // integer width), not fail the eventual sample write.
+        assert_eq!(
+            skipped_ticks(
+                Some(Duration::from_millis(u64::MAX)),
+                Duration::from_millis(1)
+            ),
+            i64::MAX.unsigned_abs()
         );
     }
 
     #[tokio::test]
-    async fn handle_log_removed_does_not_advance_watermark() {
-        // A removed log represents reverted chain state, so its block
-        // number must not contribute to the tip estimate. Otherwise an
-        // out-of-order `removed: true` could prematurely advance the
-        // confirmation boundary and flush still-unconfirmed entries.
-        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
+    async fn probe_cutoff_block_support_accepts_a_safe_block() {
+        // Safe cutoff (108) behind the chain tip (110): genuine support.
+        let outcome =
+            probe_cutoff_block_support(&provider_with_cutoff(108), 110, IngestionCutoff::Safe)
+                .await
+                .unwrap();
 
-        // Seed the buffer with an event at block 100 so handle_removed
-        // takes the buffered-drop branch instead of erroring.
-        monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block_with_index(100, 0, false),
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await
-            .unwrap();
-        assert_eq!(watermarks.highest_observed(), Some(100));
+        assert_eq!(outcome, CutoffProbe::Supported);
+    }
 
-        // A removed log at a far-future block must not advance the
-        // watermark -- the reverted chain doesn't prove forward
-        // progress.
-        monitor
-            .handle_log(
-                RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
-                &log_at_block_with_index(1000, 0, true),
-                &mut watermarks,
-                &mut buffer,
-            )
+    #[tokio::test]
+    async fn probe_cutoff_block_support_accepts_a_finalized_block() {
+        // Finalized (102) strictly behind the chain tip (110): genuine finality.
+        let outcome =
+            probe_cutoff_block_support(&provider_with_cutoff(102), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, CutoffProbe::Supported);
+    }
+
+    /// The `safe` tag can legitimately equal or exceed the chain tip (fast
+    /// sequencer batch cadence). The probe must accept this as normal, not flag
+    /// it as aliasing.
+    #[tokio::test]
+    async fn probe_cutoff_block_support_does_not_flag_safe_near_tip() {
+        // safe == chain_tip (110 == 110): valid for `safe`, must return Supported.
+        let outcome =
+            probe_cutoff_block_support(&provider_with_cutoff(110), 110, IngestionCutoff::Safe)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            CutoffProbe::Supported,
+            "safe == chain_tip is normal for fast sequencer batching; must not flag aliasing"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn probe_cutoff_block_support_accepts_null_response() {
+        // A null response (tag not yet available) must be allowed through as
+        // NotYetAvailable, so a fresh chain does not fail startup.
+        let outcome =
+            probe_cutoff_block_support(&provider_without_cutoff(), 110, IngestionCutoff::Safe)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, CutoffProbe::NotYetAvailable);
+        assert!(
+            logs_contain("RPC endpoint reports no safe block at startup"),
+            "deferred ingestion at startup must be operator-visible"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn probe_cutoff_block_support_accepts_null_finalized_response() {
+        // A null response for the finalized tag (tag not yet available) must
+        // be allowed through as NotYetAvailable, so a fresh chain does not
+        // fail startup.
+        let outcome =
+            probe_cutoff_block_support(&provider_without_cutoff(), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, CutoffProbe::NotYetAvailable);
+        assert!(
+            logs_contain("RPC endpoint reports no finalized block at startup"),
+            "deferred ingestion at startup must be operator-visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_cutoff_block_support_flags_finalized_aliasing_tip() {
+        // A provider reporting `finalized` at the chain tip (110 == 110) is
+        // likely aliasing `finalized` to `latest`, disabling reorg protection.
+        // The probe must return a structured FinalizedAliasesChainTip error.
+        let error =
+            probe_cutoff_block_support(&provider_with_cutoff(110), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CutoffProbeError::FinalizedAliasesChainTip {
+                    cutoff_block: 110,
+                    chain_tip: 110,
+                }
+            ),
+            "finalized aliasing the tip must surface as FinalizedAliasesChainTip; got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_cutoff_block_support_flags_finalized_strictly_ahead_of_tip() {
+        // finalized (111) strictly ahead of the chain tip (110): only an
+        // endpoint aliasing `finalized` to `latest` can produce this.
+        let error =
+            probe_cutoff_block_support(&provider_with_cutoff(111), 110, IngestionCutoff::Finalized)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CutoffProbeError::FinalizedAliasesChainTip {
+                    cutoff_block: 111,
+                    chain_tip: 110,
+                }
+            ),
+            "finalized ahead of the tip must surface as FinalizedAliasesChainTip; got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_cutoff_block_support_rpc_error_bubbles_for_safe_tag() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection refused");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        // An endpoint that errors on the safe tag must fail the startup probe.
+        let error = probe_cutoff_block_support(&provider, 110, IngestionCutoff::Safe)
             .await
             .unwrap_err();
 
-        assert_eq!(
-            watermarks.highest_observed(),
-            Some(100),
-            "removed log must not advance the watermark"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_log_removed_past_confirmations_errors() {
-        // If a `removed: true` log arrives for an event that is no
-        // longer in the buffer (i.e., already flushed), the
-        // confirmation gate failed -- a deep reorg crossed our depth.
-        // Must surface as a loud error rather than be silently
-        // consumed.
-        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
-        let mut watermarks = StreamWatermarks::default();
-        let mut buffer = LiveEventBuffer::default();
-
-        // No prior insert -- simulate that the event was already
-        // flushed and the buffer no longer holds it.
-        let result = monitor
-            .handle_log(
-                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
-                &log_at_block_with_index(100, 7, true),
-                &mut watermarks,
-                &mut buffer,
-            )
-            .await;
-
-        let error = result
-            .unwrap_err()
-            .downcast::<OrderFillMonitorError>()
-            .expect("expected OrderFillMonitorError");
         assert!(
-            matches!(
-                *error,
-                OrderFillMonitorError::RemovedPastConfirmations {
-                    log_index: 7,
-                    block_number: 100,
-                    ..
-                }
-            ),
-            "expected RemovedPastConfirmations variant, got {error:?}"
+            matches!(error, CutoffProbeError::Rpc(RpcError::ErrorResp(_))),
+            "a safe-tag RPC failure must surface as a wrapped RPC error; got: {error:?}"
         );
     }
 
     #[tokio::test]
-    async fn latest_confirmed_block_subtracts_confirmations() {
-        let asserter = alloy::providers::mock::Asserter::new();
-        asserter.push_success(&serde_json::Value::from(105_u64));
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+    async fn probe_cutoff_block_support_rpc_error_bubbles_for_finalized_tag() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection refused");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let confirmed = latest_confirmed_block(&provider, 3).await.unwrap();
-        assert_eq!(confirmed, Some(102));
-    }
+        // An endpoint that errors on the finalized tag must fail the startup probe.
+        let error = probe_cutoff_block_support(&provider, 110, IngestionCutoff::Finalized)
+            .await
+            .unwrap_err();
 
-    #[tokio::test]
-    async fn latest_confirmed_block_returns_none_when_chain_too_shallow() {
-        let asserter = alloy::providers::mock::Asserter::new();
-        asserter.push_success(&serde_json::Value::from(2_u64));
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let confirmed = latest_confirmed_block(&provider, 3).await.unwrap();
-        assert_eq!(confirmed, None);
+        assert!(
+            matches!(error, CutoffProbeError::Rpc(RpcError::ErrorResp(_))),
+            "a finalized-tag RPC failure must surface as a wrapped RPC error; got: {error:?}"
+        );
     }
 }

@@ -17,11 +17,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use st0x_bridge::cctp::CctpAttestationMock;
+use st0x_config::mk_env_filter;
+use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
-use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
-use st0x_hedge::telemetry::mk_env_filter;
 
 use crate::base_chain::{BaseChain, DeployableERC20};
 
@@ -76,9 +76,16 @@ pub fn init_tracing_with_log_dir(log_dir: &Path) -> tracing_appender::non_blocki
         .with_writer(std::io::stderr)
         .with_filter(console_filter);
 
+    let board_filter = mk_env_filter(tracing::Level::DEBUG);
+    let board_layer =
+        apalis_board::axum::sse::TracingSubscriber::new(st0x_hedge::apalis_broadcaster())
+            .layer()
+            .with_filter(board_filter);
+
     tracing_subscriber::registry()
         .with(console_layer)
         .with(file_layer)
+        .with(board_layer)
         .try_init()
         .expect("Failed to initialize tracing subscriber with log dir");
 
@@ -93,6 +100,11 @@ pub struct TestInfra<P> {
     pub broker_service: Arc<AlpacaBrokerMock>,
     pub tokenization_service: AlpacaTokenizationMock,
     pub attestation_service: CctpAttestationMock,
+    /// Mock issuance freeze-status endpoint (always reports not-frozen) so the
+    /// rebalancing freeze guard lets e2e flows through. Kept alive for the test.
+    _issuance_service: httpmock::MockServer,
+    /// Base URL of `_issuance_service`, for wiring into the bot's issuance ctx.
+    pub issuance_base_url: url::Url,
     /// `(symbol, vault_address, underlying_address)` per deployed equity vault.
     pub equity_addresses: Vec<(String, Address, Address)>,
 }
@@ -109,9 +121,11 @@ impl<P> TestInfra<P> {
                 let config = EquityAssetConfig {
                     tokenized_equity: *underlying_addr,
                     tokenized_equity_derivative: *vault_addr,
+                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                 };
                 let Ok(symbol_key) = Symbol::new(symbol.clone()) else {
@@ -158,6 +172,9 @@ impl TestInfra<()> {
 
         let attestation_service = CctpAttestationMock::start().await;
         debug!("CCTP attestation mock started");
+
+        let issuance_service = start_issuance_mock().await;
+        let issuance_base_url = issuance_service.base_url().parse()?;
         info!("Test infrastructure ready");
 
         Ok(TestInfra {
@@ -167,6 +184,8 @@ impl TestInfra<()> {
             broker_service,
             tokenization_service,
             attestation_service,
+            _issuance_service: issuance_service,
+            issuance_base_url,
             equity_addresses,
         })
     }
@@ -242,6 +261,21 @@ async fn start_broker_mock(
     debug!(broker_url = %broker_service.base_url(), "Broker mock started");
 
     Ok(broker_service)
+}
+
+/// Starts a mock issuance HTTP server whose freeze-status endpoint always
+/// reports the asset enabled and not frozen, so the rebalancing freeze guard
+/// lets e2e rebalancing flows proceed (production points this at real issuance).
+async fn start_issuance_mock() -> httpmock::MockServer {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET);
+        then.status(200).json_body(serde_json::json!({
+            "underlying": "TEST",
+            "status": "enabled",
+        }));
+    });
+    server
 }
 
 type MockBrokerState = (Vec<(Symbol, Float)>, Vec<MockPosition>);

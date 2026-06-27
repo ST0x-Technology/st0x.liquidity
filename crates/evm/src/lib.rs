@@ -25,8 +25,11 @@ use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 use tokio::time::{interval, timeout};
+use tracing::{debug, warn};
 
 pub mod error_decoding;
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
@@ -35,6 +38,15 @@ use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 pub mod nonce;
 pub use nonce::ResettableNonceManager;
 
+mod bindings;
+pub use bindings::{IERC20, IPyth, PythStructs};
+
+mod tokens;
+pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+mod submit;
+
 #[cfg(feature = "local-signer")]
 pub mod local;
 #[cfg(feature = "turnkey")]
@@ -42,6 +54,11 @@ pub mod turnkey;
 
 #[cfg(feature = "mock")]
 pub mod test_chain;
+
+#[cfg(feature = "test-support")]
+pub mod stub;
+#[cfg(feature = "test-support")]
+pub use stub::StubWallet;
 
 /// Wallet backend discriminant. Deserialized from a `kind` field in
 /// wallet config sections. Variants are feature-gated so unconfigured
@@ -134,6 +151,15 @@ impl WalletKind {
     }
 }
 
+/// Poll interval between `eth_blockNumber` calls in [`wait_for_node_sync`].
+pub const NODE_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum number of polls before [`wait_for_node_sync`] gives up.
+///
+/// 30 attempts at 1s each gives a 30s budget — generous for even a
+/// temporarily lagging backend node on a fast chain like Base.
+pub const NODE_SYNC_MAX_ATTEMPTS: u32 = 30;
+
 /// Errors that can occur during EVM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EvmError {
@@ -171,12 +197,74 @@ pub enum EvmError {
         tx_hash: alloy::primitives::TxHash,
         elapsed_secs: u64,
     },
+    /// A stuck under-gassed pending transaction occupies the wallet's
+    /// next nonce, and `attempts` fee-bumped resubmits at that nonce all
+    /// came back "replacement transaction underpriced". The replacement
+    /// fee never exceeded the stuck transaction's fee within the bounded
+    /// escalation budget -- surfaced as a hard error rather than bumping
+    /// the fee without limit.
+    #[error(
+        "replacement transaction still underpriced after {attempts} \
+         fee-bumped resubmits"
+    )]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    ReplacementUnderpriced { attempts: u32 },
+    /// Bumping the EIP-1559 fee for a replacement transaction overflowed
+    /// `u128`. Only reachable if the RPC returns an absurd fee estimate;
+    /// surfaced as a hard error rather than silently wrapping a financial
+    /// value.
+    #[error("replacement fee bump overflowed u128 (network fee estimate too large)")]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    ReplacementFeeOverflow,
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
     #[cfg(feature = "turnkey")]
     #[error("Turnkey error: {0}")]
     Turnkey(#[from] turnkey::TurnkeyError),
+    /// The RPC node's tip remained below the required block after exhausting
+    /// the poll budget. Raised by [`wait_for_node_sync`] when a load-balanced
+    /// backend never catches up within the retry window.
+    #[error(
+        "RPC node tip {observed_tip} is behind required block {required_block} \
+         after {attempts} polls"
+    )]
+    NodeBehindRequiredBlock {
+        observed_tip: u64,
+        required_block: u64,
+        attempts: u32,
+    },
+}
+
+impl EvmError {
+    /// `true` if this reports a transaction dropped from the mempool (it will
+    /// never mine) -- a terminal failure, distinct from a still-pending tx that
+    /// merely has not confirmed yet. Only the wallet builds (`turnkey` /
+    /// `local-signer`), which run the confirm loop, can produce it.
+    pub fn is_transaction_dropped(&self) -> bool {
+        match self {
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::TransactionDropped { .. } => true,
+            Self::Transaction(_)
+            | Self::Transport(_)
+            | Self::Contract(_)
+            | Self::AbiDecode(_)
+            | Self::DecodedRevert(_)
+            | Self::Reverted { .. }
+            | Self::WalletConfigParse(_) => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReceiptTimeout { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementUnderpriced { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementFeeOverflow => false,
+            #[cfg(feature = "local-signer")]
+            Self::InvalidPrivateKey(_) => false,
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey(_) => false,
+            Self::NodeBehindRequiredBlock { .. } => false,
+        }
+    }
 }
 
 impl EvmError {
@@ -190,6 +278,29 @@ impl EvmError {
             Self::Transport(rpc_error) => rpc_error
                 .as_error_resp()
                 .is_some_and(|payload| payload.message.contains("nonce too low")),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this is a "replacement transaction underpriced"
+    /// RPC error. It occurs when a different transaction already sits in
+    /// the mempool at the target nonce and the new submission's fee does
+    /// not exceed it by the node's required replacement margin (geth needs
+    /// at least 10% higher). Recovering means resubmitting at the same
+    /// nonce with a bumped fee.
+    ///
+    /// Deliberately does NOT match "already known": that error means the
+    /// *identical* transaction (same hash) is already pending, which is an
+    /// idempotent re-send, not a fee problem. Bumping the fee for it would
+    /// needlessly replace an already-accepted transaction.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn is_replacement_underpriced(&self) -> bool {
+        match self {
+            Self::Transport(rpc_error) => rpc_error.as_error_resp().is_some_and(|payload| {
+                payload
+                    .message
+                    .contains("replacement transaction underpriced")
+            }),
             _ => false,
         }
     }
@@ -567,6 +678,99 @@ async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
     }
 }
 
+/// Spin-polls `eth_blockNumber` until the serving node reports >= `required_block`.
+///
+/// Load-balanced RPCs route successive calls to different backend nodes. After
+/// tx N confirms at block B, the very next call may hit a node still at B-1.
+/// This function blocks the caller until one poll observes height >= B, ensuring
+/// dependent writes see the prerequisite tx's effects.
+///
+/// # Errors
+///
+/// Returns [`EvmError::NodeBehindRequiredBlock`] after `max_attempts` polls if
+/// the node never catches up.
+///
+/// Returns [`EvmError::Transport`] if the budget is exhausted while every poll
+/// resulted in a transport error (i.e. no successful `eth_blockNumber` response
+/// was ever received).
+///
+/// Transient transport errors (e.g. a momentary connection failure on a
+/// load-balanced RPC) are treated the same as a behind-tip poll: the attempt
+/// is counted against the budget and the loop continues. This preserves the
+/// full 30-attempt window as tolerance for both sync lag and transient
+/// failures, rather than aborting on the first network hiccup.
+pub async fn wait_for_node_sync(
+    provider: &impl Provider,
+    required_block: u64,
+    poll_interval: Duration,
+    max_attempts: u32,
+) -> Result<(), EvmError> {
+    // The production caller always passes NODE_SYNC_MAX_ATTEMPTS (>= 1).
+    // Passing 0 would cause an empty loop and a misleading NodeBehindRequiredBlock
+    // with observed_tip=0 and attempts=0 — a programming error.
+    debug_assert!(
+        max_attempts >= 1,
+        "wait_for_node_sync: max_attempts must be at least 1"
+    );
+
+    // Tracks the most recent successful block number response.
+    // Only appears in NodeBehindRequiredBlock, which requires at least
+    // one successful poll.
+    let mut observed_tip = 0u64;
+    // True once at least one get_block_number call returned Ok (even if stale).
+    // Used to distinguish "all polls failed with transport error" (return Transport)
+    // from "some polls succeeded but node never caught up" (return NodeBehindRequiredBlock).
+    let mut any_poll_succeeded = false;
+
+    for attempt in 1..=max_attempts {
+        if attempt > 1 {
+            sleep(poll_interval).await;
+        }
+
+        match provider.get_block_number().await {
+            Ok(tip) => {
+                observed_tip = tip;
+                any_poll_succeeded = true;
+                if observed_tip >= required_block {
+                    return Ok(());
+                }
+                debug!(
+                    target: "evm",
+                    observed_tip,
+                    required_block,
+                    attempt,
+                    max_attempts,
+                    "RPC node behind required block; retrying"
+                );
+            }
+            Err(transport_error) => {
+                warn!(
+                    target: "evm",
+                    ?transport_error,
+                    attempt,
+                    max_attempts,
+                    "Transient transport error polling block number; retrying"
+                );
+                // Treat transient transport errors as a behind-tip poll:
+                // count the attempt against the budget and retry, rather
+                // than aborting all remaining retries on the first hiccup.
+                // If attempts are exhausted, return Transport only when no
+                // poll ever succeeded; otherwise fall through to
+                // NodeBehindRequiredBlock with the last observed tip.
+                if attempt == max_attempts && !any_poll_succeeded {
+                    return Err(EvmError::Transport(transport_error));
+                }
+            }
+        }
+    }
+
+    Err(EvmError::NodeBehindRequiredBlock {
+        observed_tip,
+        required_block,
+        attempts: max_attempts,
+    })
+}
+
 /// Poll interval for fallback receipt polling.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const RECEIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -574,6 +778,58 @@ const RECEIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Maximum time to wait for a transaction receipt before giving up.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Maximum time to wait for confirmation depth after a receipt is found.
+/// Generous (30 min) because the tx is already mined — we just need blocks.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Grace period before the dropped-from-mempool check may fire. A
+/// freshly-submitted tx is not visible on every node of a load-balanced RPC
+/// for several seconds, and on Ethereum mainnet it is not mined for ~1 block
+/// (~12s); concluding "dropped" earlier yields false positives that fail a tx
+/// which actually lands. Set above one mainnet block time.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Consecutive `get_transaction_by_hash == None` observations (after the grace
+/// period) required before concluding the tx was dropped. Any sighting —
+/// pending or mined — resets the count. Debounces the load-balanced-RPC race
+/// where a single lagging node transiently reports a live tx as absent.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_CONSECUTIVE_MISSES: u32 = 3;
+
+/// Tuning parameters for [`wait_for_receipt_with_config`]. Bundled into a struct
+/// so the wait function keeps a small argument list as knobs are added.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReceiptWaitConfig {
+    /// Interval between receipt polls.
+    pub(crate) poll_interval: std::time::Duration,
+    /// Max time to wait for the tx to be included in a block.
+    pub(crate) inclusion_timeout: std::time::Duration,
+    /// Max time to wait for confirmation depth once a receipt is found.
+    pub(crate) confirmation_timeout: std::time::Duration,
+    /// Grace period before the dropped-from-mempool check may fire.
+    pub(crate) dropped_grace: std::time::Duration,
+    /// Consecutive mempool-absence observations required to conclude a drop.
+    pub(crate) dropped_consecutive_misses: u32,
+}
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+impl ReceiptWaitConfig {
+    /// Defaults tuned for Ethereum mainnet (~12s blocks) behind a
+    /// load-balanced RPC.
+    const fn mainnet_defaults() -> Self {
+        Self {
+            poll_interval: RECEIPT_POLL_INTERVAL,
+            inclusion_timeout: RECEIPT_TIMEOUT,
+            confirmation_timeout: CONFIRMATION_TIMEOUT,
+            dropped_grace: DROPPED_TX_GRACE,
+            dropped_consecutive_misses: DROPPED_TX_CONSECUTIVE_MISSES,
+        }
+    }
+}
 
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
 /// heartbeat-based `get_receipt()` which can hang when the WebSocket
@@ -593,23 +849,10 @@ pub(crate) async fn wait_for_receipt(
         provider,
         tx_hash,
         required_confirmations,
-        RECEIPT_POLL_INTERVAL,
-        RECEIPT_TIMEOUT,
-        CONFIRMATION_TIMEOUT,
+        ReceiptWaitConfig::mainnet_defaults(),
     )
     .await
 }
-
-/// Maximum time to wait for confirmation depth after a receipt is found.
-/// Generous (30 min) because the tx is already mined — we just need blocks.
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
-const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// Number of receipt polls before checking whether the transaction was
-/// dropped from the mempool. Gives the tx time to propagate before
-/// concluding it was never broadcast.
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
-const DROPPED_TX_CHECK_AFTER_POLLS: u32 = 3;
 
 /// Parameterized version of [`wait_for_receipt`] for testability.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -617,34 +860,43 @@ pub(crate) async fn wait_for_receipt_with_config(
     provider: &impl Provider,
     tx_hash: alloy::primitives::TxHash,
     required_confirmations: u64,
-    poll_interval: std::time::Duration,
-    inclusion_timeout: std::time::Duration,
-    confirmation_timeout: std::time::Duration,
+    config: ReceiptWaitConfig,
 ) -> Result<TransactionReceipt, EvmError> {
-    let mut poll = interval(poll_interval);
+    let mut poll = interval(config.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let start = std::time::Instant::now();
 
     // Phase 1: wait for inclusion (with timeout).
-    let (receipt, receipt_block) = timeout(inclusion_timeout, async {
-        let mut poll_count = 0u32;
+    let (receipt, receipt_block) = timeout(config.inclusion_timeout, async {
+        // Consecutive polls where the tx is absent from BOTH the receipt lookup
+        // and the mempool. A single absence is unreliable on a load-balanced
+        // RPC (the lookup may hit a lagging node that has not seen a recent tx),
+        // so we require several in a row — and only after a grace period —
+        // before concluding the tx was dropped.
+        let mut consecutive_misses = 0u32;
 
         loop {
             poll.tick().await;
-            poll_count += 1;
 
             let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
-                // After initial propagation window, check if the tx
-                // still exists in the mempool. If not, it was dropped
-                // and will never mine.
-                if poll_count >= DROPPED_TX_CHECK_AFTER_POLLS
-                    && provider.get_transaction_by_hash(tx_hash).await?.is_none()
-                {
-                    return Err(EvmError::TransactionDropped {
-                        tx_hash,
-                        elapsed_secs: start.elapsed().as_secs(),
-                    });
+                // Not yet mined. Only suspect a drop once the grace period has
+                // elapsed; before that a missing tx is almost certainly still
+                // propagating or awaiting its first block.
+                if start.elapsed() >= config.dropped_grace {
+                    if provider.get_transaction_by_hash(tx_hash).await?.is_none() {
+                        consecutive_misses += 1;
+
+                        if consecutive_misses >= config.dropped_consecutive_misses {
+                            return Err(EvmError::TransactionDropped {
+                                tx_hash,
+                                elapsed_secs: start.elapsed().as_secs(),
+                            });
+                        }
+                    } else {
+                        // Tx is still in the mempool; it was not dropped.
+                        consecutive_misses = 0;
+                    }
                 }
 
                 continue;
@@ -660,11 +912,11 @@ pub(crate) async fn wait_for_receipt_with_config(
     .await
     .map_err(|_| EvmError::ReceiptTimeout {
         tx_hash,
-        timeout_secs: inclusion_timeout.as_secs(),
+        timeout_secs: config.inclusion_timeout.as_secs(),
     })??;
 
     // Phase 2: wait for confirmation depth (generous timeout).
-    timeout(confirmation_timeout, async {
+    timeout(config.confirmation_timeout, async {
         loop {
             let current_block = provider.get_block_number().await?;
             let confirmations = current_block.saturating_sub(receipt_block) + 1;
@@ -679,7 +931,7 @@ pub(crate) async fn wait_for_receipt_with_config(
     .await
     .map_err(|_| EvmError::ReceiptTimeout {
         tx_hash,
-        timeout_secs: confirmation_timeout.as_secs(),
+        timeout_secs: config.confirmation_timeout.as_secs(),
     })?
 }
 
@@ -716,11 +968,156 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{Address, U256};
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
     use std::sync::Arc;
 
     use super::*;
+
+    /// Build a mock provider whose `eth_blockNumber` returns the given sequence
+    /// of block numbers in order, one per call.
+    fn mock_block_number_provider(block_numbers: &[u64]) -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        for block in block_numbers {
+            asserter.push_success(&serde_json::Value::from(*block));
+        }
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_succeeds_when_node_is_already_at_required_block() {
+        let provider = mock_block_number_provider(&[10]);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("node is at required block — should succeed immediately");
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_succeeds_when_node_is_ahead_of_required_block() {
+        let provider = mock_block_number_provider(&[15]);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("node tip > required block — should succeed immediately");
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_retries_until_node_catches_up() {
+        // Node returns blocks 8, 9 (below required 10), then 10 (at required).
+        let provider = mock_block_number_provider(&[8, 9, 10]);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("node catches up on third poll — should succeed");
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_fails_after_budget_exhausted() {
+        // Node always reports block 5, never reaching required block 10.
+        let provider = mock_block_number_provider(&[5, 5, 5]);
+
+        let error = wait_for_node_sync(&provider, 10, Duration::ZERO, 3)
+            .await
+            .expect_err("budget exhausted — should fail");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::NodeBehindRequiredBlock {
+                    observed_tip: 5,
+                    required_block: 10,
+                    attempts: 3,
+                }
+            ),
+            "expected NodeBehindRequiredBlock with correct fields, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_fails_with_transport_error_when_all_attempts_fail() {
+        let asserter = Asserter::new();
+        // Push 3 transport error responses; the exact error returned is an
+        // implementation detail — the contract is that EvmError::Transport is
+        // propagated after the budget is exhausted with all-transport errors.
+        for iteration in 1u32..=3 {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("connection refused attempt {iteration}").into(),
+                data: None,
+            });
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_node_sync(&provider, 10, Duration::ZERO, 3).await;
+
+        let error =
+            result.expect_err("all transport errors should propagate as EvmError::Transport");
+        assert!(
+            matches!(error, EvmError::Transport(_)),
+            "expected EvmError::Transport after exhausting budget with all-transport errors, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_node_sync_succeeds_when_second_attempt_succeeds_after_transport_error() {
+        let asserter = Asserter::new();
+        // First attempt: transport error; second attempt: block 10 (at required).
+        let error_payload = alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "connection refused".into(),
+            data: None,
+        };
+        asserter.push_failure(error_payload);
+        asserter.push_success(&serde_json::Value::from(10u64));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        wait_for_node_sync(&provider, 10, Duration::ZERO, 5)
+            .await
+            .expect("first transport error then success at block 10 — should succeed");
+    }
+
+    /// Verifies that when early attempts observe a stale tip (poll succeeded)
+    /// and the final attempt returns a transport error, the function returns
+    /// `NodeBehindRequiredBlock` (not `Transport`) using the last observed tip.
+    ///
+    /// This distinguishes the mixed case (some polls succeeded, node stale)
+    /// from the all-transport-error case (every poll failed before seeing any
+    /// block number). Only the all-transport-error case returns `Transport`.
+    #[tokio::test]
+    async fn wait_for_node_sync_returns_node_behind_when_stale_then_transport_error() {
+        let asserter = Asserter::new();
+        let stale_tip = 5u64;
+        let required_block = 10u64;
+        // First two attempts return a stale block number.
+        asserter.push_success(&serde_json::Value::from(stale_tip));
+        asserter.push_success(&serde_json::Value::from(stale_tip));
+        // Third (final) attempt returns a transport error.
+        asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "connection refused on final attempt".into(),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = wait_for_node_sync(&provider, required_block, Duration::ZERO, 3)
+            .await
+            .expect_err("mixed stale-then-transport must fail");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::NodeBehindRequiredBlock {
+                    observed_tip: 5,
+                    required_block: 10,
+                    attempts: 3,
+                }
+            ),
+            "must return NodeBehindRequiredBlock with last observed tip when at \
+             least one poll succeeded, got: {error:?}"
+        );
+    }
 
     sol!(
         #![sol(all_derives = true, rpc)]
@@ -1003,15 +1400,108 @@ mod tests {
             &provider,
             fake_hash,
             1,
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(60),
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(50),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(60),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
         )
         .await;
 
         assert!(
             matches!(result, Err(EvmError::TransactionDropped { tx_hash, .. }) if tx_hash == fake_hash),
             "expected TransactionDropped for nonexistent tx, got: {result:?}"
+        );
+    }
+
+    /// Regression for RAI-904: a tx that is still visible in the mempool (not
+    /// yet mined) must NEVER be reported as dropped — even on a slow chain.
+    /// Before the fix, a single `get_transaction_by_hash == None` after a few
+    /// polls falsely failed a live tx; now a mempool sighting keeps it alive
+    /// until the inclusion timeout, surfacing `ReceiptTimeout`, not
+    /// `TransactionDropped`.
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_does_not_drop_tx_visible_in_mempool() {
+        // `--no-mining`: the tx is accepted into the mempool but never mined,
+        // so `get_transaction_receipt` stays None while `get_transaction_by_hash`
+        // returns the pending tx.
+        let anvil = Anvil::new().arg("--no-mining").spawn();
+        let signer = anvil_signer(&anvil);
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(anvil.endpoint_url());
+
+        let tx = TransactionRequest::default()
+            .to(Address::ZERO)
+            .value(U256::ZERO);
+        let pending = provider.send_transaction(tx).await.unwrap();
+        let tx_hash = *pending.tx_hash();
+
+        let read_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let result = wait_for_receipt_with_config(
+            &read_provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(50),
+                inclusion_timeout: std::time::Duration::from_millis(600),
+                confirmation_timeout: std::time::Duration::from_secs(60),
+                // Grace already elapsed and a single miss would trip the old
+                // logic — the tx is in the mempool, so it must not be dropped.
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { tx_hash: ht, .. }) if ht == tx_hash),
+            "a live (pending) tx must time out, not be reported dropped, got: {result:?}"
+        );
+    }
+
+    /// The dropped-from-mempool check must not fire before the grace period,
+    /// even for a genuinely absent tx (RAI-904).
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_respects_dropped_grace() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let fake_hash = alloy::primitives::B256::random();
+        let grace = std::time::Duration::from_millis(400);
+        let start = std::time::Instant::now();
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            fake_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(50),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(60),
+                dropped_grace: grace,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(EvmError::TransactionDropped { .. })),
+            "expected TransactionDropped once grace elapsed, got: {result:?}"
+        );
+        assert!(
+            elapsed >= grace,
+            "drop must not be declared before the grace period: elapsed {elapsed:?} < {grace:?}"
         );
     }
 

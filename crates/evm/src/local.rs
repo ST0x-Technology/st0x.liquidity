@@ -10,13 +10,16 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
-use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::TransactionReceipt;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use futures::lock::Mutex;
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use std::sync::Arc;
+use tracing::info;
 
 use crate::nonce::ResettableNonceManager;
+use crate::submit::send_with_recovery;
 use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Secrets needed to construct a [`RawPrivateKeyWallet`].
@@ -67,6 +70,10 @@ pub struct RawPrivateKeyWallet<P: Provider> {
     /// `signing_provider` so we can call [`invalidate()`] on "nonce
     /// too low" errors without needing to traverse the filler chain.
     nonce_manager: ResettableNonceManager,
+    /// Serializes sends from this wallet so concurrent callers cannot
+    /// build two transactions at the same nonce. Shared across clones so
+    /// every handle to the same address contends on one lock.
+    send_lock: Arc<Mutex<()>>,
     required_confirmations: u64,
 }
 
@@ -105,6 +112,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
+            send_lock: Arc::new(Mutex::new(())),
             required_confirmations,
         })
     }
@@ -145,44 +153,16 @@ where
     ) -> Result<TxHash, EvmError> {
         info!(target: "wallet", %contract, note, "Submitting local contract call");
 
-        let tx = TransactionRequest::default()
-            .to(contract)
-            .input(calldata.into());
-
-        let pending = match self.signing_provider.send_transaction(tx.clone()).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                let error = EvmError::from(error);
-
-                if !error.is_nonce_too_low() {
-                    warn!(target: "wallet", %contract, note, "Transaction rejected \
-                        by RPC -- invalidating nonce cache to prevent nonce gap");
-                    self.nonce_manager.invalidate();
-                    return Err(error);
-                }
-
-                warn!(target: "wallet", %contract, note, "Nonce too low — \
-                    invalidating cache and retrying (external nonce change detected)");
-                self.nonce_manager.invalidate();
-
-                self.signing_provider
-                    .send_transaction(tx)
-                    .await
-                    .map_err(|error| {
-                        let error = EvmError::from(error);
-                        error!(target: "wallet", %error, "Nonce-too-low retry also failed \
-                            -- invalidating nonce cache");
-                        self.nonce_manager.invalidate();
-                        error
-                    })?
-            }
-        };
-
-        let tx_hash = *pending.tx_hash();
-
-        info!(target: "wallet", %tx_hash, note, "Transaction submitted");
-
-        Ok(tx_hash)
+        send_with_recovery(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.send_lock,
+            self.signing_provider.default_signer_address(),
+            contract,
+            calldata,
+            note,
+        )
+        .await
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {

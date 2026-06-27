@@ -1,38 +1,70 @@
 //! Mock implementations for onchain services.
 
 use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy::primitives::{Address, B256, Bloom, Log as PrimitiveLog, TxHash, U256};
+use alloy::primitives::{Address, Bloom, Log as PrimitiveLog, TxHash, U256};
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::SolEvent;
 use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::sync::Mutex;
 
-use st0x_evm::EvmError;
-use st0x_execution::Symbol;
-
-use super::raindex::{Raindex, RaindexError, RaindexVaultId};
-use crate::bindings::IERC20;
+use st0x_evm::{EvmError, IERC20};
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
 /// with an "execution reverted" RPC error (simulating a revert during
-/// gas estimation).
+/// gas estimation, e.g. `ERC20InsufficientBalance` when tokens are
+/// already in the vault from a previous session).
 #[derive(Default)]
-enum DepositBehavior {
+pub(crate) enum DepositBehavior {
     #[default]
     Succeed,
     FailGeneric,
     FailExecutionReverted,
 }
 
-pub(crate) struct MockRaindex {
-    vault_id: RaindexVaultId,
+/// Whether `confirm_tx_receipt` should succeed, fail terminally
+/// (simulating a submitted transaction whose receipt never
+/// materializes), or fail with a retryable inconclusive scan
+/// (simulating RPC lag rather than a dropped transaction).
+#[derive(Default)]
+pub(crate) enum ConfirmTxBehavior {
+    #[default]
+    Succeed,
+    Fail,
+    Retryable,
+    /// Returns a successful receipt but with `block_number: None`.
+    /// Simulates the conformant-but-rare RPC edge case where a receipt
+    /// is returned without a block number (e.g. a pending or uncle-block
+    /// receipt from a load-balanced RPC).
+    SucceedWithoutBlockNumber,
+}
+
+/// Arguments captured from the last `submit_deposit` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepositCall {
+    pub(crate) token: Address,
+    pub(crate) vault_id: RaindexVaultId,
+    pub(crate) amount: U256,
+    pub(crate) decimals: u8,
+}
+
+/// Arguments captured from the last `submit_withdraw` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WithdrawCall {
     token: Address,
+    amount: U256,
+}
+
+pub(crate) struct MockRaindex {
     withdraw_tx: TxHash,
     deposit_tx: TxHash,
     deposit_behavior: DepositBehavior,
+    confirm_behavior: ConfirmTxBehavior,
     deposited_token: Mutex<Option<Address>>,
-    withdraw_transfer: Mutex<Option<(Address, U256)>>,
+    deposit_call: Mutex<Option<DepositCall>>,
+    confirmed_tx: Mutex<Option<TxHash>>,
+    withdraw_transfer: Mutex<Option<WithdrawCall>>,
     withdraw_actual_amount: Option<U256>,
 }
 
@@ -86,45 +118,31 @@ fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
 impl MockRaindex {
     pub(crate) fn new() -> Self {
         Self {
-            vault_id: RaindexVaultId(B256::ZERO),
-            token: Address::ZERO,
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
             deposit_behavior: DepositBehavior::Succeed,
+            confirm_behavior: ConfirmTxBehavior::Succeed,
             deposited_token: Mutex::new(None),
+            deposit_call: Mutex::new(None),
+            confirmed_tx: Mutex::new(None),
             withdraw_transfer: Mutex::new(None),
             withdraw_actual_amount: None,
         }
     }
 
-    pub(crate) fn failing_deposit() -> Self {
-        Self {
-            vault_id: RaindexVaultId(B256::ZERO),
-            token: Address::ZERO,
-            withdraw_tx: TxHash::random(),
-            deposit_tx: TxHash::random(),
-            deposit_behavior: DepositBehavior::FailGeneric,
-            deposited_token: Mutex::new(None),
-            withdraw_transfer: Mutex::new(None),
-            withdraw_actual_amount: None,
-        }
+    /// Configures how `submit_deposit` behaves; combinable with the
+    /// confirm-behaviour knob, unlike the former one-knob-per-constructor
+    /// design.
+    pub(crate) fn with_deposit_behavior(mut self, behavior: DepositBehavior) -> Self {
+        self.deposit_behavior = behavior;
+        self
     }
 
-    /// Creates a mock that fails `submit_deposit` with an "execution
-    /// reverted" RPC error, simulating a revert during gas estimation
-    /// (e.g., `ERC20InsufficientBalance` when tokens are already in
-    /// the vault from a previous session).
-    pub(crate) fn reverting_deposit() -> Self {
-        Self {
-            vault_id: RaindexVaultId(B256::ZERO),
-            token: Address::ZERO,
-            withdraw_tx: TxHash::random(),
-            deposit_tx: TxHash::random(),
-            deposit_behavior: DepositBehavior::FailExecutionReverted,
-            deposited_token: Mutex::new(None),
-            withdraw_transfer: Mutex::new(None),
-            withdraw_actual_amount: None,
-        }
+    /// Configures how `confirm_tx_receipt` behaves; combinable with the
+    /// deposit-behaviour knob.
+    pub(crate) fn with_confirm_behavior(mut self, behavior: ConfirmTxBehavior) -> Self {
+        self.confirm_behavior = behavior;
+        self
     }
 
     /// Returns the token address that was passed to the last `deposit()` call.
@@ -132,9 +150,12 @@ impl MockRaindex {
         *self.deposited_token.lock().unwrap()
     }
 
-    pub(crate) fn with_token(mut self, token: Address) -> Self {
-        self.token = token;
-        self
+    pub(crate) fn last_deposit_call(&self) -> Option<DepositCall> {
+        *self.deposit_call.lock().unwrap()
+    }
+
+    pub(crate) fn last_confirmed_tx(&self) -> Option<TxHash> {
+        *self.confirmed_tx.lock().unwrap()
     }
 
     pub(crate) fn with_withdraw_actual_amount(mut self, amount: U256) -> Self {
@@ -145,17 +166,6 @@ impl MockRaindex {
 
 #[async_trait]
 impl Raindex for MockRaindex {
-    async fn lookup_vault_id(&self, _token: Address) -> Result<RaindexVaultId, RaindexError> {
-        Ok(self.vault_id)
-    }
-
-    async fn lookup_vault_info(
-        &self,
-        _symbol: &Symbol,
-    ) -> Result<(Address, RaindexVaultId), RaindexError> {
-        Ok((self.token, self.vault_id))
-    }
-
     async fn withdraw(
         &self,
         _token: Address,
@@ -169,13 +179,19 @@ impl Raindex for MockRaindex {
     async fn submit_deposit(
         &self,
         token: Address,
-        _vault_id: RaindexVaultId,
-        _amount: U256,
-        _decimals: u8,
+        vault_id: RaindexVaultId,
+        amount: U256,
+        decimals: u8,
     ) -> Result<TxHash, RaindexError> {
         match self.deposit_behavior {
             DepositBehavior::Succeed => {
                 *self.deposited_token.lock().unwrap() = Some(token);
+                *self.deposit_call.lock().unwrap() = Some(DepositCall {
+                    token,
+                    vault_id,
+                    amount,
+                    decimals,
+                });
                 Ok(self.deposit_tx)
             }
             DepositBehavior::FailGeneric => Err(RaindexError::ZeroAmount),
@@ -210,7 +226,10 @@ impl Raindex for MockRaindex {
         target_amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        *self.withdraw_transfer.lock().unwrap() = Some((token, target_amount));
+        *self.withdraw_transfer.lock().unwrap() = Some(WithdrawCall {
+            token,
+            amount: target_amount,
+        });
         Ok(self.withdraw_tx)
     }
 
@@ -218,11 +237,41 @@ impl Raindex for MockRaindex {
         &self,
         tx_hash: TxHash,
     ) -> Result<TransactionReceipt, RaindexError> {
+        *self.confirmed_tx.lock().unwrap() = Some(tx_hash);
+
+        match self.confirm_behavior {
+            ConfirmTxBehavior::Fail => {
+                return Err(RaindexError::Evm(EvmError::TransactionDropped {
+                    tx_hash,
+                    elapsed_secs: 0,
+                }));
+            }
+            ConfirmTxBehavior::Retryable => {
+                return Err(RaindexError::ScanInconclusive { from_block: 0 });
+            }
+            ConfirmTxBehavior::SucceedWithoutBlockNumber => {
+                let logs = self
+                    .withdraw_transfer
+                    .lock()
+                    .unwrap()
+                    .map(|WithdrawCall { token, amount }| {
+                        let amount = self.withdraw_actual_amount.unwrap_or(amount);
+                        vec![transfer_log(token, Address::ZERO, amount)]
+                    })
+                    .unwrap_or_default();
+
+                let mut receipt = successful_receipt(tx_hash, logs);
+                receipt.block_number = None;
+                return Ok(receipt);
+            }
+            ConfirmTxBehavior::Succeed => {}
+        }
+
         let logs = self
             .withdraw_transfer
             .lock()
             .unwrap()
-            .map(|(token, amount)| {
+            .map(|WithdrawCall { token, amount }| {
                 let amount = self.withdraw_actual_amount.unwrap_or(amount);
                 vec![transfer_log(token, Address::ZERO, amount)]
             })

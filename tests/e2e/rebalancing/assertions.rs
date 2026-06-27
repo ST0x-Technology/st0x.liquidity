@@ -25,6 +25,7 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
@@ -35,8 +36,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Positive, Usd};
 pub(crate) use st0x_hedge::UsdcRebalancing;
-use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{BrokerCtx, Ctx};
+use st0x_hedge::bindings::IRaindexV6;
 pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
@@ -207,7 +207,17 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     cash_vault_id: B256,
     usdc_rebalancing: UsdcRebalancing,
     cash_rebalancing: OperationMode,
+    wrapped_equity_recovery: OperationMode,
+    // Equity imbalance threshold. Defaults to the standard (0.5 target, 0.1
+    // deviation). Recovery tests pass a huge deviation to suppress equity
+    // rebalancing transfers (which would churn the wallet/vault and starve a
+    // second recovery) while keeping `rebalancing: Enabled` so the wallet
+    // poller still emits the events that dispatch recovery jobs.
+    equity_imbalance: Option<ImbalanceThreshold>,
     redemption_wallet: Address,
+    /// Base URL of the mock issuance service (`TestInfra::issuance_base_url`) so
+    /// the rebalancing freeze guard reaches a reachable, not-frozen endpoint.
+    issuance_base_url: url::Url,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -228,9 +238,11 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                 EquityAssetConfig {
                     tokenized_equity: unwrapped,
                     tokenized_equity_derivative: wrapped,
+                    pyth_feed_id: None,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery,
                     operational_limit: None,
                 },
             ))
@@ -241,13 +253,17 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         TestWallet::new(&chain.owner_key, chain.endpoint().parse()?, 1)?,
     );
 
+    let equity_threshold = match equity_imbalance {
+        Some(threshold) => threshold,
+        None => ImbalanceThreshold::new(float!(0.5), float!(0.1))?,
+    };
+
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
+        .equity(equity_threshold)
         .usdc(usdc_rebalancing)
         .call();
 
-    let wallet_ctx =
-        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet.clone(), base_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet.clone(), base_wallet);
 
     let assets = AssetsConfig {
         equities: EquitiesConfig {
@@ -262,9 +278,9 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         }),
     };
 
-    Ctx::for_test()
+    let mut ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(chain.ws_endpoint()?)
+        .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
@@ -273,8 +289,9 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .wallet(wallet_ctx)
         .assets(assets)
         .redemption_wallet(redemption_wallet)
-        .call()
-        .map_err(Into::into)
+        .call()?;
+    ctx.issuance.base_url = issuance_base_url;
+    Ok(ctx)
 }
 
 /// Builds a `Ctx` with USDC rebalancing enabled and both chain endpoints.
@@ -289,6 +306,7 @@ pub(crate) fn build_usdc_rebalancing_ctx<BP>(
     usdc_vault_id: B256,
     cctp: CctpOverrides,
     reserved: Option<Positive<Usd>>,
+    wrapped_equity_recovery: OperationMode,
 ) -> anyhow::Result<Ctx>
 where
     BP: Provider + Clone,
@@ -312,9 +330,11 @@ where
                 EquityAssetConfig {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
+                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery,
                     operational_limit: None,
                 },
             ))
@@ -339,12 +359,11 @@ where
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
-    let wallet_ctx =
-        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(base_chain.ws_endpoint()?)
+        .rpc_url(base_chain.endpoint().parse()?)
         .orderbook(base_chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
@@ -559,7 +578,7 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
     let mut total_refilled_wrapped_shares_delta = U256::ZERO;
     for ((token, vault_id), pre_rebalance_balance) in consumed_output_vaults {
         let post_rebalance_balance = orderbook
@@ -754,7 +773,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
             Ok(((result.input_token, result.input_vault_id), after_take))
         })
         .collect::<anyhow::Result<_>>()?;
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
     let mut total_withdrawn_wrapped_shares = U256::ZERO;
     for ((token, vault_id), pre_rebalance_balance) in &redeemed_input_vaults {
         let post_rebalance_balance = orderbook
@@ -1019,6 +1038,7 @@ fn usdc_rebalance_expectations(
                 "UsdcRebalanceEvent::ConversionConfirmed",
                 "UsdcRebalanceEvent::Initiated",
                 "UsdcRebalanceEvent::WithdrawalConfirmed",
+                "UsdcRebalanceEvent::BridgingSubmitting",
                 "UsdcRebalanceEvent::BridgingInitiated",
                 "UsdcRebalanceEvent::BridgeAttestationReceived",
                 "UsdcRebalanceEvent::Bridged",
@@ -1031,8 +1051,10 @@ fn usdc_rebalance_expectations(
         },
         UsdcRebalanceType::BaseToAlpaca => UsdcRebalanceExpectations {
             event_sequence: &[
+                "UsdcRebalanceEvent::WithdrawalSubmitting",
                 "UsdcRebalanceEvent::Initiated",
                 "UsdcRebalanceEvent::WithdrawalConfirmed",
+                "UsdcRebalanceEvent::BridgingSubmitting",
                 "UsdcRebalanceEvent::BridgingInitiated",
                 "UsdcRebalanceEvent::BridgeAttestationReceived",
                 "UsdcRebalanceEvent::Bridged",
@@ -1204,7 +1226,7 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     event_amounts: &UsdcRebalanceEventAmounts,
     take_results: &[TakeOrderResult],
 ) -> anyhow::Result<()> {
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
     let vault_balance = orderbook
         .vaultBalance2(owner, base_chain::USDC_BASE, usdc_vault_id)
         .call()
@@ -1287,13 +1309,21 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
             // mid-flight state, not baseline.
             U256::ZERO
         }
-        UsdcRebalanceType::BaseToAlpaca => ethereum_usdc_balance_before_rebalance
-            .checked_add(event_amounts.bridged_amount_received)
-            .ok_or_else(|| anyhow::anyhow!("Ethereum USDC overflow on BaseToAlpaca mint"))?,
+        UsdcRebalanceType::BaseToAlpaca => {
+            // The CCTP mint credits `bridged_amount_received` to the bot's
+            // Ethereum wallet, then the deposit-send leg forwards exactly that
+            // same amount on to Alpaca's deposit address -- a net-zero change --
+            // so the wallet ends at the pre-rebalance reading. (Before this send
+            // leg the minted USDC stayed in the wallet; the leg now moves it to
+            // Alpaca.) The BaseToAlpaca mint lands after the on-chain
+            // withdraw/burn, so `before` is captured pre-mint at baseline.
+            ethereum_usdc_balance_before_rebalance
+        }
     };
     assert_eq!(
         ethereum_usdc_balance_after_rebalance, expected_ethereum_post_units,
-        "Ethereum USDC balance should reconcile exactly with CCTP transfer amount"
+        "Ethereum USDC balance should reconcile exactly: the CCTP mint credits \
+         the wallet and the deposit-send forwards it to Alpaca, returning to zero"
     );
 
     Ok(())

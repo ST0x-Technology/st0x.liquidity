@@ -14,7 +14,7 @@
 //!
 //! - [`simulate_failures`]: Same live simulation, but first creates stuck
 //!   mint and redemption rebalances where the local aggregate failed while
-//!   the mock provider later completed, so `recheck-transfer` can recover them.
+//!   the mock provider later completed, so `transfer recheck` can recover them.
 //!   Run via `nix run .#simulate-failures`.
 
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
@@ -42,7 +43,6 @@ use st0x_execution::{
 };
 use st0x_finance::{Positive, Usd};
 use st0x_hedge::cli::TransferType;
-use st0x_hedge::config::{BrokerCtx, Ctx};
 use st0x_hedge::mock_api::{
     REDEMPTION_WALLET, RedemptionOutcome, TokenizationRequestType, TokenizationStatus,
 };
@@ -78,6 +78,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     rest_api_url: Option<&str>,
     cash_reserved: Option<Positive<Usd>>,
     server_port: u16,
+    board_port: u16,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -98,9 +99,11 @@ fn build_full_system_ctx<P: Provider + Clone>(
                 EquityAssetConfig {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
+                    pyth_feed_id: None,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -129,12 +132,11 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
-    let wallet_ctx =
-        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(chain.ws_endpoint()?)
+        .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
@@ -155,9 +157,9 @@ fn build_full_system_ctx<P: Provider + Clone>(
         })
         .inventory_poll_interval(15)
         .server_port(server_port)
+        .board_port(board_port)
         .maybe_rest_api(
-            rest_api_url
-                .map(|url| st0x_hedge::config::RestApiCtx::unauthenticated(url.to_string())),
+            rest_api_url.map(|url| st0x_config::RestApiCtx::unauthenticated(url.to_string())),
         )
         .redemption_wallet(REDEMPTION_WALLET)
         .call()
@@ -319,6 +321,7 @@ fn write_simulate_failure_cli_files<P: Provider + Clone>(
     infra: &TestInfra<P>,
     cctp: &CctpInfra,
     server_port: u16,
+    board_port: u16,
     current_block: u64,
     usdc_vault_id: B256,
     equity_vault_ids: &HashMap<String, B256>,
@@ -335,6 +338,7 @@ fn write_simulate_failure_cli_files<P: Provider + Clone>(
 
     let config = format!(
         r#"server_port = {server_port}
+board_port = {board_port}
 log_level = "debug"
 database_url = "{database_url}"
 apalis_finished_job_cleanup_interval_secs = 3600
@@ -350,6 +354,7 @@ beneficiary_entity_name = "Simulate Failures"
 orderbook = "{orderbook}"
 deployment_block = {current_block}
 required_confirmations = 0
+ingestion_cutoff = "safe"
 
 [wallet]
 kind = "private-key"
@@ -360,6 +365,8 @@ redemption_wallet = "{redemption_wallet}"
 
 [rebalancing]
 transfer_timeout_secs = 1800
+transfer_attempt_timeout_secs = 3600
+attestation_retry_deadline_secs = 86400
 equity = {{ target = 0.5, deviation = 0.1 }}
 usdc = {{ mode = "enabled", target = 0.5, deviation = 0.1 }}
 
@@ -369,6 +376,7 @@ tokenized_equity_derivative = "{aapl_wrapped}"
 vault_ids = ["{aapl_vault_id:#x}"]
 trading = "enabled"
 rebalancing = "enabled"
+wrapped_equity_recovery = "disabled"
 
 [assets.equities.TSLA]
 tokenized_equity = "{tsla_unwrapped}"
@@ -376,6 +384,7 @@ tokenized_equity_derivative = "{tsla_wrapped}"
 vault_ids = ["{tsla_vault_id:#x}"]
 trading = "enabled"
 rebalancing = "enabled"
+wrapped_equity_recovery = "disabled"
 
 [assets.cash]
 vault_ids = ["{usdc_vault_id:#x}"]
@@ -393,7 +402,7 @@ rebalancing = "enabled"
         r#"hyperdx.api_key = "simulate-failures"
 
 [evm]
-ws_rpc_url = "{ws_rpc_url}"
+rpc_url = "{rpc_url}"
 base_rpc_url = "{base_rpc_url}"
 ethereum_rpc_url = "{ethereum_rpc_url}"
 
@@ -407,7 +416,7 @@ account_id = "{account_id}"
 [wallet]
 private_key = "{private_key:#x}"
 "#,
-        ws_rpc_url = infra.base_chain.ws_endpoint()?,
+        rpc_url = infra.base_chain.endpoint(),
         base_rpc_url = infra.base_chain.endpoint(),
         ethereum_rpc_url = cctp.ethereum_endpoint,
         broker_base_url = infra.broker_service.base_url(),
@@ -447,7 +456,7 @@ fn log_recheck_command(
     };
     let command = format!(
         "nix develop --command cargo run --features mock --bin cli -- \
-         --config {} --secrets {} recheck-transfer --type {} --id {}",
+         --config {} --secrets {} transfer recheck --kind {} --id {}",
         config_path.display(),
         secrets_path.display(),
         transfer_type_arg,
@@ -579,6 +588,7 @@ async fn full_system() -> anyhow::Result<()> {
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
         .server_port(8001)
+        .board_port(8002)
         .call()?;
 
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
@@ -740,10 +750,11 @@ async fn full_system() -> anyhow::Result<()> {
     let pool = connect_db(&infra.db_path).await?;
     let usdc_events = count_events(&pool, "UsdcRebalance").await?;
     assert!(
-        usdc_events >= 9,
-        "USDC rebalance should emit at least Initiated + WithdrawalConfirmed + \
-         BridgingInitiated + BridgeAttestationReceived + Bridged + DepositInitiated + \
-         DepositConfirmed + ConversionInitiated + ConversionConfirmed, got {usdc_events}",
+        usdc_events >= 11,
+        "USDC rebalance should emit at least WithdrawalSubmitting + Initiated + \
+         WithdrawalConfirmed + BridgingSubmitting + BridgingInitiated + \
+         BridgeAttestationReceived + Bridged + DepositInitiated + DepositConfirmed + \
+         ConversionInitiated + ConversionConfirmed, got {usdc_events}",
     );
     pool.close().await;
 
@@ -881,6 +892,7 @@ async fn simulate() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
+        .board_port(server_port + 1)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 
@@ -951,7 +963,7 @@ async fn simulate() -> anyhow::Result<()> {
 /// Failure-injection simulation: starts the full system, performs normal trades
 /// to create recoverable AAPL mint and TSLA redemption failures, then advances
 /// the mock issuer/provider to Completed. The dashboard should show the failed
-/// transfers until `recheck-transfer` recovers them.
+/// transfers until `transfer recheck` recovers them.
 ///
 /// Run via `nix run .#simulate-failures`. Set
 /// `SIMULATE_EXIT_AFTER_SELF_HEAL=1` when running under automated verification
@@ -1079,6 +1091,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
+        .board_port(server_port + 1)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
     let cli_ctx = ctx.clone();
@@ -1087,6 +1100,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         &infra,
         &cctp,
         server_port,
+        server_port + 1,
         current_block,
         usdc_vault_id,
         &equity_vault_ids,
@@ -1233,7 +1247,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         // `ProviderCompletionRecovered` is the terminal recovery event: the
         // redemption aggregate evolves straight to the `Completed` state from
         // it (no separate `Completed` event is ever written), so its presence
-        // is the end-to-end proof that recheck-transfer completed the redemption.
+        // is the end-to-end proof that transfer recheck completed the redemption.
         poll_for_events_with_timeout(
             &mut bot,
             &infra.db_path,
@@ -1243,7 +1257,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         )
         .await;
         info!(
-            "Recovery verified: recheck-transfer completed stuck mint and redemption rebalances."
+            "Recovery verified: transfer recheck completed stuck mint and redemption rebalances."
         );
         bot.abort();
         return Ok(());

@@ -18,15 +18,14 @@
     rain-math-float = {
       type = "git";
       url = "https://github.com/rainlanguage/rain.math.float";
-      rev = "5a12bf839bea0ce9528a0e1810d620c44812283a";
+      rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b";
       flake = false;
     };
 
     rain-orderbook = {
       type = "git";
       url = "https://github.com/rainlanguage/rain.orderbook";
-      rev = "f7bf51ab3db0bac4f8551b91000c69cc5ba0db71";
-      submodules = true;
+      rev = "29219ff36170224786025b5c9e8fef2e460638b3";
       flake = false;
     };
 
@@ -79,16 +78,19 @@
     }:
     let
       inherit (import ./keys.nix) keys;
+      inherit (rainix.inputs.nixpkgs) lib;
       environments = {
         prod = {
           nodeName = "st0x-liquidity";
           volumeName = "st0x-liquidity-data";
           hostKey = keys.host-prod;
+          tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
         };
         staging = {
           nodeName = "st0x-liquidity-staging";
           volumeName = "st0x-liquidity-staging-data";
           hostKey = keys.host-staging;
+          tailscaleMagicDnsName = "st0x-liquidity-staging.taile5cf8a.ts.net";
         };
       };
       envNames = builtins.attrNames environments;
@@ -98,11 +100,11 @@
         let
           mkNixos =
             { environment, modules }:
-            rainix.inputs.nixpkgs.lib.nixosSystem {
+            lib.nixosSystem {
               system = "x86_64-linux";
               specialArgs = {
                 inherit environment;
-                inherit (environments.${environment}) volumeName;
+                inherit (environments.${environment}) volumeName tailscaleMagicDnsName;
                 inherit (self.packages.x86_64-linux) st0x-cli;
               };
               modules = [ disko.nixosModules.disko ] ++ modules;
@@ -139,7 +141,15 @@
           ]) envNames
         );
 
-      deploy = (import ./deploy.nix { inherit deploy-rs self environments; }).config;
+      deploy =
+        (import ./deploy.nix {
+          inherit
+            lib
+            deploy-rs
+            self
+            environments
+            ;
+        }).config;
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -172,7 +182,12 @@
 
         deployScripts =
           (import ./deploy.nix {
-            inherit deploy-rs self environments;
+            inherit
+              lib
+              deploy-rs
+              self
+              environments
+              ;
           }).mkDeployScripts
             {
               inherit pkgs infraPkgs;
@@ -196,11 +211,13 @@
             };
           })
           abis
+          abiEnvs
           abiEnv
           ;
 
         rust = pkgs.callPackage ./rust.nix {
           inherit craneLib abiEnv;
+          rainMathFloatAbiEnv = abiEnvs.rainMathFloat;
           rainMathFloat = rain-math-float;
         };
       in
@@ -331,7 +348,7 @@
               # Same live dashboard stack as `simulate`, but first creates
               # stuck mint and redemption rebalances whose Alpaca mock
               # provider later completes. The backend logs the
-              # recheck-transfer commands needed to recover them.
+              # `transfer recheck` commands needed to recover them.
               "simulate-failures" = mkSimulation {
                 name = "simulate-failures";
                 testFilter = "simulate_failures";
@@ -342,6 +359,17 @@
                 runtimeInputs = [ bun2nix ];
                 text = ''
                   exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
+                '';
+              };
+
+              "pr-template" = pkgs.writeShellApplication {
+                name = "pr-template";
+                runtimeInputs = [
+                  pkgs.gh
+                  pkgs.nushell
+                ];
+                text = ''
+                  exec nu ${./scripts/pr-template.nu} "$@"
                 '';
               };
 
@@ -377,15 +405,13 @@
 
               secret = pkgs.writeShellApplication {
                 name = "secret";
-                runtimeInputs = [ ragenixPkg ];
+                runtimeInputs = [
+                  ragenixPkg
+                  pkgs.nushell
+                  pkgs.coreutils
+                ];
                 text = ''
-                  ${infraPkgs.parseIdentity}
-                  hash_before=$(sha256sum "$1")
-                  ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
-                  hash_after=$(sha256sum "$1")
-                  if [ "$hash_before" != "$hash_after" ]; then
-                    ${rekeySecrets}
-                  fi
+                  exec nu ${./scripts/secret.nu} "$@"
                 '';
               };
 
@@ -456,6 +482,11 @@
                     packages.secret
                     packages.rekey
                     packages.ci
+                    # foundry exposes anvil for cargo tests that spawn a local
+                    # EVM (e.g. cctp + hedging e2e). Pinned rainix doesn't ship
+                    # it in rust-shell, so add it here so cargo nextest from
+                    # the default shell mirrors the ci-backend shell.
+                    foundryBin
                   ]
                   ++ builtins.attrValues infraPkgs.packages
                   ++ builtins.attrValues deployScripts
@@ -492,17 +523,14 @@
             # CI hooks: pre-commit invokes hook tools by absolute /nix/store
             # path, so they must be realized. rainix's rust-shell includes
             # pre-commit + all linter packages (deadnix/nil/nixfmt/statix/
-            # taplo/yamlfmt/shellcheck/deno) without the heavy default closure.
-            ci-hooks = pkgs.mkShell (
-              {
-                shellHook = ''
-                  ${rustShell.shellHook}
-                  ${rainMathFloatLink}
-                '';
-                inherit (rustShell) buildInputs;
-              }
-              // abiEnv
-            );
+            # taplo/yamlfmt/shellcheck/deno) without the backend ABI closure.
+            ci-hooks = pkgs.mkShell {
+              shellHook = ''
+                ${rustShell.shellHook}
+                ${rainMathFloatLink}
+              '';
+              inherit (rustShell) buildInputs;
+            };
           };
       }
     );

@@ -27,9 +27,10 @@ The `Clone` bound enables restart semantics: the supervisor stores the original
 instance and clones it for each attempt. Owned fields reset on restart; fields
 behind `Arc` survive across restarts.
 
-**Key design pattern**: create ephemeral resources (WebSocket connections, HTTP
-clients) INSIDE `run()`, not as struct fields. Each restart establishes fresh
-connections automatically.
+**Key design pattern**: create ephemeral, connection-bound resources INSIDE
+`run()`, not as struct fields, so each restart establishes them fresh. Cheaply
+cloneable, reconnect-tolerant handles (e.g. an HTTP provider) may be held as
+owned fields -- they reset to the stored clone on restart.
 
 ### Supervisor lifecycle
 
@@ -47,27 +48,63 @@ SupervisorBuilder::default()
 
 ### OrderFillMonitor
 
-Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
-ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
-`DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
+Defined in `src/conductor/monitor/order_fills.rs`. Drives continuous HTTP
+`eth_getLogs` ingestion of `ClearV3`/`TakeOrderV3` fills. It is a supervised
+interval task: every `order_fill_poll_interval` seconds it reads the chain's
+latest block for the configured ingestion cutoff tag (set via `ingestion_cutoff`
+in config; recommended value: `safe`), uses it as the cutoff, and enqueues a
+`BackfillRange` job for `(checkpoint+1, cutoff)` (no block for the tag yet ->
+nothing enqueued). The `backfill-worker` fetches the logs and pushes an
+`AccountForDexTrade` job per fill, advancing the persisted checkpoint only on
+success. The cutoff tag is unrelated to `required_confirmations`, which governs
+only transaction-submission paths.
+
+`ingestion_cutoff = "safe"` (recommended): On OP Stack chains like Base, `safe`
+is the latest L2 block whose sequencer batch has been posted to L1 -- typically
+only a few blocks behind the chain tip. Cuts hedging lag from ~20 min to
+~seconds. Tradeoff: a sufficiently deep L1 reorg dropping the batch tx before
+finalization could invalidate a safe-ingested fill; no reversal path exists
+today.
+
+`ingestion_cutoff = "finalized"` (strict): Uses
+`eth_getBlockByNumber("finalized")` (Casper FFG). Full reorg protection but ~20
+min hedging lag on Base.
 
 ```rust
-struct OrderFillMonitor {
-    ws_url: Url,
-    orderbook: Address,
-    job_queue: DexTradeAccountingJobQueue,
+struct OrderFillMonitor<P> {
+    evm_ctx: EvmCtx,
+    backfill_queue: BackfillJobQueue,
+    pool: SqlitePool,
+    provider: P,
+    poll_interval: Duration,
 }
 ```
 
-The WebSocket connection is created inside `run()`. On disconnect or error,
-`run()` returns `Err(...)`, the supervisor restarts the task, and a fresh
-connection is established.
+There is no WebSocket and no live subscription. A previous range still in flight
+is skipped (the checkpoint has not advanced, so re-enqueuing would re-scan the
+same blocks). Transient per-tick errors are logged and swallowed; the loop
+retries on the next tick, and the supervisor restarts only on a panic. This
+replaces the former WS `.watch()` filter polling -- see the module docstring for
+why `eth_subscribe`/`subscribe_logs` was also rejected.
 
 ## One-shot jobs (apalis + Job trait)
 
 Discrete units of work that are serialized to SQLite before processing and have
 a defined point of completion. If the worker crashes or the process restarts,
 unprocessed jobs are still in the database.
+
+**Gotcha -- a job that was _in flight_ (`Running`/`Queued`) when the process
+died is not auto-re-driven on a quick restart.** apalis's `fetch_next` only
+picks `Pending`/retryable-`Failed` rows; an orphaned in-flight row is reset to
+`Pending` only by apalis's `reenqueue_orphaned` sweep, which fires once the
+owning worker's heartbeat ages past `reenqueue_orphaned_after` (5 min default).
+Worker names are deterministic across restarts (`{WORKER_NAME}-{index}`), so a
+fresh process re-registers the same worker id and keeps its heartbeat current --
+the orphan never ages out, and any per-job enqueue dedup keyed off the in-flight
+row then suppresses new work indefinitely. Jobs that must survive a crash
+mid-execution reset their own orphaned rows at startup, before the monitor
+spawns (where every `Running` row is by definition orphaned): see
+`JobQueue::requeue_orphaned`, wired for the Base->Alpaca USDC transfer.
 
 ### Job trait
 
@@ -198,40 +235,66 @@ hedging pipeline:
 ### AccountantCtx
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Bundles all dependencies
-the job needs: config, symbol cache, EVM provider, CQRS frameworks, vault
-registry, executor. Wrapped in `Arc` and injected via apalis `Data`.
+the job needs: config, symbol cache, configured Pyth feed IDs (`PythFeedIds`),
+EVM provider, orderbook address, CQRS frameworks, vault registry, executor,
+database pool, and job queue. Wrapped in `Arc` and injected via apalis `Data`.
 
 ## Conductor assembly
 
 `builder::spawn()` (`src/conductor/builder.rs`) uses `#[bon::builder]` to
-construct a running `Conductor`. Required parameters: `ConductorCtx` (shared
-dependencies), `DexTradeAccountingJobQueue`, `DexEventStreams`. Optional:
-`executor_maintenance`, `rebalancer`.
+construct a running `Conductor`. Takes a `ConductorCtx` (shared dependencies)
+plus per-subsystem job queues, schedulers, and optional handles for rebalancing
+and executor maintenance.
 
 `ConductorCtx` bundles the shared dependencies (config, symbol cache, provider,
-executor, CQRS frameworks, execution threshold, wallet polling config).
+executor, CQRS frameworks, pool, execution threshold, wallet polling config,
+optional `tokenizer: Option<Arc<dyn Tokenizer>>`, shutdown token).
 
 `Conductor` lifecycle:
 
-- `run()` -- the single entry point. Sets up apalis tables, CQRS frameworks,
-  determines cutoff block, backfills historical events, then calls
-  `builder::spawn()` to start the runtime
+- `run()` -- the single entry point. Connects the HTTP provider, sets up apalis
+  tables and CQRS frameworks, seeds the vault registry, requeues orphaned jobs,
+  then calls `builder::spawn()` to start the runtime
 - `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
-  order poller, and position checker; returns when any exits
+  and periodic job cleanup (see periodic cleanup below); returns when any exits
 - `abort_all()` -- shuts down supervisor, aborts all task handles
 
 ## Startup sequencing
 
 ```
-Phase 1 (parallel):  connect_ws | setup_cqrs | setup_apalis_tables
-Phase 2 (parallel):  get_cutoff_block | seed_vaults | setup_rebalancing
-Phase 3 (sequential): backfill checkpoint gap to job queue
-Phase 4:              builder::spawn() starts the runtime
+Phase 1: connect_http (with RPC probe) | setup_apalis_tables | build CQRS stores
+Phase 2: seed_vault_registry (inline, must complete before downstream wiring)
+Phase 3: setup_rebalancing (optional) | requeue_orphaned jobs | hydrate inventory |
+         recover pending orders
+Phase 4: builder::spawn() starts supervisor + apalis workers
 ```
 
-The trade accounting worker starts only after backfill completes. The WS
-subscription is established in phase 1, so no events are missed -- they buffer
-until the monitor starts.
+There is no WebSocket and no pre-runtime backfill pass. `Conductor::run()`
+creates a single HTTP provider before spawn; `OrderFillMonitor` clones it and
+uses it for each poll tick.
+
+Vault registry seeding (`SeedVaultRegistry`) runs inline during Phase 2 so that
+`RaindexService`, trade accounting, and inventory polling start with a populated
+registry. The same `SeedVaultRegistry` job is also registered as an apalis
+worker so the queue can retry on failure if seeding is re-triggered later (e.g.
+from a recovery flow).
+
+Seeding is additive for vault discovery history but authoritative for the
+configured primary vault. Each startup registers every configured vault ID and
+then marks the first entry in the configured vault list (config file order) for
+each asset as primary. A config change from an old vault ID to a new one
+therefore moves deposit/withdraw/rebalancing paths to the new vault after
+restart, while the old vault remains registered so inventory polling can surface
+any stranded balance.
+
+Ingestion is checkpoint-driven `eth_getLogs` polling, not a live subscription,
+so no events are missed across downtime. Reading the ingestion cutoff block (tag
+configured via `ingestion_cutoff`; `safe` is the recommended value) is not a
+startup phase -- the `OrderFillMonitor` poll loop reads the latest cutoff block
+every tick and enqueues a `BackfillRange` job for the gap since the persisted
+checkpoint. The backfill and trade-accounting workers start together in Phase 4;
+catch-up backfill runs continuously after spawn while the monitor always resumes
+from the persisted checkpoint and re-scans any gap.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at

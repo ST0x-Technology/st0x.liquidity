@@ -4,7 +4,7 @@
 //! The default (no features) build ships only the trait and shared domain types.
 //! Enable the `cctp` feature for the Circle CCTP V2 implementation.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 
 #[cfg(feature = "cctp")]
@@ -31,7 +31,7 @@ pub struct BurnReceipt {
 }
 
 /// Receipt from minting USDC on the destination chain.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MintReceipt {
     /// Transaction hash of the mint transaction
     pub tx: TxHash,
@@ -43,11 +43,17 @@ pub struct MintReceipt {
 
 /// Attestation data required to mint on the destination chain.
 pub trait Attestation: Send + Sync {
-    /// Returns the nonce for this attestation.
-    fn nonce(&self) -> u64;
+    /// Returns the 32-byte CCTP V2 nonce for this attestation.
+    fn nonce(&self) -> B256;
 
-    /// Returns the raw attestation bytes.
+    /// Returns the raw attestation signature bytes.
     fn as_bytes(&self) -> &[u8];
+
+    /// Returns the full message envelope bytes. Minting needs the whole
+    /// envelope (not just the signature), so a caller persisting an attestation
+    /// for an offline resume stores these alongside [`Attestation::as_bytes`]
+    /// and later rebuilds via [`Bridge::reconstruct_attestation`].
+    fn message_bytes(&self) -> &[u8];
 }
 
 /// Generic bridge trait for cross-chain USDC transfers.
@@ -82,4 +88,51 @@ pub trait Bridge: Send + Sync + 'static {
         direction: BridgeDirection,
         attestation: &Self::Attestation,
     ) -> Result<MintReceipt, Self::Error>;
+
+    /// Rebuilds an attestation from a persisted message envelope and signature,
+    /// so an `Attested` resume mints offline without re-polling the attestation
+    /// service. The implementation re-derives and validates any embedded nonce,
+    /// so a corrupt or truncated envelope fails here rather than on-chain. This
+    /// keeps reconstruction behind the trait, so callers never depend on a
+    /// concrete attestation representation.
+    fn reconstruct_attestation(
+        &self,
+        message: Vec<u8>,
+        attestation: Vec<u8>,
+    ) -> Result<Self::Attestation, Self::Error>;
+
+    /// Scans the burn source chain for an already-submitted burn matching
+    /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
+    /// crash-safe resume.
+    async fn find_recent_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, Self::Error>;
+
+    /// Scans the mint destination chain for an already-submitted mint to
+    /// `recipient` strictly after `from_block`, for crash-safe resume. Returns
+    /// the receipt so the caller can adopt the existing mint instead of
+    /// re-minting, which reverts on the already-used CCTP nonce and otherwise
+    /// fails the transfer for USDC that was in fact minted.
+    async fn find_recent_mint(
+        &self,
+        direction: BridgeDirection,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Option<MintReceipt>, Self::Error>;
+
+    /// Returns the current head of the mint destination chain for `direction`.
+    /// Captured when the attestation is recorded -- before the mint -- so the
+    /// crash-safe resume scan in [`Bridge::find_recent_mint`] is bounded to
+    /// blocks mined strictly after it.
+    async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
+
+    /// Returns the current head of the burn source chain for `direction`.
+    /// Captured before the burn call so crash-safe resume ([`Bridge::find_recent_burn`])
+    /// has a lower-bound block. For `BaseToEthereum` this is Base chain head;
+    /// for `EthereumToBase` this is Ethereum chain head.
+    async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
 }

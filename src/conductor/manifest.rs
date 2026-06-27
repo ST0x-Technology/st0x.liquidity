@@ -21,6 +21,9 @@ use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
+use crate::performance::HedgeLatencyProjection;
+use crate::performance::rebalance::RebalanceTimingProjection;
+use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::Position;
 use crate::rebalancing::{RebalancingService, equity::EquityTransferServices};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -34,9 +37,16 @@ use crate::usdc_rebalance::UsdcRebalance;
 pub(super) struct QueryManifest {
     rebalancing_service: Arc<RebalancingService>,
     broadcaster: Arc<Broadcaster>,
+    hedge_latency: Arc<HedgeLatencyProjection>,
+    rebalance_timing: Arc<RebalanceTimingProjection>,
+    lifecycle_failure: Arc<LifecycleFailureProjection>,
 }
 
 /// Built CQRS frameworks from the wiring process.
+///
+/// `WrappedEquityRecovery` is built outside this manifest because its
+/// services include `CrossVenueEquityTransfer`, which is constructed
+/// downstream (from the `mint`/`redemption` stores this manifest produces).
 pub(super) struct BuiltFrameworks {
     pub(super) position: Arc<Store<Position>>,
     pub(super) position_projection: Arc<Projection<Position>>,
@@ -50,10 +60,16 @@ impl QueryManifest {
     pub(super) fn new(
         rebalancing_service: Arc<RebalancingService>,
         broadcaster: Arc<Broadcaster>,
+        hedge_latency: Arc<HedgeLatencyProjection>,
+        rebalance_timing: Arc<RebalanceTimingProjection>,
+        lifecycle_failure: Arc<LifecycleFailureProjection>,
     ) -> Self {
         Self {
             rebalancing_service,
             broadcaster,
+            hedge_latency,
+            rebalance_timing,
+            lifecycle_failure,
         }
     }
 
@@ -70,29 +86,37 @@ impl QueryManifest {
         let Self {
             rebalancing_service,
             broadcaster,
+            hedge_latency,
+            rebalance_timing,
+            lifecycle_failure,
         } = self;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
+            .with(hedge_latency)
             .build(())
             .await?;
 
         let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
+            .with(lifecycle_failure.clone())
             .build(services.clone())
             .await?;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
+            .with(lifecycle_failure.clone())
             .build(services)
             .await?;
 
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster)
+            .with(rebalance_timing)
+            .with(lifecycle_failure)
             .build(())
             .await?;
 
@@ -117,33 +141,33 @@ impl QueryManifest {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash, fixed_bytes};
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
     use std::time::Duration;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
     use st0x_execution::{Direction, FractionalShares, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, Venue,
     };
     use crate::onchain::mock::MockRaindex;
     use crate::position::{PositionCommand, TradeId};
+    use crate::rebalancing::equity::TransferEquityToMarketMaking;
     use crate::rebalancing::{
-        RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, TriggeredOperation,
-        drain_pending_jobs,
+        RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
     };
-    use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
+    use crate::test_utils::{rebalancing_enabled_equities, setup_test_pools};
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
-    use crate::wrapper::mock::MockWrapper;
+    use st0x_config::{AssetsConfig, ExecutionThreshold};
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
@@ -157,18 +181,15 @@ mod tests {
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: rebalancing_enabled_equities(&["AAPL"]),
                 cash: None,
             },
-
-            disabled_assets: HashSet::new(),
         }
     }
 
     #[tokio::test]
     async fn build_frameworks_produces_working_stores() {
-        let pool = setup_test_db().await;
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -184,16 +205,25 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service, broadcaster);
+        let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service,
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+            lifecycle_failure,
+        );
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -217,8 +247,7 @@ mod tests {
     /// does not `catch_up` reactor subscribers.
     #[tokio::test]
     async fn build_frameworks_dispatches_live_snapshot_events_to_view() {
-        let pool = setup_test_db().await;
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -234,14 +263,23 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service, broadcaster);
+        let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service,
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+            lifecycle_failure,
+        );
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -281,8 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_frameworks_broadcasts_live_position_updates() {
-        let pool = setup_test_db().await;
-        let (operation_sender, mut operation_receiver) = mpsc::channel(10);
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, mut event_receiver) = broadcast::channel(10);
 
         let symbol = Symbol::new("AAPL").unwrap();
@@ -342,18 +379,27 @@ mod tests {
             orderbook,
             owner,
             inventory,
-            operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);
+        let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service.clone(),
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+            lifecycle_failure,
+        );
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
-        let built = manifest.build(pool, services).await.unwrap();
+        let built = manifest.build(pool.clone(), services).await.unwrap();
 
         built
             .position
@@ -406,10 +452,16 @@ mod tests {
         }
 
         drain_pending_jobs(&rebalancing_service).await.unwrap();
-        let triggered = operation_receiver.try_recv();
-        assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "expected rebalancing subscriber to receive position event, got {triggered:?}"
+        let pending_mint_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_mint_jobs, 1,
+            "expected the rebalancing subscriber to enqueue a mint job on the position event"
         );
     }
 }

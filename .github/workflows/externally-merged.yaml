@@ -1,0 +1,294 @@
+name: Externally merged label
+
+# Graphite merge-queue optimizations land batched PRs by pushing their squash
+# commits to master and then CLOSING the PRs instead of merging them, so
+# Linear's GitHub integration never sees a merge event and the linked issues
+# stay open. Linear treats a closed PR as merged when it carries the
+# `externally-merged` label (handled even when the label arrives after the
+# close event, per Linear's 2026-04-30 changelog fix). This workflow applies
+# that label to every PR Graphite closes as part of a merge-queue merge.
+#
+# Two jobs work in tandem:
+#   label         - fast path: triggered by pull_request:closed
+#   push-backstop - safety net: triggered by push:master to catch any
+#                   pull_request:closed events that GitHub drops during
+#                   MQ burst (observed: PRs closed within a 2-second window
+#                   may never receive a pull_request:closed dispatch)
+
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  label:
+    # Only PRs that Graphite closed without a GitHub-native merge. The head-ref
+    # guard skips Graphite's synthetic `[Graphite MQ] Draft PR GROUP:...` PRs,
+    # which live on gtmq* branches and have no Linear issue.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == false &&
+      github.event.sender.login == 'graphite-app[bot]' &&
+      !startsWith(github.event.pull_request.head.ref, 'gtmq')
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      # Graphite also closes PRs when a user abandons them from the Graphite
+      # UI, with the same graphite-app[bot] sender. Distinguish a real
+      # merge-queue merge by Graphite's "Merge activity" comment, which it
+      # updates with this marker a few seconds BEFORE closing the PR.
+      - name: Check Graphite merged this PR
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # --slurp collects all pages into a single JSON array of arrays, then
+          # piped jq flattens them with .[][]. Without --slurp, jq would run per
+          # page and multi-line output from page 2+ breaks the boolean check. The
+          # runner's gh rejects --slurp combined with gh's own --jq, so we pipe to
+          # standalone jq instead of using --jq.
+          merged=$(gh api --paginate --slurp \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            | jq -r '[.[][]
+              | select(.user.login == "graphite-app[bot]")
+              | .body
+              | contains("Merged by the [Graphite merge queue]")
+            ] | any')
+          echo "Graphite merge marker found: $merged"
+          echo "merged=$merged" >> "$GITHUB_OUTPUT"
+
+      - name: Create externally-merged label if missing
+        if: steps.check.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/$GITHUB_REPOSITORY/labels/externally-merged" \
+            --silent
+          then
+            gh api -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/labels" \
+              -f name=externally-merged \
+              -f color=6f42c1 \
+              -f description="Graphite MQ merged this PR; Linear should treat the close as a merge"
+          fi
+
+      - name: Apply externally-merged label
+        if: steps.check.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            -f "labels[]=externally-merged"
+
+  # Backstop for dropped pull_request:closed events. GitHub does not guarantee
+  # exactly-once delivery; during tight MQ bursts (multiple PRs closing within
+  # seconds) some pull_request:closed dispatches may never arrive. This job
+  # runs on every push to master and applies the externally-merged label to any
+  # Graphite-merged PRs that the fast-path job missed.
+  #
+  # Uses the GitHub compare API (up to 250 commits) rather than the push event
+  # payload (capped at 20 commits, silently truncated) to enumerate commits.
+  # The marker comment — not closed-state — is the gate for labeling: the push
+  # event can fire before Graphite finishes closing PRs, so state=="closed" is
+  # unreliable as a gate. The presence of Graphite's "Merged by the [Graphite
+  # merge queue]" comment is the authoritative proof that the MQ committed it.
+  push-backstop:
+    if: github.event_name == 'push'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: Label Graphite-merged PRs from push commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          # Initial push or force-push to a previously empty ref; the all-zeros
+          # SHA means there is no meaningful before..after range to compare.
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "BEFORE is the null SHA (initial/force push); nothing reliable to diff."
+            exit 0
+          fi
+
+          # The compare endpoint returns at most 250 commits. Fail the job (do
+          # not silently truncate) if the range exceeds that, so the miss is
+          # visible and the run can be investigated.
+          compare=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/$GITHUB_REPOSITORY/compare/$BEFORE...$AFTER")
+
+          total_commits=$(printf '%s' "$compare" | jq -r '.total_commits')
+          received=$(printf '%s' "$compare" | jq -r '.commits | length')
+          echo "Compare API: total_commits=$total_commits, received=$received"
+
+          if [ "$total_commits" -gt "$received" ]; then
+            echo "ERROR: push range has $total_commits commits but compare API returned only $received (cap: 250). Some PRs in this push cannot be enumerated -- this should not happen for a normal merge-queue batch. Investigate and retry." >&2
+            exit 1
+          fi
+
+          # Extract ALL (# NNN) PR numbers from every commit's full message
+          # (subject + body). [scan(...)] yields [] for messages with no match,
+          # so .[][0] produces no output for those; jq exits 0 either way.
+          pr_numbers=$(printf '%s' "$compare" \
+            | jq -r '.commits[].commit.message | [scan("\\(#([0-9]+)\\)")] | .[][0]' \
+            | sort -u)
+
+          if [ -z "$pr_numbers" ]; then
+            if [ "$received" -gt 0 ]; then
+              echo "WARNING: $received commits were present but none matched the (#NNN) pattern -- the squash-commit format may have changed." >&2
+              printf '%s' "$compare" | jq -r '.commits[].commit.message | split("\n")[0]' >&2
+            else
+              echo "No PR numbers found in commit messages. Nothing to label."
+            fi
+            exit 0
+          fi
+
+          echo "PR numbers to check: $pr_numbers"
+
+          for pr in $pr_numbers; do
+            echo "--- Processing PR #$pr ---"
+
+            # Guard against issue references: a 404 means (#NNN) referred to an
+            # issue, not a PR -- skip it. Any other error (429, 5xx, auth, network)
+            # is a real failure that must be visible, so we exit 1. The job is
+            # idempotent (marker-gated + already_labeled checks), so a re-run is safe.
+            pr_err=$(mktemp)
+            if ! pr_data=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/pulls/$pr" 2>"$pr_err"); then
+              if grep -qiE 'HTTP 404|Not Found' "$pr_err"; then
+                echo "PR #$pr: not a PR in this repo (404) -- likely an issue reference, skipping"
+                rm -f "$pr_err"
+                continue
+              fi
+              echo "PR #$pr: PR lookup failed with a non-404 error (failing the job so the miss is visible and can be retried):" >&2
+              cat "$pr_err" >&2
+              rm -f "$pr_err"
+              exit 1
+            fi
+            rm -f "$pr_err"
+
+            merged_at=$(printf '%s' "$pr_data" | jq -r '.merged_at')
+            state=$(printf '%s' "$pr_data" | jq -r '.state')
+            head_ref=$(printf '%s' "$pr_data" | jq -r '.head.ref')
+
+            # Skip native GitHub merges (merged_at is set); those do not need
+            # the externally-merged label for Linear to register the merge.
+            if [ "$merged_at" != "null" ]; then
+              echo "PR #$pr: merged_at=$merged_at -- native GitHub merge, skipping"
+              continue
+            fi
+
+            # Skip Graphite's own synthetic MQ draft PRs (gtmq* branches).
+            if echo "$head_ref" | grep -q '^gtmq'; then
+              echo "PR #$pr: head.ref=$head_ref -- Graphite MQ draft PR, skipping"
+              continue
+            fi
+
+            # Idempotency: skip if the fast-path job already applied the label.
+            already_labeled=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
+              --jq '[.[].name | select(. == "externally-merged")] | length > 0') \
+              || { echo "PR #$pr: labels lookup failed -- failing the job (retry is safe, the run is idempotent)" >&2; exit 1; }
+            if [ "$already_labeled" = "true" ]; then
+              echo "PR #$pr: already has externally-merged label, skipping"
+              continue
+            fi
+
+            # The marker comment is the authoritative gate (same string as the
+            # fast-path label job; observed on real MQ-merged PRs e.g. the
+            # 2026-06-15 incident #856/#857/#859). The push event can outrun
+            # Graphite posting this comment (order: push -> post marker ->
+            # close PR), so retry a few times before giving up rather than
+            # skip on the first miss.
+            # --slurp + .[][] flattens page-arrays before filtering so the
+            # boolean is correct even when comments span multiple pages. The
+            # runner's gh rejects --slurp combined with gh's own --jq, so we pipe
+            # to standalone jq instead of using --jq.
+            marker_found=false
+            for attempt in 1 2 3; do
+              result=$(gh api --paginate --slurp \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
+                | jq -r '[.[][]
+                  | select(.user.login == "graphite-app[bot]")
+                  | .body
+                  | contains("Merged by the [Graphite merge queue]")
+                ] | any') \
+                || { echo "PR #$pr: comments lookup failed -- failing the job (retry is safe, the run is idempotent)" >&2; exit 1; }
+              if [ "$result" = "true" ]; then
+                marker_found=true
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "PR #$pr: Graphite marker comment not present yet (attempt $attempt/3); the push may have outrun Graphite's marker post, retrying in 10s"
+                sleep 10
+              fi
+            done
+            if [ "$marker_found" != "true" ]; then
+              echo "PR #$pr: no Graphite merge marker comment found after 3 attempts, skipping"
+              continue
+            fi
+
+            # Log when we label a PR that GitHub has not yet closed; this is
+            # normal given the push-before-close race and is harmless.
+            if [ "$state" != "closed" ]; then
+              echo "PR #$pr: state=$state but marker present -- labeling a merged-but-not-yet-closed PR"
+            fi
+
+            # Create the label if it does not exist yet. A 422 from the POST
+            # means a concurrent run already created it; that is non-fatal and
+            # we proceed to the apply step. The apply step will fail visibly if
+            # the label genuinely cannot be created.
+            if ! gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/labels/externally-merged" \
+              --silent 2>/dev/null
+            then
+              gh api -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/$GITHUB_REPOSITORY/labels" \
+                -f name=externally-merged \
+                -f color=6f42c1 \
+                -f description="Graphite MQ merged this PR; Linear should treat the close as a merge" \
+                || echo "PR #$pr: label create failed (likely already exists), proceeding to apply"
+            fi
+
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
+              -f "labels[]=externally-merged" \
+              || { echo "PR #$pr: label apply failed -- failing the job (retry is safe, the run is idempotent)" >&2; exit 1; }
+            echo "PR #$pr: externally-merged label applied"
+          done

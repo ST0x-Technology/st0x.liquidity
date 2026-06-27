@@ -6,30 +6,25 @@
 //! the fetched values. The InventoryView reacts to these events to reconcile
 //! tracked inventory.
 
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::RootProvider;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::future::try_join_all;
 use rain_math_float::FloatError;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{
-    Executor, FractionalShares, InventoryResult, SharesBlockchain, SharesConversionError, Symbol,
-};
-use st0x_finance::{HasZero, Usd, UsdToCentsError};
+use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
+use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
+use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
+use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 
-use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService, Network, TokenSymbol};
-use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
-use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
@@ -70,8 +65,6 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     Evm(#[from] EvmError),
     #[error(transparent)]
     UsdcConversion(#[from] UsdcTransferError),
-    #[error(transparent)]
-    AlpacaWallet(#[from] AlpacaWalletError),
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),
     #[error(transparent)]
@@ -119,12 +112,15 @@ where
     snapshot_id: InventorySnapshotId,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: Option<WalletPollingCtx>,
-    alpaca_wallet: Option<Arc<AlpacaWalletService>>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
     external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
     unconfigured_symbol_warnings: Mutex<HashSet<Symbol>>,
+    retired_equity_vault_warnings: Mutex<HashSet<(Address, B256)>>,
+    retired_usdc_vault_warnings: Mutex<HashSet<B256>>,
     configured_equity_symbols: Option<HashSet<Symbol>>,
+    configured_equity_vaults: Option<BTreeMap<Address, BTreeSet<B256>>>,
+    configured_usdc_vaults: Option<BTreeSet<B256>>,
     reserved_cash: Usd,
 }
 
@@ -151,12 +147,15 @@ where
             snapshot_id,
             snapshot,
             wallet_polling,
-            alpaca_wallet: None,
             tokenizer,
             pending_request_ownership: None,
             external_pending_warnings: Mutex::new(HashSet::new()),
             unconfigured_symbol_warnings: Mutex::new(HashSet::new()),
+            retired_equity_vault_warnings: Mutex::new(HashSet::new()),
+            retired_usdc_vault_warnings: Mutex::new(HashSet::new()),
             configured_equity_symbols: None,
+            configured_equity_vaults: None,
+            configured_usdc_vaults: None,
             reserved_cash,
         }
     }
@@ -169,6 +168,16 @@ where
         self
     }
 
+    pub(crate) fn with_configured_vaults(
+        mut self,
+        configured_equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
+        configured_usdc_vaults: Option<BTreeSet<B256>>,
+    ) -> Self {
+        self.configured_equity_vaults = Some(configured_equity_vaults);
+        self.configured_usdc_vaults = configured_usdc_vaults;
+        self
+    }
+
     pub(crate) fn with_pending_request_ownership(
         mut self,
         pending_request_ownership: Arc<dyn PendingRequestOwnership>,
@@ -177,32 +186,45 @@ where
         self
     }
 
-    pub(crate) fn with_alpaca_wallet(mut self, alpaca_wallet: Arc<AlpacaWalletService>) -> Self {
-        self.alpaca_wallet = Some(alpaca_wallet);
-        self
-    }
-
     /// Polls actual inventory from all venues and emits snapshot commands.
     ///
     /// 1. Queries inflight equity from tokenization provider (must be first)
     /// 2. Queries onchain equity and USDC balances from Base vaults
     /// 3. Queries Ethereum wallet USDC balance (if configured)
-    /// 4. Queries Alpaca account USDC balance (if configured)
-    /// 5. Queries offchain positions and cash from executor
+    /// 4. Queries offchain positions, cash, and Alpaca USDC from executor
     ///
-    /// Inflight must be polled first. Balance snapshots trigger
-    /// check_and_trigger_equity, which skips when has_inflight() is true.
-    /// On startup the first poll tick runs immediately -- if balance
-    /// snapshots land before inflight, the system can trigger a duplicate
-    /// operation for a request Alpaca already has pending.
+    /// Inflight is a hard precondition, not an independent poll group. Balance
+    /// snapshots trigger check_and_trigger_equity, whose dedup guard is
+    /// has_inflight(). On startup the first poll tick runs immediately -- if
+    /// balance snapshots land before a fresh inflight snapshot, the system can
+    /// trigger a duplicate operation for a request Alpaca already has pending.
+    /// So an inflight poll failure aborts the whole tick before any balance
+    /// snapshot is emitted. The remaining three groups (onchain, wallet,
+    /// offchain) are independent: each logs and continues on failure so a
+    /// single venue outage does not stall the others.
     pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<Exe::Error>> {
         let snapshot_id = &self.snapshot_id;
 
-        self.poll_inflight_equity(snapshot_id).await?;
-        self.poll_onchain(snapshot_id).await?;
-        self.poll_wallets(snapshot_id).await?;
-        self.poll_alpaca_usdc(snapshot_id).await?;
-        self.poll_offchain(snapshot_id).await?;
+        if let Err(error) = self.poll_inflight_equity(snapshot_id).await {
+            warn!(
+                target: "inventory",
+                ?error,
+                "Inventory inflight equity polling failed; aborting tick before balance snapshots to avoid duplicate operations"
+            );
+            return Ok(());
+        }
+
+        if let Err(error) = self.poll_onchain(snapshot_id).await {
+            warn!(target: "inventory", ?error, "Inventory onchain polling failed");
+        }
+
+        if let Err(error) = self.poll_wallets(snapshot_id).await {
+            warn!(target: "inventory", ?error, "Inventory wallet polling failed");
+        }
+
+        if let Err(error) = self.poll_offchain(snapshot_id).await {
+            warn!(target: "inventory", ?error, "Inventory offchain polling failed");
+        }
 
         Ok(())
     }
@@ -269,6 +291,15 @@ where
 
                 let vault_balances = try_join_all(vault_futures).await?;
 
+                for (vault, balance) in vaults_for_token.values().zip(vault_balances.iter()) {
+                    self.warn_if_retired_equity_vault_has_balance(
+                        &symbol,
+                        token,
+                        vault.vault_id,
+                        *balance,
+                    )?;
+                }
+
                 let total = vault_balances[1..]
                     .iter()
                     .copied()
@@ -322,6 +353,10 @@ where
         });
 
         let vault_balances = try_join_all(balance_futures).await?;
+
+        for (vault, balance) in registry.usdc_vaults.values().zip(vault_balances.iter()) {
+            self.warn_if_retired_usdc_vault_has_balance(vault.vault_id, *balance)?;
+        }
 
         let usdc_balance = vault_balances[1..]
             .iter()
@@ -461,29 +496,6 @@ where
         Ok(results.into_iter().collect())
     }
 
-    async fn poll_alpaca_usdc(
-        &self,
-        snapshot_id: &InventorySnapshotId,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
-        let Some(alpaca_wallet) = &self.alpaca_wallet else {
-            debug!(target: "inventory", "No Alpaca asset balance polling configured, skipping Alpaca USDC polling");
-            return Ok(());
-        };
-
-        let usdc_balance = alpaca_wallet
-            .get_asset_balance(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
-            .await?;
-
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::AlpacaUsdc { usdc_balance },
-            )
-            .await?;
-
-        Ok(())
-    }
-
     async fn poll_offchain(
         &self,
         snapshot_id: &InventorySnapshotId,
@@ -538,6 +550,15 @@ where
                 },
             )
             .await?;
+
+        if let Some(usdc_balance) = inventory.alpaca_usdc {
+            self.snapshot
+                .send(
+                    snapshot_id,
+                    InventorySnapshotCommand::AlpacaUsdc { usdc_balance },
+                )
+                .await?;
+        }
 
         Ok(())
     }
@@ -598,6 +619,91 @@ where
                 warn!(
                     target: "inventory",
                     "Unconfigured symbol warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
+    }
+
+    fn warn_if_retired_equity_vault_has_balance(
+        &self,
+        symbol: &Symbol,
+        token: Address,
+        vault_id: B256,
+        balance: FractionalShares,
+    ) -> Result<(), FloatError> {
+        let Some(configured_equity_vaults) = &self.configured_equity_vaults else {
+            return Ok(());
+        };
+
+        if configured_equity_vaults
+            .get(&token)
+            .is_some_and(|configured_vaults| configured_vaults.contains(&vault_id))
+            || balance.is_zero()?
+        {
+            return Ok(());
+        }
+
+        if self
+            .lock_retired_equity_vault_warnings()
+            .insert((token, vault_id))
+        {
+            warn!(
+                target: "inventory",
+                %symbol,
+                %token,
+                %vault_id,
+                ?balance,
+                "Registered equity vault has a positive balance but is no longer configured"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn lock_retired_equity_vault_warnings(&self) -> MutexGuard<'_, HashSet<(Address, B256)>> {
+        self.retired_equity_vault_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Retired equity vault warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
+    }
+
+    fn warn_if_retired_usdc_vault_has_balance(
+        &self,
+        vault_id: B256,
+        balance: Usdc,
+    ) -> Result<(), FloatError> {
+        let Some(configured_usdc_vaults) = &self.configured_usdc_vaults else {
+            return Ok(());
+        };
+
+        if configured_usdc_vaults.contains(&vault_id) || balance.is_zero()? {
+            return Ok(());
+        }
+
+        if self.lock_retired_usdc_vault_warnings().insert(vault_id) {
+            warn!(
+                target: "inventory",
+                %vault_id,
+                ?balance,
+                "Registered USDC vault has a positive balance but is no longer configured"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn lock_retired_usdc_vault_warnings(&self) -> MutexGuard<'_, HashSet<B256>> {
+        self.retired_usdc_vault_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Retired USDC vault warning tracker was poisoned; recovering state"
                 );
                 poisoned.into_inner()
             })
@@ -861,20 +967,17 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use httpmock::prelude::*;
-    use serde_json::json;
     use sqlx::{Row, SqlitePool};
-    use st0x_event_sorcery::{StoreBuilder, test_store};
+    use st0x_event_sorcery::test_store;
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::{
-        AlpacaAccountId, EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol,
-    };
+    use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
-    use uuid::uuid;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
+    use crate::tokenized_equity_mint::issuer_request_id;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     #[derive(Clone, Default)]
@@ -897,7 +1000,7 @@ mod tests {
             PendingRequestOwnershipSnapshot {
                 mint_issuers: mint_issuer_request_ids
                     .into_iter()
-                    .map(IssuerRequestId::new)
+                    .map(issuer_request_id)
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
@@ -1070,20 +1173,25 @@ mod tests {
         symbols.iter().map(|symbol| test_symbol(symbol)).collect()
     }
 
-    async fn create_test_raindex_service(
-        pool: &SqlitePool,
+    fn configured_equity_vaults(
+        token: Address,
+        vault_ids: impl IntoIterator<Item = B256>,
+    ) -> BTreeMap<Address, BTreeSet<B256>> {
+        let mut configured = BTreeMap::new();
+        configured.insert(token, vault_ids.into_iter().collect());
+        configured
+    }
+
+    fn vault_balance_hex(balance: rain_math_float::Float) -> String {
+        alloy::hex::encode_prefixed(balance.get_inner())
+    }
+
+    fn create_test_raindex_service(
         provider: impl Provider + Clone + 'static,
     ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
-        let (_vault_store, vault_registry_projection) =
-            StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
-                .await
-                .unwrap();
-
         Arc::new(RaindexService::new(
             ReadOnlyEvm::new(provider),
             Address::ZERO,
-            vault_registry_projection,
             Address::ZERO,
         ))
     }
@@ -1092,7 +1200,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_equity_command_with_executor_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1110,6 +1218,7 @@ mod tests {
             ],
             usd_balance_cents: 10_000_000,
             cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory.clone());
@@ -1156,7 +1265,7 @@ mod tests {
     async fn poll_and_record_emits_zero_for_configured_position_absent_from_executor() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1167,6 +1276,7 @@ mod tests {
             }],
             usd_balance_cents: 10_000_000,
             cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1213,7 +1323,7 @@ mod tests {
     async fn poll_and_record_ignores_executor_positions_not_in_configured_symbols() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1231,6 +1341,7 @@ mod tests {
             ],
             usd_balance_cents: 10_000_000,
             cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1281,13 +1392,14 @@ mod tests {
     async fn poll_and_record_emits_offchain_usd_command_with_executor_usd_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 25_000_000, // $250,000.00
             cash_buying_power_cents: Some(25_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1330,13 +1442,14 @@ mod tests {
     async fn reserved_cash_subtracted_from_offchain_usd() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 10_000_000, // $100,000
             cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1389,13 +1502,14 @@ mod tests {
     async fn reserved_cash_larger_than_balance_sets_available_to_zero() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 3_000_000, // $30,000
             cash_buying_power_cents: Some(3_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1448,13 +1562,14 @@ mod tests {
     async fn zero_reserved_cash_passes_through_full_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 10_000_000,
             cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1504,13 +1619,14 @@ mod tests {
     async fn poll_and_record_emits_empty_positions_when_executor_has_no_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 5_000_000,
             cash_buying_power_cents: Some(5_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1548,7 +1664,7 @@ mod tests {
     async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -1599,7 +1715,7 @@ mod tests {
     async fn negative_usd_balance_errors() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         // Margin account with negative cash (borrowed funds) — even with
@@ -1612,6 +1728,7 @@ mod tests {
             }],
             usd_balance_cents: -5_000_000, // -$50,000 (margin debt)
             cash_buying_power_cents: Some(0),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1630,7 +1747,11 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_offchain(&snapshot_id).await.unwrap_err();
 
         assert!(
             matches!(error, InventoryPollingError::Reserve(_)),
@@ -1642,7 +1763,7 @@ mod tests {
     async fn poll_and_record_handles_fractional_share_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let fractional_qty = FractionalShares::new(float!(12.345)); // 12.345 shares
@@ -1654,6 +1775,7 @@ mod tests {
             }],
             usd_balance_cents: 1_000_000,
             cash_buying_power_cents: Some(1_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1694,7 +1816,7 @@ mod tests {
     async fn poll_and_record_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let orderbook = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let order_owner = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
 
@@ -1702,6 +1824,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 10_000,
             cash_buying_power_cents: Some(10_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -1798,7 +1921,7 @@ mod tests {
     async fn poll_and_record_skips_onchain_when_vault_registry_not_initialized() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -1852,7 +1975,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -1906,7 +2029,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -1942,7 +2065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_fails_on_rpc_failure_for_equity_vault() {
+    async fn poll_onchain_fails_on_rpc_failure_for_equity_vault() {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
@@ -1959,7 +2082,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -1977,7 +2100,11 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_onchain(&snapshot_id).await.unwrap_err();
 
         assert!(
             matches!(error, InventoryPollingError::Raindex(_)),
@@ -1986,7 +2113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_fails_on_rpc_failure_for_usdc_vault() {
+    async fn poll_onchain_fails_on_rpc_failure_for_usdc_vault() {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
@@ -1995,7 +2122,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -2013,7 +2140,11 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_onchain(&snapshot_id).await.unwrap_err();
 
         assert!(
             matches!(error, InventoryPollingError::Raindex(_)),
@@ -2021,69 +2152,202 @@ mod tests {
         );
     }
 
-    /// Loads all InventorySnapshotEvents for the given orderbook/owner from the event store.
-    const TEST_ALPACA_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_onchain_warns_when_retired_equity_vault_has_positive_balance() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let retired_vault_id = TEST_VAULT_ID;
+        let configured_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
 
-    fn alpaca_wallet_balance_mock<'server>(
-        server: &'server MockServer,
-        balance: &str,
-    ) -> httpmock::Mock<'server> {
-        server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ALPACA_ACCOUNT_ID}/wallets"))
-                .query_param("asset", "USDC")
-                .query_param("network", "ethereum");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "asset_id": "5d0de74f-827b-41a7-9f74-9c07c08fe55f",
-                    "asset": "USDC",
-                    "address": "0x42a76C83014e886e639768D84EAF3573b1876844",
-                    "balance": balance,
-                    "created_at": "2025-08-07T08:52:40.656166Z"
-                }));
-        })
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            retired_vault_id,
+            test_symbol("SGOV"),
+        )
+        .await;
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            configured_vault_id,
+            test_symbol("SGOV"),
+        )
+        .await;
+
+        let retired_balance = vault_balance_hex(float!(5));
+        let asserter = Asserter::new();
+        asserter.push_success(&retired_balance);
+        asserter.push_success(&ZERO_FLOAT_HEX);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_vaults(
+            configured_equity_vaults(TEST_TOKEN, [configured_vault_id]),
+            None,
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        assert!(
+            logs_contain(
+                "Registered equity vault has a positive balance but is no longer configured"
+            ),
+            "Should warn when a retired equity vault still holds funds"
+        );
     }
 
-    fn alpaca_wallet_service(server: &MockServer) -> Arc<AlpacaWalletService> {
-        Arc::new(AlpacaWalletService::new(
-            server.base_url(),
-            TEST_ALPACA_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        ))
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_onchain_warns_when_retired_usdc_vault_has_positive_balance() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let retired_vault_id = TEST_VAULT_ID;
+        let configured_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        discover_usdc_vault(&pool, orderbook, order_owner, retired_vault_id).await;
+        discover_usdc_vault(&pool, orderbook, order_owner, configured_vault_id).await;
+
+        let retired_balance = vault_balance_hex(float!(125));
+        let asserter = Asserter::new();
+        asserter.push_success(&retired_balance);
+        asserter.push_success(&ZERO_FLOAT_HEX);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_vaults(BTreeMap::new(), Some(BTreeSet::from([configured_vault_id])));
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        assert!(
+            logs_contain(
+                "Registered USDC vault has a positive balance but is no longer configured"
+            ),
+            "Should warn when a retired USDC vault still holds funds"
+        );
     }
 
     #[tokio::test]
-    async fn poll_alpaca_usdc_emits_command_with_polled_balance() {
+    async fn poll_and_record_continues_to_offchain_after_onchain_failure() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+
+        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("RPC failure");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+        let inventory = Inventory {
+            positions: vec![],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: Some(Usdc::new(float!(0.788514))),
+            cash_withdrawable_cents: None,
+        };
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new().with_inventory(inventory),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. })),
+            "Offchain inventory must still emit when onchain polling fails"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::AlpacaUsdc { .. })),
+            "Alpaca USDC must still emit when onchain polling fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_offchain_emits_alpaca_usdc_from_executor_inventory() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let snapshot_id = InventorySnapshotId {
             orderbook,
             owner: order_owner,
         };
 
-        let server = MockServer::start();
-        let mock = alpaca_wallet_balance_mock(&server, "125.75");
+        let inventory = Inventory {
+            positions: vec![],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: Some(Usdc::new(float!(125.75))),
+            cash_withdrawable_cents: None,
+        };
 
         let service = InventoryPollingService::new(
             raindex_service,
-            MockExecutor::new(),
+            MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             snapshot_id.clone(),
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
             Usd::ZERO,
-        )
-        .with_alpaca_wallet(alpaca_wallet_service(&server));
+        );
 
-        service.poll_alpaca_usdc(&snapshot_id).await.unwrap();
-
-        mock.assert();
+        service.poll_offchain(&snapshot_id).await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         let alpaca_event = events
@@ -2098,19 +2362,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_alpaca_usdc_is_noop_when_wallet_unconfigured() {
+    async fn poll_offchain_skips_alpaca_usdc_when_executor_omits_it() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let snapshot_id = InventorySnapshotId {
             orderbook,
             owner: order_owner,
         };
+        let inventory = Inventory {
+            positions: vec![],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
+            cash_withdrawable_cents: None,
+        };
 
         let service = InventoryPollingService::new(
             raindex_service,
-            MockExecutor::new(),
+            MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             snapshot_id.clone(),
             Arc::new(test_store(pool.clone(), ())),
@@ -2119,57 +2390,59 @@ mod tests {
             Usd::ZERO,
         );
 
-        service.poll_alpaca_usdc(&snapshot_id).await.unwrap();
+        service.poll_offchain(&snapshot_id).await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         assert!(
             !events
                 .iter()
                 .any(|event| matches!(event, InventorySnapshotEvent::AlpacaUsdc { .. })),
-            "Must not emit AlpacaUsdc when no Alpaca wallet is configured",
+            "Must not emit AlpacaUsdc when executor omits Alpaca USDC",
         );
     }
 
     #[tokio::test]
-    async fn poll_alpaca_usdc_propagates_balance_query_error() {
+    async fn poll_and_record_aborts_tick_when_inflight_poll_fails() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
-        let snapshot_id = InventorySnapshotId {
-            orderbook,
-            owner: order_owner,
+
+        // Inventory is present, so the offchain group would emit balance
+        // snapshots if the tick were allowed to continue past the failed
+        // inflight poll.
+        let inventory = Inventory {
+            positions: vec![],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: Some(Usdc::new(float!(125.75))),
+            cash_withdrawable_cents: None,
         };
 
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ALPACA_ACCOUNT_ID}/wallets"))
-                .query_param("asset", "USDC")
-                .query_param("network", "ethereum");
-            then.status(500)
-                .header("content-type", "application/json")
-                .json_body(json!({ "message": "internal error" }));
-        });
+        let tokenizer =
+            Arc::new(crate::tokenization::mock::MockTokenizer::new().with_list_pending_failure());
 
         let service = InventoryPollingService::new(
             raindex_service,
-            MockExecutor::new(),
+            MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            snapshot_id.clone(),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::new(test_store(pool.clone(), ())),
             None,
-            None,
+            Some(tokenizer),
             Usd::ZERO,
-        )
-        .with_alpaca_wallet(alpaca_wallet_service(&server));
+        );
 
-        let error = service.poll_alpaca_usdc(&snapshot_id).await.unwrap_err();
+        service.poll_and_record().await.unwrap();
 
-        mock.assert();
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
         assert!(
-            matches!(error, InventoryPollingError::AlpacaWallet(_)),
-            "Balance query failure must surface as AlpacaWallet error, got {error:?}",
+            events.is_empty(),
+            "Inflight poll failure must abort the tick before any balance \
+             snapshot is emitted, but got: {events:?}"
         );
     }
 
@@ -2216,7 +2489,7 @@ mod tests {
     async fn poll_and_record_emits_ethereum_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
@@ -2264,7 +2537,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
@@ -2314,7 +2587,7 @@ mod tests {
     async fn poll_and_record_skips_ethereum_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2355,7 +2628,7 @@ mod tests {
     async fn poll_and_record_skips_base_wallet_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2392,10 +2665,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_propagates_ethereum_rpc_failure() {
+    async fn poll_wallets_propagates_ethereum_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2422,15 +2695,19 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
         assert!(matches!(error, InventoryPollingError::Evm(_)));
     }
 
     #[tokio::test]
-    async fn poll_and_record_propagates_base_wallet_rpc_failure() {
+    async fn poll_wallets_propagates_base_wallet_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2457,15 +2734,73 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
         assert!(matches!(error, InventoryPollingError::Evm(_)));
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_continues_to_offchain_after_wallet_failure() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("Ethereum RPC failure");
+        let ethereum_wallet = MockEthereumWallet::with_asserter(&asserter);
+
+        let server = MockServer::start();
+        let inventory = Inventory {
+            positions: vec![],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: Some(Usdc::new(float!(0.788514))),
+            cash_withdrawable_cents: None,
+        };
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new().with_inventory(inventory),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            Some(WalletPollingCtx {
+                ethereum: ethereum_wallet,
+                ..mock_wallet_polling_ctx(&server)
+            }),
+            None,
+            Usd::ZERO,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. })),
+            "Offchain inventory must still emit when wallet polling fails"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::AlpacaUsdc { .. })),
+            "Alpaca USDC must still emit when wallet polling fails"
+        );
     }
 
     #[tokio::test]
     async fn poll_and_record_emits_base_wallet_unwrapped_equity_when_wallet_and_tokens_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let token_addr = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
@@ -2531,7 +2866,7 @@ mod tests {
     async fn poll_and_record_skips_base_wallet_unwrapped_equity_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2570,10 +2905,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_propagates_base_wallet_unwrapped_equity_rpc_failure() {
+    async fn poll_wallets_propagates_base_wallet_unwrapped_equity_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2609,7 +2944,11 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
         assert!(
             matches!(error, InventoryPollingError::Evm(_)),
             "Expected Evm error, got {error:?}"
@@ -2617,10 +2956,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_propagates_base_wallet_unwrapped_equity_shares_conversion_failure() {
+    async fn poll_wallets_propagates_base_wallet_unwrapped_equity_shares_conversion_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2657,7 +2996,11 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
         assert!(
             matches!(
                 error,
@@ -2671,7 +3014,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_wrapped_equity_when_wallet_and_tokens_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let token_addr = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
@@ -2736,7 +3079,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_wrapped_equity_for_multiple_assets() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_balance = U256::from(42u64) * U256::from(10u64).pow(U256::from(18u64));
@@ -2806,7 +3149,7 @@ mod tests {
     async fn poll_and_record_skips_base_wallet_wrapped_equity_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2845,10 +3188,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_propagates_base_wallet_wrapped_equity_rpc_failure() {
+    async fn poll_wallets_propagates_base_wallet_wrapped_equity_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2884,7 +3227,11 @@ mod tests {
             Usd::ZERO,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
         assert!(
             matches!(error, InventoryPollingError::Evm(_)),
             "Expected Evm error, got {error:?}"
@@ -2895,7 +3242,7 @@ mod tests {
     async fn poll_and_record_skips_unchanged_base_wallet_wrapped_equity_snapshot() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_balance = U256::from(3u64) * U256::from(10u64).pow(U256::from(18u64));
@@ -2959,7 +3306,7 @@ mod tests {
     async fn poll_and_record_skips_token_snapshots_when_token_addresses_empty() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -3058,11 +3405,11 @@ mod tests {
         request_type: crate::tokenization::TokenizationRequestType,
         symbol: &str,
         quantity: i64,
-        issuer_request_id: &str,
+        issuer_id_label: &str,
         wallet: Option<Address>,
     ) -> crate::tokenization::TokenizationRequest {
         crate::tokenization::TokenizationRequest {
-            issuer_request_id: Some(IssuerRequestId::new(issuer_request_id)),
+            issuer_request_id: Some(issuer_request_id(issuer_id_label)),
             ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
         }
     }
@@ -3084,7 +3431,7 @@ mod tests {
     async fn poll_inflight_equity_emits_mints_and_redemptions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3144,7 +3491,7 @@ mod tests {
     async fn poll_inflight_equity_aggregates_same_symbol() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3204,7 +3551,7 @@ mod tests {
     async fn poll_inflight_equity_skipped_without_tokenizer() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -3240,7 +3587,7 @@ mod tests {
     async fn poll_inflight_equity_emits_empty_snapshot_when_no_requests_pending() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -3285,7 +3632,7 @@ mod tests {
     async fn poll_inflight_equity_treats_requests_as_external_without_ownership_source() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3344,7 +3691,7 @@ mod tests {
     async fn poll_inflight_equity_ignores_external_requests_even_for_matching_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let other_wallet = address!("0x9999999999999999999999999999999999999999");
 
@@ -3417,7 +3764,7 @@ mod tests {
     async fn poll_inflight_equity_includes_owned_mint_by_issuer_request_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3475,7 +3822,7 @@ mod tests {
     async fn poll_inflight_equity_includes_pending_redemption_intent_before_detection() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let redemption_tx = TxHash::random();
         let external_tx = TxHash::random();

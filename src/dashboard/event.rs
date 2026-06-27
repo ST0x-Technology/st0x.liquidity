@@ -93,6 +93,7 @@ impl Reactor for Broadcaster {
                     event,
                     PositionEvent::OnChainOrderFilled { .. }
                         | PositionEvent::OffChainOrderFilled { .. }
+                        | PositionEvent::ManualPositionAdjusted { .. }
                 ) {
                     return;
                 }
@@ -264,6 +265,7 @@ mod tests {
                     .unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
                 },
             )
             .await
@@ -309,7 +311,7 @@ mod tests {
 
         let symbol = Symbol::new("AAPL").unwrap();
         let now = chrono::Utc::now();
-        let threshold = crate::threshold::ExecutionThreshold::Shares(
+        let threshold = st0x_config::ExecutionThreshold::Shares(
             st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
                 st0x_float_macro::float!(1),
             ))
@@ -361,6 +363,100 @@ mod tests {
         match msg {
             Statement::PositionUpdate(position) => {
                 assert_eq!(position.symbol, symbol);
+                assert!(
+                    position.net.eq(st0x_float_macro::float!(1)).unwrap(),
+                    "expected net 1, got {:?}",
+                    position.net
+                );
+            }
+            other => panic!("expected PositionUpdate message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_position_adjustment_broadcasts_adjusted_net() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
+        let harness = ReactorHarness::new(broadcaster);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = chrono::Utc::now();
+        let threshold = crate::ExecutionThreshold::Shares(
+            st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                st0x_float_macro::float!(1),
+            ))
+            .unwrap(),
+        );
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: alloy::primitives::TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(1)),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: st0x_execution::FractionalShares::new(st0x_float_macro::float!(-3)),
+                    reason: "operator repair".to_string(),
+                    threshold,
+                    expected_net: Some(st0x_execution::FractionalShares::new(
+                        st0x_float_macro::float!(1),
+                    )),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                PositionEvent::ManualPositionAdjusted {
+                    previous_net: st0x_execution::FractionalShares::new(st0x_float_macro::float!(
+                        1
+                    )),
+                    target_net: st0x_execution::FractionalShares::new(st0x_float_macro::float!(-3)),
+                    reason: "operator repair".to_string(),
+                    price_usdc: None,
+                    adjusted_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let msg = receiver
+            .recv()
+            .await
+            .expect("should receive position update");
+
+        match msg {
+            Statement::PositionUpdate(position) => {
+                assert_eq!(position.symbol, symbol);
+                assert!(
+                    position.net.eq(st0x_float_macro::float!(-3)).unwrap(),
+                    "expected adjusted net -3, got {:?}",
+                    position.net
+                );
             }
             other => panic!("expected PositionUpdate message, got {other:?}"),
         }

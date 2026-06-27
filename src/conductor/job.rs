@@ -11,10 +11,9 @@ use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
-use apalis_sqlite::{Config, SqliteContext, SqliteStorage};
+use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
@@ -79,7 +78,7 @@ pub(crate) struct JobQueue<Task>(Storage<Task>);
 /// `#[from]` it into their own error enums instead of boxing.
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to enqueue apalis job: {0}")]
-pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<sqlx::Error>);
+pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<SqlxError>);
 
 impl<Task> Clone for JobQueue<Task> {
     fn clone(&self) -> Self {
@@ -154,7 +153,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// invalidates everything queued before it.
     pub(crate) async fn cancel_all_pending(&self) {
         let job_type = std::any::type_name::<Task>();
-        if let Err(error) = sqlx::query(
+        if let Err(error) = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Done' \
              WHERE status = 'Pending' AND job_type = ?",
         )
@@ -169,6 +168,58 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
                 "Failed to cancel pending rows for job type",
             );
         }
+    }
+
+    /// Resets this queue's in-flight rows (`Running`/`Queued`) back to
+    /// `Pending` so the apalis monitor re-drives them, and returns the number
+    /// of rows reset.
+    ///
+    /// Must only be called at startup, BEFORE the apalis monitor spawns: at
+    /// that point no worker is alive to legitimately own a `Running` row, so
+    /// every such row is necessarily orphaned by a previous process that died
+    /// mid-job. apalis's own orphan recovery cannot rescue these on a quick
+    /// restart -- it re-enqueues a locked row only once the owning worker's
+    /// heartbeat ages past `reenqueue_orphaned_after` (5 min default), but the
+    /// worker name is deterministic across restarts, so a fresh process
+    /// re-registers the same worker id and keeps refreshing its heartbeat,
+    /// and the orphan is never aged out. Resetting the row here closes that
+    /// gap. `Failed` rows (retries exhausted) are deliberately left untouched
+    /// so a latched job awaiting operator reconciliation is not re-driven on
+    /// every restart. `attempts` is preserved because a crash is not a failed
+    /// attempt against the retry budget.
+    pub(crate) async fn requeue_orphaned(&self) -> Result<u64, SqlxError> {
+        let job_type = std::any::type_name::<Task>();
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Pending', lock_by = NULL, lock_at = NULL \
+             WHERE job_type = ? AND status IN ('Running', 'Queued')",
+        )
+        .bind(job_type)
+        .execute(self.pool())
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Returns whether any job of this queue's task type is still in flight --
+    /// i.e. present in the queue and not in a terminal state. Apalis terminal
+    /// states are `Done`, `Failed`, and `Killed` (mirroring the finished-job
+    /// cleanup); anything else (`Pending`, `Queued`, `Running`) counts as in
+    /// flight.
+    ///
+    /// Used by the order-fill poller to avoid stacking overlapping backfill
+    /// ranges: while a previous range is still being processed the checkpoint
+    /// has not advanced yet, so re-enqueuing would re-scan the same blocks.
+    pub(crate) async fn has_in_flight(&self) -> Result<bool, SqlxError> {
+        let job_type = std::any::type_name::<Task>();
+        let in_flight = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? AND status NOT IN ('Done', 'Failed', 'Killed')",
+        )
+        .bind(job_type)
+        .fetch_one(self.pool())
+        .await?;
+
+        Ok(in_flight > 0)
     }
 }
 
@@ -216,26 +267,22 @@ where
     async fn perform(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error>;
 }
 
-/// Builds a `Worker` for a `Job<Ctx>` impl.
+/// Shared worker-construction body for [`build_supervised_worker!`] and
+/// [`build_best_effort_worker!`]. Not part of the public crate API; always
+/// called via one of the two public macros. Must be exported so the outer
+/// macros can call it from expansion sites in sibling modules.
 ///
-/// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
-/// types and the macro expands to a fully-wired worker (queue backend,
-/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
-/// `.build(work::<Ctx, Job>)`).
-///
-/// A macro because `.build()` returns a deeply-nested
-/// `Worker<Args, Ctx, Backend, Svc, Middleware>` whose `Svc` and
-/// `Middleware` types accumulate from the layer stack and have no
-/// public alias or `impl Trait` shorthand. Macro expansion lets the
-/// compiler infer the type at the call site.
-macro_rules! build_supervised_worker {
+/// `$on_event:expr` must be a value of type
+/// `impl Fn(&WorkerContext, &Event) + Send + Sync + 'static`, produced by
+/// either [`on_terminal_failure`] or [`on_terminal_failure_log_only`].
+macro_rules! build_worker_inner {
     (
         ::<$ctx_type:ty, $job:ty>,
         $index:expr,
         $queue:expr,
         $ctx:expr,
-        $fail_stop:expr,
-        $failure_notify:expr
+        $circuit:expr,
+        $on_event:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
         use ::apalis::layers::WorkerBuilderExt;
@@ -265,16 +312,93 @@ macro_rules! build_supervised_worker {
                 RetryPolicy::retries(3)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
-            .break_circuit_with($fail_stop)
-            .on_event($crate::conductor::job::on_terminal_failure(
-                $failure_notify,
-                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
-            ))
+            .break_circuit_with($circuit)
+            .on_event($on_event)
             .build($crate::conductor::job::work::<$ctx_type, $job>)
     }};
 }
 
+pub(crate) use build_worker_inner;
+
+/// Builds a `Worker` for a `Job<Ctx>` impl.
+///
+/// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
+/// types and the macro expands to a fully-wired worker (queue backend,
+/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
+/// `.build(work::<Ctx, Job>)`).
+///
+/// A macro because `.build()` returns a deeply-nested
+/// `Worker<Args, Ctx, Backend, Svc, Middleware>` whose `Svc` and
+/// `Middleware` types accumulate from the layer stack and have no
+/// public alias or `impl Trait` shorthand. Macro expansion lets the
+/// compiler infer the type at the call site.
+macro_rules! build_supervised_worker {
+    (
+        ::<$ctx_type:ty, $job:ty>,
+        $index:expr,
+        $queue:expr,
+        $ctx:expr,
+        $fail_stop:expr,
+        $failure_notify:expr
+        $(, $failure_injector:expr)? $(,)?
+    ) => {{
+        build_worker_inner!(
+            ::<$ctx_type, $job>,
+            $index,
+            $queue,
+            $ctx,
+            $fail_stop,
+            $crate::conductor::job::on_terminal_failure(
+                $failure_notify,
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+            )
+            $(, $failure_injector)?
+        )
+    }};
+}
+
 pub(crate) use build_supervised_worker;
+
+/// Builds a best-effort `Worker` for a `Job<Ctx>` impl.
+///
+/// Identical to [`build_supervised_worker!`] but uses
+/// [`on_terminal_failure_log_only`] instead of [`on_terminal_failure`]:
+/// a terminal job failure is logged at `error!` level but does NOT trip the
+/// conductor-wide fail-stop and does NOT stop the worker.
+///
+/// Callers MUST pass a permissive `CircuitBreakerConfig` (e.g. high
+/// `failure_threshold`, short `recovery_timeout`) so a single failing job
+/// does not latch the worker idle for a long period. Passing the conductor-wide
+/// fail-stop config (threshold 1, 1-year timeout) would silently neutralise
+/// the best-effort guarantee.
+///
+/// Use for background recovery workers (e.g. `ResumeTokenizationAggregate`)
+/// where a persistently failing individual job must not block processing of
+/// sibling jobs or bring down hedging and fill detection.
+macro_rules! build_best_effort_worker {
+    (
+        ::<$ctx_type:ty, $job:ty>,
+        $index:expr,
+        $queue:expr,
+        $ctx:expr,
+        $circuit:expr
+        $(, $failure_injector:expr)? $(,)?
+    ) => {{
+        build_worker_inner!(
+            ::<$ctx_type, $job>,
+            $index,
+            $queue,
+            $ctx,
+            $circuit,
+            $crate::conductor::job::on_terminal_failure_log_only(
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+            )
+            $(, $failure_injector)?
+        )
+    }};
+}
+
+pub(crate) use build_best_effort_worker;
 
 /// Human-readable identifier for an enqueued job, used in structured logging.
 #[derive(Debug)]
@@ -309,6 +433,15 @@ pub enum JobKind {
     HandleOrderRejection,
     EquityRebalancingCheck,
     UsdcRebalancingCheck,
+    SeedVaultRegistry,
+    WrappedEquityRecovery,
+    UnwrappedEquityRecovery,
+    CheckPositions,
+    TransferUsdcToHedging,
+    TransferUsdcToMarketMaking,
+    TransferEquityToMarketMaking,
+    TransferEquityToHedging,
+    ResumeTokenizationAggregate,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -341,6 +474,15 @@ pub struct FailureInjector {
     handle_order_rejection: Arc<Mutex<InjectionState>>,
     equity_rebalancing_check: Arc<Mutex<InjectionState>>,
     usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
+    seed_vault_registry: Arc<Mutex<InjectionState>>,
+    wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
+    unwrapped_equity_recovery: Arc<Mutex<InjectionState>>,
+    check_positions: Arc<Mutex<InjectionState>>,
+    transfer_usdc_to_hedging: Arc<Mutex<InjectionState>>,
+    transfer_usdc_to_market_making: Arc<Mutex<InjectionState>>,
+    transfer_equity_to_market_making: Arc<Mutex<InjectionState>>,
+    transfer_equity_to_hedging: Arc<Mutex<InjectionState>>,
+    resume_tokenization_aggregate: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -371,6 +513,15 @@ impl FailureInjector {
             handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
             equity_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
             usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
+            seed_vault_registry: Arc::new(Mutex::new(InjectionState::Idle)),
+            wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
+            unwrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
+            check_positions: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_usdc_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_usdc_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_equity_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_equity_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
+            resume_tokenization_aggregate: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -413,6 +564,15 @@ impl FailureInjector {
             JobKind::HandleOrderRejection => &self.handle_order_rejection,
             JobKind::EquityRebalancingCheck => &self.equity_rebalancing_check,
             JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
+            JobKind::SeedVaultRegistry => &self.seed_vault_registry,
+            JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
+            JobKind::UnwrappedEquityRecovery => &self.unwrapped_equity_recovery,
+            JobKind::CheckPositions => &self.check_positions,
+            JobKind::TransferUsdcToHedging => &self.transfer_usdc_to_hedging,
+            JobKind::TransferUsdcToMarketMaking => &self.transfer_usdc_to_market_making,
+            JobKind::TransferEquityToMarketMaking => &self.transfer_equity_to_market_making,
+            JobKind::TransferEquityToHedging => &self.transfer_equity_to_hedging,
+            JobKind::ResumeTokenizationAggregate => &self.resume_tokenization_aggregate,
         };
 
         match mutex.lock() {
@@ -504,6 +664,27 @@ pub(crate) fn on_terminal_failure(
     }
 }
 
+/// On-event handler for workers where terminal failure must not crash the
+/// conductor. Logs the error at `error!` level but does NOT call
+/// `failure_notify.notify_waiters()` and does NOT call `ctx.stop()`.
+/// Used for best-effort background workers (e.g. `ResumeTokenizationAggregate`)
+/// where a persistently failing individual job should not bring down hedging
+/// and fill detection. The worker circuit-breaker config must also be
+/// permissive — see [`build_best_effort_worker!`].
+///
+/// Structural invariant: unlike [`on_terminal_failure`], this function takes
+/// no `Notify` argument and therefore can never call `notify_waiters()` or
+/// `ctx.stop()`, regardless of how it is called.
+pub(crate) fn on_terminal_failure_log_only(
+    error_msg: &'static str,
+) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
+    move |ctx, event| {
+        if let Event::Error(err) = event {
+            error!(%err, worker = %ctx.name(), "{error_msg}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use apalis::layers::WorkerBuilderExt;
@@ -512,13 +693,39 @@ mod tests {
     use apalis_core::worker::event::Event;
     use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
     use apalis_core::worker::ext::event_listener::EventListenerExt;
-    use sqlx::SqlitePool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::setup_test_apalis_pool;
+
+    #[tokio::test]
+    async fn has_in_flight_detects_pending_and_ignores_terminal() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = JobQueue::<u32>::new(&apalis_pool);
+
+        assert!(
+            !queue.has_in_flight().await.unwrap(),
+            "empty queue has nothing in flight"
+        );
+
+        queue.push(42u32).await.unwrap();
+        assert!(
+            queue.has_in_flight().await.unwrap(),
+            "a pending job counts as in flight"
+        );
+
+        // Drive the row to a terminal state; it must no longer count.
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<u32>())
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+        assert!(
+            !queue.has_in_flight().await.unwrap(),
+            "a Done job is terminal and not in flight"
+        );
+    }
 
     #[test]
     fn failure_injector_not_armed_by_default() {
@@ -549,6 +756,70 @@ mod tests {
             "arming OrderFill should not affect Hedge"
         );
         assert!(injector.is_armed(JobKind::OrderFill));
+    }
+
+    #[test]
+    fn failure_injector_wrapped_equity_recovery_isolated() {
+        let injector = FailureInjector::new();
+
+        injector.arm(JobKind::WrappedEquityRecovery);
+        assert!(
+            injector.is_armed(JobKind::WrappedEquityRecovery),
+            "WrappedEquityRecovery should report armed after arm()",
+        );
+        assert!(
+            !injector.is_armed(JobKind::WrappedEquityRecovery),
+            "Second check should auto-disarm WrappedEquityRecovery",
+        );
+
+        injector.arm(JobKind::WrappedEquityRecovery);
+        assert!(
+            !injector.is_armed(JobKind::OrderFill),
+            "Arming WrappedEquityRecovery must not arm OrderFill",
+        );
+        assert!(
+            !injector.is_armed(JobKind::Hedge),
+            "Arming WrappedEquityRecovery must not arm Hedge",
+        );
+        assert!(
+            matches!(
+                &*injector.lock_state(JobKind::WrappedEquityRecovery),
+                InjectionState::Armed
+            ),
+            "WrappedEquityRecovery state should remain Armed when an unrelated kind is queried",
+        );
+    }
+
+    #[test]
+    fn failure_injector_unwrapped_equity_recovery_isolated() {
+        let injector = FailureInjector::new();
+
+        injector.arm(JobKind::UnwrappedEquityRecovery);
+        assert!(
+            injector.is_armed(JobKind::UnwrappedEquityRecovery),
+            "UnwrappedEquityRecovery should report armed after arm()",
+        );
+        assert!(
+            !injector.is_armed(JobKind::UnwrappedEquityRecovery),
+            "Second check should auto-disarm UnwrappedEquityRecovery",
+        );
+
+        injector.arm(JobKind::UnwrappedEquityRecovery);
+        assert!(
+            !injector.is_armed(JobKind::WrappedEquityRecovery),
+            "Arming UnwrappedEquityRecovery must not arm WrappedEquityRecovery",
+        );
+        assert!(
+            !injector.is_armed(JobKind::OrderFill),
+            "Arming UnwrappedEquityRecovery must not arm OrderFill",
+        );
+        assert!(
+            matches!(
+                &*injector.lock_state(JobKind::UnwrappedEquityRecovery),
+                InjectionState::Armed
+            ),
+            "UnwrappedEquityRecovery state should remain Armed when an unrelated kind is queried",
+        );
     }
 
     #[test]
@@ -604,6 +875,7 @@ mod tests {
 
     struct TestCtx {
         success_count: AtomicUsize,
+        success_notify: Arc<tokio::sync::Notify>,
     }
 
     impl Job<TestCtx> for TestJob {
@@ -623,6 +895,7 @@ mod tests {
             }
 
             ctx.success_count.fetch_add(1, Ordering::SeqCst);
+            ctx.success_notify.notify_waiters();
             Ok(())
         }
     }
@@ -635,15 +908,15 @@ mod tests {
     /// the worker must not pick up the next job with stale state.
     #[tokio::test]
     async fn job_failure_after_retries_halts_processing() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let apalis_pool = setup_test_apalis_pool().await;
 
-        let mut queue: JobQueue<TestJob> = JobQueue::new(&pool);
+        let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
         queue.push(TestJob { should_fail: true }).await.unwrap();
         queue.push(TestJob { should_fail: false }).await.unwrap();
 
         let ctx = Arc::new(TestCtx {
             success_count: AtomicUsize::new(0),
+            success_notify: Arc::new(tokio::sync::Notify::new()),
         });
         let ctx_for_assert = ctx.clone();
 
@@ -690,13 +963,13 @@ mod tests {
     }
 
     async fn insert_job(
-        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
         id: &str,
         status: Status,
         attempts: i64,
         max_attempts: i64,
     ) {
-        sqlx::query(
+        sqlx_apalis::query(
             "INSERT INTO Jobs \
              (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
              VALUES (?, ?, 'test', ?, ?, ?, 0, 0)",
@@ -706,31 +979,30 @@ mod tests {
         .bind(status.to_string())
         .bind(attempts)
         .bind(max_attempts)
-        .execute(pool)
+        .execute(apalis_pool)
         .await
         .unwrap();
     }
 
-    async fn job_ids(pool: &SqlitePool) -> Vec<String> {
-        sqlx::query_scalar::<_, String>("SELECT id FROM Jobs ORDER BY id")
-            .fetch_all(pool)
+    async fn job_ids(apalis_pool: &apalis_sqlite::SqlitePool) -> Vec<String> {
+        sqlx_apalis::query_scalar::<_, String>("SELECT id FROM Jobs ORDER BY id")
+            .fetch_all(apalis_pool)
             .await
             .unwrap()
     }
 
     #[tokio::test]
     async fn cleanup_finished_jobs_deletes_terminal_rows() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let apalis_pool = setup_test_apalis_pool().await;
 
-        insert_job(&pool, "done", Status::Done, 1, 25).await;
-        insert_job(&pool, "killed", Status::Killed, 1, 25).await;
-        insert_job(&pool, "failed-terminal", Status::Failed, 25, 25).await;
-        insert_job(&pool, "failed-retryable", Status::Failed, 3, 25).await;
-        insert_job(&pool, "pending", Status::Pending, 0, 25).await;
-        insert_job(&pool, "running", Status::Running, 1, 25).await;
+        insert_job(&apalis_pool, "done", Status::Done, 1, 25).await;
+        insert_job(&apalis_pool, "killed", Status::Killed, 1, 25).await;
+        insert_job(&apalis_pool, "failed-terminal", Status::Failed, 25, 25).await;
+        insert_job(&apalis_pool, "failed-retryable", Status::Failed, 3, 25).await;
+        insert_job(&apalis_pool, "pending", Status::Pending, 0, 25).await;
+        insert_job(&apalis_pool, "running", Status::Running, 1, 25).await;
 
-        let deleted = sqlx::query(
+        let deleted = sqlx_apalis::query(
             "DELETE FROM Jobs \
              WHERE status = ? \
              OR status = ? \
@@ -739,19 +1011,215 @@ mod tests {
         .bind(Status::Done.to_string())
         .bind(Status::Killed.to_string())
         .bind(Status::Failed.to_string())
-        .execute(&pool)
+        .execute(&apalis_pool)
         .await
         .unwrap()
         .rows_affected();
 
         assert_eq!(deleted, 3);
         assert_eq!(
-            job_ids(&pool).await,
+            job_ids(&apalis_pool).await,
             vec![
                 "failed-retryable".to_string(),
                 "pending".to_string(),
                 "running".to_string()
             ]
+        );
+    }
+
+    /// With a permissive circuit-breaker config, a terminally-failing job does
+    /// NOT latch the worker idle: the circuit opens briefly (short
+    /// `recovery_timeout`) and then closes so subsequent jobs can run. This is
+    /// the key behavioral contract of the best-effort worker design.
+    ///
+    /// Regression test: the previous code passed the conductor-wide fail-stop
+    /// config (threshold 1, 1-year timeout) to the best-effort worker,
+    /// permanently blocking all sibling jobs after the first terminal failure.
+    ///
+    /// Goes through `build_best_effort_worker!` with the same permissive
+    /// `CircuitBreakerConfig` that `register_resume_tokenization_worker` in
+    /// `conductor/builder.rs` constructs, so the test validates the real
+    /// production path.
+    #[tokio::test]
+    async fn best_effort_circuit_does_not_latch_on_single_terminal_failure() {
+        let apalis_pool = setup_test_apalis_pool().await;
+
+        let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
+        // Failing job first, then a successful one. With a permissive circuit
+        // breaker (threshold = u32::MAX), the second job must still complete.
+        queue.push(TestJob { should_fail: true }).await.unwrap();
+        queue.push(TestJob { should_fail: false }).await.unwrap();
+
+        // success_notify is wired into TestCtx; TestJob::perform calls
+        // notify_waiters() after each successful run.
+        let success_notify = Arc::new(tokio::sync::Notify::new());
+        let ctx = Arc::new(TestCtx {
+            success_count: AtomicUsize::new(0),
+            success_notify: success_notify.clone(),
+        });
+        let ctx_for_assert = ctx.clone();
+
+        // Mirror the production config from register_resume_tokenization_worker:
+        // high threshold + short recovery so a single failure reopens the circuit
+        // quickly but does not permanently latch the worker idle.
+        let best_effort_circuit = CircuitBreakerConfig::default()
+            .with_failure_threshold(u32::MAX)
+            .with_recovery_timeout(Duration::from_secs(10));
+
+        let monitor_handle = tokio::spawn({
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_best_effort_worker!(
+                        ::<TestCtx, TestJob>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        best_effort_circuit.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+            async move { monitor.run().await }
+        });
+
+        // Wait deterministically for the successful job to complete.
+        // TestJob::perform fires success_notify after incrementing success_count,
+        // so this unblocks as soon as job 2 succeeds -- no fixed sleep needed.
+        //
+        // The 30s budget accounts for the production RETRY_BACKOFF baked into
+        // build_best_effort_worker! via build_worker_inner!: 3 retries at 1s,
+        // 2s, 4s = 7s before the failing job goes terminal, plus the 10s
+        // recovery_timeout before the circuit closes. 30s gives ~3x headroom
+        // over the 17s worst case so the test is not flaky under CI load.
+        tokio::time::timeout(Duration::from_secs(30), success_notify.notified())
+            .await
+            .expect("second job must complete within 30s; circuit must not latch indefinitely");
+
+        monitor_handle.abort();
+
+        assert_eq!(
+            ctx_for_assert.success_count.load(Ordering::SeqCst),
+            1,
+            "second job must complete even after the first job terminally fails;              a permissive circuit breaker must not latch idle on a single failure"
+        );
+    }
+
+    async fn insert_locked_job(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        id: &str,
+        job_type: &str,
+        status: &str,
+        lock_by: Option<&str>,
+    ) {
+        sqlx_apalis::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority, lock_by, lock_at) \
+             VALUES (?, ?, ?, ?, 0, 25, 0, 0, ?, ?)",
+        )
+        .bind(vec![0_u8])
+        .bind(id)
+        .bind(job_type)
+        .bind(status)
+        .bind(lock_by)
+        .bind(lock_by.map(|_| 0_i64))
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+    }
+
+    async fn status_of(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) -> String {
+        sqlx_apalis::query_scalar::<_, String>("SELECT status FROM Jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(apalis_pool)
+            .await
+            .unwrap()
+    }
+
+    async fn lock_by_of(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) -> Option<String> {
+        sqlx_apalis::query_scalar::<_, Option<String>>("SELECT lock_by FROM Jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(apalis_pool)
+            .await
+            .unwrap()
+    }
+
+    async fn insert_worker(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) {
+        sqlx_apalis::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, 'test', 'test')",
+        )
+        .bind(id)
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn requeue_orphaned_resets_only_in_flight_rows_of_this_queue() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let job_type = std::any::type_name::<TestJob>();
+
+        // A previous process died holding the lock on these in-flight rows.
+        insert_worker(&apalis_pool, "dead-worker").await;
+        insert_locked_job(
+            &apalis_pool,
+            "running",
+            job_type,
+            "Running",
+            Some("dead-worker"),
+        )
+        .await;
+        insert_locked_job(
+            &apalis_pool,
+            "queued",
+            job_type,
+            "Queued",
+            Some("dead-worker"),
+        )
+        .await;
+        insert_locked_job(&apalis_pool, "pending", job_type, "Pending", None).await;
+        insert_locked_job(
+            &apalis_pool,
+            "failed",
+            job_type,
+            "Failed",
+            Some("dead-worker"),
+        )
+        .await;
+        insert_locked_job(&apalis_pool, "done", job_type, "Done", Some("dead-worker")).await;
+        // A Running row of a different queue's job type must be left alone.
+        insert_locked_job(
+            &apalis_pool,
+            "other",
+            "other::Job",
+            "Running",
+            Some("dead-worker"),
+        )
+        .await;
+
+        let queue = JobQueue::<TestJob>::new(&apalis_pool);
+        let reset = queue.requeue_orphaned().await.unwrap();
+
+        assert_eq!(reset, 2, "only this queue's Running + Queued rows reset");
+        assert_eq!(status_of(&apalis_pool, "running").await, "Pending");
+        assert_eq!(status_of(&apalis_pool, "queued").await, "Pending");
+        assert_eq!(
+            lock_by_of(&apalis_pool, "running").await,
+            None,
+            "lock cleared so the apalis monitor re-picks the row",
+        );
+        assert_eq!(lock_by_of(&apalis_pool, "queued").await, None);
+
+        assert_eq!(status_of(&apalis_pool, "pending").await, "Pending");
+        assert_eq!(
+            status_of(&apalis_pool, "failed").await,
+            "Failed",
+            "a latched failure awaiting operator reconciliation is not re-driven",
+        );
+        assert_eq!(status_of(&apalis_pool, "done").await, "Done");
+        assert_eq!(
+            status_of(&apalis_pool, "other").await,
+            "Running",
+            "another queue's in-flight row is untouched",
         );
     }
 }

@@ -297,6 +297,14 @@ let
               echo "Ensuring st0x-hedge is restarted on ${env}..." >&2
               ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge" || true
             fi
+            # datasette holds the pre-reset DB inode open; recreating the DB
+            # leaves it serving the deleted file forever. Reopen the live inode
+            # on every exit path, even under --stopped. The marker must be
+            # touched first: datasette's ConditionPathExists gates the start, so
+            # a bare restart with an absent marker silently stops it (exit 0).
+            echo "Restarting datasette on ${env}..." >&2
+            ssh_remote "mkdir -p /run/st0x && touch /run/st0x/datasette.ready && systemctl restart datasette" \
+              || echo "WARNING: datasette restart failed on ${env}; it may still serve the deleted inode" >&2
             _cleanup_identity
           }
           trap _restart_service EXIT
@@ -321,6 +329,16 @@ let
 
           echo "Deleting live database..."
           ssh_remote "rm -f $db_path $db_path-wal $db_path-shm $db_path-journal"
+
+          # Recreate the DB as an empty st0x-owned file immediately. Leaving the
+          # path empty opens a window where any root process that touches it
+          # (a manual sqlite3 inspection, a status query, monitoring) creates a
+          # root:root database the st0x service can never write to, sending the
+          # unit into a SQLITE_READONLY crash loop. SQLite treats a zero-length
+          # file as a valid empty database, so the bot still runs migrations on
+          # next start -- it just inherits an already-correctly-owned file.
+          echo "Recreating empty database owned by st0x:st0x..."
+          ssh_remote "install -o st0x -g st0x -m 644 /dev/null $db_path"
 
           echo "Updating deployment_block to $target_block..."
           ssh_remote "sed -i 's/^deployment_block = .*/deployment_block = $target_block/' $config"

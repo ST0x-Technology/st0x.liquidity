@@ -6,11 +6,13 @@
 
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::{Address, B256, U256, address, keccak256, utils::parse_units};
+use alloy::primitives::{Address, B256, U256, keccak256, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
+
+use crate::USDC_BASE;
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -23,9 +25,6 @@ sol!(
     IERC20,
     env!("ST0X_IERC20_ABI")
 );
-
-/// Base chain USDC address.
-pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
 /// OpenZeppelin ERC20 `_balances` mapping storage slot.
 ///

@@ -1,0 +1,32 @@
+[package]
+name = "st0x-raindex"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rain = ["dep:st0x-execution", "dep:st0x-finance", "dep:tokio", "dep:tracing"]
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+rain-math-float.workspace = true
+st0x-evm.workspace = true
+thiserror.workspace = true
+
+# Optional deps gated behind the `rain` feature (RaindexService implementation only).
+st0x-execution = { workspace = true, optional = true }
+st0x-finance = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+st0x-evm = { workspace = true, features = ["local-signer"] }
+tokio = { workspace = true, features = ["full"] }
+tracing-test.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

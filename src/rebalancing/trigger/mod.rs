@@ -1,12 +1,75 @@
 //! Rebalancing trigger that reacts to inventory imbalances.
 
 mod equity;
+mod freeze;
 mod usdc;
 
-pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
-pub(crate) use usdc::{
-    ALPACA_MINIMUM_WITHDRAWAL, UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
+#[cfg(test)]
+pub(crate) use equity::InProgressGuard;
+pub(crate) use equity::{GuardState, claim_guard_for_recovery_or_orphan};
+
+use alloy::primitives::{Address, TxHash};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, error, info, trace, warn};
+use uuid::Uuid;
+
+use rain_math_float::Float;
+use st0x_config::{AssetsConfig, OperationMode};
+use st0x_event_sorcery::{
+    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
+use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
+use st0x_finance::{HasZero, Usd, Usdc};
+use st0x_wrapper::{Wrapper, WrapperError};
+
+use self::freeze::FreezeStatusReader;
+use self::usdc::UsdcRebalanceOperation;
+use crate::conductor::job::QueuePushError;
+use crate::equity_redemption::{
+    EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
+};
+use crate::inventory::projection::InventoryProjectionError;
+use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
+use crate::inventory::view::InFlightEquityLocation;
+use crate::inventory::{
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
+    Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
+};
+use crate::position::{Position, PositionEvent};
+use crate::rebalancing::equity::{
+    TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
+    TransferEquityToMarketMakingJobQueue,
+};
+use crate::rebalancing::usdc::{
+    TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
+    TransferUsdcToMarketMakingJobQueue,
+};
+use crate::tokenized_equity_mint::{
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+};
+use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
+};
+use crate::usdc_rebalance::{
+    InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent,
+    UsdcRebalanceId, interrupted_usdc_rebalance_ids,
+};
+use crate::vault_registry::{VaultRegistry, VaultRegistryId};
+use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
+use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
+
+pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
+#[cfg(test)]
+pub(crate) use freeze::StubFreezeReader;
+pub(crate) use usdc::{UsdcRebalancingCheck, UsdcRebalancingCheckScheduler};
 
 /// Bundle of the equity + USDC schedulers so constructors and plumbing
 /// functions can pass them as a single argument instead of two.
@@ -14,55 +77,28 @@ pub(crate) use usdc::{
 pub(crate) struct RebalancingSchedulers {
     pub(crate) equity: EquityRebalancingCheckScheduler,
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
+    pub(crate) wrapped_equity_recovery: WrappedEquityRecoveryJobQueue,
+    pub(crate) unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue,
+    pub(crate) transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue,
+    pub(crate) transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue,
+    pub(crate) transfer_equity_to_market_making: TransferEquityToMarketMakingJobQueue,
+    pub(crate) transfer_equity_to_hedging: TransferEquityToHedgingJobQueue,
 }
 
 impl RebalancingSchedulers {
-    pub(crate) fn new(pool: &SqlitePool) -> Self {
+    pub(crate) fn new(pool: &apalis_sqlite::SqlitePool) -> Self {
         Self {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
+            wrapped_equity_recovery: WrappedEquityRecoveryJobQueue::new(pool),
+            unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue::new(pool),
+            transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue::new(pool),
+            transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue::new(pool),
+            transfer_equity_to_market_making: TransferEquityToMarketMakingJobQueue::new(pool),
+            transfer_equity_to_hedging: TransferEquityToHedgingJobQueue::new(pool),
         }
     }
 }
-
-use alloy::primitives::{Address, TxHash};
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{debug, error, trace, warn};
-
-use rain_math_float::Float;
-use st0x_event_sorcery::{
-    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
-};
-use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
-use st0x_finance::{HasZero, Usd, Usdc};
-
-use crate::config::AssetsConfig;
-use crate::equity_redemption::{
-    EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
-};
-use crate::inventory::projection::InventoryProjectionError;
-use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
-use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
-    Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
-};
-use crate::position::{Position, PositionEvent};
-use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
-};
-use crate::usdc_rebalance::{
-    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
-};
-use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use crate::wrapper::{Wrapper, WrapperError};
 
 /// Why the rebalancing trigger reactor failed.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +138,12 @@ pub(crate) enum RebalancingServiceError {
         tracked_quantity: FractionalShares,
         actual_quantity: FractionalShares,
     },
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    ApalisSqlx(#[from] sqlx_apalis::Error),
+    #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
+    RearmEnqueue(#[from] QueuePushError),
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -113,183 +155,6 @@ pub(crate) enum TokenAddressError {
     Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
 
-/// Error type for rebalancing configuration validation.
-#[derive(Debug, thiserror::Error)]
-pub enum RebalancingCtxError {
-    #[error("rebalancing requires alpaca-broker-api broker type")]
-    NotAlpacaBroker,
-    #[error("rebalancing transfer_timeout_secs must be non-zero")]
-    ZeroTransferTimeout,
-    #[error("invalid wallet config: {0}")]
-    WalletConfig(#[from] toml::de::Error),
-    #[error(transparent)]
-    Evm(#[from] st0x_evm::EvmError),
-}
-
-/// USDC rebalancing configuration with explicit enable/disable.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum UsdcRebalancing {
-    Enabled {
-        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-        target: Float,
-        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-        deviation: Float,
-    },
-    Disabled,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RebalancingConfig {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancing,
-    pub(crate) transfer_timeout_secs: u64,
-}
-
-/// Runtime configuration for rebalancing operations.
-///
-/// Constructed asynchronously from `RebalancingConfig`,
-/// `RebalancingSecrets`, and broker auth. During construction, wallets
-/// are pre-built for both chains. After construction, all fields are
-/// immutable.
-///
-/// Read-only provider access for either chain is available via
-/// `base_wallet().provider()` and `ethereum_wallet().provider()`.
-#[derive(Clone)]
-pub struct RebalancingCtx {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: Option<ImbalanceThreshold>,
-    pub(crate) transfer_timeout: Duration,
-    /// Circle attestation/fee API base URL (test-only override).
-    #[cfg(feature = "test-support")]
-    pub circle_api_base: String,
-    /// `TokenMessengerV2` contract address (test-only override).
-    #[cfg(feature = "test-support")]
-    pub token_messenger: Address,
-    /// `MessageTransmitterV2` contract address (test-only override).
-    #[cfg(feature = "test-support")]
-    pub message_transmitter: Address,
-}
-
-impl RebalancingCtx {
-    /// Construct from config and secrets.
-    ///
-    /// Wallets are now built separately via [`OnchainWalletCtx`] —
-    /// this constructor only validates and stores rebalancing-specific
-    /// trigger thresholds.
-    pub(crate) fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
-        if config.transfer_timeout_secs == 0 {
-            return Err(RebalancingCtxError::ZeroTransferTimeout);
-        }
-
-        let usdc = match config.usdc {
-            UsdcRebalancing::Enabled { target, deviation } => {
-                Some(ImbalanceThreshold { target, deviation })
-            }
-            UsdcRebalancing::Disabled => None,
-        };
-
-        Ok(Self {
-            equity: config.equity,
-            usdc,
-            transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
-            #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            #[cfg(feature = "test-support")]
-            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
-            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-        })
-    }
-}
-
-#[cfg(test)]
-#[bon::bon]
-impl RebalancingCtx {
-    /// Test constructor that creates a `RebalancingCtx` with stub wallets.
-    ///
-    /// The wallets panic on `send` -- use only in tests that don't submit
-    /// transactions through the rebalancing wallet.
-    #[builder]
-    pub(crate) fn stub(
-        equity: ImbalanceThreshold,
-        usdc: Option<ImbalanceThreshold>,
-        #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
-    ) -> Self {
-        Self {
-            equity,
-            usdc,
-            transfer_timeout,
-            #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            #[cfg(feature = "test-support")]
-            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
-            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
-#[bon::bon]
-impl RebalancingCtx {
-    /// Test constructor that accepts pre-built wallets for e2e tests
-    /// that need real onchain interaction (e.g. with Anvil forks).
-    #[builder]
-    pub fn with_wallets(
-        equity: ImbalanceThreshold,
-        usdc: UsdcRebalancing,
-        #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
-    ) -> Self {
-        let usdc = match usdc {
-            UsdcRebalancing::Enabled { target, deviation } => {
-                Some(ImbalanceThreshold { target, deviation })
-            }
-            UsdcRebalancing::Disabled => None,
-        };
-
-        Self {
-            equity,
-            usdc,
-            transfer_timeout,
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-        }
-    }
-
-    /// Sets the Circle API base URL override (for e2e tests with local
-    /// CCTP contracts and a mock attestation server).
-    #[must_use]
-    pub fn with_circle_api_base(mut self, base_url: String) -> Self {
-        self.circle_api_base = base_url;
-        self
-    }
-
-    /// Sets the CCTP contract address overrides (for e2e tests with
-    /// locally deployed CCTP contracts).
-    #[must_use]
-    pub fn with_cctp_addresses(
-        mut self,
-        token_messenger: Address,
-        message_transmitter: Address,
-    ) -> Self {
-        self.token_messenger = token_messenger;
-        self.message_transmitter = message_transmitter;
-        self
-    }
-}
-
-impl std::fmt::Debug for RebalancingCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RebalancingCtx")
-            .field("equity", &self.equity)
-            .field("usdc", &self.usdc)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingServiceConfig {
@@ -297,7 +162,21 @@ pub(crate) struct RebalancingServiceConfig {
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
     pub(crate) assets: AssetsConfig,
-    pub(crate) disabled_assets: HashSet<Symbol>,
+}
+
+impl RebalancingServiceConfig {
+    /// Whitelist gate for the equity rebalancing trigger: only symbols
+    /// explicitly configured with `rebalancing = "enabled"` are eligible.
+    /// Symbols observed in inventory but absent from the config are skipped
+    /// cleanly instead of falling through to the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
+    fn is_equity_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
+        self.assets
+            .equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +267,8 @@ impl MintTracking {
             | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
             | TokenizedEquityMintEvent::WrappingFailed { .. }
             | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
-            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => {}
+            | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
+            | TokenizedEquityMintEvent::OperatorReconciled { .. } => {}
         }
     }
 }
@@ -538,6 +418,7 @@ impl RedemptionTracking {
             | EquityRedemptionEvent::DetectionFailed { .. }
             | EquityRedemptionEvent::RedemptionRejected { .. }
             | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
+            | EquityRedemptionEvent::OperatorReconciled { .. }
             | EquityRedemptionEvent::Completed { .. } => {}
         }
 
@@ -566,11 +447,14 @@ fn mint_event_tokenization_request_id(
         | TokenizedEquityMintEvent::WrappingFailed { .. }
         | TokenizedEquityMintEvent::VaultDepositSubmitted { .. }
         | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
-        | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => None,
+        | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
+        | TokenizedEquityMintEvent::OperatorReconciled { .. } => None,
     }
 }
 
-/// Operations triggered by inventory imbalances.
+/// Equity rebalancing decision produced by the imbalance check.
+/// [`RebalancingService::check_and_trigger_equity`] turns it into the
+/// matching apalis transfer job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TriggeredOperation {
     /// Mint tokenized equity (too much offchain).
@@ -587,10 +471,6 @@ pub(crate) enum TriggeredOperation {
         /// Unwrapped (underlying) token address for sending to Alpaca.
         unwrapped_token: Address,
     },
-    /// Move USDC from Alpaca to Base (too much offchain).
-    UsdcAlpacaToBase { amount: Usdc },
-    /// Move USDC from Base to Alpaca (too much onchain).
-    UsdcBaseToAlpaca { amount: Usdc },
 }
 
 /// Service that folds CQRS events into rebalancing state and
@@ -602,13 +482,28 @@ pub(crate) struct RebalancingService {
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
-    pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+    /// Reads issuance's per-asset dividend freeze status so the equity trigger
+    /// can skip frozen assets before starting a flow. Set after construction via
+    /// `set_freeze_status_reader` (the conductor builds the issuance client from
+    /// config, mirroring `set_stores`); `None` only in tests that do not
+    /// exercise the gate.
+    freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
+    pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pending_offchain_order_symbols: Arc<RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
-    sender: mpsc::Sender<TriggeredOperation>,
     wrapper: Arc<dyn Wrapper>,
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
+    pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    pub(super) unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
+    /// Queues for the USDC transfer apalis jobs that drive each rebalancing
+    /// direction. `check_and_trigger_usdc` enqueues into one of these.
+    pub(super) transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
+    pub(super) transfer_usdc_to_market_making_queue: TransferUsdcToMarketMakingJobQueue,
+    /// Queues for the equity transfer apalis jobs that drive each rebalancing
+    /// direction. `check_and_trigger_equity` enqueues into one of these.
+    pub(super) transfer_equity_to_market_making_queue: TransferEquityToMarketMakingJobQueue,
+    pub(super) transfer_equity_to_hedging_queue: TransferEquityToHedgingJobQueue,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
     mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
@@ -622,15 +517,23 @@ pub(crate) struct RebalancingService {
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, DateTime<Utc>>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, DateTime<Utc>>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
+    /// Ids of post-burn-stuck USDC rebalances already logged by the timeout
+    /// sweep. A preserved post-burn entry is intentionally never removed from
+    /// `usdc_tracking` (so a late success can still settle) and its
+    /// `last_progress_at` never advances, so every sweep re-selects it. This
+    /// set deduplicates the error log to once per stuck transfer.
+    post_burn_timeout_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
-    /// CQRS stores for emitting failure events on timeout.
+    /// CQRS stores for emitting failure events on timeout and for re-deriving
+    /// durable state in the USDC timeout sweep.
     /// Set after construction via `set_stores` because the stores
     /// are built after the trigger (the trigger is a Reactor dependency
     /// of the stores' query manifest).
     mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
     redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
+    usdc_store: RwLock<Option<Arc<Store<UsdcRebalance>>>>,
 }
 
 type EquityInventoryUpdate = Box<
@@ -644,6 +547,29 @@ type EquityInventoryUpdate = Box<
 
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[derive(Debug)]
+enum UsdcTimeoutCleanup {
+    Cleared {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+    },
+    PreservedPostBurn {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+    },
+}
+
+/// A stranded post-burn USDC rebalance to re-arm on startup. `recoverable_failure`
+/// distinguishes a post-burn `BridgingFailed` (recoverable via the RAI-909 resume
+/// path, so a terminal job row must not block re-arm) from the pre-mint-confirmation
+/// states (where any job row blocks). See [`RebalancingService::rearm_stranded_transfers`].
+struct RearmCandidate {
+    id: UsdcRebalanceId,
+    direction: RebalanceDirection,
+    amount: Usdc,
+    recoverable_failure: bool,
+}
+
 impl RebalancingService {
     pub(crate) fn new(
         config: RebalancingServiceConfig,
@@ -651,13 +577,18 @@ impl RebalancingService {
         orderbook: Address,
         order_owner: Address,
         inventory: Arc<BroadcastingInventory>,
-        sender: mpsc::Sender<TriggeredOperation>,
         wrapper: Arc<dyn Wrapper>,
         schedulers: RebalancingSchedulers,
     ) -> Self {
         let RebalancingSchedulers {
             equity: equity_scheduler,
             usdc: usdc_scheduler,
+            wrapped_equity_recovery: wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery: unwrapped_equity_recovery_queue,
+            transfer_usdc_to_hedging: transfer_usdc_to_hedging_queue,
+            transfer_equity_to_market_making: transfer_equity_to_market_making_queue,
+            transfer_equity_to_hedging: transfer_equity_to_hedging_queue,
+            transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
         Self {
             config,
@@ -665,13 +596,19 @@ impl RebalancingService {
             orderbook,
             order_owner,
             inventory,
-            equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            freeze_status: RwLock::new(None),
+            equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             pending_offchain_order_symbols: Arc::new(RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
-            sender,
             wrapper,
             equity_scheduler,
             usdc_scheduler,
+            wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery_queue,
+            transfer_usdc_to_hedging_queue,
+            transfer_usdc_to_market_making_queue,
+            transfer_equity_to_market_making_queue,
+            transfer_equity_to_hedging_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -679,15 +616,18 @@ impl RebalancingService {
             timed_out_mints: Arc::new(RwLock::new(HashMap::new())),
             timed_out_redemptions: Arc::new(RwLock::new(HashMap::new())),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
+            post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
             mint_store: RwLock::new(None),
             redemption_store: RwLock::new(None),
+            usdc_store: RwLock::new(None),
         }
     }
 
-    /// Attach CQRS stores so the trigger can emit failure events on timeout.
+    /// Attach CQRS stores so the trigger can emit failure events on timeout and
+    /// re-derive durable USDC state in the timeout sweep.
     ///
     /// Called after construction because the stores are built by the query
     /// manifest, which depends on the trigger as a reactor.
@@ -695,9 +635,18 @@ impl RebalancingService {
         &self,
         mint_store: Arc<Store<TokenizedEquityMint>>,
         redemption_store: Arc<Store<EquityRedemption>>,
+        usdc_store: Arc<Store<UsdcRebalance>>,
     ) {
         *self.mint_store.write().await = Some(mint_store);
         *self.redemption_store.write().await = Some(redemption_store);
+        *self.usdc_store.write().await = Some(usdc_store);
+    }
+
+    /// Attach the issuance freeze-status reader so the equity trigger can skip
+    /// assets frozen for a dividend. Called by the conductor after construction
+    /// (the reader wraps the issuance client built from config).
+    pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
+        *self.freeze_status.write().await = Some(reader);
     }
 
     pub(crate) async fn recover_pending_offchain_order_symbols(
@@ -781,9 +730,61 @@ impl RebalancingService {
         };
 
         for id in timed_out_ids {
+            let Some(symbol) = self
+                .mint_tracking
+                .read()
+                .await
+                .get(&id)
+                .map(|t| t.symbol.clone())
+            else {
+                debug!(
+                    target: "rebalance",
+                    ?id,
+                    "Skipping timed-out mint: tracking entry already removed"
+                );
+                continue;
+            };
+
+            // Steady-state skip: if recovery already owns the slot, leave the
+            // mint untouched -- recovery drives it to terminal, and removing its
+            // tracking or failing it would clear the guard and allow a
+            // double-mint while the tokens are still unwrapped in the wallet. A
+            // concurrent flip to `HeldForRecovery` AFTER this read is closed
+            // atomically at the clear below.
+            let held_for_recovery = {
+                let guard = match self.equity_in_progress.read() {
+                    Ok(guard) => guard,
+                    Err(poison) => poison.into_inner(),
+                };
+                guard.get(&symbol) == Some(&equity::GuardState::HeldForRecovery)
+            };
+            if held_for_recovery {
+                continue;
+            }
+
             let Some((tracking, elapsed)) = self.cleanup_timed_out_mint(&id, now).await? else {
                 continue;
             };
+
+            // Atomically clear the guard UNLESS recovery claimed the slot during
+            // the async cleanup above. Holding the write lock across the re-check
+            // and the clear closes the TOCTOU race: a concurrent
+            // `mark_held_for_recovery` can flip `ActiveTransfer` ->
+            // `HeldForRecovery` after the steady-state check, and a non-atomic
+            // clear would then drop a recovery-owned guard and fail a mint whose
+            // tokens are still in the wallet -- re-opening the double-mint window
+            // this guard exists to close. If recovery now owns the slot, leave
+            // the guard and skip the failure event.
+            if !self.clear_equity_in_progress_unless_held_for_recovery(&symbol) {
+                debug!(
+                    target: "rebalance",
+                    aggregate_id = %id,
+                    %symbol,
+                    "Timed-out mint flipped to HeldForRecovery during cleanup; \
+                     recovery now owns it -- leaving guard and skipping failure event"
+                );
+                continue;
+            }
 
             let elapsed_secs = elapsed.as_secs();
             error!(
@@ -795,8 +796,6 @@ impl RebalancingService {
                 outcome = "timeout",
                 "Mint transfer timed out; clearing trigger guard and inventory inflight"
             );
-
-            self.clear_equity_in_progress(&tracking.symbol);
 
             if let Some(store) = self.mint_store.read().await.as_ref() {
                 let reason = format!(
@@ -915,7 +914,19 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
-        let timed_out_ids = {
+        // Select ids to examine this tick. The selection is intentionally broad:
+        //
+        // - Post-burn entries are ALWAYS selected regardless of elapsed time.
+        //   The durable-Reconciled check is safe to run at any age: it only
+        //   fires when the store already shows Reconciled, and clearing the guard
+        //   at that point is always correct. This ensures that a CLI
+        //   `transfer reconcile` issued before the failed transfer ages past
+        //   `transfer_timeout` still takes effect on the next sweep tick.
+        //
+        // - Pre-burn entries (not yet post-burn) are only selected after the
+        //   timeout elapses, as before: they cannot have an in-flight on-chain
+        //   burn so abandonment is safe to defer until then.
+        let candidate_ids = {
             let tracking = self.usdc_tracking.read().await;
             tracking
                 .iter()
@@ -923,7 +934,7 @@ impl RebalancingService {
                     let elapsed =
                         Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
 
-                    if elapsed >= self.config.transfer_timeout {
+                    if tracking.is_post_burn() || elapsed >= self.config.transfer_timeout {
                         Some(id.clone())
                     } else {
                         None
@@ -932,25 +943,219 @@ impl RebalancingService {
                 .collect::<Vec<_>>()
         };
 
-        for id in timed_out_ids {
-            let Some((tracking, elapsed)) = self.cleanup_timed_out_usdc_rebalance(&id, now).await?
-            else {
+        for id in candidate_ids {
+            // A timed-out transfer whose apalis row is still in flight is NOT
+            // abandoned: the job will resume and may have an irreversible on-chain
+            // withdraw/burn already submitted. Skip the cleanup entirely so we
+            // neither clear the in-progress guard / inventory inflight nor mark it
+            // timed-out (which would make the reactor ignore its eventual terminal
+            // event and latch the guard forever). Let apalis drive it to terminal.
+            if self.transfer_in_flight_for_id(&id).await {
+                warn!(
+                    target: "rebalance",
+                    aggregate_id = %id,
+                    "USDC transfer exceeded its timeout but its apalis row is still in \
+                     flight; deferring cleanup to the job rather than clearing the guard"
+                );
+                continue;
+            }
+
+            let Some(cleanup) = self.cleanup_timed_out_usdc_rebalance(&id, now).await? else {
                 continue;
             };
 
-            error!(
-                target: "rebalance",
-                aggregate_id = %id,
-                direction = ?tracking.direction,
-                stage = %tracking.stage,
-                ?elapsed,
-                "USDC transfer timed out; clearing trigger guard and inventory inflight"
-            );
+            match cleanup {
+                UsdcTimeoutCleanup::Cleared { tracking, elapsed } => {
+                    error!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        direction = ?tracking.direction,
+                        stage = %tracking.stage,
+                        ?elapsed,
+                        "USDC transfer timed out; clearing trigger guard and inventory inflight"
+                    );
 
-            self.clear_usdc_in_progress();
+                    self.clear_usdc_in_progress();
+                }
+                UsdcTimeoutCleanup::PreservedPostBurn { tracking, elapsed } => {
+                    self.usdc_in_progress.store(true, Ordering::SeqCst);
+
+                    // The preserved entry keeps its original `last_progress_at`,
+                    // so every subsequent sweep re-selects it. Log once per stuck
+                    // transfer to avoid flooding the error stream until manual
+                    // recovery. UsdcRebalanceId is never reused, so a logged id
+                    // never needs clearing.
+                    let first_log = self
+                        .post_burn_timeout_logged
+                        .write()
+                        .await
+                        .insert(id.clone());
+
+                    if first_log {
+                        error!(
+                            target: "rebalance",
+                            aggregate_id = %id,
+                            direction = ?tracking.direction,
+                            stage = %tracking.stage,
+                            ?elapsed,
+                            "USDC transfer timed out after CCTP burn; preserving trigger guard and inventory inflight"
+                        );
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Returns true if a USDC transfer apalis row for `id` -- in *either*
+    /// direction -- is still non-terminal (Pending/Queued/Running). The timeout
+    /// sweeper must not clear the `usdc_in_progress` guard while such a row exists:
+    /// the resuming job may have an irreversible withdraw/burn/mint already
+    /// submitted, and clearing the guard would let a second transfer touch the same
+    /// vault/wallet.
+    ///
+    /// Checks BOTH directions (mirroring [`Self::in_flight_usdc_transfer`]): an
+    /// `AlpacaToBase` rebalance is driven by a `TransferUsdcToMarketMaking` job, so
+    /// checking only the hedging queue would miss it and clear the guard while a
+    /// market-making transfer is still in flight. Scoped to the aggregate `id`
+    /// (carried in the job payload) so an unrelated in-flight transfer never defers
+    /// this id's cleanup. On query/decode failure the safe default is to report
+    /// "in flight" so automation stays latched.
+    async fn transfer_in_flight_for_id(&self, id: &UsdcRebalanceId) -> bool {
+        // Both transfer payloads serialize as `{ id, amount, .. }`; only the id is
+        // needed to scope the sweep, so decode just that field for either direction.
+        #[derive(serde::Deserialize)]
+        struct TransferJobId {
+            id: UsdcRebalanceId,
+        }
+
+        let rows: Result<Vec<(Vec<u8>,)>, _> = sqlx_apalis::query_as(
+            "SELECT job FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND status IN ('Pending', 'Queued', 'Running')",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
+        .await;
+
+        match rows {
+            Ok(rows) => rows.iter().any(|(payload,)| {
+                match serde_json::from_slice::<TransferJobId>(payload) {
+                    Ok(job) => job.id == *id,
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %error,
+                            "Failed to decode a non-terminal USDC transfer payload during \
+                             timeout sweep; treating as in flight to stay latched"
+                        );
+                        true
+                    }
+                }
+            }),
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    "Failed to query in-flight USDC transfer rows during timeout sweep; \
+                     keeping the in-progress guard latched to avoid re-arming"
+                );
+                true
+            }
+        }
+    }
+
+    /// Whether a USDC transfer apalis row for `id` exists in *either* direction in
+    /// ANY status -- including terminal `Failed`/`Done`, unlike
+    /// [`Self::transfer_in_flight_for_id`].
+    ///
+    /// Used by startup re-arm for the pre-mint-confirmation post-burn states to
+    /// fire only for the true "no job row at all" strand (a failed redrive
+    /// enqueue, or a crash before the enqueue committed). A `Failed` row is a job
+    /// that exhausted its retry budget and is awaiting operator reconciliation --
+    /// re-arming it would re-drive a known-failing transfer on every restart and
+    /// bypass the retry budget, contradicting [`JobQueue::requeue_orphaned`]'s
+    /// policy of leaving `Failed` rows latched. The operator path for such a
+    /// transfer is the manual `transfer resume --kind usdc` CLI, not an automatic re-arm.
+    ///
+    /// A recoverable post-burn `BridgingFailed` is the exception: it gates on
+    /// [`Self::transfer_in_flight_for_id`] instead (only an in-flight row blocks),
+    /// because recovery is new work rather than a continuation of the exhausted
+    /// budget. See [`Self::rearm_stranded_transfers`].
+    ///
+    /// Unlike the timeout-sweep probe, this PROPAGATES query/decode failures so
+    /// startup recovery fails fast rather than silently skipping (or spuriously
+    /// firing) a re-arm it could not verify.
+    async fn transfer_has_job_row_for_id(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<bool, sqlx_apalis::Error> {
+        #[derive(serde::Deserialize)]
+        struct TransferJobId {
+            id: UsdcRebalanceId,
+        }
+
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx_apalis::query_as("SELECT job FROM Jobs WHERE job_type IN (?, ?)")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+                .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
+                .await?;
+
+        for (payload,) in rows {
+            let job: TransferJobId = serde_json::from_slice(&payload)
+                .map_err(|error| sqlx_apalis::Error::Decode(Box::new(error)))?;
+            if job.id == *id {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Whether apalis still OWNS a transfer job for `id` -- a row it will run or
+    /// re-run on its own: in-flight (`Pending`/`Queued`/`Running`) OR a `Failed`
+    /// row with retries remaining (`attempts < max_attempts`), which apalis
+    /// re-fetches. Terminal rows (`Done`/`Killed`, or `Failed` with the retry
+    /// budget exhausted) do NOT count -- that job has concluded.
+    ///
+    /// Gates re-arm of a recoverable post-burn `BridgingFailed`: recovery is new
+    /// work that may take over once the original transfer job has concluded, but
+    /// must NOT start a second driver while apalis still owns a live row for the
+    /// same id (which would run two concurrent resumes). Propagates query/decode
+    /// failures so startup recovery fails fast rather than silently skipping a
+    /// re-arm it could not verify.
+    async fn transfer_live_job_for_id(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<bool, sqlx_apalis::Error> {
+        #[derive(serde::Deserialize)]
+        struct TransferJobId {
+            id: UsdcRebalanceId,
+        }
+
+        let rows: Vec<(Vec<u8>,)> = sqlx_apalis::query_as(
+            "SELECT job FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
+        .await?;
+
+        for (payload,) in rows {
+            let job: TransferJobId = serde_json::from_slice(&payload)
+                .map_err(|error| sqlx_apalis::Error::Decode(Box::new(error)))?;
+            if job.id == *id {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     async fn retire_stale_suppression_and_collect_active_symbols(
@@ -1092,7 +1297,7 @@ impl RebalancingService {
         &self,
         id: &UsdcRebalanceId,
         now: DateTime<Utc>,
-    ) -> Result<Option<(usdc::UsdcRebalanceTracking, Duration)>, RebalancingServiceError> {
+    ) -> Result<Option<UsdcTimeoutCleanup>, RebalancingServiceError> {
         let _event_sync_guard = self.usdc_event_sync.lock().await;
         let mut tracking_guard = self.usdc_tracking.write().await;
         let Some(tracking) = tracking_guard.get(id).cloned() else {
@@ -1104,6 +1309,121 @@ impl RebalancingService {
             return Ok(None);
         };
 
+        if tracking.is_post_burn() {
+            // Post-burn: check durable state FIRST, regardless of elapsed time.
+            // The Reconciled check is always safe: it only fires when the
+            // aggregate is actually Reconciled and clearing the guard at that
+            // point is always correct. Running it before the timeout gate means
+            // that a CLI `transfer reconcile` issued before the failed
+            // transfer ages past `transfer_timeout` takes effect on the next
+            // sweep tick rather than waiting for the full timeout window.
+            let usdc_store_guard = self.usdc_store.read().await;
+            if let Some(store) = usdc_store_guard.as_ref() {
+                match store.load(id).await {
+                    Ok(Some(UsdcRebalance::Reconciled { .. })) => {
+                        // Durable state is Reconciled: the CLI's separate-process
+                        // store emitted OperatorReconciled but the live reactor
+                        // never saw it. Apply the side-effect here: zero the
+                        // source-venue inflight and clear the active rebalance.
+                        //
+                        // Drop the tracking lock BEFORE acquiring inventory.
+                        // `usdc_event_sync` (held by both this sweep path and the
+                        // reactor's `on_usdc_rebalance`) serialises the two paths,
+                        // so there is no deadlock risk from lock ordering between
+                        // them. We drop the tracking lock before acquiring inventory
+                        // to reduce unnecessary contention -- the relative ordering
+                        // of these two inner locks is not load-bearing for deadlock
+                        // safety; `usdc_event_sync` serialises sweep vs reactor
+                        // entirely.
+                        //
+                        // Both inventory mutations (inflight clear and active
+                        // rebalance clear) are chained in a single lock
+                        // acquisition so there is never a transient state where
+                        // inflight is zeroed but active_usdc_rebalance is still
+                        // set.
+                        tracking_guard.remove(id);
+                        drop(tracking_guard);
+                        drop(usdc_store_guard);
+
+                        let mut inventory = self.inventory.write().await;
+                        let result = inventory
+                            .clone()
+                            .clear_usdc_inflight(tracking.source_venue(), now)
+                            .map(InventoryView::clear_active_usdc_rebalance);
+
+                        match result {
+                            Ok(updated) => *inventory = updated,
+                            Err(error) => {
+                                drop(inventory);
+                                // In practice this branch cannot be triggered:
+                                // `clear_usdc_inflight` only fails when the
+                                // resulting inflight would be negative
+                                // (`Inventory::set_inflight` guards against
+                                // this), and zeroing inflight always produces a
+                                // non-negative result. The branch is retained as
+                                // a defensive layer: if a future inventory
+                                // operation can fail, re-inserting tracking
+                                // ensures the next sweep tick retries rather
+                                // than latching the guard forever with no entry
+                                // to re-select.
+                                self.usdc_tracking
+                                    .write()
+                                    .await
+                                    .insert(id.clone(), tracking);
+                                return Err(error.into());
+                            }
+                        }
+                        drop(inventory);
+
+                        self.timed_out_usdc_rebalances
+                            .write()
+                            .await
+                            .insert(id.clone(), now);
+                        return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
+                    }
+                    Ok(Some(_) | None) => {
+                        // Guard-holding state or aggregate not yet in store:
+                        // fall through to the timeout gate below.
+                        drop(usdc_store_guard);
+                    }
+                    Err(load_error) => {
+                        // Store read failed (I/O error, deserialization error,
+                        // etc.). Fail safe: preserve the guard so a possibly-
+                        // post-burn rebalance cannot be re-burned. Log so
+                        // operators can diagnose a persistent DB issue rather
+                        // than seeing only "Skipped USDC trigger: already in
+                        // progress" with no cause.
+                        warn!(
+                            target: "rebalance",
+                            id = %id,
+                            ?load_error,
+                            "Failed to load UsdcRebalance from store during \
+                             post-burn sweep; preserving guard"
+                        );
+                        drop(usdc_store_guard);
+                        return Ok(Some(UsdcTimeoutCleanup::PreservedPostBurn {
+                            tracking,
+                            elapsed,
+                        }));
+                    }
+                }
+            }
+
+            // Not yet Reconciled (or store not wired): only transition to
+            // PreservedPostBurn after the timeout has elapsed so we do not log
+            // the "timed out after CCTP burn" error on every sweep tick for a
+            // transfer that is still within its normal window.
+            if elapsed < self.config.transfer_timeout {
+                return Ok(None);
+            }
+
+            return Ok(Some(UsdcTimeoutCleanup::PreservedPostBurn {
+                tracking,
+                elapsed,
+            }));
+        }
+
+        // Pre-burn path: only act after the timeout has elapsed.
         if elapsed < self.config.transfer_timeout {
             return Ok(None);
         }
@@ -1122,7 +1442,7 @@ impl RebalancingService {
         tracking_guard.remove(id);
         drop(tracking_guard);
 
-        Ok(Some((tracking, elapsed)))
+        Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }))
     }
 
     async fn mint_timed_out(&self, id: &IssuerRequestId) -> bool {
@@ -1260,8 +1580,9 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
-            EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext, Projection,
-            RedemptionUnwrappedExceedsTracked, SettledUsdcExceedsInitiatedAmount, SharesConversion,
+            ApalisSqlx, EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext,
+            Projection, RearmEnqueue, RedemptionUnwrappedExceedsTracked,
+            SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1275,7 +1596,10 @@ impl RebalancingService {
             | MissingUsdcTrackingContext { .. }
             | MissingUsdcBridgedAmount { .. }
             | SettledUsdcExceedsInitiatedAmount { .. }
-            | RedemptionUnwrappedExceedsTracked { .. }) => {
+            | RedemptionUnwrappedExceedsTracked { .. }
+            | Sqlx(_)
+            | ApalisSqlx(_)
+            | RearmEnqueue(_)) => {
                 return Err(other);
             }
         };
@@ -1397,6 +1721,153 @@ impl RebalancingService {
             OnchainUsdc { .. } | OffchainUsd { .. } | OffchainCashWithdrawable { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
+            // Wrapped equity in the bot wallet (outside Raindex) triggers
+            // a recovery dispatch job per symbol with a positive balance.
+            // Gated on the per-symbol `wrapped_equity_recovery` config so
+            // tests that pre-stage wallet wtSTOCK (e.g. for orderbook
+            // mechanics) can opt out.
+            BaseWalletWrappedEquity { balances, .. } => {
+                for (symbol, amount) in balances {
+                    if *amount == FractionalShares::ZERO {
+                        continue;
+                    }
+                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                        continue;
+                    }
+
+                    let mut queue = self.wrapped_equity_recovery_queue.clone();
+                    let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
+
+                    // Match the serialized `symbol` field exactly (json_extract, not
+                    // a LIKE substring) so a queued job for a ticker that contains
+                    // this symbol as a substring (e.g. GOOGL vs GOOG) can't suppress
+                    // a distinct recovery.
+                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
+                        "SELECT COUNT(*) FROM Jobs \
+                         WHERE job_type = ? \
+                         AND status IN ('Pending', 'Queued', 'Running') \
+                         AND json_extract(job, '$.symbol') = ?",
+                    )
+                    .bind(job_type)
+                    .bind(symbol.to_string())
+                    .fetch_one(queue.pool())
+                    .await;
+
+                    match existing {
+                        Ok((count,)) if count > 0 => {
+                            debug!(
+                                target: "rebalance",
+                                %symbol, %count,
+                                "Skipped WrappedEquityRecoveryJob enqueue: a non-terminal \
+                                 row for this symbol already exists",
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %symbol, %error,
+                                "Failed to query existing WrappedEquityRecoveryJob rows; \
+                                 skipping enqueue to avoid duplicates",
+                            );
+                            continue;
+                        }
+                    }
+
+                    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+                    if let Err(error) = queue
+                        .push(WrappedEquityRecoveryJob {
+                            symbol: symbol.clone(),
+                            recovery_id: recovery_id.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, %recovery_id, ?error,
+                            "Failed to enqueue WrappedEquityRecoveryJob",
+                        );
+                    }
+                }
+            }
+            // Unwrapped equity (tSTOCK) in the bot wallet triggers a
+            // recovery dispatch per symbol with a positive balance.
+            // Gated per-symbol on `wrapped_equity_recovery` -- the same
+            // config flag covers both detection paths since they share
+            // the same "auto-recover misplaced equity" intent.
+            BaseWalletUnwrappedEquity { balances, .. } => {
+                for (symbol, amount) in balances {
+                    if *amount == FractionalShares::ZERO {
+                        continue;
+                    }
+                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                        continue;
+                    }
+
+                    let mut queue = self.unwrapped_equity_recovery_queue.clone();
+                    let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
+
+                    // Status-scoped dedup, mirroring the wrapped path: only a
+                    // non-terminal row blocks a re-enqueue. apalis's
+                    // `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never
+                    // surfaces a unique-violation, and its index spans all
+                    // statuses, so an idempotency key would silently wedge a
+                    // symbol behind its own `Done` row until the hourly cleanup
+                    // -- starving the next-poll re-dispatch the guard-contention
+                    // skip relies on. Match the serialized `symbol` field
+                    // exactly (json_extract, not a LIKE substring) so a queued
+                    // job for a ticker that contains this symbol as a substring
+                    // (e.g. GOOGL vs GOOG) can't suppress a distinct recovery.
+                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
+                        "SELECT COUNT(*) FROM Jobs \
+                         WHERE job_type = ? \
+                         AND status IN ('Pending', 'Queued', 'Running') \
+                         AND json_extract(job, '$.symbol') = ?",
+                    )
+                    .bind(job_type)
+                    .bind(symbol.to_string())
+                    .fetch_one(queue.pool())
+                    .await;
+
+                    match existing {
+                        Ok((count,)) if count > 0 => {
+                            debug!(
+                                target: "rebalance",
+                                %symbol, %count,
+                                "Skipped UnwrappedEquityRecoveryJob enqueue: a non-terminal \
+                                 row for this symbol already exists",
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %symbol, %error,
+                                "Failed to query existing UnwrappedEquityRecoveryJob rows; \
+                                 skipping enqueue to avoid duplicates",
+                            );
+                            continue;
+                        }
+                    }
+
+                    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+                    if let Err(error) = queue
+                        .push(UnwrappedEquityRecoveryJob {
+                            symbol: symbol.clone(),
+                            recovery_id: recovery_id.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, %recovery_id, ?error,
+                            "Failed to enqueue UnwrappedEquityRecoveryJob",
+                        );
+                    }
+                }
+            }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
             // Suppression-aware re-triggering will be added once
@@ -1404,8 +1875,6 @@ impl RebalancingService {
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
             // Buying power is display-only and doesn't feed any rebalance
             // decision.
             | OffchainCashBuyingPower { .. }
@@ -1413,6 +1882,53 @@ impl RebalancingService {
             // indicate transfers already in progress, not new balances
             // to rebalance.
             | InflightEquity { .. } => {}
+        }
+    }
+
+    /// Re-drives recovery producers from the already-hydrated inventory view.
+    ///
+    /// Startup hydration updates the in-memory view directly instead of
+    /// dispatching snapshot reactor events. Wallet polls also suppress unchanged
+    /// balances, so a positive tSTOCK/wtSTOCK balance that was persisted before
+    /// restart would otherwise wait forever for a new event.
+    pub(crate) async fn enqueue_recovery_for_current_wallet_balances(&self) {
+        let (wrapped, unwrapped) = {
+            let view = self.inventory.read().await;
+            let mut wrapped = BTreeMap::new();
+            let mut unwrapped = BTreeMap::new();
+
+            for symbol in self.config.assets.equities.symbols.keys() {
+                if let Some(amount) =
+                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped)
+                {
+                    wrapped.insert(symbol.clone(), amount);
+                }
+                if let Some(amount) =
+                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletUnwrapped)
+                {
+                    unwrapped.insert(symbol.clone(), amount);
+                }
+            }
+
+            (wrapped, unwrapped)
+        };
+
+        let fetched_at = Utc::now();
+
+        if !wrapped.is_empty() {
+            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: wrapped,
+                fetched_at,
+            })
+            .await;
+        }
+
+        if !unwrapped.is_empty() {
+            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: unwrapped,
+                fetched_at,
+            })
+            .await;
         }
     }
 }
@@ -1505,7 +2021,17 @@ impl Reactor for RebalancingService {
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
-                    Initialized { .. } | ThresholdUpdated { .. } => return Ok(()),
+                    Initialized { .. } | ThresholdUpdated { .. } => {
+                        return Ok(());
+                    }
+                    ManualPositionAdjusted { .. } => {
+                        // A manual adjustment can create a hedgeable imbalance.
+                        // Nudge an immediate equity check (mirroring the
+                        // OffChainOrderFailed arm) rather than waiting up to a
+                        // full poll cycle for the periodic scan to notice.
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        return Ok(());
+                    }
                 };
 
                 let inventory_result = {
@@ -1648,8 +2174,14 @@ impl RebalancingService {
         }
     }
 
-    fn try_claim_equity_guard(&self, symbol: &Symbol) -> Option<equity::InProgressGuard> {
-        equity::InProgressGuard::try_claim(symbol.clone(), Arc::clone(&self.equity_in_progress))
+    fn try_claim_equity_guard_for_transfer(
+        &self,
+        symbol: &Symbol,
+    ) -> Option<equity::InProgressGuard> {
+        equity::InProgressGuard::try_claim_for_transfer(
+            symbol.clone(),
+            Arc::clone(&self.equity_in_progress),
+        )
     }
 
     async fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
@@ -1691,16 +2223,6 @@ impl RebalancingService {
 
     fn try_claim_usdc_guard(&self) -> Option<usdc::InProgressGuard> {
         usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
-    }
-
-    fn try_send_operation(&self, operation: &TriggeredOperation, context: &'static str) -> bool {
-        match self.sender.try_send(operation.clone()) {
-            Ok(()) => true,
-            Err(error) => {
-                warn!(target: "rebalance", %error, ?operation, context, "Failed to send triggered operation");
-                false
-            }
-        }
     }
 
     async fn load_mint_tracking(&self, id: &IssuerRequestId) -> Option<MintTracking> {
@@ -1749,6 +2271,7 @@ impl RebalancingService {
     fn mint_inventory_update(
         event: &TokenizedEquityMintEvent,
         quantity: FractionalShares,
+        stage: MintTrackingStage,
     ) -> Option<EquityInventoryUpdate> {
         use TokenizedEquityMintEvent::*;
 
@@ -1756,10 +2279,28 @@ impl RebalancingService {
             MintAccepted { .. } => {
                 Some(Self::start_equity_transfer_update(Venue::Hedging, quantity))
             }
-            MintAcceptanceFailed { .. } => Some(Self::cancel_equity_transfer_update(
-                Venue::Hedging,
-                quantity,
-            )),
+            // Cancel the Hedging inflight that `MintAccepted` started -- but ONLY
+            // if acceptance actually happened. The operator force-fail from
+            // `MintRequested` (RAI-999) emits this same event PRE-acceptance,
+            // where no inflight was ever started; cancelling there would be an
+            // unmatched Cancel. Gating on the tracking stage makes this honour
+            // SPEC's "no balance change for a pre-acceptance force-fail" rule by
+            // construction -- independent of process topology (the CLI's
+            // separate-process write also keeps it off this reactor today, but
+            // this guard is what keeps it correct if `transfer fail` is ever
+            // routed through the running bot). `track_mint_progress` does not
+            // advance the stage on `MintAcceptanceFailed`, so the stage here is
+            // `Requested` for a pre-acceptance fail and `Accepted` otherwise.
+            MintAcceptanceFailed { .. } => match stage {
+                MintTrackingStage::Requested => None,
+                MintTrackingStage::Accepted
+                | MintTrackingStage::TokensReceived
+                | MintTrackingStage::WrapSubmitted
+                | MintTrackingStage::TokensWrapped
+                | MintTrackingStage::VaultDepositSubmitted => Some(
+                    Self::cancel_equity_transfer_update(Venue::Hedging, quantity),
+                ),
+            },
             // TokensReceived completes the normal mint; ProviderCompletionRecovered
             // completes a recovered one. rebuild_mint_tracking_for_recovery restores
             // the canonical in-flight shape (Hedging in-flight = quantity, available
@@ -1777,7 +2318,10 @@ impl RebalancingService {
             | TokensWrapped { .. }
             | VaultDepositSubmitted { .. }
             | WrappingFailed { .. }
-            | RaindexDepositFailed { .. } => None,
+            | RaindexDepositFailed { .. }
+            // Reconciliation is a pure bookkeeping terminal transition from
+            // `Failed`: the failure already settled inventory, so nothing to do.
+            | OperatorReconciled { .. } => None,
         }
     }
 
@@ -1870,6 +2414,9 @@ impl RebalancingService {
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
+            // Reconciliation is a pure bookkeeping terminal transition from
+            // `Failed`: the failure already settled inventory, so nothing to do.
+            | OperatorReconciled { .. }
             | RedemptionRejected { .. } => None,
         }
     }
@@ -1909,8 +2456,17 @@ impl RebalancingService {
             | SendPending {
                 unwrapped_amount, ..
             } => FractionalShares::from_u256_18_decimals(*unwrapped_amount),
-            Completed { .. } | Failed { .. } => Ok(FractionalShares::ZERO),
+            Completed { .. } | Failed { .. } | Reconciled { .. } => Ok(FractionalShares::ZERO),
         }
+    }
+
+    fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
+        self.config
+            .assets
+            .equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| config.wrapped_equity_recovery == OperationMode::Enabled)
     }
 
     /// Checks inventory for equity imbalance and triggers operation if needed.
@@ -1920,8 +2476,47 @@ impl RebalancingService {
     ) -> Result<(), equity::EquityTriggerError> {
         self.expire_stuck_operations_with_logging().await;
 
-        if self.config.disabled_assets.contains(symbol) {
+        if !self.config.is_equity_rebalancing_enabled(symbol) {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger: rebalancing not enabled for symbol"
+            );
             return Ok(());
+        }
+
+        // Dividend freeze guard: do not start a rebalancing flow for an asset
+        // issuance has frozen. The check goes before claiming the in-progress
+        // guard or building the operation so a frozen asset is skipped cheaply.
+        // The reader is `None` only in tests that do not exercise the gate; the
+        // conductor always sets it in production.
+        let freeze_status = self.freeze_status.read().await.clone();
+        if let Some(reader) = freeze_status {
+            match reader.is_frozen(symbol).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    info!(
+                        target: "rebalance",
+                        %symbol,
+                        "Skipped equity trigger: asset is frozen for a dividend"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    // Fail closed: a flow started for a frozen asset strands
+                    // funds, and rebalancing is latency-tolerant, so when
+                    // issuance cannot confirm the asset is unfrozen we skip the
+                    // cycle and alert rather than risk initiating it.
+                    error!(
+                        target: "rebalance",
+                        %symbol,
+                        ?error,
+                        "Skipped equity trigger: could not confirm asset is not \
+                         frozen; failing closed"
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         if self.has_pending_offchain_order(symbol).await {
@@ -1929,7 +2524,7 @@ impl RebalancingService {
             return Ok(());
         }
 
-        let Some(guard) = self.try_claim_equity_guard(symbol) else {
+        let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
         };
@@ -1958,13 +2553,13 @@ impl RebalancingService {
 
         // Re-check immediately before dispatch: an OffChainOrderPlaced for this
         // symbol may have landed during the awaits in build_equity_operation.
-        // try_send_operation is synchronous, so no await intervenes between this
-        // check and the send, keeping the race window as tight as possible.
         // This narrows but cannot fully close the gap: the in-memory set is a
         // reactor-lagged projection of the position aggregate's
         // pending_offchain_order_id, so a just-committed OffChainOrderPlaced
-        // not yet seen by the reactor is invisible here. Closing that fully
-        // needs a source-side reservation, not a reactor-lagged projection.
+        // not yet seen by the reactor is invisible here (and the mint path
+        // awaits its Jobs-table dedupe query between this check and the
+        // push). Closing that fully needs a source-side reservation, not a
+        // reactor-lagged projection.
         if self.has_pending_offchain_order(symbol).await {
             debug!(
                 target: "rebalance",
@@ -1974,11 +2569,24 @@ impl RebalancingService {
             return Ok(());
         }
 
-        if !self.try_send_operation(&operation, "equity") {
+        let dispatched = match operation {
+            TriggeredOperation::Mint { symbol, quantity } => {
+                self.enqueue_transfer_equity_to_market_making(symbol, quantity, guard.generation())
+                    .await
+            }
+            TriggeredOperation::Redemption {
+                symbol, quantity, ..
+            } => {
+                self.enqueue_transfer_equity_to_hedging(symbol, quantity)
+                    .await
+            }
+        };
+
+        if !dispatched {
             return Ok(());
         }
 
-        debug!(target: "rebalance", %symbol, ?operation, "Triggered equity rebalancing");
+        debug!(target: "rebalance", %symbol, "Triggered equity rebalancing");
         guard.defuse();
         Ok(())
     }
@@ -2038,7 +2646,16 @@ impl RebalancingService {
             return;
         };
 
-        if !self.try_send_operation(&operation, "usdc") {
+        let dispatched = match operation {
+            UsdcRebalanceOperation::BaseToAlpaca { amount } => {
+                self.enqueue_transfer_usdc_to_hedging(amount).await
+            }
+            UsdcRebalanceOperation::AlpacaToBase { amount } => {
+                self.enqueue_transfer_usdc_to_market_making(amount).await
+            }
+        };
+
+        if !dispatched {
             return;
         }
 
@@ -2046,7 +2663,410 @@ impl RebalancingService {
         guard.defuse();
     }
 
+    /// Returns the oldest non-terminal USDC transfer job in *either* direction
+    /// (the row id and its age in seconds), if any.
+    ///
+    /// The dedupe gate is deliberately direction-independent. Both directions
+    /// move funds through the same vault and market-maker wallet, and the
+    /// in-memory `usdc_in_progress` guard resets on restart, so an in-flight
+    /// transfer in one direction must also suppress enqueuing a transfer in the
+    /// *other* direction. Querying only one job type would, after a restart, let
+    /// an opposite-direction transfer run concurrently against the same funds --
+    /// churning capital and paying CCTP/withdrawal fees twice.
+    async fn in_flight_usdc_transfer(
+        pool: &apalis_sqlite::SqlitePool,
+    ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
+        sqlx_apalis::query_as(
+            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
+             FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
+             ORDER BY run_at ASC \
+             LIMIT 1",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_optional(pool)
+        .await
+    }
+
+    /// Enqueues a [`TransferUsdcToHedging`] apalis job for a Base->Alpaca
+    /// transfer. Generates a fresh `UsdcRebalanceId` at push time so apalis
+    /// retries (and bot restarts that re-pick the job row) hit the same
+    /// aggregate. Returns `true` on successful enqueue.
+    ///
+    /// Before enqueueing, [`Self::in_flight_usdc_transfer`] checks the apalis
+    /// Jobs table for any non-terminal USDC transfer in either direction. The
+    /// in-memory `usdc_in_progress` guard resets on restart, so without this
+    /// check a crash between `queue.push` and the first persisted
+    /// `UsdcRebalance` event would let the next imbalance check enqueue a second
+    /// job for the same imbalance.
+    async fn enqueue_transfer_usdc_to_hedging(&self, amount: Usdc) -> bool {
+        // A non-terminal row in flight longer than this is treated as likely
+        // stuck: the suppression is logged at warn (with the row id and age) so
+        // it is actionable, rather than silently starving the hedge side with
+        // only a debug log. `run_at` is a unix-seconds column.
+        const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
+
+        let queue = self.transfer_usdc_to_hedging_queue.clone();
+
+        match Self::in_flight_usdc_transfer(queue.pool()).await {
+            Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    threshold_secs = STUCK_TRANSFER_WARN_AFTER_SECS,
+                    %amount,
+                    "Skipped Base->Alpaca USDC transfer enqueue: an in-flight USDC transfer \
+                     (either direction) looks stuck and is suppressing new rebalances; \
+                     investigate before it starves hedging",
+                );
+                return false;
+            }
+            Ok(Some((row_id, age_secs))) => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    %amount,
+                    "Skipped Base->Alpaca USDC transfer enqueue: a non-terminal USDC transfer \
+                     (either direction) already exists; apalis will resume it",
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    "Failed to query for in-flight USDC transfers; \
+                     skipping enqueue to avoid double-pushing",
+                );
+                return false;
+            }
+        }
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut queue = queue;
+
+        let push = queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount,
+            })
+            .await;
+
+        match push {
+            Ok(()) => {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    %amount,
+                    "Enqueued TransferUsdcToHedging job for Base->Alpaca USDC transfer",
+                );
+                true
+            }
+
+            Err(QueuePushError(error)) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %amount,
+                    "Failed to enqueue TransferUsdcToHedging job",
+                );
+                false
+            }
+        }
+    }
+
+    /// Sibling of [`Self::enqueue_transfer_usdc_to_hedging`] for the
+    /// Alpaca->Base direction.
+    ///
+    /// Mirrors the same persistent dedupe: an in-memory `usdc_in_progress`
+    /// guard resets on restart, so without querying the apalis Jobs table
+    /// a crash between `queue.push` and the first persisted
+    /// `UsdcRebalance` event would let the next imbalance check enqueue a
+    /// second job for the same rebalance.
+    async fn enqueue_transfer_usdc_to_market_making(&self, amount: Usdc) -> bool {
+        let queue = self.transfer_usdc_to_market_making_queue.clone();
+
+        match Self::in_flight_usdc_transfer(queue.pool()).await {
+            Ok(Some((row_id, age_secs))) => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    %amount,
+                    "Skipped Alpaca->Base USDC transfer enqueue: a non-terminal USDC transfer \
+                     (either direction) already exists; apalis will resume it",
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    "Failed to query for in-flight USDC transfers; \
+                     skipping enqueue to avoid double-pushing",
+                );
+                return false;
+            }
+        }
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut queue = queue;
+
+        let push = queue
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+            })
+            .await;
+
+        match push {
+            Ok(()) => {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    %amount,
+                    "Enqueued TransferUsdcToMarketMaking job for Alpaca->Base USDC transfer",
+                );
+                true
+            }
+
+            Err(QueuePushError(error)) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %amount,
+                    "Failed to enqueue TransferUsdcToMarketMaking job",
+                );
+                false
+            }
+        }
+    }
+
+    /// Returns the oldest non-terminal equity transfer job for this symbol in
+    /// *either* direction (the row id and its age in seconds), if any.
+    ///
+    /// The in-memory `equity_in_progress` guard resets on restart, so without
+    /// this check a crash between `queue.push` and the first persisted
+    /// aggregate event would let the next imbalance check enqueue a second
+    /// transfer for the same imbalance. Like the USDC gate, the check is
+    /// direction-independent per symbol: both directions move the same
+    /// symbol's inventory, so an in-flight mint must also suppress a
+    /// redemption (and vice versa). The payload is a `serde_json` BLOB
+    /// (apalis `JsonCodec`), so the symbol is filtered via `json_extract`.
+    async fn in_flight_equity_transfer(
+        pool: &apalis_sqlite::SqlitePool,
+        symbol: &Symbol,
+    ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
+        sqlx_apalis::query_as(
+            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
+             FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND json_extract(job, '$.symbol') = ? \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
+             ORDER BY run_at ASC \
+             LIMIT 1",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .bind(symbol.to_string())
+        .fetch_optional(pool)
+        .await
+    }
+
+    /// Enqueues a [`TransferEquityToMarketMaking`] apalis job for a
+    /// hedging->market-making equity mint. Generates a fresh
+    /// `IssuerRequestId` at push time so apalis retries (and bot restarts
+    /// that re-pick the job row) hit the same aggregate. Returns `true` on
+    /// successful enqueue.
+    async fn enqueue_transfer_equity_to_market_making(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        generation: u64,
+    ) -> bool {
+        // A non-terminal row in flight longer than this is treated as likely
+        // stuck: the suppression is logged at warn (with the row id and age)
+        // so it is actionable rather than silently freezing the symbol.
+        const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
+
+        let mut queue = self.transfer_equity_to_market_making_queue.clone();
+
+        match Self::in_flight_equity_transfer(queue.pool(), &symbol).await {
+            Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    threshold_secs = STUCK_TRANSFER_WARN_AFTER_SECS,
+                    %symbol,
+                    %quantity,
+                    "Skipped equity mint enqueue: an in-flight equity transfer for this \
+                     symbol looks stuck and is suppressing new rebalances; investigate \
+                     before it starves market making",
+                );
+                return false;
+            }
+            Ok(Some((row_id, age_secs))) => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    %symbol,
+                    %quantity,
+                    "Skipped equity mint enqueue: a non-terminal equity transfer for \
+                     this symbol already exists; apalis will resume it",
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %symbol,
+                    "Failed to query for in-flight equity transfers; \
+                     skipping enqueue to avoid double-pushing",
+                );
+                return false;
+            }
+        }
+
+        let issuer_request_id = IssuerRequestId::generate();
+
+        let push = queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: issuer_request_id.clone(),
+                symbol: symbol.clone(),
+                quantity,
+                generation,
+            })
+            .await;
+
+        match push {
+            Ok(()) => {
+                debug!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %symbol,
+                    %quantity,
+                    "Enqueued TransferEquityToMarketMaking job for equity mint",
+                );
+                true
+            }
+
+            Err(QueuePushError(error)) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %symbol,
+                    %quantity,
+                    "Failed to enqueue TransferEquityToMarketMaking job",
+                );
+                false
+            }
+        }
+    }
+
+    /// Sibling of [`Self::enqueue_transfer_equity_to_market_making`] for the
+    /// redemption (market-making -> hedging) direction. Same per-symbol
+    /// Jobs-table dedupe; same fresh-id-at-push-time contract.
+    async fn enqueue_transfer_equity_to_hedging(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+    ) -> bool {
+        const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
+
+        let mut queue = self.transfer_equity_to_hedging_queue.clone();
+
+        match Self::in_flight_equity_transfer(queue.pool(), &symbol).await {
+            Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    threshold_secs = STUCK_TRANSFER_WARN_AFTER_SECS,
+                    %symbol,
+                    %quantity,
+                    "Skipped equity redemption enqueue: an in-flight equity transfer for \
+                     this symbol looks stuck and is suppressing new rebalances; \
+                     investigate before it starves hedging",
+                );
+                return false;
+            }
+            Ok(Some((row_id, age_secs))) => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    %symbol,
+                    %quantity,
+                    "Skipped equity redemption enqueue: a non-terminal equity transfer \
+                     for this symbol already exists; apalis will resume it",
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %symbol,
+                    "Failed to query for in-flight equity transfers; \
+                     skipping enqueue to avoid double-pushing",
+                );
+                return false;
+            }
+        }
+
+        let aggregate_id = RedemptionAggregateId::generate();
+
+        let push = queue
+            .push(TransferEquityToHedging {
+                aggregate_id: aggregate_id.clone(),
+                symbol: symbol.clone(),
+                quantity,
+            })
+            .await;
+
+        match push {
+            Ok(()) => {
+                debug!(
+                    target: "rebalance",
+                    %aggregate_id,
+                    %symbol,
+                    %quantity,
+                    "Enqueued TransferEquityToHedging job for equity redemption",
+                );
+                true
+            }
+
+            Err(QueuePushError(error)) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %symbol,
+                    %quantity,
+                    "Failed to enqueue TransferEquityToHedging job",
+                );
+                false
+            }
+        }
+    }
+
     /// Clears the in-progress flag for an equity symbol.
+    ///
+    /// Removes the entry regardless of its current `GuardState`. Called by
+    /// `on_mint`/`on_redemption` terminal event arms and by guard-drop in all
+    /// transfer and recovery job paths.
     pub(crate) fn clear_equity_in_progress(&self, symbol: &Symbol) {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
@@ -2055,12 +3075,60 @@ impl RebalancingService {
         guard.remove(symbol);
     }
 
-    fn mark_equity_in_progress(&self, symbol: &Symbol) {
+    /// Clears the in-progress guard for a timed-out mint unless recovery owns
+    /// the slot, in a single write-lock acquisition.
+    ///
+    /// Returns `true` after removing an `ActiveTransfer` (or absent) guard so
+    /// the caller can fail the mint and free the symbol for a fresh rebalance.
+    /// Returns `false` without touching a `HeldForRecovery` slot: recovery owns
+    /// the mint and will drive it to terminal. Holding the lock across the
+    /// check and the clear closes the TOCTOU race where a concurrent
+    /// `mark_held_for_recovery` flips `ActiveTransfer` -> `HeldForRecovery`
+    /// between a separate check and clear.
+    pub(crate) fn clear_equity_in_progress_unless_held_for_recovery(
+        &self,
+        symbol: &Symbol,
+    ) -> bool {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
-        guard.insert(symbol.clone());
+        match guard.get(symbol) {
+            Some(equity::GuardState::HeldForRecovery) => false,
+            Some(equity::GuardState::ActiveTransfer { .. }) | None => {
+                guard.remove(symbol);
+                true
+            }
+        }
+    }
+
+    /// Marks the slot as `ActiveTransfer` (startup recovery and tracking-rebuild
+    /// paths that re-establish a live transfer's guard on restart).
+    fn mark_equity_active_transfer(&self, symbol: &Symbol) {
+        let mut guard = match self.equity_in_progress.write() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        guard.insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::next_generation(),
+            },
+        );
+    }
+
+    /// Sets the in-progress guard to `HeldForRecovery` for a symbol.
+    ///
+    /// Used during startup reconstruction for post-receipt mint states when
+    /// recovery is enabled: instead of `ActiveTransfer` (which would block
+    /// the recovery job), we set `HeldForRecovery` so `claim_guard_for_recovery_or_orphan`
+    /// can claim the slot and resume.
+    fn mark_equity_held_for_recovery(&self, symbol: &Symbol) {
+        let mut guard = match self.equity_in_progress.write() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
     }
 
     /// Releases the in-progress guard and tracking for a mint whose recovery
@@ -2093,6 +3161,253 @@ impl RebalancingService {
     /// Clears the in-progress flag for USDC rebalancing.
     pub(crate) fn clear_usdc_in_progress(&self) {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    /// Reconstructs the single-rebalance guard (`usdc_in_progress`) from durable
+    /// `UsdcRebalance` event state on startup, and re-arms transfer jobs for
+    /// post-burn rebalances stranded with no pending job.
+    ///
+    /// The guard is in-memory and resets to `false` on restart. Without this, a
+    /// restart between a post-burn `BridgingFailed` (or any unsettled in-flight
+    /// rebalance) and settlement would let the next imbalance check dispatch a
+    /// fresh CCTP burn against funds CCTP has already burned. Re-asserting the
+    /// guard when any aggregate is in a guard-holding state blocks new USDC
+    /// rebalancing until the stuck transfer settles or an operator recovers it.
+    ///
+    /// USDC bridges DO resume post-restart: apalis re-picks any pending transfer
+    /// job row and drives it via `resume_*`. But a redrive enqueue that fails
+    /// after its `TimeoutAttestation` already committed (or a crash in that
+    /// window) leaves the aggregate durably `AwaitingAttestation`/`Attested` with
+    /// no job to retry it -- the guard would then stay latched forever. So for
+    /// each post-burn resumable aggregate with no in-flight job row, this
+    /// re-enqueues a transfer job keyed by the existing id. The
+    /// `transfer_in_flight_for_id` check makes this idempotent with apalis's own
+    /// re-pick of still-pending rows. See ADR 2.
+    pub(crate) async fn recover_usdc_guard(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        let InterruptedUsdcRebalances {
+            ids: candidate_ids,
+            unparseable,
+        } = interrupted_usdc_rebalance_ids(pool).await?;
+
+        let mut held_ids = Vec::new();
+        let mut held_tracking = Vec::new();
+        let mut unresolved_ids = Vec::new();
+        let mut rearm_candidates = Vec::new();
+        for id in candidate_ids {
+            match usdc_store.load(&id).await {
+                Ok(Some(entity)) => {
+                    if entity.holds_rebalance_guard() {
+                        held_ids.push(id.clone());
+
+                        // Reconstruct an in-memory tracking entry for the
+                        // manually-reconcilable guard-holding terminal states
+                        // that cannot self-recover: `DepositFailed`,
+                        // `ConversionFailed { BaseToAlpaca }`, and
+                        // `BridgingFailed { AlpacaToBase, burn_tx=Some }`.
+                        // Seeding tracking for in-progress states or the
+                        // resumable `BridgingFailed { BaseToAlpaca }` would
+                        // wedge their `DepositConfirmed` path, which requires
+                        // `bridged_amount_received` that the seed cannot
+                        // supply. Those states self-recover; only these three
+                        // terminal states need the sweep's durable-state-check
+                        // path to clear the guard after a CLI reconcile.
+                        if let Some((direction, amount, last_progress_at)) =
+                            entity.guard_recovery_tracking_data()
+                        {
+                            held_tracking.push((
+                                id.clone(),
+                                usdc::UsdcRebalanceTracking {
+                                    direction,
+                                    initiated_amount: amount,
+                                    bridged_amount_received: None,
+                                    // All seeded states are post-burn
+                                    // (DepositFailed, ConversionFailed{BtA},
+                                    // BridgingFailed{AtB}), so the sweep takes
+                                    // the durable-state-check path
+                                    // (is_post_burn = true) on every tick.
+                                    stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                                    // Use the aggregate's `failed_at` rather
+                                    // than `Utc::now()` so that a failure which
+                                    // occurred hours before this restart is
+                                    // already past the `transfer_timeout` on the
+                                    // first sweep tick, enabling fast guard
+                                    // recovery without waiting for another full
+                                    // timeout window. The sweep's Reconciled
+                                    // check (which is timeout-independent) fires
+                                    // either way; `failed_at` only affects when
+                                    // the non-Reconciled PreservedPostBurn log
+                                    // is emitted.
+                                    last_progress_at,
+                                },
+                            ));
+                        }
+                    }
+
+                    if let Some((direction, amount)) = entity.resumable_post_burn_transfer() {
+                        rearm_candidates.push(RearmCandidate {
+                            recoverable_failure: matches!(
+                                &entity,
+                                UsdcRebalance::BridgingFailed { .. }
+                            ),
+                            id,
+                            direction,
+                            amount,
+                        });
+                    }
+                }
+                // The id came from the event log, so a missing or unreplayable
+                // aggregate is an inconsistency we cannot classify. Fail safe:
+                // hold the guard so a possibly-post-burn rebalance can never be
+                // re-burned, and surface it for operators. Blocking is the safe
+                // direction; the alternative is the re-burn this guards against.
+                // A single bad aggregate must not abort recovery for the rest,
+                // so we do not propagate -- only the query's I/O error does.
+                Ok(None) => {
+                    error!(
+                        target: "rebalance",
+                        %id,
+                        "USDC rebalance candidate missing from store on startup; holding guard defensively"
+                    );
+                    unresolved_ids.push(id);
+                }
+                Err(error) => {
+                    error!(
+                        target: "rebalance",
+                        %id, ?error,
+                        "Failed to load USDC rebalance candidate on startup; holding guard defensively"
+                    );
+                    unresolved_ids.push(id);
+                }
+            }
+        }
+
+        // Re-arm a transfer job for each post-burn resumable aggregate that has
+        // no job row at all -- the strand that a failed redrive enqueue (or a
+        // crash in that window) leaves behind. Done before the early return because a
+        // resumable aggregate always holds the guard, so this set is non-empty
+        // only when `held_ids` is too. Propagates on failure so startup recovery
+        // fails fast rather than coming up with a latched guard and no driving job.
+        self.rearm_stranded_transfers(rearm_candidates).await?;
+
+        // An unparseable candidate aggregate_id cannot be loaded or classified,
+        // so it joins the unresolved set: hold the guard rather than risk leaving
+        // a possibly-post-burn rebalance unguarded. Same fail-closed direction as
+        // a missing or unloadable aggregate above.
+        if held_ids.is_empty() && unresolved_ids.is_empty() && unparseable.is_empty() {
+            return Ok(());
+        }
+
+        self.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        // Populate in-memory tracking for each held aggregate so the timeout
+        // sweep can re-derive durable state and clear the guard when the
+        // operator reconciles via the CLI without requiring a restart. Without
+        // these entries the sweep's `usdc_tracking` iteration finds nothing and
+        // `cleanup_timed_out_usdc_rebalance` is never called.
+        self.usdc_tracking.write().await.extend(held_tracking);
+
+        error!(
+            target: "rebalance",
+            held = ?held_ids,
+            unresolved = ?unresolved_ids,
+            unparseable = ?unparseable,
+            "Reconstructed USDC in-progress guard for unsettled rebalances on startup; \
+             new USDC rebalancing is blocked until they settle or are recovered"
+        );
+
+        Ok(())
+    }
+
+    /// Re-enqueues a transfer job for each stranded post-burn rebalance, keyed by
+    /// the existing aggregate id so the resumed job hits the same aggregate.
+    ///
+    /// The skip gate depends on the candidate's state:
+    ///
+    /// - A pre-mint-confirmation post-burn state (`Bridging`/`AwaitingAttestation`/
+    ///   `Attested`) is re-armed only for the true "no job row at all" strand: any
+    ///   job row -- in-flight OR a terminal `Failed` awaiting operator
+    ///   reconciliation -- skips it via [`Self::transfer_has_job_row_for_id`], so
+    ///   re-arm never bypasses the retry budget of a job that already ran and gave
+    ///   up.
+    /// - A post-burn `BridgingFailed` (`recoverable_failure`) is recoverable
+    ///   (RAI-909): re-checking the mint on-chain and un-failing the aggregate is
+    ///   NEW work, not a continuation of the original transfer's exhausted budget,
+    ///   so a terminal `Failed`/`Done` row must NOT block it (that row is the
+    ///   normal artifact of the job that drove it to the failed state). Only a
+    ///   row apalis still owns -- in-flight OR a `Failed` row with retries
+    ///   remaining -- skips it, via [`Self::transfer_live_job_for_id`], so we
+    ///   never drive two concurrent resumes of the same id. A genuinely
+    ///   unrecoverable transfer re-arms again on each restart once its retry
+    ///   budget is spent; that is acceptable for committed burned funds (and an
+    ///   operator alert should fire on the repeated failure) and is the price of
+    ///   not abandoning recoverable funds.
+    ///
+    /// An enqueue failure (or a probe failure) is propagated so startup recovery
+    /// fails fast and the supervisor retries -- consistent with the
+    /// `requeue_orphaned` startup path -- rather than coming up "healthy" with the
+    /// guard latched and no job driving a post-burn transfer.
+    async fn rearm_stranded_transfers(
+        &self,
+        candidates: Vec<RearmCandidate>,
+    ) -> Result<(), RebalancingServiceError> {
+        for RearmCandidate {
+            id,
+            direction,
+            amount,
+            recoverable_failure,
+        } in candidates
+        {
+            let blocked = if recoverable_failure {
+                self.transfer_live_job_for_id(&id).await?
+            } else {
+                self.transfer_has_job_row_for_id(&id).await?
+            };
+
+            if blocked {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    recoverable_failure,
+                    "Post-burn transfer already has a blocking job row on startup; not re-arming",
+                );
+                continue;
+            }
+
+            match direction {
+                RebalanceDirection::BaseToAlpaca => {
+                    self.transfer_usdc_to_hedging_queue
+                        .clone()
+                        .push(TransferUsdcToHedging {
+                            id: id.clone(),
+                            amount,
+                        })
+                        .await?;
+                }
+                RebalanceDirection::AlpacaToBase => {
+                    self.transfer_usdc_to_market_making_queue
+                        .clone()
+                        .push(TransferUsdcToMarketMaking {
+                            id: id.clone(),
+                            amount,
+                        })
+                        .await?;
+                }
+            }
+
+            warn!(
+                target: "rebalance",
+                %id,
+                ?direction,
+                %amount,
+                "Re-armed a stranded post-burn USDC transfer with no job row on startup",
+            );
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn recover_mint_state(
@@ -2185,7 +3500,30 @@ impl RebalancingService {
                         last_progress_at,
                     },
                 );
-                self.mark_equity_in_progress(symbol);
+
+                // For pre-wrap post-receipt states (TokensReceived, WrapSubmitted),
+                // the transfer job may have already handed off to recovery via
+                // HeldForRecovery and returned Ok(()) — the apalis job is Done and
+                // will never be re-picked. On restart, reconstructing these states as
+                // ActiveTransfer would block UnwrappedEquityRecovery from claiming.
+                //
+                // When recovery is enabled, reconstruct as HeldForRecovery so
+                // claim_guard_for_recovery_or_orphan can claim the slot. When recovery
+                // is disabled, ActiveTransfer is correct — resume_interrupted_transfers
+                // will call resume_mint and the transfer job retries normally.
+                //
+                // TokensWrapped and VaultDepositSubmitted are always reconstructed as
+                // ActiveTransfer: the deposit is idempotent and resume_interrupted_transfers
+                // drives them to completion. WrappedEquityRecovery is orphan-only.
+                let is_pre_wrap_post_receipt_state =
+                    matches!(entity, TokensReceived { .. } | WrapSubmitted { .. });
+
+                if is_pre_wrap_post_receipt_state && self.is_wrapped_equity_recovery_enabled(symbol)
+                {
+                    self.mark_equity_held_for_recovery(symbol);
+                } else {
+                    self.mark_equity_active_transfer(symbol);
+                }
 
                 let mut inventory = self.inventory.write().await;
                 let mut updated = inventory.clone();
@@ -2198,14 +3536,14 @@ impl RebalancingService {
                 }
                 *inventory = updated.set_active_mint(symbol.clone(), id.clone());
             }
-            DepositedIntoRaindex { .. } | Failed { .. } => {}
+            DepositedIntoRaindex { .. } | Failed { .. } | Reconciled { .. } => {}
         }
 
         Ok(())
     }
 
     /// Rebuilds in-memory tracking for a failed mint being recovered via
-    /// `recheck-transfer`, so the live reactor applies the
+    /// `transfer recheck`, so the live reactor applies the
     /// `ProviderCompletionRecovered` inventory effect and the terminal
     /// cleanup once the recovery event is dispatched.
     ///
@@ -2249,7 +3587,7 @@ impl RebalancingService {
         // A third shape the timeout/explicit branches below do not cover: the
         // failure left the in-flight already established (a `Start` ran but the
         // failure never cancelled it back to available -- e.g. an out-of-process
-        // `fail-transfer`, or a reactor that recorded the failure without
+        // `transfer fail`, or a reactor that recorded the failure without
         // running `cancel`). That is already the canonical pre-complete shape,
         // so re-establishing it with another `Start` would double-count
         // (quantity -> 2*quantity) and strand the quantity in-flight after the
@@ -2329,7 +3667,7 @@ impl RebalancingService {
                 last_progress_at: Utc::now(),
             },
         );
-        self.mark_equity_in_progress(symbol);
+        self.mark_equity_active_transfer(symbol);
         Ok(RecoveryClaim::Claimed(rollback))
     }
 
@@ -2385,7 +3723,7 @@ impl RebalancingService {
     }
 
     /// Rebuilds in-memory tracking for a failed redemption being recovered
-    /// via `recheck-transfer`. See [`Self::rebuild_mint_tracking_for_recovery`]
+    /// via `transfer recheck`. See [`Self::rebuild_mint_tracking_for_recovery`]
     /// for why inventory balances are left untouched on the explicit-failure
     /// path: a failed redemption never cancelled its in-flight transfer, so the
     /// recovery event's inventory arm completes that still-pending transfer.
@@ -2484,7 +3822,7 @@ impl RebalancingService {
                 last_progress_at: Utc::now(),
             },
         );
-        self.mark_equity_in_progress(symbol);
+        self.mark_equity_active_transfer(symbol);
         Ok(RecoveryClaim::Claimed(rollback))
     }
 
@@ -2642,7 +3980,7 @@ impl RebalancingService {
                         last_progress_at,
                     },
                 );
-                self.mark_equity_in_progress(symbol);
+                self.mark_equity_active_transfer(symbol);
 
                 let mut inventory = self.inventory.write().await;
                 let updated = inventory.clone().update_equity(
@@ -2652,7 +3990,7 @@ impl RebalancingService {
                 )?;
                 *inventory = updated.set_active_redemption(symbol.clone(), id.clone());
             }
-            Completed { .. } | Failed { .. } => {}
+            Completed { .. } | Failed { .. } | Reconciled { .. } => {}
         }
 
         Ok(())
@@ -2677,7 +4015,8 @@ impl RebalancingService {
         };
         let symbol = tracking.symbol;
 
-        if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity) {
+        if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity, tracking.stage)
+        {
             self.apply_equity_update(&symbol, update).await?;
         }
 
@@ -2847,7 +4186,8 @@ impl RebalancingService {
             | MintRejected { .. }
             | MintAcceptanceFailed { .. }
             | RaindexDepositFailed { .. }
-            | WrappingFailed { .. } => true,
+            | WrappingFailed { .. }
+            | OperatorReconciled { .. } => true,
 
             MintRequested { .. }
             | MintAccepted { .. }
@@ -2875,7 +4215,8 @@ impl RebalancingService {
             | ProviderCompletionRecovered { .. }
             | TransferFailed { .. }
             | DetectionFailed { .. }
-            | RedemptionRejected { .. } => true,
+            | RedemptionRejected { .. }
+            | OperatorReconciled { .. } => true,
 
             VaultWithdrawPending { .. }
             | VaultWithdrawSubmitted { .. }
@@ -2898,6 +4239,7 @@ impl RebalancingService {
                 | BridgingFailed { .. }
                 | DepositFailed { .. }
                 | ConversionFailed { .. }
+                | OperatorReconciled { .. }
                 | ConversionConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     ..
@@ -2931,49 +4273,101 @@ pub(crate) async fn drain_pending_jobs(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use st0x_event_sorcery::{
-        EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
-    };
-    use st0x_execution::{Direction, ExecutorOrderId, Positive, SupportedExecutor};
-    use st0x_finance::{Usd, Usdc};
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::sync::broadcast;
-    use tokio::sync::mpsc;
-    use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
 
+    use st0x_config::{
+        CashAssetConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
+    };
     use st0x_dto::Statement;
+    use st0x_event_sorcery::{
+        EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
+    };
+    use st0x_execution::{
+        AlpacaTransferId, ClientOrderId, Direction, ExecutorOrderId, HasZero, Positive,
+        SupportedExecutor,
+    };
+    use st0x_finance::{Usd, Usdc};
+    use st0x_float_macro::float;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
-
-    use crate::alpaca_wallet::AlpacaTransferId;
     use crate::conductor::job::Job;
-    use crate::config::{CashAssetConfig, EquitiesConfig, OperationMode};
-    use crate::equity_redemption::DetectionFailure;
+    use crate::equity_redemption::{DetectionFailure, redemption_aggregate_id};
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
     };
-    use crate::inventory::view::Operator;
+    use crate::inventory::view::{InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
-    use crate::threshold::ExecutionThreshold;
-    use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
+    use crate::test_utils::rebalancing_enabled_equities;
+    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
     use crate::vault_registry::VaultRegistryCommand;
-    use crate::wrapper::mock::MockWrapper;
-    use st0x_execution::HasZero;
-    use st0x_float_macro::float;
+
+    #[test]
+    fn mint_inventory_update_skips_cancel_for_pre_acceptance_fail() {
+        // RAI-999: a pre-acceptance force-fail (tracking stage still Requested)
+        // started no Hedging inflight, so it must produce NO inventory update --
+        // a Cancel there would be unmatched. (The post-acceptance Cancel path is
+        // covered end-to-end by `recover_mint_clears_hedging_inflight`.)
+        let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
+            reason: "operator force-fail".to_string(),
+            failed_at: Utc::now(),
+        };
+        let quantity = FractionalShares::new(float!(10));
+
+        let update = RebalancingService::mint_inventory_update(
+            &event,
+            quantity,
+            MintTrackingStage::Requested,
+        );
+        assert!(
+            update.is_none(),
+            "pre-acceptance MintAcceptanceFailed must not produce an inventory update"
+        );
+    }
+
+    #[test]
+    fn mint_inventory_update_cancels_for_post_acceptance_fail() {
+        // Once acceptance happened `MintAccepted` started a Hedging inflight, so
+        // every later `MintAcceptanceFailed` (operator force-fail or poll-driven)
+        // MUST cancel it. This pins the cancel arms in place: the pre-acceptance
+        // skip test alone would still pass if they were collapsed to `None`. The
+        // end-to-end cancel effect lives in `recover_mint_clears_hedging_inflight`
+        // (a distant file); this guards the match wiring locally.
+        let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
+            reason: "operator force-fail".to_string(),
+            failed_at: Utc::now(),
+        };
+        let quantity = FractionalShares::new(float!(10));
+
+        for stage in [
+            MintTrackingStage::Accepted,
+            MintTrackingStage::TokensReceived,
+            MintTrackingStage::WrapSubmitted,
+            MintTrackingStage::TokensWrapped,
+            MintTrackingStage::VaultDepositSubmitted,
+        ] {
+            let update = RebalancingService::mint_inventory_update(&event, quantity, stage);
+            assert!(
+                update.is_some(),
+                "post-acceptance MintAcceptanceFailed (stage {stage}) must cancel the Hedging inflight"
+            );
+        }
+    }
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
@@ -2987,7 +4381,7 @@ mod tests {
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: rebalancing_enabled_equities(&["AAPL", "TSLA", "GOOG", "RKLB"]),
                 cash: Some(CashAssetConfig {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
@@ -2995,7 +4389,6 @@ mod tests {
                     reserved: None,
                 }),
             },
-            disabled_assets: HashSet::new(),
         }
     }
 
@@ -3006,34 +4399,193 @@ mod tests {
         }
     }
 
-    async fn make_trigger() -> (Arc<RebalancingService>, mpsc::Receiver<TriggeredOperation>) {
-        let (sender, receiver) = mpsc::channel(10);
+    async fn make_trigger() -> Arc<RebalancingService> {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
-        let service = Arc::new(RebalancingService::new(
+        Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
-            sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
-        ));
-        (service, receiver)
+            RebalancingSchedulers::new(&apalis_pool),
+        ))
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_scan_enqueues_persisted_unwrapped_wallet_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
+        let now = Utc::now();
+        let inventory_view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletUnwrapped,
+            &balances,
+            now,
+            now,
+        );
+
+        let mut config = test_config();
+        config.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
+        let service = RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let (jobs,): (i64,) = sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .fetch_one(service.unwrapped_equity_recovery_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs, 1,
+            "startup recovery scan must enqueue persisted positive unwrapped wallet balances",
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_equity_recovery_enqueues_when_rebalancing_disabled() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
+        let now = Utc::now();
+        let inventory_view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletUnwrapped,
+            &balances,
+            now,
+            now,
+        );
+
+        let mut config = test_config();
+        config.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
+        let service = RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let (jobs,): (i64,) = sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .fetch_one(service.unwrapped_equity_recovery_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs, 1,
+            "wrapped equity recovery must not depend on rebalancing being enabled",
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_equity_recovery_skips_when_recovery_disabled() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
+        let now = Utc::now();
+        let inventory_view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletWrapped,
+            &balances,
+            now,
+            now,
+        );
+
+        let mut config = test_config();
+        config.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
+        let service = RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let (jobs,): (i64,) = sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(service.wrapped_equity_recovery_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs, 0,
+            "recovery-disabled symbols must not enqueue wallet recovery jobs",
+        );
     }
 
     #[tokio::test]
     async fn recover_mint_state_restores_tracking_and_inflight() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-recovery");
+        let mint_id = issuer_request_id("mint-recovery");
         let accepted_at = Utc::now();
 
         trigger
@@ -3052,7 +4604,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         let tracking = trigger
             .mint_tracking
@@ -3085,11 +4643,241 @@ mod tests {
         assert_eq!(inflight, Some(FractionalShares::new(float!(10))));
     }
 
+    /// Builds a `RebalancingService` with `wrapped_equity_recovery = Enabled` for `symbol`.
+    async fn make_trigger_with_recovery_enabled(symbol: &Symbol) -> Arc<RebalancingService> {
+        let config = RebalancingServiceConfig {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols: HashMap::from([(
+                        symbol.clone(),
+                        EquityAssetConfig {
+                            tokenized_equity: Address::ZERO,
+                            tokenized_equity_derivative: Address::ZERO,
+                            pyth_feed_id: None,
+                            vault_ids: Vec::new(),
+                            trading: OperationMode::Disabled,
+                            rebalancing: OperationMode::Enabled,
+                            wrapped_equity_recovery: OperationMode::Enabled,
+                            operational_limit: None,
+                        },
+                    )]),
+                },
+                cash: None,
+            },
+            ..test_config()
+        };
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wrapper = Arc::new(MockWrapper::new());
+        Arc::new(RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            wrapper,
+            RebalancingSchedulers::new(&apalis_pool),
+        ))
+    }
+
+    /// `recover_mint_state` startup guard reconstruction: all four post-receipt
+    /// states produce the correct `GuardState`.
+    ///
+    /// - `TokensReceived` / `WrapSubmitted` (pre-wrap, recovery enabled):
+    ///   `HeldForRecovery` — `UnwrappedEquityRecovery` owns the slot; a new
+    ///   transfer cannot start until recovery completes.
+    /// - `TokensWrapped` / `VaultDepositSubmitted` (post-wrap, recovery
+    ///   enabled): `ActiveTransfer` — deposit is idempotent;
+    ///   `resume_interrupted_transfers` drives them via `resume_mint`.
+    /// - `TokensReceived` (recovery disabled): `ActiveTransfer` — no recovery
+    ///   job will run; the transfer job retries normally via apalis.
+    #[tokio::test]
+    async fn recover_mint_state_reconstructs_all_post_receipt_states() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let trigger_enabled = make_trigger_with_recovery_enabled(&symbol).await;
+        let trigger_disabled = make_trigger().await;
+
+        async fn check(
+            trigger: &RebalancingService,
+            symbol: &Symbol,
+            mint_id_str: &str,
+            entity: TokenizedEquityMint,
+            expected: equity::GuardState,
+            label: &str,
+        ) {
+            // Clear any prior guard state so each case starts clean.
+            trigger.equity_in_progress.write().unwrap().remove(symbol);
+            let mint_id = issuer_request_id(mint_id_str);
+            trigger.recover_mint_state(&mint_id, &entity).await.unwrap();
+            assert_eq!(
+                trigger
+                    .equity_in_progress
+                    .read()
+                    .unwrap()
+                    .get(symbol)
+                    .cloned(),
+                Some(expected),
+                "{label}"
+            );
+        }
+
+        check(
+            &trigger_enabled,
+            &symbol,
+            "startup-tokens-received",
+            TokenizedEquityMint::TokensReceived {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-tokens-received"),
+                tokenization_request_id: TokenizationRequestId("TOK-TR".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+            },
+            equity::GuardState::HeldForRecovery,
+            "TokensReceived + recovery enabled must reconstruct as HeldForRecovery",
+        )
+        .await;
+
+        check(
+            &trigger_enabled,
+            &symbol,
+            "startup-wrap-submitted",
+            TokenizedEquityMint::WrapSubmitted {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-wrap-submitted"),
+                tokenization_request_id: TokenizationRequestId("TOK-WS".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::ZERO,
+            },
+            equity::GuardState::HeldForRecovery,
+            "WrapSubmitted + recovery enabled must reconstruct as HeldForRecovery",
+        )
+        .await;
+
+        // For ActiveTransfer cases the generation counter is opaque so we use
+        // matches! rather than assert_eq! to verify the variant without pinning
+        // the generation value.
+        async fn check_active_transfer(
+            trigger: &RebalancingService,
+            symbol: &Symbol,
+            mint_id_str: &str,
+            entity: TokenizedEquityMint,
+            label: &str,
+        ) {
+            trigger.equity_in_progress.write().unwrap().remove(symbol);
+            let mint_id = issuer_request_id(mint_id_str);
+            trigger.recover_mint_state(&mint_id, &entity).await.unwrap();
+            assert!(
+                matches!(
+                    trigger
+                        .equity_in_progress
+                        .read()
+                        .unwrap()
+                        .get(symbol)
+                        .cloned(),
+                    Some(equity::GuardState::ActiveTransfer { .. })
+                ),
+                "{label}"
+            );
+        }
+
+        check_active_transfer(
+            &trigger_enabled,
+            &symbol,
+            "startup-tokens-wrapped",
+            TokenizedEquityMint::TokensWrapped {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-tokens-wrapped"),
+                tokenization_request_id: TokenizationRequestId("TOK-TW".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::ZERO,
+                wrapped_shares: U256::from(5u64),
+                wrap_block: None,
+                wrapped_at: now,
+            },
+            "TokensWrapped must always reconstruct as ActiveTransfer \
+             (deposit idempotent; WrappedEquityRecovery is orphan-only)",
+        )
+        .await;
+
+        check_active_transfer(
+            &trigger_enabled,
+            &symbol,
+            "startup-vault-deposit-submitted",
+            TokenizedEquityMint::VaultDepositSubmitted {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-vault-deposit-submitted"),
+                tokenization_request_id: TokenizationRequestId("TOK-VDS".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+                wrap_tx_hash: TxHash::ZERO,
+                wrapped_shares: U256::from(5u64),
+                wrapped_at: now,
+                vault_deposit_tx_hash: TxHash::ZERO,
+            },
+            "VaultDepositSubmitted must always reconstruct as ActiveTransfer \
+             (deposit tx on-chain; resume_mint confirms idempotently)",
+        )
+        .await;
+
+        check_active_transfer(
+            &trigger_disabled,
+            &symbol,
+            "startup-tokens-received-disabled",
+            TokenizedEquityMint::TokensReceived {
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+                issuer_request_id: issuer_request_id("startup-tokens-received-disabled"),
+                tokenization_request_id: TokenizationRequestId("TOK-TR-D".to_string()),
+                tx_hash: TxHash::ZERO,
+                shares_minted: U256::from(5u64),
+                fees: None,
+                requested_at: now,
+                accepted_at: now,
+                received_at: now,
+            },
+            "TokensReceived + recovery disabled must reconstruct as ActiveTransfer \
+             (apalis transfer job retries normally)",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn recover_redemption_state_restores_tracking_and_inflight() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-recovery");
+        let redemption_id = redemption_aggregate_id("redemption-recovery");
         let detected_at = Utc::now();
         let redemption_tx = TxHash::random();
 
@@ -3108,7 +4896,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         let tracking = trigger
             .redemption_tracking
@@ -3143,9 +4937,9 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_after_explicit_mint_failure_moves_equity_to_market_making() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-explicit-recovery");
+        let mint_id = issuer_request_id("mint-explicit-recovery");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // An explicit MintAcceptanceFailed cancelled the in-flight back to
@@ -3196,9 +4990,9 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_after_timeout_mint_failure_clears_tombstone_and_moves_equity() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-timeout-recovery");
+        let mint_id = issuer_request_id("mint-timeout-recovery");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // A timeout cleared the in-flight without crediting available (Hedging
@@ -3259,9 +5053,9 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_after_explicit_redemption_failure_moves_equity_to_hedging() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-explicit-recovery");
+        let redemption_id = redemption_aggregate_id("redemption-explicit-recovery");
 
         // An explicit DetectionFailed/RedemptionRejected does not touch
         // inventory, so the in-flight is still held at MarketMaking (onchain):
@@ -3315,9 +5109,9 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_after_timeout_redemption_failure_clears_tombstone_and_moves_equity() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-timeout-recovery");
+        let redemption_id = redemption_aggregate_id("redemption-timeout-recovery");
 
         // A timeout cleared the MarketMaking in-flight and tombstoned the
         // aggregate; available stays debited at 90.
@@ -3377,9 +5171,9 @@ mod tests {
 
     #[tokio::test]
     async fn abandon_mint_recovery_guard_clears_active_mint() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-resume-failure");
+        let mint_id = issuer_request_id("mint-resume-failure");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         *trigger.inventory.write().await =
@@ -3430,15 +5224,21 @@ mod tests {
 
         assert_eq!(trigger.inventory.read().await.active_mint(&symbol), None);
         assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn mint_recovery_claim_refuses_a_different_mint_without_mutating() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = IssuerRequestId::new("recovering-mint");
-        let other = IssuerRequestId::new("other-mint");
+        let recovering = issuer_request_id("recovering-mint");
+        let other = issuer_request_id("other-mint");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // Explicit-failure shape (available 100, in-flight 0) but a *different*
@@ -3471,14 +5271,20 @@ mod tests {
         assert_eq!(inventory.active_mint(&symbol), Some(&other));
         drop(inventory);
         assert!(!trigger.mint_tracking.read().await.contains_key(&recovering));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn mint_recovery_claim_succeeds_for_self_owned_slot() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = IssuerRequestId::new("recovering-mint");
+        let recovering = issuer_request_id("recovering-mint");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // The slot is still owned by the recovering mint itself (e.g. a
@@ -3514,10 +5320,10 @@ mod tests {
 
     #[tokio::test]
     async fn redemption_recovery_claim_refuses_a_different_redemption_without_mutating() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = RedemptionAggregateId::new("recovering-redemption");
-        let other = RedemptionAggregateId::new("other-redemption");
+        let recovering = redemption_aggregate_id("recovering-redemption");
+        let other = redemption_aggregate_id("other-redemption");
         let tombstone_at = Utc::now();
 
         // Timeout shape with a *different* redemption owning the slot. The claim
@@ -3571,14 +5377,20 @@ mod tests {
                 .await
                 .contains_key(&recovering)
         );
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn redemption_recovery_claim_succeeds_for_self_owned_slot() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = RedemptionAggregateId::new("recovering-redemption");
+        let recovering = redemption_aggregate_id("recovering-redemption");
         let tombstone_at = Utc::now();
 
         *trigger.inventory.write().await = InventoryView::default()
@@ -3619,10 +5431,10 @@ mod tests {
 
     #[tokio::test]
     async fn abandon_mint_recovery_guard_keeps_active_mint_owned_by_other_id() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering_id = IssuerRequestId::new("recovering-mint");
-        let other_id = IssuerRequestId::new("other-active-mint");
+        let recovering_id = issuer_request_id("recovering-mint");
+        let other_id = issuer_request_id("other-active-mint");
 
         // A different aggregate owns the symbol's active-mint slot (e.g. a
         // concurrent mint). Abandoning the recovering mint's guard must NOT clear
@@ -3644,9 +5456,9 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_after_explicit_mint_dispatch_failure_restores_available() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-explicit-rollback");
+        let mint_id = issuer_request_id("mint-explicit-rollback");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // Explicit failure cancelled the in-flight back to available: 100/0.
@@ -3702,14 +5514,20 @@ mod tests {
         assert_eq!(inventory.active_mint(&symbol), None);
         drop(inventory);
         assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn rollback_after_timeout_mint_dispatch_failure_restores_tombstone() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-timeout-rollback");
+        let mint_id = issuer_request_id("mint-timeout-rollback");
         let tok = TokenizationRequestId("TOK-1".to_string());
         let tombstone_at = Utc::now();
 
@@ -3786,14 +5604,20 @@ mod tests {
         );
         drop(inventory);
         assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn rollback_after_timeout_redemption_dispatch_failure_restores_tombstone() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-timeout-rollback");
+        let redemption_id = redemption_aggregate_id("redemption-timeout-rollback");
         let tombstone_at = Utc::now();
 
         // Timeout cleared the MarketMaking in-flight and tombstoned; 90/0.
@@ -3873,14 +5697,20 @@ mod tests {
                 .await
                 .contains_key(&redemption_id)
         );
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn rollback_after_explicit_redemption_dispatch_failure_keeps_inflight() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-explicit-rollback");
+        let redemption_id = redemption_aggregate_id("redemption-explicit-rollback");
 
         // An explicit failure left the MarketMaking in-flight in place: 90
         // available, 10 in-flight. Rebuild does not touch inventory here.
@@ -3932,14 +5762,20 @@ mod tests {
                 .await
                 .contains_key(&redemption_id)
         );
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
     async fn rollback_redemption_clears_self_owned_active_redemption() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-self-owned");
+        let redemption_id = redemption_aggregate_id("redemption-self-owned");
 
         // Explicit-failure shape with the slot still self-owned (a reactor-less
         // failure the live process never observed -- the claim treats this as
@@ -3986,10 +5822,10 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_redemption_keeps_active_redemption_owned_by_other_id() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-rollback");
-        let other_id = RedemptionAggregateId::new("other-redemption");
+        let redemption_id = redemption_aggregate_id("redemption-rollback");
+        let other_id = redemption_aggregate_id("other-redemption");
 
         // No owner at claim time -> claim succeeds.
         *trigger.inventory.write().await = InventoryView::default()
@@ -4041,9 +5877,9 @@ mod tests {
 
     #[tokio::test]
     async fn pending_request_ownership_exposes_active_mint_ids() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("owned-mint");
+        let mint_id = issuer_request_id("owned-mint");
         let tokenization_request_id = TokenizationRequestId("owned-tokenization".to_string());
 
         *trigger.inventory.write().await =
@@ -4101,7 +5937,7 @@ mod tests {
                 .contains(&tokenization_request_id)
         );
 
-        let success_mint_id = IssuerRequestId::new("owned-success-mint");
+        let success_mint_id = issuer_request_id("owned-success-mint");
         let success_tokenization_request_id =
             TokenizationRequestId("owned-success-tokenization".to_string());
 
@@ -4150,9 +5986,9 @@ mod tests {
 
     #[tokio::test]
     async fn pending_request_ownership_exposes_active_redemption_request_id() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("owned-redemption");
+        let redemption_id = redemption_aggregate_id("owned-redemption");
         let tokenization_request_id = TokenizationRequestId("owned-redemption-request".to_string());
         let redemption_tx = TxHash::random();
 
@@ -4249,9 +6085,9 @@ mod tests {
         ];
 
         for terminal_event in terminal_events {
-            let (trigger, _receiver) = make_trigger().await;
+            let trigger = make_trigger().await;
             let symbol = Symbol::new("AAPL").unwrap();
-            let redemption_id = RedemptionAggregateId::new("failing-redemption");
+            let redemption_id = redemption_aggregate_id("failing-redemption");
             let tokenization_request_id =
                 TokenizationRequestId("failing-redemption-request".to_string());
             let redemption_tx = TxHash::random();
@@ -4323,9 +6159,9 @@ mod tests {
 
     #[tokio::test]
     async fn recover_redemption_state_keeps_requested_quantity_until_unwrap_confirms() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("COIN").unwrap();
-        let redemption_id = RedemptionAggregateId::new("partial-redemption-recovery");
+        let redemption_id = redemption_aggregate_id("partial-redemption-recovery");
         let requested_quantity = float!(37.143292455);
         let actual_wrapped_amount = U256::from(33_681_456_848_531_939_569_u128);
         let requested_fractional = FractionalShares::new(requested_quantity);
@@ -4340,6 +6176,7 @@ mod tests {
                     token: Address::random(),
                     wrapped_amount: actual_wrapped_amount,
                     raindex_withdraw_tx: TxHash::random(),
+                    raindex_withdraw_block: None,
                     withdrawn_at,
                 },
             )
@@ -4387,12 +6224,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_progress_symbol_does_not_send() {
-        let (trigger, mut receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         tokio::time::timeout(
@@ -4402,40 +6242,47 @@ mod tests {
         .await
         .expect("equity timeout cleanup should complete promptly")
         .unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Expected no equity mint job enqueued"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Expected no equity redemption job enqueued"
         );
     }
 
     #[tokio::test]
     async fn test_usdc_in_progress_does_not_send() {
-        let (trigger, mut receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "Expected no USDC transfer job enqueued"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "Expected no USDC transfer job enqueued"
         );
     }
 
     #[tokio::test]
     async fn test_usdc_disabled_via_cash_config_does_not_send() {
-        let (sender, mut receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let trigger = RebalancingService::new(
@@ -4447,91 +6294,270 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
-            sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_usdc().await;
 
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty when USDC rebalancing is disabled"
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "Expected no USDC transfer job when USDC rebalancing is disabled"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "Expected no USDC transfer job when USDC rebalancing is disabled"
         );
     }
 
+    /// Builds an imbalanced (too much offchain -> Mint) trigger whose equity
+    /// assets config is overridden, with the symbol seeded in the vault
+    /// registry and a permissive `MockWrapper` so the only thing standing
+    /// between the imbalance and a dispatched mint job is the config
+    /// whitelist itself.
+    async fn make_imbalanced_trigger_with_equities(
+        symbol: &Symbol,
+        equities: EquitiesConfig,
+    ) -> Arc<RebalancingService> {
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let config = RebalancingServiceConfig {
+            assets: AssetsConfig {
+                equities,
+                cash: None,
+            },
+            ..test_config()
+        };
+
+        make_trigger_with_inventory_and_registry_config(inventory, symbol, config).await
+    }
+
+    /// A symbol configured with `rebalancing = "disabled"` must be skipped by
+    /// the whitelist even when its inventory is imbalanced.
     #[tokio::test]
     async fn disabled_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        let pool = crate::test_utils::setup_test_db().await;
-        let wrapper = Arc::new(MockWrapper::new());
 
-        let trigger = RebalancingService::new(
-            RebalancingServiceConfig {
-                equity: test_config().equity,
-                usdc: test_config().usdc,
-                transfer_timeout: test_config().transfer_timeout,
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
-                disabled_assets: HashSet::from([symbol.clone()]),
-            },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
-            inventory,
-            sender,
-            wrapper,
-            RebalancingSchedulers::new(&pool),
-        );
+        let mut equities = rebalancing_enabled_equities(&["AAPL"]);
+        equities
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = OperationMode::Disabled;
+
+        let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Disabled asset should not trigger equity rebalancing"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Disabled asset should not trigger equity rebalancing"
         );
     }
 
+    /// A symbol observed in inventory but absent from the equity assets
+    /// config must be skipped by the whitelist before any vault or wrapper
+    /// work -- not dispatched and only caught by the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
+    #[tokio::test]
+    async fn unconfigured_symbol_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, EquitiesConfig::default()).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Unconfigured symbol should be skipped by the whitelist, not dispatched"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Unconfigured symbol should be skipped by the whitelist, not dispatched"
+        );
+    }
+
+    /// Positive control for the whitelist: the same imbalance with the symbol
+    /// configured `rebalancing = "enabled"` dispatches the mint job.
+    #[tokio::test]
+    async fn whitelisted_symbol_passes_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Whitelisted symbol with an imbalance should dispatch a mint job"
+        );
+        assert_eq!(jobs[0].symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn frozen_asset_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "A frozen asset must not dispatch an equity rebalancing job"
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_freeze_status_fails_closed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Indeterminate))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "An indeterminate freeze status must fail closed -- no rebalancing job dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_frozen_asset_passes_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::NotFrozen))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "A not-frozen asset with an imbalance should still dispatch a mint job"
+        );
+        assert_eq!(jobs[0].symbol, symbol);
+    }
+
     #[tokio::test]
     async fn test_clear_equity_in_progress() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         trigger.clear_equity_in_progress(&symbol);
 
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_equity_in_progress_removes_both_active_and_held_for_recovery_states() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Verify clear works on ActiveTransfer.
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer { generation: 0 },
+        );
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "clear must remove ActiveTransfer entry"
+        );
+
+        // Verify clear works on HeldForRecovery.
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "clear must remove HeldForRecovery entry"
+        );
     }
 
     #[tokio::test]
     async fn test_clear_usdc_in_progress() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
         assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
@@ -4545,19 +6571,21 @@ mod tests {
     async fn test_balanced_inventory_does_not_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         trigger.check_and_trigger_usdc().await;
 
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Expected no equity mint job enqueued"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Expected no equity redemption job enqueued"
         );
     }
 
@@ -4655,46 +6683,219 @@ mod tests {
             .unwrap();
     }
 
-    async fn make_trigger_with_inventory(
-        inventory: InventoryView,
-    ) -> (Arc<RebalancingService>, mpsc::Receiver<TriggeredOperation>) {
+    async fn make_trigger_with_inventory(inventory: InventoryView) -> Arc<RebalancingService> {
         make_trigger_with_inventory_config(inventory, test_config()).await
     }
 
     async fn make_trigger_with_inventory_config(
         inventory: InventoryView,
         config: RebalancingServiceConfig,
-    ) -> (Arc<RebalancingService>, mpsc::Receiver<TriggeredOperation>) {
-        let (sender, receiver) = mpsc::channel(10);
+    ) -> Arc<RebalancingService> {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        let service = Arc::new(RebalancingService::new(
+        Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
-        ));
-        (service, receiver)
+            RebalancingSchedulers::new(&apalis_pool),
+        ))
     }
 
     async fn make_trigger_with_inventory_and_registry(
         inventory: InventoryView,
         symbol: &Symbol,
-    ) -> (Arc<RebalancingService>, mpsc::Receiver<TriggeredOperation>) {
+    ) -> Arc<RebalancingService> {
         make_trigger_with_inventory_and_registry_config(inventory, symbol, test_config()).await
+    }
+
+    /// Counts pending `TransferUsdcToHedging` rows in the apalis Jobs table
+    /// backing this service. Used by trigger tests that previously asserted
+    /// on the mpsc receiver for Base->Alpaca and now must assert on the queue.
+    async fn count_pending_transfer_usdc_to_hedging_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .expect("count pending TransferUsdcToHedging jobs")
+    }
+
+    async fn count_pending_transfer_usdc_to_market_making_jobs(
+        service: &RebalancingService,
+    ) -> i64 {
+        let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .expect("count pending TransferUsdcToMarketMaking jobs")
+    }
+
+    /// Counts pending `TransferEquityToMarketMaking` rows in the apalis Jobs
+    /// table backing this service. Used by trigger tests that previously
+    /// asserted on the mpsc receiver for mints and now must assert on the
+    /// queue.
+    async fn count_pending_equity_mint_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .expect("count pending TransferEquityToMarketMaking jobs")
+    }
+
+    /// Drains every pending equity mint row from the service's Jobs table and
+    /// returns the parsed payloads. Marking rows `Done` lets repeated trigger
+    /// cycles in the same test see fresh state.
+    async fn take_pending_equity_mint_jobs(
+        service: &RebalancingService,
+    ) -> Vec<TransferEquityToMarketMaking> {
+        let pool = service
+            .transfer_equity_to_market_making_queue
+            .pool()
+            .clone();
+        let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
+
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE status = 'Pending' AND job_type = ? \
+             ORDER BY run_at",
+        )
+        .bind(job_type)
+        .fetch_all(&pool)
+        .await
+        .expect("query pending TransferEquityToMarketMaking jobs");
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for (row_id, payload) in rows {
+            let job: TransferEquityToMarketMaking =
+                serde_json::from_slice(&payload).expect("deserialize TransferEquityToMarketMaking");
+
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(&row_id)
+                .execute(&pool)
+                .await
+                .expect("mark equity mint job row Done");
+
+            jobs.push(job);
+        }
+
+        jobs
+    }
+
+    /// Counts pending `TransferEquityToHedging` rows in the apalis Jobs
+    /// table backing this service. Used by trigger tests that previously
+    /// asserted on the mpsc receiver for redemptions and now must assert on
+    /// the queue.
+    async fn count_pending_equity_redemption_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<TransferEquityToHedging>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .expect("count pending TransferEquityToHedging jobs")
+    }
+
+    /// Drains every pending equity redemption row from the service's Jobs
+    /// table and returns the parsed payloads. Marking rows `Done` lets
+    /// repeated trigger cycles in the same test see fresh state.
+    async fn take_pending_equity_redemption_jobs(
+        service: &RebalancingService,
+    ) -> Vec<TransferEquityToHedging> {
+        let pool = service.transfer_equity_to_hedging_queue.pool().clone();
+        let job_type = std::any::type_name::<TransferEquityToHedging>();
+
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE status = 'Pending' AND job_type = ? \
+             ORDER BY run_at",
+        )
+        .bind(job_type)
+        .fetch_all(&pool)
+        .await
+        .expect("query pending TransferEquityToHedging jobs");
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for (row_id, payload) in rows {
+            let job: TransferEquityToHedging =
+                serde_json::from_slice(&payload).expect("deserialize TransferEquityToHedging");
+
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(&row_id)
+                .execute(&pool)
+                .await
+                .expect("mark equity redemption job row Done");
+
+            jobs.push(job);
+        }
+
+        jobs
+    }
+
+    /// Drains every pending USDC transfer row (both directions) from the
+    /// service's Jobs table and returns them parsed as
+    /// [`UsdcRebalanceOperation`]. Marking rows `Done` lets repeated trigger
+    /// cycles in the same test see fresh state.
+    async fn take_pending_usdc_transfer_jobs(
+        service: &RebalancingService,
+    ) -> Vec<UsdcRebalanceOperation> {
+        let pool = service.transfer_usdc_to_hedging_queue.pool().clone();
+        let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
+        let to_mm_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+
+        let rows: Vec<(String, Vec<u8>, String)> = sqlx_apalis::query_as(
+            "SELECT id, job, job_type FROM Jobs \
+             WHERE status = 'Pending' AND (job_type = ? OR job_type = ?) \
+             ORDER BY run_at",
+        )
+        .bind(to_hedging_type)
+        .bind(to_mm_type)
+        .fetch_all(&pool)
+        .await
+        .expect("query pending USDC transfer jobs");
+
+        let mut operations = Vec::with_capacity(rows.len());
+        for (row_id, payload, job_type) in rows {
+            let operation = if job_type == to_hedging_type {
+                let job: TransferUsdcToHedging =
+                    serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging");
+                UsdcRebalanceOperation::BaseToAlpaca { amount: job.amount }
+            } else {
+                let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload)
+                    .expect("deserialize TransferUsdcToMarketMaking");
+                UsdcRebalanceOperation::AlpacaToBase { amount: job.amount }
+            };
+
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(&row_id)
+                .execute(&pool)
+                .await
+                .expect("mark drained USDC transfer job Done");
+
+            operations.push(operation);
+        }
+
+        operations
     }
 
     async fn make_trigger_with_inventory_and_registry_config(
         inventory: InventoryView,
         symbol: &Symbol,
         config: RebalancingServiceConfig,
-    ) -> (Arc<RebalancingService>, mpsc::Receiver<TriggeredOperation>) {
+    ) -> Arc<RebalancingService> {
         make_trigger_with_inventory_registry_and_wrapper(
             inventory,
             symbol,
@@ -4709,31 +6910,27 @@ mod tests {
         symbol: &Symbol,
         wrapper: Arc<MockWrapper>,
         config: RebalancingServiceConfig,
-    ) -> (Arc<RebalancingService>, mpsc::Receiver<TriggeredOperation>) {
-        let (sender, receiver) = mpsc::channel(10);
+    ) -> Arc<RebalancingService> {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         seed_vault_registry(&pool, symbol).await;
 
-        let service = Arc::new(RebalancingService::new(
+        Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
-            sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
-        ));
-        let reactor = service;
-        (reactor, receiver)
+            RebalancingSchedulers::new(&apalis_pool),
+        ))
     }
 
     #[tokio::test]
     async fn load_token_address_errors_when_registry_uninitialized() {
-        let (trigger, _receiver) = make_trigger().await;
+        let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         let result = trigger.load_token_address(&symbol).await;
@@ -4748,8 +6945,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         let result = trigger.load_token_address(&symbol).await.unwrap();
@@ -4762,8 +6958,7 @@ mod tests {
         let unknown = Symbol::new("MSFT").unwrap();
         let inventory = InventoryView::default().with_equity(known.clone(), shares(0), shares(0));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &known).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &known).await;
         let trigger = reactor.clone();
 
         let result = trigger.load_token_address(&unknown).await.unwrap();
@@ -4783,25 +6978,23 @@ mod tests {
         // handle it (either by auto-registering or by decoupling the
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
-        let (sender, mut receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -4829,8 +7022,12 @@ mod tests {
             drain_pending_jobs(&trigger).await.unwrap();
         }
 
-        // Drain any intermediate triggers and do a final check.
-        while receiver.try_recv().is_ok() {}
+        // Drain any intermediate triggers (the early onchain-heavy phase
+        // enqueues a redemption, which would otherwise suppress the final
+        // mint via the direction-independent per-symbol dedupe) and do a
+        // final check.
+        take_pending_equity_mint_jobs(&trigger).await;
+        take_pending_equity_redemption_jobs(&trigger).await;
         trigger.clear_equity_in_progress(&symbol);
 
         // One more event to trigger the check after the imbalance is built up.
@@ -4841,11 +7038,13 @@ mod tests {
             .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        let triggered = receiver.try_recv();
-        assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "Expected Mint for imbalanced inventory starting from empty, got {triggered:?}"
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Expected a mint job enqueued for imbalanced inventory starting from empty"
         );
+        assert_eq!(jobs[0].symbol, symbol);
     }
 
     #[tokio::test]
@@ -4855,8 +7054,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor.clone());
 
@@ -4876,15 +7074,20 @@ mod tests {
 
         // Now inventory has 50 onchain, 50 offchain = balanced at 50%.
         // Drain any previous triggered operations.
-        while receiver.try_recv().is_ok() {}
+        take_pending_equity_mint_jobs(&trigger).await;
+        take_pending_equity_redemption_jobs(&trigger).await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Expected no equity mint job enqueued"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Expected no equity redemption job enqueued"
         );
     }
 
@@ -4897,8 +7100,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor);
 
@@ -4942,8 +7144,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         apply_and_dispatch_snapshot(
@@ -4994,8 +7195,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         apply_and_dispatch_snapshot(
@@ -5046,8 +7246,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor);
 
@@ -5091,8 +7290,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor);
 
@@ -5150,8 +7348,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor);
 
@@ -5205,8 +7402,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(reactor.clone());
 
         // Apply a small buy that maintains balance (5 shares onchain).
@@ -5218,12 +7414,15 @@ mod tests {
             .unwrap();
 
         // No operation should be triggered.
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+        assert_eq!(
+            count_pending_equity_mint_jobs(&reactor).await,
+            0,
+            "Expected no equity mint job enqueued"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&reactor).await,
+            0,
+            "Expected no equity redemption job enqueued"
         );
     }
 
@@ -5246,8 +7445,7 @@ mod tests {
             )
             .unwrap();
 
-        let (trigger, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(trigger.clone());
 
         // Apply a small event that triggers the imbalance check.
@@ -5258,12 +7456,10 @@ mod tests {
             .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        // Mint should be triggered because too much offchain.
-        let triggered = receiver.try_recv();
-        assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "Expected Mint operation, got {triggered:?}"
-        );
+        // A mint job should be enqueued because too much offchain.
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1, "Expected a mint job for the imbalance");
+        assert_eq!(jobs[0].symbol, symbol);
     }
 
     #[tokio::test]
@@ -5287,7 +7483,7 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
             1_500_000_000_000_000_000u64,
         )));
-        let (reactor, mut receiver) = make_trigger_with_inventory_registry_and_wrapper(
+        let reactor = make_trigger_with_inventory_registry_and_wrapper(
             inventory,
             &symbol,
             wrapper,
@@ -5298,10 +7494,11 @@ mod tests {
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
-        let triggered = receiver.try_recv();
-        assert!(
-            matches!(triggered, Ok(TriggeredOperation::Redemption { .. })),
-            "Expected Redemption with 1.5 ratio, got {triggered:?}"
+        let jobs = take_pending_equity_redemption_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Expected a redemption job enqueued with 1.5 ratio"
         );
     }
 
@@ -5316,7 +7513,7 @@ mod tests {
 
     fn make_mint_accepted() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId::new("ISS123"),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
@@ -5398,16 +7595,16 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         // Initially, trigger should detect imbalance (too much offchain).
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        let initial_check = receiver.try_recv();
-        assert!(
-            matches!(initial_check, Ok(TriggeredOperation::Mint { .. })),
-            "Expected initial imbalance to trigger Mint, got {initial_check:?}"
+        let initial_jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            initial_jobs.len(),
+            1,
+            "Expected initial imbalance to enqueue a mint job"
         );
 
         // Clear in-progress so we can test again.
@@ -5429,12 +7626,10 @@ mod tests {
 
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected no operation due to inflight"
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Expected no mint job due to inflight"
         );
     }
 
@@ -5443,14 +7638,23 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
 
         // Mark symbol as in-progress.
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         // Check that DepositedIntoRaindex is detected as terminal.
         assert!(RebalancingService::is_terminal_mint_event(
@@ -5459,7 +7663,13 @@ mod tests {
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[tokio::test]
@@ -5467,12 +7677,15 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
 
         // Mark symbol as in-progress.
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         assert!(RebalancingService::is_terminal_mint_event(
@@ -5480,13 +7693,31 @@ mod tests {
         ));
 
         trigger.clear_equity_in_progress(&symbol);
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[test]
     fn mint_acceptance_failure_is_terminal() {
         assert!(RebalancingService::is_terminal_mint_event(
             &make_mint_acceptance_failed()
+        ));
+    }
+
+    #[test]
+    fn operator_reconciled_is_terminal_mint_event() {
+        // Gates clear_equity_in_progress: a reconciled mint must read as terminal
+        // so the in-progress flag is released and rebalancing can resume.
+        assert!(RebalancingService::is_terminal_mint_event(
+            &TokenizedEquityMintEvent::OperatorReconciled {
+                reason: "credited offline".to_string(),
+                reconciled_at: Utc::now(),
+            }
         ));
     }
 
@@ -5526,15 +7757,18 @@ mod tests {
     async fn mint_rejection_via_reactor_clears_in_progress() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-1");
+        let id = issuer_request_id("mint-1");
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(10)))
@@ -5547,7 +7781,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal MintRejected"
         );
     }
@@ -5563,15 +7801,18 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-1");
+        let id = redemption_aggregate_id("redemption-1");
 
         harness
             .receive::<EquityRedemption>(
@@ -5587,7 +7828,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal Completed"
         );
     }
@@ -5611,17 +7856,17 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-blocks");
+        let id = issuer_request_id("mint-blocks");
 
         // Verify imbalance triggers before reactor events
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
-            "Should trigger Mint before reactor events"
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "Should enqueue a mint job before reactor events"
         );
         trigger.clear_equity_in_progress(&symbol);
 
@@ -5638,8 +7883,9 @@ mod tests {
 
         // Now check: inflight should block imbalance detection
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
             "Inflight from MintAccepted should block imbalance detection"
         );
     }
@@ -5663,11 +7909,10 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-transfer");
+        let id = issuer_request_id("mint-transfer");
 
         // Full mint flow: MintRequested -> MintAccepted -> TokensReceived
         harness
@@ -5689,8 +7934,15 @@ mod tests {
         // New state: 50 onchain, 50 offchain = balanced
         trigger.clear_equity_in_progress(&symbol);
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Inventory should be balanced after mint transfer (50/50)"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Inventory should be balanced after mint transfer (50/50)"
         );
     }
@@ -5714,11 +7966,10 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-fail");
+        let id = issuer_request_id("mint-fail");
 
         // MintRequested -> MintAccepted -> MintAcceptanceFailed
         harness
@@ -5738,9 +7989,10 @@ mod tests {
 
         // After cancellation, inflight is cleared, imbalance should trigger again
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
-            "Imbalance should re-trigger after MintAcceptanceFailed cancels inflight"
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "Imbalance should re-enqueue a mint job after MintAcceptanceFailed cancels inflight"
         );
     }
 
@@ -5763,18 +8015,20 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         // Set in-progress flag to verify terminal event clears it
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        let id = IssuerRequestId::new("mint-deposit");
+        let id = issuer_request_id("mint-deposit");
 
         // Full happy-path: MintRequested -> MintAccepted -> TokensReceived -> DepositedIntoRaindex
         harness
@@ -5798,7 +8052,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal DepositedIntoRaindex"
         );
     }
@@ -5821,17 +8079,19 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        let id = IssuerRequestId::new("mint-wrapping-fail");
+        let id = issuer_request_id("mint-wrapping-fail");
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(30)))
@@ -5844,7 +8104,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal WrappingFailed"
         );
     }
@@ -5867,17 +8131,19 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        let id = IssuerRequestId::new("mint-deposit-fail");
+        let id = issuer_request_id("mint-deposit-fail");
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(30)))
@@ -5890,7 +8156,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal RaindexDepositFailed"
         );
     }
@@ -5907,17 +8177,19 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        let id = RedemptionAggregateId::new("redemption-transfer-fail");
+        let id = redemption_aggregate_id("redemption-transfer-fail");
 
         harness
             .receive::<EquityRedemption>(
@@ -5933,7 +8205,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal TransferFailed"
         );
     }
@@ -5950,17 +8226,19 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        let id = RedemptionAggregateId::new("redemption-detection-fail");
+        let id = redemption_aggregate_id("redemption-detection-fail");
 
         harness
             .receive::<EquityRedemption>(
@@ -5976,7 +8254,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal DetectionFailed"
         );
     }
@@ -5993,17 +8275,19 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
-        let id = RedemptionAggregateId::new("redemption-rejected");
+        let id = redemption_aggregate_id("redemption-rejected");
 
         harness
             .receive::<EquityRedemption>(
@@ -6019,7 +8303,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "In-progress flag should be cleared after terminal RedemptionRejected"
         );
     }
@@ -6027,36 +8315,92 @@ mod tests {
     #[tokio::test]
     async fn position_noop_events_via_reactor_do_not_error() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(5), shares(5))
+            .with_usdc(usdc(10000), usdc(10000));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        // Initialized, OffChainOrderPlaced, OffChainOrderFailed, ThresholdUpdated
-        // all return Ok(()) without modifying inventory
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                PositionEvent::Initialized {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                    initialized_at: Utc::now(),
-                },
-            )
+        // Seed the pending-hedge gate so we can prove no-op events leave it intact
+        // (OffChainOrderFailed clears it; manual adjustments must not).
+        trigger
+            .pending_offchain_order_symbols
+            .write()
             .await
-            .unwrap();
+            .insert(symbol.clone());
 
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                PositionEvent::ThresholdUpdated {
-                    old_threshold: ExecutionThreshold::whole_share(),
-                    new_threshold: ExecutionThreshold::whole_share(),
-                    updated_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        // Initialized, ThresholdUpdated, and ManualPositionAdjusted all return
+        // Ok(()) without touching inventory or the pending-hedge gate.
+        for event in [
+            PositionEvent::Initialized {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::ThresholdUpdated {
+                old_threshold: ExecutionThreshold::whole_share(),
+                new_threshold: ExecutionThreshold::whole_share(),
+                updated_at: Utc::now(),
+            },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: shares(5),
+                target_net: shares(0),
+                reason: "operator repair".to_string(),
+                price_usdc: Some(float!(150)),
+                adjusted_at: Utc::now(),
+            },
+        ] {
+            harness
+                .receive::<Position>(symbol.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(5)),
+            "manual adjustment must not change hedging equity"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(5)),
+            "manual adjustment must not change market-making equity"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(10000)),
+            "manual adjustment must not change hedging USDC"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "manual adjustment must not change market-making USDC"
+        );
+        drop(inventory);
+
+        assert!(
+            trigger
+                .pending_offchain_order_symbols
+                .read()
+                .await
+                .contains(&symbol),
+            "manual adjustment must not clear the pending-hedge gate"
+        );
+
+        let pending_equity_checks = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(trigger.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending equity-check jobs after ManualPositionAdjusted");
+
+        assert_eq!(
+            pending_equity_checks, 1,
+            "ManualPositionAdjusted must enqueue exactly one immediate equity recheck"
+        );
     }
 
     #[tokio::test]
@@ -6066,8 +8410,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(usdc(10000), usdc(10000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor.clone());
 
@@ -6102,8 +8445,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor.clone());
 
@@ -6132,8 +8474,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(0), shares(0))
             .with_usdc(usdc(10000), usdc(10000));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor.clone());
 
@@ -6168,8 +8509,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(reactor.clone());
 
@@ -6210,8 +8550,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -6237,8 +8576,15 @@ mod tests {
         // After snapshot: 40 onchain (reconciled), 20 offchain
         // 40/60 = 66.7% -> within threshold (30%-70%), no trigger
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "66.7% onchain ratio should be within threshold (30%-70%)"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "66.7% onchain ratio should be within threshold (30%-70%)"
         );
     }
@@ -6262,8 +8608,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -6272,9 +8617,10 @@ mod tests {
 
         // Verify initial imbalance triggers
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
-            "20% ratio should trigger Mint"
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "20% ratio should enqueue a mint job"
         );
         trigger.clear_equity_in_progress(&symbol);
 
@@ -6295,8 +8641,9 @@ mod tests {
 
         // After snapshot: 20 onchain, 20 offchain = balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
             "50% ratio should be balanced after offchain equity snapshot"
         );
     }
@@ -6320,20 +8667,17 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-blocks");
+        let id = redemption_aggregate_id("redemption-blocks");
 
         // Verify imbalance triggers before reactor events
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::Redemption { .. })
-            ),
-            "Should trigger Redemption before reactor events"
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
+            "Should enqueue a redemption job before reactor events"
         );
         trigger.clear_equity_in_progress(&symbol);
 
@@ -6348,8 +8692,15 @@ mod tests {
 
         // Inflight should block imbalance detection
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Inflight from WithdrawnFromRaindex should block imbalance detection"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Inflight from WithdrawnFromRaindex should block imbalance detection"
         );
     }
@@ -6373,11 +8724,10 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-rebalances");
+        let id = redemption_aggregate_id("redemption-rebalances");
 
         // Full redemption flow: WithdrawnFromRaindex -> Completed
         harness
@@ -6396,8 +8746,15 @@ mod tests {
         // After Completed: 30 moved from onchain to offchain
         // New state: 50 onchain, 50 offchain = balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Inventory should be balanced after redemption completion (50/50)"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Inventory should be balanced after redemption completion (50/50)"
         );
     }
@@ -6411,19 +8768,21 @@ mod tests {
             .with_usdc(usdc(100), usdc(900))
             .with_withdrawable_cash_cents(90_000);
 
-        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        // Verify imbalance triggers before reactor events
+        // Verify imbalance triggers before reactor events. Alpaca->Base is
+        // enqueued as a TransferUsdcToMarketMaking apalis job.
         trigger.check_and_trigger_usdc().await;
+        let pending = take_pending_usdc_transfer_jobs(&trigger).await;
         assert!(
             matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::UsdcAlpacaToBase { .. })
+                pending.as_slice(),
+                [UsdcRebalanceOperation::AlpacaToBase { .. }],
             ),
-            "TooMuchOffchain (100/900) should trigger UsdcAlpacaToBase before reactor events"
+            "TooMuchOffchain (100/900) should enqueue an AlpacaToBase transfer, got {pending:?}"
         );
         trigger.clear_usdc_in_progress();
 
@@ -6438,8 +8797,15 @@ mod tests {
 
         // Inflight should block USDC imbalance detection
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "Inflight from Initiated(AlpacaToBase) should block USDC imbalance detection"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
             "Inflight from Initiated(AlpacaToBase) should block USDC imbalance detection"
         );
     }
@@ -6449,20 +8815,20 @@ mod tests {
         // 900 onchain, 100 offchain = 90% ratio -> TooMuchOnchain
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
 
-        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        // Verify imbalance triggers before reactor events
+        // Verify imbalance triggers before reactor events. Base->Alpaca is
+        // enqueued as a TransferUsdcToHedging apalis job.
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::UsdcBaseToAlpaca { .. })
-            ),
-            "TooMuchOnchain (900/100) should trigger UsdcBaseToAlpaca before reactor events"
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "TooMuchOnchain (900/100) should enqueue a TransferUsdcToHedging job before reactor events"
         );
+        take_pending_usdc_transfer_jobs(&trigger).await;
         trigger.clear_usdc_in_progress();
 
         // Send Initiated(BaseToAlpaca) through reactor -> moves onchain to inflight
@@ -6476,8 +8842,15 @@ mod tests {
 
         // Inflight should block USDC imbalance detection
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "Inflight from Initiated(BaseToAlpaca) should block USDC imbalance detection"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
             "Inflight from Initiated(BaseToAlpaca) should block USDC imbalance detection"
         );
     }
@@ -6486,7 +8859,7 @@ mod tests {
     async fn base_to_alpaca_terminal_conversion_settles_usdc_inventory() {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -6534,7 +8907,7 @@ mod tests {
     async fn alpaca_to_base_terminal_deposit_uses_bridged_amount_for_inventory() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -6589,7 +8962,7 @@ mod tests {
     #[tokio::test]
     async fn alpaca_to_base_usdc_lifecycle_tracks_started_and_cleared_inflight() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -6751,7 +9124,7 @@ mod tests {
     #[tokio::test]
     async fn base_to_alpaca_usdc_lifecycle_tracks_started_and_cleared_inflight() {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -6934,35 +9307,23 @@ mod tests {
                 ],
             },
             Scenario {
-                name: "bridging_failed_after_initiated",
+                name: "bridging_failed_before_burn",
                 events: vec![
                     make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
                     make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
                     make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
                     make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridging_failed(),
+                    make_usdc_pre_burn_bridging_failed(),
                 ],
             },
-            Scenario {
-                name: "deposit_failed_after_initiated",
-                events: vec![
-                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
-                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
-                    make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridge_attestation_received(),
-                    make_usdc_bridged_with_amounts(usdc(398), usdc(1)),
-                    make_usdc_deposit_initiated(),
-                    make_usdc_deposit_failed(),
-                ],
-            },
+            // NOTE: a post-burn `deposit_failed` no longer cancels -- it is
+            // post-mint and preserves inflight + the guard. That behavior is
+            // covered by `post_burn_deposit_failure_preserves_inflight_and_guard`.
         ];
 
         for scenario in scenarios {
             let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
-            let (reactor, _receiver) = make_trigger_with_inventory(inventory).await;
+            let reactor = make_trigger_with_inventory(inventory).await;
             let trigger = reactor.clone();
             let harness = ReactorHarness::new(Arc::clone(&trigger));
             let id = UsdcRebalanceId(Uuid::new_v4());
@@ -7002,45 +9363,23 @@ mod tests {
                 ],
             },
             Scenario {
-                name: "bridging_failed_after_initiated",
+                name: "bridging_failed_before_burn",
                 events: vec![
                     make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
                     make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridging_failed(),
+                    make_usdc_pre_burn_bridging_failed(),
                 ],
             },
-            Scenario {
-                name: "deposit_failed_after_initiated",
-                events: vec![
-                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridge_attestation_received(),
-                    make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
-                    make_usdc_deposit_initiated(),
-                    make_usdc_deposit_failed(),
-                ],
-            },
-            Scenario {
-                name: "conversion_failed_after_deposit",
-                events: vec![
-                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridge_attestation_received(),
-                    make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
-                    make_usdc_deposit_initiated(),
-                    make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
-                    make_usdc_conversion_initiated(RebalanceDirection::BaseToAlpaca, usdc(399)),
-                    make_usdc_conversion_failed(),
-                ],
-            },
+            // NOTE: post-burn failures no longer cancel -- they are post-mint and
+            // preserve inflight + the guard. `deposit_failed` is covered by
+            // `post_burn_deposit_failure_preserves_inflight_and_guard`, and the
+            // BaseToAlpaca post-deposit `conversion_failed` by
+            // `post_deposit_conversion_failure_preserves_inflight_and_guard`.
         ];
 
         for scenario in scenarios {
             let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
-            let (reactor, _receiver) = make_trigger_with_inventory(inventory).await;
+            let reactor = make_trigger_with_inventory(inventory).await;
             let trigger = reactor.clone();
             let harness = ReactorHarness::new(Arc::clone(&trigger));
             let id = UsdcRebalanceId(Uuid::new_v4());
@@ -7065,13 +9404,769 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alpaca_to_base_post_burn_bridging_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_failed())
+            .await
+            .unwrap();
+
+        // A post-burn failure must preserve the last successful stage
+        // (BridgingInitiated), not advance to a failure stage:
+        // `UsdcRebalanceStage::from_event` returns None for BridgingFailed.
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn bridge failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-burn bridge failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "post-burn bridge failure must block immediate re-burns"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "post-burn bridge failure must block immediate re-burns"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_to_alpaca_post_burn_bridging_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_failed())
+            .await
+            .unwrap();
+
+        // A post-burn failure must preserve the last successful stage
+        // (BridgingInitiated), not advance to a failure stage:
+        // `UsdcRebalanceStage::from_event` returns None for BridgingFailed.
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn bridge failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-burn bridge failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "post-burn bridge failure must block immediate re-burns"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "post-burn bridge failure must block immediate re-burns"
+        );
+    }
+
+    /// Exercises the defensive fallback branch of `post_burn_failure`: the
+    /// `BridgingFailed` event carries no `burn_tx_hash`, but the tracked stage
+    /// is `BridgingInitiated`, so `is_post_burn()` must still classify it as
+    /// post-burn and preserve the guard.
+    ///
+    /// This (hashless event + post-burn stage) combination is NOT reachable via
+    /// the real command path -- `FailBridging` from `Bridging`/`Attested` always
+    /// emits `burn_tx_hash: Some`. The fallback is defense-in-depth for the live
+    /// event stream. The startup recovery path (`holds_rebalance_guard`)
+    /// deliberately keys only on `burn_tx_hash.is_some()` because the persisted
+    /// aggregate state always carries the hash for a post-burn failure, so the
+    /// two paths agree on every command-reachable state.
+    #[tokio::test]
+    async fn bridging_failure_without_burn_hash_preserved_via_tracking_stage() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        // burn_tx_hash: None -- only the tracked BridgingInitiated stage marks
+        // this as post-burn.
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_pre_burn_bridging_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "stage-fallback must classify a hashless post-burn failure as post-burn and keep the guard"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "stage-fallback post-burn failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "stage-fallback post-burn failure must block immediate re-burns"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "stage-fallback post-burn failure must block immediate re-burns"
+        );
+    }
+
+    /// A `BridgingFailed` carrying a `cctp_nonce` but no `burn_tx_hash` is
+    /// post-burn evidence on its own: the nonce only exists once the burn reached
+    /// CCTP. When in-memory tracking is absent -- e.g. the failure arrives after a
+    /// restart where the reactor never rebuilt tracking -- the nonce alone must
+    /// keep the guard set, otherwise the caller would clear it and re-open the
+    /// re-burn window for funds already irreversibly committed.
+    #[tokio::test]
+    async fn nonce_only_bridging_failure_preserves_guard_without_tracking() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        // No prior Initiated/BridgingInitiated events: in-memory tracking is empty,
+        // mirroring a restart where only the nonce proves the burn happened.
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_nonce_only_bridging_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.get(&id).is_none(),
+            "test setup invariant: tracking must be absent so only the nonce can classify post-burn"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a nonce-only bridging failure is post-burn evidence and must keep the guard set even \
+             without tracking"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "a nonce-only post-burn failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "a nonce-only post-burn failure must block immediate re-burns"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "a nonce-only post-burn failure must block immediate re-burns"
+        );
+    }
+
+    /// A deposit failure happens after the CCTP mint, so the funds are post-burn
+    /// and unreconcilable. It must preserve inflight and the guard (not Clear),
+    /// the same as a post-burn bridge failure.
+    #[tokio::test]
+    async fn post_burn_deposit_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridge_attestation_received(),
+            make_usdc_bridged(),
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-burn deposit failure must preserve in-flight tracking"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn deposit failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-burn deposit failure must keep the active rebalance ID"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "post-burn deposit failure must preserve source inflight"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "post-burn deposit failure must block immediate re-burns"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "post-burn deposit failure must block immediate re-burns"
+        );
+    }
+
+    /// An operator reconciling a post-burn `DepositFailed` must clear the guard,
+    /// remove tracking, and zero the source-venue (MarketMaking for BaseToAlpaca)
+    /// inflight WITHOUT crediting available -- post-burn semantics, because the
+    /// minted USDC physically left the source.
+    #[tokio::test]
+    async fn operator_reconcile_clears_guard_and_zeroes_source_inflight_post_burn() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridge_attestation_received(),
+            make_usdc_bridged(),
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // Sanity: the burn moved 400 from MarketMaking available to inflight, and
+        // the post-burn deposit failure preserved it.
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "operator reconcile must remove tracking"
+        );
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "operator reconcile must clear the USDC guard"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "operator reconcile must clear the active rebalance ID"
+        );
+        // Available unchanged (500), inflight zeroed -- funds left the source.
+        assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(100), Usdc::ZERO)
+            .await;
+    }
+
+    /// Post-restart the reactor has no in-memory tracking, yet an operator
+    /// reconcile must still clear the guard and zero the source inflight derived
+    /// from the event's `direction` -- never panic on absent tracking.
+    #[tokio::test]
+    async fn operator_reconcile_works_when_tracking_absent() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Seed the source (MarketMaking) inflight to mimic a post-restart state
+        // where the burn already moved 400 into inflight, but in-memory tracking
+        // was not rebuilt and the guard was merely re-asserted. Also carry a
+        // stale active rebalance id so the test proves the Clear terminal action
+        // drops it.
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_usdc(
+                    Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                    Utc::now(),
+                )
+                .unwrap()
+                .set_active_usdc_rebalance(id.clone());
+        }
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id)
+        );
+        // Sanity: 400 moved from MarketMaking available to inflight.
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "operator reconcile must clear the guard even with tracking absent"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "operator reconcile must not resurrect in-memory tracking"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "operator reconcile must clear the stale active rebalance id"
+        );
+        // Available unchanged (500), inflight zeroed via the event's direction.
+        assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(100), Usdc::ZERO)
+            .await;
+    }
+
+    /// Mirror of `operator_reconcile_works_when_tracking_absent` for the other
+    /// direction: `AlpacaToBase` must zero the Hedging (source) inflight derived
+    /// from the event's `direction` -- not MarketMaking -- and still clear the
+    /// guard and the stale active id with tracking absent post-restart.
+    #[tokio::test]
+    async fn operator_reconcile_alpaca_to_base_clears_hedging_source_when_tracking_absent() {
+        // Hedging is the offchain venue (second arg), so seed it with enough to
+        // move 400 into inflight.
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Burn already moved 400 from the Hedging venue into inflight; tracking
+        // was not rebuilt and a stale active id lingers.
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_usdc(
+                    Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                    Utc::now(),
+                )
+                .unwrap()
+                .set_active_usdc_rebalance(id.clone());
+        }
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        // Sanity: 400 moved from Hedging available (900 -> 500) to inflight.
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(500), usdc(400)).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "operator reconcile must clear the guard even with tracking absent"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "operator reconcile must not resurrect in-memory tracking"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "operator reconcile must clear the stale active rebalance id"
+        );
+        // Hedging inflight zeroed via the event's direction; MarketMaking and
+        // Hedging available are both untouched (post-burn: no credit).
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(500), Usdc::ZERO)
+            .await;
+    }
+
+    /// A `Reconciled` aggregate is a clearing terminal: startup guard recovery
+    /// must NOT re-latch the guard for it (the opposite of a post-burn failure).
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_relatch_for_reconciled() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive a BaseToAlpaca aggregate to DepositFailed, then reconcile it.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01],
+                    cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    amount_received: usdc(399),
+                    fee_collected: usdc(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "deposit rejected".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "a Reconciled aggregate must not re-latch the USDC guard on startup"
+        );
+        // A Reconciled aggregate is a terminal no-op: startup recovery must not
+        // enqueue any fresh transfer work in either direction.
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "a Reconciled aggregate must not enqueue a USDC->Hedging transfer on startup"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            0,
+            "a Reconciled aggregate must not enqueue a USDC->MarketMaking transfer on startup"
+        );
+    }
+
+    /// For BaseToAlpaca the conversion is the post-deposit USDC->USD leg, so a
+    /// `ConversionFailed` there is post-mint: it must preserve inflight + the
+    /// guard, even though `ConversionInitiated` resets the tracked stage to a
+    /// pre-burn-looking value.
+    #[tokio::test]
+    async fn post_deposit_conversion_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridge_attestation_received(),
+            make_usdc_bridged(),
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
+            make_usdc_conversion_initiated(RebalanceDirection::BaseToAlpaca, usdc(399)),
+            make_usdc_conversion_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-deposit conversion failure must preserve in-flight tracking"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-deposit conversion failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-deposit conversion failure must keep the active rebalance ID"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "post-deposit conversion failure must preserve source inflight"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "post-deposit conversion failure must block immediate re-burns"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "post-deposit conversion failure must block immediate re-burns"
+        );
+    }
+
+    /// A transfer that times out while stalled at a post-mint stage (here
+    /// `DepositInitiated`) is also post-burn: the timeout sweep must preserve it,
+    /// not reconcile to source and clear the guard (which would re-open a re-burn
+    /// of already-burned funds).
+    #[tokio::test]
+    async fn timed_out_post_mint_usdc_rebalance_preserves_guard_and_inflight() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: Some(usdc(399)),
+                stage: usdc::UsdcRebalanceStage::DepositInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-mint USDC timeout must preserve in-flight tracking"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-mint USDC timeout must keep the guard set"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "post-mint USDC timeout must preserve source inflight"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "post-mint USDC timeout must not allow another rebalance dispatch"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "post-mint USDC timeout must not allow another rebalance dispatch"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_onchain_usdc_via_reactor_updates_usdc_balance() {
         // Start with 500 onchain, 500 offchain = balanced
         let inventory = InventoryView::default().with_usdc(usdc(500), usdc(500));
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -7080,8 +10175,9 @@ mod tests {
 
         // Balanced initially -> no trigger
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await.len(),
+            0,
             "Should be balanced initially"
         );
 
@@ -7105,8 +10201,9 @@ mod tests {
         // Need a bigger imbalance to trigger. But the point is the snapshot DID update
         // the inventory. Let me verify by setting up an initial imbalance.
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await.len(),
+            0,
             "64% ratio within 50% +/- 30% threshold"
         );
     }
@@ -7120,8 +10217,7 @@ mod tests {
         // rebalancing until some unrelated USDC balance event fired.
         let inventory = InventoryView::default().with_usdc(usdc(500), usdc(500));
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -7130,7 +10226,7 @@ mod tests {
         let pool = trigger.usdc_scheduler.queue().pool().clone();
 
         let pending_before: i64 =
-            sqlx::query_scalar(
+            sqlx_apalis::query_scalar(
                 "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
             )
                 .fetch_one(&pool)
@@ -7149,7 +10245,7 @@ mod tests {
         .unwrap();
 
         let pending_after: i64 =
-            sqlx::query_scalar(
+            sqlx_apalis::query_scalar(
                 "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
             )
                 .fetch_one(&pool)
@@ -7170,23 +10266,22 @@ mod tests {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         };
 
-        // Verify imbalance triggers before snapshot
+        // Verify imbalance triggers before snapshot. Base->Alpaca is
+        // enqueued as a TransferUsdcToHedging apalis job.
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::UsdcBaseToAlpaca { .. })
-            ),
-            "TooMuchOnchain (90% ratio) should trigger UsdcBaseToAlpaca before snapshot"
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "TooMuchOnchain (90% ratio) should enqueue a TransferUsdcToHedging job before snapshot"
         );
+        take_pending_usdc_transfer_jobs(&trigger).await;
         trigger.clear_usdc_in_progress();
 
         // Snapshot says offchain is actually 900 (not 100)
@@ -7205,8 +10300,9 @@ mod tests {
 
         // Now 900 onchain, 900 offchain = balanced -> no trigger
         trigger.check_and_trigger_usdc().await;
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await.len(),
+            0,
             "Should be balanced after offchain cash snapshot reconciled to 900"
         );
     }
@@ -7270,22 +10366,28 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
-        // First trigger detects the imbalance and sends a redemption.
+        // First trigger detects the imbalance and enqueues a redemption.
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        let first = receiver.try_recv().unwrap();
-        assert!(matches!(first, TriggeredOperation::Redemption { .. }));
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
+            "First trigger should enqueue a redemption job"
+        );
 
         // With in-progress guard held, second trigger should not send anything.
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Expected no operation while in-progress guard is held"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Expected no operation while in-progress guard is held"
         );
     }
@@ -7295,14 +10397,23 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
 
         // Mark symbol as in-progress.
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
-        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
 
         // Check that Completed is detected as terminal.
         assert!(RebalancingService::is_terminal_redemption_event(
@@ -7311,13 +10422,31 @@ mod tests {
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
-        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
     }
 
     #[test]
     fn detection_failure_is_terminal_redemption_event() {
         assert!(RebalancingService::is_terminal_redemption_event(
             &make_detection_failed()
+        ));
+    }
+
+    #[test]
+    fn operator_reconciled_is_terminal_redemption_event() {
+        // Gates clear_equity_in_progress: a reconciled redemption must read as
+        // terminal so the in-progress flag is released and rebalancing resumes.
+        assert!(RebalancingService::is_terminal_redemption_event(
+            &EquityRedemptionEvent::OperatorReconciled {
+                reason: "deposited manually".to_string(),
+                reconciled_at: Utc::now(),
+            }
         ));
     }
 
@@ -7377,7 +10506,7 @@ mod tests {
         UsdcRebalanceEvent::ConversionInitiated {
             direction,
             amount,
-            order_id: Uuid::new_v4(),
+            order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             initiated_at: Utc::now(),
         }
     }
@@ -7385,6 +10514,7 @@ mod tests {
     fn make_usdc_withdrawal_confirmed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: Utc::now(),
+            withdrawal_tx: None,
         }
     }
 
@@ -7405,9 +10535,21 @@ mod tests {
     fn make_usdc_bridge_attestation_received() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![1, 2, 3, 4],
-            cctp_nonce: 42,
+            cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
+            message: None,
+            mint_scan_from_block: Some(100),
             attested_at: Utc::now(),
         }
+    }
+
+    /// A full-length CCTP message envelope (>= MESSAGE_BODY_INDEX = 148 bytes,
+    /// non-zero nonce in bytes 12..44), matching the manager-test helper so a
+    /// `ReceiveAttestation` fixture lands a stored envelope that
+    /// `AttestationResponse::from_parts` would accept.
+    fn valid_cctp_message() -> Vec<u8> {
+        let mut message = vec![0u8; 200];
+        message[43] = 1;
+        message
     }
 
     fn make_usdc_bridged() -> UsdcRebalanceEvent {
@@ -7429,7 +10571,34 @@ mod tests {
     fn make_usdc_bridging_failed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: Some(TxHash::random()),
-            cctp_nonce: Some(12345),
+            cctp_nonce: Some(B256::left_padding_from(&12345u64.to_be_bytes())),
+            reason: "Attestation timeout".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_bridging_completion_recovered() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingCompletionRecovered {
+            mint_tx_hash: TxHash::random(),
+            amount_received: Usdc::new(float!(99.99)),
+            fee_collected: Usdc::new(float!(0.01)),
+            recovered_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_pre_burn_bridging_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            reason: "Burn failed".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_nonce_only_bridging_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: None,
+            cctp_nonce: Some(B256::left_padding_from(&54321u64.to_be_bytes())),
             reason: "Attestation timeout".to_string(),
             failed_at: Utc::now(),
         }
@@ -7454,6 +10623,16 @@ mod tests {
             deposit_ref: Some(TransferRef::OnchainTx(TxHash::random())),
             reason: "Deposit rejected".to_string(),
             failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_operator_reconciled(direction: RebalanceDirection) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::OperatorReconciled {
+            direction,
+            amount: usdc(400),
+            reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            initiated_at: Utc::now(),
+            reconciled_at: Utc::now(),
         }
     }
 
@@ -7528,7 +10707,7 @@ mod tests {
     #[tokio::test]
     async fn usdc_rebalance_completion_clears_in_progress_flag() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -7556,29 +10735,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridged_without_initiated_returns_tracking_error() {
-        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+    async fn recovered_post_burn_bridge_holds_guard_then_clears_on_terminal() {
+        // Recovery lifecycle through the reactor: a post-burn
+        // BridgingFailed is un-failed by BridgingCompletionRecovered (non-terminal
+        // -> guard stays held mid-recovery) and the guard clears only on the
+        // terminal BaseToAlpaca ConversionConfirmed, exactly like the normal
+        // bridge path.
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        let error = harness
+        // The guard is armed when the rebalance is initiated.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        // Initiated sets up tracking so the recovery event has bridged-amount
+        // context; the guard stays held (non-terminal).
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(1000)),
+            )
+            .await
+            .unwrap();
+
+        // The recovery event records the bridged amount and must keep the guard
+        // held (it is not a terminal state).
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_completion_recovered())
+            .await
+            .unwrap();
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "BridgingCompletionRecovered is non-terminal and must hold the guard mid-recovery"
+        );
+
+        // The terminal conversion clears the guard through the normal path.
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "terminal ConversionConfirmed must clear the guard after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridged_without_initiated_is_tolerated_and_holds_guard() {
+        // A Bridged event with no in-memory tracking is the post-restart-recovery
+        // shape: the guard was reasserted on startup but `usdc_tracking` was not
+        // rebuilt. `track_bridged_amount` warns and returns Ok (consistent with
+        // the other completion helpers) instead of wedging the reactor, and the
+        // non-terminal event leaves the (pre-armed) in-progress guard held.
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_bridged())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            RebalancingServiceError::MissingUsdcTrackingContext {
-                id: error_id,
-                event: usdc::UsdcTrackingEvent::Bridged,
-            } if error_id == id
-        ));
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a tolerated non-terminal Bridged event must not clear the guard"
+        );
     }
 
     #[tokio::test]
     async fn initiated_with_insufficient_balance_does_not_insert_tracking_context() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(100));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -7603,7 +10836,7 @@ mod tests {
     #[tokio::test]
     async fn deposit_confirmed_without_bridged_amount_returns_error_and_preserves_state() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -7651,7 +10884,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_failure_cancels_inflight_usdc_and_clears_tracking() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -7703,7 +10936,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (reactor, mut receiver) = make_trigger_with_inventory_config(
+        let reactor = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
         )
@@ -7752,9 +10985,12 @@ mod tests {
         );
         drop(inventory);
 
-        let triggered = receiver.try_recv();
+        let triggered = take_pending_usdc_transfer_jobs(&trigger).await;
         assert!(
-            matches!(triggered, Ok(TriggeredOperation::UsdcAlpacaToBase { .. })),
+            matches!(
+                triggered.as_slice(),
+                [UsdcRebalanceOperation::AlpacaToBase { .. }]
+            ),
             "USDC timeout should allow the next trigger cycle to proceed, got {triggered:?}"
         );
         assert!(
@@ -7779,6 +11015,2523 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_does_not_clear_guard_while_transfer_job_in_flight() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // A Base->Alpaca transfer whose apalis row is still in flight: a crash mid
+        // withdraw/burn leaves the aggregate at a *Submitting state with an
+        // irreversible effect possibly already submitted, and apalis will resume.
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "timeout must NOT clear the in-progress guard while the apalis transfer \
+             job is in flight -- an irreversible withdraw/burn may be pending and \
+             clearing would let a second transfer touch the same vault/wallet",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "timeout must not drop tracking for an in-flight transfer",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "timeout must not mark an in-flight transfer timed-out (the reactor would \
+             then ignore its terminal event and latch the guard forever)",
+        );
+
+        let marketmaking_inflight = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_inflight(Venue::MarketMaking);
+
+        assert_eq!(
+            marketmaking_inflight,
+            Some(usdc(400)),
+            "timeout must preserve the Base->Alpaca source-side inflight on \
+             MarketMaking while the apalis transfer job is still in flight",
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_in_flight_check_is_scoped_to_aggregate_id() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let other_id = UsdcRebalanceId(Uuid::new_v4());
+
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.transfer_in_flight_for_id(&id).await,
+            "a non-terminal transfer row for this id must report in flight",
+        );
+        assert!(
+            !trigger.transfer_in_flight_for_id(&other_id).await,
+            "a transfer row for a different aggregate id must NOT report this id as in flight",
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_in_flight_for_id_checks_market_making_direction() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // An Alpaca->Base rebalance is driven by a market-making transfer; the
+        // sweep's in-flight check must see it (bidirectional), not just the hedging
+        // queue -- otherwise it would clear the guard while a market-making transfer
+        // with an irreversible mint/deposit is still in flight.
+        trigger
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.transfer_in_flight_for_id(&id).await,
+            "a non-terminal market-making (Alpaca->Base) transfer row must report this id as in flight",
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_clears_guard_once_transfer_job_reaches_terminal_status() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // The transfer's apalis row has reached a terminal status: the job is no
+        // longer in flight, so the sweep must proceed to cleanup and clear the
+        // guard -- the "eventually released, not latched forever" property that is
+        // the whole safety argument for skipping cleanup while a job is in flight.
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(queue.pool())
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "timeout must clear the guard once the transfer job reaches a terminal status",
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "timeout must drop tracking once the transfer job is terminal",
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_hedging_transfer_blocks_market_making_enqueue() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A Base->Alpaca (hedging) transfer is already in flight.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+            })
+            .await
+            .unwrap();
+
+        // The opposite-direction enqueue must be suppressed: both directions
+        // move the same funds through the same vault/wallet, and the in-memory
+        // guard resets on restart, so running them concurrently would churn
+        // capital and pay fees twice.
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "an in-flight Base->Alpaca transfer must block enqueuing an Alpaca->Base transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_market_making_transfer_blocks_hedging_enqueue() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // An Alpaca->Base (market-making) transfer is already in flight.
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+            })
+            .await
+            .unwrap();
+
+        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+
+        assert!(
+            !enqueued,
+            "an in-flight Alpaca->Base transfer must block enqueuing a Base->Alpaca transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_clear_guard_while_market_making_transfer_job_in_flight() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .with_withdrawable_cash_cents(90_000)
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // An Alpaca->Base transfer whose apalis row is still in flight. The gate
+        // must cover this direction too: it is driven by TransferUsdcToMarketMaking,
+        // not TransferUsdcToHedging, and a resuming job may have an irreversible
+        // withdraw/burn pending.
+        let mut queue = trigger.transfer_usdc_to_market_making_queue.clone();
+        queue
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "timeout must NOT clear the in-progress guard while the Alpaca->Base \
+             apalis transfer job is in flight -- an irreversible withdraw/burn may \
+             be pending and clearing would let a second transfer touch the same funds",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "timeout must not drop tracking for an in-flight Alpaca->Base transfer",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "timeout must not mark an in-flight Alpaca->Base transfer timed-out (the \
+             reactor would then ignore its terminal event and latch the guard forever)",
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_post_burn_usdc_rebalance_preserves_guard_and_inflight() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000)
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-burn USDC timeout must preserve in-flight tracking"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "post-burn USDC timeout must not tombstone late events"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn USDC timeout must keep the guard set"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(400)),
+            "post-burn USDC timeout must preserve source inflight"
+        );
+        drop(inventory);
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "post-burn USDC timeout must not allow another rebalance dispatch"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "post-burn USDC timeout must not allow another rebalance dispatch"
+        );
+    }
+
+    /// The main RAI-1017 regression test: the operator runs
+    /// `transfer reconcile` in a separate CLI process, which writes
+    /// `OperatorReconciled` to durable storage. The live server's
+    /// `usdc_in_progress` guard must clear on the next sweep tick without
+    /// requiring a restart.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_cli_reconcile_without_restart() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive a BaseToAlpaca aggregate all the way to DepositFailed, then
+        // reconcile it (simulating what the CLI does in a separate process).
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            42,
+        )
+        .await;
+        // Simulate the CLI running in a separate process: write Reconciled to
+        // the durable store. The live reactor never processes this event.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Build a trigger backed by the same pool and attach the usdc_store so
+        // the sweep can re-derive durable state.
+        // BaseToAlpaca: source venue is MarketMaking (onchain, USDC leaves the
+        // Base chain). Start with 500 available so a 400 inflight fits.
+        // Set active_usdc_rebalance to verify the sweep clears it (finding #9).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        // Simulate the in-memory state the live server holds: guard is set and
+        // tracking shows a post-burn stage (BridgingInitiated), as it was when
+        // DepositFailed arrived. The CLI's OperatorReconciled event only advanced
+        // the durable store; in-memory state did not change.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard when durable state is Reconciled"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking when durable state is Reconciled"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        // Source-venue inflight for BaseToAlpaca is MarketMaking (USDC left the
+        // Base chain). The sweep zeroes it via clear_usdc_inflight (inlined in
+        // the Reconciled branch of cleanup_timed_out_usdc_rebalance).
+        // active_usdc_rebalance must also be cleared (invariant from the
+        // pre-burn timeout path; the Reconciled sweep path must match).
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero source-venue (MarketMaking) inflight after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after CLI reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Reconciled check fires even when `last_progress_at` is RECENT (within
+    /// `transfer_timeout`). This is the key correctness invariant: a CLI
+    /// `transfer reconcile` run before the failure has aged past the
+    /// timeout must still clear the guard on the next sweep tick, not wait
+    /// for the full timeout window to elapse.
+    #[tokio::test]
+    async fn sweep_clears_guard_when_reconciled_before_timeout_expires() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000042");
+        let mint_tx =
+            fixed_bytes!("0x4242424242424242424242424242424242424242424242424242424242424242");
+
+        // Drive to DepositFailed then reconcile (simulating CLI in separate
+        // process).
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            0x42,
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            // Use a 30-minute timeout so that `last_progress_at = now` is
+            // well within the timeout window, proving the Reconciled check
+            // fires independently of elapsed time.
+            test_config_with_timeout(Duration::from_secs(1800)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        // last_progress_at = now: elapsed is ~0, well within the 30-minute
+        // transfer_timeout. The sweep must still detect Reconciled and clear.
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now,
+            },
+        );
+
+        trigger.expire_stuck_usdc_rebalances(now).await.unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must clear even when last_progress_at is recent (within timeout)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be removed when Reconciled is detected before timeout"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "id must be tombstoned after Reconciled clear"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero MarketMaking inflight even when reconciled before timeout"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance even when reconciled before timeout"
+        );
+        drop(inventory);
+    }
+
+    /// Guard is preserved when the durable store still shows `DepositFailed`
+    /// (i.e. the CLI has NOT yet reconciled). The narrowed `Reconciled` match
+    /// must not accidentally clear other guard-holding states.
+    #[tokio::test]
+    async fn sweep_preserves_guard_when_store_still_deposit_failed() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive aggregate to DepositFailed but do NOT reconcile it.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            42,
+        )
+        .await;
+
+        // BaseToAlpaca: source venue is MarketMaking (USDC leaves the Base chain).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay set when durable state is still DepositFailed"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved when durable state is still DepositFailed"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "must not tombstone a genuinely stuck post-burn transfer"
+        );
+
+        // The guard-preserving path must leave source-venue inflight unchanged:
+        // zeroing it here would allow a concurrent transfer to start while the
+        // stuck rebalance is still unresolved.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "guard-preserving path must leave source-venue (MarketMaking) inflight unchanged"
+        );
+        drop(inventory);
+    }
+
+    /// Fail-safe: when `usdc_store` is not attached (None), the sweep must
+    /// preserve the guard and leave inventory inflight untouched. Covers the
+    /// "store not yet wired" case (usdc_store is None).
+    #[tokio::test]
+    async fn sweep_preserves_guard_when_usdc_store_not_set() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        // Do NOT call set_stores -- usdc_store stays None.
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay set when usdc_store is not attached"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved when usdc_store is not attached"
+        );
+
+        // The fail-safe path must not zero inflight: the source-venue USDC
+        // inflight (AlpacaToBase -> Hedging) must remain at its original value.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(400)),
+            "fail-safe path must leave source-venue inflight unchanged"
+        );
+        drop(inventory);
+    }
+
+    /// Idempotency: sweep clears the guard first, then the reactor processes
+    /// the late OperatorReconciled event. Final inventory inflight must still
+    /// be zero (zeroing zero is a no-op).
+    #[tokio::test]
+    async fn sweep_then_reactor_is_idempotent_on_inventory() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive to DepositFailed then Reconciled.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            42,
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        // BaseToAlpaca: source venue is MarketMaking (onchain, USDC leaves the
+        // Base chain). Start with 500 available so a 400 inflight fits.
+        // Set active_usdc_rebalance to verify the sweep's Reconciled branch
+        // clears it (via clear_active_usdc_rebalance, chained inline).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        let store = Arc::new(store);
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        // Step 1: sweep clears the guard and zeroes MarketMaking inflight.
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard"
+        );
+        let active_rebalance = trigger
+            .inventory
+            .read()
+            .await
+            .active_usdc_rebalance()
+            .cloned();
+        assert_eq!(
+            active_rebalance, None,
+            "sweep must clear active_usdc_rebalance"
+        );
+
+        // Step 2: the OperatorReconciled event arrives late via the reactor
+        // (simulating a race where the live reactor eventually processes it).
+        // The tombstone guard in on_usdc_rebalance must short-circuit and
+        // return without re-populating tracking or touching inventory.
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+
+        // The tombstone causes an early return: tracking is still absent (was
+        // removed by the sweep), and the guard stays clear.
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tombstone must prevent the late event from re-populating tracking"
+        );
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "tombstone must prevent the late event from re-latching the guard"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "inflight remains zero: tombstone short-circuit prevents double-clear"
+        );
+        drop(inventory);
+    }
+
+    /// Fail-safe: when `usdc_store` is attached but its `load` returns an
+    /// error (e.g. schema mismatch, I/O failure), the sweep must preserve the
+    /// guard and leave inventory inflight unchanged. A store created without
+    /// migrations will error on every query with "no such table: events".
+    #[tokio::test]
+    async fn sweep_preserves_guard_on_store_load_error() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Attach a store backed by an unmigrated pool so every `load` call
+        // returns Err("no such table: events"). This exercises the Err arm in
+        // cleanup_timed_out_usdc_rebalance that must preserve the guard.
+        let unmigrated_pool = SqlitePool::connect(":memory:").await.unwrap();
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    unmigrated_pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    unmigrated_pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone(), ())),
+            )
+            .await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay set when store load returns an error"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved when store load returns an error"
+        );
+
+        // The fail-safe Err arm must not zero inflight: source-venue inflight
+        // (AlpacaToBase -> Hedging) must remain at the original value.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(400)),
+            "fail-safe Err path must leave source-venue inflight unchanged"
+        );
+        drop(inventory);
+    }
+
+    /// AlpacaToBase direction: sweep clears the Hedging-venue inflight when
+    /// durable state is Reconciled, mirroring
+    /// `sweep_clears_guard_after_cli_reconcile_without_restart` for the
+    /// reverse direction. Exercises the `source_venue(AlpacaToBase) = Hedging`
+    /// mapping through the full sweep code path.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_cli_reconcile_alpaca_to_base() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let mint_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+
+        // Drive an AlpacaToBase aggregate to DepositFailed then Reconciled.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            99,
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        // AlpacaToBase: source venue is Hedging (USDC leaves the Alpaca side).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard when durable state is Reconciled (AlpacaToBase)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking when durable state is Reconciled (AlpacaToBase)"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "sweep must zero Hedging inflight for AlpacaToBase direction"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Exercises the real restart-then-CLI-reconcile path end-to-end:
+    /// `recover_usdc_guard` seeds tracking for a stranded `DepositFailed`
+    /// aggregate (path 1), then the sweep detects the operator's CLI
+    /// `transfer reconcile` via durable `Reconciled` state and clears
+    /// the guard (path 2). Calling `recover_usdc_guard` directly (rather than
+    /// manually planting tracking) ensures both paths are regression-tested
+    /// together: a break in path 1 is caught here, not silently missed.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_restart_then_cli_reconcile() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000003");
+        let mint_tx =
+            fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
+
+        // Drive a BaseToAlpaca aggregate to DepositFailed (not yet reconciled).
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            77,
+        )
+        .await;
+
+        // Build a trigger backed by the same pool. BaseToAlpaca: source venue
+        // is MarketMaking (USDC leaves the Base chain).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Call recover_usdc_guard (the real startup path). The aggregate is in
+        // DepositFailed, which holds the guard and seeds tracking.
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        // Path 1: tracking was seeded by recover_usdc_guard for DepositFailed.
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "recover_usdc_guard must seed tracking for DepositFailed so the sweep can run"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "recover_usdc_guard must latch the guard for DepositFailed"
+        );
+
+        // The seeded tracking's `last_progress_at` is sourced from
+        // `DepositFailed.failed_at`, which is stamped by the store when the
+        // FailDeposit command above was applied. Passing `Utc::now() + 5s` to
+        // the sweep is therefore sufficient: elapsed = (now + 5s) - failed_at
+        // which is well above the 1s test timeout, regardless of how fast the
+        // store.send calls completed.
+
+        // Simulate the operator running `transfer reconcile` in a
+        // separate CLI process (the store emits OperatorReconciled).
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        // Path 2: the sweep detects Reconciled durable state and clears the
+        // guard -- no second restart required. Pass a `now` far enough in the
+        // future to exceed the 1-second test timeout (DepositFailed.failed_at
+        // is set to Utc::now() at store.send time, so elapsed = now - failed_at
+        // must be > 1s).
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard after restart + CLI reconcile, no second restart needed"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking after CLI reconcile detected via durable state"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero MarketMaking inflight after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Restart + CLI reconcile for `ConversionFailed{BaseToAlpaca}`:
+    /// the post-deposit USDC->USD conversion failure that holds the guard,
+    /// cannot self-recover, and accepts `transfer reconcile`.
+    /// After restart, `recover_usdc_guard` must seed tracking for it so the
+    /// sweep can detect the CLI-emitted `Reconciled` state and clear the guard
+    /// without a second restart.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_restart_then_cli_reconcile_conversion_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000010");
+        let mint_tx =
+            fixed_bytes!("0x1010101010101010101010101010101010101010101010101010101010101010");
+
+        // Drive a BaseToAlpaca aggregate to ConversionFailed.
+        // Path: Initiate -> ConfirmWithdrawal -> InitiateBridging ->
+        //   ReceiveAttestation -> ConfirmBridging -> InitiateDeposit ->
+        //   ConfirmDeposit -> InitiatePostDepositConversion -> FailConversion.
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01],
+                    cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    amount_received: usdc(399),
+                    fee_collected: usdc(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    amount: usdc(399),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "conversion rejected".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Build a trigger backed by the same pool. BaseToAlpaca: source venue
+        // is MarketMaking.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Simulate restart: recover_usdc_guard must seed tracking for
+        // ConversionFailed(BaseToAlpaca) so the sweep can later detect
+        // a CLI-emitted Reconciled state.
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "recover_usdc_guard must seed tracking for ConversionFailed(BtA)"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "recover_usdc_guard must latch the guard for ConversionFailed(BtA)"
+        );
+
+        // Simulate the operator running `transfer reconcile` in a
+        // separate CLI process.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        // The sweep must detect Reconciled and clear the guard -- no second
+        // restart required.
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard after restart + CLI reconcile for ConversionFailed(BtA)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking after CLI reconcile detected via durable state"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero MarketMaking inflight after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Restart + CLI reconcile for `BridgingFailed{AlpacaToBase, burn_tx=Some}`:
+    /// a non-resumable post-burn failure (the BaseToAlpaca direction is the one
+    /// `resumable_post_burn_transfer` re-arms; AlpacaToBase has no recovery path).
+    /// After restart, `recover_usdc_guard` must seed tracking for it so the sweep
+    /// can detect the CLI-emitted `Reconciled` state and clear the guard without
+    /// a second restart.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_restart_then_cli_reconcile_non_resumable_bridging_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000020");
+
+        // Drive an AlpacaToBase aggregate to BridgingFailed with burn_tx set
+        // (post-burn). Path: Initiate{AtB} -> ConfirmWithdrawal ->
+        // InitiateBridging -> FailBridging.
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "attestation timed out, AlpacaToBase has no recovery path".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // AlpacaToBase: source venue is Hedging.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(500))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Simulate restart: recover_usdc_guard must seed tracking for this
+        // non-resumable BridgingFailed and must NOT enqueue a recovery job
+        // (that would be the BaseToAlpaca resumable path).
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "recover_usdc_guard must seed tracking for BridgingFailed(AlpacaToBase, burn_tx=Some)"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "recover_usdc_guard must latch the guard for BridgingFailed(AlpacaToBase)"
+        );
+        // No recovery job must be enqueued: AlpacaToBase is not in
+        // resumable_post_burn_transfer.
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "non-resumable AlpacaToBase BridgingFailed must not be re-armed"
+        );
+
+        // Simulate the operator running `transfer reconcile` in a
+        // separate CLI process.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard after restart + CLI reconcile for \
+             BridgingFailed(AlpacaToBase)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking after CLI reconcile detected via durable state"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "sweep must zero Hedging inflight after CLI reconcile for AlpacaToBase"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// `BridgingFailed{BaseToAlpaca, burn_tx=Some}` is resumable and must NOT
+    /// be seeded with tracking on restart: `recover_usdc_guard` re-arms it via
+    /// `resumable_post_burn_transfer`, and seeding it would wedge the re-armed
+    /// job's `DepositConfirmed` path (which requires `bridged_amount_received`).
+    #[tokio::test]
+    async fn resumable_post_burn_bridging_failed_is_not_seeded_with_tracking() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000030");
+
+        // Drive a BaseToAlpaca aggregate to BridgingFailed with burn_tx set.
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        // The resumable BridgingFailed must NOT produce a tracking entry -- it
+        // self-recovers via the re-armed job.
+        assert!(
+            !service.usdc_tracking.read().await.contains_key(&id),
+            "resumable BridgingFailed(BaseToAlpaca) must not be seeded with tracking"
+        );
+        // It MUST produce a recovery job (re-armed via resumable_post_burn_transfer).
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "resumable BridgingFailed(BaseToAlpaca) must be re-armed as a hedging job"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_burn_usdc_timeout_logs_once_across_sweeps() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000)
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        // The preserved entry is re-selected on every sweep. We assert on the
+        // dedup set (`post_burn_timeout_logged`) rather than captured logs: the
+        // `error!` is gated directly on this set's `insert` returning true, so a
+        // single retained entry across sweeps is a faithful proxy for "logged
+        // exactly once".
+        trigger.check_and_trigger_usdc().await;
+        assert!(
+            trigger.post_burn_timeout_logged.read().await.contains(&id),
+            "first sweep must record the stuck id for log deduplication"
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            trigger.post_burn_timeout_logged.read().await.len(),
+            1,
+            "subsequent sweeps must not re-log: the dedup set stays at one entry"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "the entry must remain preserved across sweeps"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_reasserts_guard_for_post_burn_bridging_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000aa");
+
+        // Persist a history that ends in a post-burn bridge failure.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "mint reverted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A fresh service has the guard cleared, as a restarted process would.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must start clear, simulating a fresh process"
+        );
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn bridge failure must re-assert the USDC guard on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_reasserts_guard_for_bridging_submitting() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
+
+        // Crash at BridgingSubmitting -- the intent marker written immediately
+        // before the irreversible CCTP burn, where the burn may already have
+        // been broadcast but not yet recorded. holds_rebalance_guard treats this
+        // as guard-holding, and the recovery candidate query must select it.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 99,
+                    burn_amount: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "a crash at BridgingSubmitting (burn possibly already broadcast) must \
+             re-assert the USDC guard on startup"
+        );
+    }
+
+    /// Drives an aggregate to `AwaitingAttestation` -- the state a redrive
+    /// enqueue that failed after `TimeoutAttestation` committed leaves behind.
+    async fn seed_awaiting_attestation(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx: TxHash,
+    ) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::TimeoutAttestation {
+                    retry_deadline_at: Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives a `UsdcRebalance` aggregate from `Uninitialized` all the way to
+    /// `DepositFailed` via the standard 7-step post-burn path. Used by sweep
+    /// tests that need a stranded post-deposit failure in the durable store.
+    ///
+    /// `cctp_nonce_seed` must be unique per test to avoid aggregate conflicts
+    /// on the shared SQLite pool.
+    async fn seed_deposit_failed(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx: TxHash,
+        mint_tx: TxHash,
+        cctp_nonce_seed: u64,
+    ) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01],
+                    cctp_nonce: alloy::primitives::B256::left_padding_from(
+                        &cctp_nonce_seed.to_be_bytes(),
+                    ),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    amount_received: usdc(399),
+                    fee_collected: usdc(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "deposit rejected".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_post_burn_bridging_failed(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx: TxHash,
+    ) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "mint receipt dropped on a load-balanced RPC".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// RAI-836: a post-burn aggregate stranded in `AwaitingAttestation` with no
+    /// pending job (e.g. a redrive enqueue that failed after `TimeoutAttestation`
+    /// committed) must get a transfer job re-armed on startup, keyed by the same
+    /// id and routed to the direction's queue -- otherwise the guard latches
+    /// forever with nothing driving the transfer.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_stranded_awaiting_attestation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "a stranded Base->Alpaca AwaitingAttestation must be re-armed as a hedging job",
+        );
+
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        let job: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            job.id, id,
+            "the re-armed job must resume the same aggregate id, not a fresh one",
+        );
+    }
+
+    /// RAI-836: re-arming is idempotent with apalis's own re-pick of pending
+    /// rows. An aggregate that still has a non-terminal job row on startup must
+    /// NOT get a second job -- a duplicate would drive two concurrent resumes of
+    /// the same id.
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_rearm_when_job_already_in_flight() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000ee");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A still-pending job row for this id, as apalis would re-pick on restart.
+        let mut queue = service.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "an aggregate with a job already in flight must not be re-armed a second time",
+        );
+    }
+
+    /// RAI-836: a post-burn aggregate whose transfer job already exhausted its
+    /// retry budget (a terminal `Failed` row) must NOT be re-armed -- re-driving
+    /// it every restart would bypass the retry budget and silently retry a
+    /// known-failing transfer. It latches for operator reconciliation (recoverable
+    /// via the `transfer resume --kind usdc` CLI), matching `requeue_orphaned`'s
+    /// policy of
+    /// leaving `Failed` rows alone.
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_rearm_when_job_already_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A job that ran and exhausted its retries, as apalis leaves it: push a
+        // row, then mark it terminal `Failed`.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "a Failed (retries-exhausted) job must NOT be re-armed; it latches for operator recovery",
+        );
+    }
+
+    /// RAI-906: a post-burn `BridgingFailed` is recoverable, so the startup re-arm
+    /// must enqueue a recovery job for it when no job row exists at all.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_post_burn_bridging_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000901");
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "a recoverable post-burn BridgingFailed must be re-armed as a hedging job",
+        );
+
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        let job: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            job.id, id,
+            "the re-armed job must resume the same aggregate id"
+        );
+    }
+
+    /// RAI-906: the key distinction from `AwaitingAttestation`. A post-burn
+    /// `BridgingFailed` is reached precisely by a transfer job that emitted
+    /// `FailBridging` and ended terminal (`Failed` from exhausted retries, or
+    /// `Done` from a clean give-up), so it almost always carries a terminal row.
+    /// Recovery is NEW work (re-check mint + un-fail), not a continuation of that
+    /// exhausted budget, so a terminal row must NOT block the re-arm -- otherwise
+    /// the auto-recovery never fires for the incident it targets.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_post_burn_bridging_failed_despite_terminal_job_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000902");
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // The transfer job that drove the aggregate to BridgingFailed, left
+        // terminal `Failed` with its retry budget EXHAUSTED (attempts ==
+        // max_attempts) as apalis leaves a job that gave up -- it will not be
+        // re-fetched, so recovery is free to take over.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "a recoverable BridgingFailed must be re-armed even with a retries-exhausted Failed row",
+        );
+    }
+
+    /// RAI-906: a `Failed` row that apalis will still RE-FETCH (retries remaining,
+    /// `attempts < max_attempts`) is a live job apalis owns, so re-arm must NOT
+    /// enqueue a second concurrent recovery for the same id.
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_rearm_for_bridging_failed_when_failed_job_retryable() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000904");
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A `Failed` row with retries remaining: a freshly-pushed job has
+        // attempts = 0 < max_attempts, so apalis will re-fetch it -- the original
+        // transfer is still in flight from apalis's perspective.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "a retryable Failed job is still owned by apalis; re-arm must not duplicate it",
+        );
+    }
+
+    /// RAI-906: a clean give-up (`Done`) row is terminal and apalis will not
+    /// re-run it, so it must not block recovery re-arm.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_post_burn_bridging_failed_despite_done_job_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000905");
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "a terminal Done row must not block recovery re-arm of a recoverable BridgingFailed",
+        );
+    }
+
+    /// RAI-906: re-arm of a recoverable BridgingFailed is still suppressed while a
+    /// recovery job is already in flight, so a restart cannot drive two concurrent
+    /// resumes of the same id.
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_rearm_for_bridging_failed_when_in_flight() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000903");
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A recovery job already in flight (Pending) for this id.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "an in-flight recovery job must not be duplicated by a second re-arm",
+        );
+    }
+
+    /// RAI-836: the re-arm must cover the Alpaca->Base direction too -- it routes
+    /// to the market-making queue with a `TransferUsdcToMarketMaking` payload. A
+    /// direction-routing bug would strand every Alpaca->Base rebalance while the
+    /// Base->Alpaca test stays green, so assert the market-making job explicitly.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_stranded_awaiting_attestation_alpaca_to_base() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            1,
+            "a stranded Alpaca->Base AwaitingAttestation must be re-armed as a market-making job",
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "an Alpaca->Base strand must not be routed to the hedging queue",
+        );
+
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            job.id, id,
+            "the re-armed market-making job must resume the same aggregate id, not a fresh one",
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_leaves_guard_clear_for_pre_burn_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let withdrawal =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+
+        // A pre-burn bridge failure (FailBridging from WithdrawalComplete) carries
+        // no burn hash and reconciles to source, so it must not hold the guard.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(withdrawal),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "usdc-to-u256 conversion error".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "pre-burn bridge failure must not hold the USDC guard on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_holds_defensively_when_candidate_cannot_load() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Persist a guard-relevant event that cannot originate an aggregate (the
+        // first event must be ConversionInitiated/Initiated). The candidate
+        // query returns this id, but Store::load replays to None -- exactly the
+        // store/event inconsistency the recovery must fail safe on.
+        let event = UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: fixed_bytes!(
+                "0x00000000000000000000000000000000000000000000000000000000000000aa"
+            ),
+            burned_at: Utc::now(),
+        };
+        let payload = serde_json::to_string(&event).unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().is_none(),
+            "an unoriginated first event must not load into an aggregate"
+        );
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "an unloadable guard-relevant candidate must hold the guard defensively"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_holds_defensively_when_candidate_id_is_unparseable() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        // Persist a guard-relevant event whose aggregate_id is not a valid UUID --
+        // a corrupt/partially-written durable row. The candidate query surfaces it
+        // as unparseable; recovery must fail closed and hold the guard rather than
+        // silently dropping it and re-opening the re-burn window.
+        let event = UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: fixed_bytes!(
+                "0x00000000000000000000000000000000000000000000000000000000000000ab"
+            ),
+            burned_at: Utc::now(),
+        };
+        let payload = serde_json::to_string(&event).unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', 'not-a-uuid', 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
+        )
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "an unparseable guard-relevant candidate aggregate_id must hold the guard defensively"
+        );
+    }
+
+    #[tokio::test]
     async fn usdc_post_deposit_conversion_refreshes_timeout_tracking() {
         let inventory = InventoryView::default()
             .with_usdc(usdc(900), usdc(100))
@@ -7787,7 +13540,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_config(
+        let reactor = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(60)),
         )
@@ -7814,7 +13567,7 @@ mod tests {
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
-                    order_id: Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     initiated_at: refreshed_at,
                 },
             )
@@ -7854,7 +13607,7 @@ mod tests {
     #[tokio::test]
     async fn usdc_pre_withdrawal_conversion_confirmation_refreshes_timeout_tracking() {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
-        let (reactor, _receiver) = make_trigger_with_inventory_config(
+        let reactor = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(60)),
         )
@@ -7871,7 +13624,7 @@ mod tests {
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
-                    order_id: Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     initiated_at,
                 },
             )
@@ -7920,9 +13673,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversion_failed_without_started_transfer_still_clears_in_progress() {
+    async fn conversion_failed_without_tracking_preserves_guard_conservatively() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -7934,62 +13687,74 @@ mod tests {
             .unwrap();
 
         assert!(
-            !trigger.usdc_in_progress.load(Ordering::SeqCst),
-            "pre-withdrawal conversion failure should still clear usdc_in_progress"
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "without tracking we cannot prove the conversion failure was pre-burn, so the guard \
+             is preserved conservatively rather than risk dispatching a fresh burn"
         );
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
-            "pre-withdrawal conversion failure should not leave tracking context behind"
+            "a conversion failure with no prior tracking should not fabricate a context"
         );
 
         let inventory = trigger.inventory.read().await;
         assert_eq!(
             inventory.usdc_available(Venue::MarketMaking),
             Some(usdc(5000)),
-            "conversion failure before withdrawal should not change onchain USDC inventory"
+            "preserving the guard must not change onchain USDC inventory"
         );
         assert_eq!(
             inventory.usdc_available(Venue::Hedging),
             Some(usdc(5000)),
-            "conversion failure before withdrawal should not change offchain USDC inventory"
+            "preserving the guard must not change offchain USDC inventory"
         );
         drop(inventory);
     }
 
     #[tokio::test]
-    async fn conversion_confirmed_without_tracking_returns_error_and_preserves_in_progress() {
+    async fn conversion_confirmed_without_tracking_clears_guard_without_reconciliation() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
-        let error = harness
+        harness
             .receive::<UsdcRebalance>(
                 id.clone(),
                 make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            RebalancingServiceError::MissingUsdcTrackingContext {
-                id: error_id,
-                event: usdc::UsdcTrackingEvent::ConversionConfirmed,
-            } if error_id == id
-        ));
         assert!(
-            trigger.usdc_in_progress.load(Ordering::SeqCst),
-            "usdc_in_progress should stay set when conversion settlement context is missing"
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a terminal-success conversion with no tracking (resumed after restart) clears the \
+             guard rather than wedging it forever on a missing-context error"
         );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "completing without tracking should not fabricate a context"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(5000)),
+            "clearing the guard with no tracking must not reconcile onchain USDC inventory"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(5000)),
+            "clearing the guard with no tracking must not reconcile offchain USDC inventory"
+        );
+        drop(inventory);
     }
 
     #[tokio::test]
     async fn conversion_confirmed_above_initiated_returns_error_and_preserves_state() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -8080,6 +13845,11 @@ mod tests {
         assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
             &make_usdc_bridged()
         ));
+        // A recovered post-burn bridge re-enters the Bridged stage and must stay
+        // non-terminal so the guard holds until the terminal deposit leg.
+        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
+            &make_usdc_bridging_completion_recovered()
+        ));
     }
 
     #[test]
@@ -8115,112 +13885,14 @@ mod tests {
         ));
     }
 
-    fn valid_rebalancing_config_toml() -> &'static str {
-        r#"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#
-    }
-
-    #[test]
-    fn deserialize_config_succeeds() {
-        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
-
-        assert!(config.equity.target.eq(float!(0.5)).unwrap());
-        assert!(config.equity.deviation.eq(float!(0.2)).unwrap());
-
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected UsdcRebalancing::Enabled");
-        };
-        assert!(target.eq(float!(0.5)).unwrap());
-        assert!(deviation.eq(float!(0.3)).unwrap());
-        assert_eq!(config.transfer_timeout_secs, 1800);
-    }
-
-    #[test]
-    fn deserialize_with_custom_thresholds() {
-        let config: RebalancingConfig = toml::from_str(
-            r#"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.6"
-            deviation = "0.1"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.4"
-            deviation = "0.15"
-        "#,
-        )
-        .unwrap();
-
-        assert!(config.equity.target.eq(float!(0.6)).unwrap());
-        assert!(config.equity.deviation.eq(float!(0.1)).unwrap());
-
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected UsdcRebalancing::Enabled");
-        };
-        assert!(target.eq(float!(0.4)).unwrap());
-        assert!(deviation.eq(float!(0.15)).unwrap());
-    }
-
-    #[test]
-    fn deserialize_missing_transfer_timeout_secs_fails() {
-        let toml_str = r#"
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("transfer_timeout_secs"),
-            "Expected missing transfer_timeout_secs error, got: {error}"
-        );
-    }
-
-    #[test]
-    fn deserialize_missing_equity_fails() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            transfer_timeout_secs = 1800
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("equity"),
-            "Expected missing equity error, got: {error}"
-        );
-    }
-
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
         // Regression: when usdc is None, startup must not require assets.cash.vault_id.
         // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
-        let (sender, _receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
-        let schedulers = RebalancingSchedulers::new(&pool);
+        let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
                 equity: ImbalanceThreshold {
@@ -8233,7 +13905,6 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
@@ -8245,7 +13916,6 @@ mod tests {
                     event_sender,
                 ))
             },
-            sender,
             wrapper,
             schedulers,
         );
@@ -8253,24 +13923,6 @@ mod tests {
         assert!(
             trigger.usdc_rebalancing_params().is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
-        );
-    }
-
-    #[test]
-    fn deserialize_missing_usdc_fails() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("usdc"),
-            "Expected missing usdc error, got: {error}"
         );
     }
 
@@ -8336,7 +13988,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -8353,7 +14010,9 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
-                    cctp_nonce: 12345,
+                    cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8405,7 +14064,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
@@ -8422,7 +14081,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -8439,7 +14103,9 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
-                    cctp_nonce: 67890,
+                    cctp_nonce: B256::left_padding_from(&67890u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8489,7 +14155,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         store
             .send(
@@ -8530,7 +14196,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
 
@@ -8547,7 +14213,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -8593,7 +14264,7 @@ mod tests {
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
-                    order_id: uuid::Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 },
             )
             .await
@@ -8622,8 +14293,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
-        let (sender, _receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(usdc(5000), usdc(5000)),
@@ -8632,13 +14302,12 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             Address::ZERO,
             Address::ZERO,
             inventory,
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         // Set in_progress flag
@@ -8719,7 +14388,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -8736,7 +14410,9 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
-                    cctp_nonce: 99999,
+                    cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8776,7 +14452,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id: uuid::Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     amount: Usdc::new(float!(99.99)),
                 },
             )
@@ -8842,21 +14518,19 @@ mod tests {
             event_sender,
         ));
 
-        let (sender, mut receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         // Seed vault registry so token lookup succeeds
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -8889,39 +14563,40 @@ mod tests {
         // - Onchain: 100 shares
         // - Offchain: 0 shares (not polled yet, treated as "no holdings")
         // - Ratio: 100% onchain -> "TooMuchOnchain" -> Redemption
-        let triggered = receiver.try_recv();
-
-        assert!(
-            triggered.is_err(),
-            "CORRECT: No operation should trigger with partial inventory data. \
-             BUG: Got {triggered:?} - system incorrectly treated missing offchain \
-             data as 'zero holdings' and triggered rebalancing."
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "No operation should trigger with partial inventory data: the system \
+             must not treat missing offchain data as 'zero holdings'"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "No operation should trigger with partial inventory data: the system \
+             must not treat missing offchain data as 'zero holdings'"
         );
     }
 
     /// Complementary test: verify that trigger DOES fire once both venues have data.
     #[tokio::test]
     async fn trigger_fires_when_both_venues_have_data() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
         ));
-        let (sender, mut receiver) = mpsc::channel(10);
-
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -8945,8 +14620,9 @@ mod tests {
         drain_pending_jobs(&trigger).await.unwrap();
 
         // No trigger yet - only one venue has data
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "should not trigger with only onchain data"
         );
 
@@ -8967,16 +14643,12 @@ mod tests {
         // Now both venues have data: 100 onchain, 0 offchain = 100% ratio
         // With target 50% and deviation 10%, ratio 100% > upper bound 60%
         // So TooMuchOnchain -> should trigger Redemption
-        let triggered = receiver.try_recv();
+        let jobs = take_pending_equity_redemption_jobs(&trigger).await;
 
-        assert!(
-            triggered.is_ok(),
-            "should trigger rebalancing once both venues have data"
-        );
-
-        assert!(
-            matches!(triggered.unwrap(), TriggeredOperation::Redemption { .. }),
-            "expected Redemption for 100% onchain ratio"
+        assert_eq!(
+            jobs.len(),
+            1,
+            "expected a redemption job for 100% onchain ratio once both venues have data"
         );
     }
 
@@ -8984,26 +14656,23 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn logs_show_partial_data_skips_imbalance_check() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
         ));
-        let (sender, _receiver) = mpsc::channel(10);
-
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -9047,26 +14716,23 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn logs_show_trigger_fires_with_complete_data() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
         ));
-        let (sender, _receiver) = mpsc::channel(10);
-
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
-            sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -9127,8 +14793,7 @@ mod tests {
             .with_usdc(usdc(2000), usdc(2000))
             .with_withdrawable_cash_cents(200_000);
 
-        let (trigger, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         let event = make_onchain_fill(shares(10), Direction::Buy);
@@ -9138,20 +14803,23 @@ mod tests {
             .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        let mut operations = Vec::new();
-        while let Ok(operation) = receiver.try_recv() {
-            operations.push(operation);
-        }
+        // Drain any equity transfer jobs; the position-event side of this test
+        // can enqueue equity operations through the rebalancer, but the
+        // assertion below is only about USDC.
+        take_pending_equity_mint_jobs(&trigger).await;
+        take_pending_equity_redemption_jobs(&trigger).await;
+
+        let usdc_operations = take_pending_usdc_transfer_jobs(&trigger).await;
 
         // Onchain buy spends USDC onchain, making the onchain ratio drop below
         // the lower bound. The system should move USDC from Alpaca to Base.
-        operations
+        usdc_operations
             .iter()
-            .find(|op| matches!(op, TriggeredOperation::UsdcAlpacaToBase { .. }))
+            .find(|op| matches!(op, UsdcRebalanceOperation::AlpacaToBase { .. }))
             .unwrap_or_else(|| {
                 panic!(
-                    "Expected UsdcAlpacaToBase (onchain USDC too low after buy), \
-                     got operations: {operations:?}"
+                    "Expected AlpacaToBase (onchain USDC too low after buy), \
+                     got operations: {usdc_operations:?}"
                 )
             });
     }
@@ -9171,7 +14839,7 @@ mod tests {
             private_key = private_key_str
         };
 
-        let wallet = crate::wallet::build_wallet(
+        let wallet = st0x_config::build_wallet(
             &st0x_evm::WalletKind::PrivateKey,
             wallet_config.into(),
             wallet_secrets.into(),
@@ -9206,20 +14874,17 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-transfer-cancel");
+        let id = redemption_aggregate_id("redemption-transfer-cancel");
 
         // Verify initial imbalance
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::Redemption { .. })
-            ),
-            "80% ratio should trigger Redemption"
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
+            "80% ratio should enqueue a redemption job"
         );
         trigger.clear_equity_in_progress(&symbol);
 
@@ -9234,8 +14899,14 @@ mod tests {
 
         // Inflight blocks imbalance detection
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Inflight should block imbalance detection"
+        );
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
             "Inflight should block imbalance detection"
         );
 
@@ -9247,12 +14918,10 @@ mod tests {
 
         // After cancel: back to 80 onchain, 20 offchain -> imbalance should re-trigger
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::Redemption { .. })
-            ),
-            "Imbalance should re-trigger after TransferFailed cancels inflight"
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
+            "Imbalance should re-enqueue a redemption job after TransferFailed cancels inflight"
         );
     }
 
@@ -9275,8 +14944,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -9285,8 +14953,14 @@ mod tests {
 
         // Verify initially balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "50/50 should be balanced"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "50/50 should be balanced"
         );
 
@@ -9309,8 +14983,14 @@ mod tests {
 
         // Inflight should block rebalancing even though ratios are balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Inflight from InflightEquity snapshot should block rebalancing"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Inflight from InflightEquity snapshot should block rebalancing"
         );
     }
@@ -9335,8 +15015,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -9358,8 +15037,14 @@ mod tests {
 
         // Verify inflight blocks rebalancing despite imbalance
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Inflight should block rebalancing"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Inflight should block rebalancing"
         );
 
@@ -9377,8 +15062,14 @@ mod tests {
         .unwrap();
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Empty snapshot should not clear inflight (symbol absent from maps)"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Empty snapshot should not clear inflight (symbol absent from maps)"
         );
 
@@ -9397,11 +15088,9 @@ mod tests {
 
         // After CQRS clears inflight, the imbalance should trigger
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::Redemption { .. })
-            ),
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
             "CQRS-cleared inflight should restore triggerability"
         );
     }
@@ -9425,11 +15114,10 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-rejected-absent-skip");
+        let id = redemption_aggregate_id("redemption-rejected-absent-skip");
 
         // WithdrawnFromRaindex: start inflight
         harness
@@ -9494,11 +15182,10 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-detection-absent-skip");
+        let id = redemption_aggregate_id("redemption-detection-absent-skip");
 
         harness
             .receive::<EquityRedemption>(
@@ -9560,11 +15247,10 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-completed-zeroed");
+        let id = redemption_aggregate_id("redemption-completed-zeroed");
 
         // WithdrawnFromRaindex -> Completed: TransferOp::Complete zeros inflight
         harness
@@ -9627,8 +15313,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -9648,8 +15333,14 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Inflight should block rebalancing"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Inflight should block rebalancing"
         );
 
@@ -9668,8 +15359,15 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Clearing inflight should not immediately trigger -- \
+             no equity recheck from terminal events"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Clearing inflight should not immediately trigger -- \
              no equity recheck from terminal events"
         );
@@ -9691,11 +15389,9 @@ mod tests {
         .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::Redemption { .. })
-            ),
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
             "Available snapshot after inflight cleared should trigger rebalancing"
         );
     }
@@ -9719,8 +15415,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -9755,8 +15450,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&reactor).await,
+            0,
+            "Inflight still present should not trigger recheck"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&reactor).await,
+            0,
             "Inflight still present should not trigger recheck"
         );
     }
@@ -9785,8 +15486,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -9796,7 +15496,7 @@ mod tests {
         };
 
         // Simulate: WithdrawnFromRaindex starts inflight for the symbol
-        let redemption_id = RedemptionAggregateId::new("redemption-stale-regression");
+        let redemption_id = redemption_aggregate_id("redemption-stale-regression");
         harness
             .receive::<EquityRedemption>(
                 redemption_id.clone(),
@@ -9823,7 +15523,8 @@ mod tests {
             .unwrap();
 
         // Drain any operations triggered so far
-        while receiver.try_recv().is_ok() {}
+        take_pending_equity_mint_jobs(&trigger).await;
+        take_pending_equity_redemption_jobs(&trigger).await;
         trigger.clear_equity_in_progress(&symbol);
 
         // Deliver an InflightEquity snapshot with mints for the symbol.
@@ -9856,8 +15557,14 @@ mod tests {
         );
 
         // No spurious rebalancing operation should have been triggered
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "InflightEquity after terminal failure should not trigger extra rebalancing"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "InflightEquity after terminal failure should not trigger extra rebalancing"
         );
     }
@@ -9882,8 +15589,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -9892,7 +15598,7 @@ mod tests {
             owner: TEST_ORDER_OWNER,
         };
 
-        let mint_id = IssuerRequestId::new("mint-stale-regression");
+        let mint_id = issuer_request_id("mint-stale-regression");
 
         // MintRequested starts inflight at Hedging venue
         harness
@@ -9916,7 +15622,8 @@ mod tests {
             .unwrap();
 
         // Drain and clear
-        while receiver.try_recv().is_ok() {}
+        take_pending_equity_mint_jobs(&trigger).await;
+        take_pending_equity_redemption_jobs(&trigger).await;
         trigger.clear_equity_in_progress(&symbol);
 
         // Deliver stale InflightEquity with redemptions for the symbol
@@ -9936,8 +15643,15 @@ mod tests {
         .unwrap();
 
         // No spurious rebalancing from the snapshot
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "InflightEquity after MintAcceptanceFailed should not \
+             trigger extra rebalancing"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "InflightEquity after MintAcceptanceFailed should not \
              trigger extra rebalancing"
         );
@@ -9954,7 +15668,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (reactor, mut receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -9962,11 +15676,14 @@ mod tests {
         .await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("timed-out-redemption");
+        let id = redemption_aggregate_id("timed-out-redemption");
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         trigger.redemption_tracking.write().await.insert(
@@ -9984,7 +15701,11 @@ mod tests {
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
             "equity timeout should clear the symbol in-progress guard"
         );
         assert!(
@@ -10009,8 +15730,14 @@ mod tests {
         );
         drop(inventory);
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "balanced inventory should not immediately trigger another equity transfer after timeout"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "balanced inventory should not immediately trigger another equity transfer after timeout"
         );
 
@@ -10105,7 +15832,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (reactor, mut receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -10113,11 +15840,14 @@ mod tests {
         .await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("timed-out-redemption-retrigger");
+        let id = redemption_aggregate_id("timed-out-redemption-retrigger");
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         trigger.redemption_tracking.write().await.insert(
@@ -10134,10 +15864,10 @@ mod tests {
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
-        let retriggered = receiver.try_recv();
-        assert!(
-            matches!(retriggered, Ok(TriggeredOperation::Redemption { .. })),
-            "timeout cleanup should still allow the next redemption trigger, got {retriggered:?}"
+        assert_eq!(
+            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            1,
+            "timeout cleanup should still allow the next redemption trigger"
         );
 
         let cleared_at = *trigger
@@ -10204,14 +15934,14 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(1)),
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("timed-out-still-pending");
+        let id = redemption_aggregate_id("timed-out-still-pending");
         let redemption_tx = TxHash::random();
         let tokenization_request_id = TokenizationRequestId("stuck-at-alpaca".to_string());
 
@@ -10271,14 +16001,14 @@ mod tests {
                 now,
             )
             .unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(60)),
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("timed-out-mint-recheck");
+        let id = issuer_request_id("timed-out-mint-recheck");
 
         trigger.mint_tracking.write().await.insert(
             id.clone(),
@@ -10337,14 +16067,14 @@ mod tests {
                 now,
             )
             .unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(60)),
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("timed-out-mint-late-request");
+        let id = issuer_request_id("timed-out-mint-late-request");
 
         trigger.mint_tracking.write().await.insert(
             id.clone(),
@@ -10404,7 +16134,7 @@ mod tests {
     async fn timed_out_mint_cleanup_clears_active_mint_id() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
-        let id = IssuerRequestId::new("timed-out-mint-active-id");
+        let id = issuer_request_id("timed-out-mint-active-id");
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(50))
             .update_equity(
@@ -10414,7 +16144,7 @@ mod tests {
             )
             .unwrap()
             .set_active_mint(symbol.clone(), id.clone());
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(60)),
@@ -10448,13 +16178,13 @@ mod tests {
     #[tokio::test]
     async fn mint_event_rechecks_tombstone_after_waiting_for_sync_gate() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("mint-sync-gate-tombstone");
+        let id = issuer_request_id("mint-sync-gate-tombstone");
         let sync_guard = trigger.mint_event_sync.lock().await;
         let trigger_for_task = Arc::clone(&trigger);
         let task_symbol = symbol.clone();
@@ -10499,14 +16229,14 @@ mod tests {
                 now,
             )
             .unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(60)),
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("timed-out-redemption-late-withdrawal");
+        let id = redemption_aggregate_id("timed-out-redemption-late-withdrawal");
 
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
@@ -10570,7 +16300,7 @@ mod tests {
     async fn timed_out_redemption_cleanup_clears_active_redemption_id() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
-        let id = RedemptionAggregateId::new("timed-out-redemption-active-id");
+        let id = redemption_aggregate_id("timed-out-redemption-active-id");
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(50))
             .update_equity(
@@ -10580,7 +16310,7 @@ mod tests {
             )
             .unwrap()
             .set_active_redemption(symbol.clone(), id.clone());
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(60)),
@@ -10621,13 +16351,13 @@ mod tests {
     #[tokio::test]
     async fn redemption_event_rechecks_tombstone_after_waiting_for_sync_gate() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("redemption-sync-gate-tombstone");
+        let id = redemption_aggregate_id("redemption-sync-gate-tombstone");
         let sync_guard = trigger.redemption_event_sync.lock().await;
         let trigger_for_task = Arc::clone(&trigger);
         let task_symbol = symbol.clone();
@@ -10672,7 +16402,7 @@ mod tests {
                 now,
             )
             .unwrap();
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         trigger.usdc_tracking.write().await.insert(
@@ -10681,7 +16411,10 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 initiated_amount: usdc(700),
                 bridged_amount_received: None,
-                stage: usdc::UsdcRebalanceStage::DepositConfirmed,
+                // Pre-burn stage: a stalled withdrawal still reconciles to source
+                // and tombstones on timeout (post-burn stages preserve instead,
+                // covered by timed_out_post_mint_usdc_rebalance_*).
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
                 last_progress_at: now - ChronoDuration::minutes(40),
             },
         );
@@ -10710,7 +16443,7 @@ mod tests {
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(700),
-                    order_id: Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     initiated_at: now,
                 },
             )
@@ -10748,7 +16481,7 @@ mod tests {
             )
             .unwrap()
             .set_active_usdc_rebalance(id.clone());
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
 
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
@@ -10756,7 +16489,10 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 initiated_amount: usdc(700),
                 bridged_amount_received: None,
-                stage: usdc::UsdcRebalanceStage::DepositConfirmed,
+                // Pre-burn stage: a stalled withdrawal still reconciles to source
+                // and tombstones on timeout (post-burn stages preserve instead,
+                // covered by timed_out_post_mint_usdc_rebalance_*).
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
                 last_progress_at: now - ChronoDuration::minutes(40),
             },
         );
@@ -10781,7 +16517,7 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_event_rechecks_tombstone_after_waiting_for_sync_gate() {
-        let (reactor, _receiver) =
+        let reactor =
             make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(5000), usdc(5000)))
                 .await;
         let trigger = reactor.clone();
@@ -10797,7 +16533,7 @@ mod tests {
                     UsdcRebalanceEvent::ConversionInitiated {
                         direction: RebalanceDirection::BaseToAlpaca,
                         amount: usdc(700),
-                        order_id: Uuid::new_v4(),
+                        order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                         initiated_at: Utc::now(),
                     },
                 )
@@ -10822,7 +16558,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_path_reuses_inflight_suppression_filter() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
@@ -10882,14 +16618,14 @@ mod tests {
                 fetched_at,
             )
             .unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+        let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
             test_config_with_timeout(Duration::from_secs(1)),
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("recovery-timeout-sweep");
+        let id = issuer_request_id("recovery-timeout-sweep");
 
         trigger.mint_tracking.write().await.insert(
             id.clone(),
@@ -10943,7 +16679,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_markers_are_pruned_after_retention_window() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
@@ -10952,8 +16688,8 @@ mod tests {
         let stale_time = Utc::now()
             - ChronoDuration::from_std(TIMEOUT_TOMBSTONE_RETENTION).unwrap()
             - ChronoDuration::seconds(1);
-        let mint_id = IssuerRequestId::new("stale-mint");
-        let redemption_id = RedemptionAggregateId::new("stale-redemption");
+        let mint_id = issuer_request_id("stale-mint");
+        let redemption_id = redemption_aggregate_id("stale-redemption");
         let usdc_id = UsdcRebalanceId(Uuid::new_v4());
 
         trigger
@@ -11000,9 +16736,11 @@ mod tests {
     #[tokio::test]
     async fn no_active_aggregate_ids_when_idle() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory(
-            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
-        )
+        let reactor = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(50),
+            shares(50),
+        ))
         .await;
         let trigger = reactor.clone();
 
@@ -11016,13 +16754,13 @@ mod tests {
     #[tokio::test]
     async fn mint_accepted_records_active_mint_id() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("mint-active-id");
+        let id = issuer_request_id("mint-active-id");
 
         trigger
             .on_mint(id.clone(), make_mint_requested(&symbol, float!(10)))
@@ -11050,13 +16788,13 @@ mod tests {
     #[tokio::test]
     async fn mint_terminal_event_clears_active_mint_id() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("mint-clear-id");
+        let id = issuer_request_id("mint-clear-id");
 
         trigger
             .on_mint(id.clone(), make_mint_requested(&symbol, float!(10)))
@@ -11092,13 +16830,13 @@ mod tests {
     #[tokio::test]
     async fn redemption_withdrawn_records_active_redemption_id() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("redemption-active-id");
+        let id = redemption_aggregate_id("redemption-active-id");
 
         trigger
             .on_redemption(id.clone(), make_withdrawn_from_raindex(&symbol, float!(10)))
@@ -11121,13 +16859,13 @@ mod tests {
     #[tokio::test]
     async fn redemption_completed_clears_active_redemption_id() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (reactor, _receiver) = make_trigger_with_inventory_and_registry(
+        let reactor = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("redemption-clear-id");
+        let id = redemption_aggregate_id("redemption-clear-id");
 
         trigger
             .on_redemption(id.clone(), make_withdrawn_from_raindex(&symbol, float!(10)))
@@ -11152,7 +16890,7 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_initiation_records_active_rebalance_id() {
-        let (reactor, _receiver) =
+        let reactor =
             make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(500), usdc(500)))
                 .await;
         let trigger = reactor.clone();
@@ -11181,7 +16919,7 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_terminal_clears_active_rebalance_id() {
-        let (reactor, _receiver) =
+        let reactor =
             make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(500), usdc(500)))
                 .await;
         let trigger = reactor.clone();
@@ -11246,8 +16984,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         EquityRebalancingCheck {
@@ -11257,11 +16994,60 @@ mod tests {
         .await
         .unwrap();
 
-        let dispatched = receiver.try_recv().unwrap();
-        let TriggeredOperation::Mint { symbol: minted, .. } = dispatched else {
-            panic!("Expected Mint, got {dispatched:?}");
+        let dispatched = take_pending_equity_mint_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one mint job, got {dispatched:?}");
         };
-        assert_eq!(minted, symbol);
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// A crash between `queue.push` and the first persisted mint event leaves
+    /// a pending job row while the in-memory guard resets. The Jobs-table
+    /// dedupe must suppress a second enqueue for the same symbol while
+    /// leaving other symbols free to enqueue.
+    #[tokio::test]
+    async fn equity_mint_enqueue_dedupes_per_symbol_against_jobs_table() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 1);
+
+        // Simulate a restart: the in-memory guard resets while the job row
+        // is still pending.
+        trigger.clear_equity_in_progress(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            1,
+            "a pending mint row for the symbol must suppress a duplicate enqueue"
+        );
+
+        // A different symbol is not suppressed by AAPL's pending row.
+        let enqueued = trigger
+            .enqueue_transfer_equity_to_market_making(Symbol::new("TSLA").unwrap(), shares(30), 0)
+            .await;
+        assert!(
+            enqueued,
+            "a pending mint row for one symbol must not block other symbols"
+        );
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 2);
     }
 
     #[tokio::test]
@@ -11271,8 +17057,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(80), shares(20))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         EquityRebalancingCheck {
@@ -11282,14 +17067,11 @@ mod tests {
         .await
         .unwrap();
 
-        let dispatched = receiver.try_recv().unwrap();
-        let TriggeredOperation::Redemption {
-            symbol: redeemed, ..
-        } = dispatched
-        else {
-            panic!("Expected Redemption, got {dispatched:?}");
+        let dispatched = take_pending_equity_redemption_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one redemption job, got {dispatched:?}");
         };
-        assert_eq!(redeemed, symbol);
+        assert_eq!(job.symbol, symbol);
     }
 
     #[tokio::test]
@@ -11297,15 +17079,18 @@ mod tests {
         let inventory = InventoryView::default()
             .with_usdc(usdc(100), usdc(900))
             .with_withdrawable_cash_cents(90_000);
-        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 
         UsdcRebalancingCheck.perform(&trigger).await.unwrap();
 
-        let dispatched = receiver.try_recv().unwrap();
+        let dispatched = take_pending_usdc_transfer_jobs(&trigger).await;
         assert!(
-            matches!(dispatched, TriggeredOperation::UsdcAlpacaToBase { .. }),
-            "Expected UsdcAlpacaToBase, got {dispatched:?}"
+            matches!(
+                dispatched.as_slice(),
+                [UsdcRebalanceOperation::AlpacaToBase { .. }],
+            ),
+            "Expected AlpacaToBase, got {dispatched:?}"
         );
     }
 
@@ -11316,8 +17101,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(500), usdc(500));
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         EquityRebalancingCheck {
@@ -11328,10 +17112,15 @@ mod tests {
         .unwrap();
         UsdcRebalancingCheck.perform(&trigger).await.unwrap();
 
-        let actual = receiver.try_recv();
-        assert!(
-            matches!(actual, Err(TryRecvError::Empty)),
-            "Balanced inventory should not dispatch a TriggeredOperation, got {actual:?}"
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Balanced inventory should not enqueue a mint job"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Balanced inventory should not enqueue a redemption job"
         );
     }
 
@@ -11342,13 +17131,15 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(500), usdc(500));
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
         }
 
         EquityRebalancingCheck {
@@ -11358,8 +17149,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "In-progress flag should suppress duplicate equity dispatch"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "In-progress flag should suppress duplicate equity dispatch"
         );
     }
@@ -11371,8 +17168,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(500), usdc(500));
 
-        let (reactor, mut receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         trigger
@@ -11388,8 +17184,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Pending offchain hedge order should suppress equity rebalancing dispatch"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
             "Pending offchain hedge order should suppress equity rebalancing dispatch"
         );
     }
@@ -11402,7 +17204,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(500), usdc(500));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         harness
@@ -11434,7 +17236,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(5000), usdc(5000));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         harness
@@ -11480,7 +17282,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(4))
             .with_usdc(usdc(5000), usdc(5000));
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         harness
@@ -11516,8 +17318,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(50))
             .with_usdc(usdc(500), usdc(500));
 
-        let (trigger, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         harness
@@ -11547,8 +17348,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(50), shares(60))
             .with_usdc(usdc(500), usdc(500));
 
-        let (trigger, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         harness
@@ -11575,7 +17375,7 @@ mod tests {
     async fn recover_pending_offchain_order_symbols_restores_block_from_projection() {
         let pending_symbol = Symbol::new("AAPL").unwrap();
         let clear_symbol = Symbol::new("TSLA").unwrap();
-        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
 
         // Persist two positions through the real command path: AAPL gets a
         // pending offchain hedge order; TSLA only has an onchain fill.
@@ -11663,15 +17463,21 @@ mod tests {
     #[tokio::test]
     async fn usdc_check_suppresses_duplicate_dispatch_when_in_progress() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
-        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
         UsdcRebalancingCheck.perform(&trigger).await.unwrap();
 
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "In-progress flag should suppress duplicate USDC dispatch"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
             "In-progress flag should suppress duplicate USDC dispatch"
         );
     }
@@ -11679,7 +17485,7 @@ mod tests {
     #[tokio::test]
     async fn base_to_alpaca_conversion_confirmed_with_excess_settled_amount_errors() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -11730,7 +17536,7 @@ mod tests {
     #[tokio::test]
     async fn alpaca_to_base_deposit_confirmed_with_excess_bridged_amount_errors() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -11778,26 +17584,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deposit_confirmed_without_any_tracking_returns_missing_context_error() {
-        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+    async fn deposit_confirmed_without_any_tracking_clears_guard_without_reconciliation() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        let error = harness
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
             .receive::<UsdcRebalance>(
                 id.clone(),
                 make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            RebalancingServiceError::MissingUsdcTrackingContext {
-                id: error_id,
-                event: usdc::UsdcTrackingEvent::DepositConfirmed,
-            } if error_id == id
-        ));
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "an AlpacaToBase deposit confirmation with no tracking (resumed after restart) clears \
+             the guard rather than wedging it forever on a missing-context error"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "completing without tracking should not fabricate a context"
+        );
     }
 
     #[tokio::test]
@@ -11808,7 +17618,7 @@ mod tests {
         // tracking entry whose source transfer hasn't started and apply the
         // inventory transfer Start exactly once.
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(1000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -11874,8 +17684,7 @@ mod tests {
         let unknown = Symbol::new("MSFT").unwrap();
         let inventory = InventoryView::default().with_equity(seeded.clone(), shares(0), shares(0));
 
-        let (reactor, _receiver) =
-            make_trigger_with_inventory_and_registry(inventory, &seeded).await;
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &seeded).await;
         let trigger = reactor.clone();
 
         trigger
@@ -11890,7 +17699,7 @@ mod tests {
         // Initiated event must update tracking metadata without re-applying
         // the inventory Start. Otherwise inflight would double-count.
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(1000));
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -11918,6 +17727,154 @@ mod tests {
             inflight,
             Some(usdc(400)),
             "replayed Initiated must not double-count inflight"
+        );
+    }
+
+    /// `expire_stuck_mints` must skip mints whose symbol's in-progress guard is
+    /// `HeldForRecovery`. The recovery job owns those mints and is responsible for
+    /// driving them to a terminal state; timing them out would clear the guard and
+    /// allow a double-mint while the original tokens are still in the wallet.
+    #[tokio::test]
+    async fn expire_stuck_mints_skips_held_for_recovery_mints() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Use a very short timeout so the mint would normally be cleaned up.
+        let config = test_config_with_timeout(Duration::from_secs(60));
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = Arc::new(RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            wrapper,
+            RebalancingSchedulers::new(&apalis_pool),
+        ));
+
+        let id = issuer_request_id("held-for-recovery-timeout");
+
+        // Seed a mint tracking entry at a post-receipt stage with a stale
+        // last_progress_at so the timeout sweep would normally pick it up.
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::TokensReceived,
+                last_progress_at: now - ChronoDuration::hours(2),
+            },
+        );
+
+        // Set the guard to HeldForRecovery for this symbol (simulating the
+        // PostReceipt handoff from the transfer job).
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+
+        // Run expire_stuck_mints with a far-future now so the mint is well past
+        // the timeout threshold.
+        trigger
+            .expire_stuck_mints(now + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        // The mint tracking entry must NOT have been removed.
+        assert!(
+            trigger.mint_tracking.read().await.contains_key(&id),
+            "expire_stuck_mints must not clean up a HeldForRecovery mint"
+        );
+
+        // The guard must still be HeldForRecovery.
+        assert_eq!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol)
+                .cloned(),
+            Some(equity::GuardState::HeldForRecovery),
+            "expire_stuck_mints must not clear a HeldForRecovery guard"
+        );
+    }
+
+    /// `clear_equity_in_progress_unless_held_for_recovery` is the single-lock
+    /// check-and-clear that closes the timeout-sweep TOCTOU race: a concurrent
+    /// `mark_held_for_recovery` can flip `ActiveTransfer` -> `HeldForRecovery`
+    /// after the steady-state check but before the clear, and a non-atomic clear
+    /// would drop the recovery-owned guard and fail a mint whose tokens are still
+    /// in the wallet -- the double-mint this guard exists to prevent. This
+    /// verifies the invariant the race hinges on: a `HeldForRecovery` slot is
+    /// never cleared (caller skips the failure event), while an `ActiveTransfer`
+    /// or absent slot is cleared so a fresh rebalance can proceed.
+    #[tokio::test]
+    async fn clear_equity_in_progress_unless_held_for_recovery_preserves_recovery_ownership() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let config = test_config_with_timeout(Duration::from_secs(60));
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = Arc::new(RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            wrapper,
+            RebalancingSchedulers::new(&apalis_pool),
+        ));
+
+        // HeldForRecovery: recovery owns the slot -- must be left untouched and
+        // signal the caller (returns false) to skip the failure event.
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        assert!(
+            !trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            "a HeldForRecovery slot must not be cleared by the timeout path",
+        );
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery),
+            "the HeldForRecovery guard must remain after a refused clear",
+        );
+
+        // ActiveTransfer: a live transfer that genuinely timed out -- clear it so
+        // a fresh rebalance can proceed.
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer { generation: 0 },
+        );
+        assert!(
+            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            "an ActiveTransfer slot must be cleared so a fresh rebalance can proceed",
+        );
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            None,
+            "the ActiveTransfer guard must be removed after a successful clear",
+        );
+
+        // Absent: clearing is a no-op that still reports success.
+        assert!(
+            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            "an absent slot must report a successful (no-op) clear",
         );
     }
 }

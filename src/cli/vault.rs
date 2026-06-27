@@ -3,20 +3,14 @@
 use alloy::primitives::{Address, B256, U256};
 use anyhow::Context;
 use rain_math_float::{Float, FloatError};
-use sqlx::SqlitePool;
 use std::io::Write;
 use thiserror::Error;
 
-use st0x_event_sorcery::StoreBuilder;
-use st0x_evm::{Evm, OpenChainErrorRegistry};
+use st0x_config::Ctx;
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
-
-use crate::bindings::IERC20;
-use crate::config::Ctx;
-use crate::onchain::USDC_BASE;
-use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
-use crate::vault_registry::VaultRegistry;
+use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
@@ -60,7 +54,6 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     stdout: &mut Writer,
     deposit: Deposit,
     ctx: &Ctx,
-    pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let Deposit {
         amount,
@@ -82,15 +75,9 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let (_vault_store, vault_registry_projection) =
-        StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
-            .await?;
-
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
-        vault_registry_projection,
         sender_address,
     );
 
@@ -119,7 +106,6 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     stdout: &mut Writer,
     withdraw: Withdraw,
     ctx: &Ctx,
-    pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let Withdraw {
         amount,
@@ -142,15 +128,9 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let (_vault_store, vault_registry_projection) =
-        StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
-            .await?;
-
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
-        vault_registry_projection,
         sender_address,
     );
 
@@ -174,7 +154,6 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     amount: st0x_finance::Usdc,
     ctx: &Ctx,
-    pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     ctx.wallet()?;
 
@@ -202,7 +181,7 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
         vault_id,
     };
 
-    vault_withdraw_command(stdout, withdraw, ctx, pool).await
+    vault_withdraw_command(stdout, withdraw, ctx).await
 }
 
 #[cfg(test)]
@@ -212,21 +191,21 @@ mod tests {
     use alloy::sol_types::SolCall;
     use url::Url;
 
-    use st0x_evm::ReadOnlyEvm;
-
-    use st0x_finance::Usdc;
-
-    use super::*;
-    use crate::bindings::IERC20::decimalsCall;
-    use crate::config::{
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::RebalancingCtx;
+    use st0x_config::create_test_issuance_ctx;
+    use st0x_config::{
         AssetsConfig, BrokerCtx, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode,
         TradingMode,
     };
-    use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmCtx;
-    use crate::rebalancing::RebalancingCtx;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_evm::IERC20::decimalsCall;
+    use st0x_evm::ReadOnlyEvm;
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
+
+    use super::*;
+    use crate::inventory::ImbalanceThreshold;
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -234,19 +213,23 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port: 8080,
+            board_port: 8081,
             evm: EvmCtx {
-                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -258,9 +241,8 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -270,19 +252,23 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port: 8080,
+            board_port: 8081,
             evm: EvmCtx {
-                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Rebalancing(Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {
@@ -296,7 +282,7 @@ mod tests {
                     .call(),
             )),
             order_owner: Address::ZERO,
-            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
+            wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
@@ -305,9 +291,8 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: Some(Address::ZERO),
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -326,13 +311,7 @@ mod tests {
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
         };
-        let result = vault_deposit_command(
-            &mut stdout,
-            deposit,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await;
+        let result = vault_deposit_command(&mut stdout, deposit, &ctx).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -351,13 +330,7 @@ mod tests {
         };
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_command(
-            &mut stdout,
-            withdraw,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await;
+        let result = vault_withdraw_command(&mut stdout, withdraw, &ctx).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -376,14 +349,9 @@ mod tests {
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
         };
-        vault_deposit_command(
-            &mut stdout,
-            deposit,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await
-        .unwrap_err();
+        vault_deposit_command(&mut stdout, deposit, &ctx)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -402,14 +370,9 @@ mod tests {
         };
 
         let mut stdout = Vec::new();
-        vault_withdraw_command(
-            &mut stdout,
-            withdraw,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await
-        .unwrap_err();
+        vault_withdraw_command(&mut stdout, withdraw, &ctx)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -503,13 +466,7 @@ mod tests {
         };
 
         let mut stdout = Vec::new();
-        let result = vault_deposit_command(
-            &mut stdout,
-            deposit,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await;
+        let result = vault_deposit_command(&mut stdout, deposit, &ctx).await;
 
         assert!(matches!(
             result,
@@ -527,13 +484,7 @@ mod tests {
         };
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_command(
-            &mut stdout,
-            withdraw,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await;
+        let result = vault_withdraw_command(&mut stdout, withdraw, &ctx).await;
 
         assert!(matches!(
             result,
@@ -552,15 +503,10 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_usdc_command(
-            &mut stdout,
-            amount,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err_msg = vault_withdraw_usdc_command(&mut stdout, amount, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err_msg.contains("assets.cash.vault_ids is required but not configured"),
@@ -573,15 +519,11 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_usdc_command(
-            &mut stdout,
-            amount,
-            &create_ctx_without_rebalancing(),
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err_msg =
+            vault_withdraw_usdc_command(&mut stdout, amount, &create_ctx_without_rebalancing())
+                .await
+                .unwrap_err()
+                .to_string();
 
         assert!(
             err_msg.contains("configured [wallet] section"),
@@ -595,15 +537,10 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_usdc_command(
-            &mut stdout,
-            amount,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err_msg = vault_withdraw_usdc_command(&mut stdout, amount, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err_msg.contains("assets.cash.vault_ids is required but not configured"),
@@ -622,13 +559,7 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_usdc_command(
-            &mut stdout,
-            amount,
-            &ctx,
-            &SqlitePool::connect(":memory:").await.unwrap(),
-        )
-        .await;
+        let result = vault_withdraw_usdc_command(&mut stdout, amount, &ctx).await;
 
         // The vault lookup succeeds but the raindex service call will fail
         // because we're using stub wallets. The important thing is we got
@@ -640,7 +571,7 @@ mod tests {
             "Expected vault ID in output (proving lookup succeeded), got: {output}"
         );
         assert!(
-            output.contains(&crate::onchain::USDC_BASE.to_string()),
+            output.contains(&USDC_BASE.to_string()),
             "Expected USDC token in output, got: {output}"
         );
     }

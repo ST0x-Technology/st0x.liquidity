@@ -14,8 +14,6 @@ use tracing::{info, warn};
 
 use st0x_event_sorcery::Store;
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
 use crate::position::{Position, PositionCommand};
@@ -40,8 +38,10 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
     type Error = JobError;
 
     const WORKER_NAME: &'static str = "handle-order-rejection-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::HandleOrderRejection;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::HandleOrderRejection;
 
     fn label(&self) -> Label {
         Label::new(format!("HandleOrderRejection:{}", self.offchain_order_id))
@@ -130,15 +130,16 @@ mod tests {
     use chrono::Utc;
 
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_execution::{
+        ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
+    };
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
     use crate::offchain::order::noop_order_placer;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     struct TestInfra {
         ctx: HandleOrderRejectionCtx,
@@ -146,7 +147,6 @@ mod tests {
 
     async fn build_test_infra() -> TestInfra {
         let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
 
         let (offchain_order, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
             .build(noop_order_placer())
@@ -228,6 +228,7 @@ mod tests {
                     shares,
                     direction,
                     executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
                 },
             )
             .await

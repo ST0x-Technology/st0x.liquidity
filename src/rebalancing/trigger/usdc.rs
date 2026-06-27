@@ -1,31 +1,33 @@
 //! USDC-specific trigger types and logic.
 
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-
-use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
 
 use st0x_finance::{Usd, Usdc};
 
-use super::{RebalancingService, RebalancingServiceError, TriggeredOperation};
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
+use super::{RebalancingService, RebalancingServiceError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
 
+/// Dispatch decision returned by [`check_imbalance_and_build_operation`].
+/// The trigger maps each variant to the corresponding apalis job queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsdcRebalanceOperation {
+    AlpacaToBase { amount: Usdc },
+    BaseToAlpaca { amount: Usdc },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UsdcTrackingEvent {
     Initiated,
-    Bridged,
     DepositConfirmed,
     ConversionConfirmed,
 }
@@ -34,7 +36,6 @@ impl std::fmt::Display for UsdcTrackingEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Initiated => write!(formatter, "Initiated"),
-            Self::Bridged => write!(formatter, "Bridged"),
             Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
             Self::ConversionConfirmed => write!(formatter, "ConversionConfirmed"),
         }
@@ -50,12 +51,20 @@ pub(super) struct UsdcRebalanceTracking {
     pub(super) last_progress_at: DateTime<Utc>,
 }
 
+/// Single source of truth for the direction -> source-venue mapping: the venue
+/// the USDC physically leaves. Both `UsdcRebalanceTracking::source_venue` and the
+/// restart-safe operator-reconciliation path (which has no tracking instance to
+/// call the method on) derive from this, so the two cannot drift.
+fn source_venue(direction: RebalanceDirection) -> Venue {
+    match direction {
+        RebalanceDirection::AlpacaToBase => Venue::Hedging,
+        RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
+    }
+}
+
 impl UsdcRebalanceTracking {
     pub(super) fn source_venue(&self) -> Venue {
-        match self.direction {
-            RebalanceDirection::AlpacaToBase => Venue::Hedging,
-            RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
-        }
+        source_venue(self.direction)
     }
 
     fn source_transfer_started(&self) -> bool {
@@ -65,6 +74,32 @@ impl UsdcRebalanceTracking {
                 UsdcRebalanceStage::ConversionInitiated | UsdcRebalanceStage::ConversionConfirmed
             ),
             RebalanceDirection::BaseToAlpaca => true,
+        }
+    }
+
+    /// Whether the CCTP burn has irreversibly committed the funds. Past the
+    /// burn the funds are no longer on the source venue, so a failure or timeout
+    /// must NOT reconcile inflight back to source and must keep the guard.
+    ///
+    /// Defined per direction as "not a pre-burn stage", so any future stage
+    /// defaults to post-burn (the safe, re-burn-blocking direction):
+    /// - `AlpacaToBase` converts USD->USDC *before* withdrawing, so its
+    ///   conversion stages are pre-burn; the burn begins at `BridgingInitiated`.
+    /// - `BaseToAlpaca`'s only conversion is the *post-deposit* USDC->USD leg
+    ///   (post-mint), so every stage except the pre-bridge withdrawal is
+    ///   post-burn -- including the conversion stages, even though
+    ///   `ConversionInitiated` resets the tracked stage after the deposit.
+    pub(super) fn is_post_burn(&self) -> bool {
+        use UsdcRebalanceStage::*;
+
+        match self.direction {
+            RebalanceDirection::AlpacaToBase => !matches!(
+                self.stage,
+                ConversionInitiated | ConversionConfirmed | Initiated | WithdrawalConfirmed
+            ),
+            RebalanceDirection::BaseToAlpaca => {
+                !matches!(self.stage, Initiated | WithdrawalConfirmed)
+            }
         }
     }
 
@@ -79,6 +114,13 @@ impl UsdcRebalanceTracking {
         self.stage = stage;
         self.last_progress_at = last_progress_at;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsdcTerminalAction {
+    NotTerminal,
+    Clear,
+    PreservePostBurn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,14 +166,20 @@ impl UsdcRebalanceStage {
             WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
             BridgingInitiated { .. } => Some(Self::BridgingInitiated),
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
-            Bridged { .. } => Some(Self::Bridged),
+            Bridged { .. } | BridgingCompletionRecovered { .. } => Some(Self::Bridged),
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } => Some(Self::DepositConfirmed),
-            ConversionConfirmed { .. }
+            // Transient intent markers: immediately superseded by Initiated /
+            // BridgingInitiated, so they emit no distinct progress stage.
+            WithdrawalSubmitting { .. }
+            | BridgingSubmitting { .. }
+            | AttestationTimedOut { .. }
+            | ConversionConfirmed { .. }
             | ConversionFailed { .. }
             | WithdrawalFailed { .. }
             | BridgingFailed { .. }
-            | DepositFailed { .. } => None,
+            | DepositFailed { .. }
+            | OperatorReconciled { .. } => None,
         }
     }
 
@@ -146,7 +194,7 @@ impl UsdcRebalanceStage {
                 Some(*converted_at)
             }
             (Self::Initiated, Initiated { initiated_at, .. }) => Some(*initiated_at),
-            (Self::WithdrawalConfirmed, WithdrawalConfirmed { confirmed_at }) => {
+            (Self::WithdrawalConfirmed, WithdrawalConfirmed { confirmed_at, .. }) => {
                 Some(*confirmed_at)
             }
             (Self::BridgingInitiated, BridgingInitiated { burned_at, .. }) => Some(*burned_at),
@@ -154,6 +202,9 @@ impl UsdcRebalanceStage {
                 Some(*attested_at)
             }
             (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
+            (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. }) => {
+                Some(*recovered_at)
+            }
             (
                 Self::DepositInitiated,
                 DepositInitiated {
@@ -173,11 +224,7 @@ impl UsdcRebalanceStage {
     }
 }
 
-/// Minimum USDC amount for Alpaca withdrawals.
-/// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
-/// we use $51 to ensure we always meet the minimum after conversion slippage.
-pub(crate) static ALPACA_MINIMUM_WITHDRAWAL: LazyLock<Usdc> =
-    LazyLock::new(|| Usdc::new(float!(51)));
+pub(crate) use st0x_config::ALPACA_MINIMUM_WITHDRAWAL;
 
 /// Maximum decimal places for rebalanceable USDC token amounts.
 const USDC_TRANSFER_MAX_DECIMAL_PLACES: u8 = 6;
@@ -243,14 +290,15 @@ impl Drop for InProgressGuard {
 
 /// Checks inventory for USDC imbalance and returns the appropriate bridging operation.
 ///
-/// Returns `UsdcAlpacaToBase` if there's too much USDC in Alpaca that needs to be bridged to Base,
-/// or `UsdcBaseToAlpaca` if there's too much USDC on Base that needs to be bridged to Alpaca.
+/// Returns `UsdcRebalanceOperation::AlpacaToBase` if there's too much USDC in
+/// Alpaca that needs to be bridged to Base, or `BaseToAlpaca` if there's too
+/// much USDC on Base that needs to be bridged to Alpaca.
 pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<BroadcastingInventory>,
     usdc_limit: Option<Usdc>,
     reserved: Option<Usd>,
-) -> Result<TriggeredOperation, UsdcTriggerSkip> {
+) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
     let imbalance_check = {
         let inventory = inventory.read().await;
         let imbalance = inventory
@@ -376,7 +424,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 );
                 Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess: capped })
             } else {
-                Ok(TriggeredOperation::UsdcAlpacaToBase { amount: capped })
+                Ok(UsdcRebalanceOperation::AlpacaToBase { amount: capped })
             }
         }
         Imbalance::TooMuchOnchain { excess } => {
@@ -405,7 +453,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 return Err(UsdcTriggerSkip::NoImbalance);
             }
 
-            Ok(TriggeredOperation::UsdcBaseToAlpaca { amount })
+            Ok(UsdcRebalanceOperation::BaseToAlpaca { amount })
         }
     }
 }
@@ -480,21 +528,31 @@ impl RebalancingService {
             return Ok(());
         }
 
-        self.apply_usdc_rebalance_event(&id, &event).await?;
+        let terminal_action = self.usdc_terminal_action(&id, &event).await;
+        self.apply_usdc_rebalance_event(&id, &event, terminal_action)
+            .await?;
 
-        let is_terminal = Self::is_terminal_usdc_rebalance_event(&event);
+        let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
         {
             let mut inventory = self.inventory.write().await;
-            *inventory = if is_terminal {
+            *inventory = if is_clearable_terminal {
                 inventory.clone().clear_active_usdc_rebalance()
             } else {
                 inventory.clone().set_active_usdc_rebalance(id.clone())
             };
         }
-        if is_terminal {
+        if is_clearable_terminal {
             self.usdc_tracking.write().await.remove(&id);
             self.clear_usdc_in_progress();
             debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
+        } else if terminal_action == UsdcTerminalAction::PreservePostBurn {
+            self.usdc_in_progress.store(true, Ordering::SeqCst);
+            warn!(
+                target: "rebalance",
+                id = %id,
+                ?event,
+                "Preserving USDC in-progress guard after post-burn terminal failure"
+            );
         }
 
         drop(event_sync_guard);
@@ -502,7 +560,7 @@ impl RebalancingService {
         // A terminal USDC transfer cleared the in-progress claim, so we
         // cancel any pre-rebalance checks and push a fresh one against
         // the post-rebalance inventory.
-        if is_terminal {
+        if is_clearable_terminal {
             self.equity_scheduler.cancel_pending().await;
             self.usdc_scheduler.cancel_pending().await;
             self.usdc_scheduler.enqueue_check().await;
@@ -511,10 +569,85 @@ impl RebalancingService {
         Ok(())
     }
 
+    async fn usdc_terminal_action(
+        &self,
+        id: &UsdcRebalanceId,
+        event: &UsdcRebalanceEvent,
+    ) -> UsdcTerminalAction {
+        if !Self::is_terminal_usdc_rebalance_event(event) {
+            return UsdcTerminalAction::NotTerminal;
+        }
+
+        if self.post_burn_failure(id, event).await {
+            UsdcTerminalAction::PreservePostBurn
+        } else {
+            UsdcTerminalAction::Clear
+        }
+    }
+
+    /// Whether a terminal failure event happened after the CCTP burn, so its
+    /// funds cannot be reconciled to source and the guard must be kept.
+    async fn post_burn_failure(&self, id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) -> bool {
+        use UsdcRebalanceEvent::*;
+
+        // A recorded burn hash OR a CCTP nonce proves post-burn even if tracking
+        // was lost: both are only ever populated after the burn reaches CCTP, so
+        // either is irreversible evidence the guard must outlive a restart.
+        if matches!(
+            event,
+            BridgingFailed {
+                burn_tx_hash: Some(_),
+                ..
+            } | BridgingFailed {
+                cctp_nonce: Some(_),
+                ..
+            }
+        ) {
+            return true;
+        }
+
+        // Every terminal failure is post-burn iff the tracked transfer is past
+        // the burn. `is_post_burn` is direction-aware, so a BaseToAlpaca
+        // post-deposit `ConversionFailed` (post-mint) is correctly preserved
+        // while an AlpacaToBase pre-withdrawal `ConversionFailed` clears.
+        // Terminal successes fall through to `false` and settle normally.
+        //
+        // When in-memory tracking is absent -- e.g. an apalis job that resumes
+        // after a restart, where `recover_usdc_guard` reasserts the guard but
+        // does not rebuild tracking -- we must NOT speculatively clear the guard
+        // on a failure that could be post-burn. So:
+        //   - `DepositFailed` is only reachable from `DepositInitiated`
+        //     (post-mint), hence unconditionally post-burn.
+        //   - `ConversionFailed` defaults to preserve when tracking is absent
+        //     (the BaseToAlpaca post-deposit leg must hold; the rare lost-track
+        //     AlpacaToBase pre-burn case holds conservatively rather than risk a
+        //     re-burn -- safe, at worst it wedges that one rebalance until an
+        //     operator clears it).
+        //   - `WithdrawalFailed` / pre-burn `BridgingFailed` are always pre-burn,
+        //     so absent tracking correctly clears.
+        match event {
+            DepositFailed { .. } => true,
+            ConversionFailed { .. } => self
+                .usdc_tracking
+                .read()
+                .await
+                .get(id)
+                .is_none_or(UsdcRebalanceTracking::is_post_burn),
+            WithdrawalFailed { .. } | BridgingFailed { .. } => self
+                .usdc_tracking
+                .read()
+                .await
+                .get(id)
+                .is_some_and(UsdcRebalanceTracking::is_post_burn),
+            _ => false,
+        }
+    }
+
     async fn apply_usdc_rebalance_event(
         &self,
         id: &UsdcRebalanceId,
         event: &UsdcRebalanceEvent,
+        terminal_action: UsdcTerminalAction,
     ) -> Result<(), RebalancingServiceError> {
         use UsdcRebalanceEvent::*;
 
@@ -547,7 +680,16 @@ impl RebalancingService {
             }
             Bridged {
                 amount_received, ..
+            }
+            | BridgingCompletionRecovered {
+                amount_received, ..
             } => {
+                // `BridgingCompletionRecovered` un-fails a post-burn
+                // `BridgingFailed` back to `Bridged`: the mint is now confirmed,
+                // so record the bridged amount and advance stage progress just
+                // as a first-time `Bridged` would. The in-progress guard stays
+                // held (recovery is mid-flight) and clears on the terminal
+                // deposit, exactly like the normal bridge path.
                 self.track_bridged_amount(id, *amount_received).await?;
                 self.track_usdc_stage_progress(id, event).await;
             }
@@ -569,15 +711,84 @@ impl RebalancingService {
             } => {
                 self.complete_alpaca_to_base_deposit(id).await?;
             }
-            WithdrawalFailed { .. }
-            | BridgingFailed { .. }
-            | DepositFailed { .. }
-            | ConversionFailed { .. } => {
+            // Transient intent markers persisted before the on-chain withdraw /
+            // burn. Detailed stage tracking starts at the subsequent Initiated /
+            // BridgingInitiated; the inventory's active-rebalance claim is set by
+            // the caller on this (first non-terminal) event, so nothing to do here.
+            WithdrawalSubmitting { .. }
+            | BridgingSubmitting { .. }
+            | AttestationTimedOut { .. } => {}
+            // Withdrawal failure is always pre-burn -> reconcile to source.
+            WithdrawalFailed { .. } => {
                 self.cancel_tracked_usdc_rebalance(id).await?;
+            }
+            // These failures may be pre- or post-burn (BridgingFailed by burn
+            // stage; ConversionFailed by direction -- BaseToAlpaca's conversion
+            // is post-deposit; DepositFailed is always post-mint). The classifier
+            // decides: preserve post-burn, otherwise reconcile to source.
+            BridgingFailed { .. } | DepositFailed { .. } | ConversionFailed { .. } => {
+                if terminal_action == UsdcTerminalAction::PreservePostBurn {
+                    // Preservation is achieved by NOT cancelling: the tracking
+                    // entry, guard, and active id are all kept by the caller. This
+                    // call only surfaces a diagnostic if tracking is absent.
+                    self.warn_if_post_burn_tracking_missing(id).await;
+                } else {
+                    self.cancel_tracked_usdc_rebalance(id).await?;
+                }
+            }
+            // Operator reconciliation of a post-burn `DepositFailed`: the minted
+            // USDC left the source venue, so reconcile inflight with post-burn
+            // semantics -- zero the source-venue inflight WITHOUT crediting
+            // available -- never a `Cancel` (which would wrongly credit
+            // available). Derives the source venue from `direction`, so it works
+            // with tracking absent (post-restart). The caller's Clear terminal
+            // action removes tracking and clears the guard.
+            OperatorReconciled { direction, .. } => {
+                self.reconcile_operator_resolved(direction, Utc::now())
+                    .await?;
             }
         }
 
         Ok(())
+    }
+
+    /// Reconciles source-venue USDC inflight for an operator-reconciled,
+    /// post-burn rebalance: zeroes the source-venue inflight while leaving
+    /// `available` unchanged, because the funds physically left the source.
+    /// Derives the source venue from `direction` via the shared `source_venue`
+    /// mapping so it does not depend on in-memory tracking, which may be absent
+    /// after a restart. Called by the `OperatorReconciled` reactor arm in this
+    /// file to apply the inflight side-effect when the live reactor processes
+    /// the event.
+    ///
+    /// The timeout sweep in `mod.rs` does NOT call this function: it inlines
+    /// `clear_usdc_inflight + clear_active_usdc_rebalance` in a single lock
+    /// acquisition to avoid a transient state where inflight is zeroed but the
+    /// active rebalance is still set.
+    async fn reconcile_operator_resolved(
+        &self,
+        direction: &RebalanceDirection,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory
+            .clone()
+            .clear_usdc_inflight(source_venue(*direction), now)?;
+        drop(inventory);
+
+        Ok(())
+    }
+
+    async fn warn_if_post_burn_tracking_missing(&self, id: &UsdcRebalanceId) {
+        if self.usdc_tracking.read().await.contains_key(id) {
+            return;
+        }
+
+        warn!(
+            target: "rebalance",
+            id = %id,
+            "Post-burn terminal failure had no USDC tracking context to preserve"
+        );
     }
 
     async fn track_initiated_usdc_rebalance(
@@ -603,7 +814,7 @@ impl RebalancingService {
         let mut tracking = self.usdc_tracking.write().await;
         if let Some(existing) = tracking.get_mut(id) {
             let tracking_entry = UsdcRebalanceTracking {
-                direction: direction.clone(),
+                direction: *direction,
                 initiated_amount: amount,
                 bridged_amount_received: existing.bridged_amount_received,
                 stage,
@@ -634,7 +845,7 @@ impl RebalancingService {
         drop(tracking);
 
         let tracking_entry = UsdcRebalanceTracking {
-            direction: direction.clone(),
+            direction: *direction,
             initiated_amount: amount,
             bridged_amount_received: None,
             stage,
@@ -684,7 +895,7 @@ impl RebalancingService {
         let mut tracking = self.usdc_tracking.write().await;
 
         if let Some(existing) = tracking.get_mut(id) {
-            existing.direction = direction.clone();
+            existing.direction = *direction;
             if !existing.source_transfer_started() {
                 existing.initiated_amount = amount;
             }
@@ -694,7 +905,7 @@ impl RebalancingService {
         }
 
         let tracking_entry = UsdcRebalanceTracking {
-            direction: direction.clone(),
+            direction: *direction,
             initiated_amount: amount,
             bridged_amount_received: None,
             stage,
@@ -711,11 +922,14 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         let mut tracking = self.usdc_tracking.write().await;
         let Some(existing) = tracking.get_mut(id) else {
-            warn!(target: "rebalance", id = %id, "Bridged event missing USDC tracking context");
-            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
-                id: id.clone(),
-                event: UsdcTrackingEvent::Bridged,
-            });
+            // Resumed after a restart with no rebuilt tracking (e.g. a post-burn
+            // BridgingFailed recovered via RecoverBridging): there is no in-memory
+            // bridged amount to record, and the terminal success event clears the
+            // guard without reconciliation. Warn and return Ok -- consistent with
+            // complete_usdc_rebalance / complete_alpaca_to_base_deposit -- rather
+            // than wedging the reactor on a MissingUsdcTrackingContext error.
+            warn!(target: "rebalance", id = %id, "Bridged event missing USDC tracking context; skipping bridged-amount tracking (resumed after restart)");
+            return Ok(());
         };
 
         existing.bridged_amount_received = Some(amount_received);
@@ -729,11 +943,12 @@ impl RebalancingService {
         id: &UsdcRebalanceId,
     ) -> Result<(), RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
-            warn!(target: "rebalance", id = %id, "DepositConfirmed event missing USDC tracking context");
-            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
-                id: id.clone(),
-                event: UsdcTrackingEvent::DepositConfirmed,
-            });
+            // Resumed after a restart with no rebuilt tracking: the transfer
+            // already settled, so there is no inventory inflight to reconcile.
+            // Return Ok so the caller clears the guard (terminal success) rather
+            // than wedging it forever on a MissingUsdcTrackingContext error.
+            warn!(target: "rebalance", id = %id, "DepositConfirmed event missing USDC tracking context; clearing guard without reconciliation (resumed after restart)");
+            return Ok(());
         };
 
         let Some(amount_received) = tracking.bridged_amount_received else {
@@ -789,11 +1004,12 @@ impl RebalancingService {
         settled_amount: Usdc,
     ) -> Result<(), RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
-            warn!(target: "rebalance", id = %id, "Terminal success event missing USDC tracking context");
-            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
-                id: id.clone(),
-                event,
-            });
+            // Resumed after a restart with no rebuilt tracking: the transfer
+            // already settled, so there is no inventory inflight to reconcile.
+            // Return Ok so the caller clears the guard (terminal success) rather
+            // than wedging it forever on a MissingUsdcTrackingContext error.
+            warn!(target: "rebalance", id = %id, ?event, "Terminal success event missing USDC tracking context; clearing guard without reconciliation (resumed after restart)");
+            return Ok(());
         };
 
         let source_venue = tracking.source_venue();
@@ -865,8 +1081,10 @@ impl Job<RebalancingService> for UsdcRebalancingCheck {
     type Error = UsdcRebalancingCheckJobError;
 
     const WORKER_NAME: &'static str = "usdc-rebalancing-check-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::UsdcRebalancingCheck;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::UsdcRebalancingCheck;
 
     fn label(&self) -> Label {
         Label::new("UsdcRebalancingCheck")
@@ -888,7 +1106,7 @@ pub(crate) struct UsdcRebalancingCheckScheduler {
 }
 
 impl UsdcRebalancingCheckScheduler {
-    pub(crate) fn new(pool: &sqlx::SqlitePool) -> Self {
+    pub(crate) fn new(pool: &apalis_sqlite::SqlitePool) -> Self {
         Self {
             queue: UsdcRebalancingCheckJobQueue::new(pool),
         }
@@ -924,7 +1142,7 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
     let job_type = std::any::type_name::<UsdcRebalancingCheck>();
 
     loop {
-        let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        let row: Option<(String, Vec<u8>)> = sqlx_apalis::query_as(
             "SELECT id, job FROM Jobs \
              WHERE status = 'Pending' AND job_type = ? \
              ORDER BY run_at LIMIT 1",
@@ -945,7 +1163,7 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
             Err(never) => match never {},
         }
 
-        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
             .bind(&id)
             .execute(&pool)
             .await
@@ -959,12 +1177,13 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{B256, TxHash};
     use chrono::TimeZone;
     use tokio::sync::broadcast;
     use uuid::Uuid;
 
     use st0x_dto::Statement;
+    use st0x_execution::ClientOrderId;
     use st0x_float_macro::float;
 
     use super::*;
@@ -1075,8 +1294,8 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if !amount.inner().lt(float!(51)).unwrap_or(true)),
-            "Expected UsdcAlpacaToBase with amount >= 51, got {result:?}"
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if !amount.inner().lt(float!(51)).unwrap_or(true)),
+            "Expected AlpacaToBase with amount >= 51, got {result:?}"
         );
     }
 
@@ -1099,8 +1318,8 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(51))),
-            "Expected UsdcAlpacaToBase with amount = 51, got {result:?}"
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(51))),
+            "Expected AlpacaToBase with amount = 51, got {result:?}"
         );
     }
 
@@ -1123,8 +1342,8 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(float!(40))),
-            "Expected UsdcBaseToAlpaca with amount = 40 (no minimum for deposits), got {result:?}"
+            matches!(result, Ok(UsdcRebalanceOperation::BaseToAlpaca { amount }) if amount == Usdc::new(float!(40))),
+            "Expected BaseToAlpaca with amount = 40 (no minimum for deposits), got {result:?}"
         );
     }
 
@@ -1145,7 +1364,7 @@ mod tests {
             check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Operational limit should cap USDC transfer to 100, got {result:?}"
         );
     }
@@ -1170,7 +1389,7 @@ mod tests {
         let first =
             check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
         assert!(
-            matches!(first, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(first, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "First transfer capped to 100, got {first:?}"
         );
 
@@ -1206,7 +1425,7 @@ mod tests {
             check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit, None)
                 .await;
         assert!(
-            matches!(third, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(third, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Remaining imbalance triggers another capped transfer, got {third:?}"
         );
     }
@@ -1321,7 +1540,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Expected reserve-adjusted withdrawable capacity to cap transfer to 100, got {result:?}"
         );
     }
@@ -1432,7 +1651,7 @@ mod tests {
         let after =
             check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
         assert!(
-            matches!(after, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(after, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Post-recovery trigger must dispatch the reserve-aware capped transfer, got {after:?}"
         );
     }
@@ -1491,7 +1710,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(float!(400))),
+            matches!(result, Ok(UsdcRebalanceOperation::BaseToAlpaca { amount }) if amount == Usdc::new(float!(400))),
             "Expected Base-to-Alpaca transfer to ignore reserve and withdrawable cash, got {result:?}"
         );
     }
@@ -1516,7 +1735,7 @@ mod tests {
         UsdcRebalanceEvent::ConversionInitiated {
             direction,
             amount,
-            order_id: Uuid::nil(),
+            order_id: ClientOrderId::from_uuid(Uuid::nil()),
             initiated_at: ts(101),
         }
     }
@@ -1535,6 +1754,7 @@ mod tests {
     fn withdrawal_confirmed_event() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: ts(103),
+            withdrawal_tx: None,
         }
     }
 
@@ -1548,7 +1768,9 @@ mod tests {
     fn bridge_attestation_received_event() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![],
-            cctp_nonce: 0,
+            cctp_nonce: B256::ZERO,
+            message: None,
+            mint_scan_from_block: Some(100),
             attested_at: ts(105),
         }
     }
@@ -1983,40 +2205,40 @@ mod tests {
         );
     }
 
-    async fn count_pending_usdc_check_jobs(pool: &sqlx::SqlitePool) -> i64 {
+    async fn count_pending_usdc_check_jobs(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
         let job_type = std::any::type_name::<UsdcRebalancingCheck>();
-        sqlx::query_scalar::<_, i64>(
+        sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(job_type)
-        .fetch_one(pool)
+        .fetch_one(apalis_pool)
         .await
         .expect("count pending usdc-check jobs")
     }
 
     #[tokio::test]
     async fn usdc_scheduler_enqueue_check_inserts_pending_row() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let scheduler = UsdcRebalancingCheckScheduler::new(&pool);
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
         scheduler.enqueue_check().await;
 
-        assert_eq!(count_pending_usdc_check_jobs(&pool).await, 1);
+        assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn usdc_scheduler_cancel_pending_marks_pending_rows_done() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let scheduler = UsdcRebalancingCheckScheduler::new(&pool);
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
         scheduler.enqueue_check().await;
         scheduler.enqueue_check().await;
-        assert_eq!(count_pending_usdc_check_jobs(&pool).await, 2);
+        assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 2);
 
         scheduler.cancel_pending().await;
 
         assert_eq!(
-            count_pending_usdc_check_jobs(&pool).await,
+            count_pending_usdc_check_jobs(&apalis_pool).await,
             0,
             "cancel_pending must drain all pending rows"
         );
@@ -2024,14 +2246,14 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_scheduler_enqueue_after_cancel_creates_fresh_row() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let scheduler = UsdcRebalancingCheckScheduler::new(&pool);
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
         scheduler.enqueue_check().await;
         scheduler.cancel_pending().await;
         scheduler.enqueue_check().await;
 
-        assert_eq!(count_pending_usdc_check_jobs(&pool).await, 1);
+        assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 1);
     }
 
     #[test]
@@ -2046,5 +2268,51 @@ mod tests {
         ));
         assert_eq!(entry.stage, UsdcRebalanceStage::DepositConfirmed);
         assert_eq!(entry.last_progress_at, ts(0));
+    }
+
+    #[test]
+    fn is_post_burn_is_direction_aware() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalanceStage::*;
+
+        let tracking = |direction, stage| UsdcRebalanceTracking {
+            direction,
+            initiated_amount: Usdc::new(float!(400.0)),
+            bridged_amount_received: None,
+            stage,
+            last_progress_at: ts(0),
+        };
+
+        // Stages from BridgingInitiated through DepositConfirmed are post-burn
+        // for both directions.
+        for stage in [
+            BridgingInitiated,
+            BridgeAttestationReceived,
+            Bridged,
+            DepositInitiated,
+            DepositConfirmed,
+        ] {
+            assert!(tracking(AlpacaToBase, stage).is_post_burn(), "A2B {stage}");
+            assert!(tracking(BaseToAlpaca, stage).is_post_burn(), "B2A {stage}");
+        }
+
+        // Withdrawal stages are pre-burn for both directions.
+        for stage in [Initiated, WithdrawalConfirmed] {
+            assert!(!tracking(AlpacaToBase, stage).is_post_burn(), "A2B {stage}");
+            assert!(!tracking(BaseToAlpaca, stage).is_post_burn(), "B2A {stage}");
+        }
+
+        // Conversion stages differ by direction: AlpacaToBase converts before the
+        // withdrawal (pre-burn); BaseToAlpaca converts after the deposit (post-mint).
+        for stage in [ConversionInitiated, ConversionConfirmed] {
+            assert!(
+                !tracking(AlpacaToBase, stage).is_post_burn(),
+                "A2B {stage} (pre-withdrawal conversion) must be pre-burn"
+            );
+            assert!(
+                tracking(BaseToAlpaca, stage).is_post_burn(),
+                "B2A {stage} (post-deposit conversion) must be post-burn"
+            );
+        }
     }
 }

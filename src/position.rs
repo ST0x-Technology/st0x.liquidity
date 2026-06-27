@@ -13,16 +13,16 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use st0x_config::ExecutionThreshold;
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{Usd, Usdc};
+use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
-
 use crate::offchain::order::OffchainOrderId;
-use crate::threshold::ExecutionThreshold;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -31,6 +31,26 @@ pub struct Position {
     pub accumulated_long: FractionalShares,
     pub accumulated_short: FractionalShares,
     pub pending_offchain_order_id: Option<OffchainOrderId>,
+    /// Idempotency anchor: the `OffchainOrderId` from the last failed
+    /// placement that has not yet been followed by a successful fill.
+    /// Subsequent placement attempts reuse this id as their broker-side
+    /// `client_order_id` so the broker dedupes the duplicate submission
+    /// when the first attempt's response was lost in flight (e.g. 5xx
+    /// after the broker recorded the order).
+    ///
+    /// Cleared on any successful `OffChainOrderFilled` event so the next
+    /// rebalance cycle gets a fresh idempotency key.
+    #[serde(default)]
+    pub last_failed_offchain_order_id: Option<OffchainOrderId>,
+    /// The most recently applied onchain fill, rejected if re-driven.
+    /// Guards the resume path's crash window between this position
+    /// write and the `OnChainTrade` acknowledgement marker (ADR 0005).
+    /// One slot suffices: accounting jobs are serialized per symbol and
+    /// re-deliveries drain in enqueue order, so only the most recent
+    /// trade can ever be re-driven against an unmarked acknowledgement;
+    /// the upstream marker blocks all longer-range duplicates.
+    #[serde(default)]
+    pub last_acknowledged_trade_id: Option<TradeId>,
     pub threshold: ExecutionThreshold,
     #[serde(
         serialize_with = "st0x_float_serde::serialize_option_float",
@@ -48,6 +68,14 @@ impl std::fmt::Debug for Position {
             .field("accumulated_long", &self.accumulated_long)
             .field("accumulated_short", &self.accumulated_short)
             .field("pending_offchain_order_id", &self.pending_offchain_order_id)
+            .field(
+                "last_failed_offchain_order_id",
+                &self.last_failed_offchain_order_id,
+            )
+            .field(
+                "last_acknowledged_trade_id",
+                &self.last_acknowledged_trade_id,
+            )
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
@@ -76,7 +104,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -91,6 +119,8 @@ impl EventSourced for Position {
                 accumulated_long: FractionalShares::ZERO,
                 accumulated_short: FractionalShares::ZERO,
                 pending_offchain_order_id: None,
+                last_failed_offchain_order_id: None,
+                last_acknowledged_trade_id: None,
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
@@ -106,6 +136,7 @@ impl EventSourced for Position {
 
         match event {
             OnChainOrderFilled {
+                trade_id,
                 amount,
                 direction: Buy,
                 price_usdc,
@@ -118,6 +149,7 @@ impl EventSourced for Position {
                 Ok(Some(Self {
                     net: new_net,
                     accumulated_long: new_accumulated_long,
+                    last_acknowledged_trade_id: Some(trade_id.clone()),
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
                     ..entity.clone()
@@ -125,6 +157,7 @@ impl EventSourced for Position {
             }
 
             OnChainOrderFilled {
+                trade_id,
                 direction: Sell,
                 amount,
                 price_usdc,
@@ -137,6 +170,7 @@ impl EventSourced for Position {
                 Ok(Some(Self {
                     net: new_net,
                     accumulated_short: new_accumulated_short,
+                    last_acknowledged_trade_id: Some(trade_id.clone()),
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
                     ..entity.clone()
@@ -170,6 +204,7 @@ impl EventSourced for Position {
                 Ok(Some(Self {
                     net: new_net,
                     pending_offchain_order_id: None,
+                    last_failed_offchain_order_id: None,
                     last_updated: Some(*broker_timestamp),
                     ..entity.clone()
                 }))
@@ -186,6 +221,7 @@ impl EventSourced for Position {
                 Ok(Some(Self {
                     net: new_net,
                     pending_offchain_order_id: None,
+                    last_failed_offchain_order_id: None,
                     last_updated: Some(*broker_timestamp),
                     ..entity.clone()
                 }))
@@ -195,8 +231,25 @@ impl EventSourced for Position {
                 offchain_order_id, ..
             } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
 
-            OffChainOrderFailed { failed_at, .. } => Ok(Some(Self {
+            OffChainOrderFailed {
+                offchain_order_id,
+                failed_at,
+                ..
+            } => Ok(Some(Self {
                 pending_offchain_order_id: None,
+                // Stash the failed OID so the next placement attempt can
+                // reuse it as `client_order_id` and let the broker dedupe.
+                //
+                // Preserve the *first* failed anchor across a chain of
+                // failures: the broker recorded the original attempt under
+                // that key, so a later attempt whose own response was also
+                // lost must keep deduping against the original key. Overwriting
+                // with each new OID would point the next retry at a key the
+                // broker never saw, double-submitting the order. Cleared only
+                // by a successful fill.
+                last_failed_offchain_order_id: entity
+                    .last_failed_offchain_order_id
+                    .or(Some(*offchain_order_id)),
                 last_updated: Some(*failed_at),
                 ..entity.clone()
             })),
@@ -208,6 +261,23 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 threshold: *new_threshold,
                 last_updated: Some(*updated_at),
+                ..entity.clone()
+            })),
+
+            ManualPositionAdjusted {
+                target_net,
+                price_usdc,
+                adjusted_at,
+                ..
+            } => Ok(Some(Self {
+                net: *target_net,
+                last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
+                last_updated: Some(*adjusted_at),
+                // A manual reconciliation supersedes any prior failed hedge, so
+                // clear the broker-idempotency anchor. Otherwise the next hedge
+                // could reuse the failed order's client_order_id and be deduped
+                // by the broker against a stale order.
+                last_failed_offchain_order_id: None,
                 ..entity.clone()
             })),
 
@@ -248,6 +318,47 @@ impl EventSourced for Position {
                 ])
             }
 
+            ManuallyAdjustPosition {
+                symbol,
+                target_net,
+                reason,
+                threshold,
+                expected_net,
+                price_usdc,
+            } => {
+                Self::validate_manual_adjustment(
+                    expected_net,
+                    FractionalShares::ZERO,
+                    target_net,
+                    &threshold,
+                    None,
+                    price_usdc,
+                )?;
+
+                let now = Utc::now();
+
+                warn!(
+                    target: "hedge",
+                    %symbol, target_net = %target_net, %reason,
+                    "Manually adjusted uninitialized position"
+                );
+
+                Ok(vec![
+                    PositionEvent::Initialized {
+                        symbol,
+                        threshold,
+                        initialized_at: now,
+                    },
+                    PositionEvent::ManualPositionAdjusted {
+                        previous_net: FractionalShares::ZERO,
+                        target_net,
+                        reason,
+                        price_usdc,
+                        adjusted_at: now,
+                    },
+                ])
+            }
+
             _ => Err(PositionError::Uninitialized),
         }
     }
@@ -266,14 +377,20 @@ impl EventSourced for Position {
                 price_usdc,
                 block_timestamp,
                 ..
-            } => Ok(vec![PositionEvent::OnChainOrderFilled {
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
-                seen_at: Utc::now(),
-            }]),
+            } => {
+                if self.last_acknowledged_trade_id.as_ref() == Some(&trade_id) {
+                    return Err(PositionError::DuplicateTrade { trade_id });
+                }
+
+                Ok(vec![PositionEvent::OnChainOrderFilled {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                    seen_at: Utc::now(),
+                }])
+            }
 
             PlaceOffChainOrder {
                 offchain_order_id,
@@ -356,6 +473,46 @@ impl EventSourced for Position {
                 new_threshold: threshold,
                 updated_at: Utc::now(),
             }]),
+
+            ManuallyAdjustPosition {
+                target_net,
+                reason,
+                expected_net,
+                price_usdc,
+                ..
+            } => {
+                if let Some(pending) = self.pending_offchain_order_id {
+                    return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
+                        offchain_order_id: pending,
+                    });
+                }
+
+                Self::validate_manual_adjustment(
+                    expected_net,
+                    self.net,
+                    target_net,
+                    &self.threshold,
+                    self.last_price_usdc,
+                    price_usdc,
+                )?;
+
+                warn!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    previous_net = %self.net,
+                    target_net = %target_net,
+                    %reason,
+                    "Manually adjusted position"
+                );
+
+                Ok(vec![PositionEvent::ManualPositionAdjusted {
+                    previous_net: self.net,
+                    target_net,
+                    reason,
+                    price_usdc,
+                    adjusted_at: Utc::now(),
+                }])
+            }
         }
     }
 }
@@ -416,6 +573,56 @@ impl Position {
                 expected: pending_id,
                 actual: offchain_order_id,
             });
+        }
+
+        Ok(())
+    }
+
+    /// Validates a manual position adjustment before emitting events.
+    ///
+    /// Enforces optimistic concurrency (the live net must still match what the
+    /// operator observed) and ensures a nonzero target under a dollar-value
+    /// threshold has a usable price, so the adjusted exposure can actually be
+    /// hedged instead of stalling on a missing `last_price_usdc`.
+    fn validate_manual_adjustment(
+        expected_net: Option<FractionalShares>,
+        current_net: FractionalShares,
+        target_net: FractionalShares,
+        threshold: &ExecutionThreshold,
+        existing_price: Option<Float>,
+        provided_price: Option<Float>,
+    ) -> Result<(), PositionError> {
+        if let Some(expected) = expected_net
+            && expected != current_net
+        {
+            return Err(PositionError::ManualAdjustmentStateChanged {
+                expected,
+                actual: current_net,
+            });
+        }
+
+        // The aggregate is the real domain boundary: a non-positive price
+        // would value the repaired exposure at zero or a negative dollar
+        // amount, stalling or corrupting dollar-threshold hedging. Reject the
+        // price that will actually drive valuation (the provided override, or
+        // the persisted price it falls back to).
+        if let Some(price) = provided_price.or(existing_price)
+            && !price.gt(float!(0))?
+        {
+            return Err(PositionError::ManualAdjustmentInvalidPrice {
+                price: Usdc::new(price),
+            });
+        }
+
+        let needs_price = match threshold {
+            ExecutionThreshold::DollarValue(_) => {
+                !target_net.is_zero()? && existing_price.is_none() && provided_price.is_none()
+            }
+            ExecutionThreshold::Shares(_) => false,
+        };
+
+        if needs_price {
+            return Err(PositionError::ManualAdjustmentRequiresPrice { target_net });
         }
 
         Ok(())
@@ -498,6 +705,37 @@ pub enum PositionError {
          pending execution {offchain_order_id:?}"
     )]
     PendingExecution { offchain_order_id: OffchainOrderId },
+    #[error(
+        "Cannot acknowledge onchain fill: trade {trade_id} \
+         was already applied to this position"
+    )]
+    DuplicateTrade { trade_id: TradeId },
+    #[error(
+        "Cannot manually adjust position: already have \
+         pending execution {offchain_order_id:?}"
+    )]
+    ManualAdjustmentBlockedByPendingExecution { offchain_order_id: OffchainOrderId },
+    #[error(
+        "Cannot manually adjust position: expected net \
+         {expected:?} but live net is {actual:?}; reload \
+         and retry"
+    )]
+    ManualAdjustmentStateChanged {
+        expected: FractionalShares,
+        actual: FractionalShares,
+    },
+    #[error(
+        "Cannot manually adjust nonzero position \
+         {target_net:?} under a dollar-value threshold \
+         without a price; provide --price"
+    )]
+    ManualAdjustmentRequiresPrice { target_net: FractionalShares },
+    #[error(
+        "Cannot manually adjust position with non-positive price \
+         {price:?}; the price must be strictly positive to value the \
+         repaired exposure"
+    )]
+    ManualAdjustmentInvalidPrice { price: Usdc },
     #[error("Cannot complete offchain order: no pending execution")]
     NoPendingExecution,
     #[error(
@@ -557,6 +795,18 @@ pub enum PositionCommand {
     UpdateThreshold {
         threshold: ExecutionThreshold,
     },
+    ManuallyAdjustPosition {
+        symbol: Symbol,
+        target_net: FractionalShares,
+        reason: String,
+        threshold: ExecutionThreshold,
+        /// Net exposure the operator observed; rejects the command if the live
+        /// aggregate has since changed. `None` skips the concurrency check.
+        expected_net: Option<FractionalShares>,
+        /// USDC price per share to record, required for nonzero adjustments
+        /// under a dollar-value threshold when no price is already known.
+        price_usdc: Option<Float>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -604,6 +854,18 @@ pub enum PositionEvent {
         new_threshold: ExecutionThreshold,
         updated_at: DateTime<Utc>,
     },
+    ManualPositionAdjusted {
+        previous_net: FractionalShares,
+        target_net: FractionalShares,
+        reason: String,
+        #[serde(
+            default,
+            serialize_with = "st0x_float_serde::serialize_option_float",
+            deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
+        )]
+        price_usdc: Option<Float>,
+        adjusted_at: DateTime<Utc>,
+    },
 }
 
 impl PositionEvent {
@@ -618,6 +880,7 @@ impl PositionEvent {
             } => *broker_timestamp,
             OffChainOrderFailed { failed_at, .. } => *failed_at,
             ThresholdUpdated { updated_at, .. } => *updated_at,
+            ManualPositionAdjusted { adjusted_at, .. } => *adjusted_at,
         }
     }
 }
@@ -632,11 +895,22 @@ impl DomainEvent for PositionEvent {
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
             ThresholdUpdated { .. } => "PositionEvent::ThresholdUpdated".to_string(),
+            ManualPositionAdjusted { .. } => "PositionEvent::ManualPositionAdjusted".to_string(),
         }
     }
 
     fn event_version(&self) -> String {
         "1.0".to_string()
+    }
+}
+
+/// Compares two optional `Float` prices, treating both-absent as equal.
+/// `Float` has no `PartialEq`, so this routes through its fallible `eq`.
+fn option_float_eq(left: Option<Float>, right: Option<Float>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.eq(right).unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -741,6 +1015,22 @@ impl PartialEq for PositionEvent {
                     updated_at: u2,
                 },
             ) => ot1 == ot2 && nt1 == nt2 && u1 == u2,
+            (
+                Self::ManualPositionAdjusted {
+                    previous_net: pn1,
+                    target_net: tn1,
+                    reason: r1,
+                    price_usdc: pr1,
+                    adjusted_at: a1,
+                },
+                Self::ManualPositionAdjusted {
+                    previous_net: pn2,
+                    target_net: tn2,
+                    reason: r2,
+                    price_usdc: pr2,
+                    adjusted_at: a2,
+                },
+            ) => pn1 == pn2 && tn1 == tn2 && r1 == r2 && option_float_eq(*pr1, *pr2) && a1 == a2,
             _ => false,
         }
     }
@@ -901,6 +1191,22 @@ impl std::fmt::Debug for PositionCommand {
                 .debug_struct("UpdateThreshold")
                 .field("threshold", threshold)
                 .finish(),
+            Self::ManuallyAdjustPosition {
+                symbol,
+                target_net,
+                reason,
+                threshold,
+                expected_net,
+                price_usdc,
+            } => f
+                .debug_struct("ManuallyAdjustPosition")
+                .field("symbol", symbol)
+                .field("target_net", target_net)
+                .field("reason", reason)
+                .field("threshold", threshold)
+                .field("expected_net", expected_net)
+                .field("price_usdc", &DebugOptionFloat(price_usdc))
+                .finish(),
         }
     }
 }
@@ -987,6 +1293,20 @@ impl std::fmt::Debug for PositionEvent {
                 .field("old_threshold", old_threshold)
                 .field("new_threshold", new_threshold)
                 .field("updated_at", updated_at)
+                .finish(),
+            Self::ManualPositionAdjusted {
+                previous_net,
+                target_net,
+                reason,
+                price_usdc,
+                adjusted_at,
+            } => f
+                .debug_struct("ManualPositionAdjusted")
+                .field("previous_net", previous_net)
+                .field("target_net", target_net)
+                .field("reason", reason)
+                .field("price_usdc", &DebugOptionFloat(price_usdc))
+                .field("adjusted_at", adjusted_at)
                 .finish(),
         }
     }
@@ -1084,6 +1404,60 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
+    }
+
+    /// Reproduction for the double-count half of the Witness/Acknowledge
+    /// gap (ADR 0005): the position must reject a trade id it has
+    /// already applied. The resume path re-drives the acknowledge step
+    /// after a crash between the position write and the acknowledgement
+    /// marker; without this rejection the re-drive counts the same fill
+    /// twice.
+    #[tokio::test]
+    async fn duplicate_acknowledge_on_chain_fill_is_rejected() {
+        let threshold = one_share_threshold();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::AcknowledgeOnChainFill {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                trade_id: trade_id.clone(),
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::DuplicateTrade {
+                    trade_id: ref rejected
+                }) if *rejected == trade_id
+            ),
+            "Re-driving an already-applied trade must be rejected as a \
+             duplicate, not double-counted; got: {error:?}",
+        );
     }
 
     #[tokio::test]
@@ -1336,6 +1710,404 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
+    #[tokio::test]
+    async fn manual_position_adjustment_initializes_position() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = one_share_threshold();
+        let target_net = FractionalShares::new(float!(100));
+
+        let events = TestHarness::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol: symbol.clone(),
+                target_net,
+                reason: "manual long correction".to_string(),
+                threshold,
+                expected_net: Some(FractionalShares::ZERO),
+                price_usdc: None,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected Initialized + ManualPositionAdjusted"
+        );
+        assert!(matches!(
+            events.first(),
+            Some(PositionEvent::Initialized {
+                symbol: initialized_symbol,
+                threshold: initialized_threshold,
+                ..
+            }) if *initialized_symbol == symbol && *initialized_threshold == threshold
+        ));
+
+        match events.get(1) {
+            Some(PositionEvent::ManualPositionAdjusted {
+                previous_net,
+                target_net: adjusted_target,
+                reason,
+                ..
+            }) => {
+                assert_eq!(*previous_net, FractionalShares::ZERO);
+                assert_eq!(*adjusted_target, target_net);
+                assert_eq!(reason, "manual long correction");
+            }
+            other => panic!("expected ManualPositionAdjusted event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_position_adjustment_sets_existing_position_to_zero() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = one_share_threshold();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(2.5)),
+                    direction: Direction::Sell,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol,
+                target_net: FractionalShares::ZERO,
+                reason: "manual rebalance completed".to_string(),
+                threshold,
+                expected_net: Some(FractionalShares::new(float!(-2.5))),
+                price_usdc: None,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+
+        match events.first() {
+            Some(PositionEvent::ManualPositionAdjusted {
+                previous_net,
+                target_net,
+                reason,
+                ..
+            }) => {
+                assert_eq!(*previous_net, FractionalShares::new(float!(-2.5)));
+                assert_eq!(*target_net, FractionalShares::ZERO);
+                assert_eq!(reason, "manual rebalance completed");
+            }
+            other => panic!("expected ManualPositionAdjusted event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_position_adjustment_rejects_pending_offchain_order() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = one_share_threshold();
+        let offchain_order_id = OffchainOrderId::new();
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(2)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+                PositionEvent::OffChainOrderPlaced {
+                    offchain_order_id,
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    trigger_reason: TriggerReason::SharesThreshold {
+                        net_position_shares: float!(2),
+                        threshold_shares: float!(1),
+                    },
+                    placed_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol,
+                target_net: FractionalShares::ZERO,
+                reason: "operator repair".to_string(),
+                threshold,
+                expected_net: None,
+                price_usdc: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::ManualAdjustmentBlockedByPendingExecution {
+                offchain_order_id: blocked_order_id
+            }) if blocked_order_id == offchain_order_id
+        ));
+    }
+
+    #[test]
+    fn manual_position_adjustment_replay_sets_net_without_rewriting_volume() {
+        let adjusted_at = Utc::now();
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("SPYM").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: FractionalShares::new(float!(5)),
+                target_net: FractionalShares::new(float!(-2.5)),
+                reason: "manual short correction".to_string(),
+                price_usdc: None,
+                adjusted_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(position.net, FractionalShares::new(float!(-2.5)));
+        assert_eq!(position.accumulated_long, FractionalShares::new(float!(5)));
+        assert_eq!(position.accumulated_short, FractionalShares::ZERO);
+        assert_eq!(position.last_updated, Some(adjusted_at));
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_rejects_nonzero_dollar_target_without_price() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
+
+        let error = TestHarness::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol,
+                target_net: FractionalShares::new(float!(100)),
+                reason: "manual long correction".to_string(),
+                threshold,
+                expected_net: Some(FractionalShares::ZERO),
+                price_usdc: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::ManualAdjustmentRequiresPrice { target_net })
+                if target_net == FractionalShares::new(float!(100))
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_rejects_non_positive_price() {
+        for price in [float!(0), float!(-5)] {
+            let symbol = Symbol::new("SPYM").unwrap();
+            let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
+
+            let error = TestHarness::<Position>::with(())
+                .given_no_previous_events()
+                .when(PositionCommand::ManuallyAdjustPosition {
+                    symbol,
+                    target_net: FractionalShares::new(float!(100)),
+                    reason: "manual long correction".to_string(),
+                    threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: Some(price),
+                })
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(PositionError::ManualAdjustmentInvalidPrice {
+                        price: rejected,
+                    }) if rejected == Usdc::new(price)
+                ),
+                "expected ManualAdjustmentInvalidPrice for price {price:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_allows_zero_dollar_target_without_price() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
+
+        let events = TestHarness::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol,
+                target_net: FractionalShares::ZERO,
+                reason: "manual rebalance completed".to_string(),
+                threshold,
+                expected_net: Some(FractionalShares::ZERO),
+                price_usdc: None,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected Initialized + ManualPositionAdjusted"
+        );
+    }
+
+    #[test]
+    fn manual_adjustment_with_price_is_hedge_ready_under_dollar_threshold() {
+        let now = Utc::now();
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("SPYM").unwrap(),
+                threshold: ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap(),
+                initialized_at: now,
+            },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: FractionalShares::ZERO,
+                target_net: FractionalShares::new(float!(100)),
+                reason: "manual long correction".to_string(),
+                price_usdc: Some(float!(200)),
+                adjusted_at: now,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            option_float_eq(position.last_price_usdc, Some(float!(200))),
+            "manual adjustment should persist the supplied price"
+        );
+
+        let (direction, shares) = position.is_ready_for_execution(None).unwrap().unwrap();
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(shares, FractionalShares::new(float!(100)));
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_allows_nonzero_dollar_target_when_price_known() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(2)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol,
+                target_net: FractionalShares::new(float!(50)),
+                reason: "manual correction".to_string(),
+                threshold,
+                expected_net: Some(FractionalShares::new(float!(2))),
+                price_usdc: None,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+
+        match events.first() {
+            Some(PositionEvent::ManualPositionAdjusted {
+                target_net,
+                price_usdc,
+                ..
+            }) => {
+                assert_eq!(*target_net, FractionalShares::new(float!(50)));
+                assert!(price_usdc.is_none());
+            }
+            other => panic!("expected ManualPositionAdjusted event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_rejects_stale_expected_net() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let threshold = one_share_threshold();
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(2)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::ManuallyAdjustPosition {
+                symbol,
+                target_net: FractionalShares::ZERO,
+                reason: "operator repair".to_string(),
+                threshold,
+                expected_net: Some(FractionalShares::new(float!(5))),
+                price_usdc: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::ManualAdjustmentStateChanged { expected, actual })
+                if expected == FractionalShares::new(float!(5))
+                    && actual == FractionalShares::new(float!(2))
+        ));
+    }
+
     #[test]
     fn offchain_sell_reduces_net_position() {
         let offchain_order_id = OffchainOrderId::new();
@@ -1442,8 +2214,209 @@ mod tests {
 
     #[test]
     fn offchain_failed_clears_pending() {
+        use PositionEvent::*;
+
         let offchain_order_id = OffchainOrderId::new();
 
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(position.net, FractionalShares::new(float!(1.5)));
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "pending_offchain_order_id should be cleared \
+             after OffChainOrderFailed"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "the failed order id should be stashed as the idempotency anchor \
+             so the next placement attempt reuses it as client_order_id"
+        );
+    }
+
+    #[test]
+    fn offchain_failed_preserves_first_failed_anchor() {
+        use PositionEvent::*;
+
+        let first_order_id = OffchainOrderId::new();
+        let second_order_id = OffchainOrderId::new();
+
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: first_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: first_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: second_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: second_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(first_order_id),
+            "a chain of failures must keep the first anchor: the broker \
+             recorded the original attempt under that key, so later retries \
+             must keep deduping against it rather than a key the broker \
+             never saw"
+        );
+    }
+
+    #[test]
+    fn offchain_filled_clears_failed_anchor() {
+        use PositionEvent::*;
+
+        let failed_order_id = OffchainOrderId::new();
+        let retry_order_id = OffchainOrderId::new();
+
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: failed_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: failed_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: retry_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFilled {
+                offchain_order_id: retry_order_id,
+                shares_filled: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor_order_id: ExecutorOrderId::new("ORDER-RETRY"),
+                price: Usd::new(float!(150.50)),
+                broker_timestamp: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            position.last_failed_offchain_order_id.is_none(),
+            "a successful fill must clear the failed-attempt anchor so the \
+             next rebalance cycle starts from a fresh idempotency key"
+        );
+    }
+
+    #[test]
+    fn manual_adjustment_clears_failed_offchain_order_anchor() {
+        let offchain_order_id = OffchainOrderId::new();
+
+        // Drive the position to a failed offchain order (which records the
+        // broker-idempotency anchor), then manually reconcile. The manual
+        // adjustment must clear the anchor so the next hedge does not reuse the
+        // failed order's client_order_id and get deduped by the broker.
         let position = replay::<Position>(vec![
             PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
@@ -1477,15 +2450,21 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
             },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: FractionalShares::new(float!(1.5)),
+                target_net: FractionalShares::ZERO,
+                reason: "operator reconciliation".to_string(),
+                price_usdc: None,
+                adjusted_at: Utc::now(),
+            },
         ])
         .unwrap()
         .unwrap();
 
-        assert_eq!(position.net, FractionalShares::new(float!(1.5)));
-        assert!(
-            position.pending_offchain_order_id.is_none(),
-            "pending_offchain_order_id should be cleared \
-             after OffChainOrderFailed"
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "manual adjustment must clear the stale broker-idempotency anchor"
         );
     }
 
@@ -1620,6 +2599,20 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_returns_adjusted_at_for_manual_position_adjusted_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::ManualPositionAdjusted {
+            previous_net: FractionalShares::new(float!(2)),
+            target_net: FractionalShares::ZERO,
+            reason: "operator repair".to_string(),
+            price_usdc: None,
+            adjusted_at: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
+    #[test]
     fn is_ready_for_execution_returns_fractional_shares() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1627,6 +2620,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1653,6 +2648,8 @@ mod tests {
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1679,6 +2676,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1708,6 +2707,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(30)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1737,6 +2738,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1765,6 +2768,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1794,6 +2799,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1823,6 +2830,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
@@ -1902,6 +2911,8 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(120)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),

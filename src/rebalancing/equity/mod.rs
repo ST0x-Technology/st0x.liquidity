@@ -1,38 +1,51 @@
 //! Cross-venue equity transfer.
 //!
-//! [`CrossVenueEquityTransfer`] implements [`CrossVenueTransfer`] in both
-//! directions:
+//! [`CrossVenueEquityTransfer`] drives equity transfers in both directions
+//! through `resume_equity_to_market_making` / `resume_equity_to_hedging`
+//! entry points, each backed by an apalis job:
 //!
 //! - **Hedging -> Market-Making** (mint): requests tokenized equity from
 //!   Alpaca and deposits it into a Raindex vault.
 //! - **Market-Making -> Hedging** (redemption): withdraws tokenized equity
 //!   from a Raindex vault and sends it to Alpaca for redemption.
 
+mod job;
+mod resume_job;
+
 #[cfg(test)]
-pub(crate) mod mock;
+pub(crate) use job::TransferEquityToMarketMakingJobError;
+pub(crate) use job::{
+    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
+    TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+    TransferEquityToMarketMakingJobQueue,
+};
+pub(crate) use resume_job::{
+    ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
+    ResumeTokenizationTarget,
+};
 
 use alloy::hex::FromHexError;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
-use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
-use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
-use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_wrapper::{
+    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
+};
 
 use super::RebalancingService;
-use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use super::trigger::RecoveryClaim;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
-use crate::onchain::raindex::{Raindex, RaindexError, RaindexVaultId};
 use crate::tokenization::{
     AlpacaTokenizationError, MintVerificationError, TokenizationRequest, TokenizationRequestStatus,
     Tokenizer, TokenizerError,
@@ -41,20 +54,7 @@ use crate::tokenized_equity_mint::{
     IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
     TokenizedEquityMintCommand,
 };
-use crate::wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
-
-/// A quantity of equity in a specific symbol.
-#[derive(Debug)]
-pub(crate) struct Equity {
-    pub(crate) symbol: Symbol,
-    pub(crate) quantity: FractionalShares,
-}
-
-impl fmt::Display for Equity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Equity({}, {})", self.symbol, self.quantity)
-    }
-}
+use crate::vault_lookup::{VaultLookup, VaultLookupError};
 
 /// Data extracted from the TokensReceived aggregate state for
 /// onchain verification and subsequent wrapping.
@@ -153,7 +153,7 @@ async fn load_mint_recheck_context(
          ORDER BY accepted.sequence DESC \
          LIMIT 1",
     )
-    .bind(raw_id)
+    .bind(raw_id.to_string())
     .fetch_optional(pool)
     .await?;
 
@@ -181,6 +181,7 @@ async fn load_mint_recheck_context(
 #[derive(Clone)]
 pub(crate) struct EquityTransferServices {
     pub(crate) raindex: Arc<dyn Raindex>,
+    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
 }
@@ -189,12 +190,14 @@ impl EquityTransferServices {
     /// Constructs a services instance whose methods all panic.
     ///
     /// Safe for sending commands that never invoke services (e.g., the
-    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, and
-    /// `FailTransfer` commands). Used by the CLI `fail-transfer`
-    /// subcommand where no real broker/RPC connection exists.
+    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, `FailTransfer`,
+    /// and `Reconcile` commands). Used by the CLI `transfer fail` and
+    /// `transfer reconcile` subcommands where no real broker/RPC connection
+    /// exists.
     pub(crate) fn panicking() -> Self {
         Self {
             raindex: Arc::new(PanickingRaindex),
+            vault_lookup: Arc::new(PanickingVaultLookup),
             tokenizer: Arc::new(PanickingTokenizer),
             wrapper: Arc::new(PanickingWrapper),
         }
@@ -206,17 +209,6 @@ struct PanickingRaindex;
 
 #[async_trait]
 impl Raindex for PanickingRaindex {
-    async fn lookup_vault_id(&self, _: Address) -> Result<RaindexVaultId, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
-    async fn lookup_vault_info(
-        &self,
-        _: &Symbol,
-    ) -> Result<(Address, RaindexVaultId), RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
     async fn withdraw(
         &self,
         _: Address,
@@ -252,6 +244,20 @@ impl Raindex for PanickingRaindex {
     }
 }
 
+/// Panicking VaultLookup stub for CLI-only use. All methods panic.
+struct PanickingVaultLookup;
+
+#[async_trait]
+impl VaultLookup for PanickingVaultLookup {
+    async fn vault_id_for_token(&self, _: Address) -> Result<RaindexVaultId, VaultLookupError> {
+        unimplemented!("PanickingVaultLookup: not available in CLI context")
+    }
+
+    async fn vault_token_for_symbol(&self, _: &Symbol) -> Result<Address, VaultLookupError> {
+        unimplemented!("PanickingVaultLookup: not available in CLI context")
+    }
+}
+
 /// Panicking Tokenizer stub for CLI-only use. All methods panic.
 struct PanickingTokenizer;
 
@@ -282,6 +288,10 @@ impl Tokenizer for PanickingTokenizer {
     }
 
     fn redemption_wallet(&self) -> Option<Address> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn wait_for_block(&self, _: u64) -> Result<(), EvmError> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
@@ -358,11 +368,15 @@ impl Wrapper for PanickingWrapper {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
+    async fn donate(&self, _: Address, _: U256) -> Result<TxHash, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
     async fn submit_wrap(&self, _: Address, _: U256, _: Address) -> Result<TxHash, WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
-    async fn confirm_wrap(&self, _: Address, _: TxHash) -> Result<U256, WrapperError> {
+    async fn confirm_wrap(&self, _: Address, _: TxHash) -> Result<WrapConfirmation, WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
@@ -376,7 +390,15 @@ impl Wrapper for PanickingWrapper {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
-    async fn confirm_unwrap(&self, _: Address, _: TxHash) -> Result<U256, WrapperError> {
+    async fn confirm_unwrap(
+        &self,
+        _: Address,
+        _: TxHash,
+    ) -> Result<UnwrapConfirmation, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn wait_for_block(&self, _: u64) -> Result<(), WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
@@ -393,6 +415,8 @@ pub(crate) enum MintError {
     Wrapper(#[from] WrapperError),
     #[error("Raindex error: {0}")]
     Raindex(#[from] RaindexError),
+    #[error("Vault lookup error: {0}")]
+    VaultLookup(#[from] VaultLookupError),
     #[error("Onchain mint verification failed: {0}")]
     Verification(#[from] MintVerificationError),
     #[error(
@@ -467,12 +491,35 @@ pub(crate) enum MintTransferError {
     PostReceipt(MintError),
 }
 
+fn mint_reached_post_receipt(entity: &TokenizedEquityMint) -> bool {
+    matches!(
+        entity,
+        TokenizedEquityMint::TokensReceived { .. }
+            | TokenizedEquityMint::WrapSubmitted { .. }
+            | TokenizedEquityMint::TokensWrapped { .. }
+            | TokenizedEquityMint::VaultDepositSubmitted { .. }
+            | TokenizedEquityMint::DepositedIntoRaindex { .. }
+    )
+}
+
+fn classify_mint_resume_error(
+    reached: Result<TokenizedEquityMint, MintError>,
+    error: MintError,
+) -> MintTransferError {
+    match reached {
+        Ok(entity) if mint_reached_post_receipt(&entity) => MintTransferError::PostReceipt(error),
+        Ok(_) | Err(_) => MintTransferError::PreReceipt(error),
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
     #[error(transparent)]
     Send(#[from] SendError<EquityRedemption>),
     #[error(transparent)]
     Raindex(#[from] RaindexError),
+    #[error(transparent)]
+    VaultLookup(#[from] VaultLookupError),
     #[error(transparent)]
     Alpaca(#[from] AlpacaTokenizationError),
     #[error(transparent)]
@@ -491,13 +538,29 @@ pub(crate) enum RedemptionError {
     Rejected,
 }
 
+/// Result of wrapping received mint tokens into ERC-4626 shares.
+///
+/// Returned by [`CrossVenueEquityTransfer::wrap_received_mint`] to give
+/// each element a clear domain name and avoid positional ambiguity in the
+/// `(Address, U256, u64)` tuple it replaces.
+struct WrappedMintResult {
+    /// ERC-4626 derivative token address (the vault).
+    token: Address,
+    /// Number of ERC-4626 shares minted by the wrap.
+    shares: U256,
+    /// Block number in which the wrap transaction was confirmed.
+    block: u64,
+}
+
 /// Orchestrates equity transfers between Raindex and Alpaca.
 ///
 /// Holds CQRS stores for both directions and domain service traits for
-/// vault operations and tokenization. External code interacts with
-/// transfers only through [`CrossVenueTransfer::transfer()`].
+/// vault operations and tokenization. External code drives transfers only
+/// through [`Self::resume_equity_to_market_making`] and
+/// [`Self::resume_equity_to_hedging`].
 pub(crate) struct CrossVenueEquityTransfer {
     raindex: Arc<dyn Raindex>,
+    vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     wrapper: Arc<dyn Wrapper>,
     wallet: Address,
@@ -508,6 +571,7 @@ pub(crate) struct CrossVenueEquityTransfer {
 impl CrossVenueEquityTransfer {
     pub(crate) fn new(
         raindex: Arc<dyn Raindex>,
+        vault_lookup: Arc<dyn VaultLookup>,
         tokenizer: Arc<dyn Tokenizer>,
         wrapper: Arc<dyn Wrapper>,
         wallet: Address,
@@ -516,6 +580,7 @@ impl CrossVenueEquityTransfer {
     ) -> Self {
         Self {
             raindex,
+            vault_lookup,
             tokenizer,
             wrapper,
             wallet,
@@ -580,17 +645,22 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintError> {
         self.verify_received_mint(&tokens_received).await?;
 
-        let (wrapped_token, wrapped_shares) = self
+        let WrappedMintResult {
+            token,
+            shares,
+            block,
+        } = self
             .wrap_received_mint(issuer_request_id, &tokens_received)
             .await?;
 
-        self.deposit_wrapped_mint(
-            issuer_request_id,
-            &tokens_received.symbol,
-            wrapped_token,
-            wrapped_shares,
-        )
-        .await
+        // Wait for the RPC node to catch up to the block where the wrap tx
+        // confirmed before depositing. Without this, a load-balanced backend
+        // that hasn't indexed the wrap block yet sees the wrapped-token balance
+        // as zero and the vault deposit reverts with ERC20InsufficientBalance.
+        self.wrapper.wait_for_block(block).await?;
+
+        self.deposit_wrapped_mint(issuer_request_id, &tokens_received.symbol, token, shares)
+            .await
     }
 
     async fn deposit_wrapped_mint(
@@ -600,7 +670,7 @@ impl CrossVenueEquityTransfer {
         wrapped_token: Address,
         wrapped_shares: U256,
     ) -> Result<(), MintError> {
-        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
+        let vault_id = self.vault_lookup.vault_id_for_token(wrapped_token).await?;
 
         let vault_deposit_tx_hash = self
             .raindex
@@ -723,14 +793,14 @@ impl CrossVenueEquityTransfer {
         &self,
         issuer_request_id: &IssuerRequestId,
         tokens_received: &TokensReceivedData,
-    ) -> Result<(Address, U256), MintError> {
+    ) -> Result<WrappedMintResult, MintError> {
         info!(target: "rebalance", "Onchain verification passed, wrapping into ERC-4626 shares");
 
-        let wrapped_token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
+        let token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
 
         let wrap_tx_hash = self
             .wrapper
-            .submit_wrap(wrapped_token, tokens_received.shares_minted, self.wallet)
+            .submit_wrap(token, tokens_received.shares_minted, self.wallet)
             .await?;
 
         self.mint_store
@@ -740,23 +810,26 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        let wrapped_shares = self
-            .wrapper
-            .confirm_wrap(wrapped_token, wrap_tx_hash)
-            .await?;
+        let WrapConfirmation { shares, block } =
+            self.wrapper.confirm_wrap(token, wrap_tx_hash).await?;
 
         self.mint_store
             .send(
                 issuer_request_id,
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash,
-                    wrapped_shares,
+                    wrapped_shares: shares,
+                    wrap_block: block,
                 },
             )
             .await?;
 
-        info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
-        Ok((wrapped_token, wrapped_shares))
+        info!(target: "rebalance", %wrap_tx_hash, %shares, "Tokens wrapped, depositing to Raindex vault");
+        Ok(WrappedMintResult {
+            token,
+            shares,
+            block,
+        })
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -786,7 +859,10 @@ impl CrossVenueEquityTransfer {
                 } => {
                     info!(%issuer_request_id, %wrap_tx_hash, "Resuming submitted wrap");
                     let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
-                    let wrapped_shares = self
+                    let WrapConfirmation {
+                        shares: wrapped_shares,
+                        block: wrap_block,
+                    } = self
                         .wrapper
                         .confirm_wrap(wrapped_token, wrap_tx_hash)
                         .await?;
@@ -797,9 +873,12 @@ impl CrossVenueEquityTransfer {
                             TokenizedEquityMintCommand::WrapTokens {
                                 wrap_tx_hash,
                                 wrapped_shares,
+                                wrap_block,
                             },
                         )
                         .await?;
+
+                    self.wrapper.wait_for_block(wrap_block).await?;
 
                     info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Wrap confirmed on resume, depositing to Raindex vault");
                     return self
@@ -814,10 +893,16 @@ impl CrossVenueEquityTransfer {
                 TokenizedEquityMint::TokensWrapped {
                     symbol,
                     wrapped_shares,
+                    wrap_block,
                     ..
                 } => {
                     info!(%issuer_request_id, "Resuming wrapped mint");
                     let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+
+                    // Skip the wait for legacy aggregates persisted before wrap_block was added.
+                    if let Some(block) = wrap_block {
+                        self.wrapper.wait_for_block(block).await?;
+                    }
 
                     return self
                         .try_deposit_or_recover(
@@ -849,7 +934,8 @@ impl CrossVenueEquityTransfer {
                     return Ok(());
                 }
                 TokenizedEquityMint::DepositedIntoRaindex { .. }
-                | TokenizedEquityMint::Failed { .. } => return Ok(()),
+                | TokenizedEquityMint::Failed { .. }
+                | TokenizedEquityMint::Reconciled { .. } => return Ok(()),
                 entity @ TokenizedEquityMint::MintRequested { .. } => {
                     return Err(MintError::UnexpectedState {
                         issuer_request_id: issuer_request_id.clone(),
@@ -1103,7 +1189,9 @@ impl CrossVenueEquityTransfer {
                         .resume_pending_redemption(aggregate_id, &tokenization_request_id)
                         .await;
                 }
-                EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. } => {
+                EquityRedemption::Completed { .. }
+                | EquityRedemption::Failed { .. }
+                | EquityRedemption::Reconciled { .. } => {
                     return Ok(());
                 }
             }
@@ -1183,7 +1271,9 @@ impl CrossVenueEquityTransfer {
     ) -> Result<bool, RedemptionError> {
         Ok(matches!(
             self.load_redemption_entity(aggregate_id).await?,
-            EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. }
+            EquityRedemption::Completed { .. }
+                | EquityRedemption::Failed { .. }
+                | EquityRedemption::Reconciled { .. }
         ))
     }
 
@@ -1203,7 +1293,9 @@ impl CrossVenueEquityTransfer {
         let entity = self.load_mint_entity(issuer_request_id).await?;
 
         let (symbol, quantity) = match &entity {
-            TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+            // Both terminals are already settled: nothing to recheck.
+            TokenizedEquityMint::DepositedIntoRaindex { .. }
+            | TokenizedEquityMint::Reconciled { .. } => {
                 return Ok(RecheckOutcome::AlreadyCompleted);
             }
             TokenizedEquityMint::Failed {
@@ -1354,7 +1446,10 @@ impl CrossVenueEquityTransfer {
         let entity = self.load_redemption_entity(aggregate_id).await?;
 
         let (symbol, tokenization_request_id, redemption_tx) = match &entity {
-            EquityRedemption::Completed { .. } => return Ok(RecheckOutcome::AlreadyCompleted),
+            // Both terminals are already settled: nothing to recheck.
+            EquityRedemption::Completed { .. } | EquityRedemption::Reconciled { .. } => {
+                return Ok(RecheckOutcome::AlreadyCompleted);
+            }
             EquityRedemption::Failed {
                 symbol,
                 redemption_tx: Some(redemption_tx),
@@ -1445,24 +1540,60 @@ impl CrossVenueEquityTransfer {
     }
 }
 
-/// Hedging -> Market-Making: tokenize equity on Alpaca and deposit into
-/// Raindex vault.
-#[async_trait]
-impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTransfer {
-    type Asset = Equity;
-    type Error = MintTransferError;
+impl CrossVenueEquityTransfer {
+    /// Hedging -> Market-Making: drives the mint lifecycle (tokenize equity
+    /// on Alpaca, wrap, deposit into the Raindex vault) for the given
+    /// `issuer_request_id`, whether fresh or interrupted.
+    ///
+    /// The id is chosen by the caller at enqueue time so apalis retries (and
+    /// bot restarts that re-pick the job row) re-enter the same aggregate: an
+    /// absent aggregate starts a new mint, an in-flight one resumes from its
+    /// persisted state, and a terminal one is a no-op.
+    #[instrument(target = "rebalance", skip_all, fields(%issuer_request_id, %symbol, %quantity))]
+    pub(crate) async fn resume_equity_to_market_making(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+    ) -> Result<(), MintTransferError> {
+        let existing = self
+            .mint_store
+            .load(issuer_request_id)
+            .await
+            .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
-    #[instrument(target = "rebalance", skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
-    async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
-        let Equity { symbol, quantity } = asset;
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
+        match existing {
+            None => self.start_mint(issuer_request_id, symbol, quantity).await,
+            Some(
+                TokenizedEquityMint::MintRequested { .. }
+                | TokenizedEquityMint::MintAccepted { .. },
+            ) => {
+                if let Err(error) = self.resume_mint(issuer_request_id).await {
+                    let reached = self.load_mint_entity(issuer_request_id).await;
+                    return Err(classify_mint_resume_error(reached, error));
+                }
 
+                Ok(())
+            }
+            Some(_) => self
+                .resume_mint(issuer_request_id)
+                .await
+                .map_err(MintTransferError::PostReceipt),
+        }
+    }
+
+    async fn start_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+    ) -> Result<(), MintTransferError> {
         debug!(target: "rebalance", %issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
         // Pre-receipt: no tokens exist yet, safe to retry on failure.
         self.mint_store
             .send(
-                &issuer_request_id,
+                issuer_request_id,
                 TokenizedEquityMintCommand::RequestMint {
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
@@ -1476,51 +1607,70 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
         info!(target: "rebalance", "Mint request accepted, polling for completion");
 
         self.mint_store
-            .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
+            .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
             .await
             .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
         // Post-receipt: tokens exist in wallet from this point on.
         let tokens_received = self
-            .load_tokens_received(&issuer_request_id)
+            .load_tokens_received(issuer_request_id)
             .await
             .map_err(MintTransferError::PostReceipt)?;
 
-        self.finalize_received_mint(&issuer_request_id, tokens_received)
+        self.finalize_received_mint(issuer_request_id, tokens_received)
             .await
             .map_err(MintTransferError::PostReceipt)
     }
 }
 
-/// Market-Making -> Hedging: withdraw tokenized equity from Raindex vault
-/// and send to Alpaca for redemption.
-#[async_trait]
-impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTransfer {
-    type Asset = Equity;
-    type Error = RedemptionError;
+impl CrossVenueEquityTransfer {
+    /// Market-Making -> Hedging: drives the redemption lifecycle (withdraw
+    /// tokenized equity from the Raindex vault, unwrap, send to Alpaca for
+    /// redemption) for the given `aggregate_id`, whether fresh or
+    /// interrupted.
+    ///
+    /// The id is chosen by the caller at enqueue time so apalis retries (and
+    /// bot restarts that re-pick the job row) re-enter the same aggregate: an
+    /// absent aggregate starts a new redemption, an in-flight one resumes
+    /// from its persisted state, and a terminal one is a no-op.
+    #[instrument(target = "rebalance", skip_all, fields(%aggregate_id, %symbol, %quantity))]
+    pub(crate) async fn resume_equity_to_hedging(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+    ) -> Result<(), RedemptionError> {
+        let existing = self.redemption_store.load(aggregate_id).await?;
 
-    #[instrument(target = "rebalance", skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
-    async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
-        let Equity { symbol, quantity } = asset;
+        match existing {
+            None => self.start_redemption(aggregate_id, symbol, quantity).await,
+            Some(_) => self.resume_redemption(aggregate_id).await,
+        }
+    }
 
-        let (token, _vault_id) = self.raindex.lookup_vault_info(&symbol).await?;
+    async fn start_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+    ) -> Result<(), RedemptionError> {
+        let token = self.vault_lookup.vault_token_for_symbol(symbol).await?;
         let amount = quantity.to_u256_18_decimals()?;
-        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
         info!(target: "rebalance", %token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
 
-        self.withdraw_from_raindex(&aggregate_id, &symbol, quantity, token, amount)
+        self.withdraw_from_raindex(aggregate_id, symbol, quantity, token, amount)
             .await?;
 
         info!(target: "rebalance", "Withdrawn from Raindex, unwrapping and sending to Alpaca");
 
-        let redemption_tx = self.unwrap_and_send(&aggregate_id).await?;
+        let redemption_tx = self.unwrap_and_send(aggregate_id).await?;
 
         info!(target: "rebalance", %redemption_tx, "Tokens sent, polling for detection");
-        let request_id = self.poll_detection(&aggregate_id, &redemption_tx).await?;
+        let request_id = self.poll_detection(aggregate_id, &redemption_tx).await?;
 
         info!(target: "rebalance", %request_id, "Redemption detected, awaiting completion");
-        self.poll_completion(&aggregate_id, &request_id).await?;
+        self.poll_completion(aggregate_id, &request_id).await?;
 
         info!(target: "rebalance", "Equity transfer to hedging venue completed successfully");
         Ok(())
@@ -1529,35 +1679,47 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::{Address, B256, address};
     use chrono::Utc;
     use sqlx::SqlitePool;
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
+    use st0x_config::{AssetsConfig, EquitiesConfig};
+    use st0x_wrapper::MockWrapper;
+
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig};
+    use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
     };
+    use crate::tokenized_equity_mint::{TokenizedEquityMintEvent, issuer_request_id};
+    use crate::usdc_rebalance::UsdcRebalance;
+    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistry;
-    use crate::wrapper::mock::MockWrapper;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new()
+            .with_symbol_token(Symbol::new("TEST").unwrap(), Address::ZERO)
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         }
@@ -1576,13 +1738,25 @@ mod tests {
              (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
              VALUES ('TokenizedEquityMint', ?, ?, ?, '1.0', ?, '{}')",
         )
-        .bind(raw)
+        .bind(raw.to_string())
         .bind(sequence)
         .bind(event_type)
         .bind(payload)
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    fn mint_accepted_payload(id: &IssuerRequestId) -> String {
+        format!(
+            r#"{{"MintAccepted":{{"issuer_request_id":"{id}","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}}}"#
+        )
+    }
+
+    fn provider_completion_recovered_payload(id: &IssuerRequestId) -> String {
+        format!(
+            r#"{{"ProviderCompletionRecovered":{{"issuer_request_id":"{id}","wallet":"0x0000000000000000000000000000000000000001","tokenization_request_id":"tok-1","tx_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","shares_minted":"10000000000000000000","fees":null,"recovered_at":"2026-01-01T00:02:00Z"}}}}"#
+        )
     }
 
     #[tokio::test]
@@ -1593,7 +1767,7 @@ mod tests {
         // (which would re-wrap already-moved tokens), so received_tokens must be
         // true even though no TokensReceived event exists.
         let pool = crate::test_utils::setup_test_db().await;
-        let id = IssuerRequestId::new("mint-rerecover");
+        let id = issuer_request_id("mint-rerecover");
 
         insert_mint_event(
             &pool,
@@ -1608,7 +1782,7 @@ mod tests {
             &id,
             1,
             "TokenizedEquityMintEvent::MintAccepted",
-            r#"{"MintAccepted":{"issuer_request_id":"mint-rerecover","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+            &mint_accepted_payload(&id),
         )
         .await;
         insert_mint_event(
@@ -1616,7 +1790,7 @@ mod tests {
             &id,
             2,
             "TokenizedEquityMintEvent::ProviderCompletionRecovered",
-            r#"{"ProviderCompletionRecovered":{"issuer_request_id":"mint-rerecover","wallet":"0x0000000000000000000000000000000000000001","tokenization_request_id":"tok-1","tx_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","shares_minted":"10000000000000000000","fees":null,"recovered_at":"2026-01-01T00:02:00Z"}}"#,
+            &provider_completion_recovered_payload(&id),
         )
         .await;
 
@@ -1636,9 +1810,9 @@ mod tests {
     /// MarketMaking available -- not stay stuck in-flight forever.
     #[tokio::test]
     async fn recover_mint_clears_hedging_inflight() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let id = IssuerRequestId::new("mint-recover-inflight");
+        let id = issuer_request_id("mint-recover-inflight");
 
         // Reactor-less failure injection: the live reactor never observes these
         // events, so its inventory holds the full Hedging balance with nothing
@@ -1656,7 +1830,7 @@ mod tests {
             &id,
             2,
             "TokenizedEquityMintEvent::MintAccepted",
-            r#"{"MintAccepted":{"issuer_request_id":"mint-recover-inflight","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+            &mint_accepted_payload(&id),
         )
         .await;
         insert_mint_event(
@@ -1668,7 +1842,6 @@ mod tests {
         )
         .await;
 
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_equity(
@@ -1691,15 +1864,13 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         // Reactor-wired stores -- the production wiring that dispatches committed
@@ -1715,7 +1886,11 @@ mod tests {
             .await
             .unwrap();
         service
-            .set_stores(mint_store.clone(), redemption_store.clone())
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
             .await;
 
         // The provider reports the request settled: get_request must find a
@@ -1728,6 +1903,7 @@ mod tests {
 
         let transfer = CrossVenueEquityTransfer::new(
             Arc::new(MockRaindex::new()),
+            Arc::new(MockVaultLookup::new()),
             tokenizer,
             Arc::new(MockWrapper::new()),
             address!("0x0000000000000000000000000000000000000001"),
@@ -1764,7 +1940,7 @@ mod tests {
     /// Recovery must not double-count an in-flight that is ALREADY established.
     ///
     /// The realistic stuck state -- what the simulate-failures harness and the
-    /// CLI `fail-transfer` ops tool both produce -- is: `MintAccepted` ran
+    /// CLI `transfer fail` ops tool both produce -- is: `MintAccepted` ran
     /// `start` so the quantity sits in Hedging in-flight, but the failure was
     /// recorded out-of-process so the reactor never ran `cancel`. Recovery then
     /// runs against an in-flight already at the mint quantity; re-establishing
@@ -1773,9 +1949,9 @@ mod tests {
     /// must reconcile it to zero idempotently.
     #[tokio::test]
     async fn recover_mint_does_not_double_count_existing_inflight() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let id = IssuerRequestId::new("mint-double-count");
+        let id = issuer_request_id("mint-double-count");
 
         insert_mint_event(
             &pool,
@@ -1790,7 +1966,7 @@ mod tests {
             &id,
             2,
             "TokenizedEquityMintEvent::MintAccepted",
-            r#"{"MintAccepted":{"issuer_request_id":"mint-double-count","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+            &mint_accepted_payload(&id),
         )
         .await;
         insert_mint_event(
@@ -1802,7 +1978,6 @@ mod tests {
         )
         .await;
 
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
 
         // MintAccepted's `start` already moved the quantity into Hedging
@@ -1834,15 +2009,13 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -1856,7 +2029,11 @@ mod tests {
             .await
             .unwrap();
         service
-            .set_stores(mint_store.clone(), redemption_store.clone())
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
             .await;
 
         let mut completed_request = TokenizationRequest::mock_completed();
@@ -1866,6 +2043,7 @@ mod tests {
 
         let transfer = CrossVenueEquityTransfer::new(
             Arc::new(MockRaindex::new()),
+            Arc::new(MockVaultLookup::new()),
             tokenizer,
             Arc::new(MockWrapper::new()),
             address!("0x0000000000000000000000000000000000000001"),
@@ -1899,26 +2077,337 @@ mod tests {
         );
     }
 
+    /// A reconciled mint is terminal: `resume_mint` must be a clean no-op for
+    /// an apalis retry, leaving the aggregate in `Reconciled`.
+    #[tokio::test]
+    async fn resume_mint_is_noop_on_reconciled_mint() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-RECONCILED");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "stranded mid-flight".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::Reconcile {
+                    reason: "wrapped manually via wrap-equity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_mint(&id)
+            .await
+            .expect("a reconciled mint must be a clean no-op for the job retry");
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Reconciled { .. }),
+            "resume must leave a reconciled mint terminal, got: {entity:?}"
+        );
+    }
+
+    /// A reconciled redemption is terminal: `resume_redemption` must be a clean
+    /// no-op for an apalis retry, leaving the aggregate in `Reconciled`.
+    #[tokio::test]
+    async fn resume_redemption_is_noop_on_reconciled_redemption() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-reconciled");
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                FractionalShares::new(float!(50)),
+                token,
+                amount,
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailDetection {
+                    failure: DetectionFailure::Timeout,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "deposited manually via vault-deposit".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_redemption(&id)
+            .await
+            .expect("a reconciled redemption must be a clean no-op for the job retry");
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "resume must leave a reconciled redemption terminal, got: {entity:?}"
+        );
+    }
+
+    /// A reconciled mint is already settled, so the operator recheck path
+    /// reports `AlreadyCompleted` without attempting provider recovery.
+    #[tokio::test]
+    async fn recover_mint_reports_already_completed_on_reconciled_mint() {
+        let (transfer, service, pool) = transfer_with_rebalancing_service().await;
+
+        let id = issuer_request_id("mint-recover-reconciled");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "stranded mid-flight".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::Reconcile {
+                    reason: "wrapped manually via wrap-equity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = transfer.recover_mint(&id, &pool, &service).await.unwrap();
+        assert!(
+            matches!(outcome, RecheckOutcome::AlreadyCompleted),
+            "a reconciled mint must recheck as AlreadyCompleted, got {outcome:?}"
+        );
+    }
+
+    /// A reconciled redemption is already settled, so the operator recheck path
+    /// reports `AlreadyCompleted` without attempting provider recovery.
+    #[tokio::test]
+    async fn recover_redemption_reports_already_completed_on_reconciled_redemption() {
+        let (transfer, service, _pool) = transfer_with_rebalancing_service().await;
+
+        let id = redemption_aggregate_id("redeem-recover-reconciled");
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                FractionalShares::new(float!(50)),
+                token,
+                amount,
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailDetection {
+                    failure: DetectionFailure::Timeout,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "deposited manually via vault-deposit".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = transfer.recover_redemption(&id, &service).await.unwrap();
+        assert!(
+            matches!(outcome, RecheckOutcome::AlreadyCompleted),
+            "a reconciled redemption must recheck as AlreadyCompleted, got {outcome:?}"
+        );
+    }
+
+    /// Builds a transfer wired to a real `RebalancingService` sharing the same
+    /// command stores, so a seeded aggregate is visible to the `recover_*`
+    /// recheck entry points.
+    async fn transfer_with_rebalancing_service() -> (
+        CrossVenueEquityTransfer,
+        Arc<RebalancingService>,
+        SqlitePool,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+
+        let service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(1800),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
+            },
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            address!("0x0000000000000000000000000000000000000001"),
+            address!("0x0000000000000000000000000000000000000002"),
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        ));
+
+        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
+            .await;
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            address!("0x0000000000000000000000000000000000000001"),
+            mint_store,
+            redemption_store,
+        );
+
+        (transfer, service, pool)
+    }
+
     async fn create_equity_transfer(
         tokenizer: Arc<dyn Tokenizer>,
         raindex: Arc<dyn Raindex>,
         wrapper: Arc<dyn Wrapper>,
     ) -> CrossVenueEquityTransfer {
+        let (transfer, _pool) = create_equity_transfer_with_pool(tokenizer, raindex, wrapper).await;
+        transfer
+    }
+
+    /// Like [`create_equity_transfer`] but also returns the backing pool, so a
+    /// test can seed legacy events directly (e.g. a `TokensWrapped` event
+    /// persisted before the `wrap_block` field existed).
+    async fn create_equity_transfer_with_pool(
+        tokenizer: Arc<dyn Tokenizer>,
+        raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
+    ) -> (CrossVenueEquityTransfer, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let services = mock_services();
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool, services));
+        let redemption_store = Arc::new(test_store(pool.clone(), services));
+        let vault_lookup = mock_vault_lookup();
 
-        CrossVenueEquityTransfer::new(
+        let transfer = CrossVenueEquityTransfer::new(
             raindex,
+            Arc::new(vault_lookup),
             tokenizer,
             wrapper,
             Address::random(),
             mint_store,
             redemption_store,
-        )
+        );
+
+        (transfer, pool)
     }
 
     #[tokio::test]
@@ -1930,15 +2419,14 @@ mod tests {
         )
         .await;
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap();
+        transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1950,7 +2438,7 @@ mod tests {
         )
         .await;
 
-        let id = IssuerRequestId::new("ISS-RESUME");
+        let id = issuer_request_id("ISS-RESUME");
         transfer
             .mint_store
             .send(
@@ -1974,6 +2462,84 @@ mod tests {
         );
     }
 
+    /// Re-running the job entry point with an id whose aggregate already
+    /// exists must resume from the persisted state (the crash-recovery path)
+    /// rather than re-requesting the mint from Alpaca.
+    #[tokio::test]
+    async fn resume_equity_to_market_making_resumes_existing_aggregate() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-CRASH-RESUME");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // First attempt crashes after the mint request was accepted: the
+        // aggregate is persisted in MintAccepted.
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The re-enqueued job runs the same entry point with the same id; a
+        // fresh RequestMint here would fail with AlreadyInProgress, so
+        // completing proves the resume path was taken.
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "Expected deposited mint after job re-run, got: {entity:?}"
+        );
+    }
+
+    /// A terminal aggregate is a no-op for the job entry point: apalis
+    /// retries after a partial failure must not error once the aggregate
+    /// has already completed.
+    #[tokio::test]
+    async fn resume_equity_to_market_making_is_noop_on_completed_mint() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-DONE");
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "Expected deposited mint, got: {entity:?}"
+        );
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
+            .await
+            .expect("a completed mint must be a clean no-op for the job retry");
+    }
+
     #[tokio::test]
     async fn resume_redemption_from_tokens_sent_completes_workflow() {
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(
@@ -1988,9 +2554,13 @@ mod tests {
         )
         .await;
 
-        let id = RedemptionAggregateId::new("redemption-resume");
+        let id = redemption_aggregate_id("redemption-resume");
         let symbol = Symbol::new("TEST").unwrap();
-        let (token, _vault_id) = transfer.raindex.lookup_vault_info(&symbol).await.unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
         let amount = FractionalShares::new(float!(50))
             .to_u256_18_decimals()
             .unwrap();
@@ -2016,6 +2586,119 @@ mod tests {
         );
     }
 
+    /// A fresh id runs the full redemption flow through the job entry point.
+    #[tokio::test]
+    async fn resume_equity_to_hedging_starts_fresh_redemption() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-fresh");
+        transfer
+            .resume_equity_to_hedging(
+                &id,
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected completed redemption, got: {entity:?}"
+        );
+    }
+
+    /// Re-running the job entry point with an id whose aggregate already
+    /// exists must resume from the persisted state (the crash-recovery path)
+    /// rather than re-running the vault withdrawal from scratch.
+    #[tokio::test]
+    async fn resume_equity_to_hedging_resumes_existing_aggregate() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-crash-resume");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        // First attempt crashes after the withdrawal: the aggregate is
+        // persisted mid-flight.
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .await
+            .unwrap();
+
+        // The re-enqueued job runs the same entry point with the same id; a
+        // fresh Redeem command here would fail on the already-initialized
+        // aggregate, so completing proves the resume path was taken.
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .await
+            .unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected completed redemption after job re-run, got: {entity:?}"
+        );
+    }
+
+    /// A terminal aggregate is a no-op for the job entry point: apalis
+    /// retries after a partial failure must not error once the aggregate has
+    /// already completed.
+    #[tokio::test]
+    async fn resume_equity_to_hedging_is_noop_on_completed_redemption() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-done");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .await
+            .unwrap();
+
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .await
+            .expect("a completed redemption must be a clean no-op for the job retry");
+    }
+
     #[tokio::test]
     async fn redemption_transfer_full_workflow_succeeds() {
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(
@@ -2030,12 +2713,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-                &transfer,
-                Equity {
-                    symbol: Symbol::new("TEST").unwrap(),
-                    quantity: FractionalShares::new(float!(50)),
-                },
+            transfer.resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-workflow"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
             ),
         )
         .await
@@ -2052,15 +2733,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-detection-timeout"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::Tokenizer(_)),
@@ -2077,15 +2757,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-detection-api-error"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::Tokenizer(_)),
@@ -2105,15 +2784,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-completion-rejected"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::Rejected),
@@ -2133,15 +2811,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-pending-status"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::UnexpectedPendingStatus),
@@ -2158,15 +2835,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, MintTransferError::PostReceipt(MintError::Wrapper(_))),
@@ -2178,20 +2854,19 @@ mod tests {
     async fn mint_transfer_fails_when_raindex_deposit_fails() {
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::failing_deposit()),
+            Arc::new(MockRaindex::new().with_deposit_behavior(DepositBehavior::FailGeneric)),
             Arc::new(MockWrapper::new()),
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, MintTransferError::PostReceipt(MintError::Raindex(_))),
@@ -2208,15 +2883,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2238,15 +2912,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2281,15 +2954,14 @@ mod tests {
         )
         .await;
 
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100)),
-            },
-        )
-        .await
-        .unwrap();
+        transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100)),
+            )
+            .await
+            .unwrap();
 
         let deposited = raindex.last_deposited_token().expect("deposit was called");
         assert_eq!(
@@ -2314,15 +2986,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2347,15 +3018,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2380,15 +3050,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2413,15 +3082,14 @@ mod tests {
         )
         .await;
 
-        let error = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(100.0)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-TEST"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2438,12 +3106,14 @@ mod tests {
     async fn resume_mint_recovers_when_deposit_reverts() {
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            ),
             Arc::new(MockWrapper::new()),
         )
         .await;
 
-        let id = IssuerRequestId::new("ISS-REVERT-RECOVERY");
+        let id = issuer_request_id("ISS-REVERT-RECOVERY");
 
         // Advance the aggregate to TokensWrapped state manually:
         // RequestMint -> MintAccepted -> TokensReceived -> WrapSubmitted
@@ -2489,6 +3159,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: wrap_tx,
                     wrapped_shares,
+                    wrap_block: 1,
                 },
             )
             .await
@@ -2530,12 +3201,14 @@ mod tests {
 
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            ),
             Arc::new(mock_wrapper),
         )
         .await;
 
-        let id = IssuerRequestId::new("ISS-WRAP-SUBMITTED-RECOVERY");
+        let id = issuer_request_id("ISS-WRAP-SUBMITTED-RECOVERY");
 
         // Advance aggregate to WrapSubmitted state:
         // RequestMint -> MintAccepted -> TokensReceived -> WrapSubmitted
@@ -2594,6 +3267,412 @@ mod tests {
             vault_deposit_tx_hash,
             TxHash::ZERO,
             "Recovered deposit must use TxHash::ZERO sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_from_tokens_wrapped_calls_wait_for_block_with_wrap_block() {
+        // Keep a typed reference so we can inspect both wait_for_block and
+        // deposit call records after resume. Ordering is verified by confirming
+        // both happened: wait_for_block must be called (the guard) and the
+        // deposit must also succeed (proving the guard did not abort the flow).
+        // Strict sequential ordering (wait_for_block strictly before deposit)
+        // cannot be asserted with the current separate-mock seam — the
+        // existing test `mint_transfer_fails_when_wait_for_block_fails` covers
+        // the abort path, proving the guard is on the critical path.
+        let mock_wrapper: Arc<MockWrapper> = Arc::new(MockWrapper::new());
+        let mock_raindex: Arc<MockRaindex> = Arc::new(MockRaindex::new());
+        let wrap_tx = TxHash::random();
+        let wrap_block = 9999u64;
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::clone(&mock_raindex) as Arc<dyn Raindex>,
+            Arc::clone(&mock_wrapper) as Arc<dyn Wrapper>,
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-TOKENS-WRAPPED-WAIT");
+
+        // Advance aggregate to TokensWrapped state manually.
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: wrap_tx,
+                    wrapped_shares,
+                    wrap_block,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "Expected TokensWrapped state before resume, got: {entity:?}"
+        );
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let calls = mock_wrapper.wait_for_block_calls();
+
+        assert_eq!(
+            calls,
+            vec![wrap_block],
+            "wait_for_block must be called exactly once with wrap_block={wrap_block} on TokensWrapped resume"
+        );
+
+        // Confirm the deposit also ran — proving wait_for_block did not abort
+        // the flow and the guard is on the critical path to deposit.
+        // (strict sequential ordering is covered by the abort test
+        // `resume_mint_from_tokens_wrapped_fails_when_wait_for_block_fails`)
+        assert_eq!(
+            mock_raindex.last_deposited_token(),
+            Some(Address::ZERO),
+            "submit_deposit must have been called with the derivative token after wait_for_block on TokensWrapped resume"
+        );
+    }
+
+    /// Verifies that `resume_mint` from `TokensWrapped` state with `wrap_block:
+    /// None` skips `wait_for_block` entirely (backward-compat path for aggregates
+    /// persisted before the field was added).
+    ///
+    /// If the `if let Some(block) = wrap_block` guard is accidentally removed,
+    /// this test catches it: `wait_for_block` would be called with a sentinel
+    /// value (0 or similar) and the assertion below would fail.
+    #[tokio::test]
+    async fn resume_mint_from_tokens_wrapped_skips_wait_for_block_when_wrap_block_is_none() {
+        let mock_wrapper: Arc<MockWrapper> = Arc::new(MockWrapper::new());
+        let wrap_tx = TxHash::random();
+
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::clone(&mock_wrapper) as Arc<dyn Wrapper>,
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-TOKENS-WRAPPED-NO-BLOCK");
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Simulate a legacy aggregate: a `TokensWrapped` event persisted before
+        // the `wrap_block` field existed. The live `WrapTokens` command now
+        // requires `wrap_block`, so the only way to reach a `wrap_block: None`
+        // state is to replay an old event -- seeded here directly with the
+        // field omitted, exercising the `#[serde(default)]` backward-compat path.
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        let legacy_payload = {
+            let mut value = serde_json::to_value(TokenizedEquityMintEvent::TokensWrapped {
+                wrap_tx_hash: wrap_tx,
+                wrapped_shares,
+                wrapped_at: Utc::now(),
+                wrap_block: None,
+            })
+            .unwrap();
+            value["TokensWrapped"]
+                .as_object_mut()
+                .unwrap()
+                .remove("wrap_block");
+            value.to_string()
+        };
+
+        let IssuerRequestId(raw_id) = &id;
+        let next_sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM events WHERE aggregate_id = ?",
+        )
+        .bind(raw_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        insert_mint_event(
+            &pool,
+            &id,
+            next_sequence,
+            "TokenizedEquityMintEvent::TokensWrapped",
+            &legacy_payload,
+        )
+        .await;
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "Expected TokensWrapped state before resume, got: {entity:?}"
+        );
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            mock_wrapper.wait_for_block_calls(),
+            Vec::<u64>::new(),
+            "wait_for_block must NOT be called when wrap_block is None (legacy aggregate)"
+        );
+    }
+
+    /// Verifies that `resume_mint` from `TokensWrapped` state propagates a
+    /// `wait_for_block` failure as `MintError::Wrapper(WrapperError::Evm(..))`,
+    /// and that the deposit does NOT run when `wait_for_block` fails.
+    ///
+    /// This proves that `wait_for_block` is on the critical path before the
+    /// deposit in the `TokensWrapped` resume branch. A refactor that swaps the
+    /// order (deposit first, wait_for_block second) would make this test fail
+    /// while the happy-path test still passes.
+    #[tokio::test]
+    async fn resume_mint_from_tokens_wrapped_fails_when_wait_for_block_fails() {
+        let mock_raindex: Arc<MockRaindex> = Arc::new(MockRaindex::new());
+        let wrap_tx = TxHash::random();
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::clone(&mock_raindex) as Arc<dyn Raindex>,
+            Arc::new(MockWrapper::failing_wait_for_block()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-TOKENS-WRAPPED-WAIT-FAIL");
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: wrap_tx,
+                    wrapped_shares,
+                    wrap_block: 9999u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "expected TokensWrapped state before resume, got: {entity:?}"
+        );
+
+        let error = transfer
+            .resume_mint(&id)
+            .await
+            .expect_err("wait_for_block failure must propagate from TokensWrapped resume");
+
+        assert!(
+            matches!(
+                error,
+                MintError::Wrapper(WrapperError::Evm(EvmError::NodeBehindRequiredBlock { .. }))
+            ),
+            "expected MintError::Wrapper wrapping NodeBehindRequiredBlock, got: {error:?}"
+        );
+
+        assert!(
+            mock_raindex.last_deposited_token().is_none(),
+            "deposit must NOT run when wait_for_block fails in TokensWrapped resume"
+        );
+    }
+
+    /// Verifies that `resume_mint` from `WrapSubmitted` state propagates a
+    /// `wait_for_block` failure as `MintError::Wrapper(WrapperError::Evm(..))`.
+    ///
+    /// The `WrapSubmitted` branch calls `wait_for_block` unconditionally (block
+    /// comes from a freshly confirmed tx). A missing `?` or wrong error mapping
+    /// would let the flow silently proceed to deposit against a stale node --
+    /// the exact regression this PR was written to prevent.
+    #[tokio::test]
+    async fn resume_mint_from_wrap_submitted_fails_when_wait_for_block_fails() {
+        let mock_wrapper = MockWrapper::failing_wait_for_block();
+        let wrap_tx = TxHash::random();
+
+        // Pre-seed so confirm_wrap recognises the tx hash stored in WrapSubmitted.
+        mock_wrapper.seed_submitted_amount(wrap_tx, U256::from(10_000_000_000_000_000_000u128));
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_wrapper),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-WRAP-SUBMITTED-WAIT-FAIL");
+
+        // Advance to WrapSubmitted: RequestMint -> Poll -> SubmitWrap
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::WrapSubmitted { .. }),
+            "expected WrapSubmitted state before resume, got: {entity:?}"
+        );
+
+        let error = transfer
+            .resume_mint(&id)
+            .await
+            .expect_err("wait_for_block failure must propagate from WrapSubmitted resume");
+
+        assert!(
+            matches!(
+                error,
+                MintError::Wrapper(WrapperError::Evm(EvmError::NodeBehindRequiredBlock { .. }))
+            ),
+            "expected MintError::Wrapper wrapping NodeBehindRequiredBlock, got: {error:?}"
+        );
+    }
+
+    /// Verifies that the mint happy-path propagates a `wait_for_block` failure
+    /// as `MintTransferError::PostReceipt(MintError::Wrapper(..))`.
+    ///
+    /// `finalize_received_mint` calls `wait_for_block(wrap_block)` unconditionally
+    /// after wrapping. A missing `?` or wrong error mapping would let the flow
+    /// silently deposit against a stale node.
+    #[tokio::test]
+    async fn mint_transfer_fails_when_wait_for_block_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block()),
+        )
+        .await;
+
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-WAIT-BLOCK-FAIL"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .expect_err("wait_for_block failure must propagate in the mint happy path");
+
+        assert!(
+            matches!(
+                error,
+                MintTransferError::PostReceipt(MintError::Wrapper(WrapperError::Evm(
+                    EvmError::NodeBehindRequiredBlock { .. }
+                )))
+            ),
+            "expected PostReceipt(Wrapper(NodeBehindRequiredBlock)), got: {error:?}"
         );
     }
 }

@@ -14,135 +14,352 @@ permissions:
   id-token: write
   contents: read
 
+# Nix is installed via nix-quick-install-action and both the shared
+# `rainlanguage` Cachix (cachix-action) and the per-runner nix store
+# (cache-nix-action) are warmed before any `nix` invocation. This replaces the
+# old DeterminateSystems installer + magic-nix-cache + custom ABI-prefetch job,
+# which did not share the `rainlanguage` cache that raindex CI populates.
+
 jobs:
-  backend-validation:
-    name: backend ${{ matrix.name }}
+  optimize_ci:
+    runs-on: "blacksmith-2vcpu-ubuntu-2404"
+    outputs:
+      skip: ${{ steps.check_skip.outputs.skip }}
+    steps:
+      # Pinned to the v0.0.9 release commit, not a mutable ref: this action
+      # gates all CI and holds the Graphite token, so the SHA freezes both the
+      # supply chain and the `skip` output contract (set in dist/index.js but
+      # undeclared in the action's action.yml).
+      - name: Optimize CI
+        id: check_skip
+        uses: withgraphite/graphite-ci-action@9bc969adfd43bb790da3b64b543c78c75cef9689  # v0.0.9
+        with:
+          graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZATION_TOKEN }}
+          # Declared required by the action but unused at the pinned version
+          # (it reads only graphite_token/endpoint/timeout; there is no
+          # run-cancel path). Skipping is enforced solely by the `skip` output
+          # and the job-level if-gates.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Classifies the push: `code == 'true'` when at least one changed file is
+  # NOT a docs file. With `predicate-quantifier: every`, a file matches the
+  # `code` filter only if it matches `**` AND every negated docs glob -- i.e.
+  # it is a non-docs file. A push that mixes code and docs therefore flips
+  # `code` to true and runs full CI (fail-closed); only a confirmed
+  # all-docs push yields `code == 'false'`. If this job errors or is
+  # skipped, `code` is empty/unknown and the gates require the real checks.
+  #
+  # Runs whenever the optimizer did NOT confirm a skip (`skip != 'true'`),
+  # including when `optimize_ci` itself failed (empty skip) -- so a broken
+  # optimizer falls into the run-CI bucket, never the skip bucket.
+  #
+  # NOTE: paths-filter needs the repo checked out for push/workflow_dispatch git
+  # change detection (this workflow is not pull_request-triggered).
+  changes:
+    name: changes
+    needs: optimize_ci
+    if: ${{ always() && needs.optimize_ci.outputs.skip != 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!AGENTS.md'
+              - '!README*'
+
+  backend-build:
+    name: backend build
+    needs: [optimize_ci, changes]
+    if: ${{ needs.optimize_ci.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 60
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@v34
+        with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rust-${{ github.workflow }}
+          workspaces: ". -> target/test"
+
+      # Build the test binaries once into a nextest archive shared by all four
+      # partitions, and run clippy here since this is the single full compile.
+      - name: Build nextest archive and run clippy
+        run: |
+          nix develop .#ci-backend -c bash -c '
+            set -euxo pipefail
+            cargo nextest archive --workspace --all-features --profile ci \
+              --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+            cargo clippy --workspace --all-targets --all-features
+            # compile_fail_tests (trybuild) shells out to cargo at run time, so
+            # run it here where the workspace build cache is warm. The archive
+            # partitions only carry prebuilt binaries and would compile it cold.
+            cargo nextest run --workspace --all-features --profile ci \
+              -E "test(compile_fail_tests)"
+          '
+
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+  backend-test:
+    name: backend test ${{ matrix.partition }} of 4
+    needs: [optimize_ci, changes, backend-build]
+    if: ${{ needs.optimize_ci.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
     strategy:
       fail-fast: false
 
       matrix:
-        include:
-          - name: check
-            cache_target: check
-            command: nix develop .#ci-backend -c cargo check --workspace
-
-          - name: test 1 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:1/4
-
-          - name: test 2 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:2/4
-
-          - name: test 3 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:3/4
-
-          - name: test 4 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:4/4
-
-          - name: clippy
-            cache_target: clippy
-            command: >
-              nix develop .#ci-backend -c cargo clippy --workspace
-              --all-targets --all-features
-
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: target/${{ matrix.cache_target }}
+        partition: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@v34
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: cachix/cachix-action@v15
         continue-on-error: true
-
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/git/db/
-            ~/.cargo/registry/cache/
-            ~/.cargo/registry/index/
-            target/${{ matrix.cache_target }}/
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
 
-      - name: ${{ matrix.name }}
-        run: ${{ matrix.command }}
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
+
+      # Test binaries come from the archive built in backend-build; no recompile.
+      - name: test ${{ matrix.partition }} of 4
+        run: |
+          nix develop .#ci-backend -c bash -c '
+            set -euxo pipefail
+            cargo nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
+              --workspace-remap . --profile ci \
+              -E "not test(compile_fail_tests)" \
+              --partition hash:${{ matrix.partition }}/4
+          '
 
   backend:
     name: backend
-    needs: backend-validation
-    if: always()
-    runs-on: ubuntu-latest
+    needs: [optimize_ci, changes, backend-build, backend-test]
+    # Runs unless the optimizer CONFIRMED a skip (skip == 'true'). A failed or
+    # empty optimizer (skip == '') falls through here and runs the gate, so a
+    # broken optimizer can never silently satisfy this required check.
+    if: ${{ always() && needs.optimize_ci.outputs.skip != 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - name: Check backend validation
         run: |
-          if [ "${{ needs.backend-validation.result }}" != "success" ]; then
-            echo "backend validation failed"
+          # Skip backend validation ONLY for a confirmed docs-only push: the
+          # changes job succeeded AND found no code files (code == 'false').
+          # Any other state -- changes failed/skipped, or code present -- falls
+          # through and requires the real jobs (which were skipped on a
+          # non-code path), so this gate fails closed rather than
+          # green-lighting untested code.
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
+            echo "Docs-only change - backend validation not required."
+            exit 0
+          fi
+          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
+            echo "backend validation failed (build=${{ needs.backend-build.result }}, test=${{ needs.backend-test.result }})"
             exit 1
           fi
 
+  # Required check. Always runs when not graphite-skipped; the real build
+  # steps are skipped only on a confirmed docs-only push (changes succeeded
+  # AND code == 'false'), so a docs-only push reports this check green
+  # without spinning up the dashboard toolchain.
   dashboard:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: [optimize_ci, changes]
+    if: ${{ always() && needs.optimize_ci.outputs.skip != 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - name: Docs-only change - dashboard build not required
+        if: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
+        run: echo "Docs-only change; skipping dashboard build."
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: actions/checkout@v4
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+
+      - name: Configure Git fetch fail-fast
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@v34
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@v15
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@v7
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
 
       - name: Check bun.nix is up to date
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         run: |
           nix run .#genBunNix
           nix fmt -- dashboard/bun.nix
           git diff --exit-code dashboard/bun.nix
 
       - name: Generate dashboard API bindings
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         run: nix run .#st0x-dto -- dashboard/src/lib/api
 
       - name: Dashboard lint
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         working-directory: dashboard
         run: |
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun install --frozen-lockfile
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run lint
 
       - name: Dashboard
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         run: nix build .#st0x-dashboard
 
+  # Required check. Runs fully whenever not graphite-skipped -- including on
+  # docs-only pushes -- because pre-commit is the only check that validates
+  # docs files (deno fmt covers markdown). Short-circuiting it on docs-only
+  # pushes would let unformatted docs merge green and then break
+  # `pre-commit run --all-files` for every subsequent push on any branch.
   hooks:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: optimize_ci
+    if: ${{ always() && needs.optimize_ci.outputs.skip != 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@v34
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
 
       - name: deploy migration invariants
         run: ./scripts/validate-deploy-migration.sh

@@ -5,14 +5,14 @@ use sqlx::SqlitePool;
 pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
 
+use st0x_config::{AssetsConfig, BrokerCtx, Ctx};
 pub(crate) use st0x_event_sorcery::Projection;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::TradingMode;
-use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{AssetsConfig, BrokerCtx, Ctx};
+use st0x_hedge::bindings::IRaindexV6;
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -20,9 +20,8 @@ use crate::assert::{assert_broker_state, assert_cqrs_state};
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::poll::{
-    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_done_jobs, count_events, count_jobs,
-    poll_for_aggregate_events_containing, poll_for_events, sleep_or_crash, spawn_bot,
-    wait_for_processing,
+    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, poll_for_aggregate_events_containing,
+    poll_for_events, sleep_or_crash, spawn_bot, wait_for_processing,
 };
 pub(crate) use crate::test_infra::TestInfra;
 
@@ -35,20 +34,37 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     deployment_block: u64,
     assets: AssetsConfig,
     execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
+    /// Override the HTTP RPC URL the bot connects to. Default is
+    /// `chain.endpoint()`. Used by chaos tests to route the bot
+    /// through a fault-injecting proxy.
+    rpc_url_override: Option<url::Url>,
+    /// Override the broker base URL the bot connects to. Default is
+    /// `broker.base_url()`. Used by chaos tests to route broker calls
+    /// through a fault-injecting proxy.
+    broker_url_override: Option<url::Url>,
 ) -> anyhow::Result<Ctx> {
+    let broker_url = broker_url_override.map_or_else(
+        || broker.base_url(),
+        |url| url.to_string().trim_end_matches('/').to_owned(),
+    );
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
         api_secret: TEST_API_SECRET.to_owned(),
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
+        mode: Some(AlpacaBrokerApiMode::Mock(broker_url)),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     });
 
+    let rpc_url = match rpc_url_override {
+        Some(url) => url,
+        None => chain.endpoint().parse()?,
+    };
+
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(chain.ws_endpoint()?)
+        .rpc_url(rpc_url)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
@@ -152,7 +168,7 @@ async fn assert_onchain_vaults<P: Provider>(
             .unwrap_or_else(|_| format!("{raw}"))
     };
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
 
     let output_balance_now = orderbook
         .vaultBalance2(owner, take_result.output_token, take_result.output_vault_id)

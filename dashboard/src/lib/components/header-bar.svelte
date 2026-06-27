@@ -1,12 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { Badge } from '$lib/components/ui/badge'
+  import RecoveryGuide from '$lib/components/recovery-guide.svelte'
   import type { ConnectionState } from '$lib/websocket'
   import {
     getApiBaseUrl,
     getSimulateRev,
     getSimulateBackendPort,
     getSimulateSourceId,
+    isDashboardMockMode
   } from '$lib/env'
   import { formatUtcClock, FETCH_TIMEOUT_MS } from '$lib/time'
   import { reactive } from '$lib/frp.svelte'
@@ -21,9 +23,7 @@
       }${simulateSourceId ? ` · ${simulateSourceId}` : ''}`
     : null
 
-  const pageTitle = simulateLabel
-    ? `${simulateLabel} · st0x.liquidity`
-    : 'st0x.liquidity'
+  const pageTitle = simulateLabel ? `${simulateLabel} · st0x.liquidity` : 'st0x.liquidity'
 
   const hashString = (input: string): number => {
     let hash = 0
@@ -33,13 +33,10 @@
     return hash
   }
 
-  const simulateHue = simulateSourceId !== null
-    ? Math.abs(hashString(simulateSourceId)) % 360
-    : null
+  const simulateHue =
+    simulateSourceId !== null ? Math.abs(hashString(simulateSourceId)) % 360 : null
 
-  const simulateBackground = simulateHue !== null
-    ? `hsl(${String(simulateHue)} 70% 35%)`
-    : null
+  const simulateBackground = simulateHue !== null ? `hsl(${String(simulateHue)} 70% 35%)` : null
 
   type Props = {
     connectionStatus: ConnectionState
@@ -57,6 +54,12 @@
   const now = reactive(new Date())
 
   const fetchHealth = async () => {
+    if (isDashboardMockMode()) {
+      health.update(() => ({ gitCommit: 'mock', uptimeSeconds: 0 }))
+      botReachable.update(() => true)
+      return
+    }
+
     try {
       const baseUrl = getApiBaseUrl()
       const response = await fetch(`${baseUrl}/health`, {
@@ -68,7 +71,7 @@
         return
       }
 
-      const data = await response.json() as HealthInfo
+      const data = (await response.json()) as HealthInfo
       health.update(() => data)
       botReachable.update(() => true)
     } catch {
@@ -88,8 +91,12 @@
 
   onMount(() => {
     void fetchHealth()
-    const healthInterval = setInterval(() => { void fetchHealth() }, 30_000)
-    const clockInterval = setInterval(() => { now.update(() => new Date()) }, 1000)
+    const healthInterval = setInterval(() => {
+      void fetchHealth()
+    }, 30_000)
+    const clockInterval = setInterval(() => {
+      now.update(() => new Date())
+    }, 1000)
     return () => {
       clearInterval(healthInterval)
       clearInterval(clockInterval)
@@ -133,6 +140,8 @@
     </h1>
 
     <div class="flex items-center gap-2 md:gap-4">
+      <RecoveryGuide />
+
       <span class="font-mono text-xs text-muted-foreground">
         {formatUtcClock(now.current)}
       </span>
@@ -140,7 +149,9 @@
       {#if health.current && botReachable.current}
         <span class="hidden text-xs text-muted-foreground md:inline-flex md:items-center md:gap-3">
           {#if health.current.gitCommit !== 'dev'}
-            <span title="Deployed commit"><span class="font-mono">{health.current.gitCommit.slice(0, 7)}</span></span>
+            <span title="Deployed commit"
+              ><span class="font-mono">{health.current.gitCommit.slice(0, 7)}</span></span
+            >
           {/if}
           <span title="Bot uptime">up {formatUptime(health.current.uptimeSeconds)}</span>
         </span>

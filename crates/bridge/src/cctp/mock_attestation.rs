@@ -301,11 +301,10 @@ async fn sign_cctp_message(
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut modified = message.to_vec();
 
-    // Generate a random nonce that fits in u64 (upper 24 bytes must be zero
-    // for AttestationResponse::new() validation). Only the low 8 bytes are
-    // randomized; the high 24 remain zero.
+    // Generate a full random 32-byte nonce, mirroring CCTP V2 where the nonce
+    // is a hash-like value with non-zero upper bytes (not a small u64).
     let mut nonce = [0u8; 32];
-    rand::thread_rng().fill(&mut nonce[24..]);
+    rand::thread_rng().fill(&mut nonce);
     // Ensure nonce is not zero (reserved)
     nonce[31] |= 1;
 

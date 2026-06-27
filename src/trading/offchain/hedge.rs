@@ -9,15 +9,17 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+use st0x_execution::{
+    ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
+};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderId, PollOrderStatus, PollOrderStatusJobQueue,
 };
 use crate::position::{Position, PositionCommand, PositionError};
-use crate::threshold::ExecutionThreshold;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
 /// Persistent job queue for hedge placement.
@@ -80,6 +82,7 @@ impl Job<HedgeCtx> for PlaceHedge {
     type Error = TradeAccountingError;
 
     const WORKER_NAME: &'static str = "hedge-worker";
+
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::Hedge;
 
@@ -145,6 +148,23 @@ impl Job<HedgeCtx> for PlaceHedge {
             Err(error) => return Err(error.into()),
         }
 
+        // Derive the broker-side `client_order_id` from the *live* position
+        // aggregate, read after `PlaceOffChainOrder` has claimed it -- never
+        // captured at enqueue. If a prior attempt failed, the aggregate holds
+        // its `OffchainOrderId` as the idempotency anchor, so this retry reuses
+        // the same key and the broker dedupes the duplicate submission (a 422
+        // the executor reconciles by adopting the order it already accepted).
+        // Reading it live means a failure recorded *after* this job was enqueued
+        // is still honored, instead of placing under a fresh key and
+        // double-submitting. Falls back to this attempt's own id on the first
+        // try, when no anchor exists yet.
+        let anchor = ctx
+            .position
+            .load(&self.symbol)
+            .await?
+            .and_then(|position| position.last_failed_offchain_order_id);
+        let client_order_id = client_order_id_for_placement(self.offchain_order_id, anchor);
+
         ctx.offchain_order
             .send(
                 &self.offchain_order_id,
@@ -153,6 +173,7 @@ impl Job<HedgeCtx> for PlaceHedge {
                     shares: self.shares,
                     direction: self.direction,
                     executor: self.executor,
+                    client_order_id,
                 },
             )
             .await?;
@@ -188,15 +209,32 @@ impl Job<HedgeCtx> for PlaceHedge {
     }
 }
 
+/// Derives the broker-side [`ClientOrderId`] for a placement attempt.
+///
+/// When a prior attempt failed after the broker accepted the order, the
+/// position aggregate stashes that attempt's [`OffchainOrderId`] as the
+/// idempotency anchor. Retries must reuse its UUID as `client_order_id` so
+/// the broker dedupes rather than double-submitting.
+fn client_order_id_for_placement(
+    offchain_order_id: OffchainOrderId,
+    last_failed_offchain_order_id: Option<OffchainOrderId>,
+) -> ClientOrderId {
+    let idempotency_source = last_failed_offchain_order_id.unwrap_or(offchain_order_id);
+    ClientOrderId::from_uuid(idempotency_source.as_uuid())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
+    use proptest::prelude::*;
     use std::any::type_name;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
+        Symbol,
     };
     use st0x_float_macro::float;
 
@@ -204,8 +242,7 @@ mod tests {
     use crate::conductor::job::Job;
     use crate::offchain::order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
     use crate::position::{Position, PositionCommand, TradeId};
-    use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
         struct SucceedingPlacer;
@@ -248,14 +285,13 @@ mod tests {
 
     struct TestInfra {
         ctx: HedgeCtx,
-        pool: sqlx::SqlitePool,
+        apalis_pool: apalis_sqlite::SqlitePool,
         position_projection: Arc<st0x_event_sorcery::Projection<Position>>,
         offchain_order_projection: Arc<st0x_event_sorcery::Projection<OffchainOrder>>,
     }
 
     async fn create_hedge_ctx(order_placer: Arc<dyn OrderPlacer>) -> TestInfra {
-        let pool = setup_test_db().await;
-        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -271,12 +307,12 @@ mod tests {
         let ctx = HedgeCtx {
             position: position.clone(),
             offchain_order,
-            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
         };
 
         TestInfra {
             ctx,
-            pool,
+            apalis_pool,
             position_projection,
             offchain_order_projection,
         }
@@ -466,7 +502,9 @@ mod tests {
     /// order doesn't sit `Submitted` until the next bot restart.
     #[tokio::test]
     async fn retry_after_failed_poll_enqueue_re_enqueues_poll() {
-        let TestInfra { ctx, pool, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         fill_position(
@@ -484,9 +522,9 @@ mod tests {
         job.perform(&ctx).await.unwrap();
 
         let poll_jobs_after_first: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
                 .bind(type_name::<PollOrderStatus>())
-                .fetch_one(&pool)
+                .fetch_one(&apalis_pool)
                 .await
                 .unwrap();
         assert_eq!(
@@ -501,14 +539,66 @@ mod tests {
         job.perform(&ctx).await.unwrap();
 
         let poll_jobs_after_retry: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
                 .bind(type_name::<PollOrderStatus>())
-                .fetch_one(&pool)
+                .fetch_one(&apalis_pool)
                 .await
                 .unwrap();
         assert_eq!(
             poll_jobs_after_retry, 2,
             "Retry must re-enqueue PollOrderStatus when the order is still Submitted"
         );
+    }
+
+    fn offchain_order_id_from(uuid: Uuid) -> OffchainOrderId {
+        uuid.to_string().parse().unwrap()
+    }
+
+    fn arb_uuid() -> impl Strategy<Value = Uuid> {
+        prop::array::uniform16(any::<u8>()).prop_map(Uuid::from_bytes)
+    }
+
+    proptest! {
+        #[test]
+        fn client_order_id_for_placement_reuses_anchor_uuid(
+            attempt_uuid in arb_uuid(),
+            anchor_uuid in arb_uuid(),
+        ) {
+            let attempt_id = offchain_order_id_from(attempt_uuid);
+            let anchor_id = offchain_order_id_from(anchor_uuid);
+
+            let derived = client_order_id_for_placement(attempt_id, Some(anchor_id));
+            prop_assert_eq!(derived, ClientOrderId::from_uuid(anchor_uuid));
+        }
+
+        #[test]
+        fn client_order_id_for_placement_falls_back_to_attempt_without_anchor(
+            attempt_uuid in arb_uuid(),
+        ) {
+            let attempt_id = offchain_order_id_from(attempt_uuid);
+
+            let derived = client_order_id_for_placement(attempt_id, None);
+            prop_assert_eq!(derived, ClientOrderId::from_uuid(attempt_uuid));
+        }
+
+        #[test]
+        fn retries_with_same_anchor_share_broker_client_order_id(
+            first_attempt in arb_uuid(),
+            second_attempt in arb_uuid(),
+            anchor in arb_uuid(),
+        ) {
+            prop_assume!(first_attempt != second_attempt);
+
+            let first = client_order_id_for_placement(
+                offchain_order_id_from(first_attempt),
+                Some(offchain_order_id_from(anchor)),
+            );
+            let second = client_order_id_for_placement(
+                offchain_order_id_from(second_attempt),
+                Some(offchain_order_id_from(anchor)),
+            );
+
+            prop_assert_eq!(first, second);
+        }
     }
 }

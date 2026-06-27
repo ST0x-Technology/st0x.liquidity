@@ -6,24 +6,23 @@
 //! (Interpreter, Store, Parser, Deployer) for compiling order expressions
 //! used in `take_order()`.
 
-use alloy::network::EthereumWallet;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::{Address, B256, Bytes, U256, address, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolEvent as _;
 use rain_math_float::Float;
 use std::collections::HashMap;
-use url::Url;
 
 use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
-use st0x_hedge::bindings::IOrderBookV6::{self, TakeOrderV3};
-pub use st0x_hedge::bindings::{DeployableERC20, IERC20};
-use st0x_hedge::bindings::{
-    Deployer, Interpreter, OrderBook, Parser, Store as RainStore, TOFUTokenDecimals,
-};
+pub use st0x_evm::{IERC20, USDC_BASE};
+pub use st0x_hedge::bindings::DeployableERC20;
+use st0x_hedge::bindings::IRaindexV6::{self, TakeOrderV3};
+use st0x_hedge::bindings::{Deployer, Interpreter, Parser, RaindexV6, Store as RainStore};
 
 /// Rounds a Float to `decimals` decimal places and formats as a string.
 fn round_and_format(value: Float, decimals: u8) -> anyhow::Result<String> {
@@ -46,9 +45,68 @@ fn format_float(value: Float) -> anyhow::Result<String> {
         .map_err(|err| anyhow::anyhow!("format_with_scientific failed: {err:?}"))
 }
 
-/// Base chain USDC address, defined locally so e2e tests don't
-/// need `st0x_hedge` to export the constant.
-pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+// Rainlang interpreter components deploy to deterministic "zoltu" addresses; the
+// expression deployer references the parser/store/interpreter by these hardcoded
+// constants (see LibInterpreterDeploy in rainlang). Tests therefore etch each
+// runtime at its canonical address rather than deploying to sequential ones.
+const RAINLANG_INTERPRETER: Address = address!("0xb3A710b89A5569893dA4Ca0dB7D178593b5BE8a0");
+const RAINLANG_STORE: Address = address!("0x1Aa775533E28B1D843e1A589034984E3a62005DC");
+const RAINLANG_PARSER: Address = address!("0x9179445a637E6Ae72Bb38273944FAB96834488dd");
+const RAINLANG_EXPRESSION_DEPLOYER: Address =
+    address!("0xC9e1D673eD122193b28376016AC506De2fA20beE");
+
+/// Etches the Rainlang interpreter, store, parser, and expression deployer
+/// runtimes at their deterministic deployment addresses. The expression deployer
+/// hardcodes these addresses, so order evaluation only works when each runtime
+/// lives at its canonical address -- the alloy/anvil equivalent of upstream's
+/// `LibInterpreterDeploy.etchRainlang`.
+async fn etch_rainlang<P: Provider>(provider: &P) -> anyhow::Result<()> {
+    provider
+        .anvil_set_code(RAINLANG_INTERPRETER, Interpreter::DEPLOYED_BYTECODE.clone())
+        .await?;
+    provider
+        .anvil_set_code(RAINLANG_STORE, RainStore::DEPLOYED_BYTECODE.clone())
+        .await?;
+    provider
+        .anvil_set_code(RAINLANG_PARSER, Parser::DEPLOYED_BYTECODE.clone())
+        .await?;
+    provider
+        .anvil_set_code(
+            RAINLANG_EXPRESSION_DEPLOYER,
+            Deployer::DEPLOYED_BYTECODE.clone(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Deterministic singleton address of the TOFUTokenDecimals contract, hardcoded by
+/// the orderbook's `LibTOFUTokenDecimals.ensureDeployed` (which checks address + codehash).
+const TOFU_TOKEN_DECIMALS: Address = address!("0x200e12D10bb0c5E4a17e7018f0F1161919bb9389");
+
+/// Canonical TOFUTokenDecimals init bytecode, copied from rain-tofu-erc20-decimals'
+/// `LibTOFUTokenDecimals.TOFU_DECIMALS_EXPECTED_CREATION_CODE`. Deploying it and etching the
+/// resulting runtime at `TOFU_TOKEN_DECIMALS` yields the codehash `ensureDeployed` requires;
+/// rain.orderbook's own recompile of TOFUTokenDecimals.sol does not match that hash.
+const TOFU_DECIMALS_CREATION_CODE: &str = "0x6080604052348015600e575f80fd5b5061044b8061001c5f395ff3fe608060405234801561000f575f80fd5b506004361061004a575f3560e01c80630782d7e11461004e57806354636d2b14610078578063b7bad1b11461009d578063f5c36eaf146100b0575b5f80fd5b61006161005c366004610363565b6100c3565b60405161006f929190610403565b60405180910390f35b61008b610086366004610363565b6100d8565b60405160ff909116815260200161006f565b6100616100ab366004610363565b6100e9565b61008b6100be366004610363565b6100f5565b5f806100cf5f84610100565b91509150915091565b5f6100e35f836101f0565b92915050565b5f806100cf5f84610281565b5f6100e35f83610356565b73ffffffffffffffffffffffffffffffffffffffff81165f9081526020838152604080832081518083019092525460ff8082161515835261010090910416818301527f313ce56700000000000000000000000000000000000000000000000000000000808452839283908190816004818a5afa915060203d1015610182575f91505b811561019857505f5160ff811115610198575f91505b816101af57505050602001516003925090506101e9565b83516101c3575f955093506101e992505050565b836020015160ff1681146101d85760026101db565b60015b846020015195509550505050505b9250929050565b5f805f6101fd8585610281565b909250905060018260038111156102165761021661039d565b1415801561023557505f8260038111156102325761023261039d565b14155b156102795783826040517fee07877f000000000000000000000000000000000000000000000000000000008152600401610270929190610421565b60405180910390fd5b949350505050565b5f805f8061028f8686610100565b90925090505f8260038111156102a7576102a761039d565b0361034b576040805180820182526001815260ff838116602080840191825273ffffffffffffffffffffffffffffffffffffffff8a165f908152908b9052939093209151825493517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00009094169015157fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff161761010093909116929092029190911790555b909590945092505050565b5f805f6101fd8585610100565b5f60208284031215610373575f80fd5b813573ffffffffffffffffffffffffffffffffffffffff81168114610396575f80fd5b9392505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b600481106103ff577f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b9052565b6040810161041182856103ca565b60ff831660208301529392505050565b73ffffffffffffffffffffffffffffffffffffffff831681526040810161039660208301846103ca56";
+
+/// Deploys the canonical TOFUTokenDecimals init bytecode and etches the resulting
+/// runtime at [`TOFU_TOKEN_DECIMALS`]. The orderbook checks both the address and the
+/// codehash, so the runtime must come from executing the canonical creation code.
+async fn deploy_tofu_singleton<P: Provider>(provider: &P) -> anyhow::Result<()> {
+    let creation_code = alloy::hex::decode(TOFU_DECIMALS_CREATION_CODE)?;
+    let deployed = provider
+        .send_transaction(TransactionRequest::default().with_deploy_code(creation_code))
+        .await?
+        .get_receipt()
+        .await?
+        .contract_address
+        .ok_or_else(|| anyhow::anyhow!("TOFU deployment produced no contract address"))?;
+    let runtime = provider.get_code_at(deployed).await?;
+    provider
+        .anvil_set_code(TOFU_TOKEN_DECIMALS, runtime)
+        .await?;
+    Ok(())
+}
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -105,7 +163,7 @@ pub enum TakeDirection {
 /// taken by a separate account. Created by `setup_order()`, consumed by
 /// `take_prepared_order()`.
 pub struct PreparedOrder {
-    pub order: IOrderBookV6::OrderV4,
+    pub order: IRaindexV6::OrderV4,
     pub input_vault_id: B256,
     pub output_vault_id: B256,
     pub input_token: Address,
@@ -147,7 +205,22 @@ impl BaseChain<()> {
         // Auto-mine a block every second so that onchain transactions
         // requiring multiple confirmations (e.g., REQUIRED_CONFIRMATIONS=3
         // in ShareWrapper) complete on Anvil instead of hanging forever.
-        let anvil = Anvil::new().block_time(1).spawn();
+        //
+        // `--slots-in-an-epoch 1` (Foundry anvil flag) shrinks Anvil's block
+        // tag lag so the fill monitor can ingest within a short test. The e2e
+        // bot uses the `safe` tag (`Ctx::for_test` pins `ingestion_cutoff =
+        // Safe`). On reth/anvil `safe` tracks one epoch behind the tip and
+        // `finalized` two; with the default 32-slot epoch the lag is large
+        // enough that a brief e2e never mines past it -- ingestion is starved
+        // and the 120s poll times out. A 1-slot epoch drops the observed lag
+        // to a couple of blocks, which the 1s auto-mining clears within
+        // seconds. (If a future Anvil changes this relationship the failure
+        // is a loud e2e timeout, not a silent pass.)
+        let anvil = Anvil::new()
+            .block_time(1)
+            .arg("--slots-in-an-epoch")
+            .arg("1")
+            .spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let signer = PrivateKeySigner::from_bytes(&key)?;
@@ -159,7 +232,7 @@ impl BaseChain<()> {
             .connect(&anvil.endpoint())
             .await?;
 
-        let orderbook = OrderBook::deploy(&provider).await?;
+        let orderbook = RaindexV6::deploy(&provider).await?;
         let orderbook = *orderbook.address();
 
         // Place USDC contract at the canonical USDC_BASE address so vault
@@ -176,31 +249,13 @@ impl BaseChain<()> {
         // shares this Anvil provider (equity e2e tests).
         deploy_usdc_at(&provider, crate::cctp::USDC_ETHEREUM, owner).await?;
 
-        provider
-            .anvil_set_code(
-                address!("F66761F6b5F58202998D6Cd944C81b22Dc6d4f1E"),
-                TOFUTokenDecimals::DEPLOYED_BYTECODE.clone(),
-            )
-            .await?;
+        deploy_tofu_singleton(&provider).await?;
 
-        let interpreter = Interpreter::deploy(&provider).await?;
-        let store = RainStore::deploy(&provider).await?;
-        let parser = Parser::deploy(&provider).await?;
+        etch_rainlang(&provider).await?;
 
-        let interpreter = *interpreter.address();
-        let store = *store.address();
-
-        let deployer = Deployer::deploy(
-            &provider,
-            Deployer::RainterpreterExpressionDeployerConstructionConfigV2 {
-                interpreter,
-                store,
-                parser: *parser.address(),
-            },
-        )
-        .await?;
-
-        let deployer = *deployer.address();
+        let interpreter = RAINLANG_INTERPRETER;
+        let store = RAINLANG_STORE;
+        let deployer = RAINLANG_EXPRESSION_DEPLOYER;
 
         let taker_key = B256::from_slice(&anvil.keys()[1].to_bytes());
         let taker_signer = PrivateKeySigner::from_bytes(&taker_key)?;
@@ -251,11 +306,6 @@ impl BaseChain<()> {
 
 #[bon::bon]
 impl<P: Provider + Clone> BaseChain<P> {
-    /// Returns the WebSocket endpoint URL for the Anvil node.
-    pub fn ws_endpoint(&self) -> anyhow::Result<Url> {
-        Ok(self.anvil.ws_endpoint().parse()?)
-    }
-
     /// Mines `count` empty blocks.
     pub async fn mine_blocks(&self, count: u64) -> anyhow::Result<()> {
         for _ in 0..count {
@@ -340,7 +390,7 @@ impl<P: Provider + Clone> BaseChain<P> {
     /// Used by USDC rebalancing tests so the bot has a known vault to
     /// withdraw from (BaseToAlpaca) or deposit into (AlpacaToBase).
     pub async fn create_usdc_vault(&self, amount: U256) -> anyhow::Result<B256> {
-        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
+        let orderbook = IRaindexV6::IRaindexV6Instance::new(self.orderbook, &self.provider);
         let vault_id = B256::random();
 
         // Over-approve for Rain float precision rounding
@@ -389,7 +439,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         amount: U256,
         decimals: u8,
     ) -> anyhow::Result<()> {
-        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
+        let orderbook = IRaindexV6::IRaindexV6Instance::new(self.orderbook, &self.provider);
 
         // Over-approve for Rain float precision rounding
         IERC20::new(token, &self.provider)
@@ -445,7 +495,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get(symbol)
             .ok_or_else(|| anyhow::anyhow!("Equity token for {symbol} not deployed"))?;
 
-        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
+        let orderbook = IRaindexV6::IRaindexV6Instance::new(self.orderbook, &self.provider);
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
@@ -490,17 +540,17 @@ impl<P: Provider + Clone> BaseChain<P> {
             usdc_vault_id.unwrap_or_else(B256::random)
         };
 
-        let order_config = IOrderBookV6::OrderConfigV4 {
-            evaluable: IOrderBookV6::EvaluableV4 {
+        let order_config = IRaindexV6::OrderConfigV4 {
+            evaluable: IRaindexV6::EvaluableV4 {
                 interpreter: self.interpreter,
                 store: self.store,
                 bytecode: Bytes::from(parsed_bytecode),
             },
-            validInputs: vec![IOrderBookV6::IOV2 {
+            validInputs: vec![IRaindexV6::IOV2 {
                 token: input_token,
                 vaultId: input_vault_id,
             }],
-            validOutputs: vec![IOrderBookV6::IOV2 {
+            validOutputs: vec![IRaindexV6::IOV2 {
                 token: output_token,
                 vaultId: output_vault_id,
             }],
@@ -520,7 +570,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .inner
             .logs()
             .iter()
-            .find_map(|log| log.log_decode::<IOrderBookV6::AddOrderV3>().ok())
+            .find_map(|log| log.log_decode::<IRaindexV6::AddOrderV3>().ok())
             .ok_or_else(|| anyhow::anyhow!("AddOrderV3 event not found"))?;
         let order = add_event.data().order.clone();
 
@@ -595,8 +645,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         prepared: &PreparedOrder,
         max_amount: Option<Float>,
     ) -> anyhow::Result<TakeOrderResult> {
-        let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.taker_provider);
+        let orderbook = IRaindexV6::IRaindexV6Instance::new(self.orderbook, &self.taker_provider);
 
         // Approve taker's input token payment (taker pays input_token)
         DeployableERC20::new(prepared.input_token, &self.taker_provider)
@@ -621,7 +670,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get_inner();
         let max_io = max_amount.map_or(default_max, |f| f.get_inner());
 
-        let take_config = IOrderBookV6::TakeOrdersConfigV5 {
+        let take_config = IRaindexV6::TakeOrdersConfigV5 {
             minimumIO: B256::ZERO,
             maximumIO: max_io,
             maximumIORatio: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
@@ -629,7 +678,7 @@ impl<P: Provider + Clone> BaseChain<P> {
                 .0
                 .get_inner(),
             IOIsInput: true,
-            orders: vec![IOrderBookV6::TakeOrderConfigV4 {
+            orders: vec![IRaindexV6::TakeOrderConfigV4 {
                 order: prepared.order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(0),
@@ -707,7 +756,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get(symbol)
             .ok_or_else(|| anyhow::anyhow!("Equity token for {symbol} not deployed"))?;
 
-        let orderbook = IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.provider);
+        let orderbook = IRaindexV6::IRaindexV6Instance::new(self.orderbook, &self.provider);
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer, &self.provider);
 
         let is_sell = matches!(direction, TakeDirection::SellEquity);
@@ -745,17 +794,17 @@ impl<P: Provider + Clone> BaseChain<P> {
         let input_vault_id = B256::random();
         let output_vault_id = B256::random();
 
-        let order_config = IOrderBookV6::OrderConfigV4 {
-            evaluable: IOrderBookV6::EvaluableV4 {
+        let order_config = IRaindexV6::OrderConfigV4 {
+            evaluable: IRaindexV6::EvaluableV4 {
                 interpreter: self.interpreter,
                 store: self.store,
                 bytecode: Bytes::from(parsed_bytecode),
             },
-            validInputs: vec![IOrderBookV6::IOV2 {
+            validInputs: vec![IRaindexV6::IOV2 {
                 token: input_token,
                 vaultId: input_vault_id,
             }],
-            validOutputs: vec![IOrderBookV6::IOV2 {
+            validOutputs: vec![IRaindexV6::IOV2 {
                 token: output_token,
                 vaultId: output_vault_id,
             }],
@@ -775,7 +824,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .inner
             .logs()
             .iter()
-            .find_map(|log| log.log_decode::<IOrderBookV6::AddOrderV3>().ok())
+            .find_map(|log| log.log_decode::<IRaindexV6::AddOrderV3>().ok())
             .ok_or_else(|| anyhow::anyhow!("AddOrderV3 event not found"))?;
         let order = add_event.data().order.clone();
 
@@ -838,7 +887,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             .call()
             .await?;
 
-        let take_config = IOrderBookV6::TakeOrdersConfigV5 {
+        let take_config = IRaindexV6::TakeOrdersConfigV5 {
             minimumIO: B256::ZERO,
             maximumIO: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
                 .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
@@ -849,7 +898,7 @@ impl<P: Provider + Clone> BaseChain<P> {
                 .0
                 .get_inner(),
             IOIsInput: true,
-            orders: vec![IOrderBookV6::TakeOrderConfigV4 {
+            orders: vec![IRaindexV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(0),

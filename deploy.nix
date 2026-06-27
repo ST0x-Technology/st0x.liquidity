@@ -1,4 +1,5 @@
 {
+  lib,
   deploy-rs,
   self,
   environments,
@@ -14,23 +15,23 @@ let
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
 
-  services = import ./services.nix;
-  enabledServices = builtins.attrNames (
-    builtins.removeAttrs services (
-      builtins.filter (n: !services.${n}.enabled) (builtins.attrNames services)
-    )
-  );
-  # Explicit ordering: sort enabledServices by each service's declared `order`
+  inherit (import ./services.nix { inherit lib; }) enabled;
+
+  enabledNames = builtins.attrNames enabled;
+
+  # Explicit ordering: sort enabled services by each service's declared `order`
   # field so adding a new entry forces choosing its slot rather than inheriting
   # the alphabetical attribute order. Duplicate orders would produce a
   # non-deterministic activation sequence, so assert uniqueness here.
-  enabledOrders = map (n: services.${n}.order) enabledServices;
+  enabledOrders = map (name: enabled.${name}.order) enabledNames;
+
   uniqueOrders = builtins.foldl' (
     acc: o: if builtins.elem o acc then acc else acc ++ [ o ]
   ) [ ] enabledOrders;
+
   orderedServices =
     if (builtins.length enabledOrders) == (builtins.length uniqueOrders) then
-      builtins.sort (a: b: services.${a}.order < services.${b}.order) enabledServices
+      builtins.sort (a: b: enabled.${a}.order < enabled.${b}.order) enabledNames
     else
       throw "services.nix: duplicate `order` values among enabled services: ${builtins.toJSON enabledOrders}";
 
@@ -40,7 +41,7 @@ let
   mkServiceProfile =
     env: name:
     let
-      cfg = services.${name};
+      cfg = enabled.${name};
       pkg = self.packages.${system}.${cfg.package};
     in
     if cfg.kind == "st0x" then
@@ -91,10 +92,18 @@ let
     profilePath = "${profileBase}/${name}";
   };
 
+  # `hostname` here is an eval-time placeholder that keeps the flake pure.
+  # The real SSH target is the public IPv4 resolved from terraform state
+  # at deploy time and injected via deploy-rs's runtime `--hostname`
+  # override (see `deployPreamble`).
   mkNode =
-    { env, nixosConfig }:
     {
-      hostname = builtins.getEnv "DEPLOY_HOST";
+      env,
+      nixosConfig,
+      tailscaleMagicDnsName,
+    }:
+    {
+      hostname = tailscaleMagicDnsName;
       sshUser = "root";
       user = "root";
 
@@ -124,6 +133,8 @@ in
           name = cfg.nodeName;
           value = mkNode {
             inherit env;
+            inherit (cfg) tailscaleMagicDnsName;
+
             nixosConfig = self.nixosConfigurations.${cfg.nodeName};
           };
         }
@@ -149,7 +160,7 @@ in
         else
           "--debug-logs --skip-checks --remote-build";
 
-      nixFlags = "--impure --accept-flake-config --extra-experimental-features 'nix-command flakes'";
+      nixFlags = "--accept-flake-config --extra-experimental-features 'nix-command flakes'";
 
       mkEnvDeployScripts =
         env:
@@ -164,7 +175,6 @@ in
               echo "Using pre-set DEPLOY_HOST=$host_ip"
             else
               ${envInfraPkgs.resolveIp}
-              export DEPLOY_HOST="$host_ip"
             fi
 
             # Pin the host key from keys.nix so SSH verifies it during
@@ -195,8 +205,9 @@ in
               text = ''
                 ${deployPreamble}
                 ${prelude}
-                deploy ${deployFlags} ${extraDeployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
-                  -- ${nixFlags} "$@"
+                deploy ${deployFlags} ${extraDeployFlags} --hostname "$host_ip" \
+                  ''${ssh_flag:+"$ssh_flag"} "$@" ${target} \
+                  -- ${nixFlags}
               '';
             };
 

@@ -3,23 +3,19 @@
 
 use alloy::primitives::Address;
 use std::io::Write;
+use uuid::Uuid;
 
-use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
+use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, Wallet};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApi, ConversionDirection, Executor, FractionalShares, Positive,
-    Symbol,
+    AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionDirection,
+    Executor, FractionalShares, Network, Positive, Symbol, TokenSymbol, TransferStatus,
+    TravelRuleInfo, WhitelistEntry, WhitelistStatus,
 };
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
 use super::ConvertDirection;
-use crate::alpaca_wallet::{
-    AlpacaWalletService, Network, TokenSymbol, TransferStatus, TravelRuleInfo, WhitelistEntry,
-    WhitelistStatus,
-};
-use crate::bindings::IERC20;
-use crate::config::{BrokerCtx, Ctx};
-use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
+use st0x_config::{BrokerCtx, Ctx};
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
@@ -358,7 +354,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
             "missing [broker.travel_rule] in config -- required for Alpaca whitelist creation"
         )
     })?;
-    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+    let travel_rule_info = TravelRuleInfo::new(travel_rule_config.beneficiary_entity_name.clone());
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
@@ -462,7 +458,7 @@ pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
             "missing [broker.travel_rule] in config -- required for travel rule patching"
         )
     })?;
-    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+    let travel_rule_info = TravelRuleInfo::new(travel_rule_config.beneficiary_entity_name.clone());
 
     writeln!(
         stdout,
@@ -618,11 +614,12 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     };
 
     let amount_exact = amount.inner();
+    let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
     writeln!(stdout, "   Placing market order...")?;
 
     let order = executor
-        .convert_usdc_usd(amount_exact, conversion_direction)
+        .convert_usdc_usd(amount_exact, conversion_direction, &correlation_id)
         .await?;
 
     writeln!(stdout, "Conversion completed successfully!")?;
@@ -641,11 +638,11 @@ pub(super) async fn alpaca_convert_command<W: Write>(
             format_float_with_fallback(&price)
         )?;
     }
-    if let Some(filled_qty) = order.filled_quantity {
+    if let Some(filled_quantity) = order.filled_quantity {
         writeln!(
             stdout,
             "   Filled Quantity: {}",
-            format_float_with_fallback(&filled_qty)
+            format_float_with_fallback(&filled_quantity)
         )?;
     }
     if let (Some(price), Some(quantity)) = (order.filled_average_price, order.filled_quantity) {
@@ -714,11 +711,12 @@ mod tests {
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmCtx;
-    use crate::rebalancing::RebalancingCtx;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::RebalancingCtx;
+    use st0x_config::create_test_issuance_ctx;
+    use st0x_config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_float_macro::float;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -727,19 +725,23 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port: 8080,
+            board_port: 8081,
             evm: EvmCtx {
-                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -751,9 +753,8 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -798,16 +799,19 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port: 8080,
+            board_port: 8081,
             evm: EvmCtx {
-                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
+                ingestion_cutoff: IngestionCutoff::Safe,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
@@ -820,6 +824,7 @@ mod tests {
                     st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
             }),
             telemetry: None,
+            alerts: None,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
@@ -837,14 +842,13 @@ mod tests {
                     .call(),
             )),
             order_owner: Address::ZERO,
-            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
+            wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: Some(Address::ZERO),
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

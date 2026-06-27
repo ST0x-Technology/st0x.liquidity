@@ -37,12 +37,13 @@ use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
+use st0x_evm::{
+    EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    OpenChainErrorRegistry, Wallet, wait_for_node_sync,
+};
+use st0x_execution::{AlpacaAccountId, FractionalShares, Network, PollingConfig, Symbol};
 
 use super::{MintVerificationError, Tokenizer, TokenizerError};
-use crate::alpaca_wallet::{Network, PollingConfig};
-use crate::bindings::IERC20;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// High-level service for Alpaca tokenization operations.
@@ -128,6 +129,12 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         self.client
             .send_tokens_for_redemption::<Registry>(token, amount)
             .await
+    }
+
+    /// Wait for the redemption provider's RPC node to reach `block` before the
+    /// redemption transfer, polling the same provider the transfer uses.
+    pub(crate) async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        self.client.wait_for_block(block).await
     }
 
     /// Poll until Alpaca detects a redemption transfer.
@@ -669,6 +676,19 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         Ok(receipt.transaction_hash)
     }
 
+    /// Wait for this client's RPC node to reach `block` before a dependent
+    /// write, polling the wallet's own provider so the gate applies to the
+    /// node that performs the transfer.
+    async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        wait_for_node_sync(
+            self.wallet.provider(),
+            block,
+            NODE_SYNC_POLL_INTERVAL,
+            NODE_SYNC_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
     /// Find a redemption request by its onchain transaction hash.
     ///
     /// This polls the Alpaca API to check if they have detected a token transfer
@@ -925,6 +945,10 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         Self::redemption_wallet(self)
     }
 
+    async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        Self::wait_for_block(self, block).await
+    }
+
     async fn send_for_redemption(
         &self,
         token: Address,
@@ -1008,6 +1032,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
+    use crate::tokenized_equity_mint::issuer_request_id;
     use st0x_float_macro::float;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
@@ -1085,7 +1110,7 @@ pub(crate) mod tests {
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            issuer_request_id: IssuerRequestId::new("test-issuer-request-id"),
+            issuer_request_id: issuer_request_id("test-issuer-request-id"),
         }
     }
 
@@ -1095,6 +1120,9 @@ pub(crate) mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let request = create_mint_request();
+        let issuer_id = request.issuer_request_id.to_string();
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST)
@@ -1107,7 +1135,7 @@ pub(crate) mod tests {
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": "test-issuer-request-id"
+                    "issuer_request_id": issuer_id,
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1121,12 +1149,12 @@ pub(crate) mod tests {
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": "iss_req_456",
+                    "issuer_request_id": issuer_id,
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
 
-        let request = create_mint_request();
+        let expected_issuer_id = request.issuer_request_id.clone();
         let result = client.request_mint(request).await.unwrap();
 
         assert_eq!(result.id, TokenizationRequestId("tok_req_123".to_string()));
@@ -1138,10 +1166,7 @@ pub(crate) mod tests {
             Some("tAAPL".to_string())
         );
         assert_eq!(result.quantity, FractionalShares::new(float!(100.5)));
-        assert_eq!(
-            result.issuer_request_id,
-            Some(IssuerRequestId("iss_req_456".to_string()))
-        );
+        assert_eq!(result.issuer_request_id, Some(expected_issuer_id));
         assert!(logs_contain(
             "Alpaca tokenization mint response body received"
         ));
@@ -1519,6 +1544,35 @@ pub(crate) mod tests {
             balance, transfer_amount,
             "redemption wallet should have received tokens"
         );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_block_succeeds_when_node_already_at_block() {
+        let (_anvil, endpoint, key) = setup_anvil();
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+
+        // The wait polls the wallet's own provider, so a block it already
+        // reports must clear the gate on the first poll.
+        let current_block = wallet.signing_provider().get_block_number().await.unwrap();
+
+        let client = AlpacaTokenizationClient::new(
+            "http://unused.invalid".to_string(),
+            TEST_ACCOUNT_ID,
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            wallet,
+            Some(TEST_REDEMPTION_WALLET),
+        );
+
+        client
+            .wait_for_block(current_block)
+            .await
+            .expect("wait_for_block must succeed when the node is already at the block");
     }
 
     #[tokio::test]
@@ -1923,7 +1977,7 @@ pub(crate) mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let mint_result = service
-            .request_mint(symbol, quantity, wallet, IssuerRequestId::new("test-id"))
+            .request_mint(symbol, quantity, wallet, issuer_request_id("test-id"))
             .await
             .unwrap();
 
@@ -2017,7 +2071,8 @@ pub(crate) mod tests {
         let service =
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
-        let issuer_request_id = IssuerRequestId::new("our-tracking-id-123");
+        let expected_id = issuer_request_id("our-tracking-id-123");
+        let expected_id_str = expected_id.to_string();
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST)
@@ -2028,7 +2083,7 @@ pub(crate) mod tests {
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": "our-tracking-id-123"
+                    "issuer_request_id": expected_id_str,
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -2042,7 +2097,7 @@ pub(crate) mod tests {
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": "our-tracking-id-123",
+                    "issuer_request_id": expected_id_str,
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
@@ -2052,13 +2107,13 @@ pub(crate) mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = service
-            .request_mint(symbol, quantity, wallet, issuer_request_id.clone())
+            .request_mint(symbol, quantity, wallet, expected_id.clone())
             .await
             .unwrap();
 
         assert_eq!(
             result.issuer_request_id,
-            Some(issuer_request_id),
+            Some(expected_id),
             "Alpaca should return the same issuer_request_id we sent"
         );
 

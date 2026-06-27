@@ -2,10 +2,10 @@ use tracing::debug;
 #[cfg(test)]
 use tracing::info;
 
+use st0x_config::AssetsConfig;
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
 
-use crate::config::AssetsConfig;
 use crate::onchain::OnChainError;
 use crate::position::Position;
 
@@ -169,10 +169,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use st0x_float_macro::float;
 
     async fn create_test_position_infra(
@@ -376,7 +376,7 @@ mod tests {
         )
         .await;
 
-        let executor = MockExecutor::new().with_market_open(false);
+        let executor = MockExecutor::new().with_market_closed();
 
         let result = check_execution_readiness(
             &executor,
@@ -413,7 +413,7 @@ mod tests {
         )
         .await;
 
-        let executor = MockExecutor::new().with_market_open(true);
+        let executor = MockExecutor::new();
 
         let params = check_execution_readiness(
             &executor,
@@ -444,7 +444,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         // Simulate market closed - accumulate multiple trades
-        let closed_executor = MockExecutor::new().with_market_open(false);
+        let closed_executor = MockExecutor::new().with_market_closed();
 
         // First trade while market closed
         initialize_position_with_fill(
@@ -509,7 +509,7 @@ mod tests {
         );
 
         // Market opens - should now execute
-        let open_executor = MockExecutor::new().with_market_open(true);
+        let open_executor = MockExecutor::new();
 
         let params = check_execution_readiness(
             &open_executor,
@@ -557,9 +557,11 @@ mod tests {
                     EquityAssetConfig {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
+                        pyth_feed_id: None,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: Some(
                             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
                         ),

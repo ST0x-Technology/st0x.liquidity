@@ -7,10 +7,10 @@ use tracing::{debug, trace};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
-use super::{AlpacaBrokerApiError, TimeInForce};
+use super::{AlpacaBrokerApiError, CryptoOrderFailureReason, TimeInForce};
 use crate::{
-    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
-    Symbol, Usd, deserialize_float_from_number_or_string,
+    ClientOrderId, Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus,
+    OrderUpdate, Positive, Symbol, Usd, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
@@ -120,6 +120,7 @@ pub(super) struct OrderRequest {
     pub order_type: &'static str,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
+    pub client_order_id: ClientOrderId,
 }
 
 /// Order request for placing limit orders.
@@ -203,6 +204,9 @@ pub(crate) struct CryptoOrderRequest {
     #[serde(rename = "type")]
     pub order_type: &'static str,
     pub time_in_force: &'static str,
+    /// Caller-supplied idempotency/correlation key. Recorded before placement
+    /// so a crashed conversion can be looked up by this key on resume.
+    pub client_order_id: ClientOrderId,
 }
 
 /// Response from a crypto order placement
@@ -231,20 +235,56 @@ pub struct CryptoOrderResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Terminal/intermediate decision for a crypto order, exposing the outcome
+/// without leaking the private `BrokerOrderStatus`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoOrderOutcome {
+    Filled,
+    Pending,
+    Failed(CryptoOrderFailureReason),
+}
+
 impl CryptoOrderResponse {
     /// Returns the status as a display-friendly string.
     pub fn status_display(&self) -> &'static str {
+        use BrokerOrderStatus::*;
+
         match self.status {
-            BrokerOrderStatus::Filled => "filled",
-            BrokerOrderStatus::New => "new",
-            BrokerOrderStatus::PendingNew => "pending_new",
-            BrokerOrderStatus::PartiallyFilled => "partially_filled",
-            BrokerOrderStatus::Canceled => "canceled",
-            BrokerOrderStatus::Expired => "expired",
-            BrokerOrderStatus::Rejected => "rejected",
-            BrokerOrderStatus::Accepted => "accepted",
+            Filled => "filled",
+            New => "new",
+            PendingNew => "pending_new",
+            PartiallyFilled => "partially_filled",
+            Canceled => "canceled",
+            Expired => "expired",
+            Rejected => "rejected",
+            Accepted => "accepted",
             _ => "other",
         }
+    }
+
+    /// Classifies the order's current status into a fill/pending/failed outcome,
+    /// consistent with the terminal mapping in `map_broker_status_to_order_status`.
+    ///
+    /// The match is exhaustive (no wildcard) so a newly added Alpaca status forces
+    /// a compile error here rather than silently mapping to `Pending` and retrying
+    /// forever.
+    pub fn classify(&self) -> CryptoOrderOutcome {
+        use BrokerOrderStatus::*;
+
+        let reason = match self.status {
+            Filled => return CryptoOrderOutcome::Filled,
+            New | PendingNew | PartiallyFilled | Accepted | AcceptedForBidding | PendingCancel
+            | PendingReplace | Stopped => return CryptoOrderOutcome::Pending,
+            Canceled => CryptoOrderFailureReason::Canceled,
+            Expired => CryptoOrderFailureReason::Expired,
+            Rejected => CryptoOrderFailureReason::Rejected,
+            DoneForDay => CryptoOrderFailureReason::DoneForDay,
+            Replaced => CryptoOrderFailureReason::Replaced,
+            Suspended => CryptoOrderFailureReason::Suspended,
+            Calculated => CryptoOrderFailureReason::Calculated,
+        };
+
+        CryptoOrderOutcome::Failed(reason)
     }
 }
 
@@ -305,17 +345,83 @@ pub(super) async fn place_market_order(
         time_in_force: time_in_force.as_api_str(),
         // Alpaca only allows extended_hours=true for limit orders, not market orders
         extended_hours: false,
+        client_order_id: market_order.client_order_id.clone(),
     };
 
-    let response = client.place_order(&request).await?;
+    // Alpaca rejects a re-used `client_order_id` on an active order with a 422
+    // ("client_order_id must be unique"), not a duplicate-tolerant 2xx. That is
+    // not a real failure: it means a prior attempt's 2xx response was lost after
+    // the broker already recorded the order. Reconcile by adopting the order the
+    // broker actually accepted (looked up by `client_order_id`), so the retry is
+    // idempotent instead of failing and leaving the position un-hedged. The
+    // adopted order's quantity is the broker's recorded intent, which may differ
+    // from this attempt's recomputed `placed_shares`; any residual is picked up
+    // by the next position scan.
+    let (order_id, shares) = match client.place_order(&request).await {
+        Ok(response) => (response.id, placed_shares),
+        Err(error) if is_duplicate_client_order_id(&error) => {
+            debug!(
+                client_order_id = %market_order.client_order_id,
+                "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
+            );
+            let existing = client
+                .get_order_by_client_order_id(&market_order.client_order_id)
+                .await?
+                .ok_or_else(|| AlpacaBrokerApiError::DuplicateOrderNotFound {
+                    client_order_id: market_order.client_order_id.clone(),
+                })?;
+            (existing.id, existing.quantity)
+        }
+        Err(error) => return Err(error),
+    };
 
     Ok(OrderPlacement {
-        order_id: response.id.to_string(),
+        order_id: order_id.to_string(),
         symbol: market_order.symbol,
-        shares: placed_shares,
+        shares,
         direction: market_order.direction,
         placed_at: Utc::now(),
     })
+}
+
+/// Alpaca returns a 422 with "client_order_id must be unique" when a placement
+/// re-uses a `client_order_id` already attached to an active order. This is the
+/// recoverable duplicate-submission case (the original 2xx was lost in flight),
+/// distinct from other 422s such as insufficient buying power or invalid order.
+fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
+    use AlpacaBrokerApiError::*;
+
+    match error {
+        ApiError {
+            status, message, ..
+        } => {
+            *status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                && message.contains("client_order_id must be unique")
+        }
+        HttpClient(_)
+        | JsonParse(_)
+        | InvalidHeader(_)
+        | InvalidOrderId(_)
+        | IncompleteFilledOrder { .. }
+        | AccountNotActive { .. }
+        | CryptoOrderFailed { .. }
+        | DuplicateOrderNotFound { .. }
+        | CalendarIterationInvariantViolation
+        | AssetNotActive { .. }
+        | AssetNotTradable { .. }
+        | InvalidLimitPricePrecision { .. }
+        | UsdBalanceConversion(_)
+        | FractionalCents(_)
+        | InvalidSymbol(_)
+        | MissingPositionQuantity
+        | BelowPrecision { .. }
+        | UsdcBelowPrecision { .. }
+        | UsdcPrecisionExceeded { .. }
+        | NotPositive(_)
+        | FloatConversion(_)
+        | LatestTrade(_)
+        | CounterTradeCost(_) => false,
+    }
 }
 
 pub(super) async fn place_limit_order(
@@ -478,6 +584,7 @@ pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
     amount: Float,
     direction: ConversionDirection,
+    client_order_id: &ClientOrderId,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
     let placed_amount = validate_usdc_amount_for_alpaca_precision(amount)?;
     let side = match direction {
@@ -485,7 +592,7 @@ pub(crate) async fn convert_usdc_usd(
         ConversionDirection::UsdToUsdc => OrderSide::Buy,
     };
 
-    debug!(?side, amount = ?placed_amount, "Placing USDC/USD conversion order");
+    debug!(?side, amount = ?placed_amount, %client_order_id, "Placing USDC/USD conversion order");
 
     let request = CryptoOrderRequest {
         symbol: "USDCUSD".to_string(),
@@ -493,6 +600,7 @@ pub(crate) async fn convert_usdc_usd(
         side,
         order_type: "market",
         time_in_force: "gtc",
+        client_order_id: client_order_id.clone(),
     };
 
     client.place_crypto_order(&request).await
@@ -503,27 +611,29 @@ pub(crate) async fn poll_crypto_order_until_filled(
     client: &AlpacaBrokerApiClient,
     order_id: Uuid,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    use BrokerOrderStatus::*;
+
     loop {
         let order = client.get_crypto_order(order_id).await?;
 
         match order.status {
-            BrokerOrderStatus::Filled => return Ok(order),
-            BrokerOrderStatus::Canceled => {
+            Filled => return Ok(order),
+            Canceled => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    reason: super::CryptoOrderFailureReason::Canceled,
+                    reason: CryptoOrderFailureReason::Canceled,
                 });
             }
-            BrokerOrderStatus::Expired => {
+            Expired => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    reason: super::CryptoOrderFailureReason::Expired,
+                    reason: CryptoOrderFailureReason::Expired,
                 });
             }
-            BrokerOrderStatus::Rejected => {
+            Rejected => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    reason: super::CryptoOrderFailureReason::Rejected,
+                    reason: CryptoOrderFailureReason::Rejected,
                 });
             }
             _ => {
@@ -542,16 +652,20 @@ pub(crate) async fn poll_crypto_order_until_filled(
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use proptest::prelude::*;
+    use reqwest::StatusCode;
     use serde_json::json;
+    use uuid::uuid;
 
     use super::*;
+    use crate::ClientOrderId;
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
     use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
@@ -562,6 +676,64 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        }
+    }
+
+    #[test]
+    fn classify_maps_every_broker_status_to_its_outcome() {
+        use crate::alpaca_broker_api::CryptoOrderFailureReason;
+
+        let cases = [
+            ("filled", CryptoOrderOutcome::Filled),
+            ("new", CryptoOrderOutcome::Pending),
+            ("pending_new", CryptoOrderOutcome::Pending),
+            ("partially_filled", CryptoOrderOutcome::Pending),
+            ("accepted", CryptoOrderOutcome::Pending),
+            ("accepted_for_bidding", CryptoOrderOutcome::Pending),
+            ("pending_cancel", CryptoOrderOutcome::Pending),
+            ("pending_replace", CryptoOrderOutcome::Pending),
+            ("stopped", CryptoOrderOutcome::Pending),
+            (
+                "canceled",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled),
+            ),
+            (
+                "expired",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Expired),
+            ),
+            (
+                "rejected",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Rejected),
+            ),
+            (
+                "done_for_day",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::DoneForDay),
+            ),
+            (
+                "replaced",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Replaced),
+            ),
+            (
+                "suspended",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Suspended),
+            ),
+            (
+                "calculated",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Calculated),
+            ),
+        ];
+
+        for (status, expected) in cases {
+            let order: CryptoOrderResponse = serde_json::from_value(json!({
+                "id": "904837e3-3b76-47ec-b432-046db621571b",
+                "symbol": "USDCUSD",
+                "qty": "100",
+                "status": status,
+                "created_at": "2025-01-06T12:00:00Z"
+            }))
+            .unwrap();
+
+            assert_eq!(order.classify(), expected, "status {status} misclassified");
         }
     }
 
@@ -579,7 +751,8 @@ mod tests {
                     "side": "buy",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "33333333-3333-4333-8333-333333333333"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -598,6 +771,9 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "33333333-3333-4333-8333-333333333333"
+            )),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -625,7 +801,8 @@ mod tests {
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "44444444-4444-4444-8444-444444444444"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -644,6 +821,9 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "44444444-4444-4444-8444-444444444444"
+            )),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -655,6 +835,155 @@ mod tests {
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner(), FractionalShares::new(float!(50)));
         assert_eq!(placement.direction, Direction::Sell);
+    }
+
+    #[tokio::test]
+    async fn place_market_order_reconciles_duplicate_client_order_id() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client_order_uuid = uuid!("66666666-6666-4666-8666-666666666666");
+        let client_order_id = client_order_uuid.to_string();
+        let existing_order_id = "904837e3-3b76-47ec-b432-046db621571b";
+
+        // The broker rejects the re-used client_order_id with a 422 because it
+        // already recorded the original attempt (whose 2xx was lost in flight).
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "client_order_id must be unique"}));
+        });
+
+        // We reconcile by adopting the order the broker actually accepted.
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(
+                    "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+                )
+                .query_param("client_order_id", client_order_id.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": existing_order_id,
+                    "symbol": "AAPL",
+                    "qty": "7",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            // This attempt's recomputed intent is 10 shares, but the broker
+            // already holds the original 7-share order under this key.
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(client_order_uuid),
+        };
+
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        // Adopts the broker's recorded order id and its recorded quantity (7),
+        // not this attempt's recomputed 10 shares -- the residual is left for
+        // the next position scan to hedge.
+        assert_eq!(placement.order_id, existing_order_id);
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(7)));
+        assert_eq!(placement.direction, Direction::Buy);
+    }
+
+    #[tokio::test]
+    async fn place_market_order_errors_when_duplicate_order_not_found() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client_order_uuid = uuid!("77777777-7777-4777-8777-777777777777");
+
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "client_order_id must be unique"}));
+        });
+
+        // The broker reported a duplicate but the lookup finds nothing -- an
+        // inconsistent state that must surface as an error so the job retries.
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+            );
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(json!({"code": 40_410_000_u64, "message": "order not found"}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(client_order_uuid),
+        };
+
+        let error = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::DuplicateOrderNotFound { ref client_order_id }
+                    if client_order_id == &ClientOrderId::from_uuid(client_order_uuid)
+            ),
+            "expected DuplicateOrderNotFound, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_market_order_propagates_non_duplicate_422() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        // A 422 that is NOT the duplicate-key case must propagate unchanged and
+        // must not trigger the by-client-order-id reconciliation lookup.
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "insufficient buying power"}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "88888888-8888-4888-8888-888888888888"
+            )),
+        };
+
+        let error = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        place_mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 422
+            ),
+            "expected a propagated 422 ApiError, got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -973,6 +1302,9 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
+        let client_order_id =
+            ClientOrderId::from_uuid(uuid!("11111111-1111-4111-8111-111111111111"));
+
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
@@ -981,7 +1313,8 @@ mod tests {
                     "qty": "1000.5",
                     "side": "sell",
                     "type": "market",
-                    "time_in_force": "gtc"
+                    "time_in_force": "gtc",
+                    "client_order_id": "11111111-1111-4111-8111-111111111111"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1000,9 +1333,14 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = float!(1000.5);
 
-        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd)
-            .await
-            .unwrap();
+        let order = convert_usdc_usd(
+            &client,
+            amount,
+            ConversionDirection::UsdcToUsd,
+            &client_order_id,
+        )
+        .await
+        .unwrap();
 
         mock.assert();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
@@ -1016,6 +1354,9 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
+        let client_order_id =
+            ClientOrderId::from_uuid(uuid!("22222222-2222-4222-8222-222222222222"));
+
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
@@ -1024,7 +1365,8 @@ mod tests {
                     "qty": "500",
                     "side": "buy",
                     "type": "market",
-                    "time_in_force": "gtc"
+                    "time_in_force": "gtc",
+                    "client_order_id": "22222222-2222-4222-8222-222222222222"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1043,9 +1385,14 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = float!(500);
 
-        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc)
-            .await
-            .unwrap();
+        let order = convert_usdc_usd(
+            &client,
+            amount,
+            ConversionDirection::UsdToUsdc,
+            &client_order_id,
+        )
+        .await
+        .unwrap();
 
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
@@ -1064,6 +1411,7 @@ mod tests {
             &client,
             float!(1000.1234567),
             ConversionDirection::UsdToUsdc,
+            &ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await
         .unwrap_err();
@@ -1094,7 +1442,8 @@ mod tests {
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "55555555-5555-4555-8555-555555555555"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1116,6 +1465,9 @@ mod tests {
             symbol: Symbol::new("RKLB").unwrap(),
             shares: Positive::new(FractionalShares::new(onchain_shares)).unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "55555555-5555-4555-8555-555555555555"
+            )),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -1146,6 +1498,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(tiny)).unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let err = place_market_order(&client, market_order, TimeInForce::Day)
@@ -1278,5 +1631,46 @@ mod tests {
             make_order(BrokerOrderStatus::Canceled).status_display(),
             "canceled"
         );
+    }
+
+    fn api_error(status: StatusCode, message: impl Into<String>) -> AlpacaBrokerApiError {
+        AlpacaBrokerApiError::ApiError {
+            status,
+            alpaca_code: None,
+            message: message.into(),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn duplicate_client_order_id_detected_for_422_unique_violation(
+            prefix in "\\PC*",
+            suffix in "\\PC*",
+        ) {
+            let message = format!("{prefix}client_order_id must be unique{suffix}");
+            let error = api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+            prop_assert!(is_duplicate_client_order_id(&error));
+        }
+
+        #[test]
+        fn duplicate_client_order_id_rejects_non_422_status(
+            status_code in 100u16..600u16,
+            message in "\\PC*",
+        ) {
+            prop_assume!(status_code != StatusCode::UNPROCESSABLE_ENTITY.as_u16());
+            let status = StatusCode::from_u16(status_code)
+                .expect("status codes in 100..600 are valid HTTP codes");
+            let error = api_error(status, message);
+            prop_assert!(!is_duplicate_client_order_id(&error));
+        }
+
+        #[test]
+        fn duplicate_client_order_id_rejects_422_without_unique_message(
+            message in prop::string::string_regex("([^\n]|\\n)*").unwrap(),
+        ) {
+            prop_assume!(!message.contains("client_order_id must be unique"));
+            let error = api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+            prop_assert!(!is_duplicate_client_order_id(&error));
+        }
     }
 }

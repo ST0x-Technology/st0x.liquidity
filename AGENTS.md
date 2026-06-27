@@ -42,9 +42,9 @@ the limit:
 
 - **README.md** — if project structure, features, commands, or architecture
   changed
-- **ROADMAP.md** — mark completed issues, link PRs. When a PR is chained
-  (depends on a parent PR), mark both as done in the roadmap so it's up to date
-  by the time they merge.
+- **Linear** — move completed issues to Done and link the PR. When a PR is
+  chained (depends on a parent PR), close both so status is current by the time
+  they merge.
 - **`docs/`** — when research or trial-and-error reveals non-obvious patterns,
   pitfalls, or framework behavior, document it in the relevant `docs/` file (or
   create a new one) to prevent rediscovery. Prioritize documenting:
@@ -74,6 +74,9 @@ permission to do the obvious corrective work.
   already told you what to do wastes their time and signals you weren't
   listening. Only stop and ask when you are actually blocked on a decision the
   user must make, not as a polite checkpoint.
+- **When you need user input, use the structured input prompt your tooling
+  exposes -- not prose at the end of a long response.** Wall-of-text questions
+  get missed. Batch all open decisions in one prompt, not a trickle.
 
 ## Planning Hierarchy
 
@@ -81,14 +84,13 @@ The project uses a strict document hierarchy:
 
 1. **SPEC.md** - Source of truth for system behavior. Features documented here
    before implementation.
-2. **ROADMAP.md / GitHub Issues** - Downstream from spec. Describe problems, not
-   solutions.
+2. **Linear issues/projects** - Downstream from spec. Describe problems, not
+   solutions. See [docs/linear-workflow.md](docs/linear-workflow.md).
 3. **Planning** - Downstream from issues. Implementation plans before coding.
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
 
-**Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
-plan the implementation.
+**Before implementing:** SPEC.md -> Linear issue -> plan.
 
 ### Goal-Oriented Planning
 
@@ -114,19 +116,19 @@ Decompose epics to maximize independent parallel execution:
 7. **Converge to a single terminal node.** One final PR depends on all parallel
    streams for integration.
 
-### Managing Epics in the Roadmap
+### Managing Epics in Linear
 
-An epic is a roadmap subsection grouping related issues toward a single goal.
+An epic is a Linear project grouping related issues toward a single goal. See
+[docs/linear-workflow.md](docs/linear-workflow.md) for issue-vs-project rules.
 
-- **Lead with motivation**: One or two sentences explaining why this work
-  matters and what the end state looks like.
-- **Show the dependency structure**: Use a Mermaid diagram (GitHub renders them
-  natively) to make the execution order and parallelism obvious at a glance.
-- **Reference issues, not solutions**: Each item links to a GitHub issue. The
-  issue describes the desired outcome; the PR (added later) describes the
-  solution.
-- **Mark progress inline**: `[x]` with PR link as branches merge. When all items
-  complete, move the section to "Completed."
+- **Lead with motivation**: the project description states why this work matters
+  and what the end state looks like.
+- **Show the dependency structure**: use issue relations (blocks/blocked-by) and
+  sub-issues so execution order and parallelism are explicit.
+- **Reference issues, not solutions**: each issue describes the desired outcome;
+  the PR (linked later) describes the solution.
+- **Mark progress via status**: advance issues through workflow states and link
+  the PR as branches merge; the project completes when its issues do.
 
 ## Plan & Review
 
@@ -136,6 +138,8 @@ An epic is a roadmap subsection grouping related issues toward a single goal.
   progresses.
 - Clear completed tasks from the active list so the remaining work is always
   obvious.
+- **Questions awaiting user answers are tasks: track them.** Untracked prose
+  questions get lost when the user replies about something else.
 
 ### While implementing
 
@@ -164,7 +168,7 @@ immediately. Do not paraphrase the request back as a confirmation step.
 When the user points out an issue, bug, or problem - fix it immediately. Do not
 ask "Want me to fix this?" or "Should I address this?". The user never sends
 messages just for the sake of it; when they point out issues, they expect action
-(usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
+(usually a fix, sometimes reproducing, opening a Linear issue, etc. based on
 context).
 
 **CRITICAL: Re-evaluate all work when a pattern is identified.** When the user
@@ -270,24 +274,19 @@ binary).
 
 **CRITICAL: If Rust build fails with sqlx macro errors like "unable to open
 database file" or "(code: 14)", run `sqlx db reset -y` to fix the database.**
-This is the proper solution - NEVER try workarounds like
-`DATABASE_URL=sqlite://:memory:` or other hacks.
+NEVER use workarounds like `DATABASE_URL=sqlite://:memory:`.
 
-**CRITICAL: NEVER manually create migration files.** Always use
-`sqlx migrate add
-<migration_name>` to create migrations. This ensures proper
-timestamping and sequencing.
+**CRITICAL: NEVER manually create migration files.** Use
+`sqlx migrate add <migration_name>` for proper timestamping and sequencing.
 
-**CRITICAL: New worktrees require database setup.** When working in a new git
-worktree, you will encounter sqlx compile errors like "unable to open database
-file". Fix this by running `sqlx db reset -y` to create and migrate the local
-database before running any cargo commands.
+**CRITICAL: New worktrees require database setup.** A new worktree will hit sqlx
+compile errors like "unable to open database file". Run `sqlx db reset -y` to
+create and migrate the local database before any cargo commands.
 
 ### Dependency Management
 
-**CRITICAL: NEVER manually edit `Cargo.toml` to add dependencies.** Always use
-`cargo add <crate_name>` to add dependencies. This ensures proper version
-resolution and feature selection.
+**CRITICAL: NEVER manually edit `Cargo.toml` to add dependencies.** Use
+`cargo add <crate_name>` for proper version resolution and feature selection.
 
 - `cargo add <crate_name>` - Add a dependency to the current crate
 - `cargo add <crate_name> --dev` - Add a dev-dependency
@@ -347,53 +346,47 @@ convention -- new generated paths should not extend that list.
   you want to understand CLI commands or configuration options, read the code.
   If you want to test functionality, write proper tests. There is never a reason
   to run the application speculatively.
-- When handling clippy errors about function lengths or cognitive complexity,
-  don't split up the functions more than necessary to get below the limit.
-  Instead ask the user if we can add a clippy allow for that error.
+- When clippy flags function length (`too_many_lines`) or cognitive complexity,
+  treat suppression as the LAST resort and work the options in order first: (1)
+  extract a genuine logical chunk -- a cohesive multi-step unit, never a
+  one-liner helper; (2) if a repeated pattern is driving the blowout, factor the
+  repetition out; (3) if it is irreducible boilerplate, consider a custom macro.
+  Only when none of these can bring the function under the threshold without
+  making the code worse may an allow be considered -- and adding any
+  `#[allow(...)]` requires EXPLICIT user permission first (per the Quality
+  Control Policy). Precedent elsewhere in the codebase is NOT permission.
 
-### Updating ROADMAP.md
+### Push policy
 
-After completing work or creating new issues, update ROADMAP.md:
+master is protected (PR + CI + 2 approvals), so mistakes can't publish to
+master. For feature branches, push is part of the work.
 
-**Section ordering (newest first):**
+- **Default: `gt ss`** to submit the whole stack. Plain `git push` leaves
+  restacked descendants stale.
+- **In-flight CI:** pushing cancels in-progress CI; hold if you don't want it
+  restarted.
+- **Shared stacks:** `gt ss` would clobber upstack work; use `gt submit` on
+  current + downstack only. If unsure, ask.
 
-The roadmap is ordered with highest priority / most recent work at the top:
+### Commit message hygiene
 
-1. **Current Development Focus** - Active work and immediate priorities
-2. **Backlog sections** - Planned future work by category
-3. **Completed sections** - Finished work, ordered newest to oldest
+Set the message at `gt create` time. After that, use `gt modify` without `-m` so
+the existing message stays. If amended work has different scope than the
+branch's message, it belongs on a different branch -- don't rewrite the message
+to absorb it.
 
-This ordering ensures readers see current priorities immediately without
-scrolling past historical work. When adding new "Completed" sections, add them
-above older completed sections.
+### Updating Linear
 
-**After completing a plan:**
+After completing work or creating issues, keep Linear current:
 
-1. Mark completed issues as `[x]` with PR link
-2. Use this format:
-   ```markdown
-   - [x] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
-     - PR: [#M PR title](https://github.com/ST0x-Technology/st0x.liquidity/pull/M)
-   ```
-3. Move completed items from "Current Development Focus" to the appropriate
-   "Completed" section (or create a new one if it represents a milestone)
-
-**When creating new issues:**
-
-1. Add the issue to the appropriate **existing** roadmap section. Do not create
-   a new section for a single issue — only create subsections when grouping
-   multiple related items. If no existing section fits, add to the closest
-   match.
-2. Use this format:
-   ```markdown
-   - [ ] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
-   ```
-
-**Verification:**
-
-- Use `gh issue list --state all` and `gh pr list --state all` to cross-check
-- Ensure no issues are marked `[x]` in ROADMAP.md but still open on GitHub
-- Ensure all recent closed issues/PRs are reflected in the roadmap
+- **Completed work**: move the issue to Done and link the merged PR. If a PR is
+  chained on a parent, close both so status reflects reality at merge time.
+- **New issues**: file under the right project/milestone per
+  [docs/linear-workflow.md](docs/linear-workflow.md). Bundle a tight cluster of
+  related issues under one parent issue.
+- **Verification**: cross-check with `linear issue list` (issues) and
+  `gh pr list --state all` (PRs). No issue should sit Done with its PR unmerged,
+  and no merged PR should leave its issue open.
 
 ## Architecture Overview
 
@@ -415,18 +408,28 @@ For detailed implementation requirements, see @crates/execution/AGENTS.md
 
 ### Core Flow
 
-The main event loop (`src/lib.rs`) monitors WebSocket streams (`ClearV2`,
-`TakeOrderV2`) from Raindex, converts events to `Trade` objects, and spawns
-async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
+The `OrderFillMonitor` (`src/conductor/monitor/order_fills.rs`) polls
+`ClearV3`/`TakeOrderV3` fills via HTTP `eth_getLogs` and enqueues each fill as
+an `AccountForDexTrade` job into the apalis `DexTradeAccountingJobQueue`. The
+job worker resolves the symbol, discovers vaults, records the `OnChainTrade`,
+updates the `Position` aggregate, and places an offsetting broker order.
+Idempotency via `(tx_hash, log_index)` keys.
 
 ### Configuration
 
 Plaintext config (`--config`, see `example.config.toml`) and encrypted secrets
 (`--secrets`, see `example.secrets.toml`).
 
-**CRITICAL: No silent fallback defaults.** Unless explicitly told otherwise,
-every operational parameter must be explicitly configured -- missing config
-fields must fail in tests and at startup, not silently assume values.
+**CRITICAL: No silent fallback defaults.** Unless told otherwise, every
+operational parameter must be explicitly configured -- missing fields must fail
+in tests and at startup, never assume values.
+
+**CRITICAL: A secrets-schema change needs an encrypted-secret update.** When a
+field is added to or required in the secrets file, the deployed
+`secret/st0x-hedge.toml.age` (shared by prod + staging) must gain it before
+deploy, or the `validate-config` gate in `deploy.nix` fails the deploy closed.
+CI cannot see it, so reviewers and review-agents must treat a secrets-schema
+change with no matching `.age` update as a blocker.
 
 ### Naming Conventions
 
@@ -453,13 +456,11 @@ is the source of truth for terminology and naming conventions.
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `AlpacaBrokerApiError`) with proper propagation
 - **CRITICAL: Onchain Transaction Confirmations**: All onchain operations must
-  explicitly wait for the configured number of confirmations before proceeding.
-  Load-balanced RPC providers (like dRPC) may route subsequent requests to
-  different nodes that haven't seen recent transactions yet. Use
-  `REQUIRED_CONFIRMATIONS` from `crate::onchain` and call
-  `.with_required_confirmations(self.required_confirmations).get_receipt()` on
-  all pending transactions. Never use bare `.get_receipt().await` in production
-  code paths.
+  wait for the configured confirmations -- load-balanced RPC providers (e.g.
+  dRPC) may route later requests to nodes that haven't seen the tx. Call
+  `.with_required_confirmations(self.required_confirmations).get_receipt()`
+  (count from `REQUIRED_CONFIRMATIONS` in `crate::onchain`) on all pending txs;
+  never bare `.get_receipt().await` in production.
 - **CRITICAL: CQRS/Event Sourcing Architecture**: **NEVER write directly to the
   `events` table** — no direct INSERTs, no manual sequence numbers, no bypassing
   `CqrsFramework`. Always use `CqrsFramework::execute()` or
@@ -610,12 +611,6 @@ reviewing code that uses configuration instead of reading secrets directly.
     input regardless of surrounding bytes)
   - Numeric operations where edge cases are hard to enumerate manually
 
-#### Writing Meaningful Tests
-
-Tests must verify application logic, not language features. Testing struct field
-assignments is useless; test actual behavior like
-`config.calculate_next_poll_delay()` returning expected values.
-
 ### Workflow Best Practices
 
 - **Incremental verification during development** -- scope checks to the package
@@ -626,12 +621,19 @@ assignments is useless; test actual behavior like
   3. `cargo clippy -p <crate>` only after all substantive edits to that crate
      are done
   4. Reserve `--workspace` variants for the final verification pass
-- **Final verification before handing over** (skip if only
-  documentation/markdown files were changed). Run full workspace checks in this
-  order to fail fast:
-  1. `cargo check --workspace` - catches compilation errors across all crates
-  2. `cargo nextest run --workspace --all-features` - full test suite including
-     e2e
+- **Final verification before handing over** (skip for doc-only changes):
+  `nix run .#ci` enters the right dev shells (`ci-backend`, `ci-dashboard`) and
+  runs the full matrix end-to-end -- backend `cargo check` (with and without
+  `--all-features`), `cargo nextest run`, `cargo clippy`, `cargo fmt --check`,
+  plus dashboard `bun.nix` freshness check, DTO regeneration, lint,
+  `svelte-check`. Mirrors CI.
+
+  For iteration (e.g. backend-only), run individual steps in the corresponding
+  shell:
+  1. `cargo check --workspace`
+  2. `cargo nextest run --workspace --all-features` -- spawns anvil for CCTP
+     integration tests; only the `ci-backend` shell exposes the foundry binary.
+     Run via `nix develop .#ci-backend -c cargo nextest run ...`.
   3. `cargo clippy --workspace --all-targets --all-features` - full linting
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert

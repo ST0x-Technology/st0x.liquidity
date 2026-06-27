@@ -31,6 +31,7 @@ pkgs.stdenv.mkDerivation {
     cd dashboard
     bun run check
     bun run test:run
+    export PUBLIC_PNL_SQL_API_URL=/__pnl_sql
     bun run build
   '';
 

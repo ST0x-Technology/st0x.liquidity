@@ -10,11 +10,14 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use st0x_config::Ctx;
 use st0x_dto::Statement;
 use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::OrderStatus;
-use st0x_hedge::config::Ctx;
-use st0x_hedge::{run_bot_session, run_bot_session_with_event_channel};
+use st0x_hedge::{
+    FailureInjector, run_bot_session, run_bot_session_with_event_channel,
+    run_bot_session_with_injector,
+};
 
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
@@ -28,6 +31,16 @@ pub fn spawn_bot_with_event_channel(
     event_sender: broadcast::Sender<Statement>,
 ) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_bot_session_with_event_channel(ctx, event_sender))
+}
+
+/// Spawns the full bot using a caller-supplied [`FailureInjector`] so the
+/// test can arm specific job kinds for failure injection.
+pub fn spawn_bot_with_injector(
+    ctx: Ctx,
+    injector: FailureInjector,
+) -> JoinHandle<anyhow::Result<()>> {
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
+    tokio::spawn(run_bot_session_with_injector(ctx, event_sender, injector))
 }
 
 /// Polls the bot's health endpoint until it responds, panicking if the
@@ -358,7 +371,11 @@ pub async fn poll_for_hedge_completion(
 ///
 /// Jobs that retry with exponential backoff (e.g., due to CQRS aggregate
 /// conflicts) may still be in-flight after higher-level conditions are met.
-/// Use this instead of an immediate `count_done_jobs` assertion.
+/// Use this instead of an immediate done-count assertion.
+///
+/// The self-rescheduling `CheckPositions` job is excluded from both totals,
+/// since it always leaves exactly one `Pending` row in the queue waiting for
+/// the next tick and is not "in-flight work".
 pub async fn poll_for_all_jobs_done(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
@@ -380,13 +397,18 @@ pub async fn poll_for_all_jobs_done(
             continue;
         };
 
-        let total = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs")
+        let check_positions = st0x_hedge::check_positions_job_type();
+        let total = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE job_type != ?")
+            .bind(check_positions)
             .fetch_one(&pool)
             .await;
 
-        let done = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
-            .fetch_one(&pool)
-            .await;
+        let done = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Done' AND job_type != ?",
+        )
+        .bind(check_positions)
+        .fetch_one(&pool)
+        .await;
 
         pool.close().await;
 
@@ -413,6 +435,95 @@ pub async fn connect_db(db_path: &std::path::Path) -> anyhow::Result<SqlitePool>
     Ok(SqlitePool::connect_with(options).await?)
 }
 
+/// Polls the apalis `Jobs` table until a job of the given type reaches
+/// `Running`, panicking if the bot dies or the timeout passes first.
+/// Used by crash tests to time an abort to the middle of a job's
+/// `perform`.
+pub async fn poll_for_running_job(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    job_type: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("Running {job_type} job");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let running: Result<(i64,), _> =
+            sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Running'")
+                .bind(job_type)
+                .fetch_one(&pool)
+                .await;
+
+        pool.close().await;
+
+        if matches!(running, Ok((count,)) if count >= 1) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
+/// Polls until the backfill checkpoint has advanced to at least
+/// `block`, panicking if the bot dies or the timeout passes first. Once
+/// the checkpoint passes a fill's block, the fill's accounting job row
+/// is the only remaining record of it -- crash tests use this to pin
+/// that premise before killing the bot.
+pub async fn poll_for_backfill_checkpoint(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    block: u64,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("backfill checkpoint >= {block}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let checkpoint: Result<(Option<i64>,), _> =
+            sqlx::query_as("SELECT MAX(last_processed_block) FROM backfill_checkpoints")
+                .fetch_one(&pool)
+                .await;
+
+        pool.close().await;
+
+        if matches!(checkpoint, Ok((Some(last),)) if u64::try_from(last).is_ok_and(|last| last >= block))
+        {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Counts CQRS events for a specific aggregate type.
 pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Result<i64> {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE aggregate_type = ?")
@@ -423,19 +534,13 @@ pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Re
     Ok(row.0)
 }
 
-/// Counts total apalis jobs enqueued in the trade-processing pipeline.
-pub async fn count_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs")
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
-}
-
-/// Counts trade-processing apalis jobs that have been processed
-/// (status = 'Done').
-pub async fn count_done_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
+/// Counts CQRS events of a specific event type (e.g.
+/// "OnChainTradeEvent::Filled"). Use this instead of [`count_events`]
+/// when the invariant is one-event-per-action and the aggregate also
+/// emits bookkeeping events (enrichment, acknowledgement markers).
+pub async fn count_events_of_type(pool: &SqlitePool, event_type: &str) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+        .bind(event_type)
         .fetch_one(pool)
         .await?;
 
@@ -493,6 +598,34 @@ pub async fn poll_for_broker_fills(
             tokio::time::Instant::now() < deadline,
             "Timed out after {timeout:?} waiting for {context}. \
              Current filled total: {filled_total}",
+        );
+    }
+}
+
+/// Polls until the broker mock's armed calendar failures begin draining,
+/// proving a market-hours readiness check actually hit the downed
+/// calendar. Crash-checks the bot while waiting.
+pub async fn poll_for_calendar_failures_consumed(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    broker: &st0x_execution::alpaca_broker_api::AlpacaBrokerMock,
+    armed: usize,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = "a calendar failure to be consumed by a readiness check";
+
+    loop {
+        sleep_or_crash(bot, context).await;
+
+        let remaining = broker.calendar_failures_remaining();
+        if remaining < armed {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}; \
+             still {remaining} of {armed} armed failures",
         );
     }
 }

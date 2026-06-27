@@ -1,7 +1,7 @@
 use clap::Parser;
-use st0x_hedge::config::{Ctx, Env};
+use st0x_config::{Ctx, Env};
 use st0x_hedge::run_bot_session;
-use st0x_hedge::setup_tracing;
+use st0x_hedge::{apalis_board_tracing_layer, setup_tracing};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -11,16 +11,28 @@ async fn main() -> anyhow::Result<()> {
     let log_level: tracing::Level = (&ctx.log_level).into();
 
     let (_file_log_guard, telemetry_guard) = if let Some(ref telemetry) = ctx.telemetry {
-        match telemetry.setup(log_level, ctx.log_dir.as_deref()) {
+        match telemetry.setup(
+            log_level,
+            ctx.log_dir.as_deref(),
+            Some(apalis_board_tracing_layer(log_level)),
+        ) {
             Ok((file_guard, tele_guard)) => (file_guard, Some(tele_guard)),
             Err(error) => {
                 eprintln!("Failed to setup telemetry: {error}");
-                let file_guard = setup_tracing(&ctx.log_level, ctx.log_dir.as_deref());
+                let file_guard = setup_tracing(
+                    &ctx.log_level,
+                    ctx.log_dir.as_deref(),
+                    Some(apalis_board_tracing_layer(log_level)),
+                );
                 (file_guard, None)
             }
         }
     } else {
-        let file_guard = setup_tracing(&ctx.log_level, ctx.log_dir.as_deref());
+        let file_guard = setup_tracing(
+            &ctx.log_level,
+            ctx.log_dir.as_deref(),
+            Some(apalis_board_tracing_layer(log_level)),
+        );
         (file_guard, None)
     };
 

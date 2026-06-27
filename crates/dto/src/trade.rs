@@ -15,6 +15,43 @@ pub enum TradingVenue {
     DryRun,
 }
 
+impl TradingVenue {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Raindex => "raindex",
+            Self::Alpaca => "alpaca",
+            Self::DryRun => "dry_run",
+        }
+    }
+}
+
+impl std::fmt::Display for TradingVenue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TradingVenue {
+    type Err = InvalidTradingVenue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "raindex" => Ok(Self::Raindex),
+            "alpaca" => Ok(Self::Alpaca),
+            "dry_run" => Ok(Self::DryRun),
+            other => Err(InvalidTradingVenue {
+                venue_provided: other.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid trading venue: {venue_provided}")]
+pub struct InvalidTradingVenue {
+    venue_provided: String,
+}
+
 /// Whether the trade was a buy or sell. Canonical Direction type used by
 /// both broker execution and dashboard DTOs -- there is no separate
 /// "TradeDirection" that needs converting back and forth.

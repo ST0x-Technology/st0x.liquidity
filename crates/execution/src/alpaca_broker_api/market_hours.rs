@@ -82,6 +82,7 @@ async fn get_calendar(
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
+    use uuid::uuid;
 
     use super::*;
     use crate::alpaca_broker_api::TimeInForce;
@@ -90,7 +91,7 @@ mod tests {
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {

@@ -1,83 +1,89 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
-use alloy::primitives::{Address, B256, Bytes, LogData, TxHash, address, bytes, fixed_bytes};
-use alloy::providers::RootProvider;
-use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::{Log, TransactionReceipt};
-use async_trait::async_trait;
+use alloy::hex;
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
+use alloy::providers::Provider;
+use alloy::providers::ext::AnvilApi as _;
+use alloy::rpc::types::{Log, TransactionRequest};
 use chrono::Utc;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use st0x_evm::{Evm, EvmError, Wallet};
-use st0x_execution::{Direction, FractionalShares, Positive};
+use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 
-use crate::bindings::IOrderBookV6::{EvaluableV4, IOV2, OrderV4};
+use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
 
-/// Panicking wallet stub for tests that construct `RebalancingCtx`
-/// without needing real chain connectivity. Provider type matches
-/// production (`RootProvider`) so it fits `Arc<dyn Wallet<Provider =
-/// RootProvider>>`.
-pub(crate) struct StubWallet {
-    address: Address,
-    provider: RootProvider,
-}
-
-impl StubWallet {
-    pub(crate) fn stub(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
-        Arc::new(Self {
-            address,
-            provider: RootProvider::new(
-                RpcClient::builder().http("http://stub.invalid".parse().unwrap()),
-            ),
-        })
+/// Builds an equity assets config with the given symbols whitelisted for
+/// rebalancing. The trigger only dispatches transfers for symbols configured
+/// with `rebalancing = "enabled"`, so trigger tests must whitelist the
+/// symbols they exercise.
+pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> EquitiesConfig {
+    EquitiesConfig {
+        operational_limit: None,
+        symbols: symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    Symbol::new(*symbol).unwrap(),
+                    EquityAssetConfig {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        pyth_feed_id: None,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Disabled,
+                        rebalancing: OperationMode::Enabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
-#[async_trait]
-impl Evm for StubWallet {
-    type Provider = RootProvider;
+/// Deterministic singleton address of the TOFUTokenDecimals contract. The
+/// orderbook's `LibTOFUTokenDecimals.ensureDeployed` hardcodes this address and
+/// checks the codehash, so any test exercising deposits, withdrawals, or order
+/// takes must place the canonical runtime here.
+pub(crate) const TOFU_TOKEN_DECIMALS: Address =
+    address!("0x200e12D10bb0c5E4a17e7018f0F1161919bb9389");
 
-    fn provider(&self) -> &RootProvider {
-        &self.provider
-    }
-}
+/// Canonical TOFUTokenDecimals init bytecode, copied from
+/// rain-tofu-erc20-decimals' `LibTOFUTokenDecimals.TOFU_DECIMALS_EXPECTED_CREATION_CODE`.
+/// Deploying this and etching the resulting runtime at `TOFU_TOKEN_DECIMALS` yields the
+/// codehash `ensureDeployed` requires; rain.orderbook's own recompile of TOFUTokenDecimals.sol
+/// does not match that hash, so its artifact bytecode cannot be used directly.
+const TOFU_DECIMALS_CREATION_CODE: &str = "0x6080604052348015600e575f80fd5b5061044b8061001c5f395ff3fe608060405234801561000f575f80fd5b506004361061004a575f3560e01c80630782d7e11461004e57806354636d2b14610078578063b7bad1b11461009d578063f5c36eaf146100b0575b5f80fd5b61006161005c366004610363565b6100c3565b60405161006f929190610403565b60405180910390f35b61008b610086366004610363565b6100d8565b60405160ff909116815260200161006f565b6100616100ab366004610363565b6100e9565b61008b6100be366004610363565b6100f5565b5f806100cf5f84610100565b91509150915091565b5f6100e35f836101f0565b92915050565b5f806100cf5f84610281565b5f6100e35f83610356565b73ffffffffffffffffffffffffffffffffffffffff81165f9081526020838152604080832081518083019092525460ff8082161515835261010090910416818301527f313ce56700000000000000000000000000000000000000000000000000000000808452839283908190816004818a5afa915060203d1015610182575f91505b811561019857505f5160ff811115610198575f91505b816101af57505050602001516003925090506101e9565b83516101c3575f955093506101e992505050565b836020015160ff1681146101d85760026101db565b60015b846020015195509550505050505b9250929050565b5f805f6101fd8585610281565b909250905060018260038111156102165761021661039d565b1415801561023557505f8260038111156102325761023261039d565b14155b156102795783826040517fee07877f000000000000000000000000000000000000000000000000000000008152600401610270929190610421565b60405180910390fd5b949350505050565b5f805f8061028f8686610100565b90925090505f8260038111156102a7576102a761039d565b0361034b576040805180820182526001815260ff838116602080840191825273ffffffffffffffffffffffffffffffffffffffff8a165f908152908b9052939093209151825493517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00009094169015157fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff161761010093909116929092029190911790555b909590945092505050565b5f805f6101fd8585610100565b5f60208284031215610373575f80fd5b813573ffffffffffffffffffffffffffffffffffffffff81168114610396575f80fd5b9392505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b600481106103ff577f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b9052565b6040810161041182856103ca565b60ff831660208301529392505050565b73ffffffffffffffffffffffffffffffffffffffff831681526040810161039660208301846103ca56";
 
-#[async_trait]
-impl Wallet for StubWallet {
-    fn address(&self) -> Address {
-        self.address
-    }
+/// Deploys the canonical TOFUTokenDecimals init bytecode and etches the resulting
+/// runtime at [`TOFU_TOKEN_DECIMALS`]. The orderbook checks both the address and
+/// the codehash, so the runtime must come from executing the canonical creation
+/// code rather than from a recompiled artifact.
+pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
+    let creation_code = hex::decode(TOFU_DECIMALS_CREATION_CODE).unwrap();
+    let tx = TransactionRequest::default().with_deploy_code(creation_code);
 
-    async fn send_pending(
-        &self,
-        _contract: Address,
-        _calldata: Bytes,
-        _note: &str,
-    ) -> Result<TxHash, EvmError> {
-        panic!(
-            "StubWallet::send_pending called - use a real wallet in tests that need transactions"
-        )
-    }
+    let deployed = provider
+        .send_transaction(tx)
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap()
+        .contract_address
+        .unwrap();
 
-    async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-        panic!(
-            "StubWallet::await_receipt called - use a real wallet in tests that need transactions"
-        )
-    }
-
-    async fn send(
-        &self,
-        _contract: Address,
-        _calldata: Bytes,
-        _note: &str,
-    ) -> Result<TransactionReceipt, EvmError> {
-        panic!("StubWallet::send called - use a real wallet in tests that need transactions")
-    }
+    let runtime = provider.get_code_at(deployed).await.unwrap();
+    provider
+        .anvil_set_code(TOFU_TOKEN_DECIMALS, runtime)
+        .await
+        .unwrap();
 }
 
 /// Returns a test `OrderV4` instance that is shared across multiple
@@ -142,13 +148,94 @@ pub(crate) fn get_test_log() -> Log {
     create_log(293)
 }
 
+static TEST_DATABASE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn test_database_url() -> String {
+    let database_id = TEST_DATABASE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("file:st0x-hedge-test-{database_id}?mode=memory&cache=shared")
+}
+
+/// CQRS pool (sqlx 0.9) and apalis worker pool (sqlx 0.8) over the same DB.
+pub(crate) async fn setup_test_pools() -> (SqlitePool, apalis_sqlite::SqlitePool) {
+    let database_url = test_database_url();
+    let pool = st0x_config::configure_sqlite_pool(&database_url)
+        .await
+        .unwrap();
+
+    sqlx::migrate!()
+        .set_ignore_missing(true)
+        .run(&pool)
+        .await
+        .unwrap();
+    let apalis_pool = crate::conductor::connect_apalis_pool(&database_url)
+        .await
+        .unwrap();
+
+    crate::conductor::setup_apalis_tables(&apalis_pool)
+        .await
+        .unwrap();
+
+    (pool, apalis_pool)
+}
+
+/// apalis worker pool (sqlx 0.8) over the same in-memory DB as [`setup_test_db`].
+pub(crate) async fn setup_test_apalis_pool() -> apalis_sqlite::SqlitePool {
+    setup_test_pools().await.1
+}
+
 /// Centralized test database setup to eliminate duplication across test files.
 /// Creates an in-memory SQLite database with all migrations applied.
 pub(crate) async fn setup_test_db() -> SqlitePool {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
+    setup_test_pools().await.0
+}
+
+/// File-backed variant of [`setup_test_db`] with production-shaped pool
+/// options (WAL journal mode, explicit busy timeout). Needed by tests
+/// that inject SQLite lock contention: an in-memory database cannot be
+/// locked from a second connection, a file can. The `busy_timeout` is
+/// injectable so lock tests wait milliseconds instead of production's
+/// 10 seconds -- the code path under test (`SQLITE_BUSY` surfacing
+/// through the store) is identical, only the wait differs. The apalis
+/// worker pool (sqlx 0.8) is opened over the same file with the same
+/// scaled-down timeout so enqueue contention surfaces just as fast.
+///
+/// Returns the CQRS pool, the apalis worker pool, the database file path
+/// (for opening contending connections), and the tempdir guard keeping
+/// the file alive.
+pub(crate) async fn setup_file_backed_test_db(
+    busy_timeout: std::time::Duration,
+) -> (
+    SqlitePool,
+    apalis_sqlite::SqlitePool,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.sqlite");
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(busy_timeout);
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+
     sqlx::migrate!().run(&pool).await.unwrap();
-    crate::conductor::setup_apalis_tables(&pool).await.unwrap();
-    pool
+
+    let apalis_options = sqlx_apalis::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .journal_mode(sqlx_apalis::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(busy_timeout);
+    let apalis_pool = apalis_sqlite::SqlitePool::connect_with(apalis_options)
+        .await
+        .unwrap();
+
+    crate::conductor::setup_apalis_tables(&apalis_pool)
+        .await
+        .unwrap();
+
+    (pool, apalis_pool, db_path, dir)
 }
 
 /// Shared constructor for positive share quantities in tests.

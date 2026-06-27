@@ -24,13 +24,13 @@ use crate::conductor::job::{Job, JobQueue, Label};
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::config::Ctx;
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
+use st0x_config::Ctx;
 
 /// Persistent job queue for DEX trade accounting.
 pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
@@ -39,7 +39,7 @@ pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
 /// It's the unified mechanism for processing both backfilled events as well as
 /// live events from the monitor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AccountForDexTrade {
+pub struct AccountForDexTrade {
     /// Raindex trade event with block inclusion metadata
     pub(crate) trade: EmittedOnChain<RaindexTradeEvent>,
 }
@@ -48,7 +48,7 @@ pub(crate) struct AccountForDexTrade {
 pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) ctx: Ctx,
     pub(crate) cache: SymbolCache,
-    pub(crate) feed_id_cache: FeedIdCache,
+    pub(crate) pyth_feed_ids: PythFeedIds,
     pub(crate) orderbook: Address,
     pub(crate) evm: ReadOnlyEvm<Node>,
     pub(crate) cqrs: TradeProcessingCqrs,
@@ -68,6 +68,7 @@ where
     type Error = TradeAccountingError;
 
     const WORKER_NAME: &'static str = "order-fill-worker";
+
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::OrderFill;
 
@@ -98,7 +99,7 @@ where
                     &ctx.evm,
                     *clear_event.clone(),
                     reconstructed_log,
-                    &ctx.feed_id_cache,
+                    &ctx.pyth_feed_ids,
                     order_owner,
                 )
                 .await
@@ -111,7 +112,7 @@ where
                     *take_event.clone(),
                     reconstructed_log,
                     order_owner,
-                    &ctx.feed_id_cache,
+                    &ctx.pyth_feed_ids,
                 )
                 .await
             }
@@ -217,6 +218,8 @@ fn reconstruct_log(orderbook: Address, trade: &EmittedOnChain<RaindexTradeEvent>
 pub(crate) enum TradeAccountingError {
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
+    #[error("Onchain trade command failed: {0}")]
+    OnChainTradeCommand(#[from] SendError<crate::onchain_trade::OnChainTrade>),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Position command failed: {0}")]
@@ -230,6 +233,10 @@ pub(crate) enum TradeAccountingError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("Failed to enqueue PollOrderStatus job: {0}")]
     EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
+    #[error("Missing block_timestamp for fill {trade_id}; cannot account for it")]
+    MissingBlockTimestamp {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
 }
 
 #[cfg(test)]
@@ -241,24 +248,24 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV6;
-    use crate::bindings::IOrderBookV6::{
+    use crate::bindings::IRaindexV6;
+    use crate::bindings::IRaindexV6::{
         ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
-    use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::offchain::order::OffchainOrder;
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
-    use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use crate::test_utils::{get_test_log, get_test_order, setup_test_pools};
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::create_test_ctx_with_order_owner;
 
     fn test_job() -> AccountForDexTrade {
         let log = get_test_log();
-        let event = RaindexTradeEvent::ClearV3(Box::new(IOrderBookV6::ClearV3 {
+        let event = RaindexTradeEvent::ClearV3(Box::new(IRaindexV6::ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             alice: get_test_order(),
             bob: get_test_order(),
@@ -289,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn perform_returns_ok_when_event_filtered_out() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -327,16 +334,16 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
-            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
         };
 
-        let job_queue = DexTradeAccountingJobQueue::new(&pool);
+        let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
 
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,
             ctx,
             cache: SymbolCache::default(),
-            feed_id_cache: FeedIdCache::default(),
+            pyth_feed_ids: PythFeedIds::default(),
             evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
             vault_registry,
@@ -353,7 +360,7 @@ mod tests {
     /// should be skipped gracefully instead of causing a fatal error.
     #[tokio::test]
     async fn perform_skips_take_order_with_non_hedgeable_pair() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let asserter = Asserter::new();
 
         // The order owner matches so the event passes the owner filter.
@@ -454,16 +461,16 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
-            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
         };
 
-        let job_queue = DexTradeAccountingJobQueue::new(&pool);
+        let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
 
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,
             ctx,
             cache: SymbolCache::default(),
-            feed_id_cache: FeedIdCache::default(),
+            pyth_feed_ids: PythFeedIds::default(),
             evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
             vault_registry,

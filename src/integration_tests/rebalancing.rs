@@ -1,8 +1,8 @@
 //! Integration tests for the inventory rebalancing pipeline: position changes
 //! flow through the RebalancingService (wired as a CQRS query processor),
-//! update the InventoryView, detect equity or USDC imbalances, and dispatch
-//! operations through the Rebalancer to drive mints, redemptions, and USDC
-//! transfers to completion.
+//! update the InventoryView, detect equity or USDC imbalances, and enqueue
+//! apalis transfer jobs that drive mints, redemptions, and USDC transfers to
+//! completion.
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, TxHash, U256, address, keccak256};
@@ -14,51 +14,73 @@ use httpmock::Mock;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_config::{
+    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold,
+    OperationMode,
+};
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
+use st0x_evm::IERC20;
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{Usd, Usdc};
+use st0x_float_macro::float;
+use st0x_raindex::{Raindex, RaindexVaultId};
+use st0x_wrapper::{MockWrapper, Wrapper};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
-use crate::bindings::{IERC20, TestERC20};
-use crate::config::{
-    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+use crate::bindings::TestERC20;
+use crate::conductor::job::Job;
+use crate::equity_redemption::{
+    EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
 };
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
+use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
-use crate::onchain::raindex::Raindex;
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
-use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
-use crate::rebalancing::usdc::mock::MockUsdcRebalance;
-use crate::rebalancing::{
-    Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
-    TriggeredOperation, drain_pending_jobs,
+use crate::rebalancing::equity::{
+    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, TransferEquityToHedging,
+    TransferEquityToHedgingCtx, TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+    TransferEquityToMarketMakingJobError,
 };
-use crate::test_utils::setup_test_db;
-use crate::threshold::ExecutionThreshold;
+use crate::rebalancing::trigger::GuardState;
+use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
+use crate::rebalancing::{
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
+};
+use crate::test_utils::setup_test_pools;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::tests::{
     TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
     tokenization_requests_path,
 };
 use crate::tokenization::mock::MockTokenizer;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::tokenized_equity_mint::{
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
+};
+use crate::unwrapped_equity_recovery::aggregate::{
+    UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
+};
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
+};
+use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
-use crate::wrapper::mock::MockWrapper;
-use st0x_float_macro::float;
+use crate::wrapped_equity_recovery::aggregate::{
+    WrappedEquityRecovery, WrappedEquityRecoveryId, WrappedEquityRecoveryServices,
+};
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue,
+};
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
@@ -83,6 +105,63 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address)
     )
     .await
     .unwrap();
+}
+
+/// Fetches the single pending `TransferEquityToMarketMaking` job payload from
+/// the apalis Jobs table, as the registered worker would receive it.
+async fn fetch_pending_equity_mint_job(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> TransferEquityToMarketMaking {
+    let payload: Vec<u8> =
+        sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+            .fetch_one(apalis_pool)
+            .await
+            .expect("expected exactly one pending TransferEquityToMarketMaking job");
+
+    serde_json::from_slice(&payload).expect("deserialize TransferEquityToMarketMaking payload")
+}
+
+async fn pending_equity_mint_job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+    sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
+}
+
+/// Fetches the single pending `TransferEquityToHedging` job payload from the
+/// apalis Jobs table, as the registered worker would receive it.
+async fn fetch_pending_equity_redemption_job(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> TransferEquityToHedging {
+    let payload: Vec<u8> =
+        sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferEquityToHedging>())
+            .fetch_one(apalis_pool)
+            .await
+            .expect("expected exactly one pending TransferEquityToHedging job");
+
+    serde_json::from_slice(&payload).expect("deserialize TransferEquityToHedging payload")
+}
+
+async fn pending_equity_redemption_job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+    sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
+}
+
+fn mock_vault_lookup_for_symbol(symbol: &Symbol, token: Address) -> Arc<dyn VaultLookup> {
+    Arc::new(
+        MockVaultLookup::new()
+            .with_symbol_token(symbol.clone(), token)
+            .with_vault(
+                token,
+                RaindexVaultId(B256::from(keccak256(symbol.to_string().as_bytes()))),
+            ),
+    )
 }
 
 /// Uses Anvil snapshot/revert to discover the deterministic tx_hash that will
@@ -131,9 +210,11 @@ fn test_trigger_config() -> RebalancingServiceConfig {
                     EquityAssetConfig {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
+                        pyth_feed_id: None,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
                         rebalancing: OperationMode::Enabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )]),
@@ -145,7 +226,6 @@ fn test_trigger_config() -> RebalancingServiceConfig {
                 reserved: None,
             }),
         },
-        disabled_assets: HashSet::new(),
     }
 }
 
@@ -171,16 +251,16 @@ async fn build_position_cqrs_with_service(
 /// processor.
 struct EquityTriggerFixture {
     pool: SqlitePool,
+    apalis_pool: apalis_sqlite::SqlitePool,
     symbol: Symbol,
     aggregate_id: String,
     service: Arc<RebalancingService>,
     inventory: Arc<BroadcastingInventory>,
     position_cqrs: Arc<Store<Position>>,
-    receiver: mpsc::Receiver<TriggeredOperation>,
 }
 
 async fn setup_equity_trigger() -> EquityTriggerFixture {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let symbol = Symbol::new("AAPL").unwrap();
     let aggregate_id = symbol.to_string();
 
@@ -195,7 +275,6 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
             .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000))),
         event_sender,
     ));
-    let (sender, receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
 
@@ -207,21 +286,20 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     ));
 
     let position_cqrs = build_position_cqrs_with_service(&pool, &service).await;
 
     EquityTriggerFixture {
         pool,
+        apalis_pool,
         symbol,
         aggregate_id,
         service,
         inventory,
         position_cqrs,
-        receiver,
     }
 }
 
@@ -269,9 +347,12 @@ fn setup_redemption_mocks(server: &MockServer, expected_tx_hash: TxHash) -> (Moc
     (detection_mock, completion_mock)
 }
 
-fn sample_pending_response(id: &str) -> serde_json::Value {
+fn sample_pending_response(
+    tokenization_request_id: &str,
+    issuer_request_id: &IssuerRequestId,
+) -> serde_json::Value {
     json!({
-        "tokenization_request_id": id,
+        "tokenization_request_id": tokenization_request_id,
         "type": "mint",
         "status": "pending",
         "underlying_symbol": "AAPL",
@@ -280,14 +361,18 @@ fn sample_pending_response(id: &str) -> serde_json::Value {
         "issuer": "st0x",
         "network": "base",
         "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": "issuer_123",
+        "issuer_request_id": issuer_request_id.to_string(),
         "created_at": "2024-01-15T10:30:00Z"
     })
 }
 
-fn sample_completed_response(id: &str, tx_hash: TxHash) -> serde_json::Value {
+fn sample_completed_response(
+    tokenization_request_id: &str,
+    issuer_request_id: &IssuerRequestId,
+    tx_hash: TxHash,
+) -> serde_json::Value {
     json!({
-        "tokenization_request_id": id,
+        "tokenization_request_id": tokenization_request_id,
         "type": "mint",
         "status": "completed",
         "underlying_symbol": "AAPL",
@@ -296,7 +381,7 @@ fn sample_completed_response(id: &str, tx_hash: TxHash) -> serde_json::Value {
         "issuer": "st0x",
         "network": "base",
         "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": "issuer_123",
+        "issuer_request_id": issuer_request_id.to_string(),
         "tx_hash": tx_hash,
         "created_at": "2024-01-15T10:30:00Z"
     })
@@ -314,6 +399,57 @@ enum Imbalance<'a> {
         onchain: Usdc,
         offchain: Usdc,
     },
+}
+
+/// Direction of a USDC transfer enqueued by the trigger, recovered from the
+/// apalis Jobs table for assertion in integration tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueuedUsdcOperation {
+    AlpacaToBase { amount: Usdc },
+    BaseToAlpaca { amount: Usdc },
+}
+
+/// Drains every pending USDC transfer row (both directions) from the apalis
+/// Jobs table, marks them Done, and returns them in `run_at` order.
+async fn drain_pending_usdc_transfer_jobs(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> Vec<EnqueuedUsdcOperation> {
+    let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
+    let to_market_making_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+
+    let rows: Vec<(String, Vec<u8>, String)> = sqlx_apalis::query_as(
+        "SELECT id, job, job_type FROM Jobs \
+         WHERE status = 'Pending' AND (job_type = ? OR job_type = ?) \
+         ORDER BY run_at",
+    )
+    .bind(to_hedging_type)
+    .bind(to_market_making_type)
+    .fetch_all(apalis_pool)
+    .await
+    .expect("query pending USDC transfer jobs");
+
+    let mut operations = Vec::with_capacity(rows.len());
+    for (row_id, payload, job_type) in rows {
+        let operation = if job_type == to_hedging_type {
+            let job: TransferUsdcToHedging =
+                serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging");
+            EnqueuedUsdcOperation::BaseToAlpaca { amount: job.amount }
+        } else {
+            let job: TransferUsdcToMarketMaking =
+                serde_json::from_slice(&payload).expect("deserialize TransferUsdcToMarketMaking");
+            EnqueuedUsdcOperation::AlpacaToBase { amount: job.amount }
+        };
+
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(&row_id)
+            .execute(apalis_pool)
+            .await
+            .expect("mark drained USDC transfer job Done");
+
+        operations.push(operation);
+    }
+
+    operations
 }
 
 async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
@@ -394,15 +530,17 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
 
 fn build_equity_transfer_with_wrapper(
     pool: &SqlitePool,
-    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    raindex: Arc<dyn Raindex>,
+    vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
 ) -> Arc<CrossVenueEquityTransfer> {
-    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
+    let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
@@ -416,6 +554,7 @@ fn build_equity_transfer_with_wrapper(
     ));
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
+        vault_lookup,
         tokenizer,
         wrapper,
         wallet,
@@ -430,16 +569,18 @@ fn build_equity_transfer_with_wrapper(
 /// lifecycle events flow through the trigger and update inflight state.
 async fn build_equity_transfer_with_service(
     pool: &SqlitePool,
-    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    raindex: Arc<dyn Raindex>,
+    vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
     service: &Arc<RebalancingService>,
 ) -> Arc<CrossVenueEquityTransfer> {
-    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
+    let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
@@ -458,6 +599,7 @@ async fn build_equity_transfer_with_service(
 
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
+        vault_lookup,
         tokenizer,
         wrapper,
         wallet,
@@ -468,21 +610,21 @@ async fn build_equity_transfer_with_service(
 
 /// Verifies the full equity mint rebalancing pipeline: position CQRS commands
 /// flow through the RebalancingService (registered as a Query processor),
-/// update the InventoryView, detect an equity imbalance, and dispatch a Mint
-/// operation through the Rebalancer to the CrossVenueEquityTransfer which
-/// drives the TokenizedEquityMint aggregate to completion via the Alpaca
-/// tokenization API.
+/// update the InventoryView, detect an equity imbalance, and enqueue a
+/// `TransferEquityToMarketMaking` apalis job whose `perform` drives the
+/// TokenizedEquityMint aggregate to completion on the real
+/// CrossVenueEquityTransfer via the Alpaca tokenization API.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn equity_offchain_imbalance_triggers_mint() {
     let EquityTriggerFixture {
         pool,
+        apalis_pool,
         symbol,
         aggregate_id,
         service,
         inventory: _,
         position_cqrs,
-        receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain.
@@ -541,55 +683,13 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         mock_wrapper,
         signer.address(),
     );
 
     let wallet_hex = format!("{:#x}", signer.address());
-
-    // json_body_partial acts as an implicit assertion: the mock only matches if
-    // the request contains these exact fields. mint_mock.assert() below then
-    // verifies the mock was called, confirming the correct qty was sent.
-    let mint_mock = server.mock(|when, then| {
-        when.method(POST)
-            .path(tokenization_mint_path())
-            .json_body_includes(
-                json!({
-                    "underlying_symbol": "AAPL",
-                    "qty": "30.5",
-                    "wallet_address": wallet_hex,
-                })
-                .to_string(),
-            );
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(sample_pending_response("mint_int_test"));
-    });
-
-    let poll_mock = server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([sample_completed_response(
-                "mint_int_test",
-                mint_tx_hash
-            )]));
-    });
-
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let mock_usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        equity_transfer as _,
-        mock_equity as _,
-        Arc::clone(&mock_usdc) as _,
-        mock_usdc as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
 
     // One more onchain sell triggers the CQRS -> trigger -> Mint flow now that
     // VaultRegistry is seeded. Inventory: 19 onchain, 80 offchain = 19.2%.
@@ -613,13 +713,59 @@ async fn equity_offchain_imbalance_triggers_mint() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    // Both trigger and position_cqrs hold Arc<RebalancingService> which owns the
-    // mpsc sender. Both must be dropped to close the channel so rebalancer.run()
-    // can exit after processing all queued operations.
-    drop(service);
-    drop(position_cqrs);
+    // The trigger enqueues the mint as an apalis job; run its perform against
+    // the real equity transfer, exactly as the registered worker would.
+    let job = fetch_pending_equity_mint_job(&apalis_pool).await;
 
-    rebalancer.run().await;
+    // json_body_partial acts as an implicit assertion: the mock only matches if
+    // the request contains these exact fields. mint_mock.assert() below then
+    // verifies the mock was called, confirming the correct qty was sent.
+    let mint_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path(tokenization_mint_path())
+            .json_body_includes(
+                json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "30.5",
+                    "wallet_address": wallet_hex,
+                })
+                .to_string(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response(
+                "mint_int_test",
+                &job.issuer_request_id,
+            ));
+    });
+
+    let poll_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_completed_response(
+                "mint_int_test",
+                &job.issuer_request_id,
+                mint_tx_hash
+            )]));
+    });
+
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
+    let ctx = TransferEquityToMarketMakingCtx {
+        transfer: equity_transfer,
+        equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+        mint_store,
+        equities_config: EquitiesConfig::default(),
+    };
+    Job::perform(&job, &ctx).await.unwrap();
 
     mint_mock.assert();
     poll_mock.assert();
@@ -718,14 +864,20 @@ async fn equity_offchain_imbalance_triggers_mint() {
         "mint_int_test",
         "MintAccepted should capture the request ID from the API response"
     );
+
+    assert_eq!(
+        pending_equity_redemption_job_count(&apalis_pool).await,
+        0,
+        "No redemption job should have been enqueued"
+    );
 }
 
 /// Verifies the full equity redemption rebalancing pipeline: position CQRS
 /// commands flow through the RebalancingService, detect too much onchain equity,
-/// and dispatch a Redemption operation through the Rebalancer to the real
-/// CrossVenueEquityTransfer. The transfer sends tokens on Anvil, then drives the
-/// EquityRedemption aggregate through TokensSent -> Detected -> Completed via
-/// the mocked Alpaca tokenization API.
+/// and enqueue a `TransferEquityToHedging` apalis job whose `perform` drives the
+/// redemption on the real CrossVenueEquityTransfer. The transfer sends tokens on
+/// Anvil, then drives the EquityRedemption aggregate through TokensSent ->
+/// Detected -> Completed via the mocked Alpaca tokenization API.
 ///
 /// Uses Anvil snapshot/revert to discover the deterministic tx_hash before
 /// setting up httpmock responses, so the mock detection endpoint can match
@@ -735,12 +887,12 @@ async fn equity_offchain_imbalance_triggers_mint() {
 async fn equity_onchain_imbalance_triggers_redemption() {
     let EquityTriggerFixture {
         pool,
+        apalis_pool,
         symbol,
         aggregate_id,
         service,
         inventory: _,
         position_cqrs,
-        receiver,
     } = setup_equity_trigger().await;
     let server = MockServer::start();
     let (_anvil, endpoint, key) = setup_anvil();
@@ -778,12 +930,18 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
-    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
     let wrapper = MockWrapper::new()
         .with_tokenized_shares(token_address)
         .with_wrapped_token(token_address);
-    let equity_transfer =
-        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper, Address::ZERO);
+    let equity_transfer = build_equity_transfer_with_wrapper(
+        &pool,
+        raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
+        tokenizer,
+        wrapper,
+        Address::ZERO,
+    );
 
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
@@ -793,19 +951,6 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     })
     .await;
     seed_vault_registry(&pool, &symbol, token_address).await;
-
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        equity_transfer as _,
-        Arc::clone(&usdc) as _,
-        usdc as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
 
     position_cqrs
         .send(
@@ -827,9 +972,15 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    drop(service);
-    drop(position_cqrs);
-    rebalancer.run().await;
+    // The trigger enqueues the redemption as an apalis job; run its perform
+    // against the real equity transfer, exactly as the registered worker would.
+    let job = fetch_pending_equity_redemption_job(&apalis_pool).await;
+    assert_eq!(job.symbol, symbol);
+
+    let ctx = TransferEquityToHedgingCtx {
+        transfer: equity_transfer,
+    };
+    Job::perform(&job, &ctx).await.unwrap();
 
     let erc20 = IERC20::new(token_address, &provider);
     assert_eq!(
@@ -968,19 +1119,18 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         "Detected should capture the request ID from the API response"
     );
     assert_eq!(
-        mock_equity.mint_calls(),
+        pending_equity_mint_job_count(&apalis_pool).await,
         0,
-        "Mint should not have been called"
+        "No mint job should have been enqueued"
     );
 }
 
-/// Verifies USDC rebalancing dispatch: a USDC imbalance triggers the
-/// RebalancingService to send a UsdcAlpacaToBase operation through the channel
-/// to the Rebalancer, which dispatches to the USDC manager. Uses mocked managers
-/// since the real USDC flow requires CCTP bridge and vault transactions.
+/// Verifies USDC rebalancing dispatch: a USDC imbalance for the Alpaca->Base
+/// direction enqueues a `TransferUsdcToMarketMaking` apalis job with the
+/// expected amount.
 #[tokio::test]
 async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // 100 onchain, 900 offchain = 10% onchain ratio -> below 30% -> TooMuchOffchain
     // Excess = target_onchain - onchain = 500 - 100 = 400 USDC (above $51 minimum)
@@ -997,8 +1147,6 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     })
     .await;
 
-    let (sender, receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1008,60 +1156,65 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
-    );
-
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        mock_equity as _,
-        Arc::clone(&usdc) as _,
-        usdc.clone() as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    // Close the channel so the rebalancer exits after processing.
-    drop(trigger);
+    let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
 
-    rebalancer.run().await;
+    let pending: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
     assert_eq!(
-        usdc.alpaca_to_base_calls(),
-        1,
-        "Expected USDC manager to be called once for alpaca_to_base"
+        pending, 1,
+        "Expected exactly one pending TransferUsdcToMarketMaking job"
     );
 
-    let call = usdc
-        .last_alpaca_to_base_call()
-        .expect("Expected a captured call");
+    let payload: Vec<u8> = sqlx_apalis::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
+
+    let job: TransferUsdcToMarketMaking =
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToMarketMaking");
     assert_eq!(
-        call.amount,
+        job.amount,
         Usdc::new(float!(400)),
         "Expected excess of $400 (target $500 - actual $100)"
     );
 
+    let opposite: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToHedging>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
+
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        0,
-        "base_to_alpaca should not have been called"
+        opposite, 0,
+        "Base->Alpaca queue should not have been touched"
     );
 }
 
 /// Verifies USDC onchain imbalance dispatch: 900 onchain / 100 offchain = 90%
-/// onchain ratio (above 70% upper bound) triggers a UsdcBaseToAlpaca operation
+/// onchain ratio (above 70% upper bound) triggers a BaseToAlpaca operation
 /// with excess = 900 - 500 = $400.
 #[tokio::test]
 async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // 900 onchain, 100 offchain = 90% onchain ratio -> above 70% -> TooMuchOnchain
     // Excess = onchain - target_onchain = 900 - 500 = 400 USDC
@@ -1078,8 +1231,6 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     })
     .await;
 
-    let (sender, receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1089,50 +1240,58 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
-    );
-
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        mock_equity as _,
-        Arc::clone(&usdc) as _,
-        usdc.clone() as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
+    // Base->Alpaca is dispatched via the TransferUsdcToHedging apalis job
+    // queue. Assert exactly one pending row with the expected payload.
+    let job_type = std::any::type_name::<TransferUsdcToHedging>();
 
-    rebalancer.run().await;
+    let pending: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        1,
-        "Expected USDC manager to be called once for base_to_alpaca"
+        pending, 1,
+        "Expected exactly one pending TransferUsdcToHedging job"
     );
 
-    let call = usdc
-        .last_base_to_alpaca_call()
-        .expect("Expected a captured call");
+    let payload: Vec<u8> = sqlx_apalis::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
+
+    let job: TransferUsdcToHedging =
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging payload");
     assert_eq!(
-        call.amount,
+        job.amount,
         Usdc::new(float!(400)),
         "Expected excess of $400 (actual $900 - target $500)"
     );
 
+    let opposite: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
+
     assert_eq!(
-        usdc.alpaca_to_base_calls(),
-        0,
-        "alpaca_to_base should not have been called"
+        opposite, 0,
+        "Alpaca->Base queue should not have been touched"
     );
 }
 
@@ -1154,20 +1313,18 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Inventory as ExecutorInventory, MockExecutor};
     use st0x_finance::Usd;
+    use st0x_raindex::RaindexService;
 
     use crate::inventory::InventoryPollingService;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
-    use crate::onchain::raindex::RaindexService;
 
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default(),
         event_sender,
     ));
-
-    let (sender, receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
@@ -1185,20 +1342,14 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     ));
 
     // Build snapshot store with the service as the CQRS subscriber — mirrors
     // production wiring in QueryManifest::build. Snapshot events from polling
     // flow through the service's on_snapshot, updating the
     // BroadcastingInventory and scheduling follow-up imbalance checks.
-    let (_, vault_registry_projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
-        .build(())
-        .await
-        .unwrap();
-
     let snapshot_id = InventorySnapshotId {
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
@@ -1228,6 +1379,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         positions: vec![],
         usd_balance_cents: 50_000,
         cash_buying_power_cents: Some(50_000),
+        alpaca_usdc: None,
         cash_withdrawable_cents: None,
     });
 
@@ -1236,7 +1388,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let raindex_service = Arc::new(RaindexService::new(
         ReadOnlyEvm::new(provider),
         TEST_ORDERBOOK,
-        vault_registry_projection,
         TEST_ORDER_OWNER,
     ));
 
@@ -1273,40 +1424,34 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     // ratio stays balanced (500/500) despite the reserve.
     service.check_and_trigger_usdc().await;
 
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        mock_equity as _,
-        Arc::clone(&usdc) as _,
-        usdc.clone() as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
-    // Drop all Arc clones holding the trigger so the mpsc channel closes
-    // and rebalancer.run() terminates after processing queued operations.
-    // The reactor (which wraps the trigger) is also held by the snapshot
-    // store's reactor list.
+    // Drop trigger holders so subsequent assertions read final queue state.
     drop(service);
     drop(snapshot_store);
     drop(polling_service);
 
-    rebalancer.run().await;
+    let to_hedging: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToHedging>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
+
+    let to_market_making: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        0,
+        to_hedging, 0,
         "Gross offchain cash is used for the rebalancing ratio, so a $300 \
          reserve must not trigger base_to_alpaca on a balanced 500/500 split"
     );
-
     assert_eq!(
-        usdc.alpaca_to_base_calls(),
-        0,
+        to_market_making, 0,
         "alpaca_to_base should not have been called"
     );
 }
@@ -1316,7 +1461,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
 /// `cash_reserve_does_not_shift_rebalancing_ratio`.
 #[tokio::test]
 async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1331,8 +1476,6 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     })
     .await;
 
-    let (sender, mut receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1342,17 +1485,16 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
-
     assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "Balanced 500/500 split should not trigger any USDC rebalancing"
     );
 }
@@ -1365,7 +1507,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
 /// which covers the balanced case.
 #[tokio::test]
 async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1390,8 +1532,6 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         cash.reserved = Some(Positive::new(Usd::new(float!(100))).unwrap());
     }
 
-    let (sender, mut receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1401,17 +1541,16 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
-
     assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "Missing withdrawable cash + reserve configured must suppress Alpaca-to-Base rebalancing even with a real imbalance"
     );
 }
@@ -1421,7 +1560,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
 /// `check_and_trigger_usdc` dispatches no operations.
 #[tokio::test]
 async fn usdc_none_disables_usdc_rebalancing() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1436,8 +1575,6 @@ async fn usdc_none_disables_usdc_rebalancing() {
     })
     .await;
 
-    let (sender, mut receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1450,35 +1587,34 @@ async fn usdc_none_disables_usdc_rebalancing() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
-
     assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "No USDC operation should be dispatched when usdc threshold is None"
     );
 }
 
 /// Tests that when the Alpaca mint API returns an HTTP error, the
 /// `TokenizedEquityMint` aggregate returns an error without emitting any
-/// events. The rebalancer swallows the error, so no mint events appear
-/// in the event store.
+/// events. The job's perform propagates the pre-receipt failure (so apalis
+/// retries it), and no mint events appear in the event store.
 #[tokio::test]
 async fn mint_api_failure_produces_rejected_event() {
     let EquityTriggerFixture {
         pool,
+        apalis_pool,
         symbol,
         aggregate_id,
         service,
         inventory: _,
         position_cqrs,
-        receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -1502,6 +1638,7 @@ async fn mint_api_failure_produces_rejected_event() {
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token),
         tokenizer,
         MockWrapper::new(),
         Address::ZERO,
@@ -1511,20 +1648,6 @@ async fn mint_api_failure_produces_rejected_event() {
         when.method(POST).path(tokenization_mint_path());
         then.status(500).body("Internal Server Error");
     });
-
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let mock_usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        equity_transfer as _,
-        mock_equity as _,
-        Arc::clone(&mock_usdc) as _,
-        mock_usdc as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
 
     // One more sell triggers the CQRS -> trigger -> Mint flow
     position_cqrs
@@ -1547,10 +1670,31 @@ async fn mint_api_failure_produces_rejected_event() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    drop(service);
-    drop(position_cqrs);
-
-    rebalancer.run().await;
+    let job = fetch_pending_equity_mint_job(&apalis_pool).await;
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
+    let ctx = TransferEquityToMarketMakingCtx {
+        transfer: equity_transfer,
+        equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+        mint_store,
+        equities_config: EquitiesConfig::default(),
+    };
+    let error = Job::perform(&job, &ctx).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PreReceipt(_))
+        ),
+        "an Alpaca API failure before tokens exist must propagate as a \
+         pre-receipt transfer error so apalis retries the job, got {error:?}"
+    );
 
     mint_mock.assert();
 
@@ -1561,8 +1705,8 @@ async fn mint_api_failure_produces_rejected_event() {
     .to_string();
 
     // When the mint API returns HTTP 500, the TokenizedEquityMint aggregate
-    // returns Err(RequestFailed) without emitting any events. The rebalancer
-    // swallows the error (logs it), so no TokenizedEquityMint events appear.
+    // returns Err(RequestFailed) without emitting any events, so no
+    // TokenizedEquityMint events appear.
     assert_events(
         &pool,
         &[
@@ -1612,7 +1756,7 @@ async fn mint_api_failure_produces_rejected_event() {
 /// remaining imbalance, and so on until the inventory is balanced.
 #[tokio::test]
 async fn usdc_operational_limits_cap_across_trigger_cycles() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // 50 onchain, 950 offchain = 5% ratio -> TooMuchOffchain
     // Excess to reach 50% target = 500 - 50 = 450 USDC
@@ -1645,10 +1789,8 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets,
-        disabled_assets: HashSet::new(),
     };
 
-    let (sender, mut receiver) = mpsc::channel(10);
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1658,24 +1800,20 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     // Cycle 1: excess = 450, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op1 = receiver.try_recv().expect("First trigger should fire");
-    match op1 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "First transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
-    }
+    let cycle1 = drain_pending_usdc_transfer_jobs(&apalis_pool).await;
+    assert_eq!(
+        cycle1.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "First transfer capped to $100",
+    );
     trigger.clear_usdc_in_progress();
 
     // Simulate first transfer: 150 onchain, 850 offchain = 15% ratio
@@ -1690,17 +1828,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 2: excess = 350, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op2 = receiver.try_recv().expect("Second trigger should fire");
-    match op2 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "Second transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
-    }
+    let cycle2 = drain_pending_usdc_transfer_jobs(&apalis_pool).await;
+    assert_eq!(
+        cycle2.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "Second transfer capped to $100",
+    );
     trigger.clear_usdc_in_progress();
 
     // Simulate second transfer: 250 onchain, 750 offchain = 25% ratio
@@ -1715,17 +1850,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 3: excess = 250, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op3 = receiver.try_recv().expect("Third trigger should fire");
-    match op3 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "Third transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op3:?}"),
-    }
+    let cycle3 = drain_pending_usdc_transfer_jobs(&apalis_pool).await;
+    assert_eq!(
+        cycle3.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "Third transfer capped to $100",
+    );
     trigger.clear_usdc_in_progress();
 
     // Simulate third transfer: 350 onchain, 650 offchain = 35% ratio
@@ -1740,10 +1872,9 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     trigger.check_and_trigger_usdc().await;
     assert!(
-        matches!(
-            receiver.try_recv().unwrap_err(),
-            mpsc::error::TryRecvError::Empty
-        ),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "Balanced inventory should not trigger"
     );
 }
@@ -1754,7 +1885,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 /// trigger fires again.
 #[tokio::test]
 async fn usdc_in_progress_blocks_concurrent_triggers() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // Large imbalance: 100 onchain, 900 offchain
     let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -1785,10 +1916,8 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets,
-        disabled_assets: HashSet::new(),
     };
 
-    let (sender, mut receiver) = mpsc::channel(10);
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1798,34 +1927,28 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     // First trigger fires: excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op1 = receiver
-        .try_recv()
-        .expect("First trigger should produce an operation");
-    match op1 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "First transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
-    }
+    assert_eq!(
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "First transfer capped to $100",
+    );
 
     // Without clearing in_progress, second trigger is blocked
     trigger.check_and_trigger_usdc().await;
     assert!(
-        matches!(
-            receiver.try_recv().unwrap_err(),
-            mpsc::error::TryRecvError::Empty
-        ),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "In-progress guard should block second trigger"
     );
 
@@ -1834,19 +1957,15 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 
     // Trigger fires again: same inventory, same excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op2 = receiver
-        .try_recv()
-        .expect("After clearing in_progress, trigger should fire again");
-    match op2 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "Retry transfer also capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
-    }
+    assert_eq!(
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "Retry transfer also capped to $100",
+    );
 }
 
 /// Tests that threshold configuration controls trigger sensitivity: the same
@@ -1855,7 +1974,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 /// dispatch a rebalancing operation.
 #[tokio::test]
 async fn threshold_config_controls_trigger_sensitivity() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // Inventory: 350 onchain / 650 offchain = 35% onchain ratio.
     // Wide config (deviation=0.4, bounds: 10%-90%): 35% is within bounds -> no trigger.
@@ -1876,7 +1995,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
         })
         .await;
 
-        let (sender, mut receiver) = mpsc::channel(10);
         let wide_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -1896,7 +2014,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     reserved: None,
                 }),
             },
-            disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -1906,19 +2023,17 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             Arc::clone(&inventory),
-            sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_usdc().await;
         drop(trigger);
 
         assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Disconnected
-            ),
+            drain_pending_usdc_transfer_jobs(&apalis_pool)
+                .await
+                .is_empty(),
             "Wide threshold (10%-90%) should not trigger at 35% onchain ratio"
         );
     }
@@ -1938,7 +2053,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
         })
         .await;
 
-        let (sender, mut receiver) = mpsc::channel(10);
         let tight_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -1958,7 +2072,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     reserved: None,
                 }),
             },
-            disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -1968,29 +2081,23 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             Arc::clone(&inventory),
-            sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_usdc().await;
         drop(trigger);
 
-        let operation = receiver
-            .try_recv()
-            .expect("Tight threshold (40%-60%) should trigger at 35% onchain ratio");
-
         // Excess = target_onchain - actual_onchain = 500 - 350 = $150
-        match operation {
-            TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                assert_eq!(
-                    amount,
-                    Usdc::new(float!(150)),
-                    "Excess should be $150 (target $500 - actual $350)"
-                );
-            }
-            _ => panic!("Expected UsdcAlpacaToBase operation"),
-        }
+        assert_eq!(
+            drain_pending_usdc_transfer_jobs(&apalis_pool)
+                .await
+                .as_slice(),
+            [EnqueuedUsdcOperation::AlpacaToBase {
+                amount: Usdc::new(float!(150))
+            }],
+            "Tight threshold (40%-60%) should trigger at 35% onchain ratio with $150 excess",
+        );
     }
 }
 
@@ -2003,12 +2110,12 @@ async fn threshold_config_controls_trigger_sensitivity() {
 async fn mint_accepted_sets_offchain_inflight() {
     let EquityTriggerFixture {
         pool,
+        apalis_pool,
         symbol,
         aggregate_id: _,
         service,
         inventory,
         position_cqrs,
-        mut receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -2054,35 +2161,22 @@ async fn mint_accepted_sets_offchain_inflight() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-    let mock_wrapper = MockWrapper::new().with_tokenized_shares(token_address);
+    let mock_wrapper = MockWrapper::new()
+        .with_tokenized_shares(token_address)
+        .with_wrapped_token(token_address);
 
     // Wire mint/redemption stores with trigger so lifecycle events update
     // inflight state through the trigger's Reactor
     let equity_transfer = build_equity_transfer_with_service(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         mock_wrapper,
         signer.address(),
         &service,
     )
     .await;
-
-    // Mock the mint API to accept but never complete (stays pending forever)
-    server.mock(|when, then| {
-        when.method(POST).path(tokenization_mint_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(sample_pending_response("inflight_test"));
-    });
-
-    // Mock the poll endpoint to keep returning pending
-    server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([sample_pending_response("inflight_test")]));
-    });
 
     // Trigger the imbalance via a position command to dispatch the Mint
     position_cqrs
@@ -2105,36 +2199,58 @@ async fn mint_accepted_sets_offchain_inflight() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    // Receive the dispatched Mint operation and get the quantity
-    let operation = receiver
-        .try_recv()
-        .expect("Trigger should dispatch a Mint operation for the imbalance");
-    let TriggeredOperation::Mint {
-        symbol: mint_symbol,
-        quantity: mint_quantity,
-    } = operation
-    else {
-        panic!("Expected Mint operation, got {operation:?}");
-    };
-    assert_eq!(mint_symbol, symbol);
+    // Fetch the enqueued mint job and get the quantity
+    let job = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(job.symbol, symbol);
+    let mint_quantity = job.quantity;
 
-    // Execute the mint transfer. This calls the Alpaca API, gets MintAccepted,
+    // Mock the mint API to accept but never complete (stays pending forever)
+    server.mock(|when, then| {
+        when.method(POST).path(tokenization_mint_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response(
+                "inflight_test",
+                &job.issuer_request_id,
+            ));
+    });
+
+    // Mock the poll endpoint to keep returning pending
+    server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_pending_response(
+                "inflight_test",
+                &job.issuer_request_id
+            )]));
+    });
+
+    // Execute the mint job. This calls the Alpaca API, gets MintAccepted,
     // which triggers on_mint -> Inventory::transfer(Hedging, Start, qty).
     // The poll will return pending, so the mint aggregate will time out or loop,
     // but MintAccepted has already fired by then. We spawn and cancel to
     // get just the MintAccepted event through.
+    let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        },
+    ));
     let transfer_handle = tokio::spawn({
         let equity_transfer = Arc::clone(&equity_transfer);
-        let mint_symbol = mint_symbol.clone();
+        let mint_store = Arc::clone(&mint_store_for_spawn);
         async move {
-            let _ = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-                equity_transfer.as_ref(),
-                Equity {
-                    symbol: mint_symbol,
-                    quantity: mint_quantity,
-                },
-            )
-            .await;
+            let ctx = TransferEquityToMarketMakingCtx {
+                transfer: equity_transfer,
+                equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+                mint_store,
+                equities_config: EquitiesConfig::default(),
+            };
+            let _ = Job::perform(&job, &ctx).await;
         }
     });
 
@@ -2200,12 +2316,12 @@ async fn mint_accepted_sets_offchain_inflight() {
 async fn completed_mint_clears_inflight_and_updates_inventory() {
     let EquityTriggerFixture {
         pool,
+        apalis_pool,
         symbol,
         aggregate_id: _,
         service,
         inventory,
         position_cqrs,
-        mut receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -2249,11 +2365,14 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-    let mock_wrapper = MockWrapper::new().with_tokenized_shares(token_address);
+    let mock_wrapper = MockWrapper::new()
+        .with_tokenized_shares(token_address)
+        .with_wrapped_token(token_address);
 
     let equity_transfer = build_equity_transfer_with_service(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         mock_wrapper,
         signer.address(),
@@ -2262,32 +2381,6 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     .await;
 
     let wallet_hex = format!("{:#x}", signer.address());
-
-    let mint_mock = server.mock(|when, then| {
-        when.method(POST)
-            .path(tokenization_mint_path())
-            .json_body_includes(
-                json!({
-                    "underlying_symbol": "AAPL",
-                    "qty": "30.5",
-                    "wallet_address": wallet_hex,
-                })
-                .to_string(),
-            );
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(sample_pending_response("completed_mint_test"));
-    });
-
-    let poll_mock = server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([sample_completed_response(
-                "completed_mint_test",
-                mint_tx_hash
-            )]));
-    });
 
     // Trigger the mint via a position command
     position_cqrs
@@ -2310,17 +2403,40 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    // Receive the dispatched Mint operation
-    let operation = receiver
-        .try_recv()
-        .expect("Trigger should dispatch a Mint operation");
-    let TriggeredOperation::Mint {
-        symbol: mint_symbol,
-        quantity: mint_quantity,
-    } = operation
-    else {
-        panic!("Expected Mint operation, got {operation:?}");
-    };
+    // Fetch the enqueued mint job
+    let job = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(job.symbol, symbol);
+    let mint_quantity = job.quantity;
+
+    let mint_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path(tokenization_mint_path())
+            .json_body_includes(
+                json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "30.5",
+                    "wallet_address": wallet_hex,
+                })
+                .to_string(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response(
+                "completed_mint_test",
+                &job.issuer_request_id,
+            ));
+    });
+
+    let poll_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_completed_response(
+                "completed_mint_test",
+                &job.issuer_request_id,
+                mint_tx_hash
+            )]));
+    });
 
     // Record initial onchain available before the mint executes
     let initial_onchain_available = {
@@ -2328,16 +2444,23 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         inv.equity_available(&symbol, Venue::MarketMaking).unwrap()
     };
 
-    // Execute the full mint lifecycle through CrossVenueTransfer
-    CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-        equity_transfer.as_ref(),
-        Equity {
-            symbol: mint_symbol,
-            quantity: mint_quantity,
+    // Execute the full mint lifecycle through the job's perform
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
         },
-    )
-    .await
-    .unwrap();
+    ));
+    let ctx = TransferEquityToMarketMakingCtx {
+        transfer: Arc::clone(&equity_transfer) as _,
+        equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+        mint_store,
+        equities_config: EquitiesConfig::default(),
+    };
+    Job::perform(&job, &ctx).await.unwrap();
 
     mint_mock.assert();
     poll_mock.assert();
@@ -2376,12 +2499,12 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
 async fn transfer_failed_cancels_redemption_inflight() {
     let EquityTriggerFixture {
         pool,
+        apalis_pool: _,
         symbol,
         aggregate_id: _,
         service,
         inventory,
         position_cqrs,
-        receiver: _,
     } = setup_equity_trigger().await;
 
     // Build inventory: 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain
@@ -2401,6 +2524,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
 
     let equity_services = EquityTransferServices {
         raindex: Arc::new(MockRaindex::new()),
+        vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         wrapper: Arc::new(MockWrapper::new()),
     };
@@ -2411,7 +2535,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .await
         .unwrap();
 
-    let redemption_id = RedemptionAggregateId::new("redemption-transfer-failed");
+    let redemption_id = redemption_aggregate_id("redemption-transfer-failed");
 
     // Redeem: creates VaultWithdrawPending
     redemption_store
@@ -2493,5 +2617,528 @@ async fn transfer_failed_cancels_redemption_inflight() {
     assert!(
         available_after_fail.inner().eq(float!("80")).unwrap(),
         "Available should be restored to 80 after TransferFailed, got {available_after_fail:?}"
+    );
+}
+
+/// WrappedEquityRecovery claims a `HeldForRecovery` slot (the wrap-landed-but-
+/// unconfirmed handoff), but when inventory shows NO wrapped balance yet it
+/// must RESCHEDULE itself rather than drop the slot: the inventory reactor only
+/// re-dispatches recovery on a positive balance, so dropping here would restore
+/// `HeldForRecovery` with no job left to drain it -- wedging the symbol. The
+/// guard is restored to `HeldForRecovery` and a delayed job keeps polling.
+///
+/// For the case where the wrapped balance IS present, see
+/// `recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery`.
+#[tokio::test]
+async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
+    let symbol = Symbol::new("AAPL").unwrap();
+
+    // Guard is HeldForRecovery: set by the transfer job when PostReceipt fired.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        WrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+        },
+    ));
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
+
+    let ctx = WrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+    let job = WrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job claims HeldForRecovery, finds no wrapped balance, and reschedules
+    // (returns Ok(())) to keep polling -- the guard is restored on drop.
+    job.perform(&ctx)
+        .await
+        .expect("wrapped recovery must return Ok(()) when rescheduling");
+
+    // The guard must be restored to HeldForRecovery after the no-balance drop.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        Some(&GuardState::HeldForRecovery),
+        "equity_in_progress must be restored to HeldForRecovery after a no-balance reschedule; \
+         the slot must not be cleared so recovery retries can still claim it",
+    );
+
+    // No work was done past the no-balance skip, so the aggregate is absent.
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        state.is_none(),
+        "wrapped recovery must not create the aggregate when it reschedules; got {state:?}",
+    );
+
+    // A rescheduled job must have been enqueued so polling continues.
+    let (rescheduled,): (i64,) =
+        sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rescheduled, 1,
+        "a HeldForRecovery claim with no balance must enqueue a delayed job to keep polling",
+    );
+}
+
+/// LANDED-BUT-UNCONFIRMED SCENARIO: the transfer job got a `PostReceipt` error
+/// in `WrapSubmitted` and handed the slot to recovery as `HeldForRecovery`, but
+/// the wrap tx actually LANDED -- only its confirmation read failed under a
+/// stale RPC. The tokens are therefore WRAPPED in the base wallet (inventory:
+/// `BaseWalletWrapped`), and `WrappedEquityRecovery` is the job the reactor
+/// dispatches. It must:
+/// 1. Claim the `HeldForRecovery` slot (not reschedule -- the old orphan-only
+///    claim refused it, wedging the slot with no job able to drain it).
+/// 2. Drive the orphan deposit sequence to `OrphanDeposited`.
+/// 3. Release the guard (map empty after completion).
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery() {
+    let symbol = Symbol::new("AAPL").unwrap();
+
+    // Guard is HeldForRecovery: set by the transfer job after a PostReceipt
+    // error in WrapSubmitted. The wrap tx landed, so tokens are WRAPPED.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO)),
+    );
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        WrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+        },
+    ));
+
+    // Inventory reports WRAPPED balance: the wrap landed, tokens are wtSTOCK
+    // in the base wallet outside Raindex.
+    let shares = FractionalShares::new(float!(5));
+    let mut balances = BTreeMap::new();
+    balances.insert(symbol.clone(), shares);
+    let now = Utc::now();
+    let view = InventoryView::default().set_inflight_equity_at_location(
+        InFlightEquityLocation::BaseWalletWrapped,
+        &balances,
+        now,
+        now,
+    );
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+    let ctx = WrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+    let job = WrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job must claim HeldForRecovery and run to completion.
+    job.perform(&ctx)
+        .await
+        .expect("WrappedEquityRecovery must run to completion when guard is HeldForRecovery");
+
+    // Verify the aggregate reached a terminal state (orphan deposit path).
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(state, Some(WrappedEquityRecovery::OrphanDeposited { .. })),
+        "WrappedEquityRecovery must drive orphan path to OrphanDeposited, got {state:?}",
+    );
+
+    // Verify the guard was released: the slot must be absent after completion.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "equity_in_progress must be empty after WrappedEquityRecovery completes; \
+         a stuck guard would block future transfers for {symbol}",
+    );
+
+    // Verify no rescheduled jobs were enqueued.
+    let (rescheduled,): (i64,) =
+        sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rescheduled, 0,
+        "WrappedEquityRecovery must NOT reschedule when it can claim HeldForRecovery and drain \
+         the wrapped balance; a reschedule count > 0 means the deadlock-break failed",
+    );
+}
+
+/// ORPHAN-DISPATCH VARIANT (RAI-1070): the ERC-4626 wrap reverted, so tokens
+/// are still UNWRAPPED in the base wallet (inventory: `BaseWalletUnwrapped`),
+/// and there is NO active mint in the inventory view, so `decide_dispatch`
+/// resolves to `Orphan`. `UnwrappedEquityRecovery` must:
+/// 1. Claim the `HeldForRecovery` slot (not reschedule).
+/// 2. Drive the orphan wrap+deposit sequence to `OrphanDeposited`.
+/// 3. Release the guard (map empty after completion).
+///
+/// The prod path usually carries an active mint (see
+/// `recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint` for
+/// the `ActiveMint` -> `DispatchToMint` variant); this test isolates the
+/// orphan branch.
+///
+/// Before this fix, `mark_held_for_recovery` only fired for `TokensWrapped`,
+/// so the prod (wrap-failed) path left the guard as `ActiveTransfer` after
+/// apalis retry exhaustion, deadlocking all future mints for the symbol.
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery() {
+    let symbol = Symbol::new("AAPL").unwrap();
+
+    // Guard is HeldForRecovery: set by the transfer job when it got a
+    // PostReceipt error with the aggregate in TokensReceived/WrapSubmitted.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO)),
+    );
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+            wallet: Address::ZERO,
+        },
+    ));
+
+    // Inventory reports UNWRAPPED balance: wrap failed, tokens are raw tSTOCK
+    // in the base wallet.
+    let shares = FractionalShares::new(float!(5));
+    let mut balances = BTreeMap::new();
+    balances.insert(symbol.clone(), shares);
+    let now = Utc::now();
+    let view = InventoryView::default().set_inflight_equity_at_location(
+        InFlightEquityLocation::BaseWalletUnwrapped,
+        &balances,
+        now,
+        now,
+    );
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+    let ctx = UnwrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+    let job = UnwrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job must claim HeldForRecovery and run to completion.
+    job.perform(&ctx)
+        .await
+        .expect("UnwrappedEquityRecovery must run to completion when guard is HeldForRecovery");
+
+    // Verify the aggregate reached a terminal state (orphan wrap+deposit path).
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(state, Some(UnwrappedEquityRecovery::OrphanDeposited { .. })),
+        "UnwrappedEquityRecovery must drive orphan path to OrphanDeposited, got {state:?}",
+    );
+
+    // Verify the guard was released: the slot must be absent after completion.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "equity_in_progress must be empty after UnwrappedEquityRecovery completes; \
+         a stuck guard would block future transfers for {symbol}",
+    );
+
+    // Verify no rescheduled jobs were enqueued.
+    let (rescheduled,): (i64,) =
+        sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rescheduled, 0,
+        "UnwrappedEquityRecovery must NOT reschedule when it can claim HeldForRecovery; \
+         a reschedule count > 0 means the job incorrectly treated it as contention",
+    );
+}
+
+/// ACTIVE-MINT VARIANT (RAI-1070): the path prod actually takes. A wrap-failed
+/// mint is in `TokensReceived`/`WrapSubmitted`, and the snapshot reactor's
+/// `update_active_mint` has populated `active_mint`, so `decide_dispatch`
+/// resolves to `ActiveMint` -- recovery dispatches `DispatchToMint`, which
+/// `resume_mint`s the persisted mint from its pre-wrap state, reaching
+/// `DispatchedToMint`. The orphan variant above covers only the
+/// no-active-mint branch, which is not what prod hits for a wrap-failed mint.
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() {
+    let symbol = Symbol::new("AAPL").unwrap();
+    let mint_id = issuer_request_id("active-mint-deadlock");
+
+    // Guard is HeldForRecovery: handed off by the transfer job after PostReceipt.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery,
+    )])));
+
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO)),
+    );
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+    let equity_services = EquityTransferServices {
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+    };
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services,
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        Arc::clone(&raindex),
+        Arc::clone(&vault_lookup),
+        Arc::clone(&tokenizer),
+        Arc::clone(&wrapper),
+        Address::random(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+            wallet: Address::ZERO,
+        },
+    ));
+
+    // Seed the mint aggregate in TokensReceived (the persisted pre-wrap state)
+    // with quantity matching the unwrapped wallet balance, so resume_mint can
+    // re-drive it and validate_active_aggregate_quantity passes.
+    mint_store
+        .send(
+            &mint_id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::ZERO,
+            },
+        )
+        .await
+        .expect("RequestMint must persist");
+    mint_store
+        .send(&mint_id, TokenizedEquityMintCommand::Poll)
+        .await
+        .expect("Poll must transition the mint to TokensReceived");
+
+    // Inventory reports UNWRAPPED balance AND an active mint, so decide_dispatch
+    // resolves to ActiveMint (the prod path) instead of Orphan.
+    let shares = FractionalShares::new(float!(5));
+    let mut balances = BTreeMap::new();
+    balances.insert(symbol.clone(), shares);
+    let now = Utc::now();
+    let view = InventoryView::default()
+        .set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletUnwrapped,
+            &balances,
+            now,
+            now,
+        )
+        .set_active_mint(symbol.clone(), mint_id.clone());
+
+    let (sender, _receiver) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+    let ctx = UnwrappedEquityRecoveryCtx {
+        inventory,
+        store: Arc::clone(&store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+
+    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+    let job = UnwrappedEquityRecoveryJob {
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+    };
+
+    // The job must claim HeldForRecovery and dispatch through the ActiveMint path.
+    job.perform(&ctx)
+        .await
+        .expect("UnwrappedEquityRecovery must run to completion on the ActiveMint path");
+
+    // Verify the recovery aggregate dispatched via DispatchToMint (NOT the orphan
+    // wrap path), reaching the DispatchedToMint terminal state.
+    let state = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(
+            state,
+            Some(UnwrappedEquityRecovery::DispatchedToMint { .. })
+        ),
+        "recovery must drive the ActiveMint path to DispatchedToMint, got {state:?}",
+    );
+
+    // Verify the guard was released after completion.
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "equity_in_progress must be empty after recovery dispatches the active mint; \
+         a stuck guard would block future transfers for {symbol}",
     );
 }

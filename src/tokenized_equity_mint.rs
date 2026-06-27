@@ -44,8 +44,10 @@ use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::fmt::Display;
 use std::str::FromStr;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -55,28 +57,38 @@ use st0x_finance::Id;
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::TokenizationRequestStatus;
 
-/// Alpaca issuer request identifier returned when a tokenization request is accepted.
+/// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.
+///
+/// Mirrors [`crate::usdc_rebalance::UsdcRebalanceId`]: a UUID so invalid ids are
+/// unrepresentable and apalis/CLI retries always target the same aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) struct IssuerRequestId(pub(crate) String);
+pub(crate) struct IssuerRequestId(pub(crate) Uuid);
 
 impl IssuerRequestId {
-    pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
     }
 }
 
-impl std::fmt::Display for IssuerRequestId {
+impl Display for IssuerRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
 impl FromStr for IssuerRequestId {
-    type Err = std::convert::Infallible;
+    type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(value.to_string()))
+        Ok(Self(Uuid::parse_str(value)?))
     }
+}
+
+/// Deterministic issuer request id for tests. Maps a human-readable label to a
+/// UUID v5 so test aggregate ids stay valid [`IssuerRequestId`] values.
+#[cfg(test)]
+pub(crate) fn issuer_request_id(label: &str) -> IssuerRequestId {
+    IssuerRequestId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
 
 /// Alpaca tokenization request identifier used to track the mint operation through their API.
@@ -116,6 +128,15 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to modify a failed mint operation
     #[error("Already failed")]
     AlreadyFailed,
+    /// Attempted to reconcile a mint that is not in the `Failed` state
+    #[error("Cannot reconcile: mint is not in the Failed state")]
+    NotFailed,
+    /// Attempted to act on a mint already resolved out-of-band (`Reconciled`)
+    #[error("Already reconciled")]
+    AlreadyReconciled,
+    /// Attempted to reconcile without an operator-supplied reason.
+    #[error("Cannot reconcile: reason is required")]
+    ReconcileReasonRequired,
     /// Tokenizer API failed to submit the mint request.
     /// Tokenizer errors can't be wrapped with #[from] because they may
     /// contain types that don't implement Serialize/Deserialize (required
@@ -170,6 +191,9 @@ impl PartialEq for TokenizedEquityMintError {
             | (Self::TokensNotReceivedForWrap, Self::TokensNotReceivedForWrap)
             | (Self::AlreadyCompleted, Self::AlreadyCompleted)
             | (Self::AlreadyFailed, Self::AlreadyFailed)
+            | (Self::NotFailed, Self::NotFailed)
+            | (Self::AlreadyReconciled, Self::AlreadyReconciled)
+            | (Self::ReconcileReasonRequired, Self::ReconcileReasonRequired)
             | (Self::MissingTxHash, Self::MissingTxHash)
             | (Self::VaultDepositFailed, Self::VaultDepositFailed) => true,
             (
@@ -242,11 +266,18 @@ pub(crate) enum TokenizedEquityMintCommand {
     WrapTokens {
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
+        /// Block where the wrap tx confirmed. Mandatory on the live command so
+        /// a new `TokensWrapped` event can never skip the node-sync wait before
+        /// deposit. The persisted event keeps `Option<u64>` for legacy replay.
+        wrap_block: u64,
     },
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
     },
-    /// Operator or timeout-driven failure from `MintAccepted` state.
+    /// Operator or timeout-driven failure from `MintAccepted` state, or operator
+    /// force-fail from `MintRequested` (requested at the provider but never
+    /// accepted). Both emit `MintAcceptanceFailed`; the pre-acceptance case
+    /// moved no shares to inflight, so there is nothing to restore.
     FailAcceptance {
         reason: String,
     },
@@ -265,6 +296,19 @@ pub(crate) enum TokenizedEquityMintCommand {
         tokenization_request_id: TokenizationRequestId,
         tx_hash: TxHash,
         fees: Option<Float>,
+    },
+    /// Reconcile a mint stranded in the terminal `Failed` state to the terminal
+    /// `Reconciled` state. The residual tokens/equity were handled out-of-band
+    /// (e.g. via wrap-equity/vault-deposit), so this is a bookkeeping resolution
+    /// rather than a re-drive. Valid ONLY from `Failed`.
+    ///
+    /// Accepts any `Failed` variant, including a pre-departure `MintRejected`
+    /// failure that stranded nothing. Such a mint needs no reconcile (the
+    /// dashboard already excludes it from the stuck list); reconciling it is a
+    /// harmless no-residue bookkeeping close, so the operator decides whether it
+    /// is warranted rather than the aggregate second-guessing the failure cause.
+    Reconcile {
+        reason: String,
     },
 }
 
@@ -292,8 +336,14 @@ pub(crate) enum TokenizedEquityMintEvent {
         tokenization_request_id: TokenizationRequestId,
         accepted_at: DateTime<Utc>,
     },
-    /// Mint failed after acceptance but before tokens were received.
-    /// Shares were moved to inflight, can be safely restored to offchain available.
+    /// Mint failed before tokens were received. Two cases:
+    /// - failed after `MintAccepted`: shares were moved to inflight (Hedging),
+    ///   so the inventory reactor restores them to offchain available (Cancel).
+    /// - operator force-fail from `MintRequested` (pre-acceptance): NO shares
+    ///   were moved to inflight, so there is nothing to restore.
+    ///
+    /// `mint_inventory_update` gates the Cancel on the tracking stage having
+    /// reached `Accepted`, so the pre-acceptance case is a no-op there.
     MintAcceptanceFailed {
         reason: String,
         failed_at: DateTime<Utc>,
@@ -323,6 +373,10 @@ pub(crate) enum TokenizedEquityMintEvent {
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
         wrapped_at: DateTime<Utc>,
+        /// Block where the wrap tx confirmed; `None` for events emitted before this field was
+        /// added (schema backward-compatibility).
+        #[serde(default)]
+        wrap_block: Option<u64>,
     },
     /// Wrapping failed after tokens were received.
     WrappingFailed {
@@ -370,6 +424,12 @@ pub(crate) enum TokenizedEquityMintEvent {
         )]
         fees: Option<Float>,
         recovered_at: DateTime<Utc>,
+    },
+    /// An operator reconciled a terminal `Failed` mint out-of-band. Marks the
+    /// transfer resolved without re-driving the failed leg.
+    OperatorReconciled {
+        reason: String,
+        reconciled_at: DateTime<Utc>,
     },
 }
 
@@ -424,6 +484,16 @@ impl PartialEq for TokenizedEquityMintEvent {
                     reason: reason_b,
                     failed_at: time_b,
                 },
+            )
+            | (
+                Self::OperatorReconciled {
+                    reason: reason_a,
+                    reconciled_at: time_a,
+                },
+                Self::OperatorReconciled {
+                    reason: reason_b,
+                    reconciled_at: time_b,
+                },
             ) => reason_a == reason_b && time_a == time_b,
             (
                 Self::MintAccepted {
@@ -465,13 +535,15 @@ impl PartialEq for TokenizedEquityMintEvent {
                     wrap_tx_hash: hash_a,
                     wrapped_shares: shares_a,
                     wrapped_at: time_a,
+                    wrap_block: block_a,
                 },
                 Self::TokensWrapped {
                     wrap_tx_hash: hash_b,
                     wrapped_shares: shares_b,
                     wrapped_at: time_b,
+                    wrap_block: block_b,
                 },
-            ) => hash_a == hash_b && shares_a == shares_b && time_a == time_b,
+            ) => hash_a == hash_b && shares_a == shares_b && time_a == time_b && block_a == block_b,
             (
                 Self::WrappingFailed {
                     symbol: sym_a,
@@ -585,6 +657,9 @@ impl DomainEvent for TokenizedEquityMintEvent {
             Self::ProviderCompletionRecovered { .. } => {
                 "TokenizedEquityMintEvent::ProviderCompletionRecovered".to_string()
             }
+            Self::OperatorReconciled { .. } => {
+                "TokenizedEquityMintEvent::OperatorReconciled".to_string()
+            }
         }
     }
 
@@ -691,6 +766,9 @@ pub(crate) enum TokenizedEquityMint {
         shares_minted: U256,
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
+        /// Block where the wrap tx confirmed; `None` for aggregates persisted before this field.
+        #[serde(default)]
+        wrap_block: Option<u64>,
         requested_at: DateTime<Utc>,
         accepted_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
@@ -751,6 +829,25 @@ pub(crate) enum TokenizedEquityMint {
         reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+    },
+
+    /// An operator reconciled a terminal `Failed` mint out-of-band (terminal
+    /// state). Retains the identifying symbol/quantity and the original failure
+    /// reason so the projection still reports the real transfer instead of a
+    /// zero-value record.
+    Reconciled {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
+        /// The failure reason carried over from the `Failed` state.
+        failure_reason: String,
+        /// The operator-supplied reconciliation reason.
+        reconcile_reason: String,
+        requested_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
     },
 }
 
@@ -908,6 +1005,7 @@ impl PartialEq for TokenizedEquityMint {
                     shares_minted: mint_a,
                     wrap_tx_hash: wrap_hash_a,
                     wrapped_shares: wrap_shares_a,
+                    wrap_block: wrap_block_a,
                     requested_at: req_a,
                     accepted_at: acc_a,
                     received_at: recv_a,
@@ -923,6 +1021,7 @@ impl PartialEq for TokenizedEquityMint {
                     shares_minted: mint_b,
                     wrap_tx_hash: wrap_hash_b,
                     wrapped_shares: wrap_shares_b,
+                    wrap_block: wrap_block_b,
                     requested_at: req_b,
                     accepted_at: acc_b,
                     received_at: recv_b,
@@ -938,6 +1037,7 @@ impl PartialEq for TokenizedEquityMint {
                     && mint_a == mint_b
                     && wrap_hash_a == wrap_hash_b
                     && wrap_shares_a == wrap_shares_b
+                    && wrap_block_a == wrap_block_b
                     && req_a == req_b
                     && acc_a == acc_b
                     && recv_a == recv_b
@@ -1048,6 +1148,31 @@ impl PartialEq for TokenizedEquityMint {
                     && req_a == req_b
                     && fail_a == fail_b
             }
+            (
+                Self::Reconciled {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    failure_reason: fail_reason_a,
+                    reconcile_reason: rec_reason_a,
+                    requested_at: req_a,
+                    reconciled_at: reconciled_a,
+                },
+                Self::Reconciled {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    failure_reason: fail_reason_b,
+                    reconcile_reason: rec_reason_b,
+                    requested_at: req_b,
+                    reconciled_at: reconciled_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && fail_reason_a == fail_reason_b
+                    && rec_reason_a == rec_reason_b
+                    && req_a == req_b
+                    && reconciled_a == reconciled_b
+            }
             _ => false,
         }
     }
@@ -1056,6 +1181,23 @@ impl PartialEq for TokenizedEquityMint {
 impl Eq for TokenizedEquityMint {}
 
 impl TokenizedEquityMint {
+    /// Returns the requested quantity carried by the aggregate in every
+    /// non-terminal state. Wrapped-equity recovery compares this against the
+    /// wallet snapshot so an audit mismatch surfaces before dispatch.
+    pub(crate) fn quantity(&self) -> Float {
+        match self {
+            Self::MintRequested { quantity, .. }
+            | Self::MintAccepted { quantity, .. }
+            | Self::TokensReceived { quantity, .. }
+            | Self::WrapSubmitted { quantity, .. }
+            | Self::TokensWrapped { quantity, .. }
+            | Self::VaultDepositSubmitted { quantity, .. }
+            | Self::DepositedIntoRaindex { quantity, .. }
+            | Self::Failed { quantity, .. }
+            | Self::Reconciled { quantity, .. } => *quantity,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &IssuerRequestId) -> TransferOperation {
         use EquityMintStatus::*;
 
@@ -1068,7 +1210,7 @@ impl TokenizedEquityMint {
                 requested_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Minting,
@@ -1083,7 +1225,7 @@ impl TokenizedEquityMint {
                 accepted_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Minting,
@@ -1105,7 +1247,7 @@ impl TokenizedEquityMint {
                 received_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Wrapping,
@@ -1127,7 +1269,7 @@ impl TokenizedEquityMint {
                 wrapped_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Depositing,
@@ -1142,7 +1284,7 @@ impl TokenizedEquityMint {
                 deposited_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Completed {
@@ -1159,7 +1301,7 @@ impl TokenizedEquityMint {
                 failed_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Failed {
@@ -1167,6 +1309,26 @@ impl TokenizedEquityMint {
                 },
                 started_at: *requested_at,
                 updated_at: *failed_at,
+            }),
+
+            // Reconciliation is a terminal operator resolution, so it maps to the
+            // existing `Completed` DTO status (no new status needed) -- mirrors the
+            // USDC `Reconciled -> Completed` mapping.
+            Self::Reconciled {
+                symbol,
+                quantity,
+                requested_at,
+                reconciled_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(issuer_request_id.to_string()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: Completed {
+                    completed_at: *reconciled_at,
+                },
+                started_at: *requested_at,
+                updated_at: *reconciled_at,
             }),
         }
     }
@@ -1203,7 +1365,12 @@ pub(crate) async fn interrupted_mint_ids(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(IssuerRequestId::new).collect())
+    rows.into_iter()
+        .map(|row| {
+            row.parse()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Our tokenized equity tokens use 18 decimals.
@@ -1232,7 +1399,11 @@ impl EventSourced for TokenizedEquityMint {
     const PROJECTION: Nil = Nil;
     // v3: removed the vestigial `receipt_id` field and added the
     // `ProviderCompletionRecovered` event for in-process failed-transfer recovery.
-    const SCHEMA_VERSION: u64 = 3;
+    // v4: added the terminal `Reconciled` state and the `OperatorReconciled`
+    // event for operator reconciliation of stuck `Failed` mints. Additive only;
+    // bumped to clear stale snapshots so they rebuild from events under the new
+    // schema (existing events replay unchanged).
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use TokenizedEquityMintEvent::*;
@@ -1324,12 +1495,21 @@ impl EventSourced for TokenizedEquityMint {
             }
 
             MintAcceptanceFailed { reason, failed_at } => {
-                let Self::MintAccepted {
+                // Emitted from `MintAccepted` (post-acceptance failure) or
+                // `MintRequested` (operator force-fail before acceptance); both
+                // carry the symbol/quantity/requested_at the `Failed` state needs.
+                let (Self::MintAccepted {
                     symbol,
                     quantity,
                     requested_at,
                     ..
-                } = entity
+                }
+                | Self::MintRequested {
+                    symbol,
+                    quantity,
+                    requested_at,
+                    ..
+                }) = entity
                 else {
                     return Ok(None);
                 };
@@ -1452,6 +1632,7 @@ impl EventSourced for TokenizedEquityMint {
                 wrap_tx_hash,
                 wrapped_shares,
                 wrapped_at,
+                wrap_block,
             } => match entity {
                 Self::TokensReceived {
                     symbol,
@@ -1488,6 +1669,7 @@ impl EventSourced for TokenizedEquityMint {
                     shares_minted: *shares_minted,
                     wrap_tx_hash: *wrap_tx_hash,
                     wrapped_shares: *wrapped_shares,
+                    wrap_block: *wrap_block,
                     requested_at: *requested_at,
                     accepted_at: *accepted_at,
                     received_at: *received_at,
@@ -1514,6 +1696,7 @@ impl EventSourced for TokenizedEquityMint {
                     accepted_at,
                     received_at,
                     wrapped_at,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -1595,6 +1778,31 @@ impl EventSourced for TokenizedEquityMint {
                 }),
                 _ => None,
             },
+
+            OperatorReconciled {
+                reason,
+                reconciled_at,
+            } => {
+                let Self::Failed {
+                    symbol,
+                    quantity,
+                    reason: failure_reason,
+                    requested_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reason.clone(),
+                    requested_at: *requested_at,
+                    reconciled_at: *reconciled_at,
+                })
+            }
         })
     }
 
@@ -1791,6 +1999,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash } => match self {
@@ -1808,6 +2017,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::SubmitVaultDeposit {
@@ -1825,17 +2035,20 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::WrapTokens {
                 wrap_tx_hash,
                 wrapped_shares,
+                wrap_block,
             } => match self {
                 Self::TokensReceived { .. } | Self::WrapSubmitted { .. } => {
                     Ok(vec![TokensWrapped {
                         wrap_tx_hash,
                         wrapped_shares,
                         wrapped_at: Utc::now(),
+                        wrap_block: Some(wrap_block),
                     }])
                 }
                 Self::MintRequested { .. } | Self::MintAccepted { .. } => {
@@ -1847,6 +2060,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::DepositToVault {
@@ -1866,18 +2080,35 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::FailAcceptance { reason } => match self {
-                Self::MintAccepted { .. } => Ok(vec![MintAcceptanceFailed {
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
+                // `MintRequested` is pre-acceptance: a mint stuck there (requested
+                // at the provider but never accepted) is force-failed by the
+                // operator. Acceptance never happened, so `MintAcceptanceFailed`
+                // is the honest terminal -- the same event the post-acceptance
+                // failure emits, broadened in `evolve` to also start from here.
+                Self::MintRequested { .. } | Self::MintAccepted { .. } => {
+                    Ok(vec![MintAcceptanceFailed {
+                        reason,
+                        failed_at: Utc::now(),
+                    }])
+                }
                 Self::DepositedIntoRaindex { .. } => {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
-                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
+                // Past acceptance and mid-pipeline: failing acceptance no longer
+                // applies. Listed explicitly (not `_`) so a new state variant is
+                // a compile error here rather than a silent AlreadyInProgress.
+                Self::TokensReceived { .. }
+                | Self::WrapSubmitted { .. }
+                | Self::TokensWrapped { .. }
+                | Self::VaultDepositSubmitted { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyInProgress)
+                }
             },
 
             TokenizedEquityMintCommand::FailWrapping { reason } => match self {
@@ -1903,6 +2134,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
 
@@ -1917,6 +2149,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
 
@@ -1936,10 +2169,31 @@ impl EventSourced for TokenizedEquityMint {
                     fees,
                     recovered_at: Utc::now(),
                 }]),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 Self::DepositedIntoRaindex { .. } => {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+            },
+
+            TokenizedEquityMintCommand::Reconcile { reason } => match self {
+                Self::Failed { symbol, .. } => {
+                    if reason.trim().is_empty() {
+                        return Err(TokenizedEquityMintError::ReconcileReasonRequired);
+                    }
+
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Reconciling stuck failed mint out-of-band"
+                    );
+                    Ok(vec![OperatorReconciled {
+                        reason,
+                        reconciled_at: Utc::now(),
+                    }])
+                }
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
+                _ => Err(TokenizedEquityMintError::NotFailed),
             },
         }
     }
@@ -1947,29 +2201,37 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::B256;
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
+    use st0x_float_macro::float;
+    use st0x_raindex::RaindexVaultId;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
-    use crate::wrapper::mock::MockWrapper;
-    use st0x_float_macro::float;
+    use crate::vault_lookup::MockVaultLookup;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
         EquityTransferServices {
             tokenizer: Arc::new(tokenizer),
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
         }
     }
 
     fn mint_command() -> TokenizedEquityMintCommand {
         TokenizedEquityMintCommand::RequestMint {
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -1987,7 +2249,7 @@ mod tests {
 
     fn mint_accepted_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
@@ -2007,6 +2269,7 @@ mod tests {
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
             wrapped_at: Utc::now(),
+            wrap_block: None,
         }
     }
 
@@ -2045,6 +2308,12 @@ mod tests {
         )
     }
 
+    fn mint_accepted_payload(id: &IssuerRequestId) -> String {
+        format!(
+            r#"{{"MintAccepted":{{"issuer_request_id":"{id}","tokenization_request_id":"TOK001","accepted_at":"2026-01-01T00:00:00Z"}}}}"#
+        )
+    }
+
     #[tokio::test]
     async fn initialize_emits_requested_and_accepted() {
         let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
@@ -2063,7 +2332,7 @@ mod tests {
             matches!(
                 &events[1],
                 TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if *issuer_request_id == IssuerRequestId::new("ISS001")
+                    if *issuer_request_id == super::issuer_request_id("ISS001")
             ),
             "Expected MintAccepted with ISS001, got: {:?}",
             events[1]
@@ -2074,7 +2343,7 @@ mod tests {
     async fn poll_after_acceptance_emits_tokens_received() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
 
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -2094,7 +2363,7 @@ mod tests {
         let tokenizer = MockTokenizer::new().with_fees(expected_fees);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
 
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -2119,7 +2388,7 @@ mod tests {
     async fn poll_completed_with_wrong_token_symbol_errors() {
         let tokenizer = MockTokenizer::new().with_token_symbol_override("tGME");
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         let error = store
@@ -2152,7 +2421,7 @@ mod tests {
     async fn poll_completed_with_missing_token_symbol_errors() {
         let tokenizer = MockTokenizer::new().with_no_token_symbol();
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         let error = store
@@ -2183,7 +2452,7 @@ mod tests {
     async fn poll_rejected_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2203,7 +2472,7 @@ mod tests {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
@@ -2213,7 +2482,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS999".to_string()),
+            issuer_request_id: issuer_request_id("ISS999"),
             tokenization_request_id: TokenizationRequestId("TOK999".to_string()),
             accepted_at: Utc::now(),
         };
@@ -2248,7 +2517,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
@@ -2264,21 +2533,43 @@ mod tests {
     }
 
     #[test]
-    fn test_evolve_acceptance_failed_rejects_non_accepted_states() {
-        let requested = TokenizedEquityMint::MintRequested {
+    fn test_evolve_acceptance_failed_rejects_inapplicable_states() {
+        // MintAcceptanceFailed applies from MintRequested (operator force-fail)
+        // and MintAccepted (post-acceptance failure); it must NOT apply to a
+        // state past acceptance -- a mid-pipeline TokensReceived or a terminal
+        // Failed mint.
+        let already_failed = TokenizedEquityMint::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
-            wallet: Address::random(),
+            reason: "previous failure".to_string(),
             requested_at: Utc::now(),
+            failed_at: Utc::now(),
         };
+        // Mid-pipeline (past acceptance) and a terminal failure: the two classes
+        // of state that must reject the event. TokensReceived stands in for the
+        // mid-pipeline states (WrapSubmitted/TokensWrapped/VaultDepositSubmitted),
+        // which the production `evolve` treats identically (anything that is not
+        // MintRequested/MintAccepted maps to None).
+        let tokens_received = replay::<TokenizedEquityMint>(vec![
+            mint_requested_event(),
+            mint_accepted_event(),
+            tokens_received_event(),
+        ])
+        .unwrap()
+        .unwrap();
 
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
             reason: "Should not apply".to_string(),
             failed_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&requested, &event).unwrap();
-        assert_eq!(result, None);
+        for state in [already_failed, tokens_received] {
+            assert_eq!(
+                TokenizedEquityMint::evolve(&state, &event).unwrap(),
+                None,
+                "MintAcceptanceFailed must not apply to {state:?}"
+            );
+        }
     }
 
     #[test]
@@ -2307,7 +2598,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
@@ -2356,7 +2647,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
@@ -2366,6 +2657,7 @@ mod tests {
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
             wrapped_at: Utc::now(),
+            wrap_block: None,
         };
 
         let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
@@ -2377,7 +2669,7 @@ mod tests {
         let tokenizer =
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::Rejected);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
 
@@ -2393,7 +2685,7 @@ mod tests {
         let tokenizer =
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         let error = store.send(&id, mint_command()).await.unwrap_err();
         assert!(
@@ -2411,7 +2703,7 @@ mod tests {
     async fn poll_pending_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Pending);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2430,7 +2722,7 @@ mod tests {
     async fn poll_error_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::PollError);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2451,14 +2743,15 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(EquityTransferServices {
             tokenizer: Arc::clone(&tokenizer) as Arc<dyn Tokenizer>,
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
         });
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
 
         let recorded_id = tokenizer.last_issuer_request_id().unwrap();
-        assert_eq!(recorded_id, IssuerRequestId::new("ISS001"));
+        assert_eq!(recorded_id, issuer_request_id("ISS001"));
     }
 
     #[test]
@@ -2490,7 +2783,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
@@ -2519,7 +2812,7 @@ mod tests {
     #[tokio::test]
     async fn wrap_tokens_is_pure_state_transition() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2532,6 +2825,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                    wrap_block: 1,
                 },
             )
             .await
@@ -2547,7 +2841,7 @@ mod tests {
     #[tokio::test]
     async fn deposit_to_vault_is_pure_state_transition() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2560,6 +2854,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                    wrap_block: 1,
                 },
             )
             .await
@@ -2585,9 +2880,12 @@ mod tests {
     async fn interrupted_mint_ids_returns_only_non_terminal_mints() {
         let pool = crate::test_utils::setup_test_db().await;
 
+        let mint_accepted_id = issuer_request_id("mint-accepted");
+        let mint_deposited_id = issuer_request_id("mint-deposited");
+
         insert_event(
             &pool,
-            "mint-accepted",
+            &mint_accepted_id.to_string(),
             0,
             "TokenizedEquityMintEvent::MintRequested",
             &mint_requested_payload("AAPL"),
@@ -2595,16 +2893,16 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "mint-accepted",
+            &mint_accepted_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintAccepted",
-            r#"{"MintAccepted":{"issuer_request_id":"ISS001","tokenization_request_id":"TOK001","accepted_at":"2026-01-01T00:00:00Z"}}"#,
+            &mint_accepted_payload(&mint_accepted_id),
         )
         .await;
 
         insert_event(
             &pool,
-            "mint-deposited",
+            &mint_deposited_id.to_string(),
             0,
             "TokenizedEquityMintEvent::MintRequested",
             &mint_requested_payload("TSLA"),
@@ -2612,7 +2910,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "mint-deposited",
+            &mint_deposited_id.to_string(),
             1,
             "TokenizedEquityMintEvent::DepositedIntoRaindex",
             r#"{"DepositedIntoRaindex":{"vault_deposit_tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","deposited_at":"2026-01-01T00:00:00Z"}}"#,
@@ -2620,7 +2918,7 @@ mod tests {
         .await;
 
         let result = interrupted_mint_ids(&pool).await.unwrap();
-        assert_eq!(result, vec![IssuerRequestId::new("mint-accepted")]);
+        assert_eq!(result, vec![mint_accepted_id]);
     }
 
     #[test]
@@ -2653,7 +2951,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_in_progress_variants() {
-        let id = IssuerRequestId::new("MINT-001");
+        let id = issuer_request_id("MINT-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -2668,7 +2966,7 @@ mod tests {
         let TransferOperation::EquityMint(op) = dto else {
             panic!("Expected EquityMint, got: {dto:?}");
         };
-        assert_eq!(op.id, Id::new("MINT-001"));
+        assert_eq!(op.id, Id::new(id.to_string()));
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(float!(10)));
         assert!(
@@ -2683,7 +2981,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             requested_at: now,
             accepted_at: later,
@@ -2703,7 +3001,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
@@ -2727,12 +3025,13 @@ mod tests {
             symbol,
             quantity: float!(10),
             wallet: Address::ZERO,
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+            wrap_block: None,
             requested_at: now,
             accepted_at: now,
             received_at: now,
@@ -2752,7 +3051,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_terminal_variants() {
-        let id = IssuerRequestId::new("MINT-001");
+        let id = issuer_request_id("MINT-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -2760,7 +3059,7 @@ mod tests {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: symbol.clone(),
             quantity: float!(10),
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
@@ -2814,7 +3113,7 @@ mod tests {
         };
 
         let recovered = TokenizedEquityMintEvent::ProviderCompletionRecovered {
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             wallet: Address::ZERO,
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::ZERO,
@@ -2851,7 +3150,7 @@ mod tests {
         // table. Assert the decimal-string form (independent of the type under
         // test) and a clean round-trip.
         let event = TokenizedEquityMintEvent::ProviderCompletionRecovered {
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             wallet: Address::ZERO,
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::ZERO,
@@ -2879,7 +3178,7 @@ mod tests {
         let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
             .given(vec![mint_requested_event()])
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
-                issuer_request_id: IssuerRequestId::new("ISS001"),
+                issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
                 tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
                 tx_hash: TxHash::ZERO,
@@ -2908,7 +3207,7 @@ mod tests {
                 vault_deposited_event(),
             ])
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
-                issuer_request_id: IssuerRequestId::new("ISS001"),
+                issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
                 tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
                 tx_hash: TxHash::ZERO,
@@ -2927,9 +3226,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_provider_completion_rejected_for_reconciled_mint() {
+        let mut history = failed_mint_history();
+        history.push(TokenizedEquityMintEvent::OperatorReconciled {
+            reason: "credited offline".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history)
+            .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
+                issuer_request_id: issuer_request_id("ISS001"),
+                wallet: Address::ZERO,
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tx_hash: TxHash::ZERO,
+                fees: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyReconciled)
+            ),
+            "a reconciled mint must report AlreadyReconciled, not recover, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_acceptance_from_accepted_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
 
@@ -2951,9 +3279,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_acceptance_from_requested_force_fails_to_failed() {
+        // A mint stuck at MintRequested (requested but never accepted) can be
+        // operator-force-failed via FailAcceptance, emitting MintAcceptanceFailed
+        // and terminating in Failed.
+        let history = vec![mint_requested_event()];
+
+        let reason = "stuck pre-acceptance; operator force-fail";
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history.clone())
+            .when(TokenizedEquityMintCommand::FailAcceptance {
+                reason: reason.to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let TokenizedEquityMintEvent::MintAcceptanceFailed {
+            reason: event_reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected MintAcceptanceFailed, got {:?}", events[0]);
+        };
+        assert_eq!(event_reason, reason);
+
+        let state = replay::<TokenizedEquityMint>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let TokenizedEquityMint::Failed {
+            reason: state_reason,
+            ..
+        } = state
+        else {
+            panic!("force-fail from MintRequested must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            state_reason, reason,
+            "the operator reason must survive into the Failed terminal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_acceptance_from_mid_pipeline_is_rejected() {
+        // FailAcceptance broadened to accept MintRequested/MintAccepted; a mint
+        // that moved past acceptance (TokensReceived) must still be rejected, so
+        // the success arm did not over-widen.
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+            ])
+            .when(TokenizedEquityMintCommand::FailAcceptance {
+                reason: "should be rejected".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyInProgress)
+            ),
+            "FailAcceptance from a mid-pipeline state must be AlreadyInProgress, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_wrapping_from_tokens_received_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2981,7 +3377,7 @@ mod tests {
     #[tokio::test]
     async fn fail_raindex_deposit_from_tokens_wrapped_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2994,6 +3390,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(100u64),
+                    wrap_block: 1,
                 },
             )
             .await
@@ -3019,7 +3416,7 @@ mod tests {
     #[tokio::test]
     async fn fail_wrapping_rejected_from_wrong_state() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         // MintAccepted state -- FailWrapping requires TokensReceived
         store.send(&id, mint_command()).await.unwrap();
@@ -3042,7 +3439,7 @@ mod tests {
     #[tokio::test]
     async fn fail_acceptance_rejected_from_terminal_state() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -3067,6 +3464,196 @@ mod tests {
         assert!(
             result.is_err(),
             "FailAcceptance should fail from Failed state"
+        );
+    }
+
+    fn failed_mint_history() -> Vec<TokenizedEquityMintEvent> {
+        vec![
+            mint_requested_event(),
+            mint_accepted_event(),
+            TokenizedEquityMintEvent::MintAcceptanceFailed {
+                reason: "timed out".to_string(),
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_failed_emits_operator_reconciled_and_replays_to_reconciled() {
+        let history = failed_mint_history();
+
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history.clone())
+            .when(TokenizedEquityMintCommand::Reconcile {
+                reason: "wrapped manually via wrap-equity".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let TokenizedEquityMintEvent::OperatorReconciled { reason, .. } = &events[0] else {
+            panic!("Expected OperatorReconciled, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "wrapped manually via wrap-equity");
+
+        let state = replay::<TokenizedEquityMint>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let TokenizedEquityMint::Reconciled {
+            failure_reason,
+            reconcile_reason,
+            quantity,
+            ..
+        } = state
+        else {
+            panic!("reconciled mint should be Reconciled, got {state:?}");
+        };
+        assert_eq!(failure_reason, "timed out");
+        assert_eq!(reconcile_reason, "wrapped manually via wrap-equity");
+        assert!(
+            quantity.eq(float!(100.5)).unwrap(),
+            "reconciled state must preserve the requested quantity, got {quantity:?}"
+        );
+    }
+
+    #[test]
+    fn evolve_operator_reconciled_from_failed_yields_reconciled() {
+        let failed = replay::<TokenizedEquityMint>(failed_mint_history())
+            .unwrap()
+            .unwrap();
+        let reconciled_at = Utc::now();
+
+        let next = TokenizedEquityMint::evolve(
+            &failed,
+            &TokenizedEquityMintEvent::OperatorReconciled {
+                reason: "credited offline".to_string(),
+                reconciled_at,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            matches!(
+                next,
+                TokenizedEquityMint::Reconciled {
+                    ref reconcile_reason,
+                    ..
+                } if reconcile_reason == "credited offline"
+            ),
+            "OperatorReconciled from Failed must yield Reconciled, got {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_non_failed_is_rejected() {
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![mint_requested_event(), mint_accepted_event()])
+            .when(TokenizedEquityMintCommand::Reconcile {
+                reason: "should be rejected".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::NotFailed)
+            ),
+            "reconcile from a non-failed mint must be rejected as NotFailed, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_blank_reason_is_rejected() {
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(failed_mint_history())
+            .when(TokenizedEquityMintCommand::Reconcile {
+                reason: "   ".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::ReconcileReasonRequired)
+            ),
+            "reconcile with a blank reason must be rejected as ReconcileReasonRequired, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_reconciled_state_is_rejected() {
+        let mut history = failed_mint_history();
+        history.push(TokenizedEquityMintEvent::OperatorReconciled {
+            reason: "already reconciled".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history)
+            .when(TokenizedEquityMintCommand::Reconcile {
+                reason: "second attempt".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyReconciled)
+            ),
+            "reconcile from an already-reconciled mint reports AlreadyReconciled, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn mint_error_partial_eq_is_reflexive_for_reconcile_variants() {
+        assert_eq!(
+            TokenizedEquityMintError::AlreadyReconciled,
+            TokenizedEquityMintError::AlreadyReconciled
+        );
+        assert_eq!(
+            TokenizedEquityMintError::NotFailed,
+            TokenizedEquityMintError::NotFailed
+        );
+        assert_ne!(
+            TokenizedEquityMintError::NotFailed,
+            TokenizedEquityMintError::AlreadyReconciled
+        );
+    }
+
+    #[test]
+    fn reconciled_to_dto_reports_completed_preserving_quantity() {
+        let requested_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled = TokenizedEquityMint::Reconciled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            failure_reason: "timed out".to_string(),
+            reconcile_reason: "credited offline".to_string(),
+            requested_at,
+            reconciled_at,
+        };
+
+        let TransferOperation::EquityMint(operation) =
+            reconciled.to_dto(&issuer_request_id("ISS001"))
+        else {
+            panic!("expected an EquityMint operation");
+        };
+        let EquityMintStatus::Completed { completed_at } = operation.status else {
+            panic!(
+                "reconciled mint must map to the Completed DTO status, got {:?}",
+                operation.status
+            );
+        };
+        assert_eq!(completed_at, reconciled_at);
+        assert_eq!(operation.started_at, requested_at);
+        assert_eq!(operation.updated_at, reconciled_at);
+        assert_eq!(
+            operation.quantity.to_string(),
+            FractionalShares::new(float!(10)).to_string()
         );
     }
 }

@@ -80,7 +80,7 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
 mod tests {
     use chrono::Utc;
 
-    use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
+    use st0x_execution::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
     use st0x_float_macro::float;
 
     use super::*;
@@ -153,6 +153,7 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
                 },
             )
             .await
@@ -292,6 +293,7 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
                     direction: Direction::Buy,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
                 },
             )
             .await

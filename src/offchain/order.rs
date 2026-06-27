@@ -42,8 +42,8 @@ use uuid::Uuid;
 use st0x_dto::{Direction, Trade, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder, Table};
 use st0x_execution::{
-    AlpacaBrokerApiError, ExecutionError, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
-    PersistenceError, Positive, SupportedExecutor, Symbol,
+    AlpacaBrokerApiError, ClientOrderId, ExecutionError, Executor, ExecutorOrderId,
+    FractionalShares, MarketOrder, PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::Usd;
 
@@ -330,12 +330,14 @@ impl EventSourced for OffchainOrder {
                 shares,
                 direction,
                 executor,
+                client_order_id,
             } => {
                 let now = Utc::now();
                 let market_order = MarketOrder {
                     symbol: symbol.clone(),
                     shares,
                     direction,
+                    client_order_id,
                 };
 
                 let direction_label = format!("{direction:?}").to_lowercase();
@@ -640,6 +642,10 @@ pub enum OffchainOrderCommand {
         shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
+        /// Idempotency key forwarded to the broker so apalis retries of
+        /// the same `PlaceHedge` job do not produce a second order if the
+        /// first placement's response is lost in flight.
+        client_order_id: ClientOrderId,
     },
     UpdatePartialFill {
         shares_filled: FractionalShares,
@@ -719,6 +725,13 @@ impl OffchainOrderId {
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Exposes the wrapped UUID so callers can derive other identifiers
+    /// (e.g. a broker-side `client_order_id`) without going through a
+    /// fallible string roundtrip.
+    pub(crate) fn as_uuid(&self) -> Uuid {
+        self.0
+    }
 }
 
 /// Returned by [`OffchainOrder::try_to_trade`] when the order isn't in the
@@ -784,6 +797,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::DryRun,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         }
     }
 

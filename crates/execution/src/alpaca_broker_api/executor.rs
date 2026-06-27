@@ -13,12 +13,14 @@ use st0x_float_serde::format_float_with_fallback;
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
+use super::order::{
+    AlpacaLimitOrder, ConversionDirection, CryptoOrderOutcome, CryptoOrderResponse,
+};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult, MarketOrder,
-    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
-    buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
+    ClientOrderId, CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult,
+    MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol,
+    TryIntoExecutor, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -170,11 +172,6 @@ impl Executor for AlpacaBrokerApi {
         Ok(order_id_str.to_string())
     }
 
-    async fn run_executor_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
-        // Alpaca uses API keys, no token refresh needed
-        None
-    }
-
     async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
         let inventory = super::positions::fetch_inventory(&self.client).await?;
         Ok(InventoryResult::Fetched(inventory))
@@ -254,8 +251,11 @@ impl AlpacaBrokerApi {
         &self,
         amount: Float,
         direction: ConversionDirection,
+        client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        let order = super::order::convert_usdc_usd(&self.client, amount, direction).await?;
+        let order =
+            super::order::convert_usdc_usd(&self.client, amount, direction, client_order_id)
+                .await?;
 
         info!(
             order_id = %order.id,
@@ -265,6 +265,42 @@ impl AlpacaBrokerApi {
         );
 
         super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+    }
+
+    /// Looks up a previously-placed conversion order by its `client_order_id`
+    /// (the correlation id recorded before placement), for crash-safe resume.
+    /// Returns the current snapshot, or `None` if the order never reached Alpaca.
+    pub async fn find_conversion_order(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        self.client
+            .get_crypto_order_by_client_order_id(client_order_id)
+            .await
+    }
+
+    /// Polls a previously-placed conversion order until it reaches a terminal
+    /// state (filled or terminally failed), returning the final snapshot.
+    ///
+    /// Crash-safe resume uses this to await a still-settling conversion -- the
+    /// same wait the original placement performs in `convert_usdc_usd` -- instead
+    /// of failing the job. Failing a healthy-but-slow conversion would burn the
+    /// finite apalis retry budget and risk the timeout sweep clearing the
+    /// in-progress guard while the conversion is still settling.
+    pub async fn poll_conversion_to_terminal(
+        &self,
+        order_id: Uuid,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        loop {
+            let order = self.client.get_crypto_order(order_id).await?;
+
+            match order.classify() {
+                CryptoOrderOutcome::Filled | CryptoOrderOutcome::Failed(_) => return Ok(order),
+                CryptoOrderOutcome::Pending => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
     }
 
     /// Journal (transfer) equities from the configured account to a
@@ -342,6 +378,7 @@ mod tests {
     use serde_json::json;
     use st0x_float_macro::float;
     use std::thread;
+    use uuid::uuid;
 
     use super::*;
     use crate::alpaca_broker_api::auth::{
@@ -349,12 +386,12 @@ mod tests {
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{
-        CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
-        FractionalShares, Positive, Usd,
+        ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+        Direction, FractionalShares, Positive, Usd,
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[test]
     fn test_asset_status_deserialize_active() {
@@ -604,7 +641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_executor_maintenance_returns_none() {
+    async fn test_maintenance_interval_returns_none() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -614,7 +651,7 @@ mod tests {
 
         account_mock.assert();
 
-        assert!(executor.run_executor_maintenance().await.is_none());
+        assert!(executor.maintenance_interval().is_none());
     }
 
     #[tokio::test]
@@ -700,6 +737,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -744,6 +782,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -841,6 +880,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let result = executor.place_market_order(order).await;
@@ -875,6 +915,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let result = executor.place_market_order(order).await;
@@ -909,6 +950,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let result = executor.place_market_order(order).await;
@@ -967,6 +1009,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order1).await.unwrap();
 
@@ -978,6 +1021,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order2).await.unwrap();
 
@@ -1043,6 +1087,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order1).await.unwrap();
 
@@ -1057,6 +1102,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order2).await.unwrap();
 

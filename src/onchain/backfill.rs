@@ -14,14 +14,14 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
+use st0x_config::EvmCtx;
 use st0x_evm::Evm;
 use st0x_execution::Executor;
 
-use super::EvmCtx;
 use super::OnChainError;
-use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
+use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{Job, Label};
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::trading::onchain::inclusion::EmittedOnChain;
@@ -171,6 +171,7 @@ where
     type Error = OnChainError;
 
     const WORKER_NAME: &'static str = "backfill-worker";
+
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::Backfill;
 
@@ -195,15 +196,34 @@ where
     }
 }
 
+/// Derives the block to resume backfill from, given the persisted checkpoint
+/// (or its absence). Resumes at `checkpoint + 1` floored at `deployment_block`;
+/// a cold start with no checkpoint begins at `deployment_block`. Pure so a
+/// caller that already holds the checkpoint (the fill monitor's poll loop) can
+/// reuse it without a second read.
+pub(crate) fn backfill_start_from_checkpoint(
+    checkpoint: Option<u64>,
+    deployment_block: u64,
+) -> u64 {
+    checkpoint.map_or(deployment_block, |last_processed_block| {
+        (last_processed_block + 1).max(deployment_block)
+    })
+}
+
+/// Loads the checkpoint and derives the backfill resume point in one call.
+/// Test-only: production resolves the resume point in the fill monitor's poll
+/// loop, which already holds the checkpoint, via
+/// [`backfill_start_from_checkpoint`].
+#[cfg(test)]
 pub(crate) async fn backfill_start_block(
     pool: &SqlitePool,
     evm_ctx: &EvmCtx,
 ) -> Result<u64, OnChainError> {
-    load_backfill_checkpoint(pool, evm_ctx)
-        .await?
-        .map_or(Ok(evm_ctx.deployment_block), |last_processed_block| {
-            Ok((last_processed_block + 1).max(evm_ctx.deployment_block))
-        })
+    let checkpoint = load_backfill_checkpoint(pool, evm_ctx).await?;
+    Ok(backfill_start_from_checkpoint(
+        checkpoint,
+        evm_ctx.deployment_block,
+    ))
 }
 
 pub(crate) async fn load_backfill_checkpoint(
@@ -281,12 +301,12 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     let get_clear_logs = move || {
         let provider = provider_clear.clone();
         let filter = clear_filter_clone.clone();
-        async move { provider.get_logs(&filter).await }
+        async move { fetch_logs_with_tip_check(&provider, &filter, batch_end).await }
     };
     let get_take_logs = move || {
         let provider = provider_take.clone();
         let filter = take_filter_clone.clone();
-        async move { provider.get_logs(&filter).await }
+        async move { fetch_logs_with_tip_check(&provider, &filter, batch_end).await }
     };
 
     let (clear_logs, take_logs) = future::try_join(
@@ -315,19 +335,22 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .chain(take_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
         .filter(|log| {
-            // Callers cap `to_block` at the confirmation boundary,
-            // so `removed: true` here implies a deep reorg crossing
-            // that depth. Surface it loudly rather than silently
-            // ingesting; skip the log so we don't persist a vanished
-            // event.
+            // Callers cap `to_block` at the ingestion cutoff block.
+            // Under `finalized`, this block cannot reorg, so `removed: true`
+            // implies a deep reorg crossing L1 finality. Under `safe`, a reorg
+            // is plausible (the batch may not yet be L1-finalized). In either
+            // case the fill is skipped to avoid persisting a vanished event. If a
+            // hedge was already placed against this fill, no reversal occurs; full
+            // reorg handling is tracked in the Reorg protection project.
             if log.removed {
-                error!(
+                warn!(
                     target: "orderbook",
                     tx_hash = ?log.transaction_hash,
                     log_index = ?log.log_index,
                     block_number = ?log.block_number,
-                    "Backfill returned `removed: true` for a log past the confirmation depth -- \
-                     deep reorg detected; skipping"
+                    "Backfill returned `removed: true` for a log at or below the \
+                     ingestion cutoff -- reorg detected; skipping. No reversal path \
+                     exists if a hedge was placed against this fill"
                 );
                 return false;
             }
@@ -364,6 +387,33 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     Ok(enqueued_count)
 }
 
+/// Wraps `eth_getLogs` with a read-after-write check on the node's tip.
+///
+/// An RPC node behind a load balancer can answer a `getLogs` request
+/// for a block range it has not finished indexing -- the response comes
+/// back empty even though the chain contains events in that range. The
+/// bot would then trust the empty result, advance its checkpoint, and
+/// silently drop those events. Verifying that the responding node's
+/// `eth_blockNumber` is at least `to_block` after the `getLogs` call
+/// catches that case; returning [`OnChainError::NodeLaggingBehindRequest`]
+/// lets the surrounding retry loop reissue the request, which routes
+/// through the load balancer to a node that has caught up.
+async fn fetch_logs_with_tip_check<P: Provider>(
+    provider: &P,
+    filter: &Filter,
+    to_block: u64,
+) -> Result<Vec<alloy::rpc::types::Log>, OnChainError> {
+    let logs = provider.get_logs(filter).await?;
+    let observed_tip = provider.get_block_number().await?;
+    if observed_tip < to_block {
+        return Err(OnChainError::NodeLaggingBehindRequest {
+            observed_tip,
+            required_tip: to_block,
+        });
+    }
+    Ok(logs)
+}
+
 fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
     const BACKFILL_BATCH_SIZE: usize = 1_000;
 
@@ -380,20 +430,20 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use alloy::primitives::{
         Address, B256, FixedBytes, IntoLogData, TxHash, U256, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
-    use sqlx::SqlitePool;
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use url::Url;
 
     use super::*;
-    use crate::bindings::IOrderBookV6;
-    use crate::conductor::setup_apalis_tables;
-    use crate::onchain::EvmCtx;
-    use crate::test_utils::{get_test_order, setup_test_db};
+    use crate::bindings::IRaindexV6;
+    use crate::test_utils::{get_test_order, setup_test_db, setup_test_pools};
 
     fn test_retry_strategy() -> ExponentialBuilder {
         ExponentialBuilder::default()
@@ -402,26 +452,32 @@ mod tests {
             .with_max_delay(Duration::from_millis(10))
     }
 
-    async fn setup_job_queue(pool: &SqlitePool) -> DexTradeAccountingJobQueue {
-        setup_apalis_tables(pool).await.unwrap();
-        DexTradeAccountingJobQueue::new(pool)
+    fn setup_job_queue(apalis_pool: &apalis_sqlite::SqlitePool) -> DexTradeAccountingJobQueue {
+        DexTradeAccountingJobQueue::new(apalis_pool)
     }
 
-    async fn job_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
-            .fetch_one(pool)
+    async fn job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
+    }
+
+    /// Pushes an `eth_blockNumber` response far above any test block range so
+    /// the read-after-write tip check in [`fetch_logs_with_tip_check`] passes.
+    fn push_tip_response(asserter: &Asserter) {
+        asserter.push_success(&serde_json::json!("0xffffffff"));
     }
 
     #[tokio::test]
     async fn test_backfill_start_block_uses_deployment_block_without_checkpoint() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
@@ -433,10 +489,11 @@ mod tests {
     async fn test_backfill_start_block_resumes_after_checkpoint() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 80).await.unwrap();
@@ -450,10 +507,11 @@ mod tests {
     async fn test_backfill_start_block_respects_deployment_block_floor() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 20).await.unwrap();
@@ -463,21 +521,39 @@ mod tests {
         assert_eq!(start_block, 50);
     }
 
+    #[test]
+    fn backfill_start_from_checkpoint_uses_deployment_block_without_checkpoint() {
+        assert_eq!(backfill_start_from_checkpoint(None, 50), 50);
+    }
+
+    #[test]
+    fn backfill_start_from_checkpoint_resumes_after_checkpoint() {
+        assert_eq!(backfill_start_from_checkpoint(Some(80), 50), 81);
+    }
+
+    #[test]
+    fn backfill_start_from_checkpoint_floors_at_deployment_block() {
+        assert_eq!(backfill_start_from_checkpoint(Some(20), 50), 50);
+    }
+
     #[tokio::test]
     async fn test_backfill_events_empty_results() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         backfill_events(
@@ -491,7 +567,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
         assert_eq!(
             load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
             Some(100)
@@ -500,13 +576,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_skips_when_checkpoint_is_caught_up() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -527,7 +604,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
         assert_eq!(
             load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
             Some(100)
@@ -536,13 +613,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_skip_preserves_newer_checkpoint() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -573,10 +651,11 @@ mod tests {
     async fn test_save_backfill_checkpoint_is_monotonic() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -688,17 +767,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_with_clear_v3_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
-        let clear_config = IOrderBookV6::ClearConfigV2 {
+        let clear_config = IRaindexV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
@@ -707,7 +787,7 @@ mod tests {
             bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -732,7 +812,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -747,24 +829,25 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_backfill_events_with_take_order_v3_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
-        let take_event = IOrderBookV6::TakeOrderV3 {
+        let take_event = IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV6::TakeOrderConfigV4 {
+            config: IRaindexV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -798,7 +881,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events (empty)
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -813,26 +898,27 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_backfill_events_enqueues_all_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let different_order = get_test_order();
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: different_order.clone(),
             bob: different_order.clone(),
-            clearConfig: IOrderBookV6::ClearConfigV2 {
+            clearConfig: IRaindexV6::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
@@ -842,9 +928,9 @@ mod tests {
             },
         };
 
-        let take_event = IOrderBookV6::TakeOrderV3 {
+        let take_event = IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV6::TakeOrderConfigV4 {
+            config: IRaindexV6::TakeOrderConfigV4 {
                 order: different_order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -895,7 +981,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -910,18 +998,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_events_rpc_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -955,18 +1044,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_block_range() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -981,17 +1073,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     fn create_test_take_event(
-        order: &IOrderBookV6::OrderV4,
+        order: &IRaindexV6::OrderV4,
         input: U256,
         output: U256,
-    ) -> IOrderBookV6::TakeOrderV3 {
-        IOrderBookV6::TakeOrderV3 {
+    ) -> IRaindexV6::TakeOrderV3 {
+        IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV6::TakeOrderConfigV4 {
+            config: IRaindexV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -1012,7 +1104,7 @@ mod tests {
 
     fn create_test_log(
         orderbook: Address,
-        event: &IOrderBookV6::TakeOrderV3,
+        event: &IRaindexV6::TakeOrderV3,
         block_number: u64,
         tx_hash: FixedBytes<32>,
     ) -> Log {
@@ -1031,16 +1123,119 @@ mod tests {
         }
     }
 
+    /// A burst-sized batch must enqueue exactly one job per
+    /// `(tx_hash, log_index)` in chronological `(block_number, log_index)`
+    /// order regardless of the order the node returned the logs in. The
+    /// sort matters under load: jobs drain through a `concurrency(1)`
+    /// worker, so out-of-order enqueue means out-of-order position
+    /// accumulation against a live hedging threshold.
     #[tokio::test]
-    async fn test_backfill_events_preserves_chronological_order() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+    async fn burst_batch_enqueues_one_job_per_log_in_chronological_order() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        };
+
+        // 30 take logs, 3 per block across 10 blocks, served by the
+        // mock node in reverse-chronological order.
+        let logs: Vec<Log> = (0..30u64)
+            .map(|index| {
+                let take_event = create_test_take_event(
+                    &order,
+                    uint!(100_000_000_U256),
+                    uint!(1_000_000_000_000_000_000_U256),
+                );
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes[0] = 0xab;
+                hash_bytes[31] = u8::try_from(index).unwrap();
+
+                let mut log = create_test_log(
+                    evm_ctx.orderbook,
+                    &take_event,
+                    10 + index / 3,
+                    FixedBytes::from(hash_bytes),
+                );
+                log.log_index = Some(index % 3);
+                log
+            })
+            .collect();
+        let reversed: Vec<&Log> = logs.iter().rev().collect();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!(reversed));
+        push_tip_response(&asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<Vec<u8>> = sqlx::query_scalar("SELECT job FROM Jobs ORDER BY rowid ASC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(payloads.len(), 30, "one job per log, none dropped");
+
+        let jobs: Vec<AccountForDexTrade> = payloads
+            .iter()
+            .map(|payload| serde_json::from_slice(payload).unwrap())
+            .collect();
+
+        let enqueue_order: Vec<(u64, u64)> = jobs
+            .iter()
+            .map(|job| (job.trade.block_number, job.trade.log_index))
+            .collect();
+        let mut chronological = enqueue_order.clone();
+        chronological.sort_unstable();
+        assert_eq!(
+            enqueue_order, chronological,
+            "Jobs must be enqueued in chronological (block, log_index) \
+             order despite the node serving them reversed"
+        );
+
+        // The 30 enqueued jobs map one-to-one onto the 30 distinct input logs:
+        // no two logs collapsed onto a shared (tx_hash, log_index) key and --
+        // together with the count check above -- none was enqueued twice. Note
+        // the inputs are all distinct, so this guards the 1:1 mapping, not an
+        // enqueue-time dedup; per-fill dedup proper lives downstream in
+        // `process_queued_trade`.
+        let distinct: HashSet<(TxHash, u64)> = jobs
+            .iter()
+            .map(|job| (job.trade.tx_hash, job.trade.log_index))
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            30,
+            "the 30 jobs must carry 30 distinct (tx_hash, log_index) keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_events_preserves_chronological_order() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+        let order = get_test_order();
+        let evm_ctx = EvmCtx {
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let tx_hash1 =
@@ -1064,7 +1259,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log2, take_log1]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1079,29 +1276,34 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_events_batch_count_verification() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1000,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
 
         // Batch 1: blocks 1000-1999
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         // Batch 2: blocks 2000-2500
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1116,29 +1318,34 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_backfill_events_batch_boundary_verification() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 500,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
 
         // Batch 1: blocks 500-1499
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         // Batch 2: blocks 1500-1900
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1153,19 +1360,20 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_process_batch_with_realistic_data() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let take_event = create_test_take_event(
@@ -1179,7 +1387,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1195,25 +1405,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(enqueued_count, 1);
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_backfill_events_large_block_range_batching() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
 
         for _ in 0..3 {
             asserter.push_success(&serde_json::json!([]));
+            push_tip_response(&asserter);
             asserter.push_success(&serde_json::json!([]));
+            push_tip_response(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1229,19 +1442,20 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_backfill_events_mixed_valid_and_invalid_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let valid_take_event = create_test_take_event(
@@ -1270,7 +1484,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([valid_log, invalid_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1286,11 +1502,11 @@ mod tests {
         .unwrap();
 
         // Both events should be enqueued (filtering happens during processing, not backfill)
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
-    fn create_clear_log(orderbook: Address, order: &IOrderBookV6::OrderV4, tx_hash: TxHash) -> Log {
-        let clear_config = IOrderBookV6::ClearConfigV2 {
+    fn create_clear_log(orderbook: Address, order: &IRaindexV6::OrderV4, tx_hash: TxHash) -> Log {
+        let clear_config = IRaindexV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
@@ -1299,7 +1515,7 @@ mod tests {
             bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -1323,14 +1539,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_mixed_clear_and_take_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let tx_hash1 =
@@ -1348,7 +1565,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1363,18 +1582,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_process_batch_retry_mechanism() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1382,7 +1602,9 @@ mod tests {
         asserter.push_failure_msg("RPC connection error");
         asserter.push_failure_msg("Timeout error");
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1402,13 +1624,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_batch_exhausted_retries() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1442,20 +1665,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_partial_batch_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
 
         // First batch succeeds
-        asserter.push_success(&serde_json::json!([]));
-        asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([])); // clear logs
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // take logs
+        push_tip_response(&asserter);
 
         // Second batch fails completely (after retries)
         // Need double the failures since clear_logs and take_logs retry in parallel
@@ -1488,13 +1714,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_corrupted_log_data() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // Create malformed log with invalid event signature
@@ -1518,7 +1745,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([corrupted_log]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1534,23 +1763,23 @@ mod tests {
         .unwrap();
 
         // Corrupted logs are silently ignored during backfill
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_backfill_skips_removed_logs() {
-        // Backfill caller caps `to_block` at the confirmation
-        // boundary, so a `removed: true` log here implies a deep
-        // reorg. We must skip it (logged as error) rather than
-        // ingesting a vanished event.
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        // Backfill caller caps `to_block` at the ingestion cutoff
+        // block. A `removed: true` log implies a reorg; skip it
+        // (logged as warn) rather than ingesting a vanished event.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let take_event = create_test_take_event(
@@ -1565,7 +1794,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([removed_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1581,7 +1812,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            job_count(&pool).await,
+            job_count(&apalis_pool).await,
             0,
             "logs with removed=true must be skipped, not ingested"
         );
@@ -1589,18 +1820,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_single_block_range() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 42,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1615,18 +1849,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_database_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -1644,12 +1879,14 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        // Close the database to simulate connection failure
-        pool.close().await;
+        // Close the apalis pool to simulate job-queue connection failure.
+        apalis_pool.close().await;
 
         let result = enqueue_batch_events(
             &provider,
@@ -1669,19 +1906,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_batch_events_filter_creation() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+    async fn test_enqueue_batch_events_errors_when_node_tip_behind_requested_range() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        };
+
+        // Both the clear and take fetches succeed at getLogs but observe a tip
+        // (0x32 = 50) below the requested to_block (100), simulating a node
+        // behind the load balancer that answered for a range it has not indexed.
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([])); // clear getLogs
+        asserter.push_success(&serde_json::json!("0x32")); // clear tip = 50
+        asserter.push_success(&serde_json::json!([])); // take getLogs
+        asserter.push_success(&serde_json::json!("0x32")); // take tip = 50
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = enqueue_batch_events(
+            &provider,
+            &evm_ctx,
+            1,
+            100,
+            ExponentialBuilder::default().with_max_times(0),
+            job_queue,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OnChainError::NodeLaggingBehindRequest {
+                    observed_tip: 50,
+                    required_tip: 100,
+                }
+            ),
+            "expected NodeLaggingBehindRequest {{ observed_tip: 50, required_tip: 100 }}, got {error:?}"
+        );
+        assert_eq!(job_count(&apalis_pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_batch_events_filter_creation() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+        let evm_ctx = EvmCtx {
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1700,13 +1987,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_batch_events_partial_enqueue_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -1737,7 +2025,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log1, take_log2])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1757,13 +2047,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_concurrent_batch_processing() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
@@ -1784,11 +2075,13 @@ mod tests {
         // blocks 1-3000 (3 batches), second batch has take events
         for batch_idx in 0..3 {
             asserter.push_success(&serde_json::json!([])); // clear events
+            push_tip_response(&asserter);
             if batch_idx == 1 {
                 asserter.push_success(&serde_json::json!([take_log])); // take events
             } else {
                 asserter.push_success(&serde_json::json!([])); // take events
             }
+            push_tip_response(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1804,18 +2097,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_retry_exponential_backoff() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let asserter = Asserter::new();
@@ -1824,7 +2118,9 @@ mod tests {
         asserter.push_failure_msg("Rate limit exceeded");
         // Second attempt succeeds for both
         asserter.push_success(&serde_json::json!([])); // clear events (retry)
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events (retry)
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1849,13 +2145,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_zero_blocks() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 100,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // No RPC calls should be made when deployment block > end block
@@ -1873,27 +2170,28 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_mixed_log_types() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         let order = get_test_order();
 
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
-            clearConfig: IOrderBookV6::ClearConfigV2 {
+            clearConfig: IRaindexV6::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
@@ -1933,7 +2231,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1949,24 +2249,27 @@ mod tests {
 
         let enqueued = result.unwrap();
         assert_eq!(enqueued, 2);
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_starts_from_deployment_block() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
         };
 
         // Should start from deployment_block (50) to end_block (100)
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events for 50-100
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events for 50-100
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1981,6 +2284,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 }

@@ -5,6 +5,7 @@
   st0x-cli,
   environment,
   volumeName,
+  tailscaleMagicDnsName,
   ...
 }:
 
@@ -12,19 +13,10 @@ let
   inherit (import ./keys.nix) roles;
   envRoles = roles.${environment};
 
-  tailscaleFqdn =
-    {
-      prod = "st0x-liquidity-nixos.taile5cf8a.ts.net";
-      staging = "st0x-liquidity-staging.taile5cf8a.ts.net";
-    }
-    .${environment};
   certDir = "/var/lib/tailscale-cert";
 
-  services = import ./services.nix;
-  enabledServices = lib.filterAttrs (_: v: v.enabled) services;
-  # Services with a systemd unit (everything except kind = "static").
-  unitServices = lib.filterAttrs (_: v: v.kind != "static") enabledServices;
-
+  # `stox` runs the CLI as the market-making bot: it defaults to the deployed
+  # liquidity config/secrets so operators don't pass --config/--secrets.
   cli = pkgs.writeShellApplication {
     name = "stox";
     runtimeInputs = [ st0x-cli ];
@@ -36,52 +28,21 @@ let
     '';
   };
 
-  mkService =
-    name: cfg:
-    let
-      execStartArgs =
-        if cfg.kind == "st0x" then
-          [
-            "--config"
-            cfg.configPath
-            "--secrets"
-            cfg.decryptedSecretPath
-          ]
-        else if cfg.kind == "plain" then
-          cfg.args
-        else
-          throw "services.${name}: kind '${cfg.kind}' has no systemd unit";
-    in
-    {
-      description = if cfg.kind == "st0x" then "st0x ${cfg.bin} (${name})" else cfg.description;
-
-      # Service is started by deploy.nix profile, not by systemd on boot.
-      # This avoids coordination issues during deployments.
-      wantedBy = [ ];
-
-      restartIfChanged = false;
-      stopIfChanged = false;
-
-      unitConfig = {
-        "X-OnlyManualStart" = true;
-        StartLimitBurst = 10;
-        StartLimitIntervalSec = 300;
-
-        # Marker file created ONLY by service profile activation.
-        # Guarantees service is SKIPPED (not failed) during system activation.
-        ConditionPathExists = cfg.markerFile;
-      };
-
-      serviceConfig = {
-        User = "st0x";
-        Group = "st0x";
-        ExecStart = builtins.concatStringsSep " " (
-          [ "${cfg.profilePath}/bin/${cfg.bin}" ] ++ execStartArgs
-        );
-        Restart = "always";
-        RestartSec = 30;
-      };
-    };
+  # `s01` runs the same CLI as the issuer: it defaults to the issuer
+  # config/secrets (separate turnkey wallet + Alpaca account + DB) so the
+  # dividend bump (buy -> tokenize -> donate) is funded and signed by the
+  # issuer rather than the market-making wallet. Override with
+  # S01_CONFIG/S01_SECRETS to point at an ad-hoc issuer config.
+  s01 = pkgs.writeShellApplication {
+    name = "s01";
+    runtimeInputs = [ st0x-cli ];
+    text = ''
+      exec st0x-cli \
+        --config "''${S01_CONFIG:-/run/st0x/s01-issuer.config}" \
+        --secrets "''${S01_SECRETS:-/run/agenix/s01-issuer.toml}" \
+        "$@"
+    '';
+  };
 
 in
 {
@@ -89,6 +50,8 @@ in
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
     (modulesPath + "/profiles/qemu-guest.nix")
     ./disko.nix
+    ./nix/tailscale.nix
+    ./nix/upgradeable-services.nix
   ];
 
   boot.loader.grub = {
@@ -154,17 +117,6 @@ in
       };
     };
 
-    # Per-environment reusable, tagged auth key. Used only on first
-    # enrollment — after that Tailscale re-authenticates via the stored
-    # node key in /var/lib/tailscale. To rotate the node identity
-    # (e.g. re-tag), run `tailscale up --force-reauth --auth-key ...`
-    # manually on the droplet.
-    tailscale = {
-      enable = true;
-      authKeyFile = "/run/agenix/tailscale-authkey-${environment}";
-      permitCertUid = "nginx";
-    };
-
     fail2ban = {
       enable = true;
       bantime = "1h";
@@ -173,11 +125,11 @@ in
 
     nginx = {
       enable = true;
-      virtualHosts.${tailscaleFqdn} = {
+      virtualHosts.${tailscaleMagicDnsName} = {
         default = true;
         forceSSL = true;
-        sslCertificate = "${certDir}/${tailscaleFqdn}.crt";
-        sslCertificateKey = "${certDir}/${tailscaleFqdn}.key";
+        sslCertificate = "${certDir}/${tailscaleMagicDnsName}.crt";
+        sslCertificateKey = "${certDir}/${tailscaleMagicDnsName}.key";
         root = "/nix/var/nix/profiles/per-service/dashboard";
 
         locations =
@@ -203,6 +155,10 @@ in
             "/orders/" = apiProxy "/orders/";
             "/trades" = apiProxy "/trades";
             "/transfers" = apiProxy "/transfers";
+            "/performance" = apiProxy "/performance";
+            "/__pnl_sql" = {
+              proxyPass = "http://127.0.0.1:8081/st0x-hedge.json";
+            };
           };
       };
     };
@@ -233,13 +189,9 @@ in
     enable = true;
     # All inbound access is gated by the DO Cloud Firewall (infra/modules/stack)
     # which only permits Tailscale WireGuard. SSH and the dashboard are reached
-    # exclusively over tailscale0, which is trusted below and bypasses the
-    # NixOS firewall entirely.
+    # exclusively over tailscale0, which is configured as a trusted interface
+    # in tailscale.nix and bypasses the NixOS firewall entirely.
     allowedTCPPorts = [ ];
-    allowedUDPPorts = [
-      41641 # Tailscale WireGuard
-    ];
-    trustedInterfaces = [ "tailscale0" ];
   };
 
   fileSystems."/mnt/data" = {
@@ -266,79 +218,11 @@ in
 
   programs.bash.interactiveShellInit = "set -o vi";
 
-  age.secrets = {
-    "tailscale-authkey-${environment}" = {
-      file = ./secret/tailscale-authkey-${environment}.age;
-      mode = "0400";
-    };
-  };
-  systemd = {
-    tmpfiles.rules = [
-      "d /mnt/data 0755 st0x st0x -"
-      "d /mnt/data/logs 0755 st0x st0x -"
-      "d /mnt/data/grafana 0750 grafana grafana -"
-      "d ${certDir} 0750 nginx nginx -"
-    ];
-
-    services = lib.recursiveUpdate (lib.mapAttrs mkService unitServices) {
-      # Clean up stale TUN device before tailscaled starts. During NixOS
-      # activation the old tailscaled may still hold /dev/net/tun when the
-      # new unit starts, causing a crash-loop.
-      tailscaled.serviceConfig.ExecStartPre = [ "-${pkgs.iproute2}/bin/ip link delete tailscale0" ];
-
-      # Provision a Tailscale-issued TLS certificate so the dashboard is
-      # served over HTTPS. Runs before nginx to guarantee cert files exist.
-      tailscale-cert = {
-        description = "Provision Tailscale HTTPS certificate for ${tailscaleFqdn}";
-        after = [ "tailscaled.service" ];
-        wants = [ "tailscaled.service" ];
-        before = [ "nginx.service" ];
-        wantedBy = [ "multi-user.target" ];
-        path = [
-          pkgs.tailscale
-          pkgs.jq
-        ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = "nginx";
-          Group = "nginx";
-          # Reload nginx so it picks up renewed certs on subsequent runs
-          # triggered by the timer. || true keeps the unit green on first
-          # boot when nginx hasn't started yet.
-          ExecStartPost = "+${pkgs.bash}/bin/bash -c 'systemctl is-active --quiet nginx.service && systemctl reload nginx.service || true'";
-        };
-        script = ''
-          set -euo pipefail
-          retries=0
-          until [ "$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null)" = "Running" ]; do
-            retries=$((retries + 1))
-            if [ "$retries" -ge 30 ]; then
-              echo "Tailscale BackendState != Running after 60s" >&2
-              exit 1
-            fi
-            sleep 2
-          done
-          tailscale cert \
-            --cert-file ${certDir}/${tailscaleFqdn}.crt \
-            --key-file ${certDir}/${tailscaleFqdn}.key \
-            ${tailscaleFqdn}
-        '';
-      };
-
-      nginx.after = [ "tailscale-cert.service" ];
-      nginx.requires = [ "tailscale-cert.service" ];
-    };
-
-    timers.tailscale-cert = {
-      description = "Renew Tailscale HTTPS certificate daily";
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnCalendar = "daily";
-        Persistent = true;
-      };
-    };
-  };
+  systemd.tmpfiles.rules = [
+    "d /mnt/data 0755 st0x st0x -"
+    "d /mnt/data/logs 0755 st0x st0x -"
+    "d /mnt/data/grafana 0750 grafana grafana -"
+  ];
 
   # The system bus implementation cannot be live-switched safely. Deploy this
   # change with deploy-rs --boot and a reboot, not a normal switch.
@@ -354,27 +238,8 @@ in
     vim
     zellij
     cli
+    s01
   ];
-
-  system.activationScripts.per-service-profiles.text = ''
-    mkdir -p /nix/var/nix/profiles/per-service
-
-    # Managed services use restartIfChanged = false + ConditionPathExists so
-    # that deploy.nix's per-service profile owns stop/install/restart. But if
-    # a previous deploy left one crash-looping (Restart = always), its failed
-    # state persists into the next activation and switch-to-configuration's
-    # final "units failed" check exits 4, which makes deploy-rs roll back
-    # before it ever reaches the per-service profile that would install the
-    # fix. Stop + reset-failed any managed service that is currently broken
-    # so activation can complete; the service profile restarts it afterwards.
-    for svc in ${builtins.concatStringsSep " " (builtins.attrNames unitServices)}; do
-      state=$(${pkgs.systemd}/bin/systemctl show -p ActiveState --value "$svc.service" 2>/dev/null || echo "")
-      if [ "$state" = "failed" ] || [ "$state" = "activating" ]; then
-        ${pkgs.systemd}/bin/systemctl stop "$svc.service" 2>/dev/null || true
-        ${pkgs.systemd}/bin/systemctl reset-failed "$svc.service" 2>/dev/null || true
-      fi
-    done
-  '';
 
   system.stateVersion = "24.11";
 

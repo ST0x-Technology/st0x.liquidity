@@ -1,0 +1,1340 @@
+import Decimal from 'decimal.js'
+import type {
+  PnlEntry,
+  PnlResponse,
+  PnlSampleStats,
+  PnlSampleSymbolStats,
+  PnlStreamKey,
+  PnlSummary,
+  PnlSymbolSummary,
+  PnlWindow,
+  PnlWindowSymbol
+} from './report'
+
+export type SqlPnlQuery = {
+  limit: number
+  offset: number
+  symbols: Set<string>
+  fromDate?: string
+  toDate?: string
+  dayFilter?: 'all' | 'weekday' | 'weekend'
+}
+
+export type SqlPositionEventRow = {
+  rowid: number
+  symbol: string
+  event_type: string
+  payload: unknown
+}
+
+export type SqlPositionViewRow = {
+  symbol: string
+  net_position: string | null
+  last_updated: string | null
+  last_price_usdc: string | null
+}
+
+export type SqlSampleStatsRow = {
+  symbol: string
+  onchain_fill_count: number
+  offchain_fill_count: number
+  first_at: string | null
+  last_at: string | null
+}
+
+type Direction = 'Buy' | 'Sell'
+type LotSide = 'long' | 'short'
+type PnlBucket = 'counter_trade' | 'onchain_netting' | 'directional_exposure'
+type SqlSymbolColumn = 'aggregate_id' | 'symbol'
+type Venue = 'onchain' | 'offchain'
+
+type Fill = {
+  rowid: number
+  id: string
+  symbol: string
+  shares: Decimal
+  direction: Direction
+  price: Decimal
+  executedAt: string
+  venue: Venue
+}
+
+type Lot = {
+  tradeId: string
+  side: LotSide
+  remainingShares: Decimal
+  price: Decimal
+  openedAt: string
+  openedRowid: number
+  openedVenue: Venue
+}
+
+type SummaryAcc = {
+  counterTradePnlUsd: Decimal
+  onchainNettingPnlUsd: Decimal
+  directionalInventoryBaselinePnlUsd: Decimal
+  directionalImbalanceExcessPnlUsd: Decimal
+  directionalExposurePnlUsd: Decimal
+  realizedPnlUsd: Decimal
+  matchedShares: Decimal
+  onchainNotionalUsd: Decimal
+  offchainNotionalUsd: Decimal
+  openLongShares: Decimal
+  openShortShares: Decimal
+  openLongNotionalUsd: Decimal
+  openShortNotionalUsd: Decimal
+  unmatchedOffchainBuyShares: Decimal
+  unmatchedOffchainSellShares: Decimal
+  unmatchedOffchainBuyNotionalUsd: Decimal
+  unmatchedOffchainSellNotionalUsd: Decimal
+  onchainFillCount: number
+  offchainFillCount: number
+  matchedLotCount: number
+  openLotCount: number
+  unmatchedOffchainFillCount: number
+}
+
+type SymbolBook = {
+  longLots: Lot[]
+  shortLots: Lot[]
+  seenOnchainFillIds: Set<string>
+  seenOffchainPlacementIds: Set<string>
+  seenOffchainFillIds: Set<string>
+  originalOnchainShares: Map<string, Decimal>
+  matchedOnchainShares: Map<string, Decimal>
+  summary: SummaryAcc
+}
+
+type UnmatchedOffchainAllocation = {
+  symbol: string
+  fillId: string
+  shares: Decimal
+}
+
+type PositionReplayDelta = {
+  symbol: string
+  replayNet: Decimal
+  positionNet: Decimal
+}
+
+const ATTRIBUTION_METHOD = 'direct_sql_position_fill_replay_fifo'
+const COUNTER_TRADE_THRESHOLD_SECONDS = 300
+const DATASSETTE_DEFAULT_MAX_RETURNED_ROWS = 1000
+const DATASSETTE_SQL_PAGE_SIZE = 900
+const SQL_FETCH_TIMEOUT_MS = 30000
+const SAFE_SQL_SYMBOL = /^[A-Za-z0-9._-]+$/u
+const ZERO = new Decimal(0)
+
+const ATTRIBUTION_WARNING =
+  'PnL source: realized gross replay from the deployed SQL JSON endpoint. Fills are ordered by execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
+const BASELINE_WARNING =
+  'Displayed PnL is realized gross PnL by lot close date from persisted fills only. Baseline drift, percentage return, true period/NAV PnL, and cost-inclusive PnL require a persisted portfolio state vector plus price vector over time, cash-flow events, fees, and financing data; those are not currently persisted, so baseline drift is zero.'
+
+const emptySummary = (): SummaryAcc => ({
+  counterTradePnlUsd: new Decimal(0),
+  onchainNettingPnlUsd: new Decimal(0),
+  directionalInventoryBaselinePnlUsd: new Decimal(0),
+  directionalImbalanceExcessPnlUsd: new Decimal(0),
+  directionalExposurePnlUsd: new Decimal(0),
+  realizedPnlUsd: new Decimal(0),
+  matchedShares: new Decimal(0),
+  onchainNotionalUsd: new Decimal(0),
+  offchainNotionalUsd: new Decimal(0),
+  openLongShares: new Decimal(0),
+  openShortShares: new Decimal(0),
+  openLongNotionalUsd: new Decimal(0),
+  openShortNotionalUsd: new Decimal(0),
+  unmatchedOffchainBuyShares: new Decimal(0),
+  unmatchedOffchainSellShares: new Decimal(0),
+  unmatchedOffchainBuyNotionalUsd: new Decimal(0),
+  unmatchedOffchainSellNotionalUsd: new Decimal(0),
+  onchainFillCount: 0,
+  offchainFillCount: 0,
+  matchedLotCount: 0,
+  openLotCount: 0,
+  unmatchedOffchainFillCount: 0
+})
+
+const emptyBook = (): SymbolBook => ({
+  longLots: [],
+  shortLots: [],
+  seenOnchainFillIds: new Set(),
+  seenOffchainPlacementIds: new Set(),
+  seenOffchainFillIds: new Set(),
+  originalOnchainShares: new Map(),
+  matchedOnchainShares: new Map(),
+  summary: emptySummary()
+})
+
+const isSafeSqlSymbol = (symbol: string): boolean => SAFE_SQL_SYMBOL.test(symbol)
+
+const sqlString = (value: string): string => `'${value.replaceAll("'", "''")}'`
+
+const symbolPredicate = (symbols: Set<string>, column: SqlSymbolColumn): string => {
+  if (symbols.size === 0) return ''
+
+  const safeSymbols = [...symbols].filter(isSafeSqlSymbol)
+  if (safeSymbols.length === 0) return ' AND 1 = 0'
+
+  return ` AND ${column} IN (${safeSymbols.map(sqlString).join(',')})`
+}
+
+const globalOrigin = (): string => {
+  const maybeLocation = (globalThis as Record<string, unknown>)['location']
+  if (
+    typeof maybeLocation === 'object' &&
+    maybeLocation !== null &&
+    'origin' in maybeLocation &&
+    typeof maybeLocation.origin === 'string'
+  ) {
+    return maybeLocation.origin
+  }
+
+  return 'http://localhost'
+}
+
+const stripSqlTerminator = (sql: string): string => sql.trim().replace(/;+\s*$/u, '')
+
+const pagedSql = (sql: string, offset: number): string =>
+  `SELECT * FROM (${stripSqlTerminator(sql)}) LIMIT ${String(DATASSETTE_SQL_PAGE_SIZE)} OFFSET ${String(offset)}`
+
+export const buildSqlApiUrl = (baseUrl: string, sql: string, offset = 0): string => {
+  const url = new URL(baseUrl, globalOrigin())
+  url.searchParams.set('sql', pagedSql(sql, offset))
+  url.searchParams.set('_shape', 'objects')
+  url.searchParams.set('_size', 'max')
+  return url.toString()
+}
+
+type DatasetteRowsResponse = {
+  rows?: unknown
+  truncated?: boolean
+}
+
+const fetchSqlPage = async <Row>(baseUrl: string, sql: string, offset: number): Promise<Row[]> => {
+  const response = await fetch(buildSqlApiUrl(baseUrl, sql, offset), {
+    signal: AbortSignal.timeout(SQL_FETCH_TIMEOUT_MS)
+  })
+
+  if (!response.ok) {
+    throw new Error(`SQL endpoint HTTP ${String(response.status)}`)
+  }
+
+  const body = (await response.json()) as DatasetteRowsResponse
+  if (!Array.isArray(body.rows)) {
+    throw new Error('SQL endpoint returned a response without rows')
+  }
+
+  if (body.truncated === true) {
+    throw new Error('SQL endpoint truncated a paged result set; refusing to render partial PnL')
+  }
+
+  if (body.truncated === undefined && body.rows.length >= DATASSETTE_DEFAULT_MAX_RETURNED_ROWS) {
+    throw new Error('SQL endpoint may have truncated the result set; refusing to render partial PnL')
+  }
+
+  return body.rows as Row[]
+}
+
+const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> => {
+  const rows: Row[] = []
+  let offset = 0
+
+  for (;;) {
+    const page = await fetchSqlPage<Row>(baseUrl, sql, offset)
+    rows.push(...page)
+
+    if (page.length < DATASSETTE_SQL_PAGE_SIZE) return rows
+    offset += DATASSETTE_SQL_PAGE_SIZE
+  }
+}
+
+const positionEventsSql = (symbols: Set<string>): string => `
+SELECT rowid, aggregate_id AS symbol, event_type, payload
+FROM events
+WHERE aggregate_type = 'Position'
+  AND event_type IN (
+    'PositionEvent::OnChainOrderFilled',
+    'PositionEvent::OffChainOrderPlaced',
+    'PositionEvent::OffChainOrderFilled'
+  )
+  ${symbolPredicate(symbols, 'aggregate_id')}
+ORDER BY rowid ASC
+`
+
+const positionViewSql = (symbols: Set<string>): string => `
+SELECT
+  symbol,
+  net_position,
+  last_updated
+FROM position_view
+WHERE symbol IS NOT NULL
+  ${symbolPredicate(symbols, 'symbol')}
+ORDER BY symbol ASC
+`
+
+const sampleStatsSql = (): string => `
+SELECT
+  aggregate_id AS symbol,
+  SUM(CASE WHEN event_type = 'PositionEvent::OnChainOrderFilled' THEN 1 ELSE 0 END) AS onchain_fill_count,
+  SUM(CASE WHEN event_type = 'PositionEvent::OffChainOrderFilled' THEN 1 ELSE 0 END) AS offchain_fill_count,
+  MIN(COALESCE(
+    json_extract(payload, '$.OnChainOrderFilled.block_timestamp'),
+    json_extract(payload, '$.OffChainOrderFilled.broker_timestamp')
+  )) AS first_at,
+  MAX(COALESCE(
+    json_extract(payload, '$.OnChainOrderFilled.block_timestamp'),
+    json_extract(payload, '$.OffChainOrderFilled.broker_timestamp')
+  )) AS last_at
+FROM events
+WHERE aggregate_type = 'Position'
+  AND event_type IN (
+    'PositionEvent::OnChainOrderFilled',
+    'PositionEvent::OffChainOrderFilled'
+  )
+GROUP BY aggregate_id
+ORDER BY aggregate_id ASC
+`
+
+const parsePayload = (payload: unknown): Record<string, unknown> | null => {
+  if (payload !== null && typeof payload === 'object' && !Array.isArray(payload)) {
+    return payload as Record<string, unknown>
+  }
+
+  if (typeof payload !== 'string') return null
+
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+  } catch {
+    return null
+  }
+
+  return null
+}
+
+const nestedRecord = (
+  payload: Record<string, unknown>,
+  key: string
+): Record<string, unknown> | null => {
+  const value = payload[key]
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+const textField = (payload: Record<string, unknown>, key: string): string | null => {
+  const value = payload[key]
+  return typeof value === 'string' ? value : null
+}
+
+const numberTextField = (payload: Record<string, unknown>, key: string): string | null => {
+  const value = payload[key]
+  if (typeof value === 'string' || typeof value === 'number') return String(value)
+  return null
+}
+
+const decimalField = (payload: Record<string, unknown>, key: string): Decimal | null => {
+  const value = numberTextField(payload, key)
+  if (value === null) return null
+
+  try {
+    return new Decimal(value)
+  } catch {
+    return null
+  }
+}
+
+const directionField = (payload: Record<string, unknown>, key: string): Direction | null => {
+  const value = textField(payload, key)
+  if (value === 'Buy' || value === 'Sell') return value
+  if (value === 'buy') return 'Buy'
+  if (value === 'sell') return 'Sell'
+  return null
+}
+
+const positionEventReplayTimestamp = (row: SqlPositionEventRow): string | null => {
+  const payload = parsePayload(row.payload)
+  if (payload === null) return null
+
+  if (row.event_type === 'PositionEvent::OnChainOrderFilled') {
+    const filled = nestedRecord(payload, 'OnChainOrderFilled')
+    return filled === null ? null : textField(filled, 'block_timestamp')
+  }
+
+  if (row.event_type === 'PositionEvent::OffChainOrderFilled') {
+    const filled = nestedRecord(payload, 'OffChainOrderFilled')
+    return filled === null ? null : textField(filled, 'broker_timestamp')
+  }
+
+  if (row.event_type === 'PositionEvent::OffChainOrderPlaced') {
+    const placed = nestedRecord(payload, 'OffChainOrderPlaced')
+    return placed === null ? null : textField(placed, 'placed_at')
+  }
+
+  return null
+}
+
+const orderedPositionEvents = (
+  rows: SqlPositionEventRow[],
+  warnings: string[]
+): SqlPositionEventRow[] =>
+  [...rows]
+    .map((row) => {
+      const timestamp = positionEventReplayTimestamp(row)
+      const parsed = timestamp === null ? Number.NaN : Date.parse(timestamp)
+      const hasTimestamp = Number.isFinite(parsed)
+      if (timestamp !== null && !hasTimestamp) {
+        warnings.push(
+          `PnL audit note: invalid replay timestamp for ${row.symbol} row ${String(row.rowid)}; using event row order`
+        )
+      }
+
+      return {
+        row,
+        timestampMs: hasTimestamp ? parsed : Number.POSITIVE_INFINITY
+      }
+    })
+    .sort((left, right) => {
+      if (left.timestampMs !== right.timestampMs) return left.timestampMs - right.timestampMs
+      return left.row.rowid - right.row.rowid
+    })
+    .map(({ row }) => row)
+
+const dateKey = (iso: string): string => iso.slice(0, 10)
+
+const isWeekendIso = (iso: string): boolean => {
+  const day = new Date(iso).getUTCDay()
+  return day === 0 || day === 6
+}
+
+const matchesDateFilter = (entry: PnlEntry, query: SqlPnlQuery): boolean => {
+  const day = dateKey(entry.closedAt)
+  if (query.fromDate !== undefined && day < query.fromDate) return false
+  if (query.toDate !== undefined && day > query.toDate) return false
+  if (query.dayFilter === 'weekday' && isWeekendIso(entry.closedAt)) return false
+  if (query.dayFilter === 'weekend' && !isWeekendIso(entry.closedAt)) return false
+  return true
+}
+
+const secondsBetween = (startIso: string, endIso: string): number =>
+  Math.max(0, Math.floor((new Date(endIso).getTime() - new Date(startIso).getTime()) / 1000))
+
+const fmtDecimal = (value: Decimal): string => {
+  const fixed = value.toFixed(9)
+  const trimmed = fixed.replace(/\.?0+$/u, '')
+  return trimmed === '-0' || trimmed === '' ? '0' : trimmed
+}
+
+const allocationSummaryText = (allocations: UnmatchedOffchainAllocation[]): string | null => {
+  if (allocations.length === 0) return null
+
+  const bySymbol = new Map<string, { fillIds: Set<string>; shares: Decimal }>()
+  for (const allocation of allocations) {
+    const current = bySymbol.get(allocation.symbol) ?? { fillIds: new Set<string>(), shares: ZERO }
+    current.fillIds.add(allocation.fillId)
+    current.shares = current.shares.plus(allocation.shares)
+    bySymbol.set(allocation.symbol, current)
+  }
+
+  const symbolDetails = [...bySymbol.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(
+      ([symbol, value]) =>
+        `${symbol}: ${fmtDecimal(value.shares)} shares across ${String(value.fillIds.size)} fills`
+    )
+    .join('; ')
+
+  return `Allocation note: ${String(allocations.length)} offchain fills opened offchain-origin inventory outside the intended onchain-to-offchain hedge flow (${symbolDetails}). Those shares are carried in the FIFO ledger so later fills can close them.`
+}
+
+const positionReplayDeltaText = (deltas: PositionReplayDelta[]): string | null => {
+  if (deltas.length === 0) return null
+
+  const details = [...deltas]
+    .sort((left, right) => left.symbol.localeCompare(right.symbol))
+    .map(
+      (delta) =>
+        `${delta.symbol}: replay ${fmtDecimal(delta.replayNet)}, position_view ${fmtDecimal(delta.positionNet)}`
+    )
+    .join('; ')
+
+  return `Reconciliation note: replayed open lots differ from position_view for ${String(deltas.length)} symbols (${details}). This means the persisted Position fill events available to the dashboard do not fully reconstruct the current projected position for those symbols.`
+}
+
+const appendInvalidQuerySymbols = (warnings: string[], symbols: Set<string>): void => {
+  const invalidSymbols = [...symbols].filter((symbol) => !isSafeSqlSymbol(symbol))
+  if (invalidSymbols.length === 0) return
+
+  warnings.push(
+    `Skipped ${String(invalidSymbols.length)} invalid symbol filters in SQL PnL query: ${invalidSymbols.join(', ')}`
+  )
+}
+
+const appendReplayDiagnostics = (
+  warnings: string[],
+  unmatchedOffchainAllocations: UnmatchedOffchainAllocation[],
+  positionReplayDeltas: PositionReplayDelta[]
+): void => {
+  const allocationText = allocationSummaryText(unmatchedOffchainAllocations)
+  if (allocationText !== null) warnings.push(allocationText)
+
+  const deltaText = positionReplayDeltaText(positionReplayDeltas)
+  if (deltaText !== null) warnings.push(deltaText)
+}
+
+const directionLabel = (direction: Direction): string => (direction === 'Buy' ? 'buy' : 'sell')
+const lotSideToOnchainDirection = (side: LotSide): string => (side === 'long' ? 'buy' : 'sell')
+
+const addVenueNotional = (summary: SummaryAcc, venue: Venue, notional: Decimal): void => {
+  if (venue === 'onchain') {
+    summary.onchainNotionalUsd = summary.onchainNotionalUsd.plus(notional)
+  } else {
+    summary.offchainNotionalUsd = summary.offchainNotionalUsd.plus(notional)
+  }
+}
+
+const addRealizedPnl = (summary: SummaryAcc, bucket: PnlBucket, value: Decimal): void => {
+  if (bucket === 'counter_trade') {
+    summary.counterTradePnlUsd = summary.counterTradePnlUsd.plus(value)
+    summary.realizedPnlUsd = summary.realizedPnlUsd.plus(value)
+    return
+  }
+
+  if (bucket === 'onchain_netting') {
+    summary.onchainNettingPnlUsd = summary.onchainNettingPnlUsd.plus(value)
+    summary.realizedPnlUsd = summary.realizedPnlUsd.plus(value)
+    return
+  }
+
+  summary.directionalImbalanceExcessPnlUsd = summary.directionalImbalanceExcessPnlUsd.plus(value)
+  summary.directionalExposurePnlUsd = summary.directionalExposurePnlUsd.plus(value)
+  summary.realizedPnlUsd = summary.realizedPnlUsd.plus(value)
+}
+
+const parseOnchainFill = (row: SqlPositionEventRow, warnings: string[]): Fill | null => {
+  const payload = parsePayload(row.payload)
+  const filled = payload === null ? null : nestedRecord(payload, 'OnChainOrderFilled')
+  if (filled === null) {
+    warnings.push(
+      `Skipped malformed position onchain fill ${row.symbol}: missing OnChainOrderFilled`
+    )
+    return null
+  }
+
+  const amount = decimalField(filled, 'amount')
+  const direction = directionField(filled, 'direction')
+  const price = decimalField(filled, 'price_usdc')
+  const executedAt = textField(filled, 'block_timestamp')
+  const tradeId = nestedRecord(filled, 'trade_id')
+  const txHash = tradeId === null ? null : textField(tradeId, 'tx_hash')
+  const logIndex = tradeId === null ? null : numberTextField(tradeId, 'log_index')
+
+  if (
+    amount === null ||
+    direction === null ||
+    price === null ||
+    executedAt === null ||
+    txHash === null ||
+    logIndex === null
+  ) {
+    warnings.push(`Skipped malformed position onchain fill ${row.symbol}: incomplete payload`)
+    return null
+  }
+
+  return {
+    rowid: row.rowid,
+    id: `${txHash}:${logIndex}`,
+    symbol: row.symbol,
+    shares: amount,
+    direction,
+    price,
+    executedAt,
+    venue: 'onchain'
+  }
+}
+
+const parseOffchainFill = (row: SqlPositionEventRow, warnings: string[]): Fill | null => {
+  const payload = parsePayload(row.payload)
+  const filled = payload === null ? null : nestedRecord(payload, 'OffChainOrderFilled')
+  if (filled === null) {
+    warnings.push(
+      `Skipped malformed position offchain fill ${row.symbol}: missing OffChainOrderFilled`
+    )
+    return null
+  }
+
+  const orderId = textField(filled, 'offchain_order_id')
+  const shares = decimalField(filled, 'shares_filled')
+  const direction = directionField(filled, 'direction')
+  const price = decimalField(filled, 'price')
+  const executedAt = textField(filled, 'broker_timestamp')
+
+  if (
+    orderId === null ||
+    shares === null ||
+    direction === null ||
+    price === null ||
+    executedAt === null
+  ) {
+    warnings.push(`Skipped malformed position offchain fill ${row.symbol}: incomplete payload`)
+    return null
+  }
+
+  return {
+    rowid: row.rowid,
+    id: orderId,
+    symbol: row.symbol,
+    shares,
+    direction,
+    price,
+    executedAt,
+    venue: 'offchain'
+  }
+}
+
+const parseOffchainPlacementId = (row: SqlPositionEventRow, warnings: string[]): string | null => {
+  const payload = parsePayload(row.payload)
+  const placed = payload === null ? null : nestedRecord(payload, 'OffChainOrderPlaced')
+  const orderId = placed === null ? null : textField(placed, 'offchain_order_id')
+
+  if (orderId === null) {
+    warnings.push(`Skipped malformed position offchain placement ${row.symbol}: incomplete payload`)
+  }
+
+  return orderId
+}
+
+const getBook = (books: Map<string, SymbolBook>, symbol: string): SymbolBook => {
+  const existing = books.get(symbol)
+  if (existing !== undefined) return existing
+  const book = emptyBook()
+  books.set(symbol, book)
+  return book
+}
+
+const openResidualLot = (book: SymbolBook, fill: Fill, remaining: Decimal): void => {
+  const side: LotSide = fill.direction === 'Buy' ? 'long' : 'short'
+  const lot: Lot = {
+    tradeId: fill.id,
+    side,
+    remainingShares: remaining,
+    price: fill.price,
+    openedAt: fill.executedAt,
+    openedRowid: fill.rowid,
+    openedVenue: fill.venue
+  }
+
+  if (side === 'long') {
+    book.longLots.push(lot)
+  } else {
+    book.shortLots.push(lot)
+  }
+}
+
+const applyOnchainFill = (
+  book: SymbolBook,
+  fill: Fill,
+  entries: PnlEntry[],
+  warnings: string[]
+): void => {
+  if (book.seenOnchainFillIds.has(fill.id)) {
+    warnings.push(
+      `PnL audit error: duplicate onchain trade_id ${fill.id} for ${fill.symbol} was skipped`
+    )
+    return
+  }
+
+  book.seenOnchainFillIds.add(fill.id)
+  book.summary.onchainFillCount += 1
+
+  const sourceLots = fill.direction === 'Buy' ? book.shortLots : book.longLots
+  const remaining = matchFillAgainstLots(
+    fill,
+    sourceLots,
+    book.summary,
+    book.matchedOnchainShares,
+    entries,
+    'onchain_netting'
+  )
+  if (remaining.isZero()) return
+
+  const original = book.originalOnchainShares.get(fill.id) ?? ZERO
+  book.originalOnchainShares.set(fill.id, original.plus(remaining))
+
+  openResidualLot(book, fill, remaining)
+}
+
+const applyOffchainPlacement = (
+  book: SymbolBook,
+  row: SqlPositionEventRow,
+  warnings: string[]
+): void => {
+  const orderId = parseOffchainPlacementId(row, warnings)
+  if (orderId === null) return
+
+  if (book.seenOffchainPlacementIds.has(orderId)) {
+    warnings.push(
+      `PnL audit error: duplicate offchain placement ${orderId} for ${row.symbol} was skipped`
+    )
+    return
+  }
+
+  book.seenOffchainPlacementIds.add(orderId)
+}
+
+const applyOffchainFill = (
+  book: SymbolBook,
+  fill: Fill,
+  entries: PnlEntry[],
+  warnings: string[],
+  unmatchedOffchainAllocations: UnmatchedOffchainAllocation[]
+): void => {
+  if (book.seenOffchainFillIds.has(fill.id)) {
+    warnings.push(
+      `PnL audit error: duplicate offchain fill ${fill.id} for ${fill.symbol} was skipped`
+    )
+    return
+  }
+
+  book.seenOffchainFillIds.add(fill.id)
+  book.summary.offchainFillCount += 1
+  const sourceLots = fill.direction === 'Buy' ? book.shortLots : book.longLots
+  const remaining = matchFillAgainstLots(
+    fill,
+    sourceLots,
+    book.summary,
+    book.matchedOnchainShares,
+    entries,
+    'counter_trade'
+  )
+
+  if (!remaining.isZero()) {
+    unmatchedOffchainAllocations.push({
+      symbol: fill.symbol,
+      fillId: fill.id,
+      shares: remaining
+    })
+    openResidualLot(book, fill, remaining)
+  }
+}
+
+const matchFillAgainstLots = (
+  fill: Fill,
+  sourceLots: Lot[],
+  summary: SummaryAcc,
+  matchedOnchainShares: Map<string, Decimal>,
+  entries: PnlEntry[],
+  bucket: PnlBucket
+): Decimal => {
+  let remaining = fill.shares
+
+  while (!remaining.isZero() && sourceLots.length > 0) {
+    const frontLot = sourceLots[0]
+    if (frontLot === undefined) break
+
+    const matchedShares = Decimal.min(remaining, frontLot.remainingShares)
+    if (matchedShares.isZero()) {
+      sourceLots.shift()
+      continue
+    }
+
+    const elapsedSeconds = secondsBetween(frontLot.openedAt, fill.executedAt)
+    const effectiveBucket: PnlBucket =
+      frontLot.openedVenue === 'offchain'
+        ? 'directional_exposure'
+        : bucket === 'counter_trade' && elapsedSeconds > COUNTER_TRADE_THRESHOLD_SECONDS
+          ? 'directional_exposure'
+          : bucket
+    const spread =
+      frontLot.side === 'long' ? fill.price.minus(frontLot.price) : frontLot.price.minus(fill.price)
+    const realizedPnl = matchedShares.mul(spread)
+    const openingNotional = matchedShares.mul(frontLot.price)
+    const closingNotional = matchedShares.mul(fill.price)
+
+    frontLot.remainingShares = frontLot.remainingShares.minus(matchedShares)
+    if (frontLot.remainingShares.isZero()) {
+      sourceLots.shift()
+    }
+
+    addRealizedPnl(summary, effectiveBucket, realizedPnl)
+    summary.matchedShares = summary.matchedShares.plus(matchedShares)
+    addVenueNotional(summary, frontLot.openedVenue, openingNotional)
+    addVenueNotional(summary, fill.venue, closingNotional)
+    summary.matchedLotCount += 1
+
+    if (frontLot.openedVenue === 'onchain') {
+      const matched = matchedOnchainShares.get(frontLot.tradeId) ?? ZERO
+      matchedOnchainShares.set(frontLot.tradeId, matched.plus(matchedShares))
+    }
+
+    const openingDirection = lotSideToOnchainDirection(frontLot.side)
+    const closingDirection = directionLabel(fill.direction)
+    const openingPriceText = fmtDecimal(frontLot.price)
+    const closingPriceText = fmtDecimal(fill.price)
+    const onchainDirection =
+      frontLot.openedVenue === 'onchain'
+        ? openingDirection
+        : fill.venue === 'onchain'
+          ? closingDirection
+          : ''
+    const offchainDirection =
+      frontLot.openedVenue === 'offchain'
+        ? openingDirection
+        : fill.venue === 'offchain'
+          ? closingDirection
+          : ''
+    const onchainTradeId =
+      frontLot.openedVenue === 'onchain'
+        ? frontLot.tradeId
+        : fill.venue === 'onchain'
+          ? fill.id
+          : ''
+    const offchainOrderId =
+      frontLot.openedVenue === 'offchain'
+        ? frontLot.tradeId
+        : fill.venue === 'offchain'
+          ? fill.id
+          : ''
+    const onchainPriceText =
+      frontLot.openedVenue === 'onchain'
+        ? openingPriceText
+        : fill.venue === 'onchain'
+          ? closingPriceText
+          : ''
+    const offchainPriceText =
+      frontLot.openedVenue === 'offchain'
+        ? openingPriceText
+        : fill.venue === 'offchain'
+          ? closingPriceText
+          : ''
+
+    entries.push({
+      symbol: fill.symbol,
+      pnlBucket: effectiveBucket,
+      matchedAt: fill.executedAt,
+      openedAt: frontLot.openedAt,
+      closedAt: fill.executedAt,
+      openingFillId: frontLot.tradeId,
+      closingFillId: fill.id,
+      openingRowid: frontLot.openedRowid,
+      closingRowid: fill.rowid,
+      openingVenue: frontLot.openedVenue,
+      closingVenue: fill.venue,
+      openingDirection,
+      closingDirection,
+      openingPriceUsd: openingPriceText,
+      closingPriceUsd: closingPriceText,
+      onchainTradeId,
+      offchainOrderId,
+      onchainDirection,
+      offchainDirection,
+      shares: fmtDecimal(matchedShares),
+      onchainPriceUsdc: onchainPriceText,
+      offchainPriceUsd: offchainPriceText,
+      spreadUsd: fmtDecimal(spread),
+      realizedPnlUsd: fmtDecimal(realizedPnl),
+      elapsedSeconds,
+      counterTradeThresholdSeconds: COUNTER_TRADE_THRESHOLD_SECONDS,
+      delayedCounterTrade: effectiveBucket === 'directional_exposure',
+      attributionMethod: ATTRIBUTION_METHOD
+    })
+
+    remaining = remaining.minus(matchedShares)
+  }
+
+  return remaining
+}
+
+const finalizeLots = (summary: SummaryAcc, lots: Lot[]): void => {
+  for (const lot of lots) {
+    const notional = lot.remainingShares.mul(lot.price)
+
+    if (lot.side === 'long') {
+      summary.openLongShares = summary.openLongShares.plus(lot.remainingShares)
+      summary.openLongNotionalUsd = summary.openLongNotionalUsd.plus(notional)
+    } else {
+      summary.openShortShares = summary.openShortShares.plus(lot.remainingShares)
+      summary.openShortNotionalUsd = summary.openShortNotionalUsd.plus(notional)
+    }
+
+    summary.openLotCount += 1
+  }
+}
+
+const finalizeBook = (
+  symbol: string,
+  book: SymbolBook,
+  positionNets: Map<string, Decimal>,
+  warnings: string[],
+  positionReplayDeltas: PositionReplayDelta[]
+): void => {
+  finalizeLots(book.summary, book.longLots)
+  finalizeLots(book.summary, book.shortLots)
+
+  for (const [tradeId, matchedShares] of book.matchedOnchainShares) {
+    const originalShares = book.originalOnchainShares.get(tradeId)
+    if (originalShares !== undefined && matchedShares.gt(originalShares.plus('0.000001'))) {
+      warnings.push(
+        `PnL audit error: onchain lot ${tradeId} for ${symbol} matched ${fmtDecimal(matchedShares)} shares above original ${fmtDecimal(originalShares)}`
+      )
+    }
+  }
+
+  const positionNet = positionNets.get(symbol)
+  if (positionNet !== undefined) {
+    const replayNet = book.summary.openLongShares.minus(book.summary.openShortShares)
+    if (replayNet.minus(positionNet).abs().gt('0.000001')) {
+      positionReplayDeltas.push({
+        symbol,
+        replayNet,
+        positionNet
+      })
+    }
+  }
+}
+
+const addSummary = (target: SummaryAcc, source: SummaryAcc): void => {
+  target.counterTradePnlUsd = target.counterTradePnlUsd.plus(source.counterTradePnlUsd)
+  target.onchainNettingPnlUsd = target.onchainNettingPnlUsd.plus(source.onchainNettingPnlUsd)
+  target.directionalInventoryBaselinePnlUsd = target.directionalInventoryBaselinePnlUsd.plus(
+    source.directionalInventoryBaselinePnlUsd
+  )
+  target.directionalImbalanceExcessPnlUsd = target.directionalImbalanceExcessPnlUsd.plus(
+    source.directionalImbalanceExcessPnlUsd
+  )
+  target.directionalExposurePnlUsd = target.directionalExposurePnlUsd.plus(
+    source.directionalExposurePnlUsd
+  )
+  target.realizedPnlUsd = target.realizedPnlUsd.plus(source.realizedPnlUsd)
+  target.matchedShares = target.matchedShares.plus(source.matchedShares)
+  target.onchainNotionalUsd = target.onchainNotionalUsd.plus(source.onchainNotionalUsd)
+  target.offchainNotionalUsd = target.offchainNotionalUsd.plus(source.offchainNotionalUsd)
+  target.openLongShares = target.openLongShares.plus(source.openLongShares)
+  target.openShortShares = target.openShortShares.plus(source.openShortShares)
+  target.openLongNotionalUsd = target.openLongNotionalUsd.plus(source.openLongNotionalUsd)
+  target.openShortNotionalUsd = target.openShortNotionalUsd.plus(source.openShortNotionalUsd)
+  target.unmatchedOffchainBuyShares = target.unmatchedOffchainBuyShares.plus(
+    source.unmatchedOffchainBuyShares
+  )
+  target.unmatchedOffchainSellShares = target.unmatchedOffchainSellShares.plus(
+    source.unmatchedOffchainSellShares
+  )
+  target.unmatchedOffchainBuyNotionalUsd = target.unmatchedOffchainBuyNotionalUsd.plus(
+    source.unmatchedOffchainBuyNotionalUsd
+  )
+  target.unmatchedOffchainSellNotionalUsd = target.unmatchedOffchainSellNotionalUsd.plus(
+    source.unmatchedOffchainSellNotionalUsd
+  )
+  target.onchainFillCount += source.onchainFillCount
+  target.offchainFillCount += source.offchainFillCount
+  target.matchedLotCount += source.matchedLotCount
+  target.openLotCount += source.openLotCount
+  target.unmatchedOffchainFillCount += source.unmatchedOffchainFillCount
+}
+
+const summaryToDto = (summary: SummaryAcc): PnlSummary => {
+  const directionalExposurePnl = summary.directionalInventoryBaselinePnlUsd.plus(
+    summary.directionalImbalanceExcessPnlUsd
+  )
+  const totalPnl = summary.counterTradePnlUsd
+    .plus(summary.onchainNettingPnlUsd)
+    .plus(summary.directionalInventoryBaselinePnlUsd)
+    .plus(summary.directionalImbalanceExcessPnlUsd)
+
+  return {
+    counterTradePnlUsd: fmtDecimal(summary.counterTradePnlUsd),
+    onchainNettingPnlUsd: fmtDecimal(summary.onchainNettingPnlUsd),
+    directionalInventoryBaselinePnlUsd: fmtDecimal(summary.directionalInventoryBaselinePnlUsd),
+    directionalImbalanceExcessPnlUsd: fmtDecimal(summary.directionalImbalanceExcessPnlUsd),
+    directionalExposurePnlUsd: fmtDecimal(directionalExposurePnl),
+    totalPnlUsd: fmtDecimal(totalPnl),
+    realizedPnlUsd: fmtDecimal(summary.realizedPnlUsd),
+    matchedShares: fmtDecimal(summary.matchedShares),
+    onchainNotionalUsd: fmtDecimal(summary.onchainNotionalUsd),
+    offchainNotionalUsd: fmtDecimal(summary.offchainNotionalUsd),
+    inventoryDriftShares: fmtDecimal(summary.openLongShares.minus(summary.openShortShares)),
+    inventoryDriftUsd: fmtDecimal(summary.openLongNotionalUsd.minus(summary.openShortNotionalUsd)),
+    openLongShares: fmtDecimal(summary.openLongShares),
+    openShortShares: fmtDecimal(summary.openShortShares),
+    unmatchedOffchainShares: fmtDecimal(
+      summary.unmatchedOffchainBuyShares.plus(summary.unmatchedOffchainSellShares)
+    ),
+    unmatchedOffchainNotionalUsd: fmtDecimal(
+      summary.unmatchedOffchainBuyNotionalUsd.plus(summary.unmatchedOffchainSellNotionalUsd)
+    ),
+    onchainFillCount: summary.onchainFillCount,
+    offchainFillCount: summary.offchainFillCount,
+    matchedLotCount: summary.matchedLotCount,
+    openLotCount: summary.openLotCount,
+    unmatchedOffchainFillCount: summary.unmatchedOffchainFillCount
+  }
+}
+
+const symbolSummaryToDto = (symbol: string, summary: SummaryAcc): PnlSymbolSummary => {
+  const dto = summaryToDto(summary)
+  return {
+    symbol,
+    counterTradePnlUsd: dto.counterTradePnlUsd,
+    onchainNettingPnlUsd: dto.onchainNettingPnlUsd,
+    directionalInventoryBaselinePnlUsd: dto.directionalInventoryBaselinePnlUsd,
+    directionalImbalanceExcessPnlUsd: dto.directionalImbalanceExcessPnlUsd,
+    directionalExposurePnlUsd: dto.directionalExposurePnlUsd,
+    totalPnlUsd: dto.totalPnlUsd,
+    realizedPnlUsd: dto.realizedPnlUsd,
+    matchedShares: dto.matchedShares,
+    inventoryDriftShares: dto.inventoryDriftShares,
+    inventoryDriftUsd: dto.inventoryDriftUsd,
+    openLongShares: dto.openLongShares,
+    openShortShares: dto.openShortShares,
+    unmatchedOffchainShares: dto.unmatchedOffchainShares,
+    matchedLotCount: dto.matchedLotCount,
+    onchainFillCount: dto.onchainFillCount,
+    offchainFillCount: dto.offchainFillCount,
+    unmatchedOffchainFillCount: dto.unmatchedOffchainFillCount
+  }
+}
+
+const withReplayExposure = (filtered: PnlSummary, replay: PnlSummary): PnlSummary => ({
+  ...filtered,
+  inventoryDriftShares: replay.inventoryDriftShares,
+  inventoryDriftUsd: replay.inventoryDriftUsd,
+  openLongShares: replay.openLongShares,
+  openShortShares: replay.openShortShares,
+  unmatchedOffchainShares: replay.unmatchedOffchainShares,
+  unmatchedOffchainNotionalUsd: replay.unmatchedOffchainNotionalUsd,
+  openLotCount: replay.openLotCount,
+  unmatchedOffchainFillCount: replay.unmatchedOffchainFillCount
+})
+
+const withSymbolReplayExposure = (
+  filtered: PnlSymbolSummary,
+  replay: PnlSymbolSummary
+): PnlSymbolSummary => ({
+  ...filtered,
+  inventoryDriftShares: replay.inventoryDriftShares,
+  inventoryDriftUsd: replay.inventoryDriftUsd,
+  openLongShares: replay.openLongShares,
+  openShortShares: replay.openShortShares,
+  unmatchedOffchainShares: replay.unmatchedOffchainShares,
+  unmatchedOffchainFillCount: replay.unmatchedOffchainFillCount
+})
+
+const emptySymbolSummary = (symbol: string): PnlSymbolSummary =>
+  symbolSummaryToDto(symbol, emptySummary())
+
+const isNonZeroText = (value: string): boolean => {
+  try {
+    return !new Decimal(value).isZero()
+  } catch {
+    return false
+  }
+}
+
+const hasReplayExposure = (summary: PnlSymbolSummary): boolean =>
+  isNonZeroText(summary.inventoryDriftShares) ||
+  isNonZeroText(summary.inventoryDriftUsd) ||
+  isNonZeroText(summary.openLongShares) ||
+  isNonZeroText(summary.openShortShares) ||
+  isNonZeroText(summary.unmatchedOffchainShares) ||
+  summary.unmatchedOffchainFillCount > 0
+
+const mergeSymbolReplayExposure = (
+  filteredSymbols: PnlSymbolSummary[],
+  replaySymbols: PnlSymbolSummary[]
+): PnlSymbolSummary[] => {
+  const bySymbol = new Map(filteredSymbols.map((row) => [row.symbol, row]))
+
+  for (const replay of replaySymbols) {
+    const existing = bySymbol.get(replay.symbol) ?? emptySymbolSummary(replay.symbol)
+    if (bySymbol.has(replay.symbol) || hasReplayExposure(replay)) {
+      bySymbol.set(replay.symbol, withSymbolReplayExposure(existing, replay))
+    }
+  }
+
+  return [...bySymbol.values()].sort((left, right) => left.symbol.localeCompare(right.symbol))
+}
+
+const entryBucketToStream = (bucket: string): PnlStreamKey | null => {
+  if (bucket === 'counter_trade') return 'counterTradePnlUsd'
+  if (bucket === 'onchain_netting') return 'onchainNettingPnlUsd'
+  if (bucket === 'directional_exposure') return 'directionalImbalanceExcessPnlUsd'
+  return null
+}
+
+const entryVenue = (value: string): Venue | null => {
+  if (value === 'onchain' || value === 'offchain') return value
+  return null
+}
+
+const summaryFromEntries = (
+  entries: PnlEntry[]
+): { summary: PnlSummary; symbols: PnlSymbolSummary[] } => {
+  const total = emptySummary()
+  const perSymbol = new Map<string, SummaryAcc>()
+
+  for (const entry of entries) {
+    const summary = perSymbol.get(entry.symbol) ?? emptySummary()
+    perSymbol.set(entry.symbol, summary)
+    const shares = new Decimal(entry.shares)
+    const openingNotional = shares.mul(new Decimal(entry.openingPriceUsd))
+    const closingNotional = shares.mul(new Decimal(entry.closingPriceUsd))
+    const pnl = new Decimal(entry.realizedPnlUsd)
+
+    summary.matchedShares = summary.matchedShares.plus(shares)
+    const openingVenue = entryVenue(entry.openingVenue)
+    const closingVenue = entryVenue(entry.closingVenue)
+    if (openingVenue !== null) addVenueNotional(summary, openingVenue, openingNotional)
+    if (closingVenue !== null) addVenueNotional(summary, closingVenue, closingNotional)
+    summary.matchedLotCount += 1
+
+    if (entry.pnlBucket === 'counter_trade') {
+      summary.counterTradePnlUsd = summary.counterTradePnlUsd.plus(pnl)
+      summary.realizedPnlUsd = summary.realizedPnlUsd.plus(pnl)
+    } else if (entry.pnlBucket === 'onchain_netting') {
+      summary.onchainNettingPnlUsd = summary.onchainNettingPnlUsd.plus(pnl)
+      summary.realizedPnlUsd = summary.realizedPnlUsd.plus(pnl)
+    } else if (entry.pnlBucket === 'directional_exposure') {
+      summary.directionalImbalanceExcessPnlUsd = summary.directionalImbalanceExcessPnlUsd.plus(pnl)
+      summary.directionalExposurePnlUsd = summary.directionalExposurePnlUsd.plus(pnl)
+      summary.realizedPnlUsd = summary.realizedPnlUsd.plus(pnl)
+    }
+  }
+
+  const symbols = [...perSymbol.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([symbol, summary]) => {
+      addSummary(total, summary)
+      return symbolSummaryToDto(symbol, summary)
+    })
+
+  return { summary: summaryToDto(total), symbols }
+}
+
+const buildWindows = (entries: PnlEntry[], symbols: string[]): PnlWindow[] => {
+  const byDate = new Map<string, PnlEntry[]>()
+
+  for (const entry of entries) {
+    const key = dateKey(entry.closedAt)
+    const dayEntries = byDate.get(key)
+    if (dayEntries === undefined) {
+      byDate.set(key, [entry])
+    } else {
+      dayEntries.push(entry)
+    }
+  }
+
+  return [...byDate.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([date, dayEntries]) => {
+      const rows: PnlWindowSymbol[] = symbols.map((symbol) => {
+        const values: Record<PnlStreamKey, Decimal> = {
+          counterTradePnlUsd: new Decimal(0),
+          onchainNettingPnlUsd: new Decimal(0),
+          directionalInventoryBaselinePnlUsd: new Decimal(0),
+          directionalImbalanceExcessPnlUsd: new Decimal(0)
+        }
+
+        for (const entry of dayEntries) {
+          if (entry.symbol !== symbol) continue
+          const stream = entryBucketToStream(entry.pnlBucket)
+          if (stream === null) continue
+          values[stream] = values[stream].plus(new Decimal(entry.realizedPnlUsd))
+        }
+
+        const directionalExposure = values.directionalInventoryBaselinePnlUsd.plus(
+          values.directionalImbalanceExcessPnlUsd
+        )
+        const totalPnl = values.counterTradePnlUsd
+          .plus(values.onchainNettingPnlUsd)
+          .plus(values.directionalInventoryBaselinePnlUsd)
+          .plus(values.directionalImbalanceExcessPnlUsd)
+
+        return {
+          symbol,
+          counterTradePnlUsd: fmtDecimal(values.counterTradePnlUsd),
+          onchainNettingPnlUsd: fmtDecimal(values.onchainNettingPnlUsd),
+          directionalInventoryBaselinePnlUsd: fmtDecimal(values.directionalInventoryBaselinePnlUsd),
+          directionalImbalanceExcessPnlUsd: fmtDecimal(values.directionalImbalanceExcessPnlUsd),
+          directionalExposurePnlUsd: fmtDecimal(directionalExposure),
+          totalPnlUsd: fmtDecimal(totalPnl)
+        }
+      })
+
+      return {
+        windowId: date,
+        startAt: `${date}T00:00:00.000Z`,
+        endAt: `${date}T23:59:59.999Z`,
+        label: date,
+        isWeekend: isWeekendIso(`${date}T00:00:00.000Z`),
+        granularity: 'day',
+        symbols: rows
+      }
+    })
+}
+
+const parsePositionView = (
+  rows: SqlPositionViewRow[],
+  warnings: string[]
+): { positionNets: Map<string, Decimal>; symbols: string[] } => {
+  const positionNets = new Map<string, Decimal>()
+  const symbols = new Set<string>()
+
+  for (const row of rows) {
+    if (!isSafeSqlSymbol(row.symbol)) {
+      warnings.push(`Skipped unsafe position_view symbol in SQL PnL response: ${row.symbol}`)
+      continue
+    }
+
+    symbols.add(row.symbol)
+
+    if (row.net_position !== null) {
+      try {
+        positionNets.set(row.symbol, new Decimal(row.net_position))
+      } catch {
+        warnings.push(`Skipped malformed position net for ${row.symbol}: ${row.net_position}`)
+      }
+    }
+  }
+
+  return { positionNets, symbols: [...symbols].sort() }
+}
+
+const parseCount = (value: number | string | null | undefined): number => {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+const buildSampleStats = (rows: SqlSampleStatsRow[], warnings: string[]): PnlSampleStats => {
+  const symbols: PnlSampleSymbolStats[] = []
+  for (const row of rows) {
+    if (!isSafeSqlSymbol(row.symbol)) {
+      warnings.push(`Skipped unsafe sample stats symbol in SQL PnL response: ${row.symbol}`)
+      continue
+    }
+
+    const onchainFillCount = parseCount(row.onchain_fill_count)
+    const offchainFillCount = parseCount(row.offchain_fill_count)
+
+    symbols.push({
+      symbol: row.symbol,
+      firstAt: row.first_at,
+      lastAt: row.last_at,
+      onchainFillCount,
+      offchainFillCount,
+      totalFillCount: onchainFillCount + offchainFillCount
+    })
+  }
+
+  const firstAt =
+    symbols
+      .map((row) => row.firstAt)
+      .filter((value): value is string => value !== null)
+      .sort((left, right) => left.localeCompare(right))[0] ?? null
+  const lastAt =
+    symbols
+      .map((row) => row.lastAt)
+      .filter((value): value is string => value !== null)
+      .sort((left, right) => right.localeCompare(left))[0] ?? null
+
+  return {
+    firstAt,
+    lastAt,
+    symbolCount: symbols.length,
+    onchainFillCount: symbols.reduce((total, row) => total + row.onchainFillCount, 0),
+    offchainFillCount: symbols.reduce((total, row) => total + row.offchainFillCount, 0),
+    totalFillCount: symbols.reduce((total, row) => total + row.totalFillCount, 0),
+    symbols
+  }
+}
+
+export const buildPnlResponseFromSqlRows = (
+  eventRows: SqlPositionEventRow[],
+  positionRows: SqlPositionViewRow[],
+  sampleRows: SqlSampleStatsRow[],
+  query: SqlPnlQuery
+): PnlResponse => {
+  const warnings = [ATTRIBUTION_WARNING, BASELINE_WARNING]
+  appendInvalidQuerySymbols(warnings, query.symbols)
+  const {
+    positionNets,
+    symbols: positionSymbols
+  } = parsePositionView(positionRows, warnings)
+  const sampleStats = buildSampleStats(sampleRows, warnings)
+  const books = new Map<string, SymbolBook>()
+  const entries: PnlEntry[] = []
+  const unmatchedOffchainAllocations: UnmatchedOffchainAllocation[] = []
+  const positionReplayDeltas: PositionReplayDelta[] = []
+
+  for (const row of orderedPositionEvents(eventRows, warnings)) {
+    if (!isSafeSqlSymbol(row.symbol)) {
+      warnings.push(`Skipped unsafe position event symbol in SQL PnL response: ${row.symbol}`)
+      continue
+    }
+
+    const book = getBook(books, row.symbol)
+
+    if (row.event_type === 'PositionEvent::OnChainOrderFilled') {
+      const fill = parseOnchainFill(row, warnings)
+      if (fill !== null) applyOnchainFill(book, fill, entries, warnings)
+    } else if (row.event_type === 'PositionEvent::OffChainOrderPlaced') {
+      applyOffchainPlacement(book, row, warnings)
+    } else if (row.event_type === 'PositionEvent::OffChainOrderFilled') {
+      const fill = parseOffchainFill(row, warnings)
+      if (fill !== null)
+        applyOffchainFill(book, fill, entries, warnings, unmatchedOffchainAllocations)
+    }
+  }
+
+  const fullTotal = emptySummary()
+  const replaySymbols: PnlSymbolSummary[] = []
+  for (const [symbol, book] of books) {
+    finalizeBook(symbol, book, positionNets, warnings, positionReplayDeltas)
+    addSummary(fullTotal, book.summary)
+    replaySymbols.push(symbolSummaryToDto(symbol, book.summary))
+  }
+  appendReplayDiagnostics(warnings, unmatchedOffchainAllocations, positionReplayDeltas)
+
+  const filteredEntries = entries
+    .filter((entry) => matchesDateFilter(entry, query))
+    .sort((left, right) => right.matchedAt.localeCompare(left.matchedAt))
+  const total = filteredEntries.length
+  const start = Math.min(query.offset, total)
+  const end = Math.min(start + query.limit, total)
+  const pageEntries = filteredEntries.slice(start, end)
+  const filtered = summaryFromEntries(filteredEntries)
+  const replaySummary = summaryToDto(fullTotal)
+  const summary = withReplayExposure(filtered.summary, replaySummary)
+  const symbols = mergeSymbolReplayExposure(filtered.symbols, replaySymbols)
+  const symbolUniverse = [
+    ...new Set([...positionSymbols, ...books.keys(), ...symbols.map((row) => row.symbol)])
+  ].sort()
+
+  return {
+    attributionMethod: ATTRIBUTION_METHOD,
+    warnings,
+    sampleStats,
+    summary,
+    symbols,
+    symbolUniverse,
+    entries: pageEntries,
+    total,
+    hasMore: end < total,
+    windows: buildWindows(filteredEntries, symbolUniverse)
+  }
+}
+
+export const fetchPnlReportFromSql = async (
+  baseUrl: string,
+  query: SqlPnlQuery
+): Promise<PnlResponse> => {
+  const [eventRows, positionRows, sampleRows] = await Promise.all([
+    fetchSqlRows<SqlPositionEventRow>(baseUrl, positionEventsSql(query.symbols)),
+    fetchSqlRows<SqlPositionViewRow>(baseUrl, positionViewSql(new Set())),
+    fetchSqlRows<SqlSampleStatsRow>(baseUrl, sampleStatsSql())
+  ])
+
+  return buildPnlResponseFromSqlRows(eventRows, positionRows, sampleRows, query)
+}

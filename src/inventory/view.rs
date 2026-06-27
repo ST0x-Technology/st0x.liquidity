@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Add, Sub};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
@@ -10,19 +10,17 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
-use st0x_float_macro::float;
+use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use crate::wrapper::{RatioError, UnderlyingPerWrapped};
-
-static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
 
 /// Error type for inventory view operations.
 #[derive(Debug, thiserror::Error)]
@@ -55,91 +53,6 @@ pub(crate) enum Imbalance<T> {
     TooMuchOnchain { excess: T },
     /// Too much offchain - triggers movement to onchain.
     TooMuchOffchain { excess: T },
-}
-
-/// Threshold configuration for imbalance detection.
-///
-/// Invariants enforced by [`ImbalanceThreshold::new`]:
-/// - `target` must be in `[0.0, 1.0]`
-/// - `deviation` must be `>= 0`
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(try_from = "RawImbalanceThreshold", deny_unknown_fields)]
-pub struct ImbalanceThreshold {
-    /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
-    #[serde(
-        serialize_with = "st0x_float_serde::serialize_float_as_string",
-        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
-    )]
-    pub(crate) target: Float,
-    /// Deviation from target that triggers rebalancing.
-    #[serde(
-        serialize_with = "st0x_float_serde::serialize_float_as_string",
-        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
-    )]
-    pub(crate) deviation: Float,
-}
-
-/// Error returned when [`ImbalanceThreshold`] is constructed with
-/// out-of-range values.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum InvalidImbalanceThreshold {
-    #[error(
-        "target must be between 0.0 and 1.0 inclusive, \
-         got {target:?}"
-    )]
-    TargetOutOfRange { target: Float },
-    #[error("deviation must be >= 0, got {deviation:?}")]
-    NegativeDeviation { deviation: Float },
-}
-
-impl ImbalanceThreshold {
-    /// Creates a new threshold with validated parameters.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidImbalanceThreshold`] if `target` is not in
-    /// `[0.0, 1.0]` or `deviation` is negative.
-    pub fn new(target: Float, deviation: Float) -> Result<Self, InvalidImbalanceThreshold> {
-        let zero =
-            Float::zero().map_err(|_| InvalidImbalanceThreshold::TargetOutOfRange { target })?;
-
-        if target
-            .lt(zero)
-            .map_err(|_| InvalidImbalanceThreshold::TargetOutOfRange { target })?
-            || target
-                .gt(*EXACT_ONE)
-                .map_err(|_| InvalidImbalanceThreshold::TargetOutOfRange { target })?
-        {
-            return Err(InvalidImbalanceThreshold::TargetOutOfRange { target });
-        }
-
-        if deviation
-            .lt(zero)
-            .map_err(|_| InvalidImbalanceThreshold::NegativeDeviation { deviation })?
-        {
-            return Err(InvalidImbalanceThreshold::NegativeDeviation { deviation });
-        }
-
-        Ok(Self { target, deviation })
-    }
-}
-
-/// Private helper for serde deserialization with validation.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawImbalanceThreshold {
-    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-    target: Float,
-    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-    deviation: Float,
-}
-
-impl TryFrom<RawImbalanceThreshold> for ImbalanceThreshold {
-    type Error = InvalidImbalanceThreshold;
-
-    fn try_from(raw: RawImbalanceThreshold) -> Result<Self, Self::Error> {
-        Self::new(raw.target, raw.deviation)
-    }
 }
 
 /// Discriminant for the two venues tracked by an [`Inventory`].
@@ -1033,7 +946,6 @@ impl InventoryView {
 
     /// Returns the in-flight equity tokens observed at the given
     /// intermediate location for a symbol.
-    #[cfg(test)]
     pub(crate) fn inflight_equity_at(
         &self,
         symbol: &Symbol,
@@ -1381,11 +1293,17 @@ impl InventoryView {
     }
 
     /// Returns the aggregate ID of the in-flight mint for `symbol`, if any.
+    ///
+    /// Consumed by the wrapped-equity recovery dispatcher to load the
+    /// stalled aggregate via `Store::load`.
     pub(crate) fn active_mint(&self, symbol: &Symbol) -> Option<&IssuerRequestId> {
         self.active_mints.get(symbol)
     }
 
     /// Returns the aggregate ID of the in-flight redemption for `symbol`, if any.
+    ///
+    /// Consumed by the wrapped-equity recovery dispatcher to load the
+    /// stalled aggregate via `Store::load`.
     pub(crate) fn active_redemption(&self, symbol: &Symbol) -> Option<&RedemptionAggregateId> {
         self.active_redemptions.get(symbol)
     }
@@ -1885,9 +1803,9 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_finance::Usdc;
+    use st0x_wrapper::RATIO_ONE;
 
     use super::*;
-    use crate::wrapper::RATIO_ONE;
     use st0x_float_macro::float;
 
     fn shares(amount: i64) -> FractionalShares {
