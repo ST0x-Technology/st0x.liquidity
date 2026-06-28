@@ -179,10 +179,15 @@ stox alpaca-convert -d to-usdc -a 1000   # USD -> USDC (for withdrawals)
 Addresses must be whitelisted before Alpaca will send withdrawals to them:
 
 ```
-stox alpaca-whitelist -a 0x...       # Whitelist an address
-stox alpaca-whitelist-list           # List whitelisted addresses
-stox alpaca-unwhitelist -a 0x...     # Remove an address
+stox alpaca-whitelist -a 0x...              # Whitelist an address
+stox alpaca-whitelist-list                  # List whitelisted addresses
+stox alpaca-unwhitelist -a 0x...            # Remove an address
+stox alpaca-whitelist-patch-travel-rule     # Patch travel rule info on all whitelisted addresses
 ```
+
+`alpaca-whitelist-patch-travel-rule` updates every whitelisted address with the
+beneficiary identity from `[broker.travel_rule]` in the config. Required for
+addresses whitelisted before the travel rule deadline took effect.
 
 ### Transfer History
 
@@ -195,6 +200,16 @@ stox alpaca-transfers --pending      # Only pending transfers
 
 ```
 stox alpaca-tokenization-requests
+```
+
+### Equity Journaling Between Accounts
+
+Use `alpaca-journal` to transfer equity shares from the configured Alpaca
+account to another account under the same broker firm via a security journal
+(JNLS):
+
+```
+stox alpaca-journal --to <destination-account-id> -s COIN -q 10
 ```
 
 ### Rechecking Failed Equity Transfers
@@ -237,7 +252,8 @@ The command prints the recovery outcome: `recovered`, `resumed`,
 Not covered by `transfer recheck` yet:
 
 - Mint requests rejected before Alpaca acceptance. There is no provider
-  completion to discover.
+  completion to discover. Use `transfer fail --kind mint` (see below) to
+  force-fail a mint stuck at `MintRequested`.
 - Mints that failed after receiving tokens (wrapping/deposit failures). The
   tokens already left the issuer, so provider-completion recovery does not
   apply.
@@ -259,6 +275,25 @@ Not covered by `transfer recheck` yet:
   `/transfers/resume` endpoint (always resumes ALL interrupted transfers, no
   per-id filter; each succeeds or fails independently and failures are reported
   as counts with a non-zero exit). Requires the bot to be running.
+
+### Force-Failing Stuck Mint or Redemption Transfers
+
+Use `transfer fail` to force a stuck mint or redemption to the terminal `Failed`
+state when no automatic recovery path applies. Operates directly on the local
+CQRS state; the bot need not be running, but must not be concurrently driving
+the same id. `--reason` is required and persisted as the audit record.
+
+```
+# Force-fail a mint stuck at MintRequested (provider never accepted it)
+stox transfer fail --kind mint --id <issuer-request-id> --reason "rejected by provider, no fill"
+
+# Force-fail a redemption stuck without a recovery path
+stox transfer fail --kind redemption --id <redemption-aggregate-id> --reason "stuck, handled manually"
+```
+
+After force-failing, use `transfer reconcile` if the stranded funds were already
+handled out-of-band and the transfer should be marked resolved rather than left
+in `Failed`.
 
 ### Clearing a pre-burn guard latch
 
