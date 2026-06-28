@@ -276,17 +276,20 @@ impl EventSourced for Position {
                 price_usdc,
                 adjusted_at,
                 ..
-            } => Ok(Some(Self {
-                net: *target_net,
-                last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
-                last_updated: Some(*adjusted_at),
-                // A manual reconciliation supersedes any prior failed hedge, so
-                // clear the broker-idempotency anchor. Otherwise the next hedge
-                // could reuse the failed order's client_order_id and be deduped
-                // by the broker against a stale order.
-                last_failed_offchain_order_id: None,
-                ..entity.clone()
-            })),
+            } => {
+                record_position_gauge(&entity.symbol, target_net);
+                Ok(Some(Self {
+                    net: *target_net,
+                    last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
+                    last_updated: Some(*adjusted_at),
+                    // A manual reconciliation supersedes any prior failed hedge,
+                    // so clear the broker-idempotency anchor. Otherwise the next
+                    // hedge could reuse the failed order's client_order_id and be
+                    // deduped by the broker against a stale order.
+                    last_failed_offchain_order_id: None,
+                    ..entity.clone()
+                }))
+            }
 
             Initialized { .. } => Ok(None),
         }
