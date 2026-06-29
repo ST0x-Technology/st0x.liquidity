@@ -796,6 +796,11 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
                 "PositionEvent::OffChainOrderPlaced",
             ),
             ExpectedEvent::new(
@@ -812,6 +817,11 @@ async fn equity_offchain_imbalance_triggers_mint() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
             ),
             ExpectedEvent::new(
                 "TokenizedEquityMint",
@@ -852,14 +862,14 @@ async fn equity_offchain_imbalance_triggers_mint() {
     )
     .await;
 
-    let mint_requested = &events[6].payload["MintRequested"];
+    let mint_requested = &events[8].payload["MintRequested"];
     assert_eq!(
         mint_requested["symbol"].as_str().unwrap(),
         "AAPL",
         "MintRequested should target the correct symbol"
     );
 
-    let mint_accepted = &events[7].payload["MintAccepted"];
+    let mint_accepted = &events[9].payload["MintAccepted"];
     assert_eq!(
         mint_accepted["tokenization_request_id"].as_str().unwrap(),
         "mint_int_test",
@@ -1027,6 +1037,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
                 "PositionEvent::OffChainOrderPlaced",
             ),
             ExpectedEvent::new(
@@ -1043,6 +1058,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -1099,21 +1119,21 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     assert_eq!(
-        events[6].payload["VaultWithdrawPending"]["symbol"]
+        events[8].payload["VaultWithdrawPending"]["symbol"]
             .as_str()
             .unwrap(),
         "AAPL",
         "VaultWithdrawPending should target the correct symbol"
     );
     assert_eq!(
-        events[13].payload["TokensSent"]["redemption_tx"]
+        events[15].payload["TokensSent"]["redemption_tx"]
             .as_str()
             .unwrap(),
         format!("{expected_tx_hash:#x}"),
         "TokensSent redemption_tx should match the deterministic Anvil hash"
     );
     assert_eq!(
-        events[14].payload["Detected"]["tokenization_request_id"]
+        events[16].payload["Detected"]["tokenization_request_id"]
             .as_str()
             .unwrap(),
         "redeem_int_test",
@@ -1726,6 +1746,11 @@ async fn mint_api_failure_produces_rejected_event() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
                 "PositionEvent::OffChainOrderPlaced",
             ),
             ExpectedEvent::new(
@@ -1742,6 +1767,11 @@ async fn mint_api_failure_produces_rejected_event() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
             ),
         ],
     )

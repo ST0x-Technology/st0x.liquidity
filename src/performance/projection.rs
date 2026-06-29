@@ -41,7 +41,11 @@ impl HedgeLatencyProjection {
         event: PositionEvent,
     ) -> Result<(), ProjectionError> {
         match event {
-            PositionEvent::Initialized { .. } | PositionEvent::ThresholdUpdated { .. } => Ok(()),
+            // Dedup bookkeeping only (ADR 0010): no performance signal.
+            PositionEvent::Initialized { .. }
+            | PositionEvent::ThresholdUpdated { .. }
+            | PositionEvent::OnChainFillApplied { .. }
+            | PositionEvent::OnChainFillSettled { .. } => Ok(()),
             PositionEvent::OnChainOrderFilled {
                 trade_id,
                 block_timestamp,

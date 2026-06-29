@@ -2074,7 +2074,11 @@ impl Reactor for RebalancingService {
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
-                    Initialized { .. } | ThresholdUpdated { .. } => {
+                    Initialized { .. }
+                    | ThresholdUpdated { .. }
+                    // Dedup bookkeeping only (ADR 0010): no inventory effect.
+                    | OnChainFillApplied { .. }
+                    | OnChainFillSettled { .. } => {
                         return Ok(());
                     }
                     ManualPositionAdjusted { .. } => {

@@ -3230,7 +3230,7 @@ named exemptions defined after the list:**
   a mandatory audit reason.
 - `rebuild` -- recompute a projection from the event log; emits no events.
 
-Two commands sit deliberately outside the six-verb set, named for their exact
+Three commands sit deliberately outside the six-verb set, named for their exact
 effect rather than a generic intent:
 
 - `cctp complete-mint` -- the `cctp` group exposes raw on-chain primitives that
@@ -3241,6 +3241,20 @@ effect rather than a generic intent:
   `fail-pending-offchain-order` command. `fail` would be the wrong verb here:
   the Position itself never fails -- only its orphaned order does; `--reason`
   required.
+- `process-tx` -- account an onchain fill the bot never recorded, given its
+  transaction hash: it witnesses the fill into the `OnChainTrade` log,
+  acknowledges it on the `Position`, and places the opposite-side hedge, running
+  the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
+  sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
+  commands above it belongs to no object group -- there is no stuck aggregate to
+  recover, only a missing fill to backfill. It **fails closed on a fill already
+  recorded** in the `OnChainTrade` log, whether acknowledged or merely
+  witnessed: re-applying it would double-count the position, so only a fill with
+  no record is accounted. It runs in direct-DB mode and **must not run while the
+  bot is concurrently accounting the same symbol** -- the CLI and the bot are
+  separate processes that no in-process lock can serialize, so the persisted
+  pending-acknowledgement set (see ADR 0010), not process isolation, is what
+  makes a cross-process re-drive reject as a duplicate rather than double-count.
 
 **Standing rules:**
 
