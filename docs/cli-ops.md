@@ -260,6 +260,46 @@ Not covered by `transfer recheck` yet:
   per-id filter; each succeeds or fails independently and failures are reported
   as counts with a non-zero exit). Requires the bot to be running.
 
+### Withdrawal poll inconclusive (Alpaca->Base stuck at `Withdrawing`)
+
+An Alpaca withdrawal poll that returns an indeterminate error (timeout, network
+failure, non-retried API error) leaves the aggregate in `Withdrawing` with the
+guard held. It does NOT send `FailWithdrawal` and does NOT release the guard.
+The job schedules an unbounded delayed redrive that re-polls the same Alpaca
+transfer ID (idempotent -- never re-initiates the withdrawal).
+
+**Operator alert after 4 hours**: if polling remains inconclusive for more than
+4 hours from `Withdrawing.initiated_at` (a durable aggregate timestamp -- the
+countdown survives bot restarts), the job begins paging the operator on every
+redrive while still keeping the guard held and continuing to re-poll
+automatically. The alert message includes the transfer UUID and the elapsed
+time. Normal transient outages (< 4 hours) never fire an alert.
+
+When alerted, first check whether Alpaca connectivity/credentials are intact:
+
+    # Check the withdrawal status directly via the Alpaca API or dashboard.
+    # To manually re-poll immediately:
+    stox transfer resume --kind usdc --id <uuid> --direction to-raindex
+
+This re-polls Alpaca for the recorded transfer and proceeds normally if the
+withdrawal has completed (the common case), or emits `FailWithdrawal` if Alpaca
+reports Failed with no tx hash. If Alpaca reports Failed with a tx hash, polling
+stays inconclusive and the guard remains held. The `--direction` must be
+`to-raindex` for AlpacaToBase.
+
+**Known limitation -- permanent `TransferNotFound`**: if `transfer resume`
+consistently reports inconclusive and Alpaca's dashboard confirms the withdrawal
+UUID was never initiated or is genuinely absent from Alpaca's records, the
+automatic re-poll will loop indefinitely. This is intentional and safe: the
+guard stays held, no re-withdrawal occurs, and funds are not stranded. However,
+rebalancing remains blocked until resolved. Distinguish this from a transient
+Alpaca outage (where re-poll will eventually succeed) by verifying directly on
+the Alpaca dashboard or API that no withdrawal with the recorded UUID exists. A
+force-fail recovery verb for this exact case is a tracked follow-up. No current
+CLI command clears a `Withdrawing` aggregate whose Alpaca UUID is genuinely
+absent; escalate to the on-call engineer for direct recovery after confirming no
+funds moved.
+
 ### Clearing a pre-burn guard latch
 
 Use `fail-usdc-transfer` when a USDC rebalance is stranded at

@@ -25,6 +25,11 @@ pub enum AlpacaWalletError {
     FromHex(#[from] FromHexError),
     #[error("Transfer not found: {transfer_id}")]
     TransferNotFound { transfer_id: AlpacaTransferId },
+    #[error("Transfer {transfer_id} failed but reported on-chain tx {tx_hash}")]
+    FailedTransferHasTx {
+        transfer_id: AlpacaTransferId,
+        tx_hash: TxHash,
+    },
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
     TransferTimeout {
         transfer_id: AlpacaTransferId,

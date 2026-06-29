@@ -20,11 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, warn};
 
 use st0x_evm::Wallet;
+use st0x_execution::AlpacaWalletError;
 use st0x_finance::Usdc;
 
 use super::UsdcTransferError;
@@ -61,6 +63,33 @@ const TIMEOUT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 /// avoid materially delaying the transfer.
 const SETTLEMENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 
+/// Delay before re-polling an Alpaca withdrawal when the poll outcome was
+/// inconclusive (Alpaca API unreachable or returned an error). 30 seconds
+/// gives Alpaca time to recover from a transient outage without hammering the
+/// API during a prolonged failure. Distinct from `SETTLEMENT_REDRIVE_DELAY`
+/// (Ethereum block timing) so the two can evolve independently.
+const WITHDRAWAL_POLL_REDRIVE_DELAY: Duration = Duration::from_secs(30);
+
+/// Duration after which repeated `WithdrawalPollInconclusive` redrives page
+/// the operator via the notifier. The deadline is durable: it is derived from
+/// `Withdrawing.initiated_at` (stored in the CQRS aggregate, survives restarts)
+/// so the countdown is not reset by a bot restart.
+///
+/// 4 hours gives substantial headroom above the 30-minute internal poll timeout
+/// (the longest a healthy Alpaca withdrawal can take), while ensuring a
+/// permanently-stuck poll (rotated credentials, Alpaca API shape change, etc.)
+/// is surfaced well before it becomes a multi-day outage.
+const WITHDRAWAL_POLL_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Redrive delay used AFTER the 4-hour operator alert deadline has elapsed.
+/// Much longer than `WITHDRAWAL_POLL_REDRIVE_DELAY` (30 s) to prevent alert
+/// fatigue: a permanently-stuck poll at 30 s cadence pages ~120 times/hour,
+/// drowning out other alerts on the shared Telegram channel. At 30 minutes the
+/// operator receives at most ~2 pages/hour while the guard stays held and
+/// re-polling continues. The re-poll itself is idempotent (same transfer ID),
+/// so a slower post-deadline cadence is harmless for funds in transit.
+const WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
+
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
@@ -75,6 +104,10 @@ const SETTLEMENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 fn warn_threshold(max_redrives: u32) -> Option<u32> {
     let threshold = max_redrives / 2 + 1;
     (threshold < max_redrives).then_some(threshold)
+}
+
+fn withdrawal_poll_deadline_elapsed(elapsed: Option<Duration>) -> Option<Duration> {
+    elapsed.filter(|elapsed| *elapsed >= WITHDRAWAL_POLL_ALERT_DEADLINE)
 }
 
 /// Apalis queue type for [`TransferUsdcToHedging`].
@@ -773,6 +806,24 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making ambient-balance alert");
                 }
             }
+            // Indeterminate withdrawal poll: the Alpaca poll timed out or returned
+            // a transport/API error without observing a terminal status. The
+            // aggregate is in Withdrawing (guard held, AlpacaTransferId recorded)
+            // -- NOT WithdrawalFailed. Re-polling is idempotent (reads only; never
+            // re-initiates the withdrawal). Schedule an unbounded delayed redrive
+            // (like SettlementCheckTransient): return Ok so apalis does not
+            // consume the retry budget, and enqueue a new job after the delay so
+            // the same transfer ID is re-polled. Before the alert deadline only
+            // a warn log fires; at or after the deadline the operator is paged on
+            // every redrive while the guard stays held and re-polling continues.
+            Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id,
+                initiated_at,
+                source,
+            }) => {
+                self.handle_withdrawal_poll_inconclusive(ctx, id, initiated_at, source)
+                    .await?;
+            }
             // Revert-class burn failures: safe to redrive because
             // `resume_bridging_submitting` scans for an existing burn before
             // re-burning (the scan lower bound is durably recorded). The safety
@@ -878,6 +929,64 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 }
 
 impl TransferUsdcToMarketMaking {
+    async fn handle_withdrawal_poll_inconclusive(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        source: AlpacaWalletError,
+    ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        // Mirror the `.ok()` pattern for `signed_duration_since`: if
+        // `initiated_at` is in the future (e.g., clock skew after restart),
+        // `to_std()` returns `Err` and we treat elapsed as `None`; the deadline
+        // check is then false (no spurious alert).
+        let elapsed = Utc::now().signed_duration_since(initiated_at).to_std().ok();
+
+        // Once past the deadline, slow the redrive cadence from 30 s to 30 min
+        // so the operator page repeats at ~2/hour rather than ~120/hour. The
+        // re-poll is idempotent so a slower cadence is safe.
+        let deadline_elapsed = withdrawal_poll_deadline_elapsed(elapsed);
+        let redrive_delay = if deadline_elapsed.is_some() {
+            WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY
+        } else {
+            WITHDRAWAL_POLL_REDRIVE_DELAY
+        };
+
+        warn!(
+            target: "rebalance",
+            %id,
+            %source,
+            ?elapsed,
+            delay = ?redrive_delay,
+            "Alpaca withdrawal polling inconclusive; rescheduling for re-poll \
+             (aggregate stays in Withdrawing, guard held)"
+        );
+
+        if let Some(elapsed) = deadline_elapsed {
+            let message = format!(
+                "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
+                 for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
+                 be unreachable or credentials may have changed ({source}). Aggregate stays in \
+                 Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
+                 {id} --direction to-raindex` to manually re-poll, or investigate \
+                 Alpaca connectivity."
+            );
+            if let Err(notify_err) = ctx.notifier.notify(&message).await {
+                warn!(
+                    target: "rebalance",
+                    ?notify_err,
+                    "Failed to deliver withdrawal-poll-deadline-elapsed alert"
+                );
+            }
+        }
+
+        ctx.job_queue
+            .clone()
+            .push_with_delay(self.clone(), redrive_delay)
+            .await?;
+        Ok(())
+    }
+
     /// Handles a revert-class burn error by either opening the circuit (when the
     /// redrive limit is reached) or scheduling a delayed redrive attempt. Extracted
     /// to keep `Job::perform` under the line-count lint threshold.
@@ -986,17 +1095,29 @@ impl TransferUsdcToMarketMaking {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
-    use st0x_bridge::cctp::CctpError;
-    use st0x_evm::EvmError;
     use uuid::Uuid;
 
+    use st0x_bridge::cctp::CctpError;
+    use st0x_evm::EvmError;
+    use st0x_execution::{AlpacaTransferId, AlpacaWalletError};
     use st0x_float_macro::float;
 
     use super::*;
     use crate::alerts::{CapturingNotifier, NoopNotifier};
     use crate::test_utils::setup_test_apalis_pool;
+
+    #[test]
+    fn withdrawal_poll_deadline_elapsed_includes_exact_boundary() {
+        let elapsed = Some(WITHDRAWAL_POLL_ALERT_DEADLINE);
+
+        assert_eq!(
+            withdrawal_poll_deadline_elapsed(elapsed),
+            Some(WITHDRAWAL_POLL_ALERT_DEADLINE),
+            "the alert deadline comparison must be inclusive"
+        );
+    }
 
     /// Builds a `TransferUsdcToHedgingCtx` with test-safe defaults for the
     /// notifier and redrive-limit fields.
@@ -1126,6 +1247,64 @@ mod tests {
             _amount: Usdc,
         ) -> Result<(), UsdcTransferError> {
             Err(self.0.into_error(id))
+        }
+    }
+
+    /// Stub that returns `WithdrawalPollInconclusive` for every resume call.
+    /// `initiated_at` controls whether the deadline check in the job handler
+    /// fires an operator alert (past deadline) or only logs a warning (before).
+    struct InconclusiveAlpacaToBase {
+        initiated_at: DateTime<Utc>,
+    }
+
+    impl InconclusiveAlpacaToBase {
+        fn before_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now(),
+            }
+        }
+
+        fn future_initiated_at() -> Self {
+            Self {
+                initiated_at: Utc::now() + chrono::Duration::minutes(5),
+            }
+        }
+
+        fn after_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now()
+                    - chrono::Duration::from_std(WITHDRAWAL_POLL_ALERT_DEADLINE).unwrap()
+                    - chrono::Duration::seconds(1),
+            }
+        }
+
+        /// Nominally at the deadline boundary. The handler computes elapsed later,
+        /// so this exercises the job path at or just beyond the boundary; the pure
+        /// helper test pins the exact `elapsed == WITHDRAWAL_POLL_ALERT_DEADLINE`
+        /// comparison.
+        fn at_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now()
+                    - chrono::Duration::from_std(WITHDRAWAL_POLL_ALERT_DEADLINE).unwrap(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for InconclusiveAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at: self.initiated_at,
+                source: AlpacaWalletError::TransferTimeout {
+                    transfer_id: AlpacaTransferId::from(Uuid::new_v4()),
+                    elapsed: Duration::from_secs(1800),
+                },
+            })
         }
     }
 
@@ -1337,6 +1516,248 @@ mod tests {
             run_at >= before + 55 && run_at <= after + 65,
             "redrive must be delayed by ~{ATTESTATION_REDRIVE_DELAY:?} -- neither immediate nor \
              excessive: run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// `WithdrawalPollInconclusive` before the alert deadline must schedule a
+    /// delayed redrive (one Pending job row with `WITHDRAWAL_POLL_REDRIVE_DELAY`) and
+    /// return `Ok` so the apalis retry budget is not consumed -- warn log only,
+    /// no operator alert. `revert_redrive_attempts` must not be incremented
+    /// (the re-poll redrive is unbounded and independent of the burn-revert budget).
+    #[tokio::test]
+    async fn market_making_job_redrives_on_withdrawal_poll_inconclusive() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(InconclusiveAlpacaToBase::before_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "WithdrawalPollInconclusive must enqueue exactly one delayed redrive job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + i64::try_from(WITHDRAWAL_POLL_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at
+                    <= after + i64::try_from(WITHDRAWAL_POLL_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{WITHDRAWAL_POLL_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+        // No alert before the deadline: this is a normal transient outcome.
+        assert!(
+            notifier.messages().is_empty(),
+            "WithdrawalPollInconclusive before deadline must not fire an operator alert, \
+             got: {:?}",
+            notifier.messages()
+        );
+        // The burn-revert budget must not be touched by a withdrawal re-poll.
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, 0,
+            "WithdrawalPollInconclusive must not increment revert_redrive_attempts: \
+             the re-poll redrive is unbounded and independent of the burn-revert budget"
+        );
+    }
+
+    /// A future `initiated_at` can happen after clock skew on restart. The
+    /// elapsed calculation must treat it as `None`, which keeps the transfer on
+    /// the pre-deadline cadence and avoids a spurious operator page.
+    #[tokio::test]
+    async fn market_making_job_redrives_future_initiated_at_without_alert() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(InconclusiveAlpacaToBase::future_initiated_at()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            withdrawal_poll_deadline_elapsed(None),
+            None,
+            "future initiated_at maps to elapsed=None, so the deadline is not elapsed"
+        );
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "future initiated_at must still enqueue one delayed redrive"
+        );
+
+        let (_payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        assert!(
+            run_at >= before + i64::try_from(WITHDRAWAL_POLL_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at
+                    <= after + i64::try_from(WITHDRAWAL_POLL_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "future initiated_at must use the pre-deadline delay -- \
+             run_at={run_at} before={before} after={after}"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "future initiated_at must not fire an operator alert, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// `WithdrawalPollInconclusive` at or after the alert deadline must fire an
+    /// operator alert via the notifier while STILL scheduling the delayed redrive
+    /// and returning `Ok`. The guard stays held and re-polling continues.
+    #[tokio::test]
+    async fn market_making_job_fires_alert_on_withdrawal_poll_deadline_elapsed() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(InconclusiveAlpacaToBase::after_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        // perform must still return Ok: deadline-elapsed does NOT consume the
+        // apalis retry budget or emit FailWithdrawal.
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        // The delayed redrive must still be enqueued (re-polling continues),
+        // but at the post-deadline cadence (30 min) to prevent alert fatigue.
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "deadline-elapsed must still enqueue a delayed redrive job (guard stays held)"
+        );
+        let (_payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        assert!(
+            run_at
+                >= before
+                    + i64::try_from(WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap()
+                    - 5
+                && run_at
+                    <= after
+                        + i64::try_from(WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                            .unwrap()
+                        + 5,
+            "post-deadline redrive must use the longer {WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY:?} \
+             delay to prevent alert fatigue -- run_at={run_at} before={before} after={after}"
+        );
+
+        // Exactly one alert must fire with the correct operator instructions.
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "WithdrawalPollInconclusive past deadline must fire exactly one operator alert, \
+             got: {messages:?}"
+        );
+        let alert = &messages[0];
+        assert!(
+            alert.contains(&job.id.to_string()),
+            "alert must contain the transfer id so the operator can act on it; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("stox transfer resume"),
+            "alert must contain the recovery command; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("to-raindex"),
+            "alert must contain the --direction flag; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("timed out after 1800s"),
+            "alert must contain the underlying Alpaca polling error; got: {alert:?}"
+        );
+    }
+
+    /// `WithdrawalPollInconclusive` at the deadline boundary must fire the operator
+    /// alert and use the post-deadline redrive delay.
+    #[tokio::test]
+    async fn market_making_job_fires_alert_at_exact_deadline_boundary() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(InconclusiveAlpacaToBase::at_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        // perform must return Ok even at the exact boundary.
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        // Redrive at post-deadline cadence (30 min).
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "exact-boundary must still enqueue a delayed redrive (guard held)"
+        );
+        let (_payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        assert!(
+            run_at
+                >= before
+                    + i64::try_from(WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap()
+                    - 5
+                && run_at
+                    <= after
+                        + i64::try_from(WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                            .unwrap()
+                        + 5,
+            "exact-boundary redrive must use the post-deadline delay -- run_at={run_at} before={before} after={after}"
+        );
+
+        // Alert must fire at the exact boundary (>=, not >).
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "WithdrawalPollInconclusive at exact deadline boundary must fire the operator alert \
+             (>= comparison); got: {messages:?}"
         );
     }
 
@@ -3005,7 +3426,7 @@ mod tests {
 
         assert!(
             matches!(error, TransferUsdcToHedgingJobError::Transfer(_)),
-            "a mint-path Cctp revert must propagate as terminal Transfer,              not redrive; got {error:?}",
+            "a mint-path Cctp revert must propagate as terminal Transfer, not redrive; got {error:?}",
         );
         assert_eq!(
             pending_job_count::<TransferUsdcToHedging>(&pool).await,
@@ -3064,7 +3485,7 @@ mod tests {
 
         assert!(
             matches!(error, TransferUsdcToMarketMakingJobError::Transfer(_)),
-            "a mint-path Cctp revert in market-making must propagate as terminal Transfer;              got {error:?}",
+            "a mint-path Cctp revert in market-making must propagate as terminal Transfer; got {error:?}",
         );
         assert_eq!(
             pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,

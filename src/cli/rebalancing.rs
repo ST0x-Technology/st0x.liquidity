@@ -203,12 +203,12 @@ const CLI_ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 ///
 /// `resume` is re-invoked with the same `UsdcRebalanceId` on every attempt, so a
 /// retry resumes the existing transfer instead of starting a second
-/// fund-moving one. The retryable set mirrors the worker:
-/// `AttestationTimedOut` plus the settlement-wait errors
-/// (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
-/// `SettlementCheckTransient`). Any other error -- including
-/// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate -- is
-/// terminal and returned to the caller.
+/// fund-moving one. The retryable set mirrors the worker: `AttestationTimedOut`,
+/// `WithdrawalPollInconclusive` (Alpaca API unreachable or returned a transient
+/// error), plus the settlement-wait errors (`WithdrawalTxUnderconfirmed`,
+/// `WalletUsdcInsufficient`, `SettlementCheckTransient`). Errors not in this set
+/// -- including `AttestationRetryDeadlineElapsed` and a previously-failed
+/// aggregate -- are terminal and returned to the caller.
 async fn redrive_transfer_until_settled<Resume, Fut>(
     redrive_delay: Duration,
     mut resume: Resume,
@@ -240,6 +240,21 @@ where
                     ?redrive_delay,
                     "USDC transfer settlement not yet durable for manual transfer; \
                      retrying after delay"
+                );
+                tokio::time::sleep(redrive_delay).await;
+            }
+            // WithdrawalPollInconclusive is non-terminal: Alpaca was unreachable or
+            // returned an error. The aggregate stays in Withdrawing (guard held);
+            // the automatic delayed redrive continues in the background. Retry here
+            // so the CLI polls periodically without spinning, matching the behaviour
+            // of AttestationTimedOut for Circle unavailability.
+            Err(UsdcTransferError::WithdrawalPollInconclusive { id, .. }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?redrive_delay,
+                    "Alpaca withdrawal poll inconclusive; Alpaca may be unreachable -- \
+                     retrying after delay (aggregate stays in Withdrawing, guard held)"
                 );
                 tokio::time::sleep(redrive_delay).await;
             }
@@ -1624,7 +1639,8 @@ mod tests {
     use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_event_sorcery::LifecycleError;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, ClientOrderId, TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTransferId,
+        AlpacaWalletError, ClientOrderId, TimeInForce,
     };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
@@ -1730,6 +1746,43 @@ mod tests {
             "a deadline-elapsed outcome must surface, not be retried; got {error:?}",
         );
         assert_eq!(calls.get(), 1, "a terminal error must not be retried");
+    }
+
+    /// The manual redrive loop must also retry `WithdrawalPollInconclusive` --
+    /// otherwise a manual `stox transfer resume --kind usdc --direction to-raindex`
+    /// invocation would exit when Alpaca is temporarily unreachable instead of
+    /// waiting for recovery, leaving the operator unable to drive the stuck
+    /// withdrawal to completion via the CLI.
+    #[tokio::test]
+    async fn redrive_loop_retries_withdrawal_poll_inconclusive_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+
+        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
+            let attempt = calls.get() + 1;
+            calls.set(attempt);
+            async move {
+                if attempt == 1 {
+                    Err(UsdcTransferError::WithdrawalPollInconclusive {
+                        id: UsdcRebalanceId(Uuid::from_u128(42)),
+                        initiated_at: chrono::Utc::now(),
+                        source: AlpacaWalletError::TransferTimeout {
+                            transfer_id: AlpacaTransferId::from(Uuid::from_u128(1)),
+                            elapsed: std::time::Duration::from_secs(1800),
+                        },
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        result.expect("redrive must succeed once Alpaca becomes reachable again");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the loop must retry exactly once after the inconclusive poll, then succeed",
+        );
     }
 
     /// `transfer resume --kind equity` against a mocked bot endpoint: the

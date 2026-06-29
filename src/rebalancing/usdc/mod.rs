@@ -18,6 +18,7 @@ pub(crate) use manager::{CrossVenueCashTransfer, UsdcSettlementParams, u256_to_u
 use std::time::Duration;
 
 use alloy::primitives::TxHash;
+use chrono::{DateTime, Utc};
 use rain_math_float::FloatError;
 use thiserror::Error;
 
@@ -103,6 +104,34 @@ pub(crate) enum UsdcTransferError {
          operator reconciliation"
     )]
     AttestationRetryDeadlineElapsed { id: UsdcRebalanceId },
+    /// Alpaca withdrawal polling returned an indeterminate result: the poll timed
+    /// out or returned a transport/API error without observing a terminal status
+    /// (`Complete` or `Failed`). The aggregate stays in `Withdrawing` (guard
+    /// held, Alpaca transfer ID recorded). This is NOT a terminal failure: a
+    /// delayed redrive re-polls the same Alpaca transfer ID (idempotent). Only
+    /// `TransferStatus::Failed` with no tx hash (Alpaca's determinate terminal
+    /// for a failed withdrawal that did not broadcast on-chain) produces
+    /// `FailWithdrawal`; `Failed` with a tx hash stays indeterminate.
+    ///
+    /// Mirrors `SettlementCheckTransient` / `WithdrawalTxUnderconfirmed` in
+    /// redrive semantics: unbounded, returns `Ok` from the job.
+    ///
+    /// `initiated_at` is the `Withdrawing.initiated_at` timestamp from the
+    /// aggregate, threaded here so the job handler can compute a durable
+    /// deadline: before the deadline only a warn log fires; at or after the
+    /// deadline the operator is paged (while the guard stays held and
+    /// re-polling continues).
+    #[error(
+        "USDC rebalance {id}: Alpaca withdrawal polling inconclusive \
+         (timeout or transient error); transfer may still be in progress \
+         (Alpaca transfer ID preserved in Withdrawing state)"
+    )]
+    WithdrawalPollInconclusive {
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        #[source]
+        source: AlpacaWalletError,
+    },
     #[error(
         "USDC rebalance {id} attestation retry deadline duration {retry_deadline:?} \
          cannot be represented as an absolute timestamp"

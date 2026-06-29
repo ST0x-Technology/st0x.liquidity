@@ -2381,6 +2381,13 @@ terminal states only.
   ID) before entering `WithdrawalSubmitting` and adding a corresponding resume
   arm in `resume_alpaca_to_base`. This is deferred work; for now the operator is
   alerted and must reconcile manually.
+- **`Withdrawing{AlpacaToBase}` / `WithdrawalComplete{AlpacaToBase}` ARE
+  auto-re-armed on startup**: The Alpaca transfer ID is durably recorded in
+  `Withdrawing`; `resume_alpaca_to_base` re-polls the same transfer
+  (idempotent). `WithdrawalComplete` means the source withdrawal already moved
+  funds into the market-maker wallet; resume scans for an existing CCTP burn
+  before submitting one. Startup recovery enqueues a fresh
+  `TransferUsdcToMarketMaking` job for either state when no live job row exists.
 - **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
   store or have unparseable IDs also latch the guard with an operator alert.
   These indicate store inconsistency and require manual investigation.
@@ -2399,6 +2406,34 @@ Alpaca to Base:
 2. Poll Alpaca until conversion order is filled
 3. Initiate USDC withdrawal from Alpaca (get transfer_id)
 4. Poll Alpaca API until withdrawal status is COMPLETE
+   - **Poll inconclusive durability**: if `poll_transfer_until_complete` returns
+     any indeterminate error (30-minute timeout, transport/network error,
+     non-retried API error), the job does NOT emit `FailWithdrawal`. The
+     aggregate stays in `Withdrawing` (guard held, Alpaca transfer ID recorded).
+     The job schedules an unbounded delayed redrive (like
+     `SettlementCheckTransient`). On re-pickup, `resume_alpaca_to_base` re-polls
+     the same Alpaca transfer via the recorded ID: if Alpaca now reports
+     Complete the withdrawal is adopted; if Failed with no returned tx hash,
+     `FailWithdrawal` is emitted normally; if Failed with a tx hash, or if still
+     in progress, another delayed redrive fires. Only `TransferStatus::Failed`
+     with no returned tx hash (Alpaca's determinate terminal for a withdrawal
+     that did not broadcast on-chain) is safe to auto-emit `FailWithdrawal`.
+
+     This closes the re-withdrawal window: `Withdrawing` holds the guard so no
+     new withdrawal starts while the prior one may still be in progress. If the
+     chain later strands at `WithdrawalComplete`, the guard is also preserved
+     and the same market-making redrive resumes from the recorded state.
+     Re-polling is idempotent (reads only; never re-initiates the withdrawal),
+     so unbounded redrives are safe. An operator can interrupt via
+     `transfer resume` at any time to manually re-drive.
+
+     **Operator alert (deadline-based)**: at or after 4 hours of inconclusive
+     polling (measured from `Withdrawing.initiated_at`, a durable aggregate
+     field that survives restarts) the job begins paging the operator on every
+     redrive while still keeping the guard held and continuing to re-poll. The
+     4-hour threshold gives headroom above the 30-minute internal poll timeout
+     while ensuring a permanent failure (rotated credentials, Alpaca API shape
+     change) surfaces well before it becomes a multi-day outage.
    - **Settlement gate (before proceeding):** wait for the withdrawal tx to
      reach the required confirmations on Ethereum. Alpaca marks a withdrawal
      "Complete" before the on-chain tx is settled network-wide on load-balanced
@@ -3150,8 +3185,9 @@ event state on startup, so a restart between a post-burn failure and settlement
 cannot re-open the re-burn window. Any aggregate not in a clearable-terminal
 state (success, or a pre-burn failure that reconciles to source) re-asserts the
 guard at boot and blocks new USDC rebalancing until it settles or an operator
-recovers it. USDC bridges are not auto-resumed on restart, so the guard is held
-until manual recovery.
+recovers it. Supported stranded states are re-armed with idempotent transfer
+jobs on startup; unsupported states keep the guard held and page the operator
+for manual recovery.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
