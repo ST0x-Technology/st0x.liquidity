@@ -126,8 +126,9 @@ rebalancing = "enabled"
 # low_balance_threshold = "0.05"
 # Seconds between native-balance polls.
 # poll_interval = 300
-# Minimum seconds between repeated low-balance alerts while still low.
-# realert_interval = 3600
+# Minimum seconds between repeated low-balance alerts while still low; 12h
+# (twice daily) keeps a persistent low balance from being noisy.
+# realert_interval = 43200
 # Optional forum topic to deliver alerts into (a forum supergroup's
 # message_thread_id). Omit to post to the chat's default (General) topic.
 # message_thread_id = 42

@@ -80,7 +80,8 @@ low_balance_threshold = "0.05"
 # Seconds between native-balance polls.
 poll_interval = 300
 # Minimum seconds between repeated alerts while the balance stays below threshold.
-realert_interval = 3600
+# 43200 = 12 hours.
+realert_interval = 43200
 
 # USDC vault and rebalancing settings.
 [assets.cash]
