@@ -130,14 +130,6 @@ pub(crate) enum RebalancingServiceError {
         initiated_amount: Usdc,
         settled_amount: Usdc,
     },
-    #[error(
-        "redemption {id} unwrapped {actual_quantity} shares, exceeding tracked quantity {tracked_quantity}"
-    )]
-    RedemptionUnwrappedExceedsTracked {
-        id: RedemptionAggregateId,
-        tracked_quantity: FractionalShares,
-        actual_quantity: FractionalShares,
-    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -1634,8 +1626,7 @@ impl RebalancingService {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
             ApalisSqlx, EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext,
-            Projection, RearmEnqueue, RedemptionUnwrappedExceedsTracked,
-            SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
+            Projection, RearmEnqueue, SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1649,7 +1640,6 @@ impl RebalancingService {
             | MissingUsdcTrackingContext { .. }
             | MissingUsdcBridgedAmount { .. }
             | SettledUsdcExceedsInitiatedAmount { .. }
-            | RedemptionUnwrappedExceedsTracked { .. }
             | Sqlx(_)
             | ApalisSqlx(_)
             | RearmEnqueue(_)) => {
@@ -4633,18 +4623,28 @@ impl RebalancingService {
                 )
                 .await?;
             } else if existing.quantity.inner().lt(actual_quantity.inner())? {
-                warn!(
+                let surplus = (actual_quantity - existing.quantity)?;
+                info!(
                     target: "rebalance",
                     id = %id,
-                    expected_quantity = %existing.quantity,
+                    symbol = %existing.symbol,
+                    tracked_quantity = %existing.quantity,
                     actual_quantity = %actual_quantity,
-                    "Redemption unwrapped more than tracked quantity"
+                    %surplus,
+                    "Redemption unwrapped more than tracked (NAV appreciation); \
+                     updating inflight to actual"
                 );
-                return Err(RebalancingServiceError::RedemptionUnwrappedExceedsTracked {
-                    id,
-                    tracked_quantity: existing.quantity,
-                    actual_quantity,
-                });
+                // set_inflight replaces rather than adds, so it works even when
+                // available is 0 (full-position NAV redemption). No last_rebalancing
+                // bump needed: redemptions are detection-based -- Alpaca reports the
+                // redemption only after the bot sends the actual unwrapped amount, so
+                // any inflight snapshot reports that same amount and an overwrite is
+                // a no-op.
+                self.apply_equity_update(
+                    &existing.symbol,
+                    Inventory::set_inflight(Venue::MarketMaking, actual_quantity),
+                )
+                .await?;
             }
         }
 
@@ -11037,6 +11037,631 @@ mod tests {
         assert!(!RebalancingService::is_terminal_redemption_event(
             &make_redemption_detected()
         ));
+    }
+
+    #[tokio::test]
+    async fn redemption_nav_surplus_updates_tracking_and_inflight() {
+        // When TokensUnwrapped delivers more than tracked (NAV appreciation),
+        // inflight is set to actual and tracking updated — no error returned.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("nav-surplus-1a");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let available_after_start = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::MarketMaking)
+            .expect("MM available after start");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28.224)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = trigger.inventory.read().await;
+        assert_eq!(
+            inv.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::new(float!(28.224))),
+            "inflight must be updated to actual unwrapped quantity"
+        );
+        assert_eq!(
+            inv.equity_available(&symbol, Venue::MarketMaking),
+            Some(available_after_start),
+            "available must be unchanged — surplus not drained from available"
+        );
+        drop(inv);
+
+        let quantity = {
+            let tracking = trigger.redemption_tracking.read().await;
+            tracking
+                .get(&id)
+                .expect("tracking entry must exist")
+                .quantity
+        };
+        assert_eq!(
+            quantity,
+            FractionalShares::new(float!(28.224)),
+            "tracking quantity must be updated to actual"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_nav_surplus_does_not_drain_available_when_available_is_zero() {
+        // Critical regression: when VaultWithdrawPending drains all available,
+        // set_inflight(actual) must succeed with MM available = 0.
+        // (TransferOp::Start(surplus) would fail with InsufficientAvailable.)
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(28.148)),
+            FractionalShares::ZERO,
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("nav-surplus-1b");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = trigger.inventory.read().await;
+        assert_eq!(
+            inv.equity_available(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "all available must have moved to inflight after VaultWithdrawPending"
+        );
+        drop(inv);
+
+        // Surplus event — must succeed even though available = 0
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28.224)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (inflight, available) = {
+            let inv = trigger.inventory.read().await;
+            (
+                inv.equity_inflight(&symbol, Venue::MarketMaking),
+                inv.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(FractionalShares::new(float!(28.224))),
+            "inflight must be set to actual"
+        );
+        assert_eq!(
+            available,
+            Some(FractionalShares::ZERO),
+            "available must remain 0 — surplus not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_nav_surplus_legacy_quantity_none_path() {
+        // When TokensUnwrapped has quantity: None, actual is derived from
+        // unwrapped_amount (legacy path).
+        let symbol = Symbol::new("AAPL").unwrap();
+        let unwrapped_amount = U256::from(28_224_000_000_000_000_000_u128);
+        let expected_actual = FractionalShares::from_u256_18_decimals(unwrapped_amount).unwrap();
+
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("nav-surplus-1c");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Legacy path: quantity = None, actual derived from unwrapped_amount
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: None,
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount,
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = trigger.inventory.read().await;
+        assert_eq!(
+            inv.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(expected_actual),
+            "inflight must be updated to actual quantity via legacy unwrapped_amount path"
+        );
+        drop(inv);
+
+        let quantity = {
+            let tracking = trigger.redemption_tracking.read().await;
+            tracking
+                .get(&id)
+                .expect("tracking entry must exist")
+                .quantity
+        };
+        assert_eq!(
+            quantity, expected_actual,
+            "tracking quantity must be updated via legacy unwrapped_amount path"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_nav_surplus_full_flow_correct_settlement() {
+        // Full flow: VaultWithdrawPending → TokensUnwrapped(surplus) → Completed.
+        // Completed must zero inflight and credit Hedging by actual quantity.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("nav-surplus-1d");
+
+        let hedging_before = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging)
+            .expect("Hedging available before");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28.224)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::new(float!(28.224))),
+            "inflight must be 28.224 after TokensUnwrapped"
+        );
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::Completed {
+                    completed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (inflight, hedging_available) = {
+            let inv = trigger.inventory.read().await;
+            (
+                inv.equity_inflight(&symbol, Venue::MarketMaking),
+                inv.equity_available(&symbol, Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(FractionalShares::ZERO),
+            "inflight must be zeroed after Completed"
+        );
+        assert_eq!(
+            hedging_available,
+            Some((hedging_before + FractionalShares::new(float!(28.224))).unwrap()),
+            "Hedging available must increase by actual quantity after Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_nav_surplus_provider_completion_recovered_correct_settlement() {
+        // Full flow: VaultWithdrawPending → TokensUnwrapped(surplus) → ProviderCompletionRecovered.
+        // ProviderCompletionRecovered must zero inflight and credit Hedging by actual quantity,
+        // not the originally tracked quantity (28.148).
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("nav-surplus-1f");
+
+        let hedging_before = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging)
+            .expect("Hedging available before");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28.224)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::new(float!(28.224))),
+            "inflight must be 28.224 after TokensUnwrapped"
+        );
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: TokenizationRequestId("nav-surplus-tok".to_string()),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (inflight, hedging_available) = {
+            let inv = trigger.inventory.read().await;
+            (
+                inv.equity_inflight(&symbol, Venue::MarketMaking),
+                inv.equity_available(&symbol, Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(FractionalShares::ZERO),
+            "inflight must be zeroed after ProviderCompletionRecovered"
+        );
+        assert_eq!(
+            hedging_available,
+            Some((hedging_before + FractionalShares::new(float!(28.224))).unwrap()),
+            "Hedging available must increase by actual quantity after ProviderCompletionRecovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_nav_surplus_transfer_failed_cancels_actual_inflight() {
+        // After surplus: TransferFailed must cancel using actual (28.224),
+        // not the originally tracked quantity (28.148).
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("nav-surplus-1e");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let available_after_start = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::MarketMaking)
+            .expect("MM available after start");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28.224)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TransferFailed {
+                    tx_hash: Some(TxHash::random()),
+                    reason: None,
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (inflight, available) = {
+            let inv = trigger.inventory.read().await;
+            (
+                inv.equity_inflight(&symbol, Venue::MarketMaking),
+                inv.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(FractionalShares::ZERO),
+            "inflight must be zeroed after TransferFailed"
+        );
+        assert_eq!(
+            available,
+            Some((available_after_start + FractionalShares::new(float!(28.224))).unwrap()),
+            "available must be available_after_start + 28.224 (actual unwrapped) after \
+             TransferFailed; the surplus 0.076 shares are real NAV yield, so the end state \
+             intentionally exceeds the original available"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_shortfall_adjusts_inflight_and_continues() {
+        // Existing behavior: shortfall (actual < tracked) partially cancels
+        // inflight and updates tracking to actual.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(40)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("redemption-shortfall-1f");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(30),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(30_000_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_000_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = trigger.inventory.read().await;
+        assert_eq!(
+            inv.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::new(float!(28))),
+            "shortfall: inflight must be reduced to actual"
+        );
+        drop(inv);
+
+        let quantity = {
+            let tracking = trigger.redemption_tracking.read().await;
+            tracking
+                .get(&id)
+                .expect("tracking entry must exist")
+                .quantity
+        };
+        assert_eq!(
+            quantity,
+            FractionalShares::new(float!(28)),
+            "shortfall: tracking quantity must be updated to actual"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_exact_match_updates_tracking_only() {
+        // When actual == tracked, no inventory mutation — tracking still updated.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("redemption-exact-1g");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(28.148),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let available_after_start = {
+            let inv = trigger.inventory.read().await;
+            inv.equity_available(&symbol, Venue::MarketMaking)
+        };
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(28.148)),
+                    underlying_token: Address::random(),
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let available_after_unwrap = {
+            let inv = trigger.inventory.read().await;
+            inv.equity_available(&symbol, Venue::MarketMaking)
+        };
+
+        assert_eq!(
+            available_after_unwrap, available_after_start,
+            "exact match: available must be unchanged after TokensUnwrapped \
+             (no surplus/shortfall path taken)"
+        );
+
+        let inv = trigger.inventory.read().await;
+        assert_eq!(
+            inv.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::new(float!(28.148))),
+            "exact match: inflight must remain at tracked quantity"
+        );
+        drop(inv);
+
+        let quantity = {
+            let tracking = trigger.redemption_tracking.read().await;
+            tracking
+                .get(&id)
+                .expect("tracking entry must exist")
+                .quantity
+        };
+        assert_eq!(
+            quantity,
+            FractionalShares::new(float!(28.148)),
+            "exact match: tracking quantity must be updated"
+        );
     }
 
     fn usdc(n: i64) -> Usdc {

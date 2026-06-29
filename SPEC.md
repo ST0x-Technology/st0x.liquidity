@@ -1677,6 +1677,12 @@ enum EquityRedemptionEvent {
 
     // Unwrap failures are signaled via EquityRedemptionError::UnwrapFailed
     // (no event emitted), keeping the aggregate in WithdrawnFromRaindex for retry.
+    // NAV appreciation: for yield-bearing ERC-4626 wrappers, `unwrapped_amount`
+    // may exceed the originally requested `quantity`. The rebalancing trigger
+    // treats this positive delta as expected NAV yield: it replaces inflight
+    // with `actual` and updates tracked quantity to `actual`, so `Completed`
+    // zeroes inflight correctly. A negative delta triggers a shortfall
+    // adjustment.
     TokensUnwrapped {
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -2899,8 +2905,12 @@ know about cross-venue inventory.
   inflight was ever started, so there is no balance change
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
-- `EquityRedemptionEvent::TokensUnwrapped` - No balance change (conversion
-  between wrapped/unwrapped forms)
+- `EquityRedemptionEvent::TokensUnwrapped` - Exact-match unwraps, including
+  non-yield-bearing wrappers, cause no balance change (wrapped/unwrapped
+  conversion only). For yield-bearing wrappers where NAV appreciation makes the
+  unwrapped amount exceed the tracked quantity, `set_inflight` replaces inflight
+  with the actual unwrapped amount while `available` remains unchanged; only a
+  shortfall cancels the difference back to available
 - `EquityRedemptionEvent::TransferFailed` - Cancels inflight back to Raindex
   available (tokens never left our wallet)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
