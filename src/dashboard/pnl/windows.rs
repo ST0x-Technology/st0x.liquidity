@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{NaiveDate, SecondsFormat, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use num_decimal::Num;
+use tracing::warn;
 
 use super::parsing::fmt_decimal;
 use super::response::{PnlEntry, PnlWindow, PnlWindowSymbol};
@@ -10,12 +11,15 @@ use super::sessions::{counter_trading_session_for_iso, date_key, market_session_
 use super::state::PnlBucket;
 
 fn et_day_boundary(date: &str, is_end: bool) -> String {
+    let fallback = if is_end {
+        format!("{date}T23:59:59.999Z")
+    } else {
+        format!("{date}T00:00:00.000Z")
+    };
+
     let Some(day) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
-        return if is_end {
-            format!("{date}T23:59:59.999Z")
-        } else {
-            format!("{date}T00:00:00.000Z")
-        };
+        warn!(%date, is_end, "Failed to parse PnL window ET boundary date");
+        return fallback;
     };
     let local_time = if is_end {
         day.and_hms_milli_opt(23, 59, 59, 999)
@@ -23,22 +27,16 @@ fn et_day_boundary(date: &str, is_end: bool) -> String {
         day.and_hms_milli_opt(0, 0, 0, 0)
     };
     let Some(local_time) = local_time else {
-        return if is_end {
-            format!("{date}T23:59:59.999Z")
-        } else {
-            format!("{date}T00:00:00.000Z")
-        };
+        warn!(%date, is_end, "Failed to construct PnL window ET boundary time");
+        return fallback;
     };
     New_York
         .from_local_datetime(&local_time)
         .single()
         .map_or_else(
             || {
-                if is_end {
-                    format!("{date}T23:59:59.999Z")
-                } else {
-                    format!("{date}T00:00:00.000Z")
-                }
+                warn!(%date, is_end, "Failed to resolve PnL window ET boundary");
+                fallback
             },
             |local| {
                 local
