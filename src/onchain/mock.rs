@@ -23,6 +23,15 @@ pub(crate) enum DepositBehavior {
     FailExecutionReverted,
 }
 
+/// Whether `submit_withdraw` should succeed or fail with a generic error
+/// (simulating a submission revert or RPC failure on the withdrawal path).
+#[derive(Default)]
+pub(crate) enum WithdrawBehavior {
+    #[default]
+    Succeed,
+    FailGeneric,
+}
+
 /// Whether `confirm_tx_receipt` should succeed, fail terminally
 /// (simulating a submitted transaction whose receipt never
 /// materializes), or fail with a retryable inconclusive scan
@@ -51,9 +60,11 @@ pub(crate) struct DepositCall {
 
 /// Arguments captured from the last `submit_withdraw` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WithdrawCall {
-    token: Address,
-    amount: U256,
+pub(crate) struct WithdrawCall {
+    pub(crate) token: Address,
+    pub(crate) vault_id: RaindexVaultId,
+    pub(crate) amount: U256,
+    pub(crate) decimals: u8,
 }
 
 pub(crate) struct MockRaindex {
@@ -61,6 +72,7 @@ pub(crate) struct MockRaindex {
     deposit_tx: TxHash,
     deposit_behavior: DepositBehavior,
     confirm_behavior: ConfirmTxBehavior,
+    withdraw_behavior: WithdrawBehavior,
     deposited_token: Mutex<Option<Address>>,
     deposit_call: Mutex<Option<DepositCall>>,
     confirmed_tx: Mutex<Option<TxHash>>,
@@ -122,6 +134,7 @@ impl MockRaindex {
             deposit_tx: TxHash::random(),
             deposit_behavior: DepositBehavior::Succeed,
             confirm_behavior: ConfirmTxBehavior::Succeed,
+            withdraw_behavior: WithdrawBehavior::Succeed,
             deposited_token: Mutex::new(None),
             deposit_call: Mutex::new(None),
             confirmed_tx: Mutex::new(None),
@@ -143,6 +156,17 @@ impl MockRaindex {
     pub(crate) fn with_confirm_behavior(mut self, behavior: ConfirmTxBehavior) -> Self {
         self.confirm_behavior = behavior;
         self
+    }
+
+    /// Configures how `submit_withdraw` behaves; combinable with the other
+    /// behaviour knobs.
+    pub(crate) fn with_withdraw_behavior(mut self, behavior: WithdrawBehavior) -> Self {
+        self.withdraw_behavior = behavior;
+        self
+    }
+
+    pub(crate) fn last_withdraw_call(&self) -> Option<WithdrawCall> {
+        *self.withdraw_transfer.lock().unwrap()
     }
 
     /// Returns the token address that was passed to the last `deposit()` call.
@@ -222,15 +246,22 @@ impl Raindex for MockRaindex {
     async fn submit_withdraw(
         &self,
         token: Address,
-        _vault_id: RaindexVaultId,
+        vault_id: RaindexVaultId,
         target_amount: U256,
-        _decimals: u8,
+        decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        *self.withdraw_transfer.lock().unwrap() = Some(WithdrawCall {
-            token,
-            amount: target_amount,
-        });
-        Ok(self.withdraw_tx)
+        match self.withdraw_behavior {
+            WithdrawBehavior::Succeed => {
+                *self.withdraw_transfer.lock().unwrap() = Some(WithdrawCall {
+                    token,
+                    vault_id,
+                    amount: target_amount,
+                    decimals,
+                });
+                Ok(self.withdraw_tx)
+            }
+            WithdrawBehavior::FailGeneric => Err(RaindexError::ZeroAmount),
+        }
     }
 
     async fn confirm_tx_receipt(
@@ -254,7 +285,7 @@ impl Raindex for MockRaindex {
                     .withdraw_transfer
                     .lock()
                     .unwrap()
-                    .map(|WithdrawCall { token, amount }| {
+                    .map(|WithdrawCall { token, amount, .. }| {
                         let amount = self.withdraw_actual_amount.unwrap_or(amount);
                         vec![transfer_log(token, Address::ZERO, amount)]
                     })
@@ -271,7 +302,7 @@ impl Raindex for MockRaindex {
             .withdraw_transfer
             .lock()
             .unwrap()
-            .map(|WithdrawCall { token, amount }| {
+            .map(|WithdrawCall { token, amount, .. }| {
                 let amount = self.withdraw_actual_amount.unwrap_or(amount);
                 vec![transfer_log(token, Address::ZERO, amount)]
             })

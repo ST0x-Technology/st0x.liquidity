@@ -396,6 +396,17 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::SendPending;
                 self.last_progress_at = *pending_at;
             }
+            EquityRedemptionEvent::SendSubmitted {
+                redemption_tx,
+                submitted_at,
+                ..
+            } => {
+                // The transfer is broadcast; track it as sent (the bookkeeping
+                // finalization to TokensSent is a pure, resume-driven step).
+                self.redemption_tx = Some(*redemption_tx);
+                self.stage = RedemptionTrackingStage::TokensSent;
+                self.last_progress_at = *submitted_at;
+            }
             EquityRedemptionEvent::TokensSent {
                 redemption_tx,
                 sent_at,
@@ -2540,6 +2551,7 @@ impl RebalancingService {
             | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
             | SendPending { .. }
+            | SendSubmitted { .. }
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
@@ -2577,6 +2589,7 @@ impl RebalancingService {
             | WithdrawnFromRaindex { quantity, .. }
             | UnwrapPending { quantity, .. }
             | UnwrapSubmitted { quantity, .. }
+            | SendSubmitted { quantity, .. }
             | TokensSent { quantity, .. }
             | Pending { quantity, .. } => Ok(FractionalShares::new(*quantity)),
             TokensUnwrapped {
@@ -4500,6 +4513,7 @@ impl RebalancingService {
             | UnwrapSubmitted { symbol, .. }
             | TokensUnwrapped { symbol, .. }
             | SendPending { symbol, .. }
+            | SendSubmitted { symbol, .. }
             | TokensSent { symbol, .. }
             | Pending { symbol, .. } => {
                 let quantity = Self::recovered_redemption_quantity(entity)?;
@@ -4546,6 +4560,16 @@ impl RebalancingService {
                         *unwrapped_at,
                         None,
                         None,
+                    ),
+                    SendSubmitted {
+                        submitted_at,
+                        redemption_tx,
+                        ..
+                    } => (
+                        RedemptionTrackingStage::TokensSent,
+                        *submitted_at,
+                        None,
+                        Some(*redemption_tx),
                     ),
                     TokensSent {
                         sent_at,
@@ -4827,6 +4851,7 @@ impl RebalancingService {
             | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
             | SendPending { .. }
+            | SendSubmitted { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
         }
@@ -13893,10 +13918,7 @@ mod tests {
         trigger
             .set_stores(
                 Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
                 Arc::new(store),
             )
             .await;
@@ -14016,10 +14038,7 @@ mod tests {
         trigger
             .set_stores(
                 Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
                 Arc::new(store),
             )
             .await;
@@ -14114,10 +14133,7 @@ mod tests {
         trigger
             .set_stores(
                 Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
                 Arc::new(store),
             )
             .await;
@@ -14283,10 +14299,7 @@ mod tests {
         trigger
             .set_stores(
                 Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<EquityRedemption>(pool.clone(), ())),
                 Arc::clone(&store),
             )
             .await;
@@ -14387,7 +14400,7 @@ mod tests {
                 >(unmigrated_pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     unmigrated_pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    (),
                 )),
                 Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone(), ())),
             )
@@ -14490,7 +14503,7 @@ mod tests {
                 >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    (),
                 )),
                 Arc::new(store),
             )
@@ -14630,7 +14643,7 @@ mod tests {
                 >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    (),
                 )),
                 Arc::clone(&store),
             )
@@ -14827,7 +14840,7 @@ mod tests {
                 >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    (),
                 )),
                 Arc::clone(&store),
             )
@@ -14978,7 +14991,7 @@ mod tests {
                 >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    (),
                 )),
                 Arc::clone(&store),
             )

@@ -464,7 +464,7 @@ mod tests {
     use crate::inventory::BroadcastingInventory;
     use crate::inventory::view::InventoryView;
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+    use crate::rebalancing::equity::CrossVenueEquityTransfer;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
@@ -481,14 +481,8 @@ mod tests {
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let transfer_services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: vault_lookup.clone(),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: wrapper.clone(),
-        };
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
+        let redemption_store = Arc::new(test_store(pool.clone(), ()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             vault_lookup.clone(),

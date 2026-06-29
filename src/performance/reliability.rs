@@ -500,6 +500,7 @@ fn equity_redemption_failure(
         | EquityRedemptionEvent::UnwrapPending { .. }
         | EquityRedemptionEvent::UnwrapSubmitted { .. }
         | EquityRedemptionEvent::SendPending { .. }
+        | EquityRedemptionEvent::SendSubmitted { .. }
         | EquityRedemptionEvent::TokensSent { .. }
         | EquityRedemptionEvent::Detected { .. }
         | EquityRedemptionEvent::Completed { .. }
