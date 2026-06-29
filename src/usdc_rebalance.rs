@@ -128,6 +128,25 @@ impl From<RebalanceDirection> for st0x_dto::UsdcBridgeDirection {
     }
 }
 
+/// Explicit source and destination cash amounts for a USD <-> USDC conversion.
+///
+/// Cash amounts remain modeled as [`Usdc`] throughout the system because offchain
+/// USD buying power is normalized into the same cash type as onchain USDC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ConversionAmounts {
+    pub(crate) source_amount: Usdc,
+    pub(crate) received_amount: Usdc,
+}
+
+impl ConversionAmounts {
+    pub(crate) const fn new(source_amount: Usdc, received_amount: Usdc) -> Self {
+        Self {
+            source_amount,
+            received_amount,
+        }
+    }
+}
+
 /// Why an operator reconciled a USDC rebalance stranded in the post-burn
 /// terminal `DepositFailed` state. The funds were handled out-of-band, so the
 /// reconcile records the reason rather than re-driving the failed deposit.
@@ -246,13 +265,8 @@ pub(crate) enum UsdcRebalanceCommand {
         order_id: ClientOrderId,
     },
     /// Confirm successful conversion. Valid only from `Converting` state.
-    /// Contains filled_amount for accurate inventory tracking.
-    ConfirmConversion {
-        /// Actual USDC amount from the conversion.
-        /// - AlpacaToBase (USD->USDC): USDC received
-        /// - BaseToAlpaca (USDC->USD): USDC sold
-        filled_amount: Usdc,
-    },
+    /// Contains the source amount sold and the destination amount received.
+    ConfirmConversion { conversion: ConversionAmounts },
     /// Record conversion failure. Valid only from `Converting` state.
     FailConversion { reason: String },
     /// Start post-deposit conversion for BaseToAlpaca direction.
@@ -374,13 +388,11 @@ pub(crate) enum UsdcRebalanceEvent {
     /// Conversion completed successfully.
     /// Includes direction so terminal detection works with incremental dispatch
     /// (cqrs-es Query::dispatch only receives newly committed events, not full history).
-    /// Contains filled_amount for accurate inventory tracking (may differ from requested due to slippage).
+    /// Captures both the source amount sold and the destination amount received.
     ConversionConfirmed {
         direction: RebalanceDirection,
-        /// Actual USDC amount from the conversion.
-        /// - AlpacaToBase (USD->USDC): USDC received
-        /// - BaseToAlpaca (USDC->USD): USDC sold
-        filled_amount: Usdc,
+        #[serde(flatten)]
+        conversion: ConversionAmounts,
         converted_at: DateTime<Utc>,
     },
     /// Conversion failed.
@@ -559,7 +571,7 @@ impl DomainEvent for UsdcRebalanceEvent {
     }
 
     fn event_version(&self) -> String {
-        "1.0".to_string()
+        "2.0".to_string()
     }
 }
 
@@ -581,8 +593,7 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         /// Originally requested amount
         amount: Usdc,
-        /// Actual USDC amount from the conversion (may differ due to slippage)
-        filled_amount: Usdc,
+        conversion: ConversionAmounts,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
@@ -829,7 +840,7 @@ impl UsdcRebalance {
 
             Self::ConversionComplete {
                 direction,
-                filled_amount,
+                conversion,
                 initiated_at,
                 converted_at,
                 ..
@@ -845,7 +856,7 @@ impl UsdcRebalance {
 
                 (
                     direction,
-                    *filled_amount,
+                    conversion.received_amount,
                     status,
                     *initiated_at,
                     *converted_at,
@@ -1160,7 +1171,7 @@ impl UsdcRebalance {
     /// through the opposite-direction resume path.
     ///
     /// Deliberately does NOT expose the amount: a state's `amount` field is
-    /// reassigned to the conversion `filled_amount` (and later the post-fee
+    /// reassigned to the conversion's received amount (and later the post-fee
     /// `amount_received`), so it is not the original requested amount the CLI
     /// prints -- validating `--amount` against it would reject legitimate resumes
     /// whenever slippage or CCTP fees move the effective amount.
@@ -1294,7 +1305,7 @@ impl UsdcRebalance {
         match self {
             // Post-conversion / post-bridge, the actually received amount is
             // the effective one; `amount` is the originally requested figure.
-            Self::ConversionComplete { filled_amount, .. } => *filled_amount,
+            Self::ConversionComplete { conversion, .. } => conversion.received_amount,
             Self::Bridged {
                 amount_received, ..
             } => *amount_received,
@@ -1487,7 +1498,11 @@ impl EventSourced for UsdcRebalance {
     // v5: added the terminal `Reconciled` state (and `OperatorReconciled` event)
     // for operator reconciliation of a post-burn `DepositFailed`. Bumped to
     // clear stale snapshots so they rebuild from events under the new schema.
-    const SCHEMA_VERSION: u64 = 5;
+    // v6: the conversion data model changed -- `ConversionComplete` state and the
+    // `ConversionConfirmed` event now carry `ConversionAmounts` (source +
+    // received) instead of a single `filled_amount`. Bumped to clear stale
+    // snapshots so they rebuild under the new schema.
+    const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1557,7 +1572,7 @@ impl EventSourced for UsdcRebalance {
 
             (
                 ConversionConfirmed {
-                    filled_amount,
+                    conversion,
                     converted_at,
                     ..
                 },
@@ -1570,7 +1585,7 @@ impl EventSourced for UsdcRebalance {
             ) => Self::ConversionComplete {
                 direction: *direction,
                 amount: *amount,
-                filled_amount: *filled_amount,
+                conversion: *conversion,
                 initiated_at: *initiated_at,
                 converted_at: *converted_at,
             },
@@ -1596,13 +1611,13 @@ impl EventSourced for UsdcRebalance {
                 WithdrawalSubmitting { from_block, .. },
                 Self::ConversionComplete {
                     direction,
-                    filled_amount,
+                    conversion,
                     initiated_at,
                     ..
                 },
             ) => Self::WithdrawalSubmitting {
                 direction: *direction,
-                amount: *filled_amount,
+                amount: conversion.received_amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
             },
@@ -1626,13 +1641,13 @@ impl EventSourced for UsdcRebalance {
                 Initiated { withdrawal_ref, .. },
                 Self::ConversionComplete {
                     direction,
-                    filled_amount,
+                    conversion,
                     initiated_at,
                     ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
-                amount: *filled_amount,
+                amount: conversion.received_amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *initiated_at,
             },
@@ -2134,9 +2149,7 @@ impl EventSourced for UsdcRebalance {
         use UsdcRebalanceCommand::*;
         match command {
             InitiateConversion { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
-            ConfirmConversion { filled_amount } => {
-                self.transition_confirm_conversion(filled_amount)
-            }
+            ConfirmConversion { conversion } => self.transition_confirm_conversion(conversion),
             FailConversion { reason } => self.transition_fail_conversion(reason),
             InitiatePostDepositConversion { order_id, amount } => {
                 self.transition_post_deposit_conversion(order_id, amount)
@@ -2202,13 +2215,13 @@ impl EventSourced for UsdcRebalance {
 impl UsdcRebalance {
     fn transition_confirm_conversion(
         &self,
-        filled_amount: Usdc,
+        conversion: ConversionAmounts,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
             Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
                 direction: *direction,
-                filled_amount,
+                conversion,
                 converted_at: Utc::now(),
             }]),
             Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
@@ -2276,7 +2289,7 @@ impl UsdcRebalance {
         use UsdcRebalanceEvent::*;
         let Self::ConversionComplete {
             direction: conv_direction,
-            filled_amount: conv_filled_amount,
+            conversion,
             ..
         } = self
         else {
@@ -2290,20 +2303,20 @@ impl UsdcRebalance {
                     .to_string(),
             });
         }
-        if amount != *conv_filled_amount {
+        if amount != conversion.received_amount {
             return Err(UsdcRebalanceError::InvalidCommand {
                 command: "BeginWithdrawal".to_string(),
                 state: format!(
                     "ConversionComplete with amount \
                      mismatch: expected {:?}, got {:?}",
-                    conv_filled_amount.inner(),
+                    conversion.received_amount.inner(),
                     amount.inner()
                 ),
             });
         }
         Ok(vec![WithdrawalSubmitting {
             direction,
-            amount: *conv_filled_amount,
+            amount: conversion.received_amount,
             from_block,
             submitting_at: Utc::now(),
         }])
@@ -2325,9 +2338,9 @@ impl UsdcRebalance {
             } => (direction, amount),
             Self::ConversionComplete {
                 direction,
-                filled_amount,
+                conversion,
                 ..
-            } => (direction, filled_amount),
+            } => (direction, &conversion.received_amount),
             _ => return Err(UsdcRebalanceError::AlreadyInitiated),
         };
         if direction != *expected_direction {
@@ -3109,6 +3122,14 @@ mod tests {
         };
 
         assert_eq!(message, None);
+    }
+
+    fn conversion(source_amount: Usdc, received_amount: Usdc) -> ConversionAmounts {
+        ConversionAmounts::new(source_amount, received_amount)
+    }
+
+    fn par_conversion(amount: Usdc) -> ConversionAmounts {
+        conversion(amount, amount)
     }
 
     #[tokio::test]
@@ -4771,7 +4792,7 @@ mod tests {
         let conversion_complete = UsdcRebalance::ConversionComplete {
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
-            filled_amount: Usdc::new(float!(999)),
+            conversion: par_conversion(Usdc::new(float!(999))),
             initiated_at: now,
             converted_at: now,
         };
@@ -4832,7 +4853,7 @@ mod tests {
         let conversion_complete = UsdcRebalance::ConversionComplete {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: requested,
-            filled_amount: Usdc::new(float!(319)),
+            conversion: par_conversion(Usdc::new(float!(319))),
             initiated_at: now,
             converted_at: now,
         };
@@ -7116,7 +7137,7 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_conversion_from_converting_state() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
-        let filled_amount = Usdc::new(float!(998));
+        let conversion = par_conversion(Usdc::new(float!(998)));
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
@@ -7125,7 +7146,7 @@ mod tests {
                 order_id,
                 initiated_at: Utc::now(),
             }])
-            .when(UsdcRebalanceCommand::ConfirmConversion { filled_amount })
+            .when(UsdcRebalanceCommand::ConfirmConversion { conversion })
             .await
             .events();
 
@@ -7141,7 +7162,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc::new(float!(998)),
+                conversion: par_conversion(Usdc::new(float!(998))),
             })
             .await
             .then_expect_error();
@@ -7166,12 +7187,12 @@ mod tests {
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount: Usdc::new(float!(998)),
+                    conversion: par_conversion(Usdc::new(float!(998))),
                     converted_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc::new(float!(998)),
+                conversion: par_conversion(Usdc::new(float!(998))),
             })
             .await
             .then_expect_error();
@@ -7236,7 +7257,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount: Usdc::new(float!(998)),
+                    conversion: par_conversion(Usdc::new(float!(998))),
                     converted_at: Utc::now(),
                 },
             ])
@@ -7256,7 +7277,7 @@ mod tests {
     async fn test_initiate_withdrawal_after_conversion_complete() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let filled_amount = Usdc::new(float!(998));
+        let received_amount = Usdc::new(float!(998));
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -7268,13 +7289,13 @@ mod tests {
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount,
+                    conversion: par_conversion(received_amount),
                     converted_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::AlpacaToBase,
-                amount: filled_amount,
+                amount: received_amount,
                 withdrawal: TransferRef::AlpacaId(transfer_id),
             })
             .await
@@ -7288,7 +7309,7 @@ mod tests {
     async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
-        let filled_amount = Usdc::new(float!(998));
+        let received_amount = Usdc::new(float!(998));
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -7300,7 +7321,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount,
+                    conversion: par_conversion(received_amount),
                     converted_at: Utc::now(),
                 },
             ])
@@ -7583,7 +7604,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc::new(float!(998)),
+                conversion: conversion(Usdc::new(float!(1000)), Usdc::new(float!(998))),
             })
             .await
             .events();
@@ -7687,7 +7708,7 @@ mod tests {
             },
             UsdcRebalanceEvent::ConversionConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
-                filled_amount: Usdc::new(float!(999.99)),
+                conversion: conversion(Usdc::new(float!(1000)), Usdc::new(float!(999.99))),
                 converted_at: conversion_completed_at,
             },
             UsdcRebalanceEvent::Initiated {
@@ -7717,7 +7738,7 @@ mod tests {
     fn conversion_confirmed_on_uninitialized_produces_failed_state() {
         let error = replay::<UsdcRebalance>(vec![UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::BaseToAlpaca,
-            filled_amount: Usdc::new(float!(998)),
+            conversion: conversion(Usdc::new(float!(1000)), Usdc::new(float!(998))),
             converted_at: Utc::now(),
         }])
         .unwrap_err();
@@ -7894,7 +7915,7 @@ mod tests {
         let state = UsdcRebalance::ConversionComplete {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
-            filled_amount: Usdc::new(float!(499)),
+            conversion: conversion(Usdc::new(float!(500)), Usdc::new(float!(499))),
             initiated_at,
             converted_at,
         };
@@ -7918,7 +7939,7 @@ mod tests {
         let state = UsdcRebalance::ConversionComplete {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(500)),
-            filled_amount: Usdc::new(float!(499)),
+            conversion: conversion(Usdc::new(float!(500)), Usdc::new(float!(499))),
             initiated_at,
             converted_at,
         };
@@ -8480,7 +8501,7 @@ mod tests {
             ConversionComplete {
                 direction: AlpacaToBase,
                 amount,
-                filled_amount: amount,
+                conversion: par_conversion(amount),
                 initiated_at: now,
                 converted_at: now,
             }
@@ -8490,7 +8511,7 @@ mod tests {
             !ConversionComplete {
                 direction: BaseToAlpaca,
                 amount,
-                filled_amount: amount,
+                conversion: par_conversion(amount),
                 initiated_at: now,
                 converted_at: now,
             }
@@ -8806,7 +8827,7 @@ mod tests {
             ConversionComplete {
                 direction: BaseToAlpaca,
                 amount,
-                filled_amount: amount,
+                conversion: par_conversion(amount),
                 initiated_at: now,
                 converted_at: now,
             }

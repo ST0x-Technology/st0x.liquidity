@@ -990,7 +990,9 @@ mod tests {
 
     use super::*;
     use crate::test_utils::setup_test_db;
-    use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
+    use crate::usdc_rebalance::{
+        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
+    };
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_750_000_000 + seconds, 0).unwrap()
@@ -1013,7 +1015,10 @@ mod tests {
             },
             UsdcRebalanceEvent::ConversionConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
-                filled_amount: Usdc::new(float!(1000)),
+                conversion: ConversionAmounts::new(
+                    Usdc::new(float!(1000)),
+                    Usdc::new(float!(1000)),
+                ),
                 converted_at: timestamp(10),
             },
             UsdcRebalanceEvent::WithdrawalSubmitting {
@@ -1848,7 +1853,7 @@ mod tests {
             },
             UsdcRebalanceEvent::ConversionConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
-                filled_amount: Usdc::new(float!(500)),
+                conversion: ConversionAmounts::new(Usdc::new(float!(500)), Usdc::new(float!(500))),
                 converted_at: timestamp(150),
             },
         ];
@@ -2413,7 +2418,7 @@ mod tests {
             },
             UsdcRebalanceEvent::ConversionConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
-                filled_amount: Usdc::new(float!(500)),
+                conversion: ConversionAmounts::new(Usdc::new(float!(500)), Usdc::new(float!(500))),
                 converted_at: timestamp(150),
             },
         ];
