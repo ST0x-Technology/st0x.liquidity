@@ -116,7 +116,11 @@ impl TelemetryCtx {
             let span_exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .with_http_client(http_client.clone())
-                .with_endpoint(self.traces_endpoint.join("opentelemetry/v1/traces")?.as_str())
+                .with_endpoint(
+                    self.traces_endpoint
+                        .join("opentelemetry/v1/traces")?
+                        .as_str(),
+                )
                 .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                 .build()?;
 

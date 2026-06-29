@@ -2530,7 +2530,10 @@ mod tests {
         assert_eq!(telemetry.environment, "test");
         // `url::Url` normalizes an authority-only URL to carry a trailing-slash
         // root path, so the parsed endpoint gains the `/` the literal omits.
-        assert_eq!(telemetry.traces_endpoint.as_str(), "http://100.0.0.1:10428/");
+        assert_eq!(
+            telemetry.traces_endpoint.as_str(),
+            "http://100.0.0.1:10428/"
+        );
         assert_eq!(telemetry.logs_endpoint.as_str(), "http://100.0.0.1:9428/");
     }
 
