@@ -5,6 +5,7 @@
 //! after downtime. A persisted checkpoint records the last block that was
 //! fully enqueued.
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{B256, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
@@ -285,20 +286,37 @@ where
         .await?;
 
         // A `removed: true` log is the legacy (now-inert over `eth_getLogs`)
-        // reorg signal; the authoritative one is a present log re-served on a
-        // different block_hash than the witnessed fill persisted. Both funnel
-        // through the same exactly-once `record_reorg` reversal.
+        // reorg signal; the authoritative re-mined signal is a present log
+        // re-served on a different block_hash than the witnessed fill persisted.
+        // Both funnel through the same exactly-once `record_reorg` reversal.
         let mut reorged = scan.removed;
         reorged.extend(detect_block_hash_reorgs(&ctx.cqrs.onchain_trade, &scan.present).await?);
 
-        if reorged.is_empty() {
-            return Ok(());
-        }
-
-        // Depth is measured from the current tip: the dropped block is gone, so
-        // the reorg spans at least `tip - block_number` blocks. Fetched once and
-        // reused for every reversal in this batch.
+        // The tip anchors both the unfinalized window the re-verification scans and
+        // the reorg depth recorded per reversal (the dropped block is gone, so the
+        // reorg spans at least `tip - block_number`). Read once and reused for every
+        // reversal in this batch.
         let tip = ctx.evm.provider().get_block_number().await?;
+
+        // `detect_block_hash_reorgs` only fires when a witnessed `(tx_hash,
+        // log_index)` is RE-observed on a different block, so a fill the chain
+        // DROPPED (orphaned, never re-mined) is structurally invisible to it. This
+        // pass drives from the witnessed-fills side and actively re-reads each
+        // unfinalized fill's canonical block by number -- INDEPENDENT of the forward
+        // scan, which never re-covers a dropped block below the checkpoint. It runs
+        // every tick (not gated on the scan) so a drop is caught even when the scan
+        // is empty; the reversal is reverse-ONLY through the same `record_reorg`.
+        reorged.extend(
+            detect_dropped_fill_reorgs(
+                &ctx.cqrs.onchain_trade,
+                &ctx.pool,
+                ctx.evm.provider(),
+                &scan.present,
+                tip,
+                ctx.ctx.evm.required_confirmations,
+            )
+            .await?,
+        );
 
         for removed_trade in reorged {
             // A tip behind the removed block would saturate `reorg_depth` to 0 --
@@ -413,6 +431,204 @@ async fn detect_block_hash_reorgs(
                 }),
             });
         }
+    }
+
+    Ok(reorged)
+}
+
+/// How many blocks below the chain tip the dropped-fill re-verification still
+/// re-checks each tick. A witnessed fill whose block is deeper than this is
+/// treated as final and dropped from consideration, keeping the pass
+/// O(unfinalized fills) rather than O(all history).
+///
+/// Sized to cover the `safe`-cutoff reorg window with margin: a `safe` OP-stack
+/// L2 block is batch-posted but not yet L1-finalized, so it can still be reorged
+/// until its batch finalizes on L1 -- on Base that is ~hundreds of L2 blocks
+/// (~2s/block against ~13 min L1 finality). The work is O(fills in the window),
+/// not O(blocks), so a wide window stays cheap. The exact value is a deliberate
+/// estimate pending measured fleet data, like the `SAFE_CUTOFF_QUIET_SKEW` band
+/// in the fill monitor.
+const REORG_REVERIFICATION_WINDOW: u64 = 1024;
+
+/// Detects witnessed fills the canonical chain DROPPED -- orphaned by a reorg and
+/// never re-mined -- which [`detect_block_hash_reorgs`] structurally cannot catch.
+/// That detector only fires when a witnessed `(tx_hash, log_index)` is RE-observed
+/// on a different `block_hash`; a dropped fill is never re-observed, so it is never
+/// compared and a naked hedge is left behind. This pass instead drives from the
+/// witnessed-fills side and ACTIVELY RE-VERIFIES each unfinalized fill against the
+/// chain: it re-reads the fill's block by number and asks whether the block the
+/// fill was accounted against is still canonical.
+///
+/// For each candidate fill `F` (`block_number`, persisted `block_hash`, not yet
+/// reorg-acknowledged) inside the unfinalized window:
+/// - fetch the current canonical block at `F.block_number` via
+///   [`Provider::get_block_by_number`];
+/// - if its hash EQUALS `F`'s persisted hash, the block is still canonical -- no-op;
+/// - if its hash DIFFERS, the block was orphaned. When `F`'s own
+///   `(tx_hash, log_index)` is ALSO absent from the current scan (not re-mined under
+///   the same key, which is [`detect_block_hash_reorgs`]'s reverse-then-reapply
+///   job), the fill was dropped -> flag reverse-ONLY (`reinclusion: None`).
+///
+/// This is INDEPENDENT of the forward scan / checkpoint: the canonical block is read
+/// directly by number, so a fill whose block sits BELOW the checkpoint -- which the
+/// forward scan never re-covers -- is still re-verified. The scan's present logs are
+/// consulted ONLY to partition a re-mined-same-key fill (key re-observed) away from
+/// this detector, so within a pass a fill is flagged by at most one detector.
+///
+/// Confirmation-respecting: a fill within `required_confirmations` of the tip is too
+/// close to trust the canonical view (a near-tip fork may itself reorg back), so it
+/// is deferred to a later tick once buried deep enough. Combined with the
+/// [`REORG_REVERIFICATION_WINDOW`] floor, only fills in
+/// `(tip - WINDOW, tip - required_confirmations]` are re-verified, keeping the pass
+/// O(unfinalized fills).
+///
+/// Exactly-once across ticks: a fill whose reorg reversal is already acknowledged
+/// (`is_reorg_acknowledged`) is skipped, mirroring [`detect_block_hash_reorgs`]. A
+/// reversal that began but did not finish (reorged, not yet acknowledged) is
+/// re-flagged so `record_reorg`'s idempotent resume completes it. `OnChainTrade` has
+/// no projection, so candidates come straight from the event log; the authoritative
+/// block/hash/reorg state is read from the loaded aggregate.
+async fn detect_dropped_fill_reorgs<P: Provider>(
+    onchain_trade: &Store<OnChainTrade>,
+    pool: &SqlitePool,
+    provider: &P,
+    present: &[PresentLog],
+    tip: u64,
+    required_confirmations: u64,
+) -> Result<Vec<RemovedTrade>, OnChainError> {
+    let finalized_tip = tip.saturating_sub(REORG_REVERIFICATION_WINDOW);
+    let finalized_tip_bound = i64::try_from(finalized_tip)?;
+
+    // A fill closer to the tip than the confirmation depth is not yet buried deep
+    // enough to trust the canonical view -- a near-tip fork can still reorg back.
+    // Re-verify only at or below this ceiling; a fresher fill is re-checked on a
+    // later tick once it is confirmed-deep.
+    let confirmed_ceiling = tip.saturating_sub(required_confirmations);
+
+    // Candidate ids: witnessed fills whose latest block (its `Filled`, or its
+    // `ReWitnessed` after a re-mine) is still above the finality boundary. Filtered
+    // in SQL so only the unfinalized fills are loaded.
+    let candidates = sqlx::query_as::<_, (String,)>(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'OnChainTrade' \
+           AND event_type IN ('OnChainTradeEvent::Filled', 'OnChainTradeEvent::ReWitnessed') \
+         GROUP BY aggregate_id \
+         HAVING MAX(COALESCE( \
+             json_extract(payload, '$.Filled.block_number'), \
+             json_extract(payload, '$.ReWitnessed.block_number') \
+         )) > ?",
+    )
+    .bind(finalized_tip_bound)
+    .fetch_all(pool)
+    .await?;
+
+    let mut reorged = Vec::new();
+
+    for (aggregate_id,) in candidates {
+        let trade_id = match aggregate_id.parse::<OnChainTradeId>() {
+            Ok(trade_id) => trade_id,
+            Err(error) => {
+                warn!(
+                    target: "orderbook",
+                    %aggregate_id,
+                    %error,
+                    "Skipping unparseable OnChainTrade aggregate id during dropped-fill \
+                     re-verification"
+                );
+                continue;
+            }
+        };
+
+        let Some(trade) = onchain_trade.load(&trade_id).await? else {
+            continue;
+        };
+
+        // Already fully reversed (and, for a re-mined fill, since re-witnessed):
+        // nothing to do. Mirrors `detect_block_hash_reorgs`'s acknowledged guard so
+        // the reversal stays exactly-once across ticks.
+        if trade.is_reorg_acknowledged() {
+            continue;
+        }
+
+        let (Some(block_number), Some(persisted_block_hash)) =
+            (trade.block_number, trade.block_hash)
+        else {
+            // No persisted block hash to compare against (a legacy fill, or one
+            // whose source log carried none): the orphaning cannot be proven, so do
+            // not flag -- matches `detect_block_hash_reorgs`.
+            continue;
+        };
+
+        // The SQL bound is on the event log's block number; re-check against the
+        // authoritative loaded block so a fill that finalized between the query and
+        // the load is not reversed.
+        if block_number <= finalized_tip {
+            continue;
+        }
+
+        // Too close to the tip to trust the canonical view yet: defer to a later
+        // tick. The re-verification re-runs every tick, so deferring keeps the
+        // reversal exactly-once rather than dropping it.
+        if block_number > confirmed_ceiling {
+            continue;
+        }
+
+        // The fill's own key is still on the chain (re-observed): either still
+        // canonical, or re-mined under the SAME key -- which is
+        // `detect_block_hash_reorgs`'s job (reverse-then-reapply). Not a drop, and
+        // checked before the canonical read so a re-mine is never reverse-only here.
+        let key_reobserved = present
+            .iter()
+            .any(|log| log.tx_hash == trade_id.tx_hash && log.log_index == trade_id.log_index);
+        if key_reobserved {
+            continue;
+        }
+
+        // Active canonical re-verification: read the block the fill was accounted
+        // against by number and compare its CURRENT hash to the one persisted. This
+        // is the authoritative orphan signal, independent of the forward scan -- it
+        // surfaces a drop even when the fill's block sits below the checkpoint the
+        // scan never re-covers.
+        let Some(canonical_block) = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .await?
+        else {
+            // The node has not surfaced a block at this height (a lagging or
+            // cold-start node): the orphaning cannot be proven, so do not reverse an
+            // already-hedged fill. A later tick re-checks against a caught-up node.
+            warn!(
+                target: "orderbook",
+                tx_hash = ?trade_id.tx_hash,
+                log_index = trade_id.log_index,
+                block_number,
+                "Canonical block absent during dropped-fill re-verification; deferring -- \
+                 cannot prove the fill's block was orphaned"
+            );
+            continue;
+        };
+
+        // The fill's block is still canonical (its hash is unchanged): not a drop.
+        if canonical_block.header.hash == persisted_block_hash {
+            continue;
+        }
+
+        warn!(
+            target: "orderbook",
+            tx_hash = ?trade_id.tx_hash,
+            log_index = trade_id.log_index,
+            block_number,
+            ?persisted_block_hash,
+            canonical_block_hash = ?canonical_block.header.hash,
+            "Witnessed fill's block was orphaned (canonical hash differs) and the fill's \
+             identity did not re-appear -- dropped by a reorg; recording reverse-only reversal"
+        );
+        reorged.push(RemovedTrade {
+            trade_id,
+            block_number,
+            // Truly dropped: the canonical chain no longer holds the fill, so there
+            // is nothing to re-apply -- reverse only.
+            reinclusion: None,
+        });
     }
 
     Ok(reorged)
@@ -1047,7 +1263,7 @@ mod tests {
         uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
-    use alloy::rpc::types::Log;
+    use alloy::rpc::types::{Block, Log, Transaction};
     use chrono::Utc;
     use rain_math_float::Float;
     use st0x_config::{
@@ -4356,5 +4572,429 @@ mod tests {
         assert_eq!(present.tx_hash, expected_tx_hash);
         assert_eq!(present.log_index, 1);
         assert_eq!(present.block_number, 50);
+    }
+
+    /// Tip far above the seed block (100) so the fill is comfortably inside the
+    /// unfinalized window in the dropped-fill tests below.
+    const UNFINALIZED_TIP: u64 = 1_000;
+
+    /// Confirmations used by the dropped-fill unit tests: zero, matching the e2e
+    /// chain config, so the confirmation ceiling is the tip and never gates the
+    /// in-window seed block.
+    const NO_CONFIRMATIONS: u64 = 0;
+
+    /// Mock provider answering exactly one `eth_getBlockByNumber` with a block at
+    /// `number` carrying `hash` -- the canonical block the dropped-fill
+    /// re-verification reads to compare against a fill's persisted hash.
+    fn provider_with_block(number: u64, hash: B256) -> impl Provider + Clone {
+        let mut block = Block::<Transaction>::default();
+        block.header.inner.number = number;
+        block.header.hash = hash;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&block);
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    /// Mock provider answering one `eth_getBlockByNumber` with a JSON null -- the
+    /// node has not surfaced a block at the requested height yet.
+    fn provider_without_block() -> impl Provider + Clone {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::Null);
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    /// Mock provider with no queued responses: any RPC call panics the test. Used
+    /// where the re-verification must short-circuit BEFORE the canonical block read
+    /// (re-mined-same-key, already-acknowledged, finalized window).
+    fn provider_never_called() -> impl Provider + Clone {
+        ProviderBuilder::new().connect_mocked_client(Asserter::new())
+    }
+
+    /// The dropped-fill re-verification reverses (reverse-ONLY) a witnessed, hedged
+    /// fill whose block the canonical chain orphaned: the canonical block at the
+    /// fill's height now carries a DIFFERENT hash than the one persisted, and the
+    /// fill's own `(tx_hash, log_index)` never re-appeared in the scan, so it is
+    /// flagged with NO re-inclusion. This is the gap `detect_block_hash_reorgs`
+    /// cannot close.
+    #[tokio::test]
+    async fn dropped_fill_with_orphaned_block_is_flagged_reverse_only() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let persisted_block_hash = B256::repeat_byte(0xaa);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(persisted_block_hash),
+            now,
+        )
+        .await;
+
+        // The orphan-block marker the chaos `ForkDrop` getLogs drop serves: the
+        // fill's block height under a competing hash, but a DIFFERENT transaction
+        // identity -- the fill's own key never re-appears, so the re-mine detector
+        // cannot claim it.
+        let present = vec![PresentLog {
+            tx_hash: TxHash::repeat_byte(0xdd),
+            log_index,
+            block_number: 100,
+            block_hash: Some(B256::repeat_byte(0xff)),
+            block_timestamp: Some(now),
+        }];
+
+        // The canonical block at the fill's height now carries a competing hash, so
+        // the active re-verification sees hash != persisted and flags the drop.
+        let provider = provider_with_block(100, B256::repeat_byte(0xff));
+
+        let reorged = detect_dropped_fill_reorgs(
+            &onchain_trade,
+            &pool,
+            &provider,
+            &present,
+            UNFINALIZED_TIP,
+            NO_CONFIRMATIONS,
+        )
+        .await
+        .unwrap();
+
+        let [removed] = reorged.as_slice() else {
+            panic!(
+                "a dropped fill with an orphaned block must surface exactly one reorg, got {reorged:?}"
+            );
+        };
+        assert_eq!(removed.trade_id.tx_hash, tx_hash);
+        assert_eq!(removed.trade_id.log_index, log_index);
+        assert_eq!(removed.block_number, 100);
+        assert!(
+            removed.reinclusion.is_none(),
+            "a dropped fill must be reverse-only -- no re-inclusion to re-apply",
+        );
+    }
+
+    /// A witnessed fill whose key never re-appears but whose canonical block STILL
+    /// carries its persisted hash was not orphaned: the active re-verification reads
+    /// the block by number, sees the hash is unchanged, and leaves the fill alone.
+    #[tokio::test]
+    async fn still_canonical_fill_is_noop() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let persisted_block_hash = B256::repeat_byte(0xaa);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(persisted_block_hash),
+            now,
+        )
+        .await;
+
+        // The fill's key never re-appears, so the pass falls through to the canonical
+        // read -- which returns the SAME hash the fill persisted.
+        let provider = provider_with_block(100, persisted_block_hash);
+
+        let reorged = detect_dropped_fill_reorgs(
+            &onchain_trade,
+            &pool,
+            &provider,
+            &[],
+            UNFINALIZED_TIP,
+            NO_CONFIRMATIONS,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "a fill whose canonical block hash is unchanged is still canonical, \
+             not dropped, got {reorged:?}",
+        );
+    }
+
+    /// A fill re-mined under the SAME key on a competing block is the re-mined
+    /// case `detect_block_hash_reorgs` owns (reverse-then-reapply). Because its key
+    /// is re-observed, the dropped-fill pass must skip it BEFORE the canonical read
+    /// -- avoiding a double revert, so the provider must never be consulted.
+    #[tokio::test]
+    async fn re_mined_same_key_is_left_to_block_hash_detector() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let persisted_block_hash = B256::repeat_byte(0xaa);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(persisted_block_hash),
+            now,
+        )
+        .await;
+
+        // Same key, competing block hash: a re-mine. The block-hash detector flags
+        // this; the dropped-fill pass defers via the key-reobserved guard.
+        let present = vec![PresentLog {
+            tx_hash,
+            log_index,
+            block_number: 100,
+            block_hash: Some(B256::repeat_byte(0xff)),
+            block_timestamp: Some(now),
+        }];
+
+        // The key-reobserved guard short-circuits before any canonical read.
+        let provider = provider_never_called();
+
+        let reorged = detect_dropped_fill_reorgs(
+            &onchain_trade,
+            &pool,
+            &provider,
+            &present,
+            UNFINALIZED_TIP,
+            NO_CONFIRMATIONS,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "a re-mined same-key fill is `detect_block_hash_reorgs`'s job and must not \
+             be double-reverted here, got {reorged:?}",
+        );
+    }
+
+    /// A fill whose reorg reversal is already acknowledged must never be re-flagged
+    /// -- the reverse-only reversal stays exactly-once across poll ticks even while
+    /// the orphan marker keeps re-appearing.
+    #[tokio::test]
+    async fn already_reorg_acknowledged_fill_is_idempotent_noop() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let persisted_block_hash = B256::repeat_byte(0xaa);
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(persisted_block_hash),
+            now,
+        )
+        .await;
+
+        let trade_id = OnChainTradeId { tx_hash, log_index };
+        onchain_trade
+            .send(
+                &trade_id,
+                OnChainTradeCommand::RecordReorg { reorg_depth: 5 },
+            )
+            .await
+            .unwrap();
+        onchain_trade
+            .send(&trade_id, OnChainTradeCommand::AcknowledgeReorg)
+            .await
+            .unwrap();
+
+        // The orphan marker is still being served, but the reversal is already
+        // complete, so the pass must short-circuit on the acknowledged guard before
+        // ever reading the canonical block.
+        let present = vec![PresentLog {
+            tx_hash: TxHash::repeat_byte(0xdd),
+            log_index,
+            block_number: 100,
+            block_hash: Some(B256::repeat_byte(0xff)),
+            block_timestamp: Some(now),
+        }];
+
+        // The acknowledged guard short-circuits before any canonical read.
+        let provider = provider_never_called();
+
+        let reorged = detect_dropped_fill_reorgs(
+            &onchain_trade,
+            &pool,
+            &provider,
+            &present,
+            UNFINALIZED_TIP,
+            NO_CONFIRMATIONS,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "an already reorg-acknowledged fill must not be re-flagged, got {reorged:?}",
+        );
+    }
+
+    /// When the node has not surfaced a block at the fill's height (a lagging or
+    /// cold-start node returning a null `eth_getBlockByNumber`), the orphaning
+    /// cannot be proven, so an already-hedged fill must NOT be reversed -- the pass
+    /// defers to a later tick against a caught-up node.
+    #[tokio::test]
+    async fn canonical_block_absent_is_deferred_not_reversed() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(B256::repeat_byte(0xaa)),
+            now,
+        )
+        .await;
+
+        // The fill's key is absent (no re-mine), but the node returns no block at the
+        // fill's height -- the orphaning is unproven, so the fill must be left alone.
+        let provider = provider_without_block();
+
+        let reorged = detect_dropped_fill_reorgs(
+            &onchain_trade,
+            &pool,
+            &provider,
+            &[],
+            UNFINALIZED_TIP,
+            NO_CONFIRMATIONS,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "an unproven orphaning (no canonical block) must never reverse a fill, got {reorged:?}",
+        );
+    }
+
+    /// Fills whose block has finalized (deeper than [`REORG_REVERIFICATION_WINDOW`]
+    /// below the tip) are dropped from consideration, keeping the pass bounded to
+    /// the unfinalized window -- even when an orphan marker is still present.
+    #[tokio::test]
+    async fn finalized_fill_is_outside_the_reverification_window() {
+        let pool = setup_test_db().await;
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        // The seed witnesses on block 100.
+        seed_witnessed_fill_with_block_hash(
+            &onchain_trade,
+            &position,
+            &symbol,
+            tx_hash,
+            log_index,
+            Some(B256::repeat_byte(0xaa)),
+            now,
+        )
+        .await;
+
+        let present = vec![PresentLog {
+            tx_hash: TxHash::repeat_byte(0xdd),
+            log_index,
+            block_number: 100,
+            block_hash: Some(B256::repeat_byte(0xff)),
+            block_timestamp: Some(now),
+        }];
+
+        // The finality-window floor short-circuits before any canonical read.
+        let provider = provider_never_called();
+
+        // Tip far enough ahead that block 100 is below the finality boundary
+        // (100 <= tip - REORG_REVERIFICATION_WINDOW), so the fill is final.
+        let tip_past_finality = 100 + REORG_REVERIFICATION_WINDOW + 1;
+        let reorged = detect_dropped_fill_reorgs(
+            &onchain_trade,
+            &pool,
+            &provider,
+            &present,
+            tip_past_finality,
+            NO_CONFIRMATIONS,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reorged.is_empty(),
+            "a finalized fill is outside the unfinalized window and must not be re-verified, \
+             got {reorged:?}",
+        );
     }
 }
