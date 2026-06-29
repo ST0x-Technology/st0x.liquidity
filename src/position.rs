@@ -91,7 +91,7 @@ impl std::fmt::Debug for Position {
 // possible. The precision loss is intentional and acceptable here — this gauge
 // is for monitoring dashboards only. All financial accounting uses the lossless
 // Float arithmetic in the Position aggregate itself.
-fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
+pub(crate) fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
     match net.to_string().parse::<f64>() {
         Ok(value) => gauge!("position_shares", "symbol" => symbol.to_string()).set(value),
         Err(err) => {
@@ -1911,6 +1911,58 @@ mod tests {
         assert_eq!(position.accumulated_long, FractionalShares::new(float!(5)));
         assert_eq!(position.accumulated_short, FractionalShares::ZERO);
         assert_eq!(position.last_updated, Some(adjusted_at));
+    }
+
+    /// Reads the value of a single-label gauge line out of Prometheus exposition
+    /// text, e.g. `position_shares{symbol="SPYM"} 5` -> `5.0`. Parsing the value
+    /// rather than substring-matching a formatted float keeps the assertion
+    /// robust to how the exporter renders the number.
+    fn gauge_value(rendered: &str, metric: &str, symbol: &str) -> Option<f64> {
+        let needle = format!("{metric}{{symbol=\"{symbol}\"}}");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&needle)?.trim().parse::<f64>().ok())
+    }
+
+    #[test]
+    fn position_shares_gauge_reflects_net_after_replay() {
+        // Installs the process-global Prometheus recorder; nextest (used by CI
+        // and local runs) isolates each test in its own process, so the rendered
+        // registry reflects only this replay. Exercises record_position_gauge
+        // end-to-end through evolve().
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("SPYM").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(position.net, FractionalShares::new(float!(5)));
+
+        let rendered = handle.render();
+        let value = gauge_value(&rendered, "position_shares", "SPYM").unwrap_or_else(|| {
+            panic!("position_shares{{symbol=SPYM}} must be present after replay, got:\n{rendered}")
+        });
+        assert!(
+            (value - 5.0).abs() < f64::EPSILON,
+            "position_shares gauge should equal net 5, got {value}\n{rendered}"
+        );
     }
 
     #[tokio::test]

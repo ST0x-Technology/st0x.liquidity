@@ -11,6 +11,7 @@ use alloy::sol_types::SolEvent;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures_util::future;
 use itertools::Itertools;
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::Duration;
@@ -379,6 +380,10 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     let enqueued_count = trade_events.len();
 
     for trade_event in trade_events {
+        // Count each decoded fill accepted into the accounting pipeline, keyed
+        // by event type, so ingestion volume is observable even before any
+        // hedge is placed downstream. `kind()` yields "ClearV3"/"TakeOrderV3".
+        counter!("onchain_events_total", "event_type" => trade_event.event.kind()).increment(1);
         job_queue
             .push(AccountForDexTrade { trade: trade_event })
             .await?;
@@ -2175,6 +2180,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_batch_events_mixed_log_types() {
+        // Install the process-global Prometheus recorder so the per-event
+        // onchain_events_total increments are observable. nextest isolates each
+        // test in its own process, so only this test's two events are counted.
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
@@ -2250,6 +2259,16 @@ mod tests {
         let enqueued = result.unwrap();
         assert_eq!(enqueued, 2);
         assert_eq!(job_count(&apalis_pool).await, 2);
+
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("onchain_events_total{event_type=\"ClearV3\"} 1"),
+            "ClearV3 ingestion must increment onchain_events_total, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("onchain_events_total{event_type=\"TakeOrderV3\"} 1"),
+            "TakeOrderV3 ingestion must increment onchain_events_total, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]

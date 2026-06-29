@@ -50,3 +50,39 @@ pub(crate) async fn endpoint(
 ) -> String {
     state.metrics_handle.render()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests install the process-global Prometheus recorder. nextest runs
+    // each test in its own process, so the install-once recorder is fresh per
+    // test and they do not contend over global state.
+
+    #[test]
+    fn setup_is_idempotent_across_calls() {
+        // The double-checked lock must let a second caller reuse the cached
+        // handle rather than failing to reinstall the global recorder.
+        let first = setup().expect("first setup installs the recorder");
+        let second = setup().expect("second setup returns the cached handle");
+
+        // Both handles point at the same shared registry, so they render
+        // identical output -- proving the second call reused the recorder
+        // rather than failing to reinstall it.
+        assert_eq!(first.render(), second.render());
+    }
+
+    #[test]
+    fn rendered_output_surfaces_an_incremented_counter() {
+        let handle = setup().expect("setup installs the recorder");
+
+        metrics::counter!("hedge_trades_total", "symbol" => "AAPL", "direction" => "buy")
+            .increment(1);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("hedge_trades_total"),
+            "an incremented counter must appear in the rendered /metrics output, got:\n{rendered}"
+        );
+    }
+}
