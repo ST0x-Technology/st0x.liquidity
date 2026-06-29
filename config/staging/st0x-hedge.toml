@@ -12,8 +12,12 @@ database_url = "sqlite:///mnt/data/st0x-hedge.db"
 apalis_finished_job_cleanup_interval_secs = 3600
 [telemetry]
 service_name = "st0x-liquidity"
-traces_endpoint = "http://100.x.x.x:10428"
-logs_endpoint = "http://100.x.x.x:9428"
+environment = "staging"
+# Shared st0x-management-observability box (same as prod); staging traces/logs
+# are distinguished by deployment.environment, not endpoint. Reachable once the
+# bot is migrated onto the st0x tailnet; until then exports drop best-effort.
+traces_endpoint = "http://100.93.167.114:10428"
+logs_endpoint = "http://100.93.167.114:9428"
 
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.

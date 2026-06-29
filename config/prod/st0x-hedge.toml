@@ -12,8 +12,13 @@ database_url = "sqlite:///mnt/data/st0x-hedge.db"
 apalis_finished_job_cleanup_interval_secs = 3600
 [telemetry]
 service_name = "st0x-liquidity"
-traces_endpoint = "http://100.x.x.x:10428"
-logs_endpoint = "http://100.x.x.x:9428"
+environment = "production"
+# st0x-management-observability on the st0x tailnet (VictoriaTraces :10428,
+# VictoriaLogs :9428). Reachable once the bot is migrated onto the st0x tailnet;
+# until then the OTLP exporters fail closed and drop best-effort (no startup
+# impact, file/console logging unaffected).
+traces_endpoint = "http://100.93.167.114:10428"
+logs_endpoint = "http://100.93.167.114:9428"
 
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.

@@ -739,7 +739,7 @@ fn parse_and_validate(
     }
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
-    let telemetry = config.telemetry.map(TelemetryCtx::new);
+    let telemetry = config.telemetry.map(TelemetryCtx::from);
     let alerts = AlertsCtx::new(config.alerts, secrets.alerts)?;
 
     // Execution threshold is determined by broker capabilities:
@@ -2516,6 +2516,7 @@ mod tests {
 
             [telemetry]
             service_name = "test-service"
+            environment = "test"
             traces_endpoint = "http://100.0.0.1:10428"
             logs_endpoint = "http://100.0.0.1:9428"
         "#,
@@ -2526,8 +2527,11 @@ mod tests {
             .unwrap();
         let telemetry = ctx.telemetry.as_ref().expect("telemetry should be Some");
         assert_eq!(telemetry.service_name, "test-service");
-        assert_eq!(telemetry.traces_endpoint, "http://100.0.0.1:10428");
-        assert_eq!(telemetry.logs_endpoint, "http://100.0.0.1:9428");
+        assert_eq!(telemetry.environment, "test");
+        // `url::Url` normalizes an authority-only URL to carry a trailing-slash
+        // root path, so the parsed endpoint gains the `/` the literal omits.
+        assert_eq!(telemetry.traces_endpoint.as_str(), "http://100.0.0.1:10428/");
+        assert_eq!(telemetry.logs_endpoint.as_str(), "http://100.0.0.1:9428/");
     }
 
     #[tokio::test]
@@ -2536,7 +2540,11 @@ mod tests {
         let ctx = Ctx::load_files(config.path(), dry_run_secrets_toml().path())
             .await
             .unwrap();
-        assert!(ctx.telemetry.is_none());
+        assert!(
+            ctx.telemetry.is_none(),
+            "expected telemetry None when [telemetry] absent, got: {:?}",
+            ctx.telemetry
+        );
     }
 
     #[tokio::test]

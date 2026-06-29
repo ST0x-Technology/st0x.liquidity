@@ -10,6 +10,12 @@ order_fill_poll_interval = 5
 
 [telemetry]
 service_name = "st0x-hedge"
+# Deployment environment exported as the `deployment.environment` resource
+# attribute (e.g. "production", "staging") so signals from different envs are
+# distinguishable in VictoriaTraces/VictoriaLogs.
+environment = "production"
+# OTLP/HTTP endpoints for the self-hosted observability box (VictoriaTraces
+# :10428, VictoriaLogs :9428), reached over Tailscale.
 traces_endpoint = "http://100.x.x.x:10428"
 logs_endpoint = "http://100.x.x.x:9428"
 

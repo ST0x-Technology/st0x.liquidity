@@ -28,6 +28,7 @@ use thiserror::Error;
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
+use url::Url;
 
 use crate::LogLevel;
 
@@ -54,36 +55,45 @@ fn build_log_file_appender(dir: &str) -> Result<RollingFileAppender, InitError> 
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     pub service_name: String,
-    pub traces_endpoint: String,
-    pub logs_endpoint: String,
+    /// Deployment environment (e.g. `production`, `staging`) exported as the
+    /// `deployment.environment` resource attribute. Without it, staging and
+    /// prod traces/logs are indistinguishable in VictoriaTraces/VictoriaLogs.
+    pub environment: String,
+    pub traces_endpoint: Url,
+    pub logs_endpoint: Url,
 }
 
 #[derive(Clone)]
 pub struct TelemetryCtx {
     pub service_name: String,
-    pub traces_endpoint: String,
-    pub logs_endpoint: String,
+    pub environment: String,
+    pub traces_endpoint: Url,
+    pub logs_endpoint: Url,
 }
 
 impl std::fmt::Debug for TelemetryCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryCtx")
             .field("service_name", &self.service_name)
+            .field("environment", &self.environment)
             .field("traces_endpoint", &self.traces_endpoint)
             .field("logs_endpoint", &self.logs_endpoint)
             .finish()
     }
 }
 
-impl TelemetryCtx {
-    pub fn new(config: TelemetryConfig) -> Self {
+impl From<TelemetryConfig> for TelemetryCtx {
+    fn from(config: TelemetryConfig) -> Self {
         Self {
             service_name: config.service_name,
+            environment: config.environment,
             traces_endpoint: config.traces_endpoint,
             logs_endpoint: config.logs_endpoint,
         }
     }
+}
 
+impl TelemetryCtx {
     pub fn setup(
         &self,
         log_level: tracing::Level,
@@ -96,14 +106,17 @@ impl TelemetryCtx {
 
         let resource = Resource::builder()
             .with_service_name(self.service_name.clone())
-            .with_attributes(vec![KeyValue::new("deployment.environment", "production")])
+            .with_attributes(vec![KeyValue::new(
+                "deployment.environment",
+                self.environment.clone(),
+            )])
             .build();
 
         let tracer_provider = {
             let span_exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .with_http_client(http_client.clone())
-                .with_endpoint(format!("{}/opentelemetry/v1/traces", self.traces_endpoint))
+                .with_endpoint(self.traces_endpoint.join("opentelemetry/v1/traces")?.as_str())
                 .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                 .build()?;
 
@@ -127,10 +140,11 @@ impl TelemetryCtx {
             let log_exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_http()
                 .with_http_client(http_client)
-                .with_endpoint(format!(
-                    "{}/insert/opentelemetry/v1/logs",
+                .with_endpoint(
                     self.logs_endpoint
-                ))
+                        .join("insert/opentelemetry/v1/logs")?
+                        .as_str(),
+                )
                 .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                 .build()?;
 
@@ -239,6 +253,8 @@ pub enum TelemetryError {
     HttpClient(#[from] reqwest::Error),
     #[error("Failed to build OTLP exporter")]
     OtlpExporter(#[from] ExporterBuildError),
+    #[error("Invalid telemetry endpoint URL")]
+    EndpointUrl(#[from] url::ParseError),
     #[error("Failed to set global subscriber")]
     Subscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
 }
@@ -492,6 +508,33 @@ mod tests {
             remaining, LOG_RETENTION_DAYS,
             "retention should leave exactly {LOG_RETENTION_DAYS} files \
              (max_files - 1 pruned survivors + today's file), found {remaining}"
+        );
+    }
+
+    #[test]
+    fn telemetry_setup_continues_without_file_logging_when_log_dir_is_invalid() {
+        // A regular file cannot contain a subdirectory, so the log directory
+        // cannot be created. setup() must keep the OTLP trace/log pipeline live
+        // and degrade only the file-logging half, returning a None file guard
+        // rather than failing the whole telemetry stack.
+        let file = NamedTempFile::new().unwrap();
+        let uncreatable_dir = file.path().join("nested");
+
+        let ctx = TelemetryCtx {
+            service_name: "test-service".to_string(),
+            environment: "test".to_string(),
+            traces_endpoint: Url::parse("http://localhost:10428").unwrap(),
+            logs_endpoint: Url::parse("http://localhost:9428").unwrap(),
+        };
+
+        let (file_guard, _telemetry_guard) = ctx
+            .setup(tracing::Level::INFO, uncreatable_dir.to_str(), None)
+            .unwrap();
+
+        assert!(
+            file_guard.is_none(),
+            "an invalid log dir must degrade to console-only logging (None file \
+             guard) while the OTLP exporters stay live"
         );
     }
 }
