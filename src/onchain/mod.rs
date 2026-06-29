@@ -1,18 +1,20 @@
 //! Onchain event processing: trade parsing, event backfilling,
 //! position accumulation, and vault management.
 
+use alloy::primitives::TxHash;
 use alloy::primitives::ruint::FromUintError;
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
 use std::num::TryFromIntError;
 
-use st0x_event_sorcery::ProjectionError;
+use st0x_event_sorcery::{ProjectionError, SendError};
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::{
     EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
     InvalidExecutorError, InvalidSharesError, NotPositive, PersistenceError, SharesConversionError,
 };
 
+use crate::onchain_trade::OnChainTrade;
 use crate::position::{Position, PositionError};
 
 pub(crate) mod accumulator;
@@ -65,6 +67,10 @@ pub(crate) enum OnChainError {
     InvalidDirection(#[from] InvalidDirectionError),
     #[error("Position error: {0}")]
     Position(#[from] PositionError),
+    #[error("OnChainTrade reorg command failed: {0}")]
+    OnChainTradeReorg(#[source] Box<SendError<OnChainTrade>>),
+    #[error("Position reorg command failed: {0}")]
+    PositionReorg(#[source] Box<SendError<Position>>),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] SharesConversionError),
     #[error(transparent)]
@@ -92,4 +98,29 @@ pub(crate) enum OnChainError {
         observed_tip: u64,
         required_tip: u64,
     },
+    #[error(
+        "Removed log at or below the ingestion cutoff is missing identifying \
+         fields (tx_hash={tx_hash:?}, log_index={log_index:?}, \
+         block_number={block_number:?}); cannot record the reorg reversal"
+    )]
+    RemovedLogMissingIdentity {
+        tx_hash: Option<TxHash>,
+        log_index: Option<u64>,
+        block_number: Option<u64>,
+    },
+}
+
+// `SendError` carries the (large) aggregate state, so box it on the way into
+// `OnChainError` to keep the enum small (avoids `clippy::result_large_err`)
+// while still letting call sites use `?`.
+impl From<SendError<OnChainTrade>> for OnChainError {
+    fn from(error: SendError<OnChainTrade>) -> Self {
+        Self::OnChainTradeReorg(Box::new(error))
+    }
+}
+
+impl From<SendError<Position>> for OnChainError {
+    fn from(error: SendError<Position>) -> Self {
+        Self::PositionReorg(Box::new(error))
+    }
 }

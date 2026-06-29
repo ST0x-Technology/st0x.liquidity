@@ -14,20 +14,42 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::Duration;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_config::EvmCtx;
+use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_evm::Evm;
-use st0x_execution::Executor;
+use st0x_execution::{Executor, FractionalShares};
 
 use super::OnChainError;
 use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{Job, Label};
 use crate::onchain::trade::RaindexTradeEvent;
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
+use crate::position::{Position, PositionCommand, TradeId};
+use crate::symbol::lock::get_symbol_lock;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
+
+/// A confirmed fill whose block a reorg dropped past the confirmation depth,
+/// identified for reversal. The `(tx_hash, log_index)` identity is the
+/// [`OnChainTradeId`] of the fill to reverse; `block_number` lets the caller
+/// derive how deep the reorg ran (current tip minus this block).
+#[derive(Debug, Clone)]
+pub(crate) struct RemovedTrade {
+    pub(crate) trade_id: OnChainTradeId,
+    pub(crate) block_number: u64,
+}
+
+/// What an `enqueue_batch_events` pass found: how many fresh fills it enqueued
+/// and which already-accounted fills its logs reported as reorged away.
+#[derive(Debug)]
+struct BatchOutcome {
+    enqueued: usize,
+    removed: Vec<RemovedTrade>,
+}
 
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
     const BACKFILL_MAX_RETRIES: usize = 15;
@@ -60,7 +82,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
     end_block: u64,
     retry_strategy: B,
     job_queue: DexTradeAccountingJobQueue,
-) -> Result<(), OnChainError> {
+) -> Result<Vec<RemovedTrade>, OnChainError> {
     let start_block = backfill_start_block(pool, evm_ctx).await?;
 
     backfill_range(
@@ -96,7 +118,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
     to_block: u64,
     retry_strategy: B,
     job_queue: DexTradeAccountingJobQueue,
-) -> Result<(), OnChainError> {
+) -> Result<Vec<RemovedTrade>, OnChainError> {
     if from_block > to_block {
         info!(
             target: "orderbook",
@@ -105,7 +127,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         );
 
         save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let total_blocks = to_block - from_block + 1;
@@ -119,8 +141,9 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
     let batch_ranges = generate_batch_ranges(from_block, to_block);
 
     let mut total_enqueued: usize = 0;
+    let mut removed_trades = Vec::new();
     for (batch_start, batch_end) in batch_ranges {
-        let enqueued = enqueue_batch_events(
+        let outcome = enqueue_batch_events(
             provider,
             evm_ctx,
             batch_start,
@@ -129,14 +152,20 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
             job_queue.clone(),
         )
         .await?;
-        total_enqueued += enqueued;
+        total_enqueued += outcome.enqueued;
+        removed_trades.extend(outcome.removed);
     }
 
-    info!(target: "orderbook", total_enqueued, "Backfill completed");
+    info!(
+        target: "orderbook",
+        total_enqueued,
+        total_removed = removed_trades.len(),
+        "Backfill completed"
+    );
 
     save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
 
-    Ok(())
+    Ok(removed_trades)
 }
 
 /// Persistent job queue for backfill jobs.
@@ -183,7 +212,7 @@ where
     }
 
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
-        backfill_range(
+        let removed = backfill_range(
             ctx.evm.provider(),
             &ctx.ctx.evm,
             &ctx.pool,
@@ -192,7 +221,40 @@ where
             get_backfill_retry_strat(),
             ctx.job_queue.clone(),
         )
-        .await
+        .await?;
+
+        if removed.is_empty() {
+            return Ok(());
+        }
+
+        // Depth is measured from the current tip: the dropped block is gone, so
+        // the reorg spans at least `tip - block_number` blocks. Fetched once and
+        // reused for every reversal in this batch.
+        let tip = ctx.evm.provider().get_block_number().await?;
+
+        for removed_trade in removed {
+            // A tip behind the removed block would saturate `reorg_depth` to 0 --
+            // a permanently underreported depth on an audit record. The load-
+            // balanced RPC routed us to a lagging node; fail so apalis retries
+            // against a caught-up one rather than recording a wrong depth.
+            if tip < removed_trade.block_number {
+                return Err(OnChainError::NodeLaggingBehindRequest {
+                    observed_tip: tip,
+                    required_tip: removed_trade.block_number,
+                });
+            }
+            let reorg_depth = tip - removed_trade.block_number;
+
+            record_reorg(
+                &ctx.cqrs.onchain_trade,
+                &ctx.cqrs.position,
+                &removed_trade,
+                reorg_depth,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -208,6 +270,82 @@ pub(crate) fn backfill_start_from_checkpoint(
     checkpoint.map_or(deployment_block, |last_processed_block| {
         (last_processed_block + 1).max(deployment_block)
     })
+}
+
+/// Reverses an already-accounted fill that a reorg dropped at or below the
+/// ingestion cutoff: appends `RecordReorg` to the `OnChainTrade` and `Position`
+/// aggregates through the CQRS framework (never direct SQL). A fill we never
+/// witnessed (e.g. a non-hedgeable pair) has nothing to reverse and is skipped.
+///
+/// The two sends are NOT atomic, so this path is only partially crash-safe. A
+/// crash after the `OnChainTrade` reversal but before the `Position` reversal
+/// leaves the position impact unreversed; on retry the `OnChainTrade`
+/// `AlreadyReorged` guard short-circuits before the `Position` repair can run,
+/// so that window stays open. Closing it is the job of the exactly-once reorg
+/// accounting built later in this stack, which records reversal progress per
+/// trade. A retry that did not crash mid-reversal is safe: if neither send
+/// landed it re-reverses cleanly, and if both landed `AlreadyReorged` makes the
+/// re-run a no-op.
+///
+/// The `Position` reversal runs under the same per-symbol lock that
+/// `AccountForDexTrade` holds while it mutates position state, so a concurrent
+/// live fill for the symbol cannot interleave with the reversal and corrupt the
+/// net.
+async fn record_reorg(
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    removed: &RemovedTrade,
+    reorg_depth: u64,
+) -> Result<(), OnChainError> {
+    let RemovedTrade { trade_id, .. } = removed;
+
+    let Some(trade) = onchain_trade.load(trade_id).await? else {
+        warn!(
+            target: "orderbook",
+            tx_hash = ?trade_id.tx_hash,
+            log_index = trade_id.log_index,
+            "Reorged log has no witnessed OnChainTrade; nothing to reverse"
+        );
+        return Ok(());
+    };
+
+    // Serialize against `AccountForDexTrade`, which holds this same per-symbol
+    // lock while it mutates position state; without it the `Position` reversal
+    // below could interleave with a concurrent live fill and corrupt the net.
+    let symbol_lock = get_symbol_lock(&trade.symbol).await;
+    let _guard = symbol_lock.lock().await;
+
+    match onchain_trade
+        .send(trade_id, OnChainTradeCommand::RecordReorg { reorg_depth })
+        .await
+    {
+        Ok(()) => {}
+        // Already reversed by an earlier delivery. Whether the `Position`
+        // reversal followed it is not knowable here (see the crash window in
+        // this fn's docs), so stop rather than reverse again; repairing a
+        // half-applied reversal is the exactly-once accounting's job.
+        Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::AlreadyReorged,
+        ))) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+
+    position
+        .send(
+            &trade.symbol,
+            PositionCommand::RecordReorg {
+                trade_id: TradeId {
+                    tx_hash: trade_id.tx_hash,
+                    log_index: trade_id.log_index,
+                },
+                amount: FractionalShares::new(trade.amount),
+                direction: trade.direction,
+                reorg_depth,
+            },
+        )
+        .await?;
+
+    Ok(())
 }
 
 /// Loads the checkpoint and derives the backfill resume point in one call.
@@ -280,7 +418,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     batch_end: u64,
     retry_strategy: B,
     mut job_queue: DexTradeAccountingJobQueue,
-) -> Result<usize, OnChainError> {
+) -> Result<BatchOutcome, OnChainError> {
     let clear_filter = Filter::new()
         .address(evm_ctx.orderbook)
         .from_block(batch_start)
@@ -330,32 +468,64 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         "Processed a batch of blocks from {batch_start} to {batch_end}",
     );
 
-    let trade_events = clear_logs
+    let mut removed_trades = Vec::new();
+    let mut present_logs = Vec::new();
+    for log in clear_logs
         .into_iter()
         .chain(take_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
-        .filter(|log| {
-            // Callers cap `to_block` at the ingestion cutoff block.
-            // Under `finalized`, this block cannot reorg, so `removed: true`
-            // implies a deep reorg crossing L1 finality. Under `safe`, a reorg
-            // is plausible (the batch may not yet be L1-finalized). In either
-            // case the fill is skipped to avoid persisting a vanished event. If a
-            // hedge was already placed against this fill, no reversal occurs; full
-            // reorg handling is tracked in the Reorg protection project.
-            if log.removed {
-                warn!(
-                    target: "orderbook",
-                    tx_hash = ?log.transaction_hash,
-                    log_index = ?log.log_index,
-                    block_number = ?log.block_number,
-                    "Backfill returned `removed: true` for a log at or below the \
-                     ingestion cutoff -- reorg detected; skipping. No reversal path \
-                     exists if a hedge was placed against this fill"
-                );
-                return false;
-            }
-            true
-        })
+    {
+        // The ingestion cutoff (currently the `safe` block) is not final: an L1
+        // reorg of the not-yet-finalized batch can still drop a fill. A
+        // `removed: true` log at or below the cutoff is such a reorg -- record it
+        // for reversal rather than silently dropping a vanished, already-accounted
+        // event.
+        //
+        // NOTE: this `removed: true` path is inert in production today. Both the
+        // monitor and backfill read fills via `eth_getLogs` range queries, which
+        // only ever return the current canonical chain and never flag a log
+        // `removed: true` -- only subscription / `eth_getFilterChanges`
+        // notifications do that, and neither path uses them. The authoritative
+        // reorg detector is a separate block-hash-mismatch re-scan -- comparing
+        // the persisted `block_hash` for a known `(tx_hash, log_index)` against a
+        // freshly observed one -- which is not yet built. This branch is kept as
+        // correct scaffolding for that detector; tests exercise it by
+        // synthesizing `removed: true` logs.
+        if !log.removed {
+            present_logs.push(log);
+            continue;
+        }
+
+        let (Some(tx_hash), Some(log_index), Some(block_number)) =
+            (log.transaction_hash, log.log_index, log.block_number)
+        else {
+            // Fail the batch rather than dropping the reorg: a `continue` here lets
+            // the checkpoint advance past an unreversible removed log, permanently
+            // losing the reversal. Erroring makes apalis retry once the provider
+            // returns complete identity fields.
+            return Err(OnChainError::RemovedLogMissingIdentity {
+                tx_hash: log.transaction_hash,
+                log_index: log.log_index,
+                block_number: log.block_number,
+            });
+        };
+
+        error!(
+            target: "orderbook",
+            ?tx_hash,
+            log_index,
+            block_number,
+            "Backfill returned `removed: true` for a log at or below the ingestion cutoff -- \
+             reorg detected; recording reversal"
+        );
+        removed_trades.push(RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number,
+        });
+    }
+
+    let trade_events = present_logs
+        .into_iter()
         .filter_map(|log| {
             if let Ok(clear_event) = log.log_decode::<ClearV3>() {
                 let event = RaindexTradeEvent::ClearV3(Box::new(clear_event.data().clone()));
@@ -384,7 +554,10 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
             .await?;
     }
 
-    Ok(enqueued_count)
+    Ok(BatchOutcome {
+        enqueued: enqueued_count,
+        removed: removed_trades,
+    })
 }
 
 /// Wraps `eth_getLogs` with a read-after-write check on the node's tip.
@@ -431,19 +604,33 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     use alloy::primitives::{
-        Address, B256, FixedBytes, IntoLogData, TxHash, U256, address, fixed_bytes, uint,
+        Address, B256, Bytes, FixedBytes, IntoLogData, LogData, TxHash, U256, address, fixed_bytes,
+        uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
+    use chrono::Utc;
     use rain_math_float::Float;
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{
+        EvmCtx, ExecutionThreshold, IngestionCutoff, create_test_ctx_with_order_owner,
+    };
     use url::Url;
+
+    use st0x_event_sorcery::StoreBuilder;
+    use st0x_execution::{Direction, MockExecutorCtx, Symbol, TryIntoExecutor};
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::bindings::IRaindexV6;
+    use crate::conductor::TradeProcessingCqrs;
+    use crate::offchain::order::{OffchainOrder, noop_order_placer};
+    use crate::onchain::pyth::PythFeedIds;
+    use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_pools};
+    use crate::vault_registry::VaultRegistry;
 
     fn test_retry_strategy() -> ExponentialBuilder {
         ExponentialBuilder::default()
@@ -1402,7 +1589,8 @@ mod tests {
             job_queue,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .enqueued;
 
         assert_eq!(enqueued_count, 1);
         assert_eq!(job_count(&apalis_pool).await, 1);
@@ -1618,7 +1806,7 @@ mod tests {
         )
         .await;
 
-        let enqueued_count = result.unwrap();
+        let enqueued_count = result.unwrap().enqueued;
         assert_eq!(enqueued_count, 0);
     }
 
@@ -1767,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backfill_skips_removed_logs() {
+    async fn test_backfill_does_not_enqueue_removed_log_as_fill() {
         // Backfill caller caps `to_block` at the ingestion cutoff
         // block. A `removed: true` log implies a reorg; skip it
         // (logged as warn) rather than ingesting a vanished event.
@@ -1814,7 +2002,7 @@ mod tests {
         assert_eq!(
             job_count(&apalis_pool).await,
             0,
-            "logs with removed=true must be skipped, not ingested"
+            "a removed log must not be enqueued as a fresh fill; it is surfaced for reversal"
         );
     }
 
@@ -1982,7 +2170,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(result.unwrap().enqueued, 0);
     }
 
     #[tokio::test]
@@ -2041,7 +2229,7 @@ mod tests {
         )
         .await;
 
-        let enqueued = result.unwrap();
+        let enqueued = result.unwrap().enqueued;
         assert_eq!(enqueued, 2);
     }
 
@@ -2136,7 +2324,7 @@ mod tests {
         .await;
         let elapsed = start_time.elapsed();
 
-        let enqueued = result.unwrap();
+        let enqueued = result.unwrap().enqueued;
         assert_eq!(enqueued, 0);
 
         // Should have taken at least the test initial delay time due to retries
@@ -2247,7 +2435,7 @@ mod tests {
         )
         .await;
 
-        let enqueued = result.unwrap();
+        let enqueued = result.unwrap().enqueued;
         assert_eq!(enqueued, 2);
         assert_eq!(job_count(&apalis_pool).await, 2);
     }
@@ -2285,5 +2473,403 @@ mod tests {
         .unwrap();
 
         assert_eq!(job_count(&apalis_pool).await, 0);
+    }
+
+    /// A `removed: true` log past the confirmation depth is surfaced as a
+    /// `RemovedTrade` for reversal instead of being silently dropped.
+    #[tokio::test]
+    async fn backfill_surfaces_removed_log_as_reorg() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+
+        let tx_hash = TxHash::repeat_byte(0xcd);
+        let removed_log = Log {
+            inner: alloy::primitives::Log {
+                address: address!("0x1111111111111111111111111111111111111111"),
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            },
+            block_hash: Some(B256::repeat_byte(0x11)),
+            block_number: Some(50),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(3),
+            removed: true,
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([removed_log])); // clear events
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm_ctx = EvmCtx {
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        };
+
+        let removed = backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            removed.len(),
+            1,
+            "the removed log must be surfaced for reversal"
+        );
+        assert_eq!(removed[0].trade_id.tx_hash, tx_hash);
+        assert_eq!(removed[0].trade_id.log_index, 3);
+        assert_eq!(removed[0].block_number, 50);
+        // The vanished fill must NOT be enqueued as a fresh trade.
+        assert_eq!(job_count(&apalis_pool).await, 0);
+    }
+
+    /// A `removed: true` log missing its `(tx_hash, log_index)` identity must
+    /// fail the batch with `RemovedLogMissingIdentity` rather than silently
+    /// advancing the checkpoint past a reorg it can never reverse.
+    #[tokio::test]
+    async fn enqueue_batch_events_fails_on_removed_log_without_identity() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+        let evm_ctx = EvmCtx {
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        };
+
+        // A reorged-out log whose `transaction_hash` the provider dropped: the
+        // batch must error, not skip, so apalis retries once identity is intact.
+        let removed_log = Log {
+            inner: alloy::primitives::Log {
+                address: evm_ctx.orderbook,
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            },
+            block_hash: Some(B256::repeat_byte(0x11)),
+            block_number: Some(50),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: Some(0),
+            log_index: Some(3),
+            removed: true,
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([removed_log])); // clear events
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = enqueue_batch_events(
+            &provider,
+            &evm_ctx,
+            1,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OnChainError::RemovedLogMissingIdentity {
+                    tx_hash: None,
+                    log_index: Some(3),
+                    block_number: Some(50),
+                }
+            ),
+            "a removed log missing its tx_hash must fail with RemovedLogMissingIdentity; got {error:?}"
+        );
+        assert_eq!(job_count(&apalis_pool).await, 0);
+    }
+
+    /// `BackfillRange::perform` measures reorg depth from the current tip. A tip
+    /// behind the removed fill's block would underreport the depth, so the job
+    /// must fail with `NodeLaggingBehindRequest` (apalis then retries against a
+    /// caught-up node) rather than record a wrong depth.
+    #[tokio::test]
+    async fn perform_fails_when_tip_lags_behind_removed_block() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        // The batch surfaces one removed fill at block 50, then perform reads a
+        // tip of 1 -- behind the removed block, so the depth cannot be computed.
+        let removed_log = Log {
+            inner: alloy::primitives::Log {
+                address: ctx.evm.orderbook,
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            },
+            block_hash: Some(B256::repeat_byte(0x11)),
+            block_number: Some(50),
+            block_timestamp: None,
+            transaction_hash: Some(TxHash::repeat_byte(0xcd)),
+            transaction_index: Some(0),
+            log_index: Some(3),
+            removed: true,
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([removed_log])); // clear getLogs
+        push_tip_response(&asserter); // clear tip
+        asserter.push_success(&serde_json::json!([])); // take getLogs
+        push_tip_response(&asserter); // take tip
+        asserter.push_success(&serde_json::json!("0x1")); // perform's tip = 1
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let (vault_registry, _vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
+        let cqrs = TradeProcessingCqrs {
+            onchain_trade,
+            position,
+            position_projection,
+            offchain_order,
+            order_placer: noop_order_placer(),
+            execution_threshold: ExecutionThreshold::whole_share(),
+            assets: ctx.assets.clone(),
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
+        };
+
+        let accountant_ctx = AccountantCtx {
+            orderbook: ctx.evm.orderbook,
+            ctx,
+            cache: SymbolCache::default(),
+            pyth_feed_ids: PythFeedIds::default(),
+            evm: st0x_evm::ReadOnlyEvm::new(provider),
+            cqrs,
+            vault_registry,
+            executor,
+            pool: pool.clone(),
+            job_queue: DexTradeAccountingJobQueue::new(&apalis_pool),
+        };
+
+        let job = BackfillRange {
+            from_block: 1,
+            to_block: 100,
+        };
+        let error = job.perform(&accountant_ctx).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OnChainError::NodeLaggingBehindRequest {
+                    observed_tip: 1,
+                    required_tip: 50,
+                }
+            ),
+            "a tip behind the removed block must fail with NodeLaggingBehindRequest; got {error:?}"
+        );
+        // The reorg must not be recorded against the lagging tip.
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 0);
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 0);
+    }
+
+    /// `record_reorg` appends `Reorged` to both aggregates through the CQRS
+    /// framework (never direct SQL) and reverses the position to flat.
+    #[tokio::test]
+    async fn record_reorg_emits_reorged_events_through_cqrs() {
+        let pool = setup_test_db().await;
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        seed_witnessed_fill(&onchain_trade, &position, &symbol, tx_hash, log_index, now).await;
+
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+        };
+        let before_reorg = Utc::now();
+        record_reorg(&onchain_trade, &position, &removed, 12)
+            .await
+            .unwrap();
+        let after_reorg = Utc::now();
+
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+
+        let position_state = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position_state.net,
+            FractionalShares::ZERO,
+            "the reversal must return the position to flat",
+        );
+        let last_reorged_at = position_state
+            .last_reorged_at
+            .expect("the reversal must mark the position reorged");
+        assert!(
+            (before_reorg..=after_reorg).contains(&last_reorged_at),
+            "last_reorged_at {last_reorged_at} must fall within the reversal window \
+             [{before_reorg}, {after_reorg}]"
+        );
+    }
+
+    /// A re-delivered backfill range must not double-reverse: the OnChainTrade
+    /// `AlreadyReorged` guard short-circuits the second emission.
+    #[tokio::test]
+    async fn record_reorg_is_idempotent_across_redelivery() {
+        let pool = setup_test_db().await;
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        seed_witnessed_fill(&onchain_trade, &position, &symbol, tx_hash, log_index, now).await;
+
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+        };
+        record_reorg(&onchain_trade, &position, &removed, 12)
+            .await
+            .unwrap();
+        record_reorg(&onchain_trade, &position, &removed, 12)
+            .await
+            .unwrap();
+
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+
+        let position_state = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position_state.net,
+            FractionalShares::ZERO,
+            "a re-delivery must not reverse the fill twice",
+        );
+    }
+
+    /// A reorged log for a fill we never witnessed (e.g. a non-hedgeable pair)
+    /// has no aggregate to reverse and is skipped without error.
+    #[tokio::test]
+    async fn record_reorg_skips_unwitnessed_fill() {
+        let pool = setup_test_db().await;
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId {
+                tx_hash: TxHash::repeat_byte(0xee),
+                log_index: 1,
+            },
+            block_number: 100,
+        };
+        record_reorg(&onchain_trade, &position, &removed, 5)
+            .await
+            .unwrap();
+
+        assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 0);
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 0);
+    }
+
+    async fn seed_witnessed_fill(
+        onchain_trade: &Store<OnChainTrade>,
+        position: &Store<Position>,
+        symbol: &Symbol,
+        tx_hash: TxHash,
+        log_index: u64,
+        now: chrono::DateTime<Utc>,
+    ) {
+        onchain_trade
+            .send(
+                &OnChainTradeId { tx_hash, log_index },
+                OnChainTradeCommand::Witness {
+                    symbol: symbol.clone(),
+                    amount: float!(5),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_number: 100,
+                    block_hash: None,
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId { tx_hash, log_index },
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn count_events(pool: &SqlitePool, event_type: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE event_type = ?")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 }
