@@ -8,14 +8,13 @@
 use std::collections::BTreeSet;
 
 use alloy::primitives::TxHash;
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use st0x_config::ExecutionThreshold;
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil, Table};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
 };
@@ -136,13 +135,12 @@ impl std::fmt::Debug for Position {
     }
 }
 
-#[async_trait]
 impl EventSourced for Position {
     type Id = Symbol;
     type Event = PositionEvent;
     type Command = PositionCommand;
     type Error = PositionError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "Position";
@@ -428,9 +426,9 @@ impl EventSourced for Position {
         }
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use PositionCommand::*;
         match command {
@@ -515,10 +513,10 @@ impl EventSourced for Position {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use PositionCommand::*;
         match command {
@@ -1791,7 +1789,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_fill_initializes_and_accumulates() {
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given_no_previous_events()
             .when(PositionCommand::AcknowledgeOnChainFill {
                 symbol: Symbol::new("AAPL").unwrap(),
@@ -1828,7 +1826,7 @@ mod tests {
     async fn acknowledge_onchain_fill_accumulates_position() {
         let threshold = one_share_threshold();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
@@ -1873,7 +1871,7 @@ mod tests {
             log_index: 1,
         };
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol,
@@ -1943,7 +1941,7 @@ mod tests {
             log_index: 1,
         };
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol,
@@ -2140,7 +2138,7 @@ mod tests {
         };
         let amount = FractionalShares::new(float!(5));
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -2212,7 +2210,7 @@ mod tests {
         };
         let amount = FractionalShares::new(float!(5));
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -2271,7 +2269,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_reorg_uninitialized_position() {
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given_no_previous_events()
             .when(PositionCommand::RecordReorg {
                 trade_id: TradeId {
@@ -2303,7 +2301,7 @@ mod tests {
             log_index: 1,
         };
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol,
@@ -2362,7 +2360,7 @@ mod tests {
         };
         let amount = FractionalShares::new(float!(5));
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -2530,7 +2528,7 @@ mod tests {
             log_index: 1,
         };
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -2588,7 +2586,7 @@ mod tests {
         };
         let now = Utc::now();
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -2763,7 +2761,7 @@ mod tests {
         };
         let now = Utc::now();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -2803,7 +2801,7 @@ mod tests {
     async fn settle_is_noop_when_not_member() {
         let threshold = one_share_threshold();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
@@ -2836,7 +2834,7 @@ mod tests {
         };
         let amount = FractionalShares::new(float!(5));
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -2935,7 +2933,7 @@ mod tests {
     async fn settle_reorg_is_noop_when_not_member() {
         let threshold = one_share_threshold();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
@@ -2960,7 +2958,7 @@ mod tests {
     async fn shares_threshold_triggers_execution() {
         let threshold = one_share_threshold();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -3007,7 +3005,7 @@ mod tests {
     async fn place_offchain_order_below_threshold_fails() {
         let threshold = one_share_threshold();
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -3047,7 +3045,7 @@ mod tests {
         let threshold = one_share_threshold();
         let offchain_order_id = OffchainOrderId::new();
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -3098,7 +3096,7 @@ mod tests {
         let threshold = one_share_threshold();
         let offchain_order_id = OffchainOrderId::new();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -3147,7 +3145,7 @@ mod tests {
         let threshold = one_share_threshold();
         let offchain_order_id = OffchainOrderId::new();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -3189,7 +3187,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_threshold_creates_audit_trail() {
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold: one_share_threshold(),
@@ -3212,7 +3210,7 @@ mod tests {
         let threshold = one_share_threshold();
         let target_net = FractionalShares::new(float!(100));
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given_no_previous_events()
             .when(PositionCommand::ManuallyAdjustPosition {
                 symbol: symbol.clone(),
@@ -3259,7 +3257,7 @@ mod tests {
         let symbol = Symbol::new("SPYM").unwrap();
         let threshold = one_share_threshold();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -3312,7 +3310,7 @@ mod tests {
         let threshold = one_share_threshold();
         let offchain_order_id = OffchainOrderId::new();
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -3404,7 +3402,7 @@ mod tests {
         let symbol = Symbol::new("SPYM").unwrap();
         let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given_no_previous_events()
             .when(PositionCommand::ManuallyAdjustPosition {
                 symbol,
@@ -3430,7 +3428,7 @@ mod tests {
             let symbol = Symbol::new("SPYM").unwrap();
             let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
 
-            let error = TestHarness::<Position>::with(())
+            let error = TestHarness::<Position>::with()
                 .given_no_previous_events()
                 .when(PositionCommand::ManuallyAdjustPosition {
                     symbol,
@@ -3460,7 +3458,7 @@ mod tests {
         let symbol = Symbol::new("SPYM").unwrap();
         let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given_no_previous_events()
             .when(PositionCommand::ManuallyAdjustPosition {
                 symbol,
@@ -3516,7 +3514,7 @@ mod tests {
         let symbol = Symbol::new("SPYM").unwrap();
         let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
 
-        let events = TestHarness::<Position>::with(())
+        let events = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -3566,7 +3564,7 @@ mod tests {
         let symbol = Symbol::new("SPYM").unwrap();
         let threshold = one_share_threshold();
 
-        let error = TestHarness::<Position>::with(())
+        let error = TestHarness::<Position>::with()
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -4401,7 +4399,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_none_when_no_aggregate_exists() {
         let pool = crate::test_utils::setup_test_db().await;
-        let (_store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let (_store, projection) = StoreBuilder::<Position>::new(pool).build().await.unwrap();
 
         let result = projection
             .load(&Symbol::new("AAPL").unwrap())
@@ -4417,7 +4415,7 @@ mod tests {
     #[tokio::test]
     async fn load_position_returns_position_for_live_lifecycle() {
         let pool = crate::test_utils::setup_test_db().await;
-        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build().await.unwrap();
 
         let symbol = Symbol::new("AAPL").unwrap();
 

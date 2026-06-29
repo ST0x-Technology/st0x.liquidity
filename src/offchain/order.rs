@@ -40,7 +40,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{Direction, Trade, TradingVenue};
-use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, JobQueue, Nil, SendError, Store, Table};
 use st0x_execution::{
     AlpacaBrokerApiError, ClientOrderId, ExecutionError, Executor, ExecutorOrderId,
     FractionalShares, MarketOrder, PersistenceError, Positive, SupportedExecutor, Symbol,
@@ -253,13 +253,12 @@ pub enum OffchainOrder {
     },
 }
 
-#[async_trait]
 impl EventSourced for OffchainOrder {
     type Id = OffchainOrderId;
     type Event = OffchainOrderEvent;
     type Command = OffchainOrderCommand;
     type Error = OffchainOrderError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
@@ -458,9 +457,9 @@ impl EventSourced for OffchainOrder {
         }
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        (): &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use OffchainOrderCommand::*;
         match command {
@@ -485,10 +484,10 @@ impl EventSourced for OffchainOrder {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        (): &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             // Idempotent against a placement retry: the durable path re-sends
@@ -1002,7 +1001,7 @@ mod tests {
     async fn place_at_broker(placer: &dyn OrderPlacer) -> Option<OffchainOrder> {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1105,7 +1104,7 @@ mod tests {
     async fn place_retry_with_divergent_payload_is_rejected() {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let id = OffchainOrderId::new();
@@ -1138,7 +1137,7 @@ mod tests {
     async fn place_at_broker_skips_broker_when_order_left_pending() {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let id = OffchainOrderId::new();
@@ -1195,7 +1194,7 @@ mod tests {
     async fn place_at_broker_skips_markfailed_when_order_advanced_concurrently() {
         let pool = crate::test_utils::setup_test_db().await;
         let (store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let id = OffchainOrderId::new();
@@ -1260,7 +1259,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_is_idempotent_once_placed() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // The durable placement path re-sends `Place` on retry; an existing
@@ -1296,7 +1295,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_accepted_is_idempotent_on_submitted() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // The durable placement path re-sends `MarkAccepted` on retry (the broker
@@ -1326,7 +1325,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_is_idempotent_on_failed() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -1362,7 +1361,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_accepted_after_failed_is_noop() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         store.send(&id, place_command()).await.unwrap();
@@ -1400,7 +1399,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1421,7 +1420,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_updates_shares() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1456,7 +1455,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1476,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_fill_from_partially_filled() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1506,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_uninitialized_order() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         let err = store
@@ -1526,7 +1525,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fill_already_filled() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1557,7 +1556,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_submitted() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1577,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_failed_from_partially_filled() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;
@@ -1607,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_placement_failed_fails_a_pending_order() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // The placement path's broker call errored while the order was still
@@ -1629,7 +1628,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_placement_failed_leaves_a_live_order_untouched() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         // A stale placement attempt's broker error must never fail a live order a
@@ -1659,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_fail_already_filled() {
-        let store = TestStore::<OffchainOrder>::new(());
+        let store = TestStore::<OffchainOrder>::new();
         let id = OffchainOrderId::new();
 
         place_and_submit(&store, &id).await;

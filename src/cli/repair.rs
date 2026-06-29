@@ -29,7 +29,7 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
     reason: String,
 ) -> anyhow::Result<()> {
     let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
+        .build()
         .await
         .context("failed to build position store")?;
 
@@ -253,7 +253,7 @@ async fn fail_offchain_order_aggregate<W: Write>(
     // projection updates immediately -- a stale 'Submitted' row in the view is
     // the very symptom this command exists to repair.
     let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(())
+        .build()
         .await
         .context("failed to build offchain order store")?;
     let send_result = store
@@ -340,7 +340,7 @@ pub(super) async fn set_position_command<W: Write>(
     }
 
     let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
+        .build()
         .await
         .context("failed to build position store")?;
 
@@ -411,7 +411,6 @@ mod tests {
                 direction: Direction::Sell,
                 executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
             },
-            (),
         )
         .await
         .unwrap();
@@ -427,7 +426,6 @@ mod tests {
                 placed_shares: positive_shares("0.5"),
                 submitted_at: chrono::Utc::now(),
             },
-            (),
         )
         .await
         .unwrap();
@@ -439,7 +437,7 @@ mod tests {
         offchain_order_id: OffchainOrderId,
     ) {
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let threshold = ExecutionThreshold::whole_share();
@@ -497,7 +495,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -530,7 +528,7 @@ mod tests {
 
         // Position pointer cleared.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -591,7 +589,6 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -612,7 +609,7 @@ mod tests {
             "expected a filled-order refusal; got: {error}"
         );
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -649,7 +646,6 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -698,7 +694,6 @@ mod tests {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -770,7 +765,6 @@ mod tests {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -791,7 +785,6 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -812,7 +805,6 @@ mod tests {
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it".to_string(),
             },
-            (),
         )
         .await
         .unwrap();
@@ -837,7 +829,7 @@ mod tests {
 
         // Partial prior run cleared the pointer...
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         position
@@ -858,7 +850,6 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -899,7 +890,6 @@ mod tests {
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it concurrently".to_string(),
             },
-            (),
         )
         .await
         .unwrap();
@@ -950,7 +940,6 @@ mod tests {
             OffchainOrderCommand::MarkFailed {
                 error: "pre-failed".to_string(),
             },
-            (),
         )
         .await
         .unwrap();
@@ -974,7 +963,7 @@ mod tests {
 
         // The pointer must still be cleared even when the order needed no fix.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -1004,7 +993,7 @@ mod tests {
 
         // Simulate the partial prior run: pointer cleared, order untouched.
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         position
@@ -1074,12 +1063,12 @@ mod tests {
         // Symbol A has a position with a clear pointer; the order belongs to B.
         seed_pending_position(&pool, &symbol_a, OffchainOrderId::new()).await;
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = {
             let (_pos, projection) = StoreBuilder::<Position>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
             projection.load(&symbol_a).await.unwrap().unwrap()
@@ -1141,7 +1130,6 @@ mod tests {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
             },
-            (),
         )
         .await
         .unwrap();
@@ -1173,7 +1161,7 @@ mod tests {
             "order must remain PartiallyFilled, got {order:?}"
         );
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -1198,7 +1186,7 @@ mod tests {
         seed_pending_position(&pool, &symbol, order_id).await;
 
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         position
@@ -1250,7 +1238,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -1339,7 +1327,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1351,7 +1339,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("MSTR").unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1411,7 +1399,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1430,7 +1418,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("SPYM").unwrap();
         let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1468,7 +1456,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1508,7 +1496,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -1541,7 +1529,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -1572,7 +1560,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();
@@ -1608,7 +1596,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&symbol).await.unwrap().unwrap();

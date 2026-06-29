@@ -138,12 +138,12 @@ wasm-bindgen = "=0.2.122"
 
 [workspace.dependencies.sqlite-es]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "0.1.1"
+tag = "0.2.0-rc2"
 package = "sqlite-es"
 
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "0.1.1"
+tag = "0.2.0-rc2"
 package = "event-sorcery"
 
 [package]

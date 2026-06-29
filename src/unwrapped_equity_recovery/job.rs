@@ -1032,8 +1032,8 @@ mod tests {
     ) -> UnwrappedEquityRecoveryCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let mint_store = Arc::new(test_store(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             vault_lookup.clone(),
@@ -1050,7 +1050,7 @@ mod tests {
             transfer,
             wallet: Address::random(),
         };
-        let store = Arc::new(test_store(pool, ()));
+        let store = Arc::new(test_store(pool));
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(view, sender));
 
@@ -1098,8 +1098,8 @@ mod tests {
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let mint_store = Arc::new(test_store(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             Arc::new(MockVaultLookup::new()),
@@ -1116,7 +1116,7 @@ mod tests {
             transfer,
             wallet: Address::random(),
         };
-        let store = Arc::new(test_store(pool.clone(), ()));
+        let store = Arc::new(test_store(pool.clone()));
 
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
@@ -1172,8 +1172,8 @@ mod tests {
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let mint_store = Arc::new(test_store(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store(pool.clone(), ()));
+        let mint_store = Arc::new(test_store(pool.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             Arc::new(MockVaultLookup::new()),
@@ -1190,7 +1190,7 @@ mod tests {
             transfer,
             wallet: Address::random(),
         };
-        let store = Arc::new(test_store(pool.clone(), ()));
+        let store = Arc::new(test_store(pool.clone()));
 
         // Inventory reports an unwrapped balance (so a snapshot exists) and an
         // active mint for the symbol (so dispatch resolves to `ActiveMint`), but

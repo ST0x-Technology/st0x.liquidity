@@ -8,7 +8,6 @@
 
 use alloy::hex::FromHexError;
 use alloy::primitives::{Address, B256, TxHash};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,7 +19,9 @@ use tracing::{debug, info};
 
 use st0x_execution::Symbol;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Projection, SendError, Store, Table};
+use st0x_event_sorcery::{
+    DomainEvent, EventSourced, Never, Nil, Projection, SendError, Store, Table,
+};
 
 use st0x_config::{Ctx, CtxError};
 
@@ -72,13 +73,12 @@ impl FromStr for VaultRegistryId {
     }
 }
 
-#[async_trait]
 impl EventSourced for VaultRegistry {
     type Id = VaultRegistryId;
     type Event = VaultRegistryEvent;
     type Command = VaultRegistryCommand;
     type Error = Never;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
@@ -97,17 +97,19 @@ impl EventSourced for VaultRegistry {
         Ok(Some(new_registry))
     }
 
-    async fn initialize(
+    // Fully-qualified `st0x_event_sorcery::JobQueue` here avoids colliding with
+    // the `crate::conductor::job::JobQueue` imported in this module.
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut st0x_event_sorcery::JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         Ok(vec![Self::command_to_event(command)])
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut st0x_event_sorcery::JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match &command {
             VaultRegistryCommand::SeedEquityVaultFromConfig {
@@ -767,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_equity_discovery_initializes_registry() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given_no_previous_events()
             .when(VaultRegistryCommand::DiscoverEquityVault {
                 token: TEST_TOKEN,
@@ -794,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_usdc_discovery_initializes_registry() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given_no_previous_events()
             .when(VaultRegistryCommand::DiscoverUsdcVault {
                 vault_id: TEST_VAULT_ID,
@@ -813,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_equity_vault_on_existing_registry() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::UsdcVaultDiscovered {
                 vault_id: TEST_VAULT_ID,
                 discovered_in: TEST_TX_HASH,
@@ -844,7 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_usdc_vault_on_existing_registry() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::EquityVaultDiscovered {
                 token: TEST_TOKEN,
                 vault_id: TEST_VAULT_ID,
@@ -874,7 +876,7 @@ mod tests {
         let new_tx_hash =
             b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::EquityVaultDiscovered {
                 token: TEST_TOKEN,
                 vault_id: TEST_VAULT_ID,
@@ -1192,7 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn seed_equity_vault_deduplicates_on_same_token_and_vault_id() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::EquityVaultSeededFromConfig {
                 token: TEST_TOKEN,
                 vault_id: TEST_VAULT_ID,
@@ -1219,7 +1221,7 @@ mod tests {
         let new_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
 
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::EquityVaultSeededFromConfig {
                 token: TEST_TOKEN,
                 vault_id: TEST_VAULT_ID,
@@ -1243,7 +1245,7 @@ mod tests {
 
     #[tokio::test]
     async fn seed_usdc_vault_deduplicates_on_same_vault_id() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::UsdcVaultSeededFromConfig {
                 vault_id: TEST_VAULT_ID,
                 seeded_at: Utc::now(),
@@ -1266,7 +1268,7 @@ mod tests {
         let new_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
 
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![VaultRegistryEvent::UsdcVaultSeededFromConfig {
                 vault_id: TEST_VAULT_ID,
                 seeded_at: Utc::now(),
@@ -1286,7 +1288,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_primary_equity_vault_deduplicates_when_config_unchanged() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![
                 VaultRegistryEvent::EquityVaultSeededFromConfig {
                     token: TEST_TOKEN,
@@ -1321,7 +1323,7 @@ mod tests {
         let new_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
 
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![
                 VaultRegistryEvent::EquityVaultSeededFromConfig {
                     token: TEST_TOKEN,
@@ -1364,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_primary_usdc_vault_deduplicates_when_config_unchanged() {
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![
                 VaultRegistryEvent::UsdcVaultSeededFromConfig {
                     vault_id: TEST_VAULT_ID,
@@ -1393,7 +1395,7 @@ mod tests {
         let new_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
 
-        let events = TestHarness::<VaultRegistry>::with(())
+        let events = TestHarness::<VaultRegistry>::with()
             .given(vec![
                 VaultRegistryEvent::UsdcVaultSeededFromConfig {
                     vault_id: TEST_VAULT_ID,
@@ -1439,7 +1441,7 @@ mod tests {
 
         // Phase 1: emit an event with NO reactors
         let (bare_store, _projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1461,7 +1463,7 @@ mod tests {
         let reactor = EventCounter(counter.clone());
         let (observed_store, _projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
             .with(Arc::new(reactor))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1535,7 +1537,7 @@ mod tests {
 
     async fn seed_ctx_from(pool: sqlx::SqlitePool, ctx: &Ctx) -> Arc<SeedVaultRegistryCtx> {
         let (store, _projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1602,7 +1604,7 @@ mod tests {
 
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
+            .build()
             .await
             .unwrap();
 

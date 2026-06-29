@@ -179,7 +179,7 @@ mod tests {
         pool: &SqlitePool,
     ) -> (Arc<Store<Position>>, Arc<Projection<Position>>) {
         StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap()
     }

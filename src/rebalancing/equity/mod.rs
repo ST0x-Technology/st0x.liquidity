@@ -2058,7 +2058,7 @@ mod tests {
                     cash: None,
                 },
             },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory.clone(),
@@ -2071,19 +2071,19 @@ mod tests {
         // events to the reactor's `on_mint`.
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(service.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         service
             .set_stores(
                 mint_store.clone(),
                 redemption_store.clone(),
-                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone())),
             )
             .await;
 
@@ -2204,7 +2204,7 @@ mod tests {
                     cash: None,
                 },
             },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory.clone(),
@@ -2215,19 +2215,19 @@ mod tests {
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(service.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         service
             .set_stores(
                 mint_store.clone(),
                 redemption_store.clone(),
-                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone())),
             )
             .await;
 
@@ -2530,7 +2530,7 @@ mod tests {
                     cash: None,
                 },
             },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone())),
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory,
@@ -2541,19 +2541,19 @@ mod tests {
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(service.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         service
             .set_stores(
                 mint_store.clone(),
                 redemption_store.clone(),
-                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone())),
             )
             .await;
 
@@ -2589,8 +2589,8 @@ mod tests {
     ) -> (CrossVenueEquityTransfer, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
         let vault_lookup = mock_vault_lookup();
 
         let transfer = CrossVenueEquityTransfer::new(

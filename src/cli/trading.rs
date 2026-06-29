@@ -530,14 +530,13 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
-        .await?;
+    let (position_store, position_projection) =
+        StoreBuilder::<Position>::new(pool.clone()).build().await?;
     let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
     let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-        .build(())
+        .build()
         .await?;
 
     // Refuse a fill the bot has already recorded (witnessed or acknowledged),
@@ -1442,7 +1441,7 @@ mod tests {
 
         // Simulate the automated path having already accounted this fill.
         let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         onchain_trade_store
@@ -1483,7 +1482,7 @@ mod tests {
         // The position must never have been touched -- the fill is not
         // re-counted.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -1515,7 +1514,7 @@ mod tests {
 
         // Witness only -- no Acknowledge: the crash-window state.
         let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         onchain_trade_store
@@ -1554,7 +1553,7 @@ mod tests {
 
         // The position must never have been touched.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -1585,7 +1584,7 @@ mod tests {
             .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let view = projection.load(&base_symbol).await.unwrap().unwrap();
@@ -1599,7 +1598,7 @@ mod tests {
         // double-counted (and the bot's later pickup of the same fill skips it as
         // already acknowledged).
         let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let recorded = onchain_trade_store
@@ -1635,7 +1634,7 @@ mod tests {
         .unwrap();
 
         let (position_store, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let position = position_store
@@ -1676,11 +1675,11 @@ mod tests {
         };
 
         let (position_store, _projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1780,7 +1779,7 @@ mod tests {
         .unwrap();
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         let net_after_first = projection.load(&base_symbol).await.unwrap().unwrap().net;
@@ -1834,7 +1833,7 @@ mod tests {
 
         // Fully account A on the OnChainTrade log (witness + acknowledge).
         let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         onchain_trade_store
@@ -1859,7 +1858,7 @@ mod tests {
 
         // Apply A then the newer B to the position, so its single slot points at B.
         let (position_store, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         for fill in [&fill_a, &fill_b] {
@@ -1971,7 +1970,7 @@ mod tests {
 
         // Fail-closed before any write: no position, no witness.
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(
@@ -2014,7 +2013,7 @@ mod tests {
         );
 
         let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
         assert!(

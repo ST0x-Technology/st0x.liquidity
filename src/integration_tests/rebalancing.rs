@@ -90,7 +90,7 @@ const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000
 async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address) {
     let vault_id = B256::from(keccak256(symbol.to_string().as_bytes()));
 
-    let cqrs = test_store::<VaultRegistry>(pool.clone(), ());
+    let cqrs = test_store::<VaultRegistry>(pool.clone());
     let id = VaultRegistryId {
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
@@ -240,7 +240,7 @@ async fn build_position_cqrs_with_service(
 ) -> Arc<Store<Position>> {
     let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(Arc::clone(service))
-        .build(())
+        .build()
         .await
         .unwrap();
 
@@ -277,7 +277,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         event_sender,
     ));
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
 
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -540,8 +540,8 @@ fn build_equity_transfer_with_wrapper(
 ) -> Arc<CrossVenueEquityTransfer> {
     let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
         vault_lookup,
@@ -570,13 +570,13 @@ async fn build_equity_transfer_with_service(
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::clone(service))
-        .build(())
+        .build()
         .await
         .unwrap();
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
         .with(Arc::clone(service))
-        .build(())
+        .build()
         .await
         .unwrap();
 
@@ -733,7 +733,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             )]));
     });
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -1154,7 +1154,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     })
     .await;
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -1239,7 +1239,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     })
     .await;
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -1335,7 +1335,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         event_sender,
     ));
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     // Trigger config mirrors prod: reserved is configured here so the
@@ -1368,7 +1368,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let snapshot_store =
         StoreBuilder::<crate::inventory::snapshot::InventorySnapshot>::new(pool.clone())
             .with(Arc::clone(&service))
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -1486,7 +1486,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     })
     .await;
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -1543,7 +1543,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         cash.reserved = Some(Positive::new(Usd::new(float!(100))).unwrap());
     }
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -1587,7 +1587,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
     })
     .await;
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -1684,7 +1684,7 @@ async fn mint_api_failure_produces_rejected_event() {
     drain_pending_jobs(&service).await.unwrap();
 
     let job = fetch_pending_equity_mint_job(&apalis_pool).await;
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -1807,7 +1807,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         assets,
     };
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -1935,7 +1935,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         assets,
     };
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
     let wrapper = Arc::new(MockWrapper::new());
 
     let trigger = RebalancingService::new(
@@ -2033,7 +2033,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 }),
             },
         };
-        let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
         let wrapper = Arc::new(MockWrapper::new());
         let trigger = RebalancingService::new(
             wide_config,
@@ -2092,7 +2092,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 }),
             },
         };
-        let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+        let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone()));
         let wrapper = Arc::new(MockWrapper::new());
         let trigger = RebalancingService::new(
             tight_config,
@@ -2251,7 +2251,7 @@ async fn mint_accepted_sets_offchain_inflight() {
     // The poll will return pending, so the mint aggregate will time out or loop,
     // but MintAccepted has already fired by then. We spawn and cancel to
     // get just the MintAccepted event through.
-    let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
+    let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
     let transfer_handle = tokio::spawn({
         let equity_transfer = Arc::clone(&equity_transfer);
         let mint_store = Arc::clone(&mint_store_for_spawn);
@@ -2457,7 +2457,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     };
 
     // Execute the full mint lifecycle through the job's perform
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: Arc::clone(&equity_transfer) as _,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -2526,7 +2526,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
     // Build a redemption store wired to the trigger so events flow through
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
         .with(Arc::clone(&service))
-        .build(())
+        .build()
         .await
         .unwrap();
 
@@ -2669,8 +2669,8 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -2686,7 +2686,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         wrapper,
         transfer,
     };
-    let store = Arc::new(test_store(pool.clone(), ()));
+    let store = Arc::new(test_store(pool.clone()));
 
     let (sender, _receiver) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
@@ -2774,8 +2774,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -2791,7 +2791,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         wrapper,
         transfer,
     };
-    let store = Arc::new(test_store(pool.clone(), ()));
+    let store = Arc::new(test_store(pool.clone()));
 
     // Inventory reports WRAPPED balance: the wrap landed, tokens are wtSTOCK
     // in the base wallet outside Raindex.
@@ -2898,8 +2898,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -2916,7 +2916,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         transfer,
         wallet: Address::ZERO,
     };
-    let store = Arc::new(test_store::<UnwrappedEquityRecovery>(pool.clone(), ()));
+    let store = Arc::new(test_store::<UnwrappedEquityRecovery>(pool.clone()));
 
     // Inventory reports UNWRAPPED balance: wrap failed, tokens are raw tSTOCK
     // in the base wallet.
@@ -3014,8 +3014,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
-    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone(), ()));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone()));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(pool.clone()));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
@@ -3032,7 +3032,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         transfer,
         wallet: Address::ZERO,
     };
-    let store = Arc::new(test_store::<UnwrappedEquityRecovery>(pool.clone(), ()));
+    let store = Arc::new(test_store::<UnwrappedEquityRecovery>(pool.clone()));
 
     // Seed the mint aggregate in TokensReceived (the persisted pre-wrap state)
     // with quantity matching the unwrapped wallet balance, so resume_mint can

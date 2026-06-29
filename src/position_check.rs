@@ -345,13 +345,13 @@ mod tests {
         Arc<st0x_event_sorcery::Store<Position>>,
     ) {
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 
@@ -557,7 +557,7 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"]);
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -572,7 +572,7 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build()
                 .await
                 .unwrap();
 

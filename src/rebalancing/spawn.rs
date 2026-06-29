@@ -364,7 +364,7 @@ mod tests {
         let (services, _ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = Arc::new(test_store(pool, ()));
+        let usdc_store = Arc::new(test_store(pool));
 
         let UsdcTransferResumeHandles {
             resume_base_to_alpaca: _,

@@ -433,7 +433,7 @@ mod tests {
         let projection = Arc::new(InventoryProjection::new(inventory.clone()));
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool)
             .with(projection)
-            .build(())
+            .build()
             .await
             .unwrap();
 
