@@ -3811,7 +3811,7 @@ impl RebalancingService {
                 "USDC rebalancing is LATCHED on startup with no automated recovery. \
                  stranded={stranded_held_ids:?} unresolved={unresolved_ids:?} \
                  unparseable={unparseable:?}. \
-                 Run `resume-usdc-transfer` or `reconcile-usdc-transfer` to unblock. \
+                 Run `transfer resume` or `transfer reconcile` to unblock. \
                  Rebalancing is blocked until manually resolved."
             );
             if let Err(error) = self.notifier.notify(&message).await {
@@ -15116,7 +15116,7 @@ mod tests {
     /// KNOWN LIMITATION: `WithdrawalSubmitting{AlpacaToBase}` is deliberately
     /// excluded from the startup re-arm because `resume_alpaca_to_base` returns
     /// `ResumeDirectionMismatch` for that state. The transfer must be recovered manually
-    /// via `resume-usdc-transfer` or `reconcile-usdc-transfer`. The operator is alerted
+    /// via `transfer resume` or `transfer reconcile`. The operator is alerted
     /// on startup (see `recover_usdc_guard_alerts_on_stranded_withdrawal_submitting_alpaca_to_base`).
     /// This test asserts the deliberate exclusion is preserved -- a regression that
     /// accidentally re-armed this state would immediately fail the market-making job.
@@ -15183,7 +15183,7 @@ mod tests {
             messages[0]
         );
         assert!(
-            messages[0].contains("resume-usdc-transfer"),
+            messages[0].contains("transfer resume"),
             "alert must mention the manual recovery command; got: {:?}",
             messages[0]
         );

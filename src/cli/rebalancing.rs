@@ -616,6 +616,15 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         | UsdcRebalance::ConversionFailed {
             direction: RebalanceDirection::BaseToAlpaca,
             ..
+        }
+        // A recorded pending burn (`pending_burn_tx: Some`) means a CCTP burn was
+        // broadcast and durably recorded before its receipt was confirmed. Treat it
+        // as POST-burn so `fail-usdc-transfer` cannot clear the guard while a burn
+        // may already be on-chain (use `transfer resume`, which checks burn_status
+        // and adopts/waits/pages). Only `pending_burn_tx: None` is genuinely pre-burn.
+        | UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: Some(_),
+            ..
         } => true,
         UsdcRebalance::BridgingFailed { burn_tx_hash, .. } => burn_tx_hash.is_some(),
         UsdcRebalance::Converting { .. }
@@ -628,14 +637,20 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         | UsdcRebalance::Withdrawing { .. }
         | UsdcRebalance::WithdrawalFailed { .. }
         | UsdcRebalance::WithdrawalComplete { .. }
-        | UsdcRebalance::BridgingSubmitting { .. } => false,
+        | UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: None,
+            ..
+        } => false,
     };
 
     if is_post_burn {
         anyhow::bail!(
             "fail-usdc-transfer: transfer {id} is in a post-burn state. \
              A CCTP burn may have already been broadcast. Refusing to act -- \
-             use transfer reconcile for post-burn failures."
+             use `transfer resume` to adopt/await a recorded in-flight burn \
+             (BridgingSubmitting with a recorded tx), `clear-pending-burn` if the \
+             recorded burn was dropped and verified absent on-chain, or \
+             `transfer reconcile` for a confirmed post-burn failure."
         );
     }
 
@@ -671,8 +686,19 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     // above rejected burn_tx_hash:Some via the post-burn gate). It is listed in
     // the bail group for exhaustiveness.
     match &state {
-        UsdcRebalance::WithdrawalComplete { .. } | UsdcRebalance::BridgingSubmitting { .. } => {}
-        UsdcRebalance::Converting { .. }
+        UsdcRebalance::WithdrawalComplete { .. }
+        | UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: None,
+            ..
+        } => {}
+        // `BridgingSubmitting { pending_burn_tx: Some(_) }` was already rejected by
+        // the post-burn gate above (a recorded burn may be on-chain); listed here
+        // for match exhaustiveness.
+        UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: Some(_),
+            ..
+        }
+        | UsdcRebalance::Converting { .. }
         | UsdcRebalance::ConversionComplete { .. }
         | UsdcRebalance::ConversionFailed { .. }
         | UsdcRebalance::Withdrawing { .. }
@@ -688,9 +714,8 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         | UsdcRebalance::DepositFailed { .. }
         | UsdcRebalance::Reconciled { .. } => {
             anyhow::bail!(
-                "fail-usdc-transfer is only valid from BridgingSubmitting or WithdrawalComplete; \
-                 transfer {id} is in {state:?} (a pre-bridging or post-bridging phase). \
-                 Refusing to act."
+                "fail-usdc-transfer is only valid from BridgingSubmitting (no recorded burn) \
+                 or WithdrawalComplete; transfer {id} is in {state:?}. Refusing to act."
             );
         }
     }
@@ -747,6 +772,114 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
             );
         }
     }
+
+    Ok(())
+}
+
+/// Clears a durably-recorded pending CCTP burn hash on a transfer latched at
+/// `BridgingSubmitting { pending_burn_tx: Some(_) }`, returning it to
+/// `BridgingSubmitting { pending_burn_tx: None }` so the pre-burn
+/// `fail-usdc-transfer` path can then release the rebalancing guard.
+///
+/// A burn classified `Dropped` (`BurnStatus::Dropped` -> `BurnTxDropped`) leaves
+/// the aggregate stuck at `BridgingSubmitting` with a recorded burn hash that no
+/// other recovery command can clear: `fail-usdc-transfer` treats a recorded burn
+/// as post-burn and refuses, `transfer resume` re-derives `Dropped`, and
+/// `transfer reconcile` rejects `BridgingSubmitting`. This is the operator
+/// escape hatch.
+///
+/// SAFETY: clearing the recorded hash discards the only durable record that a
+/// burn was broadcast. Run this ONLY after verifying on-chain that the burn never
+/// landed (the USDC never left the market-maker wallet); clearing it when a burn
+/// is actually live would let `fail-usdc-transfer` release the guard while funds
+/// are mid-bridge, stranding them. Clearing does NOT release the guard on its own
+/// -- after this, run `fail-usdc-transfer` (if the burn never landed) or
+/// `transfer resume`.
+///
+/// Valid ONLY from `BridgingSubmitting { pending_burn_tx: Some(_) }`. Every other
+/// state -- including `BridgingSubmitting { pending_burn_tx: None }` (nothing to
+/// clear) -- is rejected. Rejects an unknown id. The command is CLI-direct (no
+/// running bot required) and is a store-only send (no broker/bridge/provider).
+pub(super) async fn clear_pending_burn_command<Writer: Write>(
+    stdout: &mut Writer,
+    id: Uuid,
+    reason: &str,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let id = UsdcRebalanceId(id);
+    writeln!(
+        stdout,
+        "Clearing recorded pending CCTP burn for USDC transfer {id} (reason: {reason})"
+    )?;
+
+    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        .build(())
+        .await?;
+
+    let Some(state) = usdc_store.load(&id).await? else {
+        anyhow::bail!(
+            "clear-pending-burn: no transfer found for id {id}. Refusing to act -- \
+             check the id and that you are pointed at the right database."
+        );
+    };
+
+    // Only a `BridgingSubmitting` transfer carrying a recorded pending burn has a
+    // hash to clear. A `BridgingSubmitting` with no recorded burn has nothing to
+    // clear, and every other state is post-bridge or pre-bridge; reject both with
+    // a clear operator-facing error rather than emitting a no-op or surfacing the
+    // internal aggregate error.
+    //
+    // Exhaustive match: new UsdcRebalance variants must be placed explicitly so
+    // the compiler flags unhandled variants at this gate boundary.
+    match &state {
+        UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: Some(_),
+            ..
+        } => {}
+        UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: None,
+            ..
+        } => {
+            anyhow::bail!(
+                "clear-pending-burn: transfer {id} is at BridgingSubmitting with no recorded \
+                 pending burn to clear (pending_burn_tx: None). If the guard must be released, \
+                 use fail-usdc-transfer (after verifying on-chain that no burn landed)."
+            );
+        }
+        UsdcRebalance::Converting { .. }
+        | UsdcRebalance::ConversionComplete { .. }
+        | UsdcRebalance::ConversionFailed { .. }
+        | UsdcRebalance::WithdrawalSubmitting { .. }
+        | UsdcRebalance::Withdrawing { .. }
+        | UsdcRebalance::WithdrawalFailed { .. }
+        | UsdcRebalance::WithdrawalComplete { .. }
+        | UsdcRebalance::Bridging { .. }
+        | UsdcRebalance::AwaitingAttestation { .. }
+        | UsdcRebalance::Attested { .. }
+        | UsdcRebalance::Bridged { .. }
+        | UsdcRebalance::BridgingFailed { .. }
+        | UsdcRebalance::DepositInitiated { .. }
+        | UsdcRebalance::DepositConfirmed { .. }
+        | UsdcRebalance::DepositFailed { .. }
+        | UsdcRebalance::Reconciled { .. } => {
+            anyhow::bail!(
+                "clear-pending-burn is only valid from BridgingSubmitting with a recorded \
+                 pending burn; transfer {id} is in {state:?}. Refusing to act."
+            );
+        }
+    }
+
+    usdc_store
+        .send(&id, UsdcRebalanceCommand::ClearPendingBurn)
+        .await?;
+
+    writeln!(
+        stdout,
+        "Cleared the recorded pending burn for USDC transfer {id}; it is now at \
+         BridgingSubmitting with no recorded burn (the rebalancing guard is still held). \
+         Next, run fail-usdc-transfer (if you confirmed on-chain that the burn never landed) \
+         to release the guard, or `transfer resume --kind usdc` to continue the bridge."
+    )?;
 
     Ok(())
 }
@@ -2575,7 +2708,9 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
+            err_msg.contains(
+                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+            ),
             "Converting state must be rejected as not in bridging phase; got: {err_msg}"
         );
     }
@@ -2665,6 +2800,160 @@ mod tests {
         assert!(
             output.contains("restart"),
             "success message must mention 'restart'; got: {output}"
+        );
+    }
+
+    /// `fail-usdc-transfer` MUST be rejected when a CCTP burn was already recorded
+    /// (`BridgingSubmitting { pending_burn_tx: Some(_) }`): failing it as pre-burn
+    /// would emit `BridgingFailed { burn_tx_hash: None }`, clearing the double-burn
+    /// guard while a burn may already be on-chain (stranded funds / double burn).
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_bridging_submitting_with_recorded_burn() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0009);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging_submitting(&store, id).await;
+        let burn_tx = alloy::primitives::TxHash::from([0x77; 32]);
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::RecordPendingBurn { burn_tx },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let error = fail_usdc_transfer_command(&mut stdout, id, "manual fail", &pool)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("post-burn"),
+            "fail-usdc-transfer must reject a recorded-burn BridgingSubmitting as post-burn; \
+             got: {error}"
+        );
+
+        // State unchanged: still BridgingSubmitting with the recorded burn; guard held.
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(tx), .. } if tx == burn_tx
+            ),
+            "state must remain BridgingSubmitting with the recorded burn (not failed); \
+             got: {state:?}"
+        );
+        assert!(
+            state.holds_rebalance_guard(),
+            "a recorded-burn BridgingSubmitting must still hold the rebalancing guard"
+        );
+    }
+
+    /// `clear-pending-burn` is the operator escape hatch for a transfer latched at
+    /// `BridgingSubmitting { pending_burn_tx: Some(_) }` after a `Dropped`
+    /// classification: it clears the recorded hash so the pre-burn
+    /// `fail-usdc-transfer` path can then release the guard. Clearing itself must
+    /// NOT release the guard -- `BridgingSubmitting` keeps holding it.
+    #[tokio::test]
+    async fn clear_pending_burn_succeeds_on_bridging_submitting_with_recorded_burn() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000C);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging_submitting(&store, id).await;
+        let burn_tx = alloy::primitives::TxHash::from([0x55; 32]);
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::RecordPendingBurn { burn_tx },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = clear_pending_burn_command(&mut stdout, id, "burn never landed", &pool).await;
+        result.expect("clear_pending_burn must succeed from BridgingSubmitting with a record");
+
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: None,
+                    ..
+                }
+            ),
+            "clearing must return BridgingSubmitting with no recorded burn; got: {state:?}"
+        );
+        assert!(
+            state.holds_rebalance_guard(),
+            "clearing the pending burn must NOT release the rebalancing guard"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("fail-usdc-transfer"),
+            "success message must point the operator at fail-usdc-transfer; got: {output}"
+        );
+    }
+
+    /// A `BridgingSubmitting` with no recorded burn has nothing to clear; the
+    /// command must reject it rather than emit a no-op.
+    #[tokio::test]
+    async fn clear_pending_burn_rejects_bridging_submitting_without_recorded_burn() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_000D);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridging_submitting(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let error = clear_pending_burn_command(&mut stdout, id, "nothing to clear", &pool)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no recorded pending burn to clear"),
+            "clear-pending-burn must reject a BridgingSubmitting with no recorded burn; \
+             got: {error}"
+        );
+
+        // State unchanged: still BridgingSubmitting with no recorded burn.
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: None,
+                    ..
+                }
+            ),
+            "state must remain BridgingSubmitting with no recorded burn; got: {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_burn_rejects_unknown_id() {
+        let pool = setup_test_db().await;
+        let unknown_id = Uuid::from_u128(0xC0FF_EE01);
+
+        let mut stdout = Vec::new();
+        let result = clear_pending_burn_command(&mut stdout, unknown_id, "reason", &pool).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no transfer found for id"),
+            "unknown id must be rejected; got: {err_msg}"
         );
     }
 
@@ -3163,7 +3452,9 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
+            err_msg.contains(
+                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+            ),
             "ConversionFailed{{AlpacaToBase}} must be rejected as not in bridging phase; \
              got: {err_msg}"
         );
@@ -3216,7 +3507,9 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("only valid from BridgingSubmitting or WithdrawalComplete"),
+            err_msg.contains(
+                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+            ),
             "WithdrawalFailed state must be rejected as not in bridging phase; got: {err_msg}"
         );
     }

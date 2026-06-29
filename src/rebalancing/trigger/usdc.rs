@@ -173,6 +173,8 @@ impl UsdcRebalanceStage {
             // BridgingInitiated, so they emit no distinct progress stage.
             WithdrawalSubmitting { .. }
             | BridgingSubmitting { .. }
+            | PendingBurnRecorded { .. }
+            | PendingBurnCleared { .. }
             | AttestationTimedOut { .. }
             | ConversionConfirmed { .. }
             | ConversionFailed { .. }
@@ -715,8 +717,14 @@ impl RebalancingService {
             // burn. Detailed stage tracking starts at the subsequent Initiated /
             // BridgingInitiated; the inventory's active-rebalance claim is set by
             // the caller on this (first non-terminal) event, so nothing to do here.
+            // `PendingBurnRecorded` records the broadcast burn tx hash while still
+            // in `BridgingSubmitting`, and `PendingBurnCleared` resets it before a
+            // (re)broadcast; both stay in `BridgingSubmitting` and advance no
+            // tracking stage.
             WithdrawalSubmitting { .. }
             | BridgingSubmitting { .. }
+            | PendingBurnRecorded { .. }
+            | PendingBurnCleared { .. }
             | AttestationTimedOut { .. } => {}
             // Withdrawal failure is always pre-burn -> reconcile to source.
             WithdrawalFailed { .. } => {

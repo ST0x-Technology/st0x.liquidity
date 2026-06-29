@@ -1,12 +1,12 @@
 //! Single-chain CCTP operations.
 
-use std::time::Duration;
-
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
+use std::time::{Duration, Instant};
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, trace, warn};
 
 #[cfg(test)]
@@ -74,6 +74,64 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// trusted as a true absence (the burn lands at/after `from_block`).
 const SCAN_FINALITY_MARGIN: u64 = 2;
 
+/// Grace period before [`CctpEndpoint::burn_status`] may conclude a broadcast
+/// burn tx was dropped from the mempool. Mirrors the wallet's `wait_for_receipt`
+/// `DROPPED_TX_GRACE`: a freshly-broadcast tx is not visible on every node of a
+/// load-balanced RPC for several seconds, and is not mined for ~1 block, so
+/// concluding "dropped" earlier risks re-burning a tx that actually lands.
+const BURN_DROP_GRACE: Duration = Duration::from_secs(30);
+
+/// Consecutive `get_transaction_by_hash == None` observations (after the grace
+/// period) required before [`CctpEndpoint::burn_status`] concludes the burn tx
+/// was dropped. The count is strictly consecutive because any sighting -- a
+/// mempool hit or a mined receipt -- returns from the poll loop (`Pending` or
+/// `Mined*`) rather than continuing it, so the misses can never be interleaved
+/// with a sighting. Mirrors the wallet's `wait_for_receipt`
+/// `DROPPED_TX_CONSECUTIVE_MISSES`, debouncing the load-balanced-RPC race where a
+/// single lagging node transiently reports a live tx as absent.
+const BURN_DROP_CONSECUTIVE_MISSES: u32 = 3;
+
+/// Poll interval while [`CctpEndpoint::burn_status`] waits out the drop grace
+/// window. Matches the wallet's `wait_for_receipt` poll cadence.
+const BURN_DROP_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Tuning knobs for [`CctpEndpoint::burn_status`]'s conservative drop policy.
+/// Bundled into a struct so a fast variant can be injected in tests without a
+/// long argument list, mirroring the wallet crate's `ReceiptWaitConfig`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BurnDropConfig {
+    /// Grace period before an absent tx may be suspected dropped.
+    pub(super) grace: Duration,
+    /// Consecutive mempool-absence observations required to conclude a drop.
+    pub(super) consecutive_misses: u32,
+    /// Interval between status polls while waiting out the grace window.
+    pub(super) poll_interval: Duration,
+}
+
+impl BurnDropConfig {
+    /// Defaults mirroring the wallet's `wait_for_receipt` drop policy.
+    const fn defaults() -> Self {
+        Self {
+            grace: BURN_DROP_GRACE,
+            consecutive_misses: BURN_DROP_CONSECUTIVE_MISSES,
+            poll_interval: BURN_DROP_POLL_INTERVAL,
+        }
+    }
+
+    /// Zero-grace, single-miss, fast-poll variant for tests: an absent tx
+    /// concludes `Dropped` immediately rather than waiting out the production
+    /// 30 s grace window. Shared by the bridge's own tests and downstream
+    /// consumers' resume tests (via [`CctpBridge::with_fast_burn_drop_policy`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) const fn fast() -> Self {
+        Self {
+            grace: Duration::ZERO,
+            consecutive_misses: 1,
+            poll_interval: Duration::from_millis(10),
+        }
+    }
+}
+
 /// Maps a sync result during the allowance retry to the error returned on
 /// failure, preserving the original burn error as the actionable root cause.
 ///
@@ -110,6 +168,11 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     /// Production always uses [`NODE_SYNC_POLL_INTERVAL`]. Tests override it to
     /// `Duration::ZERO` to avoid sleeping through the 30-attempt budget.
     node_sync_poll_interval: Duration,
+    /// Drop policy for [`burn_status`](Self::burn_status). Production uses
+    /// [`BurnDropConfig::defaults`]; tests override it via
+    /// [`with_burn_drop_config`](Self::with_burn_drop_config) so the drop grace
+    /// resolves immediately instead of after the production 30 s window.
+    burn_drop_config: BurnDropConfig,
 }
 
 impl<W: Wallet> CctpEndpoint<W> {
@@ -129,6 +192,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             message_transmitter_address: message_transmitter,
             wallet,
             node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
+            burn_drop_config: BurnDropConfig::defaults(),
         }
     }
 
@@ -289,25 +353,11 @@ impl<W: Wallet> CctpEndpoint<W> {
     ) -> Result<crate::BurnReceipt, CctpError> {
         info!(target: "bridge", %max_fee, %amount, "Depositing for burn with fast transfer");
 
-        let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
-
-        // bytes32(0) allows any address to call receiveMessage() on destination.
-        // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
-        let destination_caller = FixedBytes::<32>::ZERO;
-
         let receipt = self
             .wallet
             .submit::<Registry, _>(
                 self.token_messenger_address,
-                TokenMessengerV2::depositForBurnCall {
-                    amount,
-                    destinationDomain: direction.dest_domain(),
-                    mintRecipient: recipient_bytes32,
-                    burnToken: self.usdc_address,
-                    destinationCaller: destination_caller,
-                    maxFee: max_fee,
-                    minFinalityThreshold: FAST_TRANSFER_THRESHOLD,
-                },
+                self.deposit_for_burn_call(amount, recipient, direction, max_fee),
                 "depositForBurn",
             )
             .await?;
@@ -327,6 +377,168 @@ impl<W: Wallet> CctpEndpoint<W> {
             tx: receipt.transaction_hash,
             amount,
         })
+    }
+
+    /// Builds the `depositForBurn` call for a fast CCTP transfer, shared by the
+    /// atomic [`deposit_for_burn`](Self::deposit_for_burn) and the two-phase
+    /// [`submit_deposit_for_burn`](Self::submit_deposit_for_burn).
+    fn deposit_for_burn_call(
+        &self,
+        amount: U256,
+        recipient: Address,
+        direction: BridgeDirection,
+        max_fee: U256,
+    ) -> TokenMessengerV2::depositForBurnCall {
+        let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
+
+        // bytes32(0) allows any address to call receiveMessage() on destination.
+        // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
+        let destination_caller = FixedBytes::<32>::ZERO;
+
+        TokenMessengerV2::depositForBurnCall {
+            amount,
+            destinationDomain: direction.dest_domain(),
+            mintRecipient: recipient_bytes32,
+            burnToken: self.usdc_address,
+            destinationCaller: destination_caller,
+            maxFee: max_fee,
+            minFinalityThreshold: FAST_TRANSFER_THRESHOLD,
+        }
+    }
+
+    /// Broadcasts `depositForBurn` and returns its tx hash WITHOUT awaiting the
+    /// receipt, so the caller can record the broadcast hash before confirming it
+    /// (closing the double-burn window). Pair with
+    /// [`confirm_burn`](Self::confirm_burn) to await and validate the receipt.
+    pub(super) async fn submit_deposit_for_burn(
+        &self,
+        amount: U256,
+        recipient: Address,
+        direction: BridgeDirection,
+        max_fee: U256,
+    ) -> Result<TxHash, CctpError> {
+        info!(target: "bridge", %max_fee, %amount, "Submitting depositForBurn (pending) for fast transfer");
+
+        Ok(self
+            .wallet
+            .submit_pending(
+                self.token_messenger_address,
+                self.deposit_for_burn_call(amount, recipient, direction, max_fee),
+                "depositForBurn",
+            )
+            .await?)
+    }
+
+    /// Awaits the receipt of a burn broadcast via
+    /// [`submit_deposit_for_burn`](Self::submit_deposit_for_burn), decoding a
+    /// revert, and validates the CCTP `MessageSent` event is present. `amount` is
+    /// the burned input amount, carried through onto the returned [`BurnReceipt`]
+    /// (mirroring [`deposit_for_burn`](Self::deposit_for_burn), whose receipt
+    /// records the input amount, not the net-of-fee minted amount).
+    pub(super) async fn confirm_burn<Registry: IntoErrorRegistry>(
+        &self,
+        tx_hash: TxHash,
+        amount: U256,
+    ) -> Result<crate::BurnReceipt, CctpError> {
+        let receipt = self.wallet.confirm::<Registry>(tx_hash).await?;
+
+        if !receipt
+            .inner
+            .logs()
+            .iter()
+            .any(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).is_ok())
+        {
+            return Err(CctpError::MessageSentEventNotFound { tx_hash });
+        }
+
+        Ok(crate::BurnReceipt {
+            tx: tx_hash,
+            amount,
+        })
+    }
+
+    /// Resolves the on-chain status of a broadcast burn tx for crash-safe resume,
+    /// using this endpoint's configured drop policy (`burn_drop_config`).
+    pub(super) async fn burn_status(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<crate::BurnTxStatus, CctpError> {
+        self.burn_status_with_config(tx_hash, self.burn_drop_config)
+            .await
+    }
+
+    /// Conservative drop detection: an independent grace + consecutive-miss poll
+    /// loop modeled on the same drop policy as the wallet's `wait_for_receipt`
+    /// (not a call into that function). Polls in a loop at `config.poll_interval`
+    /// (first tick immediate) and resolves as follows:
+    ///
+    /// - a receipt arriving at any tick -> [`BurnTxStatus::MinedSuccess`] /
+    ///   [`BurnTxStatus::MinedReverted`] (returns immediately)
+    /// - no receipt, tx still visible via `get_transaction_by_hash` (mempool) ->
+    ///   [`BurnTxStatus::Pending`] (returns immediately)
+    /// - no receipt and tx absent from the mempool -> KEEPS POLLING (does NOT
+    ///   return `Pending` early); only once `config.grace` has elapsed AND
+    ///   `config.consecutive_misses` consecutive post-grace absences are observed
+    ///   does it return [`BurnTxStatus::Dropped`].
+    ///
+    /// A still-pending burn (broadcast but unmined) thus never reports `Dropped`,
+    /// so the caller never re-burns a tx that may still land -- the exact
+    /// double-burn hazard a chain-head-margin heuristic alone cannot rule out.
+    pub(super) async fn burn_status_with_config(
+        &self,
+        tx_hash: TxHash,
+        config: BurnDropConfig,
+    ) -> Result<crate::BurnTxStatus, CctpError> {
+        let provider = self.wallet.provider();
+        let start = Instant::now();
+        let mut consecutive_misses = 0u32;
+        let mut poll = interval(config.poll_interval);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            // First tick completes immediately, so the receipt/mempool checks run
+            // before any sleep; subsequent ticks pace the drop-grace polling.
+            poll.tick().await;
+
+            if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+                if receipt.status() {
+                    // Success is re-validated downstream by `confirm_burn` (which waits
+                    // the wallet's confirmation depth), so a premature success here is
+                    // safe to return immediately.
+                    return Ok(crate::BurnTxStatus::MinedSuccess);
+                }
+                // A reverted receipt drives the caller to reburn (a reverted burn moved
+                // no funds), but a shallow reorg could re-include this exact tx as a
+                // SUCCESS -- reburning before the revert is confirmation-deep would then
+                // double-burn. Re-fetch through the wallet's confirmation-aware path
+                // (mirroring the success path) before trusting the revert.
+                let confirmed = self.wallet.await_receipt(tx_hash).await?;
+                return Ok(if confirmed.status() {
+                    crate::BurnTxStatus::MinedSuccess
+                } else {
+                    crate::BurnTxStatus::MinedReverted
+                });
+            }
+
+            // No receipt. A tx still known to the node (mempool) may yet mine, so
+            // it is Pending and must NOT be re-burned.
+            if provider.get_transaction_by_hash(tx_hash).await?.is_some() {
+                return Ok(crate::BurnTxStatus::Pending);
+            }
+
+            // Absent from both receipt and mempool. Keep polling within this call
+            // rather than returning early: only after the grace period AND
+            // `consecutive_misses` consecutive absences is the absence trusted as a
+            // true drop. Before that, a transient absence (lagging node, not-yet-
+            // propagated tx) keeps polling so a tx that mines late is still seen and
+            // a still-pending tx is never re-burned.
+            if start.elapsed() >= config.grace {
+                consecutive_misses += 1;
+                if consecutive_misses >= config.consecutive_misses {
+                    return Ok(crate::BurnTxStatus::Dropped);
+                }
+            }
+        }
     }
 
     /// Scans for a `DepositForBurn` event from this endpoint's wallet at or
@@ -880,6 +1092,16 @@ impl<W: Wallet> CctpEndpoint<W> {
     #[cfg(test)]
     pub(super) fn with_node_sync_poll_interval(mut self, interval: Duration) -> Self {
         self.node_sync_poll_interval = interval;
+        self
+    }
+
+    /// Overrides the [`burn_status`](Self::burn_status) drop policy. Test-only:
+    /// lets resume tests classify an absent burn tx as `Dropped` immediately
+    /// instead of waiting out the production 30 s grace window.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub(super) fn with_burn_drop_config(mut self, config: BurnDropConfig) -> Self {
+        self.burn_drop_config = config;
         self
     }
 }

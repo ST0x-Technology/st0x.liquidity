@@ -35,7 +35,10 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 
 1. **The `Bridge` trait** - The core abstraction (always compiled)
 2. **The `Attestation` trait** - For opaque attestation data access
-3. **Domain types** - `BridgeDirection`, `BurnReceipt`, `MintReceipt`
+3. **Domain types** - `BridgeDirection`, `BurnReceipt`, `MintReceipt`,
+   `BurnTxStatus` (the return type of `Bridge::burn_status`, so consumers can
+   drive crash-safe resume off the trait without touching the CCTP
+   implementation)
 4. **Implementation type** - `CctpBridge` (behind `cctp` feature)
 5. **Context type** - `CctpCtx` (behind `cctp` feature)
 

@@ -292,9 +292,7 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
   burn, persists `BridgingInitiated`, and the transfer continues normally.
 
 `transfer reconcile` is the path for persisted post-burn terminal failures (e.g.
-`DepositFailed`, `BridgingFailed` with a burn tx recorded). The legacy flat
-`resume-usdc-transfer` / `reconcile-usdc-transfer` names have been removed; only
-the grouped `transfer resume` / `transfer reconcile` forms exist.
+`DepositFailed`, `BridgingFailed` with a burn tx recorded).
 
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
@@ -335,6 +333,32 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   seeding only on the **next** bot restart (the running process keeps the seeded
   amount until then). Valid only from `Failed`; a transfer in any other state is
   rejected. The `--reason` is free text.
+
+### Clearing a dropped pending burn (`BridgingSubmitting` latch)
+
+A burn that the resume path classifies `Dropped` (broadcast, then absent from
+the mempool past the grace window) latches the aggregate at `BridgingSubmitting`
+with the dropped tx still recorded (`pending_burn_tx: Some`). This holds the
+guard and no other recovery command can release it: `fail-usdc-transfer` rejects
+a recorded burn as post-burn, `transfer resume` re-derives `Dropped`, and
+`transfer reconcile` rejects `BridgingSubmitting`.
+
+`clear-pending-burn` is the escape hatch. After verifying on-chain that the burn
+never landed (the USDC never left the market-maker wallet), it clears the
+recorded hash, returning the aggregate to `BridgingSubmitting` with no recorded
+burn. It does NOT release the guard on its own -- run `fail-usdc-transfer` next
+(if the burn never landed) to release it, or `transfer resume --kind usdc` to
+continue the bridge.
+
+Safe to run with the bot live: this command only loads the aggregate and sends a
+single CQRS command, and the precondition is a `Dropped`-latched transfer whose
+job has already fail-closed -- no active job is driving that rebalance, so there
+is no race. Do NOT run it against a transfer that is still being actively
+processed (one that has not yet latched); always confirm the latch and the
+burn-absent on-chain state first.
+
+    stox clear-pending-burn --id <uuid> --reason "dropped burn verified absent on-chain"
+    stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn never landed"
 
 For local dashboard testing, run:
 
