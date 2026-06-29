@@ -30,6 +30,12 @@ pub enum RebalancingCtxError {
     ZeroTransferAttemptTimeout,
     #[error("rebalancing attestation_retry_deadline_secs must be non-zero")]
     ZeroAttestationRetryDeadline,
+    #[error(
+        "rebalancing max_burn_revert_redrives must be non-zero when USDC rebalancing \
+         is enabled; set it to the maximum number of burn-revert redrive attempts \
+         before the circuit opens (suggested value: 5)"
+    )]
+    ZeroMaxBurnRevertRedrives,
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -70,6 +76,20 @@ pub struct RebalancingConfig {
     /// At the production default (24h) the overshoot is negligible; set with
     /// that granularity in mind, not as a hard millisecond cutoff.
     pub attestation_retry_deadline_secs: u64,
+    /// Maximum number of burn-revert redrive attempts for a single Base->Alpaca
+    /// USDC transfer job before the circuit-breaker opens and the operator is
+    /// alerted.
+    ///
+    /// A revert-class CCTP burn failure (where no EVM state change occurred)
+    /// is reclassified as a safe redrive: the job returns Ok and re-enqueues
+    /// itself, re-entering the scan-or-reburn path. After this many consecutive
+    /// revert redrives the transfer stalls for operator review instead of
+    /// looping forever. Required when `usdc.mode = "enabled"`; must be non-zero.
+    ///
+    /// Suggested value: 5. Covers transient load-balanced-RPC oscillation
+    /// while halting for permanent contract reverts (USDC blocklist, paused
+    /// TokenMessenger, etc.).
+    pub max_burn_revert_redrives: u32,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -87,6 +107,9 @@ pub struct RebalancingCtx {
     /// [`RebalancingConfig::transfer_attempt_timeout_secs`].
     pub transfer_attempt_timeout: Duration,
     pub attestation_retry_deadline: Duration,
+    /// Maximum consecutive burn-revert redrives before the circuit opens.
+    /// See [`RebalancingConfig::max_burn_revert_redrives`].
+    pub max_burn_revert_redrives: u32,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -120,12 +143,17 @@ impl RebalancingCtx {
             UsdcRebalancing::Disabled => None,
         };
 
+        if usdc.is_some() && config.max_burn_revert_redrives == 0 {
+            return Err(RebalancingCtxError::ZeroMaxBurnRevertRedrives);
+        }
+
         Ok(Self {
             equity: config.equity,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
             attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
+            max_burn_revert_redrives: config.max_burn_revert_redrives,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -151,6 +179,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
+        #[builder(default = 5)] max_burn_revert_redrives: u32,
     ) -> Self {
         Self {
             equity,
@@ -158,6 +187,7 @@ impl RebalancingCtx {
             transfer_timeout,
             transfer_attempt_timeout,
             attestation_retry_deadline,
+            max_burn_revert_redrives,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -181,6 +211,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
+        #[builder(default = 5)] max_burn_revert_redrives: u32,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -195,6 +226,7 @@ impl RebalancingCtx {
             transfer_timeout,
             transfer_attempt_timeout,
             attestation_retry_deadline,
+            max_burn_revert_redrives,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -242,6 +274,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [equity]
             target = "0.5"
@@ -269,6 +302,7 @@ mod tests {
         assert_eq!(config.transfer_timeout_secs, 1800);
         assert_eq!(config.transfer_attempt_timeout_secs, 3600);
         assert_eq!(config.attestation_retry_deadline_secs, 86400);
+        assert_eq!(config.max_burn_revert_redrives, 5);
     }
 
     #[test]
@@ -278,6 +312,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 7200
+            max_burn_revert_redrives = 3
 
             [equity]
             target = "0.6"
@@ -300,11 +335,16 @@ mod tests {
         assert!(target.eq(float!(0.4)).unwrap());
         assert!(deviation.eq(float!(0.15)).unwrap());
         assert_eq!(config.attestation_retry_deadline_secs, 7200);
+        assert_eq!(config.max_burn_revert_redrives, 3);
     }
 
     #[test]
     fn deserialize_missing_transfer_timeout_secs_fails() {
         let toml_str = r#"
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+
             [equity]
             target = "0.5"
             deviation = "0.2"
@@ -327,6 +367,7 @@ mod tests {
         let toml_str = r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
+            max_burn_revert_redrives = 5
 
             [equity]
             target = "0.5"
@@ -352,6 +393,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 0
+            max_burn_revert_redrives = 5
 
             [equity]
             target = "0.5"
@@ -376,7 +418,9 @@ mod tests {
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [usdc]
             mode = "enabled"
@@ -395,7 +439,9 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [equity]
             target = "0.5"
@@ -413,6 +459,8 @@ mod tests {
     fn deserialize_missing_transfer_attempt_timeout_secs_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [equity]
             target = "0.5"
@@ -438,6 +486,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 0
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [equity]
             target = "0.5"
@@ -456,5 +505,80 @@ mod tests {
             error,
             RebalancingCtxError::ZeroTransferAttemptTimeout
         ));
+    }
+
+    #[test]
+    fn zero_max_burn_revert_redrives_fails_validation_when_usdc_enabled() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 0
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroMaxBurnRevertRedrives
+        ));
+    }
+
+    #[test]
+    fn zero_max_burn_revert_redrives_is_ok_when_usdc_disabled() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 0
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#,
+        )
+        .unwrap();
+
+        // USDC is disabled so the zero-check is skipped.
+        RebalancingCtx::new(&config).unwrap();
+    }
+
+    #[test]
+    fn deserialize_missing_max_burn_revert_redrives_fails() {
+        let toml_str = r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("max_burn_revert_redrives"),
+            "Expected missing max_burn_revert_redrives error, got: {error}"
+        );
     }
 }

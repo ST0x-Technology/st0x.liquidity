@@ -2203,7 +2203,78 @@ only on first use or a manual reset, and (b) the defense-in-depth retry below.
 **Defense-in-depth retry:** If `depositForBurn` reverts despite the above
 (structurally: re-read allowance < burn amount), the bridge re-runs the cold
 path and retries the burn exactly once. This handles rare cases where the
-node-sync poll window expires before a node catches up.
+node-sync poll window expires before a node catches up. If the bridge-level
+one-shot retry also fails, the job-level bounded redrive (described below) takes
+over.
+
+#### Self-Healing and Alerting
+
+##### Transient burn-revert self-heal (bounded redrive)
+
+A Base->Alpaca transfer job that receives a revert-class CCTP burn error (where
+`CctpError::is_revert()` is true, indicating a pre-submission chain revert with
+no on-chain effect) is reclassified as a safe redrive rather than a
+circuit-breaker trip. The job returns `Ok` and re-enqueues itself with a 15 s
+delay, re-entering the `resume_bridging_submitting` scan-or-reburn path on the
+next pickup.
+
+The double-burn safety guarantee is NOT `is_revert()` classification -- it is
+the `resume_bridging_submitting` scan: `find_recent_burn` scans for an existing
+burn before re-attempting, using the `from_block` lower bound durably recorded
+in the `BridgingSubmitting` aggregate event before the burn call. Even a
+misclassified error cannot cause a double-burn because the scan adopts any
+existing burn.
+
+A per-attempt wall-clock timeout is similarly reclassified: the hung attempt is
+aborted and the job re-enqueues with a 30 s delay. On re-pickup, if the burn
+landed during the timeout, the scan adopts it rather than re-burning.
+
+**Bound**: Both revert and timeout redrives count against a shared
+`max_burn_revert_redrives` counter persisted in the job payload (durable across
+restarts). Once the bound is reached, the job propagates a
+`BurnRevertLimitReached` error so the circuit opens and the operator is alerted.
+Genuinely ambiguous failures (where the burn may have landed and `is_revert()`
+returns false, e.g. `MessageSentEventNotFound`) are never reclassified and
+always halt for operator review.
+
+**Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
+redrives), at the limit, and before any terminal non-redriven error propagates.
+
+##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
+
+On startup, `recover_usdc_guard` re-arms transfer jobs for aggregates at
+`BridgingSubmitting` (both directions) or `WithdrawalSubmitting{BaseToAlpaca}`
+state that have no pending job row. These states are non-terminal and resumable:
+the process either crashed before the burn tx was submitted, or before the
+apalis enqueue committed. The re-arm is idempotent (suppressed if a job row
+exists) and runs before the apalis monitor starts so there is no live-job race.
+
+`WithdrawalSubmitting{AlpacaToBase}` is **NOT** auto-re-armed: the withdrawal
+transfer ID has not yet been persisted in that state (it is persisted only when
+`Withdrawing` is entered), so `resume_alpaca_to_base` returns
+`ResumeDirectionMismatch` and cannot reconstruct which Alpaca withdrawal to
+poll. When a crash leaves an aggregate in this state, `recover_usdc_guard`
+latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
+alert via `self.notifier` so the operator is paged to run `resume-usdc-transfer`
+or `reconcile-usdc-transfer` manually.
+
+These states do NOT receive a tracking seed (unlike `DepositFailed` /
+`ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a
+mid-flight resumable state would wedge the `DepositConfirmed` path which
+requires `bridged_amount_received` that the seed cannot supply. The re-arm path
+(job re-enqueue) handles them; the sweep path is for manually-reconcilable
+terminal states only.
+
+###### Known limitations / follow-ups
+
+- **`WithdrawalSubmitting{AlpacaToBase}` is not auto-resumable**: Making this
+  state resumable requires persisting the withdrawal identity (Alpaca transfer
+  ID) before entering `WithdrawalSubmitting` and adding a corresponding resume
+  arm in `resume_alpaca_to_base`. This is deferred work; for now the operator is
+  alerted and must reconcile manually.
+- **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
+  store or have unparseable IDs also latch the guard with an operator alert.
+  These indicate store inconsistency and require manual investigation.
 
 Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
 `transferFrom`. At realistic rebalancing sizes the allowance never drops below

@@ -46,6 +46,7 @@ use st0x_execution::{
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
 
+use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::Broadcaster;
@@ -78,7 +79,8 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{
-    TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
+    TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     RebalancerServices, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
@@ -978,12 +980,24 @@ fn spawn_finished_job_cleanup(
         loop {
             interval.tick().await;
 
+            // USDC transfer-job rows are the durable startup re-arm
+            // idempotency + redrive-budget signal. Pruning them while the
+            // aggregate is still mid-flight (e.g. `BridgingSubmitting`) resets
+            // the redrive bound to a fresh budget on restart and silences the
+            // stranded-transfer operator alert. Transfer jobs are low-volume,
+            // so retaining their finished rows is cheap; exclude both transfer
+            // job types from cleanup.
             let cleanup_result = sqlx_apalis::query(
                 "DELETE FROM Jobs \
-                 WHERE status = ? \
-                 OR status = ? \
-                 OR (status = ? AND max_attempts <= attempts)",
+                 WHERE job_type NOT IN (?, ?) \
+                 AND ( \
+                     status = ? \
+                     OR status = ? \
+                     OR (status = ? AND max_attempts <= attempts) \
+                 )",
             )
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
             .bind(Status::Done.to_string())
             .bind(Status::Killed.to_string())
             .bind(Status::Failed.to_string())
@@ -1205,6 +1219,29 @@ impl PositionAndRebalancing {
     }
 }
 
+/// Builds the USDC alerting notifier.
+///
+/// Returns `Ok(Arc<NoopNotifier>)` when `[alerts]` is absent — silence is
+/// the correct behaviour for an unconfigured optional channel.
+///
+/// Returns `Err` when `[alerts]` IS present but `TelegramNotifier` fails to
+/// initialise. The caller must propagate this so the server fails to start:
+/// an operator who configured `[alerts]` believes alerts are active; silently
+/// falling back to Noop would suppress all redrive-limit and terminal-error
+/// pages with no runtime indication.
+fn build_usdc_notifier(
+    alerts: Option<&st0x_config::AlertsCtx>,
+) -> Result<Arc<dyn crate::alerts::Notifier>, NotifierError> {
+    let Some(alerts) = alerts else {
+        debug!("USDC alerting: [alerts] section absent, using NoopNotifier");
+        return Ok(Arc::new(NoopNotifier));
+    };
+    let notifier =
+        TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
+    info!("USDC alerting: Telegram notifier configured");
+    Ok(Arc::new(notifier))
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -1267,6 +1304,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.ctx.issuance.api_key.header_value(),
         )?);
 
+        let usdc_notifier = build_usdc_notifier(deps.ctx.alerts.as_ref())?;
+
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
@@ -1280,6 +1319,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.inventory.clone(),
             wrapper.clone(),
             deps.schedulers,
+            usdc_notifier.clone(),
         ));
 
         rebalancing_service
@@ -1295,11 +1335,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         // live path missed in the previous run. Reads only the un-folded tail
         // past each operation's checkpoint, so this does not re-fold history.
         let rebalance_timing_replayed = rebalance_timing.catch_up().await?;
-        info!(
-            target: "rebalance",
-            replayed = rebalance_timing_replayed,
-            "Rebalance stage-timing read model caught up to the event log at startup"
-        );
+        info!(target: "rebalance", replayed = rebalance_timing_replayed,
+            "Rebalance stage-timing read model caught up to the event log at startup");
 
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
@@ -1335,9 +1372,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             built.redemption.clone(),
         ));
 
-        // Built outside `QueryManifest` because the recovery aggregate's
-        // services include `recovery_transfer`, which depends on the
-        // mint/redemption stores produced by the manifest above.
+        // Built outside `QueryManifest`: services depend on mint/redemption stores
+        // that the manifest produces.
         let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
             build_equity_recovery_stores(
                 &deps.pool,
@@ -1372,11 +1408,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             alpaca_auth.api_secret.clone(),
         ));
 
-        // Build the broker here (not inside `RebalancerServices::new`) so it can
-        // be wrapped in the telemetry decorator before being threaded down. This
-        // mirrors how the hedge executor is wrapped in `Conductor::run` before
-        // use, so the rebalancer's Alpaca conversion calls emit broker dependency
-        // samples alongside the hedge path.
+        // Wrap with telemetry before threading down so rebalancer Alpaca calls
+        // emit broker dependency samples (mirrors hedge executor wrapping).
         let broker = InstrumentedAlpacaBroker::new(
             AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,
             deps.telemetry.clone(),
@@ -1408,30 +1441,31 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let mint_store = built.mint;
-        let redemption_store = built.redemption;
-
         let usdc_handles = services.into_usdc_transfer_handles(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             built.usdc,
         );
 
+        let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            transfer: usdc_handles.resume_alpaca_to_base,
+            job_queue: transfer_usdc_to_market_making_queue,
+            max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
+            notifier: usdc_notifier.clone(),
+        });
+
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
             transfer: usdc_handles.resume_base_to_alpaca,
             timeout: rebalancing_ctx.transfer_attempt_timeout,
             job_queue: transfer_usdc_to_hedging_queue,
-        });
-
-        let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
-            transfer: usdc_handles.resume_alpaca_to_base,
-            job_queue: transfer_usdc_to_market_making_queue,
+            max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
+            notifier: usdc_notifier,
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
-            mint_store: mint_store.clone(),
+            mint_store: built.mint.clone(),
             equities_config: deps.ctx.assets.equities.clone(),
         });
 
@@ -1448,8 +1482,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             recovery_transfer,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
-            mint_store,
-            redemption_store,
+            mint_store: built.mint,
+            redemption_store: built.redemption,
             transfer_usdc_to_hedging_ctx,
             transfer_usdc_to_market_making_ctx,
             transfer_equity_to_market_making_ctx,
@@ -2843,6 +2877,30 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_job_row(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        id: &str,
+        job_type: &str,
+        status: Status,
+        attempts: i64,
+        max_attempts: i64,
+    ) {
+        sqlx_apalis::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(vec![0_u8])
+        .bind(id)
+        .bind(job_type)
+        .bind(status.to_string())
+        .bind(attempts)
+        .bind(max_attempts)
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn requeue_recovery_orphans_resets_unwrapped_recovery_rows() {
         let (_pool, apalis_pool) = setup_test_pools().await;
@@ -2976,6 +3034,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         );
 
         let resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
@@ -3342,6 +3401,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         );
 
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -3433,6 +3493,7 @@ mod tests {
             inventory2.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool2),
+            Arc::new(crate::alerts::NoopNotifier),
         );
 
         let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
@@ -3600,6 +3661,57 @@ mod tests {
         assert!(
             join_error.is_cancelled(),
             "expected cleanup task to be cancelled, got: {join_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_finished_job_cleanup_retains_usdc_transfer_rows() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let hedging_type = std::any::type_name::<TransferUsdcToHedging>();
+        let market_making_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+
+        // Non-transfer finished rows must be pruned (Done and exhausted Failed).
+        insert_job_row(&apalis_pool, "other-done", "test", Status::Done, 1, 25).await;
+        insert_job_row(&apalis_pool, "other-failed", "test", Status::Failed, 25, 25).await;
+
+        // USDC transfer finished rows must survive cleanup: they are the durable
+        // startup re-arm idempotency + redrive-budget signal.
+        insert_job_row(
+            &apalis_pool,
+            "hedging-done",
+            hedging_type,
+            Status::Done,
+            1,
+            25,
+        )
+        .await;
+        insert_job_row(
+            &apalis_pool,
+            "market-making-failed",
+            market_making_type,
+            Status::Failed,
+            25,
+            25,
+        )
+        .await;
+
+        let handle =
+            spawn_finished_job_cleanup(pool.clone(), apalis_pool.clone(), Duration::from_secs(60));
+
+        // The two non-transfer finished rows are pruned; the two transfer rows remain.
+        wait_for_job_count(&apalis_pool, 2).await;
+        handle.abort();
+
+        let mut remaining: Vec<String> = sqlx_apalis::query_scalar("SELECT job_type FROM Jobs")
+            .fetch_all(&apalis_pool)
+            .await
+            .unwrap();
+        remaining.sort();
+        let mut expected = vec![hedging_type.to_string(), market_making_type.to_string()];
+        expected.sort();
+        assert_eq!(
+            remaining, expected,
+            "USDC transfer finished rows must survive cleanup regardless of Done/Failed status"
         );
     }
 
@@ -5952,6 +6064,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -6060,6 +6173,7 @@ mod tests {
             Arc::clone(&inventory),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -6178,6 +6292,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -6314,6 +6429,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -7713,5 +7829,42 @@ mod tests {
             !is_pre_wrap_held_for_recovery(&tokens_wrapped, &equity_in_progress),
             "TokensWrapped must NEVER be excluded (deposit idempotent)"
         );
+    }
+
+    /// When `[alerts]` is absent, `build_usdc_notifier` returns a `NoopNotifier`
+    /// that silently discards notifications without error.
+    #[tokio::test]
+    async fn build_usdc_notifier_returns_ok_noop_when_alerts_absent() {
+        let notifier = build_usdc_notifier(None).unwrap();
+        notifier
+            .notify("test message")
+            .await
+            .expect("NoopNotifier must not error on notify");
+    }
+
+    /// When `[alerts]` IS present, `build_usdc_notifier` constructs a real
+    /// Telegram notifier and returns `Ok` -- it must NOT fail startup for a
+    /// well-formed config, and it must NOT silently fall back to `NoopNotifier`
+    /// (which would suppress every redrive-limit and terminal-error page).
+    ///
+    /// The error branch (`Err(NotifierError::ClientBuild)`) is only reachable on
+    /// a reqwest/TLS backend init failure; it cannot be triggered deterministically
+    /// from the `AlertsCtx` inputs, so it is not unit-testable here. At the call
+    /// site the `?` propagation fails startup, which is the behaviour that matters.
+    /// `notify()` is deliberately not exercised: the present-branch notifier posts
+    /// to the live Telegram API, which a unit test must never reach.
+    #[tokio::test]
+    async fn build_usdc_notifier_returns_ok_telegram_when_alerts_present() {
+        let alerts = st0x_config::AlertsCtx {
+            chat_id: 123,
+            bot_token: "test-bot-token".to_string(),
+            low_balance_threshold_wei: U256::from(0u64),
+            poll_interval: std::time::Duration::from_secs(60),
+            realert_interval: std::time::Duration::from_secs(3600),
+            message_thread_id: Some(42),
+        };
+
+        build_usdc_notifier(Some(&alerts))
+            .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 }

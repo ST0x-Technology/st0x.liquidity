@@ -2606,6 +2606,22 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 }
             }
             Ok(None) => self.burn_on_base(amount).await?,
+            // ScanInconclusive: the chain head hasn't advanced far enough past
+            // `from_block` to trust an empty scan result. The aggregate is at
+            // `BridgingSubmitting` (a durable state), so return
+            // `SettlementCheckTransient` so the job delayed-redrives instead of
+            // consuming the apalis retry budget.
+            Err(error @ CctpError::ScanInconclusive { .. }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "CCTP burn scan on Base inconclusive; will retry after delay"
+                );
+                return Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP burn scan on Base failed: {error}");
                 return Err(UsdcTransferError::Cctp(Box::new(error)));
@@ -2629,7 +2645,11 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             .await
             .map_err(|error| {
                 warn!(target: "rebalance", "CCTP burn on Base failed: {error}");
-                UsdcTransferError::Cctp(Box::new(error))
+                if error.is_revert() {
+                    UsdcTransferError::BurnRevert(Box::new(error))
+                } else {
+                    UsdcTransferError::Cctp(Box::new(error))
+                }
             })
     }
 
@@ -2764,7 +2784,11 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             .await
             .map_err(|error| {
                 warn!(target: "rebalance", "CCTP burn on Ethereum failed: {error}");
-                UsdcTransferError::Cctp(Box::new(error))
+                if error.is_revert() {
+                    UsdcTransferError::BurnRevert(Box::new(error))
+                } else {
+                    UsdcTransferError::Cctp(Box::new(error))
+                }
             })
     }
 
@@ -7591,10 +7615,16 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // Deploy a REVERT-only contract at TOKEN_MESSENGER_V2 so the burn
-        // attempt fails predictably: BeginBridging fires before the burn,
-        // leaving the aggregate at BridgingSubmitting (not BridgingFailed).
-        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        // Deploy a REVERT contract at TOKEN_MESSENGER_V2 so the burn fails
+        // predictably. The bytecode is PUSH1 0 PUSH1 0 REVERT (0x60 0x00 0x60
+        // 0x00 0xFD), which pushes two zero arguments for the REVERT opcode so
+        // the stack is not underflowed. This produces a proper EVM revert
+        // (error code 3 / "execution reverted"), recognized by is_revert().
+        // A bare 0xFD with empty stack would cause StackUnderflow (code -32603),
+        // which is_revert() does not classify as a revert-class error.
+        // BeginBridging fires before the burn attempt; the REVERT leaves the
+        // aggregate at BridgingSubmitting (not BridgingFailed).
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
         let provider = ProviderBuilder::new()
             .connect(&chain.endpoint)
             .await
@@ -7618,8 +7648,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error, not a balance-gate wedge; got: {error:?}"
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "Expected BurnRevert error from REVERT-bytecode burn (0xFD), got: {error:?}"
         );
 
         // Aggregate at BridgingSubmitting confirms BeginBridging was emitted
@@ -7726,8 +7756,12 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // REVERT-only contract: confirms burn was attempted (not wedged).
-        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        // REVERT contract: confirms burn was attempted (not wedged by gates).
+        // The bytecode PUSH1 0 PUSH1 0 REVERT (0x60 0x00 0x60 0x00 0xFD)
+        // produces a proper EVM revert (code 3 / "execution reverted") so
+        // is_revert() classifies it as a BurnRevert. A bare 0xFD with empty
+        // stack causes StackUnderflow (code -32603), which is_revert() rejects.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
         let provider = ProviderBuilder::new()
             .connect(&chain.endpoint)
             .await
@@ -7745,16 +7779,16 @@ mod tests {
         // withdrawal_tx = None: no confirmation gate is entered at all.
         // If the confirmation gate ran, the mock server would return 404 (no
         // tx-confirmation endpoint registered), producing SettlementCheckTransient.
-        // A Cctp error proves the gate was skipped and the burn was attempted.
+        // A BurnRevert error proves the gate was skipped and the burn was attempted.
         let error = manager
             .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
             .await
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error (burn attempted, tx-confirmation gate skipped); \
-             SettlementCheckTransient would indicate the confirmation gate incorrectly fired; \
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "Expected BurnRevert error from REVERT-bytecode burn (0xFD, confirmation gate \
+             skipped); SettlementCheckTransient would indicate the gate incorrectly fired; \
              got: {error:?}"
         );
 
@@ -7923,9 +7957,13 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // Deploy a REVERT-only contract at TOKEN_MESSENGER_V2 (0xFD = REVERT opcode)
-        // to ensure any call that reaches the contract level also reverts.
-        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        // Deploy a REVERT contract at TOKEN_MESSENGER_V2. The bytecode is
+        // PUSH1 0 PUSH1 0 REVERT (0x60 0x00 0x60 0x00 0xFD): two zero
+        // arguments for REVERT so the stack is not underflowed. This produces
+        // a proper EVM revert (code 3 / "execution reverted") recognized by
+        // is_revert(). A bare 0xFD with empty stack causes StackUnderflow
+        // (code -32603) which is_revert() does not classify as a revert.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
         let provider = ProviderBuilder::new()
             .connect(&chain.endpoint)
             .await
@@ -7950,8 +7988,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error from pre-commit burn failure, got: {error:?}"
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "Expected BurnRevert error from REVERT-bytecode burn (0xFD pre-commit), got: {error:?}"
         );
 
         // Aggregate must be in BridgingSubmitting (BeginBridging was emitted before
@@ -8762,6 +8800,44 @@ mod tests {
             ),
             "BridgingSubmitting{{BaseToAlpaca}} must yield ResumeDirectionMismatch, \
              got: {error:?}"
+        );
+    }
+
+    /// `resume_bridging_submitting` (Base->Alpaca, burning via BaseToEthereum)
+    /// returns `SettlementCheckTransient` -- not `Cctp` -- when the burn scan is
+    /// inconclusive (chain head not yet `SCAN_FINALITY_MARGIN` blocks past
+    /// `from_block`). Mirrors the Ethereum counterpart so an inconclusive scan
+    /// delayed-redrives instead of tripping the terminal circuit. The aggregate
+    /// stays at `BridgingSubmitting`.
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_scan_inconclusive_returns_settlement_transient() {
+        let server = MockServer::start();
+        let (manager, cqrs, anvil) = make_resume_test_manager(&server).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+        let from_block = provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+        let error = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+            "an inconclusive Base burn scan must yield SettlementCheckTransient (delayed \
+             redrive), not Cctp (terminal); got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "Aggregate must stay at BridgingSubmitting after an inconclusive scan; got: {state:?}"
         );
     }
 

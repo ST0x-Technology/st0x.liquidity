@@ -1278,6 +1278,52 @@ impl UsdcRebalance {
             | Self::Reconciled { amount, .. } => *amount,
         }
     }
+
+    /// Returns the `(direction, amount)` for a mid-flight resumable aggregate
+    /// that can be re-armed by `recover_usdc_guard`, or `None` otherwise.
+    ///
+    /// `BridgingSubmitting` is resumable for both directions.
+    /// `WithdrawalSubmitting` is resumable only for `BaseToAlpaca`:
+    /// `resume_base_to_alpaca` handles it; `resume_alpaca_to_base` returns
+    /// `ResumeDirectionMismatch` for `WithdrawalSubmitting{AlpacaToBase}`.
+    ///
+    /// This method covers ONLY pre-burn / pre-withdrawal-tx states: post-burn
+    /// states (`Bridging`, `AwaitingAttestation`, `Attested`) are already
+    /// handled by `resumable_post_burn_transfer`.
+    pub(crate) fn is_resumable_mid_flight_data(&self) -> Option<(RebalanceDirection, Usdc)> {
+        match self {
+            // WithdrawalSubmitting is only resumable for BaseToAlpaca:
+            // resume_base_to_alpaca handles it; resume_alpaca_to_base returns
+            // ResumeDirectionMismatch for this state regardless of direction.
+            Self::WithdrawalSubmitting {
+                direction: direction @ RebalanceDirection::BaseToAlpaca,
+                amount,
+                ..
+            }
+            | Self::BridgingSubmitting {
+                direction, amount, ..
+            } => Some((*direction, *amount)),
+            Self::WithdrawalSubmitting {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::BridgingFailed { .. }
+            | Self::Reconciled { .. } => None,
+        }
+    }
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
@@ -8813,5 +8859,122 @@ mod tests {
         };
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(burn_tx_hash, burn_tx);
+    }
+
+    // --- is_resumable_mid_flight tests ---
+
+    fn bridging_submitting_base_to_alpaca() -> UsdcRebalance {
+        UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            from_block: 1,
+            initiated_at: Utc::now(),
+            burn_amount: None,
+        }
+    }
+
+    fn bridging_submitting_alpaca_to_base() -> UsdcRebalance {
+        UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100)),
+            from_block: 1,
+            initiated_at: Utc::now(),
+            burn_amount: None,
+        }
+    }
+
+    fn withdrawal_submitting_base_to_alpaca() -> UsdcRebalance {
+        UsdcRebalance::WithdrawalSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            from_block: 1,
+            initiated_at: Utc::now(),
+        }
+    }
+
+    fn withdrawal_submitting_alpaca_to_base() -> UsdcRebalance {
+        UsdcRebalance::WithdrawalSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100)),
+            from_block: 1,
+            initiated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn is_resumable_mid_flight_data_some_for_bridging_submitting_base_to_alpaca() {
+        let amount = Usdc::new(float!(100));
+        let result = bridging_submitting_base_to_alpaca().is_resumable_mid_flight_data();
+        assert_eq!(
+            result,
+            Some((RebalanceDirection::BaseToAlpaca, amount)),
+            "BridgingSubmitting BaseToAlpaca must be resumable"
+        );
+    }
+
+    #[test]
+    fn is_resumable_mid_flight_data_some_for_bridging_submitting_alpaca_to_base() {
+        let amount = Usdc::new(float!(100));
+        let result = bridging_submitting_alpaca_to_base().is_resumable_mid_flight_data();
+        assert_eq!(
+            result,
+            Some((RebalanceDirection::AlpacaToBase, amount)),
+            "BridgingSubmitting AlpacaToBase must be resumable"
+        );
+    }
+
+    #[test]
+    fn is_resumable_mid_flight_data_some_for_withdrawal_submitting_base_to_alpaca() {
+        let amount = Usdc::new(float!(100));
+        let result = withdrawal_submitting_base_to_alpaca().is_resumable_mid_flight_data();
+        assert_eq!(
+            result,
+            Some((RebalanceDirection::BaseToAlpaca, amount)),
+            "WithdrawalSubmitting BaseToAlpaca must be resumable (resume_base_to_alpaca handles it)"
+        );
+    }
+
+    #[test]
+    fn is_resumable_mid_flight_data_none_for_withdrawal_submitting_alpaca_to_base() {
+        let result = withdrawal_submitting_alpaca_to_base().is_resumable_mid_flight_data();
+        assert_eq!(
+            result, None,
+            "WithdrawalSubmitting AlpacaToBase must NOT be resumable \
+             (resume_alpaca_to_base returns ResumeDirectionMismatch)"
+        );
+    }
+
+    #[test]
+    fn is_resumable_mid_flight_data_none_for_post_burn_bridging() {
+        let state = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            burn_tx_hash: alloy::primitives::TxHash::ZERO,
+            initiated_at: Utc::now(),
+            burned_at: Utc::now(),
+        };
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            None,
+            "Bridging (post-burn) must not be mid-flight resumable"
+        );
+    }
+
+    #[test]
+    fn is_resumable_mid_flight_data_none_for_terminal_bridging_failed() {
+        let state = UsdcRebalance::BridgingFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            reason: "transient".to_string(),
+            initiated_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            None,
+            "BridgingFailed (terminal) must not be mid-flight resumable"
+        );
     }
 }
