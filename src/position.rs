@@ -307,59 +307,13 @@ impl EventSourced for Position {
             // out-of-order one after a newer reorg advanced the slot (ADR 0012).
             Reorged {
                 trade_id,
-                direction: Buy,
+                direction,
                 amount,
                 reorged_at,
                 ..
-            } => {
-                let mut pending_acknowledged_trade_ids =
-                    entity.pending_acknowledged_trade_ids.clone();
-                pending_acknowledged_trade_ids.remove(trade_id);
-                let mut pending_reorged_trade_ids = entity.pending_reorged_trade_ids.clone();
-                pending_reorged_trade_ids.insert(trade_id.clone());
-                Ok(Some(Self {
-                    net: (entity.net - *amount)?,
-                    accumulated_long: (entity.accumulated_long - *amount)?,
-                    last_reorged_at: Some(*reorged_at),
-                    last_acknowledged_trade_id: entity
-                        .last_acknowledged_trade_id
-                        .clone()
-                        .filter(|id| id != trade_id),
-                    last_reorged_trade_id: Some(trade_id.clone()),
-                    pending_acknowledged_trade_ids,
-                    pending_reorged_trade_ids,
-                    last_updated: Some(*reorged_at),
-                    ..entity.clone()
-                }))
-            }
-
-            Reorged {
-                trade_id,
-                direction: Sell,
-                amount,
-                reorged_at,
-                ..
-            } => {
-                let mut pending_acknowledged_trade_ids =
-                    entity.pending_acknowledged_trade_ids.clone();
-                pending_acknowledged_trade_ids.remove(trade_id);
-                let mut pending_reorged_trade_ids = entity.pending_reorged_trade_ids.clone();
-                pending_reorged_trade_ids.insert(trade_id.clone());
-                Ok(Some(Self {
-                    net: (entity.net + *amount)?,
-                    accumulated_short: (entity.accumulated_short - *amount)?,
-                    last_reorged_at: Some(*reorged_at),
-                    last_acknowledged_trade_id: entity
-                        .last_acknowledged_trade_id
-                        .clone()
-                        .filter(|id| id != trade_id),
-                    last_reorged_trade_id: Some(trade_id.clone()),
-                    pending_acknowledged_trade_ids,
-                    pending_reorged_trade_ids,
-                    last_updated: Some(*reorged_at),
-                    ..entity.clone()
-                }))
-            }
+            } => entity
+                .evolve_reorg(trade_id, *direction, *amount, *reorged_at)
+                .map(Some),
 
             // Bookkeeping only (ADR 0012): prune the settled reversal from the
             // pending-reorg set without touching net -- the reversal already
@@ -659,48 +613,7 @@ impl EventSourced for Position {
                 direction,
                 price_usdc,
                 reorg_depth,
-            } => {
-                // A reversal must undo a real (strictly positive) fill amount.
-                // Reject a zero or negative amount rather than appending a
-                // reversal that would corrupt the net position.
-                Positive::new(amount)
-                    .map_err(|_| PositionError::NonPositiveReorgAmount { amount })?;
-
-                // Dual guard (ADR 0012, mirroring ADR 0010 for fills): the
-                // retained slot bridges a reorg reversed under pre-set code and
-                // left unsettled at the deploy restart; the set rejects an
-                // out-of-order re-drive the single slot cannot, because a newer
-                // reorg advances the slot but never the set entry.
-                if self.last_reorged_trade_id.as_ref() == Some(&trade_id)
-                    || self.pending_reorged_trade_ids.contains(&trade_id)
-                {
-                    warn!(
-                        target: "hedge",
-                        symbol = %self.symbol, %trade_id,
-                        "Rejecting re-driven reorg: fill already reversed on this position"
-                    );
-                    return Err(PositionError::DuplicateReorg { trade_id });
-                }
-
-                warn!(
-                    target: "hedge",
-                    symbol = %self.symbol,
-                    %trade_id,
-                    ?direction,
-                    %amount,
-                    reorg_depth,
-                    "Reversing position impact of a reorged fill"
-                );
-
-                Ok(vec![PositionEvent::Reorged {
-                    trade_id,
-                    amount,
-                    direction,
-                    price_usdc: Some(price_usdc),
-                    reorg_depth,
-                    reorged_at: Utc::now(),
-                }])
-            }
+            } => self.record_reorg_events(trade_id, amount, direction, price_usdc, reorg_depth),
 
             SettleReorg { trade_id } => {
                 if self.pending_reorged_trade_ids.contains(&trade_id) {
@@ -852,6 +765,93 @@ impl EventSourced for Position {
 }
 
 impl Position {
+    fn record_reorg_events(
+        &self,
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        price_usdc: Float,
+        reorg_depth: u64,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        Positive::new(amount).map_err(|_| PositionError::NonPositiveReorgAmount { amount })?;
+
+        // Dual guard (ADR 0012, mirroring ADR 0010 for fills): the retained slot
+        // bridges a reorg reversed under pre-set code and left unsettled at the
+        // deploy restart; the set rejects an out-of-order re-drive the single
+        // slot cannot, because a newer reorg advances the slot but never the set.
+        if self.last_reorged_trade_id.as_ref() == Some(&trade_id)
+            || self.pending_reorged_trade_ids.contains(&trade_id)
+        {
+            warn!(
+                target: "hedge",
+                symbol = %self.symbol, %trade_id,
+                "Rejecting re-driven reorg: fill already reversed on this position"
+            );
+            return Err(PositionError::DuplicateReorg { trade_id });
+        }
+
+        warn!(
+            target: "hedge",
+            symbol = %self.symbol,
+            %trade_id,
+            ?direction,
+            %amount,
+            reorg_depth,
+            "Reversing position impact of a reorged fill"
+        );
+
+        Ok(vec![PositionEvent::Reorged {
+            trade_id,
+            amount,
+            direction,
+            price_usdc: Some(price_usdc),
+            reorg_depth,
+            reorged_at: Utc::now(),
+        }])
+    }
+
+    fn evolve_reorg(
+        &self,
+        trade_id: &TradeId,
+        direction: Direction,
+        amount: FractionalShares,
+        reorged_at: DateTime<Utc>,
+    ) -> Result<Self, PositionError> {
+        let mut pending_acknowledged_trade_ids = self.pending_acknowledged_trade_ids.clone();
+        pending_acknowledged_trade_ids.remove(trade_id);
+        let mut pending_reorged_trade_ids = self.pending_reorged_trade_ids.clone();
+        pending_reorged_trade_ids.insert(trade_id.clone());
+
+        let (net, accumulated_long, accumulated_short) = match direction {
+            Direction::Buy => (
+                (self.net - amount)?,
+                (self.accumulated_long - amount)?,
+                self.accumulated_short,
+            ),
+            Direction::Sell => (
+                (self.net + amount)?,
+                self.accumulated_long,
+                (self.accumulated_short - amount)?,
+            ),
+        };
+
+        Ok(Self {
+            net,
+            accumulated_long,
+            accumulated_short,
+            last_reorged_at: Some(reorged_at),
+            last_acknowledged_trade_id: self
+                .last_acknowledged_trade_id
+                .clone()
+                .filter(|id| id != trade_id),
+            last_reorged_trade_id: Some(trade_id.clone()),
+            pending_acknowledged_trade_ids,
+            pending_reorged_trade_ids,
+            last_updated: Some(reorged_at),
+            ..self.clone()
+        })
+    }
+
     fn acknowledge_on_chain_fill_init_events(
         symbol: Symbol,
         threshold: ExecutionThreshold,
