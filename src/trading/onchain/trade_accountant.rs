@@ -203,7 +203,7 @@ fn reconstruct_log(orderbook: Address, trade: &EmittedOnChain<RaindexTradeEvent>
             address: orderbook,
             data: log_data,
         },
-        block_hash: None,
+        block_hash: trade.block_hash,
         block_number: Some(trade.block_number),
         block_timestamp,
         transaction_hash: Some(trade.tx_hash),
@@ -300,6 +300,28 @@ mod tests {
 
         let label_str = label.to_string();
         assert_eq!(label_str, "ClearV3:12345:293");
+    }
+
+    #[test]
+    fn reconstruct_log_preserves_block_hash() {
+        // block_hash must survive `EmittedOnChain -> reconstruct_log -> Log` so
+        // fork detection can compare the persisted hash against a re-observed
+        // one; dropping it would make a reorged re-observation of the same
+        // `(tx_hash, log_index)` look like a duplicate rather than a reorg.
+        let block_hash = B256::repeat_byte(0xcd);
+        let mut job = test_job();
+        job.trade.block_hash = Some(block_hash);
+
+        let log = reconstruct_log(
+            address!("0x2222222222222222222222222222222222222222"),
+            &job.trade,
+        );
+
+        assert_eq!(
+            log.block_hash,
+            Some(block_hash),
+            "reconstructed log must carry the original block hash for fork detection"
+        );
     }
 
     #[tokio::test]

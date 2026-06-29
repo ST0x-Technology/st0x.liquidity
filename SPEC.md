@@ -888,9 +888,9 @@ rules and maintain consistency boundaries.
 OnChain trades, offchain orders, and positions are all entities with distinct
 lifecycles, so we model them as separate aggregates:
 
-- **OnChainTrade**: Lifecycle = blockchain fill -> enriched with metadata.
-  Immutable blockchain facts (reorgs not currently handled, see Future
-  Consideration section).
+- **OnChainTrade**: Lifecycle = blockchain fill -> enriched with metadata ->
+  reversed on reorg. Records the `block_hash` of the fill's block for fork
+  detection (see Reorg Handling).
 - **OffchainOrder**: Lifecycle = placed -> submitted -> filled/failed. Broker
   order tracking.
 - **Position**: Lifecycle = accumulates fills -> triggers hedging decisions.
@@ -3438,33 +3438,63 @@ evolves toward lifecycle workflows, the pipeline steps will become discrete
 workflow steps coordinated by apalis-workflow, with each step as a durable
 checkpoint.
 
-#### Future Consideration: Reorg Handling
+#### Reorg Handling
 
-**Note**: Reorg handling is not implemented currently, but the event-sourced
-architecture will make it significantly easier to add in the future.
+Blockchain reorganizations can invalidate a fill the bot already witnessed: a
+confirmed `(tx_hash, log_index)` may be dropped from the canonical chain, or
+reappear on a different fork. Because ingestion is event-sourced, the bot treats
+a reorg as a first-class domain event that reverses the original fill's impact
+rather than mutating or deleting history.
 
-Blockchain reorganizations occur before block finalization. When we eventually
-implement reorg handling, the event-sourced architecture will make it
-significantly easier than the current CRUD approach.
+##### Fork identity
 
-##### Why Event Sourcing Helps
+Every `OnChainTrade` records the `block_hash` of the block its fill was
+confirmed in, alongside `(tx_hash, log_index, block_number)`. The idempotency
+key stays `(tx_hash, log_index)`; `block_hash` is the fork-detection field, not
+part of the key. On backfill or restart the bot distinguishes "same fill, same
+fork" (a duplicate, skipped) from "same `(tx_hash, log_index)`, different
+`block_hash`" (a reorg).
 
-Simply append a reorg event that reverses the position change. The event would
-be: PositionCommand::RecordReorg with tx_hash, log_index, symbol, amount,
-direction, reorg_depth. The resulting PositionEvent::Reorged would reverse the
-original trade's position impact. Views would update automatically. The
-`onchain_trade_view` could mark trades as `reorged: true` without deleting them.
+When either side of the comparison has **no** `block_hash` -- the source log
+carried none, or the fill predates the field -- the backfill/restart path cannot
+classify the re-observation, so it conservatively treats it as a duplicate
+(skipped, never a reversal): a missing hash must never fabricate a reorg against
+a fill that may be perfectly canonical. Fork detection for those fills falls
+back to the live removed-log path (a removed log past the confirmation gate
+still emits `RecordReorg`), which does not depend on the stored hash.
 
-##### Benefits (when implemented)
+_(Design specification -- the detection and reversal paths below describe the
+target behavior, not what runs today. Only `block_hash` storage, the
+fork-identity foundation above, exists so far; detection and reversal are being
+implemented.)_
+
+##### Detection
+
+A reorg is detected on either ingestion path:
+
+- **Live**: a previously confirmed log is removed past the confirmation gate.
+- **Backfill/restart**: a re-observed `(tx_hash, log_index)` carries a
+  `block_hash` that differs from the recorded one.
+
+Either path emits a `RecordReorg` command through the CQRS framework -- never a
+direct SQL write.
+
+##### Reversal
+
+`RecordReorg` produces `OnChainTradeEvent::Reorged` and
+`PositionEvent::Reorged`. The position event reverses the original fill's
+position impact (a buy fill's reorg reverses as a sell of the same size, and
+vice versa). Views update automatically: `onchain_trade_view` and
+`position_view` expose an append-only `reorged` flag -- original rows are
+preserved, never deleted.
+
+##### Why event sourcing fits
 
 - Append-only: no cascading updates across tables
-- Complete audit trail: preserves both original trade and reorg event
+- Complete audit trail: preserves both the original fill and its reversal
 - Testable: Given-When-Then testing for reorg scenarios
 - Recoverable: fix bugs and replay events to correct state
 - Explicit: reorgs are first-class domain events, not special cases
-
-This demonstrates how the event-sourced architecture provides a cleaner
-foundation for future enhancements.
 
 ### Testing Strategy
 
