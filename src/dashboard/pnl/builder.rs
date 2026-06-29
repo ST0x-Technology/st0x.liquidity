@@ -30,6 +30,14 @@ pub(crate) fn build_pnl_response_from_rows(
     symbols: &BTreeSet<String>,
     mut warnings: Vec<String>,
 ) -> PnlResponse {
+    let event_rows = if symbols.is_empty() {
+        event_rows
+    } else {
+        event_rows
+            .into_iter()
+            .filter(|row| symbols.contains(&row.symbol))
+            .collect()
+    };
     let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings);
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
     let mut books: HashMap<String, SymbolBook> = HashMap::new();
@@ -111,14 +119,7 @@ pub(crate) fn build_pnl_response_from_rows(
     let page_entries = filtered_entries[start..end].to_vec();
 
     let mut cost_replay = build_cost_entries(cost_rows, &mut warnings);
-    let alpaca_entries = build_alpaca_activity_cost_entries(alpaca_activities);
-    if !alpaca_entries.is_empty() {
-        warnings.push(format!(
-            "Cost coverage note: {} Alpaca account activity rows were fetched from the broker API \
-             and included as explicit cost/revenue ledger entries.",
-            alpaca_entries.len()
-        ));
-    }
+    let alpaca_entries = build_alpaca_activity_cost_entries(alpaca_activities, &mut warnings);
     cost_replay.entries.extend(alpaca_entries);
 
     let mut filtered_cost_entries: Vec<_> = cost_replay
@@ -127,6 +128,16 @@ pub(crate) fn build_pnl_response_from_rows(
         .filter(|entry| matches_cost_symbol_filter(entry, symbols))
         .filter(|entry| matches_cost_date_filter(entry, query))
         .collect();
+    let filtered_alpaca_entry_count = filtered_cost_entries
+        .iter()
+        .filter(|entry| entry.aggregate_type == "AlpacaAccountActivity")
+        .count();
+    if filtered_alpaca_entry_count > 0 {
+        warnings.push(format!(
+            "Cost coverage note: {filtered_alpaca_entry_count} Alpaca account activity rows were fetched from the broker API \
+             and included as explicit cost/revenue ledger entries."
+        ));
+    }
     filtered_cost_entries.sort_by(|left, right| {
         right
             .occurred_at

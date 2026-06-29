@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use num_decimal::Num;
 use serde_json::Value;
@@ -9,6 +9,15 @@ use super::response::{PnlSummary, PnlSymbolSummary};
 pub(crate) enum Direction {
     Buy,
     Sell,
+}
+
+impl Direction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +109,8 @@ pub(crate) struct SummaryAcc {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SymbolBook {
-    pub(crate) long_lots: Vec<Lot>,
-    pub(crate) short_lots: Vec<Lot>,
+    pub(crate) long_lots: VecDeque<Lot>,
+    pub(crate) short_lots: VecDeque<Lot>,
     pub(crate) seen_onchain_fill_ids: HashSet<String>,
     pub(crate) seen_offchain_placement_ids: HashSet<String>,
     pub(crate) seen_offchain_fill_ids: HashSet<String>,

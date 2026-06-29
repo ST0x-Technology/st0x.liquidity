@@ -57,6 +57,7 @@
 
   const fetchHealth = async () => {
     if (skipHealth) {
+      health.update(() => null)
       botReachable.update(() => null)
       return
     }

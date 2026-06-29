@@ -5,7 +5,7 @@ use num_decimal::Num;
 use st0x_execution::AccountActivity;
 
 use super::parsing::{
-    abs_decimal, decimal_field, fmt_decimal, is_safe_symbol, nested_record, parse_decimal_lossy,
+    abs_decimal, decimal_field, fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal,
     text_field,
 };
 use super::response::{PnlCostCoverage, PnlCostSummary, PnlSummary};
@@ -349,9 +349,9 @@ pub(crate) fn summarize_cost_entries(
 }
 
 pub(crate) fn with_costs(summary: PnlSummary, costs: &PnlCostSummary) -> PnlSummary {
-    let gross = parse_decimal_lossy(&summary.total_pnl_usd);
-    let tracked_costs = parse_decimal_lossy(&costs.total_tracked_costs_usd);
-    let tracked_revenue = parse_decimal_lossy(&costs.total_tracked_revenue_usd);
+    let gross = parse_internal_decimal(&summary.total_pnl_usd);
+    let tracked_costs = parse_internal_decimal(&costs.total_tracked_costs_usd);
+    let tracked_revenue = parse_internal_decimal(&costs.total_tracked_revenue_usd);
     let net = &(&gross - &tracked_costs) + &tracked_revenue;
 
     PnlSummary {
@@ -649,6 +649,7 @@ fn activity_detail(activity: &AccountActivity) -> String {
 
 pub(crate) fn build_alpaca_activity_cost_entries(
     activities: &[AccountActivity],
+    warnings: &mut Vec<String>,
 ) -> Vec<CostEntryInternal> {
     let mut sorted = activities.to_vec();
     sorted.sort_by(|left, right| {
@@ -662,16 +663,45 @@ pub(crate) fn build_alpaca_activity_cost_entries(
         .iter()
         .enumerate()
         .filter_map(|(idx, activity)| {
-            let occurred_at = activity_timestamp(activity)?;
-            let signed_amount = activity
-                .net_amount
-                .as_deref()
-                .and_then(|amount| Num::from_str(amount).ok())?;
+            let Some(occurred_at) = activity_timestamp(activity) else {
+                warnings.push(format!(
+                    "Skipped malformed Alpaca account activity {}: missing timestamp/date",
+                    activity.id
+                ));
+                return None;
+            };
+            let Some(net_amount) = activity.net_amount.as_deref() else {
+                warnings.push(format!(
+                    "Skipped malformed Alpaca account activity {}: missing net_amount",
+                    activity.id
+                ));
+                return None;
+            };
+            let signed_amount = match Num::from_str(net_amount) {
+                Ok(amount) => amount,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Skipped malformed Alpaca account activity {}: invalid net_amount {} ({error})",
+                        activity.id, net_amount
+                    ));
+                    return None;
+                }
+            };
             if signed_amount.is_zero() {
                 return None;
             }
             let (category, accounting_bucket, effect) =
                 classify_activity(&activity.activity_type, &signed_amount)?;
+            let event_rowid = match i64::try_from(idx) {
+                Ok(idx) => -1 - idx,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Skipped malformed Alpaca account activity {}: activity index cannot be represented as i64 ({error})",
+                        activity.id
+                    ));
+                    return None;
+                }
+            };
 
             Some(CostEntryInternal {
                 category,
@@ -681,7 +711,7 @@ pub(crate) fn build_alpaca_activity_cost_entries(
                 occurred_at,
                 aggregate_type: "AlpacaAccountActivity".to_owned(),
                 aggregate_id: activity.id.clone(),
-                event_rowid: -1 - i64::try_from(idx).ok()?,
+                event_rowid,
                 symbol: activity.symbol.clone().filter(|symbol| !symbol.is_empty()),
                 detail: activity_detail(activity),
             })

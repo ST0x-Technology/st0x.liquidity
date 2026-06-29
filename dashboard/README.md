@@ -40,7 +40,7 @@ otherwise the panel shows the live load/configuration failure.
 Run the full dashboard locally against a backend origin:
 
 ```sh
-PUBLIC_BACKEND_API_URL=https://st0x-liquidity-nixos.taile5cf8a.ts.net \
+PUBLIC_BACKEND_API_URL=http://localhost:8001 \
 bun run dev
 ```
 

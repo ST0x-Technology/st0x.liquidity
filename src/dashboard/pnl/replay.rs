@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 
 use num_decimal::Num;
@@ -6,7 +6,7 @@ use num_decimal::Num;
 use super::costs::{AccountingEffect, CostEntryInternal};
 use super::parsing::{
     abs_decimal, decimal_field, direction_field, fmt_decimal, min_decimal, nested_record,
-    number_text_field, parse_decimal_lossy, text_field,
+    number_text_field, parse_internal_decimal, text_field,
 };
 use super::response::{PnlEntry, PnlSummary, PnlSymbolSummary};
 use super::sessions::seconds_between;
@@ -16,17 +16,10 @@ use super::state::{
 };
 use super::{ATTRIBUTION_METHOD, COUNTER_TRADE_THRESHOLD_SECONDS, EPSILON};
 
-fn direction_label(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Buy => "buy",
-        Direction::Sell => "sell",
-    }
-}
-
-fn lot_side_to_direction(side: LotSide) -> &'static str {
+fn lot_side_to_direction(side: LotSide) -> Direction {
     match side {
-        LotSide::Long => "buy",
-        LotSide::Short => "sell",
+        LotSide::Long => Direction::Buy,
+        LotSide::Short => Direction::Sell,
     }
 }
 
@@ -175,8 +168,8 @@ fn open_residual_lot(book: &mut SymbolBook, fill: &Fill, remaining: Num) {
     };
 
     match side {
-        LotSide::Long => book.long_lots.push(lot),
-        LotSide::Short => book.short_lots.push(lot),
+        LotSide::Long => book.long_lots.push_back(lot),
+        LotSide::Short => book.short_lots.push_back(lot),
     }
 }
 
@@ -284,7 +277,7 @@ pub(crate) fn apply_offchain_fill(
 
 fn match_fill_against_lots(
     fill: &Fill,
-    source_lots: &mut Vec<Lot>,
+    source_lots: &mut VecDeque<Lot>,
     summary: &mut SummaryAcc,
     matched_onchain_shares: &mut HashMap<String, Num>,
     entries: &mut Vec<PnlEntry>,
@@ -292,8 +285,10 @@ fn match_fill_against_lots(
 ) -> Num {
     let mut remaining = fill.shares.clone();
 
-    while !remaining.is_zero() && !source_lots.is_empty() {
-        let mut front_lot = source_lots.remove(0);
+    while !remaining.is_zero() {
+        let Some(mut front_lot) = source_lots.pop_front() else {
+            break;
+        };
         let matched_shares = min_decimal(&remaining, &front_lot.remaining_shares);
         if matched_shares.is_zero() {
             continue;
@@ -320,7 +315,7 @@ fn match_fill_against_lots(
 
         front_lot.remaining_shares -= &matched_shares;
         if !front_lot.remaining_shares.is_zero() {
-            source_lots.insert(0, front_lot.clone());
+            source_lots.push_front(front_lot.clone());
         }
 
         add_realized_pnl(summary, effective_bucket, &realized_pnl);
@@ -337,20 +332,20 @@ fn match_fill_against_lots(
         }
 
         let opening_direction = lot_side_to_direction(front_lot.side);
-        let closing_direction = direction_label(fill.direction);
+        let closing_direction = fill.direction;
         let opening_price_text = fmt_decimal(&front_lot.price);
         let closing_price_text = fmt_decimal(&fill.price);
         let onchain_direction = if front_lot.opened_venue == Venue::Onchain {
-            opening_direction.to_owned()
+            opening_direction.as_str().to_owned()
         } else if fill.venue == Venue::Onchain {
-            closing_direction.to_owned()
+            closing_direction.as_str().to_owned()
         } else {
             String::new()
         };
         let offchain_direction = if front_lot.opened_venue == Venue::Offchain {
-            opening_direction.to_owned()
+            opening_direction.as_str().to_owned()
         } else if fill.venue == Venue::Offchain {
-            closing_direction.to_owned()
+            closing_direction.as_str().to_owned()
         } else {
             String::new()
         };
@@ -385,7 +380,7 @@ fn match_fill_against_lots(
 
         entries.push(PnlEntry {
             symbol: fill.symbol.clone(),
-            pnl_bucket: effective_bucket.as_str(),
+            pnl_bucket: effective_bucket,
             matched_at: fill.executed_at.clone(),
             opened_at: front_lot.opened_at.clone(),
             closed_at: fill.executed_at.clone(),
@@ -393,21 +388,21 @@ fn match_fill_against_lots(
             closing_fill_id: fill.id.clone(),
             opening_rowid: front_lot.opened_rowid,
             closing_rowid: fill.rowid,
-            opening_venue: front_lot.opened_venue.as_str(),
-            closing_venue: fill.venue.as_str(),
+            opening_venue: front_lot.opened_venue,
+            closing_venue: fill.venue,
             opening_direction,
             closing_direction,
-            opening_price_usd: opening_price_text,
-            closing_price_usd: closing_price_text,
+            opening_price_usd: front_lot.price.clone(),
+            closing_price_usd: fill.price.clone(),
             onchain_trade_id,
             offchain_order_id,
             onchain_direction,
             offchain_direction,
-            shares: fmt_decimal(&matched_shares),
+            shares: matched_shares.clone(),
             onchain_price_usdc: onchain_price_text,
             offchain_price_usd: offchain_price_text,
-            spread_usd: fmt_decimal(&spread),
-            realized_pnl_usd: fmt_decimal(&realized_pnl),
+            spread_usd: spread,
+            realized_pnl_usd: realized_pnl,
             elapsed_seconds,
             counter_trade_threshold_seconds: COUNTER_TRADE_THRESHOLD_SECONDS,
             delayed_counter_trade: effective_bucket == PnlBucket::DirectionalExposure,
@@ -420,7 +415,7 @@ fn match_fill_against_lots(
     remaining
 }
 
-fn finalize_lots(summary: &mut SummaryAcc, lots: &[Lot]) {
+fn finalize_lots(summary: &mut SummaryAcc, lots: &VecDeque<Lot>) {
     for lot in lots {
         let notional = &lot.remaining_shares * &lot.price;
         match lot.side {
@@ -703,7 +698,7 @@ pub(crate) fn with_direct_symbol_costs(
         let existing = by_symbol
             .remove(&symbol)
             .unwrap_or_else(|| empty_symbol_summary(&symbol));
-        let gross = parse_decimal_lossy(&existing.total_pnl_usd);
+        let gross = parse_internal_decimal(&existing.total_pnl_usd);
         let cost = costs_by_symbol.remove(&symbol).unwrap_or_default();
         let revenue = revenue_by_symbol.remove(&symbol).unwrap_or_default();
         let net = &(&gross - &cost) + &revenue;
@@ -730,39 +725,38 @@ pub(crate) fn summary_from_entries(entries: &[PnlEntry]) -> SummaryAndSymbols {
 
     for entry in entries {
         let summary = per_symbol.entry(entry.symbol.clone()).or_default();
-        let shares = parse_decimal_lossy(&entry.shares);
-        let opening_notional = &shares * &parse_decimal_lossy(&entry.opening_price_usd);
-        let closing_notional = &shares * &parse_decimal_lossy(&entry.closing_price_usd);
-        let pnl = parse_decimal_lossy(&entry.realized_pnl_usd);
+        let shares = entry.shares.clone();
+        let opening_notional = &shares * &entry.opening_price_usd;
+        let closing_notional = &shares * &entry.closing_price_usd;
+        let pnl = entry.realized_pnl_usd.clone();
 
         summary.matched_shares += &shares;
-        if entry.opening_venue == "onchain" {
+        if entry.opening_venue == Venue::Onchain {
             add_venue_notional(summary, Venue::Onchain, &opening_notional);
-        } else if entry.opening_venue == "offchain" {
+        } else if entry.opening_venue == Venue::Offchain {
             add_venue_notional(summary, Venue::Offchain, &opening_notional);
         }
-        if entry.closing_venue == "onchain" {
+        if entry.closing_venue == Venue::Onchain {
             add_venue_notional(summary, Venue::Onchain, &closing_notional);
-        } else if entry.closing_venue == "offchain" {
+        } else if entry.closing_venue == Venue::Offchain {
             add_venue_notional(summary, Venue::Offchain, &closing_notional);
         }
         summary.matched_lot_count += 1;
 
         match entry.pnl_bucket {
-            "counter_trade" => {
+            PnlBucket::CounterTrade => {
                 summary.counter_trade_pnl_usd += &pnl;
                 summary.realized_pnl_usd += &pnl;
             }
-            "onchain_netting" => {
+            PnlBucket::OnchainNetting => {
                 summary.onchain_netting_pnl_usd += &pnl;
                 summary.realized_pnl_usd += &pnl;
             }
-            "directional_exposure" => {
+            PnlBucket::DirectionalExposure => {
                 summary.directional_imbalance_excess_pnl_usd += &pnl;
                 summary.directional_exposure_pnl_usd += &pnl;
                 summary.realized_pnl_usd += &pnl;
             }
-            _ => {}
         }
     }
 

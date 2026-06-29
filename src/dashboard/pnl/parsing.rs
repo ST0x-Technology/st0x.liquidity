@@ -8,20 +8,28 @@ use super::SAFE_SYMBOL_CHARS;
 use super::query::PnlError;
 use super::state::{Direction, PositionEventRow};
 
-pub(crate) fn parse_payload_string(payload: &str) -> Value {
-    serde_json::from_str(payload).unwrap_or(Value::Null)
+pub(crate) fn parse_payload_string(payload: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str(payload)
 }
 
-pub(crate) fn parse_query_datetime(value: &str) -> Result<DateTime<Utc>, PnlError> {
+pub(crate) fn parse_query_datetime(
+    value: &str,
+    field: &'static str,
+) -> Result<DateTime<Utc>, PnlError> {
     if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
         return Ok(parsed.with_timezone(&Utc));
     }
 
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| PnlError::InvalidQuery(format!("invalid timestamp/date: {value}")))?;
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| PnlError::InvalidDate {
+        field,
+        value: value.to_owned(),
+    })?;
     let datetime = date
         .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| PnlError::InvalidQuery(format!("invalid timestamp/date: {value}")))?;
+        .ok_or_else(|| PnlError::InvalidDate {
+            field,
+            value: value.to_owned(),
+        })?;
     Ok(DateTime::from_naive_utc_and_offset(datetime, Utc))
 }
 
@@ -134,6 +142,7 @@ pub(crate) fn min_decimal(left: &Num, right: &Num) -> Num {
     }
 }
 
-pub(crate) fn parse_decimal_lossy(value: &str) -> Num {
-    Num::from_str(value).unwrap_or_default()
+pub(crate) fn parse_internal_decimal(value: &str) -> Num {
+    Num::from_str(value)
+        .unwrap_or_else(|error| panic!("internal PnL decimal field must parse: {value}: {error}"))
 }

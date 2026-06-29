@@ -1,7 +1,49 @@
-use serde::Serialize;
+use num_decimal::Num;
+use serde::{Serialize, Serializer};
 
 use super::costs::CostEntryInternal;
 use super::parsing::fmt_decimal;
+use super::state::{Direction, PnlBucket, Venue};
+
+fn serialize_decimal<S>(value: &Num, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&fmt_decimal(value))
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde serialize_with functions receive field values by reference"
+)]
+fn serialize_pnl_bucket<S>(value: &PnlBucket, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value.as_str())
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde serialize_with functions receive field values by reference"
+)]
+fn serialize_venue<S>(value: &Venue, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value.as_str())
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde serialize_with functions receive field values by reference"
+)]
+fn serialize_direction<S>(value: &Direction, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value.as_str())
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,7 +123,8 @@ pub(crate) struct PnlSymbolSummary {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PnlEntry {
     pub(crate) symbol: String,
-    pub(crate) pnl_bucket: &'static str,
+    #[serde(serialize_with = "serialize_pnl_bucket")]
+    pub(crate) pnl_bucket: PnlBucket,
     pub(crate) matched_at: String,
     pub(crate) opened_at: String,
     pub(crate) closed_at: String,
@@ -89,21 +132,30 @@ pub(crate) struct PnlEntry {
     pub(crate) closing_fill_id: String,
     pub(crate) opening_rowid: i64,
     pub(crate) closing_rowid: i64,
-    pub(crate) opening_venue: &'static str,
-    pub(crate) closing_venue: &'static str,
-    pub(crate) opening_direction: &'static str,
-    pub(crate) closing_direction: &'static str,
-    pub(crate) opening_price_usd: String,
-    pub(crate) closing_price_usd: String,
+    #[serde(serialize_with = "serialize_venue")]
+    pub(crate) opening_venue: Venue,
+    #[serde(serialize_with = "serialize_venue")]
+    pub(crate) closing_venue: Venue,
+    #[serde(serialize_with = "serialize_direction")]
+    pub(crate) opening_direction: Direction,
+    #[serde(serialize_with = "serialize_direction")]
+    pub(crate) closing_direction: Direction,
+    #[serde(serialize_with = "serialize_decimal")]
+    pub(crate) opening_price_usd: Num,
+    #[serde(serialize_with = "serialize_decimal")]
+    pub(crate) closing_price_usd: Num,
     pub(crate) onchain_trade_id: String,
     pub(crate) offchain_order_id: String,
     pub(crate) onchain_direction: String,
     pub(crate) offchain_direction: String,
-    pub(crate) shares: String,
+    #[serde(serialize_with = "serialize_decimal")]
+    pub(crate) shares: Num,
     pub(crate) onchain_price_usdc: String,
     pub(crate) offchain_price_usd: String,
-    pub(crate) spread_usd: String,
-    pub(crate) realized_pnl_usd: String,
+    #[serde(serialize_with = "serialize_decimal")]
+    pub(crate) spread_usd: Num,
+    #[serde(serialize_with = "serialize_decimal")]
+    pub(crate) realized_pnl_usd: Num,
     pub(crate) elapsed_seconds: i64,
     pub(crate) counter_trade_threshold_seconds: i64,
     pub(crate) delayed_counter_trade: bool,

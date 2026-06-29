@@ -1,3 +1,8 @@
+//! Alpaca Broker account activity retrieval for reporting-only cost and revenue ingestion.
+//!
+//! This module fetches immutable broker activity rows for the configured account. It does not
+//! place orders, mutate account state, or participate in hot-path execution.
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,7 +17,11 @@ pub const PNL_ACTIVITY_TYPES: &[&str] = &[
 ];
 
 const ACCOUNT_ACTIVITIES_PAGE_SIZE: usize = 100;
+
+#[cfg(not(test))]
 const MAX_ACCOUNT_ACTIVITIES_PAGES: usize = 1000;
+#[cfg(test)]
+const MAX_ACCOUNT_ACTIVITIES_PAGES: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct AccountActivitiesQuery {
@@ -123,7 +132,7 @@ async fn fetch_account_activities_page(
     let mut url = reqwest::Url::parse(&base).map_err(|error| {
         AlpacaBrokerApiError::InvalidAccountActivitiesUrl {
             url: base.clone(),
-            reason: error.to_string(),
+            source: error,
         }
     })?;
 
@@ -266,5 +275,117 @@ mod tests {
         .unwrap();
 
         mock.assert();
+    }
+
+    #[tokio::test]
+    async fn rejects_repeated_account_activities_page_token() {
+        let server = MockServer::start();
+        let second_page = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/activities")
+                .query_param("account_id", TEST_ACCOUNT_ID.to_string())
+                .query_param("page_token", "repeated-token");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(full_page("repeated-token"));
+        });
+        let first_page = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/activities")
+                .query_param("account_id", TEST_ACCOUNT_ID.to_string())
+                .query_param("page_size", ACCOUNT_ACTIVITIES_PAGE_SIZE.to_string());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(full_page("repeated-token"));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&create_test_ctx(&server)).unwrap();
+        let error = get_account_activities(
+            &client,
+            &AccountActivitiesQuery {
+                activity_types: Vec::new(),
+                after: None,
+                until: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        first_page.assert();
+        second_page.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::AccountActivitiesPaginationInvariantViolation
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_account_activities_after_page_limit() {
+        let server = MockServer::start();
+        let mut mocks = Vec::new();
+        for page_index in 0..MAX_ACCOUNT_ACTIVITIES_PAGES {
+            let page_token = page_index
+                .checked_sub(1)
+                .map(|previous| format!("page-{previous}-last"));
+            let last_id = format!("page-{page_index}-last");
+            let mock = server.mock(|when, then| {
+                let when = when
+                    .method(GET)
+                    .path("/v1/accounts/activities")
+                    .query_param("account_id", TEST_ACCOUNT_ID.to_string())
+                    .query_param("page_size", ACCOUNT_ACTIVITIES_PAGE_SIZE.to_string());
+                if let Some(page_token) = &page_token {
+                    when.query_param("page_token", page_token);
+                } else {
+                    when.query_param_missing("page_token");
+                }
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(full_page(&last_id));
+            });
+            mocks.push(mock);
+        }
+
+        let client = AlpacaBrokerApiClient::new(&create_test_ctx(&server)).unwrap();
+        let error = get_account_activities(
+            &client,
+            &AccountActivitiesQuery {
+                activity_types: Vec::new(),
+                after: None,
+                until: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        for mock in mocks {
+            mock.assert();
+        }
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded {
+                pages: MAX_ACCOUNT_ACTIVITIES_PAGES
+            }
+        ));
+    }
+
+    fn full_page(last_id: &str) -> serde_json::Value {
+        serde_json::json!(
+            (0..ACCOUNT_ACTIVITIES_PAGE_SIZE)
+                .map(|idx| {
+                    let id = if idx + 1 == ACCOUNT_ACTIVITIES_PAGE_SIZE {
+                        last_id.to_owned()
+                    } else {
+                        format!("{last_id}-{idx}")
+                    };
+                    serde_json::json!({
+                        "activity_type": "FEE",
+                        "id": id,
+                        "date": "2026-06-03",
+                        "net_amount": "-0.01"
+                    })
+                })
+                .collect::<Vec<_>>()
+        )
     }
 }

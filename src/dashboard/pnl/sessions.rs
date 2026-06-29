@@ -8,8 +8,11 @@ use super::parsing::parse_timestamp;
 use super::query::{PnlCounterTradingFilter, PnlMarketSessionFilter, PnlQuery};
 use super::response::PnlEntry;
 
-pub(crate) fn date_key(iso: &str) -> &str {
-    iso.get(..10).unwrap_or(iso)
+pub(crate) fn date_key(iso: &str) -> String {
+    parse_timestamp(iso).map_or_else(
+        || iso.get(..10).unwrap_or(iso).to_owned(),
+        |parsed| parsed.with_timezone(&New_York).date_naive().to_string(),
+    )
 }
 
 pub(crate) fn market_session_for_iso(iso: &str) -> &'static str {

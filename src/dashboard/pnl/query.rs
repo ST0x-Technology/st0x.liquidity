@@ -1,14 +1,22 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, Utc};
 use serde::Deserialize;
 
 use super::parsing::{is_safe_symbol, parse_query_datetime};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PnlError {
-    #[error("invalid query: {0}")]
-    InvalidQuery(String),
+    #[error("invalid {field}: {value}")]
+    InvalidDate { field: &'static str, value: String },
+    #[error("failed to parse persisted PnL payload at row {rowid} ({aggregate_type}/{event_type})")]
+    InvalidPayload {
+        rowid: i64,
+        aggregate_type: String,
+        event_type: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("failed to load PnL rows: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -38,7 +46,7 @@ impl PnlQuery {
         self.from_date
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .map(parse_query_datetime)
+            .map(|value| parse_query_datetime(value, "fromDate"))
             .transpose()
     }
 
@@ -51,19 +59,25 @@ impl PnlQuery {
             return Ok(None);
         };
 
-        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
-            return Ok(Some(parsed.with_timezone(&Utc)));
-        }
+        let parsed = parse_query_datetime(value, "toDate")?;
+        let Some(date_value) = self.to_date.as_deref().filter(|value| value.len() == 10) else {
+            return Ok(Some(parsed));
+        };
 
-        let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .map_err(|_| PnlError::InvalidQuery(format!("invalid date: {value}")))?;
-        let until = date
-            .checked_add_days(Days::new(2))
-            .ok_or_else(|| PnlError::InvalidQuery(format!("invalid date: {value}")))?;
+        let until = parsed
+            .date_naive()
+            .checked_add_days(Days::new(1))
+            .ok_or_else(|| PnlError::InvalidDate {
+                field: "toDate",
+                value: date_value.to_owned(),
+            })?;
         Ok(Some(DateTime::from_naive_utc_and_offset(
             until
                 .and_hms_opt(0, 0, 0)
-                .ok_or_else(|| PnlError::InvalidQuery(format!("invalid date: {value}")))?,
+                .ok_or_else(|| PnlError::InvalidDate {
+                    field: "toDate",
+                    value: date_value.to_owned(),
+                })?,
             Utc,
         )))
     }

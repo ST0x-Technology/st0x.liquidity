@@ -2,24 +2,16 @@ use std::collections::{BTreeSet, HashMap};
 
 use num_decimal::Num;
 
-use super::parsing::{fmt_decimal, parse_decimal_lossy};
+use super::parsing::fmt_decimal;
 use super::response::{PnlEntry, PnlWindow, PnlWindowSymbol};
 use super::sessions::{counter_trading_session_for_iso, date_key, market_session_for_iso};
-
-fn entry_bucket_to_stream(bucket: &str) -> Option<&'static str> {
-    match bucket {
-        "counter_trade" => Some("counterTradePnlUsd"),
-        "onchain_netting" => Some("onchainNettingPnlUsd"),
-        "directional_exposure" => Some("directionalImbalanceExcessPnlUsd"),
-        _ => None,
-    }
-}
+use super::state::PnlBucket;
 
 pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<PnlWindow> {
     let mut by_date: HashMap<String, Vec<&PnlEntry>> = HashMap::new();
     for entry in entries {
         by_date
-            .entry(date_key(&entry.closed_at).to_owned())
+            .entry(date_key(&entry.closed_at))
             .or_default()
             .push(entry);
     }
@@ -53,18 +45,33 @@ pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<Pnl
             } else {
                 "mixed".to_owned()
             };
+            let is_weekend = market_session == "weekend";
+            let mut entries_by_symbol: HashMap<&str, Vec<&PnlEntry>> = HashMap::new();
+            for entry in &day_entries {
+                entries_by_symbol
+                    .entry(entry.symbol.as_str())
+                    .or_default()
+                    .push(entry);
+            }
 
             let rows = symbols
                 .iter()
-                .map(|symbol| window_symbol_row(symbol, &day_entries))
+                .map(|symbol| {
+                    window_symbol_row(
+                        symbol,
+                        entries_by_symbol
+                            .get(symbol.as_str())
+                            .map_or(&[][..], Vec::as_slice),
+                    )
+                })
                 .collect();
 
             PnlWindow {
                 window_id: date.clone(),
                 start_at: format!("{date}T00:00:00.000Z"),
                 end_at: format!("{date}T23:59:59.999Z"),
-                label: date.clone(),
-                is_weekend: market_session_for_iso(&format!("{date}T00:00:00.000Z")) == "weekend",
+                label: date,
+                is_weekend,
                 market_session,
                 counter_trading_session,
                 granularity: "day",
@@ -84,12 +91,11 @@ fn window_symbol_row(symbol: &str, entries: &[&PnlEntry]) -> PnlWindowSymbol {
         if entry.symbol != symbol {
             continue;
         }
-        let pnl = parse_decimal_lossy(&entry.realized_pnl_usd);
-        match entry_bucket_to_stream(entry.pnl_bucket) {
-            Some("counterTradePnlUsd") => counter_trade += &pnl,
-            Some("onchainNettingPnlUsd") => onchain_netting += &pnl,
-            Some("directionalImbalanceExcessPnlUsd") => directional_excess += &pnl,
-            _ => {}
+        let pnl = entry.realized_pnl_usd.clone();
+        match entry.pnl_bucket {
+            PnlBucket::CounterTrade => counter_trade += &pnl,
+            PnlBucket::OnchainNetting => onchain_netting += &pnl,
+            PnlBucket::DirectionalExposure => directional_excess += &pnl,
         }
     }
 

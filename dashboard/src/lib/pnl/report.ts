@@ -141,7 +141,7 @@ export type PnlCostCoverage = {
   source: string
   accountingBucket: PnlAccountingBucket
   effect: PnlAccountingEffect
-  status: 'included' | 'zero' | 'not_ingested' | 'partial'
+  status: 'included' | 'zero' | 'not_ingested'
   amountUsd: string
   note: string
 }

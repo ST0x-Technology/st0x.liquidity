@@ -170,29 +170,33 @@ async fn pnl(
         .activity_until()
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Alpaca Broker API is not configured".to_string(),
-        ));
+    let activities = if let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker {
+        alpaca_auth
+            .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
+            .await
+            .map_err(|error| {
+                error!(%error, "Failed to fetch Alpaca account activities for PnL");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Failed to fetch Alpaca account activities".to_string(),
+                )
+            })?
+    } else {
+        Vec::new()
     };
-
-    let activities = alpaca_auth
-        .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
-        .await
-        .map_err(|error| {
-            error!(%error, "Failed to fetch Alpaca account activities for PnL");
-            (
-                StatusCode::BAD_GATEWAY,
-                "Failed to fetch Alpaca account activities".to_string(),
-            )
-        })?;
 
     build_pnl_report(&state.pool, &query, activities)
         .await
         .map(Json)
         .map_err(|error| match error {
-            PnlError::InvalidQuery(message) => (StatusCode::BAD_REQUEST, message),
+            PnlError::InvalidDate { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
+            PnlError::InvalidPayload { .. } => {
+                error!(%error, "Failed to build PnL report from persisted payload");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to build PnL report".to_string(),
+                )
+            }
             PnlError::Database(error) => {
                 error!(%error, "Failed to build PnL report");
                 (

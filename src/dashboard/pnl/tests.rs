@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 
+use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use st0x_execution::AccountActivity;
 
 use super::builder::build_pnl_response_from_rows;
-use super::parsing::parse_timestamp;
+use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp};
 use super::query::{PnlCounterTradingFilter, PnlMarketSessionFilter, PnlQuery};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
-use super::state::{CostEventRow, PositionEventRow, PositionViewRow};
+use super::state::{CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow, Venue};
 use super::{ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING};
 
 fn event(rowid: i64, symbol: &str, event_type: &str, payload: Value) -> PositionEventRow {
@@ -101,6 +102,37 @@ fn query() -> PnlQuery {
         to_date: Some("2026-05-15".to_owned()),
         ..PnlQuery::default()
     }
+}
+
+#[test]
+fn query_to_date_uses_exclusive_next_day_for_date_values() {
+    let query = PnlQuery {
+        to_date: Some("2026-05-15".to_owned()),
+        ..PnlQuery::default()
+    };
+
+    assert_eq!(
+        query.activity_until().unwrap(),
+        Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).single()
+    );
+}
+
+#[test]
+fn query_to_timestamp_uses_exact_exclusive_bound() {
+    let query = PnlQuery {
+        to_date: Some("2026-05-15T14:30:00Z".to_owned()),
+        ..PnlQuery::default()
+    };
+
+    assert_eq!(
+        query.activity_until().unwrap(),
+        Utc.with_ymd_and_hms(2026, 5, 15, 14, 30, 0).single()
+    );
+}
+
+#[test]
+fn malformed_persisted_payloads_are_rejected() {
+    assert!(parse_payload_string("{not-json").is_err());
 }
 
 fn position_row(symbol: &str, net_position: &str) -> PositionViewRow {
@@ -289,7 +321,7 @@ fn maps_prompt_counter_trades_into_counter_trade_pnl() {
     assert_eq!(report.summary.counter_trade_pnl_usd, "2");
     assert_eq!(report.summary.directional_imbalance_excess_pnl_usd, "0");
     assert_eq!(report.summary.total_pnl_usd, "2");
-    assert_eq!(report.entries[0].pnl_bucket, "counter_trade");
+    assert_eq!(report.entries[0].pnl_bucket, PnlBucket::CounterTrade);
     assert!(!report.entries[0].delayed_counter_trade);
 }
 
@@ -304,7 +336,7 @@ fn replays_fills_by_execution_timestamp_before_rowid() {
     assert_eq!(report.summary.directional_imbalance_excess_pnl_usd, "0");
     assert_eq!(report.entries[0].opening_rowid, 2);
     assert_eq!(report.entries[0].closing_rowid, 1);
-    assert_eq!(report.entries[0].pnl_bucket, "counter_trade");
+    assert_eq!(report.entries[0].pnl_bucket, PnlBucket::CounterTrade);
 }
 
 #[test]
@@ -316,8 +348,8 @@ fn closes_long_inventory_with_counter_trade_sell() {
 
     assert_eq!(report.summary.counter_trade_pnl_usd, "2");
     assert_eq!(report.summary.total_pnl_usd, "2");
-    assert_eq!(report.entries[0].opening_direction, "buy");
-    assert_eq!(report.entries[0].closing_direction, "sell");
+    assert_eq!(report.entries[0].opening_direction, Direction::Buy);
+    assert_eq!(report.entries[0].closing_direction, Direction::Sell);
 }
 
 #[test]
@@ -330,9 +362,9 @@ fn nets_onchain_fills_by_fifo_without_offchain_parentage() {
     assert_eq!(report.summary.onchain_netting_pnl_usd, "2");
     assert_eq!(report.summary.counter_trade_pnl_usd, "0");
     assert_eq!(report.summary.total_pnl_usd, "2");
-    assert_eq!(report.entries[0].opening_venue, "onchain");
-    assert_eq!(report.entries[0].closing_venue, "onchain");
-    assert_eq!(report.entries[0].pnl_bucket, "onchain_netting");
+    assert_eq!(report.entries[0].opening_venue, Venue::Onchain);
+    assert_eq!(report.entries[0].closing_venue, Venue::Onchain);
+    assert_eq!(report.entries[0].pnl_bucket, PnlBucket::OnchainNetting);
 }
 
 #[test]
@@ -345,7 +377,7 @@ fn delayed_counter_trade_is_bucketed_as_directional_exposure() {
     assert_eq!(report.summary.counter_trade_pnl_usd, "0");
     assert_eq!(report.summary.directional_imbalance_excess_pnl_usd, "2");
     assert_eq!(report.summary.total_pnl_usd, "2");
-    assert_eq!(report.entries[0].pnl_bucket, "directional_exposure");
+    assert_eq!(report.entries[0].pnl_bucket, PnlBucket::DirectionalExposure);
     assert!(report.entries[0].delayed_counter_trade);
 }
 
@@ -359,9 +391,9 @@ fn carries_offchain_origin_inventory_until_later_fills_close_it() {
     assert_eq!(report.summary.total_pnl_usd, "2");
     assert_eq!(report.summary.directional_imbalance_excess_pnl_usd, "2");
     assert_eq!(report.summary.open_long_shares, "0");
-    assert_eq!(report.entries[0].opening_venue, "offchain");
-    assert_eq!(report.entries[0].closing_venue, "onchain");
-    assert_eq!(report.entries[0].pnl_bucket, "directional_exposure");
+    assert_eq!(report.entries[0].opening_venue, Venue::Offchain);
+    assert_eq!(report.entries[0].closing_venue, Venue::Onchain);
+    assert_eq!(report.entries[0].pnl_bucket, PnlBucket::DirectionalExposure);
 }
 
 #[test]
@@ -402,6 +434,18 @@ fn date_filter_uses_realized_close_date() {
     assert_eq!(report.entries.len(), 1);
     assert_eq!(report.entries[0].opened_at, "2026-05-14T20:00:00Z");
     assert_eq!(report.entries[0].closed_at, "2026-05-15T14:00:00Z");
+}
+
+#[test]
+fn date_filter_and_windows_use_new_york_trading_date() {
+    let report = report(vec![
+        onchain_sell(1, "10", "2026-05-16T01:00:00Z"),
+        offchain_buy(2, "2026-05-16T01:01:00Z", "9", "1"),
+    ]);
+
+    assert_eq!(report.total, 1);
+    assert_eq!(report.entries[0].closing_rowid, 2);
+    assert_eq!(report.windows[0].label, "2026-05-15");
 }
 
 #[test]
@@ -722,6 +766,9 @@ fn ignores_alpaca_activities_without_usable_amounts() {
     assert_eq!(report.summary.tracked_revenue_usd, "0");
     assert_eq!(report.summary.net_realized_pnl_usd, "0");
     assert_eq!(report.cost_entries.len(), 0);
+    assert!(report.warnings.iter().any(|warning| warning.contains(
+        "Skipped malformed Alpaca account activity missing-amount-1: missing net_amount"
+    )));
 }
 
 #[test]
@@ -821,19 +868,54 @@ fn matches_legacy_frontend_sql_fixture_for_stable_report_fields() {
             .iter()
             .map(|entry| (
                 entry.symbol.as_str(),
-                entry.pnl_bucket,
+                entry.pnl_bucket.as_str(),
                 entry.opening_rowid,
                 entry.closing_rowid,
-                entry.shares.as_str(),
-                entry.realized_pnl_usd.as_str(),
+                fmt_decimal(&entry.shares),
+                fmt_decimal(&entry.realized_pnl_usd),
             ))
             .collect::<Vec<_>>(),
         vec![
-            ("SPYM", "counter_trade", 9, 10, "1.5", "7.5"),
-            ("RKLB", "directional_exposure", 7, 8, "1", "3"),
-            ("RKLB", "directional_exposure", 5, 6, "1", "5"),
-            ("RKLB", "onchain_netting", 3, 4, "1", "3"),
-            ("RKLB", "counter_trade", 1, 2, "1", "2"),
+            (
+                "SPYM",
+                "counter_trade",
+                9,
+                10,
+                "1.5".to_owned(),
+                "7.5".to_owned()
+            ),
+            (
+                "RKLB",
+                "directional_exposure",
+                7,
+                8,
+                "1".to_owned(),
+                "3".to_owned()
+            ),
+            (
+                "RKLB",
+                "directional_exposure",
+                5,
+                6,
+                "1".to_owned(),
+                "5".to_owned()
+            ),
+            (
+                "RKLB",
+                "onchain_netting",
+                3,
+                4,
+                "1".to_owned(),
+                "3".to_owned()
+            ),
+            (
+                "RKLB",
+                "counter_trade",
+                1,
+                2,
+                "1".to_owned(),
+                "2".to_owned()
+            ),
         ]
     );
 

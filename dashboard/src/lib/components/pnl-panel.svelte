@@ -292,6 +292,8 @@
 
   const clearFilters = () => {
     selectedSymbols.update(() => new Set(allSymbols.current))
+    marketSessionFilter.update(() => 'all')
+    counterTradingFilter.update(() => 'all')
     void fetchPnl()
   }
 
@@ -363,8 +365,10 @@
   ]
 
   const hasFilters = $derived(
-    allSymbols.current.length > 0 &&
-      !isCompleteSelection(selectedSymbols.current, allSymbols.current)
+    (allSymbols.current.length > 0 &&
+      !isCompleteSelection(selectedSymbols.current, allSymbols.current)) ||
+      marketSessionFilter.current !== 'all' ||
+      counterTradingFilter.current !== 'all'
   )
 
   $effect(() => {

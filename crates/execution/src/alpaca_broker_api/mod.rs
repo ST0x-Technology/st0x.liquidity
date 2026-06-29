@@ -179,8 +179,12 @@ pub enum AlpacaBrokerApiError {
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
 
-    #[error("Invalid Alpaca account activities URL {url}: {reason}")]
-    InvalidAccountActivitiesUrl { url: String, reason: String },
+    #[error("Invalid Alpaca account activities URL {url}")]
+    InvalidAccountActivitiesUrl {
+        url: String,
+        #[source]
+        source: url::ParseError,
+    },
 
     #[error("Alpaca account activities pagination returned the same page token twice")]
     AccountActivitiesPaginationInvariantViolation,
