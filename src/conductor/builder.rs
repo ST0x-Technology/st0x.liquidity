@@ -1,5 +1,6 @@
 //! Constructs a fully-wired [`Conductor`] instance from its dependencies.
 
+use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use apalis::prelude::Monitor;
 use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
@@ -14,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
-use st0x_execution::Executor;
+use st0x_execution::{Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
 use st0x_raindex::RaindexService;
 
@@ -37,6 +38,7 @@ use crate::inventory::{
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
 use crate::offchain::order::reconcile_fill::ReconcileOrderFillCtx;
+use crate::offchain::order::{ExecutorOrderPlacer, OrderPlacer};
 use crate::offchain::order::{
     HandleOrderRejection, HandleOrderRejectionJobQueue, OffchainOrder, PollOrderStatus,
     PollOrderStatusJobQueue, ReconcileOrderFill, ReconcileOrderFillJobQueue,
@@ -102,6 +104,45 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) failure_injector: FailureInjector,
 }
 
+/// The configured equity symbols plus the equity/USDC vaults the inventory
+/// poller watches, derived from the assets config.
+struct ConfiguredInventoryVaults {
+    equity_symbols: HashSet<Symbol>,
+    equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
+    usdc_vaults: Option<BTreeSet<B256>>,
+}
+
+fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
+    let equity_symbols: HashSet<_> = ctx
+        .assets
+        .equities
+        .symbols
+        .keys()
+        .filter(|symbol| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .cloned()
+        .collect();
+
+    let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
+    for equity_config in ctx.assets.equities.symbols.values() {
+        equity_vaults
+            .entry(equity_config.tokenized_equity_derivative)
+            .or_default()
+            .extend(equity_config.vault_ids.iter().copied());
+    }
+
+    let usdc_vaults = ctx
+        .assets
+        .cash
+        .as_ref()
+        .map(|cash| cash.vault_ids.iter().copied().collect());
+
+    ConfiguredInventoryVaults {
+        equity_symbols,
+        equity_vaults,
+        usdc_vaults,
+    }
+}
+
 /// Wires all runtime components and returns a running [`Conductor`].
 #[bon::builder]
 pub(crate) fn spawn<Prov, Exec>(
@@ -164,32 +205,11 @@ where
         owner: order_owner,
     };
 
-    let configured_equity_symbols: HashSet<_> = context
-        .ctx
-        .assets
-        .equities
-        .symbols
-        .keys()
-        .filter(|symbol| {
-            context.ctx.is_trading_enabled(symbol) || context.ctx.is_rebalancing_enabled(symbol)
-        })
-        .cloned()
-        .collect();
-
-    let mut configured_equity_vaults: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-    for equity_config in context.ctx.assets.equities.symbols.values() {
-        configured_equity_vaults
-            .entry(equity_config.tokenized_equity_derivative)
-            .or_default()
-            .extend(equity_config.vault_ids.iter().copied());
-    }
-
-    let configured_usdc_vaults = context
-        .ctx
-        .assets
-        .cash
-        .as_ref()
-        .map(|cash| cash.vault_ids.iter().copied().collect());
+    let ConfiguredInventoryVaults {
+        equity_symbols: configured_equity_symbols,
+        equity_vaults: configured_equity_vaults,
+        usdc_vaults: configured_usdc_vaults,
+    } = configured_inventory_vaults(&context.ctx);
 
     let wallet_polling = context.wallet_polling;
     let tokenizer = context.tokenizer;
@@ -248,17 +268,31 @@ where
 
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+    // The broker placement capability, lifted out of the (now pure)
+    // `OffchainOrder::Place` handler: both the rebalancing hedge job and the
+    // trade-processing path place through it instead of the aggregate.
+    let order_placer: Arc<dyn OrderPlacer> =
+        Arc::new(ExecutorOrderPlacer(context.executor.clone()));
+
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
+        order_placer: order_placer.clone(),
         poll_status_queue: poll_status_queue.clone(),
+        counter_trade_submission_lock: counter_trade_submission_lock.clone(),
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
         executor: context.executor.clone(),
+        position: context.frameworks.position.clone(),
         position_projection: context.frameworks.position_projection.clone(),
+        offchain_order: context.frameworks.offchain_order.clone(),
+        offchain_order_projection: context.frameworks.offchain_order_projection.clone(),
+        order_placer: order_placer.clone(),
+        counter_trade_submission_lock: counter_trade_submission_lock.clone(),
         hedge_queue: hedge_queue.clone(),
         check_positions_queue: check_positions_queue.clone(),
+        poll_status_queue: poll_status_queue.clone(),
         ctx: context.ctx.clone(),
         pool: context.pool.clone(),
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
@@ -269,6 +303,7 @@ where
         position: context.frameworks.position,
         position_projection: context.frameworks.position_projection,
         offchain_order: context.frameworks.offchain_order,
+        order_placer,
         execution_threshold: context.execution_threshold,
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,

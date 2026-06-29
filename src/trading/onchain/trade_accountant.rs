@@ -14,6 +14,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+use st0x_config::Ctx;
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
@@ -30,7 +31,6 @@ use crate::onchain::{OnChainError, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
-use st0x_config::Ctx;
 
 /// Persistent job queue for DEX trade accounting.
 pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
@@ -237,6 +237,14 @@ pub(crate) enum TradeAccountingError {
     MissingBlockTimestamp {
         trade_id: crate::onchain_trade::OnChainTradeId,
     },
+    #[error(
+        "Offchain order {offchain_order_id} in unexpected state {state:?} directly after Place; \
+         retrying without clearing the position claim"
+    )]
+    UnexpectedPostPlaceState {
+        offchain_order_id: crate::offchain::order::OffchainOrderId,
+        state: crate::offchain::order::OffchainOrder,
+    },
 }
 
 #[cfg(test)]
@@ -247,6 +255,8 @@ mod tests {
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
 
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::create_test_ctx_with_order_owner;
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
@@ -256,12 +266,10 @@ mod tests {
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
-    use crate::offchain::order::OffchainOrder;
+    use crate::offchain::order::{OffchainOrder, noop_order_placer};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
     use crate::test_utils::{get_test_log, get_test_order, setup_test_pools};
-    use st0x_config::ExecutionThreshold;
-    use st0x_config::create_test_ctx_with_order_owner;
 
     fn test_job() -> AccountForDexTrade {
         let log = get_test_log();
@@ -316,7 +324,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(crate::offchain::order::noop_order_placer())
+                .build(())
                 .await
                 .unwrap();
 
@@ -331,6 +339,7 @@ mod tests {
             position,
             position_projection,
             offchain_order,
+            order_placer: noop_order_placer(),
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -443,7 +452,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(crate::offchain::order::noop_order_placer())
+                .build(())
                 .await
                 .unwrap();
 
@@ -458,6 +467,7 @@ mod tests {
             position,
             position_projection,
             offchain_order,
+            order_placer: noop_order_placer(),
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),

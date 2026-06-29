@@ -437,6 +437,7 @@ fn offchain_order_failure(event: &OffchainOrderEvent) -> Option<(FailureEventTyp
         }
         OffchainOrderEvent::Placed { .. }
         | OffchainOrderEvent::Submitted { .. }
+        | OffchainOrderEvent::Accepted { .. }
         | OffchainOrderEvent::PartiallyFilled { .. }
         | OffchainOrderEvent::Filled { .. } => None,
     }

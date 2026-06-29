@@ -11,16 +11,20 @@ use std::time::Duration;
 use apalis::prelude::Status;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 use st0x_config::Ctx;
-use st0x_event_sorcery::Projection;
+use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::{ClientOrderId, CounterTradePreflight, Executor, MarketOrder, Symbol};
 
-use crate::conductor::clamp_shares_to_reservation;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::{clamp_shares_to_reservation, recover_orphaned_pending_offchain_orders};
 use crate::equity_redemption::symbols_with_active_transfers;
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{
+    OffchainOrder, OffchainOrderId, OrderPlacer, PollOrderStatusJobQueue,
+    recover_submitted_offchain_orders,
+};
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::position::Position;
 use crate::trading::offchain::hedge::{HedgeJobQueue, PlaceHedge};
@@ -30,9 +34,26 @@ pub(crate) type CheckPositionsJobQueue = JobQueue<CheckPositions>;
 /// Shared dependencies for the [`CheckPositions`] job.
 pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static> {
     pub(crate) executor: E,
+    pub(crate) position: Arc<Store<Position>>,
     pub(crate) position_projection: Arc<Projection<Position>>,
+    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
+    /// Re-drives `Pending` placements stuck between broker acceptance and the
+    /// outcome commit (ADR 0014): `CheckPositions` skips pending-claimed
+    /// positions, so without a periodic sweep such an order is only recovered at
+    /// the next restart.
+    pub(crate) order_placer: Arc<dyn OrderPlacer>,
+    /// Shared with the placement paths so the periodic recovery's broker re-drive
+    /// serializes against live placements (ADR 0014).
+    pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
     pub(crate) hedge_queue: HedgeJobQueue,
     pub(crate) check_positions_queue: CheckPositionsJobQueue,
+    /// Catches up `PollOrderStatus` for orders the pending re-drive leaves
+    /// `Submitted` at runtime. The startup recovery is followed by
+    /// `recover_submitted_offchain_orders`; the periodic sweep has no such
+    /// follow-up, so without re-running it here a runtime-recovered order would
+    /// sit `Submitted` (unpolled) until the next restart (ADR 0014).
+    pub(crate) poll_status_queue: PollOrderStatusJobQueue,
     pub(crate) ctx: Ctx,
     pub(crate) pool: SqlitePool,
     pub(crate) check_interval: Duration,
@@ -94,6 +115,55 @@ where
     E: Executor + Clone + Send + Sync + 'static,
 {
     async fn scan_and_enqueue(&self) -> Result<(), CheckPositionsError> {
+        // Reconcile placements stuck between broker acceptance and the outcome
+        // commit (ADR 0014). `is_ready_for_execution` skips pending-claimed
+        // positions, so the main scan never re-drives these; this periodic sweep
+        // does. Best-effort: a failure is logged and retried next interval rather
+        // than killing the loop. Held under the shared submission lock so the
+        // broker re-drive serializes against live placements.
+        {
+            let _submission_guard = self.counter_trade_submission_lock.lock().await;
+            if let Err(error) = recover_orphaned_pending_offchain_orders(
+                &self.position,
+                &self.position_projection,
+                &self.offchain_order,
+                self.order_placer.as_ref(),
+            )
+            .await
+            {
+                error!(%error, "Periodic stuck-pending recovery failed; retrying next interval");
+            }
+        }
+
+        // The submitted-order poll catch-up runs OUTSIDE the submission lock: it
+        // only enqueues apalis `PollOrderStatus` jobs (no broker I/O), so it does
+        // not need to serialize against live placements -- holding the lock here
+        // would needlessly block placements behind a queue-only sweep.
+        //
+        // It runs every tick: a placement that reaches `Submitted` but whose poll
+        // job died (a transient broker error exhausts the apalis retries ->
+        // `Failed`, which `requeue_orphaned` deliberately skips) or was never
+        // enqueued (crash window) is otherwise stuck until the next restart,
+        // leaving the hedge unreconciled. Re-enqueue is idempotent -- a duplicate
+        // poll for an order that already has a live one is harmless: the worker
+        // observes the terminal/again-pending state and exits. It does re-poll
+        // live orders too; a precise per-order dedup is tracked as a follow-up
+        // (apalis persists the job payload as an opaque blob, so the order id
+        // cannot be matched there to skip live polls).
+        let mut poll_status_queue = self.poll_status_queue.clone();
+        if let Err(error) = recover_submitted_offchain_orders(
+            &self.offchain_order_projection,
+            &mut poll_status_queue,
+            self.executor.to_supported_executor(),
+        )
+        .await
+        {
+            error!(
+                %error,
+                "Periodic submitted-order poll recovery failed; retrying next interval"
+            );
+        }
+
         let all_positions = self.position_projection.load_all().await?;
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
@@ -250,7 +320,8 @@ mod tests {
 
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        Direction, FractionalShares, MockExecutor, MockExecutorCtx, Symbol, TryIntoExecutor,
+        Direction, FractionalShares, MockExecutor, MockExecutorCtx, Positive, SupportedExecutor,
+        Symbol, TryIntoExecutor,
     };
     use st0x_float_macro::float;
 
@@ -260,6 +331,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::offchain::order::{OffchainOrder, OffchainOrderCommand};
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_pools;
 
@@ -277,19 +349,120 @@ mod tests {
             .await
             .unwrap();
 
+        let (offchain_order, offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
 
         let ctx = CheckPositionsCtx {
             executor,
+            position: position.clone(),
             position_projection,
+            offchain_order,
+            offchain_order_projection,
+            order_placer: crate::offchain::order::noop_order_placer(),
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
             check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             ctx: ctx_cfg,
             pool,
             check_interval,
         };
 
         (ctx, position)
+    }
+
+    #[tokio::test]
+    async fn periodic_scan_redrives_stuck_pending_order() {
+        // ADR 0014: a position claimed by a Pending order (placement crashed
+        // before the broker outcome committed) is re-driven at RUNTIME by the
+        // periodic scan. CheckPositions itself skips pending-claimed positions
+        // (is_ready_for_execution short-circuits), so without this sweep the
+        // order would sit Pending until the next bot restart.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        // Claim the position, then leave the order Pending (Place committed, broker
+        // outcome never recorded) -- the crash window ADR 0014 recovers.
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ctx.offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Pending { .. }
+        ));
+
+        ctx.scan_and_enqueue().await.unwrap();
+
+        // The periodic recovery re-drove the placement (the noop broker accepts),
+        // so the stuck order reaches Submitted at runtime instead of waiting for a
+        // restart.
+        assert!(matches!(
+            ctx.offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted { .. }
+        ));
+
+        // ...and a PollOrderStatus job was enqueued for it. Without this the
+        // runtime-recovered order would sit Submitted, unpolled, until the next
+        // restart (the gap the submitted-order catch-up closes).
+        assert_eq!(
+            count_jobs(&apalis_pool, &poll_status_job_type()).await,
+            1,
+            "the runtime re-drive must enqueue a PollOrderStatus so the recovered \
+             order is polled to a fill instead of waiting for the next restart"
+        );
     }
 
     async fn accumulate_position(
@@ -328,6 +501,10 @@ mod tests {
 
     fn hedge_job_type() -> String {
         std::any::type_name::<PlaceHedge>().to_string()
+    }
+
+    fn poll_status_job_type() -> String {
+        std::any::type_name::<crate::offchain::order::PollOrderStatus>().to_string()
     }
 
     fn check_positions_job_type() -> String {
@@ -393,11 +570,23 @@ mod tests {
         )
         .await;
 
+        let (offchain_order, offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
         let ctx = CheckPositionsCtx {
             executor: MockExecutor::with_failure("connection refused"),
+            position: position.clone(),
             position_projection,
+            offchain_order,
+            offchain_order_projection,
+            order_placer: crate::offchain::order::noop_order_placer(),
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
             check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             ctx: cfg,
             pool: pool.clone(),
             check_interval: Duration::from_secs(60),

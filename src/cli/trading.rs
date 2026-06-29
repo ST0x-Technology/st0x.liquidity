@@ -24,8 +24,8 @@ use crate::conductor::{
     execute_witness_trade,
 };
 use crate::offchain::order::{
-    OffchainOrderCommand, OffchainOrderId, OrderPlacementResult, OrderPlacer,
-    build_offchain_order_cqrs,
+    OffchainOrder, OffchainOrderId, OrderPlacementResult, OrderPlacer,
+    client_order_id_for_placement, place_offchain_order_at_broker,
 };
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::PythFeedIds;
@@ -533,7 +533,9 @@ pub(super) async fn process_found_trade<W: Write>(
     let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
         .build(())
         .await?;
-    let (offchain_order_store, _) = build_offchain_order_cqrs(pool, order_placer).await?;
+    let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+        .build(())
+        .await?;
     let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
         .build(())
         .await?;
@@ -618,36 +620,82 @@ pub(super) async fn process_found_trade<W: Write>(
         )
         .await
     {
-        error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {error}");
+        error!(
+            %offchain_order_id,
+            symbol = %params.symbol,
+            "Failed to execute Position::PlaceOffChainOrder: {error}"
+        );
     }
 
     // Reuse a prior failed attempt's stashed OffchainOrderId as the broker-side
     // idempotency anchor (mirroring the automated `execute_create_offchain_order`
     // path) so a CLI retry after a transient broker failure dedupes instead of
-    // placing a second order. Fall back to this attempt's id when there is none.
-    let anchor = match position_store.load(&params.symbol).await {
-        Ok(position) => position.and_then(|position| position.last_failed_offchain_order_id),
-        Err(error) => {
-            error!(%offchain_order_id, symbol = %params.symbol, %error, "Failed to load position for the idempotency anchor; placing under a fresh key");
-            None
-        }
-    };
-    let client_order_id_source = anchor.unwrap_or(offchain_order_id);
-
-    if let Err(error) = offchain_order_store
-        .send(
-            &offchain_order_id,
-            OffchainOrderCommand::Place {
-                symbol: params.symbol.clone(),
-                shares: params.shares,
-                direction: params.direction,
-                executor: params.executor,
-                client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
-            },
-        )
+    // placing a second order. Fail fast on a load error rather than placing under
+    // a fresh key: a transient load failure while an anchor exists would submit a
+    // SECOND live broker order for shares the prior attempt already placed -- a
+    // double-hedge the fail-fast rule exists to prevent. Re-running the CLI
+    // reloads the anchor.
+    let anchor = position_store
+        .load(&params.symbol)
         .await
+        .inspect_err(|error| {
+            error!(
+                %offchain_order_id,
+                symbol = %params.symbol,
+                %error,
+                "Failed to load position for the idempotency anchor; refusing \
+                 placement until it can be read"
+            );
+        })?
+        .and_then(|position| position.last_failed_offchain_order_id);
+    let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
+
+    match place_offchain_order_at_broker(
+        &offchain_order_store,
+        order_placer.as_ref(),
+        &offchain_order_id,
+        params.symbol.clone(),
+        params.shares,
+        params.direction,
+        params.executor,
+        client_order_id,
+    )
+    .await
     {
-        error!(%offchain_order_id, "Failed to execute OffchainOrder::Place: {error}");
+        // A broker rejection comes back as `Ok(Some(Failed))`, not `Err`. Mirror
+        // the automated path (`check_and_execute_accumulated_positions`): clear
+        // the position's pending claim so the symbol is not stranded permanently
+        // claimed -- which would block all future hedging for it -- and surface
+        // the rejection to the operator.
+        Ok(Some(OffchainOrder::Failed { error, .. })) => {
+            error!(
+                %offchain_order_id,
+                symbol = %params.symbol,
+                %error,
+                "Broker rejected the order; clearing the position claim"
+            );
+            if let Err(send_error) = position_store
+                .send(
+                    &params.symbol,
+                    PositionCommand::FailOffChainOrder {
+                        offchain_order_id,
+                        error,
+                    },
+                )
+                .await
+            {
+                error!(
+                    %offchain_order_id,
+                    symbol = %params.symbol,
+                    %send_error,
+                    "Failed to clear the position claim after broker rejection"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            error!(%offchain_order_id, "Failed to place OffchainOrder: {error}");
+        }
     }
 
     writeln!(stdout, "Trade processing completed!")?;

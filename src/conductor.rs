@@ -57,9 +57,11 @@ use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
 use crate::offchain::order::{
-    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
-    PollOrderStatus, PollOrderStatusJobQueue,
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OrderPlacer, PollOrderStatus,
+    PollOrderStatusJobQueue, client_order_id_for_placement, place_offchain_order_at_broker,
 };
+#[cfg(test)]
+use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
 use crate::onchain::OnchainTrade;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
@@ -156,6 +158,10 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    /// Places the broker order for a newly-recorded offchain order. Lifted out
+    /// of the (now pure) `OffchainOrder::Place` handler: the side effect lives
+    /// in the placement path, not the command handler.
+    pub(crate) order_placer: Arc<dyn OrderPlacer>,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
@@ -574,16 +580,14 @@ impl Conductor {
             service.enqueue_recovery_for_current_wallet_balances().await;
         }
 
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-
         // Catch the lifecycle-failure read model up to the event log before its
         // OffchainOrder reactor (registered below) goes live, in both modes.
         catch_up_lifecycle_failures(&pool).await?;
 
         // The HedgeLatencyProjection subscribes to BOTH Position and
-        // OffchainOrder (see its deps!). This instance, registered on the
-        // OffchainOrder store, handles only OffchainOrderEvent::Submitted to
-        // stamp submitted_at. The cycle's authoritative filled_at/failed_at are
+        // OffchainOrder (see its deps!). This instance, on the OffchainOrder
+        // store, handles the broker-acceptance event (`Accepted`/legacy
+        // `Submitted`) to stamp submitted_at. The cycle's filled_at/failed_at are
         // stamped by the SAME projection registered on the Position store (the
         // Position stream carries the broker's own fill timestamp). Do NOT
         // consolidate the two registrations: routing OffchainOrder Filled/Failed
@@ -592,11 +596,21 @@ impl Conductor {
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
                 .with(Arc::new(LifecycleFailureProjection::new(pool.clone())))
-                .build(order_placer)
+                .build(())
                 .await?;
 
-        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
-            .await?;
+        // Startup recovery runs before any job worker starts, so no concurrent
+        // placement can race its broker re-drive -- it intentionally runs without
+        // `counter_trade_submission_lock` (which the builder constructs later). The
+        // periodic `CheckPositions` sweep, which CAN race live placements, holds
+        // the lock across the same call.
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            &ExecutorOrderPlacer(executor.clone()),
+        )
+        .await?;
 
         let frameworks = CqrsFrameworks {
             onchain_trade,
@@ -938,6 +952,7 @@ pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
     pub(crate) position: &'a Store<Position>,
     pub(crate) position_projection: &'a Projection<Position>,
     pub(crate) offchain_order: &'a Arc<Store<OffchainOrder>>,
+    pub(crate) order_placer: &'a dyn OrderPlacer,
     pub(crate) counter_trade_submission_lock: &'a Mutex<()>,
     pub(crate) threshold: &'a ExecutionThreshold,
     pub(crate) assets: &'a AssetsConfig,
@@ -1719,20 +1734,30 @@ fn is_pre_wrap_held_for_recovery(
     }
 }
 
-/// Recovers positions whose `pending_offchain_order_id` references an
-/// offchain order that has already reached a terminal state (Filled or
-/// Failed) but whose completion was never propagated back to the position
-/// aggregate.
+/// Recovers positions whose `pending_offchain_order_id` references an offchain
+/// order that still needs reconciling back into the position aggregate. Two
+/// cases:
 ///
-/// This can happen when `complete_offchain_order_fill` succeeds but the
-/// subsequent `complete_position_order` call fails -- the two operations
-/// are not atomic. Since the order poller only polls `Submitted` orders,
-/// it will never retry the failed position update, leaving the position
-/// permanently stuck.
-async fn recover_orphaned_pending_offchain_orders(
+/// - **Terminal order, un-propagated:** the order reached `Filled`/`Failed` but
+///   the position update never landed (e.g. `complete_offchain_order_fill`
+///   succeeded and the subsequent `complete_position_order` failed -- the two
+///   are not atomic). The poller only polls `Submitted` orders, so it never
+///   retries the position update and the position would stay stuck.
+/// - **Still `Pending`:** a crash between `Place` (which records intent and
+///   enters `Pending` before the broker call) and the broker outcome left the
+///   order un-driven. The broker placement is re-driven; the broker dedupes on
+///   `client_order_id`, so an in-flight order is adopted rather than placed
+///   twice.
+///
+/// Called at startup (`Conductor::start`) and on every periodic `CheckPositions`
+/// scan. A re-drive that reaches `Submitted` does not enqueue a poll itself: at
+/// startup the subsequent `recover_submitted_offchain_orders` covers it, and the
+/// periodic scan re-runs that same catch-up immediately after this call.
+pub(crate) async fn recover_orphaned_pending_offchain_orders(
     position: &Arc<Store<Position>>,
     position_projection: &Arc<Projection<Position>>,
     offchain_order: &Arc<Store<OffchainOrder>>,
+    order_placer: &dyn OrderPlacer,
 ) -> anyhow::Result<()> {
     let positions = position_projection.load_all().await?;
 
@@ -1754,7 +1779,8 @@ async fn recover_orphaned_pending_offchain_orders(
     );
 
     for (symbol, order_id) in orphaned {
-        recover_single_orphaned_order(position, offchain_order, &symbol, order_id).await?;
+        recover_single_orphaned_order(position, offchain_order, order_placer, &symbol, order_id)
+            .await?;
     }
 
     Ok(())
@@ -1764,65 +1790,150 @@ async fn recover_orphaned_pending_offchain_orders(
 async fn recover_single_orphaned_order(
     position: &Arc<Store<Position>>,
     offchain_order: &Arc<Store<OffchainOrder>>,
+    order_placer: &dyn OrderPlacer,
     symbol: &Symbol,
     order_id: OffchainOrderId,
 ) -> anyhow::Result<()> {
-    let Some(order) = offchain_order.load(&order_id).await? else {
-        warn!(%symbol, %order_id, "Pending offchain order not found in store -- recovering");
-        position
-            .send(
-                symbol,
-                PositionCommand::FailOffChainOrder {
-                    offchain_order_id: order_id,
-                    error: "pending offchain order has no offchain order aggregate".to_string(),
-                },
+    let order = offchain_order.load(&order_id).await?;
+
+    if resolve_terminal_claimed_order(position, symbol, order_id, order.as_ref()).await? {
+        info!(%symbol, %order_id, "Orphaned pending order recovered");
+        return Ok(());
+    }
+
+    // Only live orders remain -- terminal and absent ones were resolved above.
+    match order {
+        Some(OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. }) => {
+            debug!(%symbol, %order_id, "Pending offchain order still in progress");
+            Ok(())
+        }
+
+        Some(OffchainOrder::Pending {
+            symbol: order_symbol,
+            shares,
+            direction,
+            executor,
+            ..
+        }) => {
+            warn!(
+                %symbol, %order_id,
+                "Offchain order still Pending on startup -- re-driving the broker placement"
+            );
+            // A crash between `Place` (which now records intent and enters
+            // Pending before the broker call) and the broker outcome leaves a
+            // Pending orphan. Re-drive the durable placement: the pure `Place`
+            // is a no-op on the existing aggregate, and the broker dedupes on
+            // `client_order_id` (so it adopts the in-flight order rather than
+            // placing a second time). Reconstruct that key exactly as the
+            // placement paths derive it -- the prior-failure anchor, else this
+            // order's own id. A resulting `Submitted` is polled to a fill by the
+            // `recover_submitted_offchain_orders` catch-up that follows this
+            // recovery (at startup, and re-run by the periodic scan at runtime);
+            // only a terminal `Failed` needs the position claim cleared here.
+            let anchor = position
+                .load(symbol)
+                .await?
+                .and_then(|position| position.last_failed_offchain_order_id);
+            let client_order_id = client_order_id_for_placement(order_id, anchor);
+
+            let recovered = place_offchain_order_at_broker(
+                offchain_order,
+                order_placer,
+                &order_id,
+                order_symbol,
+                shares,
+                direction,
+                executor,
+                client_order_id,
             )
             .await?;
-        info!(%symbol, %order_id, "Orphaned missing pending order recovered");
-        return Ok(());
-    };
+
+            // The broker rejected the re-drive: clear the position claim. A
+            // re-drive that reaches a live broker state needs a `PollOrderStatus`
+            // job, which the periodic submitted-order catch-up enqueues.
+            if let Some(OffchainOrder::Failed { error, .. }) = recovered {
+                position
+                    .send(
+                        symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id: order_id,
+                            error,
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+
+        // Terminal and absent orders are resolved by
+        // `resolve_terminal_claimed_order` above.
+        Some(OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. }) | None => Ok(()),
+    }
+}
+
+/// Propagates a terminal (or absent) offchain order's outcome into the position
+/// that still claims it via `pending_offchain_order_id`, clearing the claim
+/// in-process.
+///
+/// A position can hold a claim for an order that already reached `Filled` /
+/// `Failed` -- or whose aggregate is missing entirely -- because the order
+/// update and the position update are not atomic and the poller only polls
+/// `Submitted` orders. Left alone the claim sits stuck until the next
+/// `CheckPositions` sweep, so this emits the matching `CompleteOffChainOrder` /
+/// `FailOffChainOrder` to resolve it immediately.
+///
+/// Returns `true` when a terminal/absent order was resolved, `false` when the
+/// order is still live (`Pending` / `Submitted` / `PartiallyFilled`) and the
+/// caller must drive it further.
+async fn resolve_terminal_claimed_order(
+    position: &Store<Position>,
+    symbol: &Symbol,
+    order_id: OffchainOrderId,
+    order: Option<&OffchainOrder>,
+) -> Result<bool, SendError<Position>> {
+    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
 
     let command = match order {
-        OffchainOrder::Filled {
-            ref executor_order_id,
+        None => {
+            warn!(%symbol, %order_id, "Claimed offchain order missing from store -- recovering");
+            PositionCommand::FailOffChainOrder {
+                offchain_order_id: order_id,
+                error: "pending offchain order has no offchain order aggregate".to_string(),
+            }
+        }
+
+        Some(Filled {
+            shares,
+            direction,
+            executor_order_id,
             price,
             filled_at,
             ..
-        } => {
-            info!(%symbol, %order_id, "Orphaned order already Filled -- recovering");
+        }) => {
+            info!(%symbol, %order_id, "Claimed offchain order already Filled -- recovering");
             PositionCommand::CompleteOffChainOrder {
                 offchain_order_id: order_id,
-                shares_filled: order.shares(),
-                direction: order.direction(),
+                shares_filled: *shares,
+                direction: *direction,
                 executor_order_id: executor_order_id.clone(),
-                price,
-                broker_timestamp: filled_at,
+                price: *price,
+                broker_timestamp: *filled_at,
             }
         }
 
-        OffchainOrder::Failed { .. } => {
-            info!(%symbol, %order_id, "Orphaned order already Failed -- recovering");
+        Some(Failed { error, .. }) => {
+            info!(%symbol, %order_id, "Claimed offchain order already Failed -- recovering");
             PositionCommand::FailOffChainOrder {
                 offchain_order_id: order_id,
-                error: "recovered from orphaned state on startup".to_string(),
+                error: error.clone(),
             }
         }
 
-        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-            debug!(%symbol, %order_id, "Pending offchain order still in progress");
-            return Ok(());
-        }
-
-        OffchainOrder::Pending { .. } => {
-            warn!(%symbol, %order_id, "Offchain order still Pending -- may not have been submitted");
-            return Ok(());
-        }
+        Some(Pending { .. } | Submitted { .. } | PartiallyFilled { .. }) => return Ok(false),
     };
 
     position.send(symbol, command).await?;
-    info!(%symbol, %order_id, "Orphaned pending order recovered");
-
-    Ok(())
+    Ok(true)
 }
 
 /// Constructs the position CQRS framework with its view query
@@ -2473,10 +2584,16 @@ async fn place_offchain_order(
     let offchain_order_id = OffchainOrderId::new();
 
     if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
-        return Ok(None);
+        // `PendingExecution`: the position is already claimed by a prior
+        // placement attempt that may not have completed (e.g. it placed the
+        // broker order but crashed/was retried before enqueuing the poll).
+        // Reconcile that claimed order instead of dropping it -- otherwise it
+        // sits `Submitted`-but-unpolled until the next restart. Mirrors the
+        // hedge job's `recover_pending_poll_status`.
+        return recover_claimed_offchain_order(execution, cqrs).await;
     }
 
-    execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
+    execute_create_offchain_order(execution, cqrs, offchain_order_id).await?;
 
     let loaded = cqrs
         .offchain_order
@@ -2492,6 +2609,95 @@ async fn place_offchain_order(
         })?;
 
     dispatch_post_place_state(loaded, execution, cqrs, offchain_order_id).await
+}
+
+/// Recovers the order a position is already claimed by when a fresh placement
+/// hits `PendingExecution`. A prior attempt claimed the position but may not
+/// have finished: re-enqueue the poll if the order reached the broker
+/// (`Submitted`/`PartiallyFilled`), or re-drive the idempotent placement if it
+/// is still `Pending`. Symmetric to the hedge job's `recover_pending_poll_status`
+/// so a stuck order is recovered at runtime instead of sitting unpolled until
+/// the next restart. Terminal or absent orders propagate their outcome into the
+/// position via `resolve_terminal_claimed_order`, clearing the stale claim
+/// in-process instead of waiting for the next `CheckPositions` sweep.
+async fn recover_claimed_offchain_order(
+    execution: &ExecutionCtx,
+    cqrs: &TradeProcessingCqrs,
+) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+
+    let Some(pending_id) = cqrs
+        .position
+        .load(&execution.symbol)
+        .await?
+        .and_then(|position| position.pending_offchain_order_id)
+    else {
+        return Ok(None);
+    };
+
+    let order = cqrs.offchain_order.load(&pending_id).await?;
+
+    if resolve_terminal_claimed_order(
+        &cqrs.position,
+        &execution.symbol,
+        pending_id,
+        order.as_ref(),
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+
+    match order {
+        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+            cqrs.poll_status_queue
+                .clone()
+                .push(PollOrderStatus {
+                    offchain_order_id: pending_id,
+                })
+                .await
+                .inspect_err(|error| {
+                    error!(
+                        offchain_order_id = %pending_id,
+                        symbol = %execution.symbol,
+                        %error,
+                        "Failed to re-enqueue PollOrderStatus for a claimed pending order"
+                    );
+                })?;
+            Ok(Some(pending_id))
+        }
+        Some(Pending {
+            symbol,
+            shares,
+            direction,
+            executor,
+            ..
+        }) => {
+            let anchor = cqrs
+                .position
+                .load(&symbol)
+                .await?
+                .and_then(|position| position.last_failed_offchain_order_id);
+            let client_order_id = client_order_id_for_placement(pending_id, anchor);
+
+            let placed = place_offchain_order_at_broker(
+                &cqrs.offchain_order,
+                cqrs.order_placer.as_ref(),
+                &pending_id,
+                symbol,
+                shares,
+                direction,
+                executor,
+                client_order_id,
+            )
+            .await?;
+
+            dispatch_post_place_state(placed, execution, cqrs, pending_id).await
+        }
+        // Terminal and absent orders were resolved by
+        // `resolve_terminal_claimed_order` above.
+        Some(Filled { .. } | Failed { .. }) | None => Ok(None),
+    }
 }
 
 /// Routes the freshly-loaded `OffchainOrder` post-`Place` to either the
@@ -2540,12 +2746,10 @@ async fn dispatch_post_place_state(
             Ok(Some(offchain_order_id))
         }
 
-        // `OffchainOrder::initialize` for Place always emits Placed plus
-        // either Submitted or Failed atomically, so a persisted Pending or
-        // Filled state directly after Place would be a lifecycle bug. None
-        // means the prior `execute_create_offchain_order` swallowed a Place
-        // failure -- report no order placed so the caller does not pretend
-        // a phantom id is real, and clear the position pending state.
+        // No order exists after a successful Place -- a serious inconsistency,
+        // since the aggregate should have been created. Report no order placed
+        // so the caller does not treat a phantom id as real, and clear the
+        // position pending state (there is no order to track).
         None => {
             cqrs.position
                 .send(
@@ -2560,19 +2764,19 @@ async fn dispatch_post_place_state(
             Ok(None)
         }
 
-        Some(Pending { .. } | Filled { .. }) => {
-            cqrs.position
-                .send(
-                    &execution.symbol,
-                    PositionCommand::FailOffChainOrder {
-                        offchain_order_id,
-                        error: "Offchain order in unexpected state directly after Place"
-                            .to_string(),
-                    },
-                )
-                .await?;
-
-            Ok(None)
+        // With the pure `Place` handler, `Place` only records intent (entering
+        // `Pending`) and the durable placement path commits the broker outcome
+        // separately. `place_offchain_order_at_broker` returns only once the
+        // order has left `Pending`, and a commit failure propagates out of
+        // `execute_create_offchain_order` before we reach here -- so `Pending` or
+        // `Filled` at this point is unexpected. Surface it as a retryable error
+        // rather than clearing the position claim, which would strand a
+        // possibly-live broker order.
+        Some(state @ (Pending { .. } | Filled { .. })) => {
+            Err(TradeAccountingError::UnexpectedPostPlaceState {
+                offchain_order_id,
+                state,
+            })
         }
     }
 }
@@ -2618,44 +2822,66 @@ async fn execute_create_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
-) {
+) -> Result<(), TradeAccountingError> {
     // Derive the broker-side client_order_id from the live position aggregate
     // (read after PlaceOffChainOrder claimed it), reusing a prior failed
     // attempt's stashed OffchainOrderId as the idempotency anchor so the broker
-    // dedupes the retry. Fall back to this attempt's id when there is no anchor.
-    let anchor = match cqrs.position.load(&execution.symbol).await {
-        Ok(position) => position.and_then(|position| position.last_failed_offchain_order_id),
-        Err(error) => {
-            warn!(
+    // dedupes the retry. Fail fast on a load error rather than placing under a
+    // fresh key: a transient load failure while an anchor exists would submit a
+    // SECOND live broker order for shares the prior attempt already placed (the
+    // anchor exists precisely to dedupe that retry) -- a double-hedge the
+    // fail-fast rule exists to prevent. Retrying the job reloads the anchor.
+    let anchor = cqrs
+        .position
+        .load(&execution.symbol)
+        .await
+        .inspect_err(|error| {
+            error!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
                 %error,
-                "Failed to load position for the idempotency anchor; placing under a fresh key"
+                "Failed to load position for the idempotency anchor; failing the \
+                 job so a retry reloads it before placing"
             );
-            None
-        }
-    };
-    let client_order_id_source = anchor.unwrap_or(offchain_order_id);
-    let command = OffchainOrderCommand::Place {
-        symbol: execution.symbol.clone(),
-        shares: execution.shares,
-        direction: execution.direction,
-        executor: execution.executor,
-        client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
-    };
+        })?
+        .and_then(|position| position.last_failed_offchain_order_id);
+    let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
 
-    match cqrs.offchain_order.send(&offchain_order_id, command).await {
-        Ok(()) => debug!(
+    // Propagate a placement failure instead of swallowing it. If the broker
+    // accepted the order but committing `MarkAccepted` failed, the aggregate is
+    // left `Pending` with a live broker order; returning the error fails the
+    // accounting job so apalis retries, the position claim is preserved, and the
+    // idempotent re-drive (or startup orphan recovery) reconciles it. Swallowing
+    // here would let the caller observe `Pending` and force-fail the position,
+    // stranding the live broker order.
+    place_offchain_order_at_broker(
+        &cqrs.offchain_order,
+        cqrs.order_placer.as_ref(),
+        &offchain_order_id,
+        execution.symbol.clone(),
+        execution.shares,
+        execution.direction,
+        execution.executor,
+        client_order_id,
+    )
+    .await
+    .inspect(|_| {
+        debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "OffchainOrder::Place succeeded"
-        ),
-        Err(error) => error!(
+            "OffchainOrder placement completed"
+        );
+    })
+    .inspect_err(|error| {
+        error!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "OffchainOrder::Place failed: {error}"
-        ),
-    }
+            %error,
+            "OffchainOrder placement failed"
+        );
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2673,6 +2899,7 @@ where
         position,
         position_projection,
         offchain_order,
+        order_placer,
         counter_trade_submission_lock,
         threshold,
         assets,
@@ -2753,55 +2980,62 @@ where
         let anchor = match position.load(&execution.symbol).await {
             Ok(loaded) => loaded.and_then(|loaded| loaded.last_failed_offchain_order_id),
             Err(error) => {
+                // Financial-integrity: never place under a fresh idempotency key when the
+                // anchor cannot be read. A stashed `last_failed_offchain_order_id` may
+                // front a live broker order, so a fresh key would double-hedge (this is
+                // why `execute_create_offchain_order` fails fast here). The position is
+                // already claimed above but no OffchainOrder aggregate exists yet, so the
+                // runtime orphaned-pending recovery (ADR 0014) clears the stale claim and
+                // a later CheckPositions scan re-attempts the placement.
                 warn!(
                     %offchain_order_id,
                     symbol = %execution.symbol,
                     %error,
-                    "Failed to load position for the idempotency anchor; placing under a fresh key"
+                    "Failed to load position for the idempotency anchor; deferring \
+                     placement to runtime recovery instead of using a fresh key"
                 );
-                None
+                continue;
             }
         };
-        let client_order_id_source = anchor.unwrap_or(offchain_order_id);
+        let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
 
-        let command = OffchainOrderCommand::Place {
-            symbol: execution.symbol.clone(),
-            shares: execution.shares,
-            direction: execution.direction,
-            executor: execution.executor,
-            client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
-        };
+        let place_result = place_offchain_order_at_broker(
+            offchain_order,
+            order_placer,
+            &offchain_order_id,
+            execution.symbol.clone(),
+            execution.shares,
+            execution.direction,
+            execution.executor,
+            client_order_id,
+        )
+        .await;
 
-        let place_result = offchain_order.send(&offchain_order_id, command).await;
+        let mut broker_rejected_immediately = false;
 
         match &place_result {
-            Ok(()) => debug!(
+            Ok(Some(OffchainOrder::Failed { error, .. })) => {
+                broker_rejected_immediately = true;
+                position
+                    .send(
+                        &execution.symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id,
+                            error: error.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            Ok(_) => debug!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "OffchainOrder::Place succeeded"
+                "OffchainOrder placement completed"
             ),
             Err(error) => error!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "OffchainOrder::Place failed: {error}"
+                "OffchainOrder placement failed: {error}"
             ),
-        }
-
-        let mut broker_rejected_immediately = false;
-
-        if let Ok(Some(OffchainOrder::Failed { error, .. })) =
-            offchain_order.load(&offchain_order_id).await
-        {
-            broker_rejected_immediately = true;
-            position
-                .send(
-                    &execution.symbol,
-                    PositionCommand::FailOffChainOrder {
-                        offchain_order_id,
-                        error,
-                    },
-                )
-                .await?;
         }
 
         if place_result.is_ok()
@@ -4279,9 +4513,8 @@ mod tests {
         Arc::new(TestOrderPlacer)
     }
 
-    async fn create_cqrs_frameworks_with_order_placer(
+    async fn create_cqrs_frameworks(
         pool: &SqlitePool,
-        order_placer: Arc<dyn OrderPlacer>,
     ) -> (CqrsFrameworks, Arc<Projection<OffchainOrder>>) {
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
@@ -4295,7 +4528,7 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
                 .await
                 .unwrap();
 
@@ -4333,6 +4566,7 @@ mod tests {
             position: frameworks.position.clone(),
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
+            order_placer: succeeding_order_placer(),
             execution_threshold: threshold,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -4370,8 +4604,7 @@ mod tests {
     #[tokio::test]
     async fn trade_below_threshold_does_not_place_order() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4410,8 +4643,7 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_places_offchain_order() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4469,8 +4701,7 @@ mod tests {
     async fn db_write_lock_during_witness_propagates_error_for_retry() {
         let (pool, apalis_pool, db_path, _dir) =
             crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4566,8 +4797,7 @@ mod tests {
     #[tokio::test]
     async fn dedup_load_failure_propagates_as_retryable_error() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4606,8 +4836,7 @@ mod tests {
     #[tokio::test]
     async fn redelivery_after_crash_between_witness_and_acknowledge_recovers_fill() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4771,8 +5000,7 @@ mod tests {
     #[tokio::test]
     async fn resume_path_enriches_trade_unenriched_at_crash() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4858,8 +5086,7 @@ mod tests {
     #[tokio::test]
     async fn redelivery_after_crash_between_position_write_and_marker_recovers_fill() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -4981,8 +5208,7 @@ mod tests {
     #[tokio::test]
     async fn execute_mark_acknowledged_is_idempotent() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5026,8 +5252,7 @@ mod tests {
     #[tokio::test]
     async fn redelivery_of_marked_fill_after_later_fill_is_deduped() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5110,8 +5335,7 @@ mod tests {
     #[tokio::test]
     async fn redelivery_of_unmarked_fill_after_later_fill_is_rejected() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5197,8 +5421,7 @@ mod tests {
     #[tokio::test]
     async fn execute_acknowledge_fill_redrive_is_idempotent() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5247,8 +5470,7 @@ mod tests {
     #[tokio::test]
     async fn process_queued_trade_rejects_missing_block_timestamp() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5281,8 +5503,7 @@ mod tests {
     #[tokio::test]
     async fn broker_outage_records_fill_and_defers_hedge_to_rescan() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5345,6 +5566,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -5378,8 +5600,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_trade_event_is_single_effect() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5461,8 +5682,7 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_skips_counter_trade_without_offchain_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5512,8 +5732,7 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_places_partial_hedge_with_available_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5576,8 +5795,7 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_still_skips_with_zero_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5622,8 +5840,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5667,8 +5884,7 @@ mod tests {
     #[tokio::test]
     async fn pending_order_blocks_new_execution() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5717,8 +5933,7 @@ mod tests {
     #[tokio::test]
     async fn periodic_checker_executes_after_order_completion() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5783,6 +5998,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -5813,8 +6029,7 @@ mod tests {
     #[tokio::test]
     async fn periodic_checker_skips_counter_trade_without_buying_power() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5841,6 +6056,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -5874,8 +6090,7 @@ mod tests {
     #[tokio::test]
     async fn periodic_checker_reserves_buying_power_across_batch() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5905,6 +6120,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -5938,8 +6154,7 @@ mod tests {
     #[tokio::test]
     async fn periodic_checker_places_partial_hedge_with_limited_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -5968,6 +6183,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -6037,13 +6253,13 @@ mod tests {
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailOnceOrderPlacer {
             attempts: AtomicUsize::new(0),
         });
-        let (frameworks, offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, order_placer).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let mut cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
+        cqrs.order_placer = order_placer;
 
         acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
         acknowledge_fill(&cqrs.position, "MSFT", "1", Direction::Sell, 2).await;
@@ -6064,6 +6280,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -6882,13 +7099,13 @@ mod tests {
         }
 
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, failing_order_placer()).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let mut cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
+        cqrs.order_placer = failing_order_placer();
 
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
@@ -6917,8 +7134,7 @@ mod tests {
         // find the position still has a net imbalance and place a new order.
         // Rebuild CQRS with a broker that accepts orders (simulating the
         // transient PDT restriction being lifted).
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -6933,6 +7149,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -6977,13 +7194,13 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         // Build CQRS with a rejecting broker
-        let (frameworks, _) =
-            create_cqrs_frameworks_with_order_placer(&pool, rejecting_order_placer()).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (frameworks, _) = create_cqrs_frameworks(&pool).await;
+        let mut cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
+        cqrs.order_placer = rejecting_order_placer();
 
         // Accumulate a position by acknowledging an onchain fill
         let symbol = Symbol::new("AAPL").unwrap();
@@ -7023,6 +7240,7 @@ mod tests {
                 position: &cqrs.position,
                 position_projection: &cqrs.position_projection,
                 offchain_order: &cqrs.offchain_order,
+                order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
                 assets: &cqrs.assets,
@@ -7049,8 +7267,7 @@ mod tests {
     #[tokio::test]
     async fn enrichment_fields_present_emits_enrich_event() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -7101,8 +7318,7 @@ mod tests {
     #[tokio::test]
     async fn missing_enrichment_fields_skips_enrich_event() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -7140,8 +7356,6 @@ mod tests {
     #[tokio::test]
     async fn recover_orphaned_pending_clears_filled_order() {
         let pool = setup_test_db().await;
-        let order_placer = crate::offchain::order::noop_order_placer();
-
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
             .await
@@ -7149,7 +7363,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
                 .await
                 .unwrap();
 
@@ -7204,7 +7418,18 @@ mod tests {
                     shares,
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("test-order"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
                 },
             )
             .await
@@ -7225,9 +7450,14 @@ mod tests {
         assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
 
         // Step 4: Run recovery
-        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
-            .await
-            .unwrap();
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            noop_order_placer().as_ref(),
+        )
+        .await
+        .unwrap();
 
         // Verify recovery cleared the pending order
         let pos = position_projection.load(&symbol).await.unwrap().unwrap();
@@ -7240,8 +7470,6 @@ mod tests {
     #[tokio::test]
     async fn recover_orphaned_pending_clears_missing_order_aggregate() {
         let pool = setup_test_db().await;
-        let order_placer = crate::offchain::order::noop_order_placer();
-
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
             .await
@@ -7249,7 +7477,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
                 .await
                 .unwrap();
 
@@ -7296,9 +7524,14 @@ mod tests {
         let pos = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
 
-        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
-            .await
-            .unwrap();
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            noop_order_placer().as_ref(),
+        )
+        .await
+        .unwrap();
 
         let pos = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
@@ -7339,7 +7572,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
                 .await
                 .unwrap();
 
@@ -7385,20 +7618,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Create offchain order in Submitted state (Place triggers submission)
-        offchain_order
-            .send(
-                &offchain_order_id,
-                OffchainOrderCommand::Place {
-                    symbol: symbol.clone(),
-                    shares,
-                    direction: Direction::Sell,
-                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
-                },
-            )
-            .await
-            .unwrap();
+        // Drive the order to Submitted via the durable placement path; the
+        // placer accepts, so the order leaves Pending for Submitted.
+        place_offchain_order_at_broker(
+            &offchain_order,
+            order_placer.as_ref(),
+            &offchain_order_id,
+            symbol.clone(),
+            shares,
+            Direction::Sell,
+            st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+            ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+        )
+        .await
+        .unwrap();
 
         // Verify: order is Submitted, position has pending
         let order = offchain_order
@@ -7409,9 +7642,14 @@ mod tests {
         assert!(matches!(order, OffchainOrder::Submitted { .. }));
 
         // Run recovery
-        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
-            .await
-            .unwrap();
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            noop_order_placer().as_ref(),
+        )
+        .await
+        .unwrap();
 
         // Verify: pending_offchain_order_id is NOT cleared
         let pos = position_projection.load(&symbol).await.unwrap().unwrap();
@@ -7423,9 +7661,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_orphaned_pending_clears_failed_order() {
+    async fn recover_orphaned_pending_redrives_pending_order() {
         let pool = setup_test_db().await;
-        let order_placer = crate::offchain::order::noop_order_placer();
+
+        // A broker that accepts: re-driving the Pending orphan reaches Submitted.
+        let order_placer = noop_order_placer();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -7434,7 +7674,226 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("SGOV").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000003"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Leave the order in Pending: a crash during placement persists `Placed`
+        // (Pending) but never records the broker outcome.
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Pending { .. }
+        ));
+
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            order_placer.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        // The sweep re-drove the placement in place: the same aggregate advanced
+        // to Submitted (the broker accepted), not failed or left Pending.
+        assert!(matches!(
+            offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted { .. }
+        ));
+        // The position claim is intact -- the order recovered in place, so the
+        // sweep did not fall back to failing the claim and re-hedging.
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_redrives_and_clears_position_on_rejection() {
+        let pool = setup_test_db().await;
+
+        // A broker that rejects: re-driving the Pending orphan fails the order,
+        // and the sweep must clear the position claim so hedging can retry.
+        fn rejecting_order_placer() -> Arc<dyn OrderPlacer> {
+            struct RejectingPlacer;
+
+            #[async_trait::async_trait]
+            impl OrderPlacer for RejectingPlacer {
+                async fn place_market_order(
+                    &self,
+                    _order: MarketOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Err("Broker rejected: insufficient buying power".into())
+                }
+            }
+
+            Arc::new(RejectingPlacer)
+        }
+
+        let order_placer = rejecting_order_placer();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("SGOV").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000004"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Leave the order in Pending: a crash during placement persists `Placed`
+        // (Pending) but never records the broker outcome.
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            order_placer.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        // The re-driven placement was rejected, so the order is Failed and the
+        // position claim is cleared for a fresh hedge attempt.
+        assert!(matches!(
+            offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Failed { .. }
+        ));
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "a rejected re-drive must clear the position claim so hedging can retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_clears_failed_order() {
+        let pool = setup_test_db().await;
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(())
                 .await
                 .unwrap();
 
@@ -7489,7 +7948,6 @@ mod tests {
                     shares,
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
                 },
             )
             .await
@@ -7510,9 +7968,14 @@ mod tests {
         assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
 
         // Run recovery
-        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
-            .await
-            .unwrap();
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            noop_order_placer().as_ref(),
+        )
+        .await
+        .unwrap();
 
         // Verify recovery cleared the pending order
         let pos = position_projection.load(&symbol).await.unwrap().unwrap();
@@ -7588,8 +8051,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_post_place_state_none_clears_position_pending() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -7632,10 +8094,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_post_place_state_pending_clears_position_pending() {
+    async fn dispatch_post_place_state_pending_preserves_position_claim() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -7646,7 +8107,11 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
-        let lifecycle_bug_state = OffchainOrder::Pending {
+        // After the pure-Place extraction, a `Pending` order observed here means
+        // the broker outcome commit failed and the error was propagated, leaving
+        // a possibly-live broker order. Dispatch must NOT clear the claim (which
+        // would strand it) -- it surfaces a retryable error instead.
+        let pending_state = OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
@@ -7655,17 +8120,19 @@ mod tests {
         };
 
         let execution = execution_ctx_for(&symbol, shares);
-        let result = dispatch_post_place_state(
-            Some(lifecycle_bug_state),
-            &execution,
-            &cqrs,
-            offchain_order_id,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            result, None,
-            "Lifecycle-bug Pending state must report no order placed"
+        let error =
+            dispatch_post_place_state(Some(pending_state), &execution, &cqrs, offchain_order_id)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TradeAccountingError::UnexpectedPostPlaceState {
+                    state: OffchainOrder::Pending { .. },
+                    ..
+                }
+            ),
+            "Pending after Place must surface as a retryable error, got {error:?}"
         );
 
         let position = frameworks
@@ -7675,8 +8142,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            position.pending_offchain_order_id, None,
-            "Lifecycle-bug Pending state must clear the position's pending offchain order id"
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "a Pending order after Place must keep its position claim so a live broker order \
+             is not stranded"
         );
     }
 
@@ -7757,10 +8226,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_post_place_state_filled_clears_position_pending() {
+    async fn dispatch_post_place_state_filled_preserves_position_claim() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -7771,7 +8239,10 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
-        let lifecycle_bug_state = OffchainOrder::Filled {
+        // `place_offchain_order_at_broker` never returns `Filled`, so observing it
+        // here is unexpected. Dispatch must surface a retryable error rather than
+        // clear the claim -- it must not fail an order that has already filled.
+        let filled_state = OffchainOrder::Filled {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
@@ -7784,17 +8255,19 @@ mod tests {
         };
 
         let execution = execution_ctx_for(&symbol, shares);
-        let result = dispatch_post_place_state(
-            Some(lifecycle_bug_state),
-            &execution,
-            &cqrs,
-            offchain_order_id,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            result, None,
-            "Lifecycle-bug Filled state must report no order placed"
+        let error =
+            dispatch_post_place_state(Some(filled_state), &execution, &cqrs, offchain_order_id)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TradeAccountingError::UnexpectedPostPlaceState {
+                    state: OffchainOrder::Filled { .. },
+                    ..
+                }
+            ),
+            "Filled after Place must surface as a retryable error, got {error:?}"
         );
 
         let position = frameworks
@@ -7804,16 +8277,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            position.pending_offchain_order_id, None,
-            "Lifecycle-bug Filled state must clear the position's pending offchain order id"
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "an unexpected Filled state after Place must not clear the position claim"
         );
     }
 
     #[tokio::test]
     async fn dispatch_post_place_state_failed_clears_position_pending() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _projection) =
-            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
@@ -7854,6 +8327,100 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "Failed state must clear the position's pending offchain order id"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_claimed_offchain_order_clears_filled_terminal_claim() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+
+        // A prior placement attempt claimed the position and the broker filled the
+        // order, but the position update never landed -- the claim is stuck while
+        // the order is already terminal.
+        let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::DryRun,
+                },
+            )
+            .await
+            .unwrap();
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("ORD_TERMINAL"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(150)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Sanity: the order is Filled yet the position still holds the claim.
+        assert!(matches!(
+            frameworks
+                .offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Filled { .. }
+        ));
+        let position = frameworks
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.pending_offchain_order_id, Some(offchain_order_id));
+
+        let execution = execution_ctx_for(&symbol, shares);
+        let result = recover_claimed_offchain_order(&execution, &cqrs)
+            .await
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "a Filled terminal order reports no new placement from the PendingExecution \
+             recovery path"
+        );
+
+        let position = frameworks
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "recovery must complete the position and clear the stale claim in-process"
         );
     }
 

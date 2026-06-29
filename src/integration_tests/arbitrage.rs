@@ -706,7 +706,7 @@ async fn create_test_cqrs_with_assets(
 
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(order_placer)
+            .build(())
             .await
             .unwrap();
 
@@ -719,6 +719,7 @@ async fn create_test_cqrs_with_assets(
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
+        order_placer,
     };
 
     (
@@ -825,7 +826,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         ExpectedEvent::new(
             "OffchainOrder",
             &order_id_str,
-            "OffchainOrderEvent::Submitted",
+            "OffchainOrderEvent::Accepted",
         ),
     ]);
     let events = assert_events(&pool, &expected).await;
@@ -979,7 +980,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         ExpectedEvent::new(
             "OffchainOrder",
             &order_id_str,
-            "OffchainOrderEvent::Submitted",
+            "OffchainOrderEvent::Accepted",
         ),
         ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Failed"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFailed"),
@@ -997,6 +998,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &AssetsConfig {
@@ -1040,7 +1042,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     expected.extend([
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Submitted"),
+        ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Accepted"),
         ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ]);
@@ -1190,7 +1192,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         ExpectedEvent::new(
             "OffchainOrder",
             &aapl_order_str,
-            "OffchainOrderEvent::Submitted",
+            "OffchainOrderEvent::Accepted",
         ),
     ]);
     let events = assert_events(&pool, &expected).await;
@@ -1291,7 +1293,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         ExpectedEvent::new(
             "OffchainOrder",
             &msft_order_str,
-            "OffchainOrderEvent::Submitted",
+            "OffchainOrderEvent::Accepted",
         ),
     ]);
     let events = assert_events(&pool, &expected).await;
@@ -1429,7 +1431,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         ExpectedEvent::new(
             "OffchainOrder",
             &order_id_str,
-            "OffchainOrderEvent::Submitted",
+            "OffchainOrderEvent::Accepted",
         ),
     ];
     let events = assert_events(&pool, &expected).await;
@@ -1538,7 +1540,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         ExpectedEvent::new(
             "OffchainOrder",
             &order_id_str,
-            "OffchainOrderEvent::Submitted",
+            "OffchainOrderEvent::Accepted",
         ),
     ];
     let events = assert_events(&pool, &expected).await;
@@ -1599,6 +1601,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &AssetsConfig {
@@ -1726,11 +1729,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainFillSettled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order1_str,
-            "OffchainOrderEvent::Submitted",
-        ),
+        ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Accepted"),
         ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
         // Second cycle
@@ -1745,11 +1744,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainFillSettled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
         ExpectedEvent::new("OffchainOrder", &order2_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order2_str,
-            "OffchainOrderEvent::Submitted",
-        ),
+        ExpectedEvent::new("OffchainOrder", &order2_str, "OffchainOrderEvent::Accepted"),
         ExpectedEvent::new("OffchainOrder", &order2_str, "OffchainOrderEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ];
@@ -1953,7 +1948,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
             ExpectedEvent::new(
                 "OffchainOrder",
                 &order_id_str,
-                "OffchainOrderEvent::Submitted",
+                "OffchainOrderEvent::Accepted",
             ),
         ],
     )
@@ -2115,7 +2110,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
             ExpectedEvent::new(
                 "OffchainOrder",
                 &order_id_str,
-                "OffchainOrderEvent::Submitted",
+                "OffchainOrderEvent::Accepted",
             ),
         ],
     )
@@ -2233,7 +2228,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
             ExpectedEvent::new(
                 "OffchainOrder",
                 &order_id_str,
-                "OffchainOrderEvent::Submitted",
+                "OffchainOrderEvent::Accepted",
             ),
             // Trade 2 events: only onchain fill, no offchain order
             ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
@@ -2411,6 +2406,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &assets,
@@ -2449,6 +2445,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &assets,
@@ -2499,6 +2496,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &assets,
@@ -2624,6 +2622,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &assets,
@@ -2660,6 +2659,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
             position: &position,
             position_projection: &position_query,
             offchain_order: &offchain_order,
+            order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
             assets: &assets,

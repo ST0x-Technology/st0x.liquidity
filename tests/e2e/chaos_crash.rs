@@ -24,23 +24,23 @@ use crate::poll::{
 };
 
 /// Top-level hypothesis: a crash while a broker placement is in flight
-/// -- the broker received and recorded the order, the acknowledgement
-/// never arrived, and no `OffchainOrder` event was persisted -- must
-/// not double-submit when the bot restarts.
+/// -- the broker received the order but its outcome
+/// (`MarkAccepted`/`MarkFailed`) was never committed -- must not
+/// double-submit when the bot restarts.
 ///
 /// Mechanism under test: the hedge job persists the position's pending
-/// claim (`PlaceOffChainOrder`) before calling the broker, and the
-/// broker call happens inside the `OffchainOrder` aggregate's `Place`
-/// command *before* any event is emitted. Killing the bot while the
-/// [`LatencyProxy`] holds the placement response therefore leaves a
-/// position claimed by an order aggregate that has zero events. On
-/// restart, `recover_orphaned_pending_offchain_orders` finds the claim,
-/// observes the aggregate is missing, and issues `FailOffChainOrder`,
-/// which stashes the orphaned id as the position's idempotency anchor.
-/// The `CheckPositions` scan then re-enqueues a hedge whose
-/// `client_order_id` derives from that anchor, the broker rejects the
-/// duplicate with a 422, and the executor adopts the order the broker
-/// already accepted. Net result: exactly one broker order.
+/// claim (`PlaceOffChainOrder`) before placement, and the durable
+/// `place_offchain_order_at_broker` path emits `Placed` (entering
+/// `Pending`) *before* calling the broker. Killing the bot while the
+/// [`LatencyProxy`] holds the placement response therefore leaves the
+/// order aggregate in `Pending`, the position still claimed, and the
+/// broker order possibly live. On restart,
+/// `recover_orphaned_pending_offchain_orders` finds the `Pending` orphan
+/// and re-drives `place_offchain_order_at_broker`: `Place` is a no-op on
+/// the existing aggregate, and the broker dedupes the retry on
+/// `client_order_id` (a 422 the executor reconciles by adopting the order
+/// it already accepted), driving it to `Submitted`. Net result: exactly
+/// one broker order.
 #[test_log::test(tokio::test)]
 async fn crash_during_in_flight_placement_recovers_without_double_submit() -> anyhow::Result<()> {
     let equity_symbol = "AAPL";
@@ -87,24 +87,25 @@ async fn crash_during_in_flight_placement_recovers_without_double_submit() -> an
     bot.abort();
     let _ = bot.await;
 
-    // Pin the crash point: the broker has the order, the position holds
-    // a pending claim, and the order aggregate has zero events. If the
-    // placement pipeline ever starts persisting events before the
-    // broker call, this premise check fails loudly instead of letting
-    // the test validate a different scenario.
+    // Pin the crash point: the broker has the order, the position holds a
+    // pending claim, and the order aggregate holds exactly its `Placed` event.
+    // The now-pure `Place` records intent and enters `Pending` BEFORE the broker
+    // call, so a crash during that in-flight call leaves one event (`Placed`) and
+    // no broker outcome yet. If the pipeline's event ordering ever changes again,
+    // this premise check fails loudly instead of validating a different scenario.
     let pool = connect_db(&infra.db_path).await?;
     let offchain_events_at_crash = count_events(&pool, "OffchainOrder").await?;
     let position_events_at_crash = fetch_events_by_type(&pool, "Position").await?;
     pool.close().await;
     assert_eq!(
-        offchain_events_at_crash, 0,
-        "Expected the crash to land before any OffchainOrder event was \
-         persisted; found {offchain_events_at_crash}",
+        offchain_events_at_crash, 1,
+        "Expected the crash to land after `Placed` (Pending) but before the \
+         broker outcome was recorded; found {offchain_events_at_crash} events",
     );
     // Symmetric premise: the pending placement claim -- the orphan the restart
-    // sweep recovers -- must already exist. Without this, a crash that landed
-    // before the claim was written would still satisfy the zero-events check
-    // and silently exercise fresh-hedge placement instead of dedupe recovery.
+    // sweep re-drives -- must already exist. Without this, a crash that landed
+    // before the claim was written would still satisfy the events check above
+    // and silently exercise fresh-hedge placement instead of in-place recovery.
     let claim_count = position_events_at_crash
         .iter()
         .filter(|event| event.event_type == "PositionEvent::OffChainOrderPlaced")
@@ -133,9 +134,13 @@ async fn crash_during_in_flight_placement_recovers_without_double_submit() -> an
     )
     .await;
 
-    // The startup sweep must have recovered the orphaned claim -- this
-    // is what proves the recovery path ran rather than the test passing
-    // trivially.
+    // The startup sweep re-drove the orphaned Pending placement rather than
+    // failing it: the pure `Place` is a no-op on the existing aggregate and the
+    // broker dedupes the in-flight order, so the SAME aggregate advances to
+    // Submitted and then Filled. A Pending order that reached Filled at all
+    // proves the re-drive ran (nothing else completes a Pending order); the
+    // absence of any orphan failure proves it recovered in place rather than
+    // falling back to fail-and-re-hedge.
     let pool = connect_db(&infra.db_path).await?;
     let position_events = fetch_events_by_type(&pool, "Position").await?;
     pool.close().await;
@@ -145,9 +150,9 @@ async fn crash_during_in_flight_placement_recovers_without_double_submit() -> an
         .filter(|event| event.event_type == "PositionEvent::OffChainOrderFailed")
         .count();
     assert_eq!(
-        orphan_failures, 1,
-        "Expected exactly one PositionEvent::OffChainOrderFailed from the \
-         startup orphan sweep; got {orphan_failures}",
+        orphan_failures, 0,
+        "Expected the orphan sweep to re-drive the Pending order in place, not \
+         fail it; got {orphan_failures} PositionEvent::OffChainOrderFailed",
     );
 
     let orders = infra.broker_service.orders();
@@ -160,13 +165,12 @@ async fn crash_during_in_flight_placement_recovers_without_double_submit() -> an
          could not dedupe the second submission.",
     );
 
-    // Broker-level dedupe (the 422-adopt path) keeps the order count at one
-    // even if recovery spawned a second OffchainOrder aggregate, so assert the
-    // aggregate count directly. The orphan sweep records its failure as a
-    // Position event (asserted above), not a second OffchainOrder aggregate, so
-    // the only OffchainOrder aggregate is the fresh retry: exactly one. More
-    // would be the CQRS-level double-count the broker dedupe would otherwise
-    // mask.
+    // The sweep re-drove the SAME Pending aggregate in place, so there is
+    // exactly one OffchainOrder aggregate -- the recovered orphan, not a fresh
+    // retry. Assert the aggregate count directly: broker-level dedupe (the
+    // 422-adopt path) would keep the broker order count at one even if recovery
+    // had spawned a second aggregate, so more than one here would be a CQRS-level
+    // double-count the broker dedupe otherwise masks.
     let pool = connect_db(&infra.db_path).await?;
     let offchain_order_events = fetch_events_by_type(&pool, "OffchainOrder").await?;
     pool.close().await;
@@ -261,7 +265,7 @@ async fn crash_while_order_submitted_resumes_polling_and_fills() -> anyhow::Resu
     poll_for_events_with_timeout(
         &mut bot,
         &infra.db_path,
-        "OffchainOrderEvent::Submitted",
+        "OffchainOrderEvent::Accepted",
         1,
         Duration::from_secs(60),
     )
