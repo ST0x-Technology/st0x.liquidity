@@ -711,7 +711,7 @@ mod tests {
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::tokenized_equity_mint::{
-        TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
+        TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
     };
     use crate::vault_lookup::MockVaultLookup;
 
@@ -751,7 +751,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
         };
-        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let mint_store = Arc::new(test_store(pool.clone(), ()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
@@ -824,7 +824,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
-        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let mint_store = Arc::new(test_store(pool.clone(), ()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
@@ -905,7 +905,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
-        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let mint_store = Arc::new(test_store(pool.clone(), ()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
@@ -1221,15 +1221,16 @@ mod tests {
         ctx.mint_store
             .send(
                 &mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::random(),
+                    tokenization_request_id: TokenizationRequestId("tok-req-accept".to_string()),
                 },
             )
             .await
-            .expect("RequestMint should persist a mint aggregate");
+            .expect("RecordMintRequested should persist a mint aggregate");
 
         let snapshot = RecoverySnapshot {
             shares: FractionalShares::new(float!(5)),
@@ -1249,15 +1250,16 @@ mod tests {
         ctx.mint_store
             .send(
                 &mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(3),
                     wallet: Address::random(),
+                    tokenization_request_id: TokenizationRequestId("tok-req-mismatch".to_string()),
                 },
             )
             .await
-            .expect("RequestMint should persist a mint aggregate");
+            .expect("RecordMintRequested should persist a mint aggregate");
 
         let snapshot = RecoverySnapshot {
             shares: FractionalShares::new(float!(5)),
@@ -1647,21 +1649,29 @@ mod tests {
 
         // Seed the mint to `TokensWrapped` so `resume_mint` runs to completion
         // under the succeeding mocks:
-        // RequestMint -> (Poll) TokensReceived -> WrapSubmitted -> TokensWrapped.
+        // RecordMintRequested -> RecordTokensReceived -> WrapSubmitted -> TokensWrapped.
         ctx.mint_store
             .send(
                 &mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::random(),
+                    tokenization_request_id: TokenizationRequestId("tok-req-dispatch".to_string()),
                 },
             )
             .await
             .unwrap();
         ctx.mint_store
-            .send(&mint_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
         let wrap_tx = TxHash::random();

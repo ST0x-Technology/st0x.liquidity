@@ -65,7 +65,8 @@ use crate::tokenization::alpaca::tests::{
 };
 use crate::tokenization::mock::MockTokenizer;
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
+    IssuerRequestId, TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    issuer_request_id,
 };
 use crate::unwrapped_equity_recovery::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
@@ -545,10 +546,7 @@ fn build_equity_transfer_with_wrapper(
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        equity_services.clone(),
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
         equity_services,
@@ -588,7 +586,7 @@ async fn build_equity_transfer_with_service(
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::clone(service))
-        .build(equity_services.clone())
+        .build(())
         .await
         .unwrap();
 
@@ -751,15 +749,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             )]));
     });
 
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        },
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -1698,15 +1688,7 @@ async fn mint_api_failure_produces_rejected_event() {
     drain_pending_jobs(&service).await.unwrap();
 
     let job = fetch_pending_equity_mint_job(&apalis_pool).await;
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        },
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -1731,9 +1713,10 @@ async fn mint_api_failure_produces_rejected_event() {
     }
     .to_string();
 
-    // When the mint API returns HTTP 500, the TokenizedEquityMint aggregate
-    // returns Err(RequestFailed) without emitting any events, so no
-    // TokenizedEquityMint events appear.
+    // When the mint API returns HTTP 500, the orchestrator's request_mint call
+    // fails pre-receipt (MintTransferError::PreReceipt) before any
+    // RecordMintRequested command reaches the aggregate, so the aggregate never
+    // originates and no TokenizedEquityMint events appear.
     assert_events(
         &pool,
         &[
@@ -2272,15 +2255,7 @@ async fn mint_accepted_sets_offchain_inflight() {
     // The poll will return pending, so the mint aggregate will time out or loop,
     // but MintAccepted has already fired by then. We spawn and cancel to
     // get just the MintAccepted event through.
-    let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        },
-    ));
+    let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let transfer_handle = tokio::spawn({
         let equity_transfer = Arc::clone(&equity_transfer);
         let mint_store = Arc::clone(&mint_store_for_spawn);
@@ -2486,15 +2461,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     };
 
     // Execute the full mint lifecycle through the job's perform
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        },
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: Arc::clone(&equity_transfer) as _,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -2693,10 +2660,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        equity_services.clone(),
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
         equity_services,
@@ -2811,10 +2775,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        equity_services.clone(),
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
         equity_services,
@@ -2948,10 +2909,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        equity_services.clone(),
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
         equity_services,
@@ -3077,10 +3035,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
-    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-        pool.clone(),
-        equity_services.clone(),
-    ));
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
         equity_services,
@@ -3111,19 +3066,27 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     mint_store
         .send(
             &mint_id,
-            TokenizedEquityMintCommand::RequestMint {
+            TokenizedEquityMintCommand::RecordMintRequested {
                 issuer_request_id: mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
+                tokenization_request_id: TokenizationRequestId("active-mint-deadlock".to_string()),
             },
         )
         .await
-        .expect("RequestMint must persist");
+        .expect("RecordMintRequested must persist");
     mint_store
-        .send(&mint_id, TokenizedEquityMintCommand::Poll)
+        .send(
+            &mint_id,
+            TokenizedEquityMintCommand::RecordTokensReceived {
+                tx_hash: Some(TxHash::random()),
+                token_symbol: Some(format!("t{symbol}")),
+                fees: None,
+            },
+        )
         .await
-        .expect("Poll must transition the mint to TokensReceived");
+        .expect("RecordTokensReceived must transition the mint to TokensReceived");
 
     // Inventory reports UNWRAPPED balance AND an active mint, so decide_dispatch
     // resolves to ActiveMint (the prod path) instead of Orphan.

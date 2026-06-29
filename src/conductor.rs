@@ -3301,10 +3301,7 @@ mod tests {
             wrapper: wrapper.clone(),
         };
 
-        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
         let seeding_redemption_store = Arc::new(test_store::<EquityRedemption>(
             pool.clone(),
             services.clone(),
@@ -3313,11 +3310,14 @@ mod tests {
         seeding_mint_store
             .send(
                 &mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
                     quantity: st0x_float_macro::float!(10.0),
                     wallet: alloy::primitives::Address::from([wallet_byte; 20]),
+                    tokenization_request_id: TokenizationRequestId(
+                        "TOK-interrupted-mint".to_string(),
+                    ),
                 },
             )
             .await
@@ -3408,10 +3408,7 @@ mod tests {
         // The recover function only calls store.load() (event replay); it does
         // not invoke tokenizer methods. Use the same services for the function
         // call -- MockTokenizer methods are never called during load().
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
         let redemption_store = Arc::new(test_store::<EquityRedemption>(
             pool.clone(),
             services.clone(),
@@ -3505,10 +3502,7 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
             Arc::new(test_store::<EquityRedemption>(
                 pool.clone(),
                 services.clone(),
@@ -3529,10 +3523,7 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
             Arc::new(test_store::<EquityRedemption>(
                 pool.clone(),
                 services.clone(),
@@ -3579,10 +3570,7 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
             Arc::new(test_store::<EquityRedemption>(
                 pool.clone(),
                 services.clone(),
@@ -3607,10 +3595,7 @@ mod tests {
             &pool,
             &rebalancing_service,
             inventory.as_ref(),
-            Arc::new(test_store::<TokenizedEquityMint>(
-                pool.clone(),
-                services.clone(),
-            )),
+            Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
             Arc::new(test_store::<EquityRedemption>(
                 pool.clone(),
                 services.clone(),
@@ -3676,28 +3661,35 @@ mod tests {
             wrapper: wrapper.clone(),
         };
 
-        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
 
-        // RequestMint (Pending) -> MintAccepted state.
-        // Poll with Completed outcome -> TokensReceived state (pre-wrap).
+        // RecordMintRequested -> MintAccepted state.
+        // RecordTokensReceived -> TokensReceived state (pre-wrap).
         seeding_mint_store
             .send(
                 &mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5.0),
                     wallet: alloy::primitives::Address::from([3u8; 20]),
+                    tokenization_request_id: TokenizationRequestId("TOK-pre-wrap-held".to_string()),
                 },
             )
             .await
             .unwrap();
 
         seeding_mint_store
-            .send(&mint_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(fixed_bytes!(
+                        "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    )),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3731,10 +3723,7 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         );
 
-        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
-            pool.clone(),
-            services.clone(),
-        ));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ()));
         let redemption_store = Arc::new(test_store::<EquityRedemption>(
             pool.clone(),
             services.clone(),
@@ -3770,26 +3759,35 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
 
-        let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
-            pool2.clone(),
-            services2.clone(),
-        ));
+        let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone(), ()));
 
         seeding_mint_store2
             .send(
                 &mint_id2,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id2.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5.0),
                     wallet: alloy::primitives::Address::from([4u8; 20]),
+                    tokenization_request_id: TokenizationRequestId(
+                        "TOK-pre-wrap-active".to_string(),
+                    ),
                 },
             )
             .await
             .unwrap();
 
         seeding_mint_store2
-            .send(&mint_id2, TokenizedEquityMintCommand::Poll)
+            .send(
+                &mint_id2,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(fixed_bytes!(
+                        "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    )),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -3823,10 +3821,7 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         );
 
-        let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
-            pool2.clone(),
-            services2.clone(),
-        ));
+        let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(pool2.clone(), ()));
         let redemption_store2 = Arc::new(test_store::<EquityRedemption>(
             pool2.clone(),
             services2.clone(),

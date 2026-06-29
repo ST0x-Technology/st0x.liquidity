@@ -13892,10 +13892,7 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14018,10 +14015,7 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14119,10 +14113,7 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14291,10 +14282,7 @@ mod tests {
         let store = Arc::new(store);
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14396,10 +14384,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    unmigrated_pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(unmigrated_pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     unmigrated_pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14502,10 +14487,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14645,10 +14627,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14845,10 +14824,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -14999,10 +14975,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
