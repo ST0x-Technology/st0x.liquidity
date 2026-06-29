@@ -1,5 +1,7 @@
 //! Single-chain CCTP operations.
 
+use std::time::Duration;
+
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
@@ -9,7 +11,10 @@ use tracing::{debug, info, trace, warn};
 
 #[cfg(test)]
 use st0x_evm::Evm;
-use st0x_evm::{EvmError, IntoErrorRegistry, Wallet};
+use st0x_evm::{
+    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL, Wallet,
+    wait_for_node_sync,
+};
 
 use super::{
     CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
@@ -18,6 +23,38 @@ use super::{
 use crate::BridgeDirection;
 
 const CCTP_RECOVERY_LOG_BLOCK_CHUNK: u64 = 20_000;
+
+/// Approve this amount to the CCTP TokenMessenger as the standing allowance.
+///
+/// `U256::MAX` is the Circle-standard CCTP integration pattern.
+///
+/// Note: FiatToken v2.2 (Circle's USDC implementation) unconditionally
+/// decrements allowances in `_transferFrom` with no `type(uint256).max`
+/// shortcut, so `U256::MAX` is decremented on every burn. This makes the
+/// threshold top-up in [`ensure_standing_allowance`] a real code path, not
+/// dead code. That said, the `TARGET / 2` threshold means correctness does not
+/// depend solely on this assumption: even if a future USDC version added a
+/// max-allowance shortcut the approve fires at most once per cold path anyway.
+/// At realistic rebalancing sizes the allowance never drops below
+/// [`STANDING_ALLOWANCE_THRESHOLD`], so the approve fires exactly once (at first
+/// use or after a manual reset) and never on the hot path.
+const STANDING_ALLOWANCE_TARGET: U256 = U256::MAX;
+
+/// Top up the standing allowance when it falls below this threshold.
+///
+/// Equal to `STANDING_ALLOWANCE_TARGET / 2` = `U256::MAX / 2`. The standing
+/// allowance model is safe because the SPEC guarantees a single USDC rebalance
+/// in flight at a time (one burn at a time), so two concurrent burns cannot race
+/// the same allowance. With that invariant, and at realistic rebalancing sizes,
+/// this threshold is never reached in normal operation.
+///
+/// Expressed as `U256::from_limbs(...)` because `ruint`'s `Div` is not `const
+/// fn`. A test pins `STANDING_ALLOWANCE_TARGET` against an independent
+/// `from_limbs` literal and `STANDING_ALLOWANCE_THRESHOLD` against a runtime
+/// `U256::MAX / 2` computation, so any divergence between the encoding and
+/// mathematical intent is caught.
+const STANDING_ALLOWANCE_THRESHOLD: U256 =
+    U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 1]);
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -37,6 +74,24 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// trusted as a true absence (the burn lands at/after `from_block`).
 const SCAN_FINALITY_MARGIN: u64 = 2;
 
+/// Maps a sync result during the allowance retry to the error returned on
+/// failure, preserving the original burn error as the actionable root cause.
+///
+/// On sync failure (`Err(sync_err)`), returns `Err(original_error)` — the
+/// original burn revert is what the job retry queue and operator logs need to
+/// diagnose, not the sync error. The sync error is already logged by the caller.
+///
+/// On sync success (`Ok(())`), returns `Ok(())` so the retry burn can proceed.
+///
+/// This pure function exists to make the error-selection logic unit-testable
+/// independently of the async I/O path.
+pub(super) fn apply_sync_result(
+    original_error: CctpError,
+    sync_result: Result<(), CctpError>,
+) -> Result<(), CctpError> {
+    sync_result.map_err(|_sync_err| original_error)
+}
+
 /// Single-chain CCTP endpoint with contract instances for cross-chain operations.
 ///
 /// The wallet's provider is used for read-only view calls (e.g. allowance
@@ -50,6 +105,11 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     message_transmitter_address: Address,
     /// Wallet for submitting write transactions
     wallet: W,
+    /// Poll interval between `eth_blockNumber` calls in [`wait_for_node_sync`].
+    ///
+    /// Production always uses [`NODE_SYNC_POLL_INTERVAL`]. Tests override it to
+    /// `Duration::ZERO` to avoid sleeping through the 30-attempt budget.
+    node_sync_poll_interval: Duration,
 }
 
 impl<W: Wallet> CctpEndpoint<W> {
@@ -68,12 +128,24 @@ impl<W: Wallet> CctpEndpoint<W> {
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
             wallet,
+            node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
         }
     }
 
-    pub(super) async fn ensure_usdc_approval<Registry: IntoErrorRegistry>(
+    /// Ensures a standing `U256::MAX` allowance from the wallet to the
+    /// TokenMessenger. This is a no-op (fast path) when the allowance is at or
+    /// above [`STANDING_ALLOWANCE_THRESHOLD`]; on the slow path it approves
+    /// `STANDING_ALLOWANCE_TARGET` and waits until at least one poll through the
+    /// load-balanced endpoint returns a block at or above the approve block before
+    /// returning, reducing (but not eliminating) the chance that a subsequent
+    /// `depositForBurn` pre-flight hits a lagging node.
+    ///
+    /// The node-sync wait significantly reduces the dRPC load-balancing race
+    /// window: a `depositForBurn` pre-flight `eth_call` can still hit a lagging
+    /// node, but the defense-in-depth retry in
+    /// [`deposit_for_burn_with_allowance_retry`] handles that case.
+    pub(super) async fn ensure_standing_allowance<Registry: IntoErrorRegistry>(
         &self,
-        amount: U256,
     ) -> Result<(), CctpError> {
         let allowance = self
             .wallet
@@ -86,22 +158,126 @@ impl<W: Wallet> CctpEndpoint<W> {
             )
             .await?;
 
-        trace!(target: "bridge", ?allowance, %amount, "Checking USDC allowance");
-
-        if allowance < amount {
-            self.wallet
-                .submit::<Registry, _>(
-                    self.usdc_address,
-                    IERC20::approveCall {
-                        spender: self.token_messenger_address,
-                        amount,
-                    },
-                    "USDC approve for CCTP",
-                )
-                .await?;
+        if allowance >= STANDING_ALLOWANCE_THRESHOLD {
+            trace!(
+                target: "bridge",
+                ?allowance,
+                "USDC allowance at or above standing threshold; skipping approve"
+            );
+            return Ok(());
         }
 
+        info!(
+            target: "bridge",
+            ?allowance,
+            standing_target = ?STANDING_ALLOWANCE_TARGET,
+            "USDC allowance below standing threshold; approving U256::MAX to TokenMessenger"
+        );
+
+        let receipt = self
+            .wallet
+            .submit::<Registry, _>(
+                self.usdc_address,
+                IERC20::approveCall {
+                    spender: self.token_messenger_address,
+                    amount: STANDING_ALLOWANCE_TARGET,
+                },
+                "USDC standing allowance approve for CCTP",
+            )
+            .await?;
+
+        let approve_block = receipt
+            .block_number
+            .ok_or(CctpError::TxReceiptMissingBlock {
+                tx_hash: receipt.transaction_hash,
+            })?;
+
+        // Wait until at least one poll through the load-balanced endpoint returns
+        // a block at or above the approve block. This reduces (but does not
+        // eliminate) the chance that the subsequent depositForBurn pre-flight
+        // eth_call hits a lagging node; the defense-in-depth retry handles
+        // the residual race.
+        wait_for_node_sync(
+            self.wallet.provider(),
+            approve_block,
+            self.node_sync_poll_interval,
+            NODE_SYNC_MAX_ATTEMPTS,
+        )
+        .await?;
+
         Ok(())
+    }
+
+    /// Submits a `depositForBurn` and retries once if it reverts.
+    ///
+    /// Test-only helper that exercises the endpoint-level retry path in isolation
+    /// (without the fee re-query that `CctpBridge::retry_burn_if_revert` performs).
+    /// Production callers use `CctpBridge::burn_internal`, which re-queries the
+    /// Circle fast-transfer fee before the retry burn to avoid a stale fee bound.
+    ///
+    /// The retry is triggered by any revert-class failure (not by a post-revert
+    /// allowance re-read). On a revert-class error nothing was minted, so one retry
+    /// cannot double-burn. The one-shot bound prevents loops. If the second burn
+    /// also reverts that error is final and propagates to the caller.
+    ///
+    /// Non-revert errors (transport timeouts, RPC connection failures) are NOT
+    /// retried — `is_revert()` distinguishes them from EVM reverts.
+    ///
+    /// Note: `max_fee` is used as-is for the retry burn. On the cold
+    /// `ensure_standing_allowance` path (~30 s sync wait), a Circle fee spike
+    /// could make this stale. Production code re-queries the fee; this helper
+    /// does not, which is acceptable for the unit-test scenarios it covers.
+    ///
+    /// If `ensure_standing_allowance` fails during the retry, the original burn
+    /// revert is returned rather than the sync error — the burn revert is the
+    /// actionable root cause that the job retry queue and operator logs need to see.
+    #[cfg(test)]
+    pub(super) async fn deposit_for_burn_with_allowance_retry<Registry: IntoErrorRegistry>(
+        &self,
+        amount: U256,
+        recipient: Address,
+        direction: BridgeDirection,
+        max_fee: U256,
+    ) -> Result<crate::BurnReceipt, CctpError> {
+        let first_result = self
+            .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
+            .await;
+
+        let Err(original_error) = first_result else {
+            return first_result;
+        };
+
+        // Only retry on revert-class errors. Transport or non-revert errors are
+        // not allowance-related; propagate immediately.
+        if !original_error.is_revert() {
+            return Err(original_error);
+        }
+
+        warn!(
+            target: "bridge",
+            ?original_error,
+            "depositForBurn reverted; re-running ensure_standing_allowance and retrying once"
+        );
+
+        // Re-run ensure_standing_allowance (cheap no-op on the hot path when
+        // allowance is already MAX; approves and syncs on the cold path). If sync
+        // fails, return the original burn revert — not the sync error — so the
+        // caller and operator logs see the actionable root cause.
+        let sync_result = self.ensure_standing_allowance::<Registry>().await;
+
+        if let Err(sync_err) = &sync_result {
+            warn!(
+                target: "bridge",
+                ?sync_err,
+                ?original_error,
+                "node-sync gate failed during allowance retry; returning original burn revert"
+            );
+        }
+
+        apply_sync_result(original_error, sync_result)?;
+
+        self.deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
+            .await
     }
 
     pub(super) async fn deposit_for_burn<Registry: IntoErrorRegistry>(
@@ -697,6 +873,15 @@ impl<W: Wallet> CctpEndpoint<W> {
     pub(super) fn token_messenger_address(&self) -> Address {
         self.token_messenger_address
     }
+
+    /// Sets a custom node-sync poll interval. Test-only: lets node-sync
+    /// exhaustion paths run without sleeping at the production one-second
+    /// cadence.
+    #[cfg(test)]
+    pub(super) fn with_node_sync_poll_interval(mut self, interval: Duration) -> Self {
+        self.node_sync_poll_interval = interval;
+        self
+    }
 }
 
 fn parse_mint_receipt(receipt: &TransactionReceipt) -> Option<MintReceipt> {
@@ -772,6 +957,35 @@ mod tests {
     use alloy::rpc::types::Log;
 
     use super::*;
+
+    /// Guards the values of the allowance constants against accidental change.
+    ///
+    /// `STANDING_ALLOWANCE_TARGET` is pinned against a concrete four-limb
+    /// `U256::MAX` literal. `STANDING_ALLOWANCE_THRESHOLD` is pinned against
+    /// `U256::MAX / U256::from(2u8)` computed at runtime -- an independent
+    /// derivation that does not share the `from_limbs` expression used in the
+    /// constant definition, so any divergence between the two formulas is caught.
+    #[test]
+    fn allowance_constants_have_expected_values() {
+        // U256::MAX: all 256 bits set, represented as four 64-bit limbs of
+        // 0xFFFF_FFFF_FFFF_FFFF (Rust uint uses little-endian limb order).
+        assert_eq!(
+            STANDING_ALLOWANCE_TARGET,
+            U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
+            "STANDING_ALLOWANCE_TARGET must be U256::MAX"
+        );
+
+        // Cross-check the constant against an independent runtime computation
+        // (U256::MAX / 2) rather than duplicating the from_limbs expression.
+        // If the constant's from_limbs encoding drifts from the mathematical
+        // intention, this assertion will fail even if both sides use different
+        // literal representations.
+        assert_eq!(
+            STANDING_ALLOWANCE_THRESHOLD,
+            U256::MAX / U256::from(2u8),
+            "STANDING_ALLOWANCE_THRESHOLD must be U256::MAX / 2"
+        );
+    }
 
     fn mint_log(log_index: u64, amount: u64) -> Log {
         let event = TokenMessengerV2::MintAndWithdraw {
@@ -855,5 +1069,49 @@ mod tests {
             parse_mint_receipt_for_message(&receipt, 0).is_none(),
             "no MintAndWithdraw below the MessageReceived log must yield None, not a later mint"
         );
+    }
+
+    // --- apply_sync_result unit tests ---
+
+    /// Helper that constructs a representative non-revert `CctpError` for use as
+    /// the `original_error` sentinel in `apply_sync_result` tests.
+    fn sentinel_original_error() -> CctpError {
+        CctpError::ScanInconclusive { from_block: 42 }
+    }
+
+    /// Helper that constructs a different `CctpError` to use as the sync error,
+    /// distinct from the sentinel so tests can verify which error was returned.
+    fn sentinel_sync_error() -> CctpError {
+        CctpError::ScanInconclusive { from_block: 99 }
+    }
+
+    /// When `ensure_standing_allowance` fails during the retry, `apply_sync_result`
+    /// returns the original burn error so operator logs see the actionable root cause.
+    ///
+    /// This covers the branch in `deposit_for_burn_with_allowance_retry` (and
+    /// `retry_burn_if_revert`) where sync fails: the sync error is logged but the
+    /// original error is what propagates.
+    #[test]
+    fn apply_sync_result_on_sync_failure_returns_original_error() {
+        let original = sentinel_original_error();
+        let sync_result: Result<(), CctpError> = Err(sentinel_sync_error());
+
+        let result = apply_sync_result(original, sync_result);
+
+        // Must return Err with the original error (from_block: 42), not the sync
+        // error (from_block: 99).
+        let CctpError::ScanInconclusive { from_block: 42 } = result.unwrap_err() else {
+            panic!("expected original_error (from_block: 42) to be returned on sync failure");
+        };
+    }
+
+    /// When `ensure_standing_allowance` succeeds during the retry, `apply_sync_result`
+    /// returns `Ok(())` so the caller can proceed to issue the retry burn.
+    #[test]
+    fn apply_sync_result_on_sync_success_returns_ok() {
+        let original = sentinel_original_error();
+        let sync_result: Result<(), CctpError> = Ok(());
+
+        apply_sync_result(original, sync_result).unwrap();
     }
 }
