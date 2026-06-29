@@ -2624,7 +2624,9 @@ pub(crate) enum FillAccountingOutcome {
     /// A reorg invalidated the fill's block before acknowledgement; nothing
     /// was accounted and the fill must not be settled or hedged.
     Reorged,
-    Accounted { trade_id: OnChainTradeId },
+    Accounted {
+        trade_id: OnChainTradeId,
+    },
 }
 
 pub(crate) async fn account_for_onchain_fill(

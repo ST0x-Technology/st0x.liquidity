@@ -129,6 +129,60 @@ pub(crate) async fn poll_for_hedged_position(
     }
 }
 
+/// Polls until the Position projection for `symbol` reports `net ==
+/// expected`, crash-checking the bot.
+///
+/// `Projection::load` reads the `position_view` materialized view, which
+/// is updated asynchronously: the projection is registered as a reactor
+/// dispatched AFTER the command's event commit and writes the view in a
+/// separate transaction. A test that gates on a `PositionEvent` via
+/// `poll_for_events` (which counts the `events` table) therefore observes
+/// the event before the view reflects it, so reading `net` immediately can
+/// return the pre-reversal value. Wait on this before asserting `net`.
+pub(crate) async fn poll_for_position_net(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    symbol: &str,
+    expected: FractionalShares,
+) {
+    let url = format!("sqlite:{}", db_path.display());
+    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("Position({symbol}) net == {expected}");
+    let target_symbol = Symbol::new(symbol.to_owned()).unwrap();
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect(&url).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let net = {
+            let projection = Projection::<Position>::sqlite(pool.clone());
+            match projection.load(&target_symbol).await {
+                Ok(maybe_position) => maybe_position.map(|position| position.net),
+                Err(load_error) => panic!("failed to load Position projection: {load_error}"),
+            }
+        };
+
+        pool.close().await;
+
+        if net == Some(expected) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context} (current net: {net:?})",
+        );
+    }
+}
+
 /// Comprehensive end-to-end assertions covering broker state, onchain
 /// vaults, and CQRS events/views for one or more symbols.
 ///
