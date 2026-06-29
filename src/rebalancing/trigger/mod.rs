@@ -2726,22 +2726,170 @@ impl RebalancingService {
     /// *other* direction. Querying only one job type would, after a restart, let
     /// an opposite-direction transfer run concurrently against the same funds --
     /// churning capital and paying CCTP/withdrawal fees twice.
+    ///
+    /// `Pending`/`Queued`/`Running` rows are always treated as in-flight.
+    /// `Failed AND attempts < max_attempts` rows are checked: apalis WILL
+    /// re-fetch and re-run them, so they can still represent active transfers.
+    /// However, if the job's `UsdcRebalanceId` aggregate has already reached a
+    /// terminal state (a "zombie" caused by e.g. operator recovery completing
+    /// the transfer while the row remained Failed), the zombie is killed so
+    /// apalis cannot re-drive it and this guard clears. Exhausted-Failed, Done,
+    /// and Killed rows never match the query predicate and do not suppress.
+    ///
+    /// If the USDC store is not yet attached (`None`), or if the aggregate
+    /// cannot be loaded, the Failed row is treated conservatively as in-flight
+    /// so we never clear the guard without confirming terminality.
+    ///
+    /// Contrast with [`Self::transfer_live_job_for_id`], which intentionally
+    /// includes `Failed AND attempts < max_attempts` unconditionally because it
+    /// gates re-arm of post-burn recovery -- apalis WILL re-fetch that row and
+    /// we must not start a second driver while it is still owned by the
+    /// scheduler. The zombie-reconciliation logic here serves a different
+    /// purpose and must not bleed into that function.
     async fn in_flight_usdc_transfer(
         pool: &apalis_sqlite::SqlitePool,
+        usdc_store: Option<&Store<UsdcRebalance>>,
     ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
-        sqlx_apalis::query_as(
-            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
-             FROM Jobs \
-             WHERE job_type IN (?, ?) \
-             AND (status IN ('Pending', 'Queued', 'Running') \
-                  OR (status = 'Failed' AND attempts < max_attempts)) \
-             ORDER BY run_at ASC \
-             LIMIT 1",
+        // Both job types carry `id: UsdcRebalanceId` at the top level of their
+        // JSON payload (apalis JsonCodec serializes the struct directly).
+        #[derive(serde::Deserialize)]
+        struct UsdcJobId {
+            id: UsdcRebalanceId,
+        }
+
+        loop {
+            let row: Option<(String, i64, String)> = sqlx_apalis::query_as(
+                "SELECT id, \
+                        CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
+                        status \
+                 FROM Jobs \
+                 WHERE job_type IN (?, ?) \
+                 AND (status IN ('Pending', 'Queued', 'Running') \
+                      OR (status = 'Failed' AND attempts < max_attempts)) \
+                 ORDER BY run_at ASC \
+                 LIMIT 1",
+            )
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .fetch_optional(pool)
+            .await?;
+
+            let Some((row_id, age_secs, status)) = row else {
+                return Ok(None);
+            };
+
+            // Pending/Queued/Running rows are always in-flight.
+            if status != "Failed" {
+                return Ok(Some((row_id, age_secs)));
+            }
+
+            // Failed+attempts<max path: check whether this is a zombie.
+            let Some(store) = usdc_store else {
+                // Store not yet wired; conservative: treat as in-flight.
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    "USDC store not yet wired; treating Failed row as in-flight conservatively"
+                );
+                return Ok(Some((row_id, age_secs)));
+            };
+
+            // Fetch the job payload (a JSON BLOB, apalis `JsonCodec`) only on the
+            // Failed path, so the common non-terminal case skips the extra read.
+            let job_payload: Option<Vec<u8>> =
+                sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE id = ?")
+                    .bind(&row_id)
+                    .fetch_optional(pool)
+                    .await?;
+
+            let Some(job_payload) = job_payload else {
+                // Row disappeared between the two queries (apalis killed it);
+                // re-query for the next candidate.
+                continue;
+            };
+
+            let aggregate_id = match serde_json::from_slice::<UsdcJobId>(&job_payload) {
+                Ok(parsed) => parsed.id,
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        %row_id,
+                        ?error,
+                        "Failed to parse USDC job payload; treating row as in-flight"
+                    );
+                    return Ok(Some((row_id, age_secs)));
+                }
+            };
+
+            let aggregate = match store.load(&aggregate_id).await {
+                Ok(Some(agg)) => agg,
+                Ok(None) => {
+                    // A Jobs row referencing an aggregate with no events is a
+                    // data inconsistency; conservative: treat as in-flight.
+                    warn!(
+                        target: "rebalance",
+                        %row_id,
+                        %aggregate_id,
+                        "USDC transfer Jobs row references an aggregate with no events; \
+                         treating as in-flight"
+                    );
+                    return Ok(Some((row_id, age_secs)));
+                }
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        %row_id,
+                        ?error,
+                        "Failed to load USDC aggregate; treating row as in-flight"
+                    );
+                    return Ok(Some((row_id, age_secs)));
+                }
+            };
+
+            if aggregate.holds_rebalance_guard() {
+                // Genuine retry: aggregate is still live.
+                return Ok(Some((row_id, age_secs)));
+            }
+
+            // Zombie: aggregate is terminal but the Jobs row is still retryable.
+            // Kill it so apalis cannot re-drive it and this guard clears.
+            if Self::kill_zombie_job(pool, &row_id).await? {
+                info!(
+                    target: "rebalance",
+                    %row_id,
+                    %aggregate_id,
+                    "Killed zombie USDC Jobs row (aggregate already terminal)"
+                );
+                // Loop: re-query to find the next candidate row.
+            } else {
+                // Apalis grabbed the row between our terminal check and the kill. It will
+                // re-run the job, but the aggregate is already terminal so no second
+                // transfer can occur (the state machine rejects re-processing); the row
+                // reaches a terminal status either way.
+                return Ok(Some((row_id, age_secs)));
+            }
+        }
+    }
+
+    /// Terminates a zombie apalis Jobs row by setting its status to `Killed`.
+    ///
+    /// The conditional predicate (`AND status='Failed' AND attempts <
+    /// max_attempts`) makes this a no-op if apalis grabbed the row between
+    /// our aggregate-terminal check and this call. Returns `true` when the
+    /// kill landed, `false` when it was a no-op (apalis already owns the
+    /// row and will run the job, which no-ops on the terminal aggregate).
+    async fn kill_zombie_job(
+        pool: &apalis_sqlite::SqlitePool,
+        job_id: &str,
+    ) -> Result<bool, sqlx_apalis::Error> {
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status='Killed', done_at=strftime('%s','now') \
+             WHERE id=? AND status='Failed' AND attempts < max_attempts",
         )
-        .bind(std::any::type_name::<TransferUsdcToHedging>())
-        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-        .fetch_optional(pool)
-        .await
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Enqueues a [`TransferUsdcToHedging`] apalis job for a Base->Alpaca
@@ -2763,8 +2911,9 @@ impl RebalancingService {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
         let queue = self.transfer_usdc_to_hedging_queue.clone();
+        let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_usdc_transfer(queue.pool()).await {
+        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref()).await {
             Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
                 warn!(
                     target: "rebalance",
@@ -2845,8 +2994,9 @@ impl RebalancingService {
     /// second job for the same rebalance.
     async fn enqueue_transfer_usdc_to_market_making(&self, amount: Usdc) -> bool {
         let queue = self.transfer_usdc_to_market_making_queue.clone();
+        let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_usdc_transfer(queue.pool()).await {
+        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref()).await {
             Ok(Some((row_id, age_secs))) => {
                 debug!(
                     target: "rebalance",
@@ -2915,25 +3065,215 @@ impl RebalancingService {
     /// symbol's inventory, so an in-flight mint must also suppress a
     /// redemption (and vice versa). The payload is a `serde_json` BLOB
     /// (apalis `JsonCodec`), so the symbol is filtered via `json_extract`.
+    ///
+    /// `Pending`/`Queued`/`Running` rows are always treated as in-flight.
+    /// `Failed AND attempts < max_attempts` rows are zombie-checked: if the
+    /// corresponding aggregate (`TokenizedEquityMint` for mint jobs,
+    /// `EquityRedemption` for redemption jobs) has already reached a terminal
+    /// state, the zombie is killed and skipped. Genuine retries (non-terminal
+    /// aggregate) still block. Fail-safe: if the relevant store is `None` or
+    /// the aggregate cannot be loaded, the row is treated as in-flight.
     async fn in_flight_equity_transfer(
         pool: &apalis_sqlite::SqlitePool,
         symbol: &Symbol,
+        mint_store: Option<&Store<TokenizedEquityMint>>,
+        redemption_store: Option<&Store<EquityRedemption>>,
     ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
-        sqlx_apalis::query_as(
-            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
-             FROM Jobs \
-             WHERE job_type IN (?, ?) \
-             AND json_extract(job, '$.symbol') = ? \
-             AND (status IN ('Pending', 'Queued', 'Running') \
-                  OR (status = 'Failed' AND attempts < max_attempts)) \
-             ORDER BY run_at ASC \
-             LIMIT 1",
-        )
-        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
-        .bind(std::any::type_name::<TransferEquityToHedging>())
-        .bind(symbol.to_string())
-        .fetch_optional(pool)
-        .await
+        #[derive(serde::Deserialize)]
+        struct MintJobId {
+            issuer_request_id: IssuerRequestId,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct RedemptionJobId {
+            aggregate_id: RedemptionAggregateId,
+        }
+
+        let mint_type = std::any::type_name::<TransferEquityToMarketMaking>();
+        let redemption_type = std::any::type_name::<TransferEquityToHedging>();
+
+        loop {
+            let row: Option<(String, i64, String, String)> = sqlx_apalis::query_as(
+                "SELECT id, \
+                        CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
+                        status, \
+                        job_type \
+                 FROM Jobs \
+                 WHERE job_type IN (?, ?) \
+                 AND json_extract(job, '$.symbol') = ? \
+                 AND (status IN ('Pending', 'Queued', 'Running') \
+                      OR (status = 'Failed' AND attempts < max_attempts)) \
+                 ORDER BY run_at ASC \
+                 LIMIT 1",
+            )
+            .bind(mint_type)
+            .bind(redemption_type)
+            .bind(symbol.to_string())
+            .fetch_optional(pool)
+            .await?;
+
+            let Some((row_id, age_secs, status, job_type)) = row else {
+                return Ok(None);
+            };
+
+            // Pending/Queued/Running rows are always in-flight.
+            if status != "Failed" {
+                return Ok(Some((row_id, age_secs)));
+            }
+
+            // Failed+attempts<max path: check the corresponding aggregate.
+            // Fetch the job payload (a JSON BLOB, apalis `JsonCodec`) separately
+            // to avoid reading it for every row on the non-Failed fast path.
+            let job_payload: Option<Vec<u8>> =
+                sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE id = ?")
+                    .bind(&row_id)
+                    .fetch_optional(pool)
+                    .await?;
+
+            let Some(job_payload) = job_payload else {
+                // Row disappeared between our first query and this fetch
+                // (apalis killed it); re-query for the next candidate.
+                continue;
+            };
+
+            // Also capture the aggregate id for the zombie-kill log; both branches
+            // return (is_terminal, aggregate_id_display) to converge at one log site.
+            let (is_terminal, aggregate_id) = if job_type == mint_type {
+                let Some(store) = mint_store else {
+                    // Store not yet wired; conservative: treat as in-flight.
+                    debug!(
+                        target: "rebalance",
+                        %row_id,
+                        %symbol,
+                        "Mint store not yet wired; treating Failed row as in-flight conservatively"
+                    );
+                    return Ok(Some((row_id, age_secs)));
+                };
+                match serde_json::from_slice::<MintJobId>(&job_payload) {
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %row_id,
+                            ?error,
+                            "Failed to parse mint job payload; treating row as in-flight"
+                        );
+                        return Ok(Some((row_id, age_secs)));
+                    }
+                    Ok(parsed) => {
+                        let issuer_request_id = parsed.issuer_request_id;
+                        match store.load(&issuer_request_id).await {
+                            Ok(Some(agg)) => (agg.is_terminal(), issuer_request_id.to_string()),
+                            Ok(None) => {
+                                // A Jobs row referencing an aggregate with no events is a
+                                // data inconsistency; conservative: treat as in-flight.
+                                warn!(
+                                    target: "rebalance",
+                                    %row_id,
+                                    %symbol,
+                                    issuer_request_id = %issuer_request_id,
+                                    "Mint Jobs row references an aggregate with no events; \
+                                     treating as in-flight"
+                                );
+                                return Ok(Some((row_id, age_secs)));
+                            }
+                            Err(error) => {
+                                warn!(
+                                    target: "rebalance",
+                                    %row_id,
+                                    ?error,
+                                    "Failed to load mint aggregate; treating row as in-flight"
+                                );
+                                return Ok(Some((row_id, age_secs)));
+                            }
+                        }
+                    }
+                }
+            } else if job_type == redemption_type {
+                let Some(store) = redemption_store else {
+                    // Store not yet wired; conservative: treat as in-flight.
+                    debug!(
+                        target: "rebalance",
+                        %row_id,
+                        %symbol,
+                        "Redemption store not yet wired; treating Failed row as in-flight \
+                         conservatively"
+                    );
+                    return Ok(Some((row_id, age_secs)));
+                };
+                match serde_json::from_slice::<RedemptionJobId>(&job_payload) {
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %row_id,
+                            ?error,
+                            "Failed to parse redemption job payload; treating row as in-flight"
+                        );
+                        return Ok(Some((row_id, age_secs)));
+                    }
+                    Ok(parsed) => {
+                        let redemption_id = parsed.aggregate_id;
+                        match store.load(&redemption_id).await {
+                            Ok(Some(agg)) => (agg.is_terminal(), redemption_id.to_string()),
+                            Ok(None) => {
+                                // A Jobs row referencing an aggregate with no events is a
+                                // data inconsistency; conservative: treat as in-flight.
+                                warn!(
+                                    target: "rebalance",
+                                    %row_id,
+                                    %symbol,
+                                    redemption_aggregate_id = %redemption_id,
+                                    "Redemption Jobs row references an aggregate with no events; \
+                                     treating as in-flight"
+                                );
+                                return Ok(Some((row_id, age_secs)));
+                            }
+                            Err(error) => {
+                                warn!(
+                                    target: "rebalance",
+                                    %row_id,
+                                    ?error,
+                                    "Failed to load redemption aggregate; treating row as in-flight"
+                                );
+                                return Ok(Some((row_id, age_secs)));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // The SQL already filters job_type to the two known types, so
+                // this branch is a defensive fallback for any future regression.
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    %symbol,
+                    %job_type,
+                    "Unexpected job_type in equity in-flight guard; treating row as in-flight"
+                );
+                return Ok(Some((row_id, age_secs)));
+            };
+
+            if !is_terminal {
+                return Ok(Some((row_id, age_secs)));
+            }
+
+            // Zombie: aggregate is terminal; kill the row.
+            if Self::kill_zombie_job(pool, &row_id).await? {
+                info!(
+                    target: "rebalance",
+                    %row_id,
+                    %symbol,
+                    %aggregate_id,
+                    "Killed zombie equity Jobs row (aggregate already terminal)"
+                );
+                // Loop: re-query to find the next candidate row.
+            } else {
+                // Apalis grabbed the row between our terminal check and the kill. It will
+                // re-run the job, but the aggregate is already terminal so no second
+                // transfer can occur (the state machine rejects re-processing); the row
+                // reaches a terminal status either way.
+                return Ok(Some((row_id, age_secs)));
+            }
+        }
     }
 
     /// Enqueues a [`TransferEquityToMarketMaking`] apalis job for a
@@ -2953,8 +3293,17 @@ impl RebalancingService {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
         let mut queue = self.transfer_equity_to_market_making_queue.clone();
+        let mint_store = self.mint_store.read().await.as_ref().map(Arc::clone);
+        let redemption_store = self.redemption_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_equity_transfer(queue.pool(), &symbol).await {
+        match Self::in_flight_equity_transfer(
+            queue.pool(),
+            &symbol,
+            mint_store.as_deref(),
+            redemption_store.as_deref(),
+        )
+        .await
+        {
             Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
                 warn!(
                     target: "rebalance",
@@ -3041,8 +3390,17 @@ impl RebalancingService {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
         let mut queue = self.transfer_equity_to_hedging_queue.clone();
+        let mint_store = self.mint_store.read().await.as_ref().map(Arc::clone);
+        let redemption_store = self.redemption_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_equity_transfer(queue.pool(), &symbol).await {
+        match Self::in_flight_equity_transfer(
+            queue.pool(),
+            &symbol,
+            mint_store.as_deref(),
+            redemption_store.as_deref(),
+        )
+        .await
+        {
             Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
                 warn!(
                     target: "rebalance",
@@ -4471,19 +4829,27 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, NoopNotifier};
     use crate::conductor::job::Job;
-    use crate::equity_redemption::{DetectionFailure, redemption_aggregate_id};
+    use crate::equity_redemption::{
+        DetectionFailure, EquityRedemptionCommand, redemption_aggregate_id,
+    };
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
     };
     use crate::inventory::view::{InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
+    use crate::onchain::mock::MockRaindex;
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
+    use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::rebalancing_enabled_equities;
-    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::{
+        TokenizationRequestId, TokenizedEquityMintCommand, issuer_request_id,
+    };
     use crate::usdc_rebalance::{
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
+    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistryCommand;
 
     #[test]
@@ -11444,6 +11810,1487 @@ mod tests {
         assert!(
             !enqueued,
             "an in-flight Alpaca->Base transfer must block enqueuing a Base->Alpaca transfer"
+        );
+    }
+
+    // -- USDC guard: Failed and terminal status tests --
+
+    #[tokio::test]
+    async fn queued_transfer_with_done_at_set_blocks_enqueue() {
+        // apalis re-dispatch sets status='Queued' but does not clear done_at from a
+        // prior ack. A Queued row must still be treated as in-flight.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Queued', done_at = strftime('%s', 'now') \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "a Queued transfer (even with done_at set from a prior ack) must block enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_usdc_transfer_blocks_enqueue() {
+        // A Running row must block enqueue. This guards against regressions where
+        // the SQL filter accidentally omitted 'Running' from the IN-clause.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Running' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(!enqueued, "a Running USDC transfer must block enqueue");
+    }
+
+    // -- USDC guard: zombie reconciliation (Failed+attempts<max, aggregate terminal) --
+
+    /// Drives a UsdcRebalance aggregate to `WithdrawalFailed` (holds_rebalance_guard = false).
+    async fn seed_terminal_usdc_aggregate(store: &Store<UsdcRebalance>, id: &UsdcRebalanceId) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(100),
+                    withdrawal: TransferRef::OnchainTx(TxHash::default()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: "test: forced withdrawal failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives a UsdcRebalance aggregate to `Withdrawing` (holds_rebalance_guard = true).
+    async fn seed_nonterminal_usdc_aggregate(store: &Store<UsdcRebalance>, id: &UsdcRebalanceId) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(100),
+                    withdrawal: TransferRef::OnchainTx(TxHash::default()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Attaches USDC + equity stores (all on `pool`) to `service`.
+    async fn attach_stores(
+        service: &RebalancingService,
+        pool: SqlitePool,
+        usdc_store: Store<UsdcRebalance>,
+    ) {
+        service
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool,
+                    EquityTransferServices::panicking(),
+                )),
+                Arc::new(usdc_store),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_usdc_zombie_with_terminal_aggregate_does_not_block_hedging_enqueue() {
+        // A Failed+attempts<max row whose aggregate is already terminal (zombie)
+        // must be killed and must NOT suppress a new hedging transfer.
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&usdc_store, &id).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .execute(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+
+        assert!(
+            enqueued,
+            "zombie with terminal aggregate must NOT block hedging enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+                .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "Killed",
+            "zombie row must be killed after reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_usdc_zombie_with_terminal_aggregate_does_not_block_market_making_enqueue() {
+        // Symmetric: a zombie hedging job must not block a market-making enqueue.
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&usdc_store, &id).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            enqueued,
+            "zombie with terminal aggregate must NOT block market-making enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "Killed",
+            "zombie row must be killed after reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_usdc_genuine_retry_with_nonterminal_aggregate_blocks() {
+        // A Failed+attempts<max row whose aggregate is still live (genuine retry)
+        // must block enqueue even after the zombie check.
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_nonterminal_usdc_aggregate(&usdc_store, &id).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "genuine-retry Failed row (non-terminal aggregate) must block enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed", "genuine-retry row must remain Failed");
+    }
+
+    #[tokio::test]
+    async fn failed_usdc_zombie_store_not_wired_is_conservative() {
+        // When the usdc_store is not yet wired (None), the guard must treat
+        // Failed+attempts<max rows as in-flight (conservative fail-safe).
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        // Do NOT call set_stores: usdc_store stays None.
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "store not wired: must conservatively treat Failed+attempts<max as in-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_usdc_zombie_aggregate_not_found_is_conservative() {
+        // Store is wired but has no aggregate record for the job's id.
+        // The guard must conservatively treat the row as in-flight.
+        let pool = crate::test_utils::setup_test_db().await;
+        // Do NOT seed any aggregate -- store is empty.
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "aggregate not found in store: must conservatively treat row as in-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_usdc_job_payload_is_conservative() {
+        // A Failed+attempts<max row whose job blob cannot be parsed as UsdcJobId
+        // must block enqueue: the guard fails closed rather than letting an unknown
+        // in-flight operation race a new transfer.
+        //
+        // The store must be wired so the guard reaches the parse branch; the
+        // store-not-wired check fires first and returns early, so without wiring
+        // the test would exercise the wrong branch.
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        let corrupt_payload: Vec<u8> = b"not json at all".to_vec();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1, \
+             job = ? WHERE job_type = ?",
+        )
+        .bind(corrupt_payload)
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .execute(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+
+        assert!(
+            !enqueued,
+            "corrupt USDC job payload must be treated as in-flight (conservative) and block enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_usdc_multiple_zombies_all_cleared() {
+        // Two Failed+attempts<max rows with terminal aggregates and no Pending row:
+        // both must be killed and enqueue must succeed.
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id1 = UsdcRebalanceId(Uuid::new_v4());
+        let id2 = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&usdc_store, &id1).await;
+        seed_terminal_usdc_aggregate(&usdc_store, &id2).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        // Push both zombie jobs (hedging direction).
+        for zombie_id in [&id1, &id2] {
+            service
+                .transfer_usdc_to_hedging_queue
+                .clone()
+                .push(TransferUsdcToHedging {
+                    id: zombie_id.clone(),
+                    amount: usdc(100),
+                    revert_redrive_attempts: 0,
+                })
+                .await
+                .unwrap();
+        }
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(enqueued, "all zombies cleared: enqueue must succeed");
+
+        let killed_count: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Killed'",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(killed_count, 2, "both zombie rows must have been killed");
+    }
+
+    #[tokio::test]
+    async fn failed_exhausted_job_does_not_block_enqueue() {
+        // A Failed row whose attempt budget is exhausted (attempts == max_attempts)
+        // is terminal and must not block a new transfer.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), \
+             attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            enqueued,
+            "a retry-exhausted Failed job must NOT suppress a new transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_job_does_not_block_enqueue() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now') \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(enqueued, "a Done job must NOT suppress a new transfer");
+    }
+
+    #[tokio::test]
+    async fn killed_job_does_not_block_enqueue() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Killed', done_at = strftime('%s', 'now') \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(enqueued, "a Killed job must NOT suppress a new transfer");
+    }
+
+    #[tokio::test]
+    async fn zombie_killed_then_genuine_pending_row_still_blocks() {
+        // A Failed zombie row (terminal aggregate, older run_at) is killed on the
+        // first guard loop iteration, but a genuine Pending row with a non-terminal
+        // aggregate is found on the next iteration and blocks the enqueue.
+        // This verifies that `in_flight_usdc_transfer` re-queries after killing a
+        // zombie rather than blindly treating the cleared zombie as "all clear".
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let zombie_id = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&usdc_store, &zombie_id).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: zombie_id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1, \
+             run_at = strftime('%s', 'now') - 200 WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .execute(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        let live_id = UsdcRebalanceId(Uuid::new_v4());
+        seed_nonterminal_usdc_aggregate(&usdc_store, &live_id).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: live_id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        attach_stores(&service, pool, usdc_store).await;
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "zombie killed but live Pending row must still block a new market-making enqueue"
+        );
+
+        let zombie_status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+                .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            zombie_status, "Killed",
+            "zombie row must be killed even though the live Pending row blocks the overall enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_zombie_job_is_noop_when_row_not_failed_retryable() {
+        // kill_zombie_job's WHERE clause requires status='Failed' AND attempts <
+        // max_attempts. A row in any other state (e.g. Running) must be left
+        // untouched and the function must return false.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Running' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        let row_id: String = sqlx_apalis::query_scalar("SELECT id FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        let killed = RebalancingService::kill_zombie_job(
+            service.transfer_usdc_to_hedging_queue.pool(),
+            &row_id,
+        )
+        .await
+        .unwrap();
+
+        assert!(!killed, "kill_zombie_job must be a no-op for a Running row");
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "Running",
+            "Running row must not be changed to Killed"
+        );
+    }
+
+    // -- transfer_live_job_for_id regression: Failed+done_at+attempts<max still blocks re-arm --
+
+    #[tokio::test]
+    async fn transfer_live_job_for_id_regression_failed_done_at() {
+        // transfer_live_job_for_id intentionally includes Failed+attempts<max rows
+        // (apalis WILL re-fetch them). This test guards against copy-paste of the
+        // guard fix accidentally removing that behaviour.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        // Simulate apalis acking the job as Failed with retries remaining.
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        let live = service.transfer_live_job_for_id(&id).await.unwrap();
+
+        assert!(
+            live,
+            "transfer_live_job_for_id must return true for a Failed+done_at+attempts<max row \
+             because apalis will re-fetch and re-run it"
+        );
+    }
+
+    // -- Equity guard: Failed status tests and zombie reconciliation --
+
+    /// Drives a `TokenizedEquityMint` aggregate to `Failed` state (terminal).
+    ///
+    /// Uses `MockTokenizer` so `RequestMint` succeeds (returns `MintAccepted`),
+    /// then `FailAcceptance` drives it to `Failed` without calling any other service.
+    async fn seed_terminal_mint_aggregate(pool: &SqlitePool, mint_id: &IssuerRequestId) {
+        let store = test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            EquityTransferServices {
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(MockVaultLookup::new()),
+                tokenizer: Arc::new(MockTokenizer::new()),
+                wrapper: Arc::new(MockWrapper::new()),
+            },
+        );
+        store
+            .send(
+                mint_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: mint_id.clone(),
+                    symbol: Symbol::new("tAAPL").unwrap(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                mint_id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "test: forced mint failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives a `TokenizedEquityMint` aggregate to `MintAccepted` state (non-terminal).
+    ///
+    /// Same services as `seed_terminal_mint_aggregate`; stops before the failure
+    /// so the aggregate is still live and holds the duplicate-protection guard.
+    async fn seed_nonterminal_mint_aggregate(pool: &SqlitePool, mint_id: &IssuerRequestId) {
+        let store = test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            EquityTransferServices {
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(MockVaultLookup::new()),
+                tokenizer: Arc::new(MockTokenizer::new()),
+                wrapper: Arc::new(MockWrapper::new()),
+            },
+        );
+        store
+            .send(
+                mint_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: mint_id.clone(),
+                    symbol: Symbol::new("tAAPL").unwrap(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives an `EquityRedemption` aggregate to `Failed` state (terminal).
+    ///
+    /// `Redeem` emits `VaultWithdrawPending` without calling any service.
+    /// `FailTransfer` from `VaultWithdrawPending` also calls no service. Both
+    /// are safe with panicking services.
+    async fn seed_terminal_redemption_aggregate(
+        pool: &SqlitePool,
+        redemption_id: &RedemptionAggregateId,
+    ) {
+        let store =
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking());
+        store
+            .send(
+                redemption_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("tAAPL").unwrap(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    amount: U256::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                redemption_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "test: forced redemption failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives an `EquityRedemption` aggregate to `VaultWithdrawPending` state
+    /// (non-terminal). `Redeem` calls no services so panicking services are safe.
+    async fn seed_nonterminal_redemption_aggregate(
+        pool: &SqlitePool,
+        redemption_id: &RedemptionAggregateId,
+    ) {
+        let store =
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking());
+        store
+            .send(
+                redemption_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("tAAPL").unwrap(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    amount: U256::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Wires specific mint and redemption stores to `service` (used by equity
+    /// zombie tests). The USDC store is a no-op on the same pool.
+    async fn attach_equity_stores(
+        service: &RebalancingService,
+        pool: SqlitePool,
+        mint_store: Store<TokenizedEquityMint>,
+        redemption_store: Store<EquityRedemption>,
+    ) {
+        service
+            .set_stores(
+                Arc::new(mint_store),
+                Arc::new(redemption_store),
+                Arc::new(test_store::<UsdcRebalance>(pool, ())),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn equity_failed_exhausted_job_does_not_block_enqueue() {
+        // An equity Failed row whose retry budget is exhausted must not block.
+        // This is terminal regardless of the aggregate state.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let symbol = Symbol::new("tAAPL").unwrap();
+
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: IssuerRequestId::generate(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), \
+             attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(
+            enqueued,
+            "a retry-exhausted Failed equity job must NOT suppress a new equity redemption"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_equity_transfer_blocks_enqueue() {
+        // A Running equity job row must block enqueue; guards against regressions
+        // where 'Running' is accidentally omitted from the IN-clause.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let symbol = Symbol::new("tAAPL").unwrap();
+
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: IssuerRequestId::generate(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Running' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+            .execute(service.transfer_equity_to_market_making_queue.pool())
+            .await
+            .unwrap();
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(!enqueued, "a Running equity transfer must block enqueue");
+    }
+
+    #[tokio::test]
+    async fn failed_mint_zombie_with_terminal_aggregate_does_not_block_hedging_enqueue() {
+        // A Failed+attempts<max mint job whose TokenizedEquityMint aggregate is already
+        // terminal (zombie) must be killed and must NOT suppress a new hedging transfer.
+        let pool = crate::test_utils::setup_test_db().await;
+        let mint_id = issuer_request_id("mint-zombie-hedging");
+        seed_terminal_mint_aggregate(&pool, &mint_id).await;
+
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(
+            enqueued,
+            "zombie mint job with terminal aggregate must NOT block hedging enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+                .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "Killed",
+            "zombie mint row must be killed after reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_redemption_zombie_with_terminal_aggregate_does_not_block_market_making_enqueue()
+    {
+        // A Failed+attempts<max redemption job whose EquityRedemption aggregate is
+        // already terminal (zombie) must be killed and must NOT suppress a new mint.
+        let pool = crate::test_utils::setup_test_db().await;
+        let redemption_id = redemption_aggregate_id("redemption-zombie-mint");
+        seed_terminal_redemption_aggregate(&pool, &redemption_id).await;
+
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_equity_to_hedging_queue
+            .clone()
+            .push(TransferEquityToHedging {
+                aggregate_id: redemption_id,
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .execute(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .await;
+
+        assert!(
+            enqueued,
+            "zombie redemption job with terminal aggregate must NOT block market-making enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferEquityToHedging>())
+                .fetch_one(service.transfer_equity_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "Killed",
+            "zombie redemption row must be killed after reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_equity_genuine_retry_with_nonterminal_aggregate_blocks() {
+        // A Failed+attempts<max mint job whose aggregate is still live (genuine retry)
+        // must block enqueue even after the zombie check.
+        let pool = crate::test_utils::setup_test_db().await;
+        let mint_id = issuer_request_id("mint-genuine-retry");
+        seed_nonterminal_mint_aggregate(&pool, &mint_id).await;
+
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: mint_id,
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(
+            !enqueued,
+            "genuine-retry Failed mint job (non-terminal aggregate) must block enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+                .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed", "genuine-retry row must remain Failed");
+    }
+
+    #[tokio::test]
+    async fn failed_redemption_genuine_retry_with_nonterminal_aggregate_blocks() {
+        // A Failed+attempts<max redemption job whose EquityRedemption aggregate is
+        // still live (genuine retry) must block enqueue.
+        let pool = crate::test_utils::setup_test_db().await;
+        let redemption_id = redemption_aggregate_id("redemption-genuine-retry");
+        seed_nonterminal_redemption_aggregate(&pool, &redemption_id).await;
+
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_equity_to_hedging_queue
+            .clone()
+            .push(TransferEquityToHedging {
+                aggregate_id: redemption_id,
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .execute(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .await;
+
+        assert!(
+            !enqueued,
+            "genuine-retry Failed redemption job (non-terminal aggregate) must block enqueue"
+        );
+
+        let status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferEquityToHedging>())
+                .fetch_one(service.transfer_equity_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "Failed",
+            "genuine-retry redemption row must remain Failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_equity_zombie_store_not_wired_is_conservative() {
+        // When the equity stores are not wired (None), the guard must treat
+        // Failed+attempts<max rows as in-flight (conservative fail-safe).
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: IssuerRequestId::generate(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        // Do NOT call set_stores: mint_store stays None.
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(
+            !enqueued,
+            "equity store not wired: must conservatively treat Failed+attempts<max as in-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_equity_zombie_aggregate_not_found_is_conservative() {
+        // Store is wired but has no aggregate record for the job's id.
+        // The guard must conservatively treat the row as in-flight.
+        let pool = crate::test_utils::setup_test_db().await;
+        // Do NOT seed any aggregate -- stores are empty.
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: IssuerRequestId::generate(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(
+            !enqueued,
+            "aggregate not found in store: must conservatively treat equity row as in-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_mint_job_payload_is_conservative() {
+        // A Failed+attempts<max mint row with a payload that passes the
+        // json_extract(job,'$.symbol') SQL filter (valid symbol field) but whose
+        // issuer_request_id cannot be parsed as IssuerRequestId must block enqueue:
+        // the guard fails closed on any parse error to protect against an unknown
+        // in-flight mint operation.
+        //
+        // The stores must be wired so the guard reaches the parse branch; the
+        // store-not-wired check fires first and returns early without reaching parse.
+        let pool = crate::test_utils::setup_test_db().await;
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: IssuerRequestId::generate(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+
+        // Valid JSON so json_extract returns "tAAPL" and the row is selected,
+        // but "not-a-uuid" fails IssuerRequestId (Uuid) deserialization, which
+        // exercises the parse-error conservative branch.
+        let corrupt_payload = format!(
+            r#"{{"issuer_request_id":"not-a-uuid","symbol":"{symbol}","quantity":"1","generation":0}}"#
+        )
+        .into_bytes();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1, \
+             job = ? WHERE job_type = ?",
+        )
+        .bind(corrupt_payload)
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(
+            !enqueued,
+            "corrupt mint job payload must be treated as in-flight (conservative) and block enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_redemption_job_payload_is_conservative() {
+        // Mirror of corrupt_mint_job_payload_is_conservative for the redemption
+        // job type: valid symbol so json_extract selects the row, but aggregate_id
+        // is not a valid UUID so RedemptionJobId deserialization fails, triggering
+        // the conservative in-flight return.
+        let pool = crate::test_utils::setup_test_db().await;
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_equity_to_hedging_queue
+            .clone()
+            .push(TransferEquityToHedging {
+                aggregate_id: redemption_aggregate_id("corrupt-redemption-payload"),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+
+        let corrupt_payload =
+            format!(r#"{{"aggregate_id":"not-a-uuid","symbol":"{symbol}","quantity":"1"}}"#)
+                .into_bytes();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1, \
+             job = ? WHERE job_type = ?",
+        )
+        .bind(corrupt_payload)
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .execute(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .await;
+
+        assert!(
+            !enqueued,
+            "corrupt redemption job payload must be treated as in-flight (conservative) \
+             and block enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_equity_multiple_mint_zombies_all_cleared() {
+        // Two Failed+attempts<max mint zombie rows with terminal aggregates and no
+        // Pending row: both must be killed and enqueue must succeed.
+        let pool = crate::test_utils::setup_test_db().await;
+        let mint_id1 = issuer_request_id("mint-zombie-multi-1");
+        let mint_id2 = issuer_request_id("mint-zombie-multi-2");
+        seed_terminal_mint_aggregate(&pool, &mint_id1).await;
+        seed_terminal_mint_aggregate(&pool, &mint_id2).await;
+
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        for zombie_id in [&mint_id1, &mint_id2] {
+            service
+                .transfer_equity_to_market_making_queue
+                .clone()
+                .push(TransferEquityToMarketMaking {
+                    issuer_request_id: zombie_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(1)),
+                    generation: 0,
+                })
+                .await
+                .unwrap();
+        }
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .await;
+
+        assert!(enqueued, "all mint zombies cleared: enqueue must succeed");
+
+        let killed_count: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Killed'",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            killed_count, 2,
+            "both zombie mint rows must have been killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn equity_zombie_killed_then_genuine_pending_row_still_blocks() {
+        // A Failed zombie mint row (terminal aggregate, older run_at) is killed on
+        // the first guard loop iteration, but a genuine Pending redemption row with
+        // a non-terminal aggregate is found on the next iteration and blocks the
+        // enqueue. This verifies that `in_flight_equity_transfer` re-queries after
+        // killing a zombie rather than treating the cleared zombie as "all clear".
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let zombie_mint_id = issuer_request_id("equity-zombie-then-live-zombie");
+        seed_terminal_mint_aggregate(&pool, &zombie_mint_id).await;
+
+        let live_redemption_id = redemption_aggregate_id("equity-zombie-then-live-live");
+        seed_nonterminal_redemption_aggregate(&pool, &live_redemption_id).await;
+
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: zombie_mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1, \
+             run_at = strftime('%s', 'now') - 200 WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        service
+            .transfer_equity_to_hedging_queue
+            .clone()
+            .push(TransferEquityToHedging {
+                aggregate_id: live_redemption_id,
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+
+        attach_equity_stores(
+            &service,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+
+        let enqueued = service
+            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .await;
+
+        assert!(
+            !enqueued,
+            "zombie killed but live Pending redemption row must still block a new mint enqueue"
+        );
+
+        let zombie_status: String =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+                .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            zombie_status, "Killed",
+            "zombie mint row must be killed even though the live Pending redemption row blocks \
+             the overall enqueue"
         );
     }
 
