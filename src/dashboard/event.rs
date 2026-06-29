@@ -545,6 +545,7 @@ mod tests {
                     trade_id: reorged_trade.clone(),
                     amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(5)),
                     direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
                     reorg_depth: 1,
                 },
             )
@@ -558,6 +559,7 @@ mod tests {
                     trade_id: reorged_trade,
                     amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(5)),
                     direction: st0x_execution::Direction::Buy,
+                    price_usdc: Some(st0x_float_macro::float!(150)),
                     reorg_depth: 1,
                     reorged_at: now,
                 },
