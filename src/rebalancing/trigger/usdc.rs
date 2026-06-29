@@ -25,6 +25,25 @@ pub(super) enum UsdcRebalanceOperation {
     BaseToAlpaca { amount: Usdc },
 }
 
+/// Internal decision built inside the inventory read-lock, coupling each
+/// imbalance variant with its pre-computed capacity data. This eliminates
+/// the outer `Option<Option<_>>` and makes the post-lock dispatch exhaustive.
+enum UsdcImbalanceDecision {
+    NoImbalance,
+    TooMuchOffchain {
+        excess: Usdc,
+        withdrawable_capacity: WithdrawableCapacity,
+    },
+    TooMuchOnchain {
+        excess: Usdc,
+    },
+}
+
+enum WithdrawableCapacity {
+    Missing,
+    Available(Usdc),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UsdcTrackingEvent {
     Initiated,
@@ -236,13 +255,17 @@ const USDC_TRANSFER_MAX_DECIMAL_PLACES: u8 = 6;
 pub(crate) enum UsdcTriggerSkip {
     /// No USDC imbalance detected.
     NoImbalance,
-    /// Alpaca did not report settled withdrawable cash, so outbound
-    /// Alpaca-to-Base capacity cannot be proven reserve-safe.
+    /// Alpaca did not report settled withdrawable cash, so the withdrawable cap
+    /// cannot be applied and the transfer amount cannot be safely bounded.
     MissingWithdrawableCash,
-    /// Withdrawable cash is at or below the configured reserve, so no
-    /// Alpaca-to-Base capacity is available. Operators should investigate;
-    /// the reserve may need to be lowered or the broker rebalanced.
+    /// Withdrawable cash, after subtracting the configured reserve, leaves
+    /// capacity below the Alpaca minimum withdrawal. Lower the reserve or
+    /// rebalance the broker.
     ReserveCapacityExhausted,
+    /// Alpaca's withdrawable cash itself is below the Alpaca minimum withdrawal.
+    /// No reserve is configured; the broker simply has too little settled cash.
+    /// No operator action is needed; this clears once the broker settles more.
+    WithdrawableBelowMinimum,
     /// Imbalance exists but amount is below Alpaca's minimum withdrawal ($51).
     BelowMinimumWithdrawal { excess: Usdc },
     /// Arithmetic error during imbalance calculation.
@@ -301,7 +324,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     usdc_limit: Option<Usdc>,
     reserved: Option<Usd>,
 ) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
-    let imbalance_check = {
+    let decision = {
         let inventory = inventory.read().await;
         let imbalance = inventory
             .check_usdc_imbalance_with_gross_offchain(threshold, reserved)
@@ -313,16 +336,18 @@ pub(super) async fn check_imbalance_and_build_operation(
                 );
                 UsdcTriggerSkip::ArithmeticError
             })?;
-        // Only compute the Alpaca-to-Base capacity when we will actually use
-        // it: the imbalance is offchain-heavy AND a reserve is configured.
-        // Capacity reads parse `withdrawable_cash_cents`, so binding it to
-        // unrelated branches would let a malformed withdrawable value block
-        // Base-to-Alpaca rebalancing, which is supposed to be independent of
-        // withdrawable cash. Holding the same read guard while computing both
-        // values preserves TOCTOU safety against polling-driven updates.
-        let capacity = match (&imbalance, reserved) {
-            (Some(Imbalance::TooMuchOffchain { .. }), Some(_)) => Some(
-                inventory
+        // Compute the Alpaca-to-Base capacity for every TooMuchOffchain
+        // imbalance; the cap applies regardless of whether a reserve is
+        // configured. `alpaca_to_base_usdc_capacity` treats `None` reserve
+        // as zero, so "no reserve" means the full withdrawable cash is
+        // available as capacity. Capacity reads parse `withdrawable_cash_cents`,
+        // so binding the call to TooMuchOffchain only keeps Base-to-Alpaca
+        // rebalancing independent of withdrawable cash (which it must be).
+        // Holding one read guard for both values preserves TOCTOU safety.
+        let decision = match imbalance {
+            None => UsdcImbalanceDecision::NoImbalance,
+            Some(Imbalance::TooMuchOffchain { excess }) => {
+                let withdrawable_capacity = inventory
                     .alpaca_to_base_usdc_capacity(reserved)
                     .map_err(|error| {
                         warn!(
@@ -331,75 +356,91 @@ pub(super) async fn check_imbalance_and_build_operation(
                             "USDC Alpaca-to-Base capacity check failed due to inventory error"
                         );
                         UsdcTriggerSkip::ArithmeticError
-                    })?,
-            ),
-            _ => None,
+                    })?
+                    .map_or(
+                        WithdrawableCapacity::Missing,
+                        WithdrawableCapacity::Available,
+                    );
+                UsdcImbalanceDecision::TooMuchOffchain {
+                    excess,
+                    withdrawable_capacity,
+                }
+            }
+            Some(Imbalance::TooMuchOnchain { excess }) => {
+                UsdcImbalanceDecision::TooMuchOnchain { excess }
+            }
         };
         drop(inventory);
-        (imbalance, capacity)
-    };
-    let (imbalance, alpaca_to_base_capacity) = imbalance_check;
-
-    let Some(imbalance) = imbalance else {
-        trace!(target: "rebalance", "No USDC imbalance detected (balanced, partial data, or inflight)");
-        return Err(UsdcTriggerSkip::NoImbalance);
+        decision
     };
 
-    match imbalance {
-        Imbalance::TooMuchOffchain { excess } => {
-            // `alpaca_to_base_capacity` is `Some(capacity)` only when a
-            // reserve is configured (see the capacity computation above);
-            // when reserved is `None`, there is no reserve to protect and
-            // the transfer is constrained only by `usdc_limit` and the
-            // Alpaca minimum withdrawal.
-            let capped_by_capacity = match alpaca_to_base_capacity {
-                Some(capacity_opt) => {
-                    let Some(capacity) = capacity_opt else {
-                        warn!(
-                            target: "rebalance",
-                            excess = ?excess,
-                            "Skipping Alpaca-to-Base USDC rebalance: broker did not report withdrawable cash; reserve-safety cannot be proven"
-                        );
-                        return Err(UsdcTriggerSkip::MissingWithdrawableCash);
-                    };
-
-                    // A reserve that leaves capacity below the Alpaca minimum
-                    // withdrawal is operationally equivalent to capacity == 0
-                    // — the bot cannot make ANY reserve-safe transfer. Report
-                    // it with the precise reason rather than letting the
-                    // result fall through to BelowMinimumWithdrawal, which
-                    // would be misleading.
-                    if capacity.lt(&ALPACA_MINIMUM_WITHDRAWAL).map_err(|error| {
-                        warn!(
-                            target: "rebalance",
-                            ?error,
-                            "USDC capacity minimum-comparison failed"
-                        );
-                        UsdcTriggerSkip::ArithmeticError
-                    })? {
-                        warn!(
-                            target: "rebalance",
-                            excess = ?excess,
-                            ?reserved,
-                            ?capacity,
-                            minimum = ?*ALPACA_MINIMUM_WITHDRAWAL,
-                            "Skipping Alpaca-to-Base USDC rebalance: reserve leaves withdrawable capacity below Alpaca minimum withdrawal"
-                        );
-                        return Err(UsdcTriggerSkip::ReserveCapacityExhausted);
-                    }
-
-                    let capped = cap_usdc(excess, usdc_limit);
-                    cap_usdc_by_alpaca_capacity(capped, capacity).map_err(|error| {
-                        warn!(
-                            target: "rebalance",
-                            ?error,
-                            "USDC Alpaca capacity comparison failed"
-                        );
-                        UsdcTriggerSkip::ArithmeticError
-                    })?
+    match decision {
+        UsdcImbalanceDecision::NoImbalance => {
+            trace!(target: "rebalance", "No USDC imbalance detected (balanced, partial data, or inflight)");
+            Err(UsdcTriggerSkip::NoImbalance)
+        }
+        UsdcImbalanceDecision::TooMuchOffchain {
+            excess,
+            withdrawable_capacity,
+        } => {
+            let capacity = match withdrawable_capacity {
+                WithdrawableCapacity::Missing => {
+                    warn!(
+                        target: "rebalance",
+                        excess = ?excess,
+                        "Skipping Alpaca-to-Base USDC rebalance: broker did not report withdrawable cash; withdrawable cap cannot be applied"
+                    );
+                    return Err(UsdcTriggerSkip::MissingWithdrawableCash);
                 }
-                None => cap_usdc(excess, usdc_limit),
+                WithdrawableCapacity::Available(capacity) => capacity,
             };
+
+            // Capacity below the Alpaca minimum withdrawal is operationally
+            // equivalent to zero. Report it with
+            // the precise reason rather than letting the result fall through
+            // to BelowMinimumWithdrawal, which would be misleading.
+            if capacity.lt(&ALPACA_MINIMUM_WITHDRAWAL).map_err(|error| {
+                warn!(
+                    target: "rebalance",
+                    ?error,
+                    "USDC capacity minimum-comparison failed"
+                );
+                UsdcTriggerSkip::ArithmeticError
+            })? {
+                let Some(reserve) = reserved else {
+                    warn!(
+                        target: "rebalance",
+                        excess = ?excess,
+                        ?capacity,
+                        minimum = ?*ALPACA_MINIMUM_WITHDRAWAL,
+                        "Skipping Alpaca-to-Base USDC rebalance: Alpaca withdrawable \
+                         cash is below the minimum withdrawal amount"
+                    );
+                    return Err(UsdcTriggerSkip::WithdrawableBelowMinimum);
+                };
+
+                warn!(
+                    target: "rebalance",
+                    excess = ?excess,
+                    reserved = ?reserve,
+                    ?capacity,
+                    minimum = ?*ALPACA_MINIMUM_WITHDRAWAL,
+                    "Skipping Alpaca-to-Base USDC rebalance: withdrawable capacity \
+                     after reserve is below Alpaca minimum withdrawal"
+                );
+                return Err(UsdcTriggerSkip::ReserveCapacityExhausted);
+            }
+
+            let capped = cap_usdc(excess, usdc_limit);
+            let capped_by_capacity =
+                cap_usdc_by_alpaca_capacity(capped, capacity).map_err(|error| {
+                    warn!(
+                        target: "rebalance",
+                        ?error,
+                        "USDC Alpaca capacity comparison failed"
+                    );
+                    UsdcTriggerSkip::ArithmeticError
+                })?;
 
             let capped = truncate_for_transfer(capped_by_capacity).map_err(|error| {
                 warn!(
@@ -429,7 +470,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 Ok(UsdcRebalanceOperation::AlpacaToBase { amount: capped })
             }
         }
-        Imbalance::TooMuchOnchain { excess } => {
+        UsdcImbalanceDecision::TooMuchOnchain { excess } => {
             let amount = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
                 warn!(
                     target: "rebalance",
@@ -1301,9 +1342,12 @@ mod tests {
 
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
-        assert!(
-            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if !amount.inner().lt(float!(51)).unwrap_or(true)),
-            "Expected AlpacaToBase with amount >= 51, got {result:?}"
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(200))
+            }),
+            "Expected AlpacaToBase with amount == 200, got {result:?}"
         );
     }
 
@@ -1325,8 +1369,11 @@ mod tests {
 
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
-        assert!(
-            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(51))),
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(51))
+            }),
             "Expected AlpacaToBase with amount = 51, got {result:?}"
         );
     }
@@ -1349,8 +1396,11 @@ mod tests {
 
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
-        assert!(
-            matches!(result, Ok(UsdcRebalanceOperation::BaseToAlpaca { amount }) if amount == Usdc::new(float!(40))),
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::BaseToAlpaca {
+                amount: Usdc::new(float!(40))
+            }),
             "Expected BaseToAlpaca with amount = 40 (no minimum for deposits), got {result:?}"
         );
     }
@@ -1371,8 +1421,11 @@ mod tests {
         let result =
             check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
 
-        assert!(
-            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(100))
+            }),
             "Operational limit should cap USDC transfer to 100, got {result:?}"
         );
     }
@@ -1396,8 +1449,11 @@ mod tests {
 
         let first =
             check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
-        assert!(
-            matches!(first, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+        assert_eq!(
+            first,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(100))
+            }),
             "First transfer capped to 100, got {first:?}"
         );
 
@@ -1432,8 +1488,11 @@ mod tests {
         let third =
             check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit, None)
                 .await;
-        assert!(
-            matches!(third, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+        assert_eq!(
+            third,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(100))
+            }),
             "Remaining imbalance triggers another capped transfer, got {third:?}"
         );
     }
@@ -1547,8 +1606,11 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(100))
+            }),
             "Expected reserve-adjusted withdrawable capacity to cap transfer to 100, got {result:?}"
         );
     }
@@ -1658,8 +1720,11 @@ mod tests {
 
         let after =
             check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
-        assert!(
-            matches!(after, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+        assert_eq!(
+            after,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(100))
+            }),
             "Post-recovery trigger must dispatch the reserve-aware capped transfer, got {after:?}"
         );
     }
@@ -1717,9 +1782,151 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(result, Ok(UsdcRebalanceOperation::BaseToAlpaca { amount }) if amount == Usdc::new(float!(400))),
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::BaseToAlpaca {
+                amount: Usdc::new(float!(400))
+            }),
             "Expected Base-to-Alpaca transfer to ignore reserve and withdrawable cash, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_is_capped_by_withdrawable_cash_with_no_reserve() {
+        // 100 onchain / 500 offchain -> excess = 200; withdrawable = $150 (below excess).
+        // With no reserve, the withdrawable cap must still apply -> transfer capped at 150.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(15_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(150))
+            }),
+            "Withdrawable cap must apply even with no reserve configured; expected 150, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_proceeds_when_withdrawable_exactly_at_minimum_no_reserve() {
+        // 100 onchain / 500 offchain -> excess = 200; withdrawable = $51 (exactly the minimum).
+        // The capacity check uses strict `lt` (not `le`), so withdrawable exactly at the minimum
+        // must NOT skip; it must produce a transfer capped at $51 (the binding capacity).
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(5_100),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(51))
+            }),
+            "Withdrawable exactly at $51 minimum must not skip; expected AlpacaToBase {{ amount: 51 }}, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_withdrawable_binds_below_operational_limit_with_no_reserve() {
+        // 100 onchain / 900 offchain -> excess = 400; usdc_limit = $200; withdrawable = $150.
+        // Both the $200 operational limit and $150 withdrawable are below the $400 excess.
+        // Withdrawable ($150) is the tighter bound and must be the final transfer amount.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(900)))
+                .with_offchain_gross_usd_cents(90_000)
+                .with_withdrawable_cash_cents(15_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+        let usdc_limit = Some(Usdc::new(float!(200)));
+
+        let result =
+            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(150))
+            }),
+            "Withdrawable ($150) must bind below the operational limit ($200); expected 150, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_skips_when_withdrawable_missing_and_no_reserve() {
+        // No reserve configured, no withdrawable_cash_cents -> capacity unknown -> skip.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+
+        assert_eq!(
+            result,
+            Err(UsdcTriggerSkip::MissingWithdrawableCash),
+            "Missing withdrawable cash must skip regardless of reserve configuration, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_skips_when_withdrawable_below_minimum_and_no_reserve() {
+        // No reserve configured; withdrawable = $30, below $51 Alpaca minimum.
+        // Must return WithdrawableBelowMinimum: the broker has too little settled
+        // cash and no reserve is in play.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(3_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+
+        assert_eq!(
+            result,
+            Err(UsdcTriggerSkip::WithdrawableBelowMinimum),
+            "Withdrawable below $51 minimum with no reserve must return WithdrawableBelowMinimum, got {result:?}"
         );
     }
 

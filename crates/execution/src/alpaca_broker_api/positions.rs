@@ -90,6 +90,10 @@ struct AccountDetailsResponse {
     cash: Float,
     /// Settled cash that can be withdrawn -- excludes T+1 unsettled
     /// equity-sale proceeds. `None` if the broker omits the field.
+    /// Alpaca documents this field on the trading-account response and defines
+    /// it as cash available to withdraw, excluding unsettled memoposts:
+    /// https://docs.alpaca.markets/us/reference/gettradingaccount
+    /// https://docs.alpaca.markets/us/docs/instant-funding-1
     #[serde(
         default,
         deserialize_with = "deserialize_option_float_from_number_or_string"

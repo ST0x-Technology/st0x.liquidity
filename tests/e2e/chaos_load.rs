@@ -299,8 +299,16 @@ async fn kill_mid_burst_recovers_every_take_exactly_once() -> anyhow::Result<()>
     // Kill while the queue is still mid-drain: a couple of trades witnessed,
     // the rest of the burst still Queued/Running behind the throttled receipts.
     poll_for_events(&mut bot, &infra.db_path, "OnChainTradeEvent::Filled", 2).await;
+    // Let the tail-block backfill enqueue its accounting job before the kill.
+    // This covers the harder recovery case: the checkpoint has advanced, so
+    // restart must recover from the persisted job row rather than rescanning.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     bot.abort();
     let _ = bot.await;
+    // The e2e "kill" is an in-process task abort. Give the abort guard one
+    // scheduling window to stop detached child tasks before starting the next
+    // conductor, matching a real process restart where the old process is gone.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let ctx2 = build_ctx()
         .chain(&infra.base_chain)

@@ -86,7 +86,7 @@ impl<Task> Clone for JobQueue<Task> {
     }
 }
 
-/// Pickup latency SLO for queued jobs.
+/// Pickup latency and reservation SLO for queued jobs.
 ///
 /// Hedge placement (and the upstream trade-processing pipeline) needs
 /// to react to events on the order of a single second: a missed window
@@ -99,6 +99,13 @@ impl<Task> Clone for JobQueue<Task> {
 ///
 /// We cap the polling interval at 1s end-to-end so the worst-case
 /// pickup latency matches the SLO regardless of prior queue state.
+///
+/// Apalis also defaults to fetching 10 rows per worker poll. Our workers are
+/// single-concurrency, so a larger fetch buffer reserves extra rows as
+/// `Queued` in SQLite before the handler can run them. If the process dies or
+/// the in-memory fetch buffer is dropped, those rows are no longer `Pending`
+/// and the deterministic worker heartbeat keeps them from aging out. Fetch one
+/// row at a time so durable queue state mirrors actual handler execution.
 fn build_poll_config<T: 'static>() -> Config {
     let strategy = StrategyBuilder::new()
         .apply(
@@ -107,7 +114,9 @@ fn build_poll_config<T: 'static>() -> Config {
         )
         .build();
 
-    Config::new(std::any::type_name::<T>()).with_poll_interval(strategy)
+    Config::new(std::any::type_name::<T>())
+        .set_buffer_size(1)
+        .with_poll_interval(strategy)
 }
 
 impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueue<Task> {
@@ -267,14 +276,14 @@ where
     async fn perform(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error>;
 }
 
-/// Shared worker-construction body for [`build_supervised_worker!`] and
-/// [`build_best_effort_worker!`]. Not part of the public crate API; always
-/// called via one of the two public macros. Must be exported so the outer
-/// macros can call it from expansion sites in sibling modules.
+/// Shared worker-construction body for [`build_supervised_worker!`]. Not part
+/// of the public crate API; always called via the public macro. Must be
+/// exported so the outer macro can call it from expansion sites in sibling
+/// modules.
 ///
 /// `$on_event:expr` must be a value of type
 /// `impl Fn(&WorkerContext, &Event) + Send + Sync + 'static`, produced by
-/// either [`on_terminal_failure`] or [`on_terminal_failure_log_only`].
+/// [`on_terminal_failure`].
 macro_rules! build_worker_inner {
     (
         ::<$ctx_type:ty, $job:ty>,
@@ -361,16 +370,11 @@ pub(crate) use build_supervised_worker;
 
 /// Builds a best-effort `Worker` for a `Job<Ctx>` impl.
 ///
-/// Identical to [`build_supervised_worker!`] but uses
-/// [`on_terminal_failure_log_only`] instead of [`on_terminal_failure`]:
-/// a terminal job failure is logged at `error!` level but does NOT trip the
-/// conductor-wide fail-stop and does NOT stop the worker.
-///
-/// Callers MUST pass a permissive `CircuitBreakerConfig` (e.g. high
-/// `failure_threshold`, short `recovery_timeout`) so a single failing job
-/// does not latch the worker idle for a long period. Passing the conductor-wide
-/// fail-stop config (threshold 1, 1-year timeout) would silently neutralise
-/// the best-effort guarantee.
+/// A terminal job failure is logged at `error!` level but does NOT trip the
+/// conductor-wide fail-stop, does NOT stop the worker, and does NOT install an
+/// Apalis circuit breaker. The circuit breaker can latch a single-concurrency
+/// worker idle after retries are exhausted because `poll_ready` returns
+/// `Pending` without scheduling a wakeup when the circuit is open.
 ///
 /// Use for background recovery workers (e.g. `ResumeTokenizationAggregate`)
 /// where a persistently failing individual job must not block processing of
@@ -380,21 +384,39 @@ macro_rules! build_best_effort_worker {
         ::<$ctx_type:ty, $job:ty>,
         $index:expr,
         $queue:expr,
-        $ctx:expr,
-        $circuit:expr
+        $ctx:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
-        build_worker_inner!(
-            ::<$ctx_type, $job>,
+        use ::apalis::layers::WorkerBuilderExt;
+        use ::apalis::layers::retry::RetryPolicy;
+        use ::apalis::prelude::WorkerBuilder;
+        use ::apalis_core::worker::ext::event_listener::EventListenerExt;
+
+        let builder = WorkerBuilder::new(format!(
+            "{}-{}",
+            <$job as $crate::conductor::job::Job<$ctx_type>>::WORKER_NAME,
             $index,
-            $queue,
-            $ctx,
-            $circuit,
-            $crate::conductor::job::on_terminal_failure_log_only(
-                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+        ))
+        .backend($queue.into_storage())
+        .data($ctx);
+
+        $(
+            #[cfg(any(test, feature = "test-support"))]
+            let builder = builder.data($failure_injector).data(
+                <$job as $crate::conductor::job::Job<$ctx_type>>::JOB_KIND,
+            );
+        )?
+
+        builder
+            .concurrency(1)
+            .retry(
+                RetryPolicy::retries(3)
+                    .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
-            $(, $failure_injector)?
-        )
+            .on_event($crate::conductor::job::on_terminal_failure_log_only(
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+            ))
+            .build($crate::conductor::job::work::<$ctx_type, $job>)
     }};
 }
 
@@ -669,8 +691,8 @@ pub(crate) fn on_terminal_failure(
 /// `failure_notify.notify_waiters()` and does NOT call `ctx.stop()`.
 /// Used for best-effort background workers (e.g. `ResumeTokenizationAggregate`)
 /// where a persistently failing individual job should not bring down hedging
-/// and fill detection. The worker circuit-breaker config must also be
-/// permissive — see [`build_best_effort_worker!`].
+/// and fill detection. See [`build_best_effort_worker!`] for why these workers
+/// do not install Apalis' circuit-breaker layer.
 ///
 /// Structural invariant: unlike [`on_terminal_failure`], this function takes
 /// no `Notify` argument and therefore can never call `notify_waiters()` or
@@ -724,6 +746,18 @@ mod tests {
         assert!(
             !queue.has_in_flight().await.unwrap(),
             "a Done job is terminal and not in flight"
+        );
+    }
+
+    #[test]
+    fn poll_config_fetches_one_row_per_single_concurrency_worker() {
+        let config = build_poll_config::<u32>();
+
+        assert_eq!(
+            config.buffer_size(),
+            1,
+            "workers run with concurrency(1), so the SQLite fetch buffer must \
+             not reserve extra rows as Queued before a handler can execute them",
         );
     }
 
@@ -991,6 +1025,42 @@ mod tests {
             .unwrap()
     }
 
+    async fn job_rows_for_assertion(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> Vec<(String, String, i64, i64, Option<String>)> {
+        sqlx_apalis::query_as(
+            "SELECT id, status, attempts, max_attempts, lock_by \
+             FROM Jobs ORDER BY id",
+        )
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap()
+    }
+
+    async fn wait_for_terminal_test_job(apalis_pool: &apalis_sqlite::SqlitePool) {
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let rows = job_rows_for_assertion(apalis_pool).await;
+                if rows.iter().any(|(_, status, attempts, max_attempts, _)| {
+                    (status == &Status::Killed.to_string() || status == &Status::Failed.to_string())
+                        && attempts >= max_attempts
+                }) {
+                    return;
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            terminal.is_ok(),
+            "failing job should reach terminal state before sibling is enqueued; \
+             job rows at timeout: {:?}",
+            job_rows_for_assertion(apalis_pool).await
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_finished_jobs_deletes_terminal_rows() {
         let apalis_pool = setup_test_apalis_pool().await;
@@ -1027,28 +1097,25 @@ mod tests {
         );
     }
 
-    /// With a permissive circuit-breaker config, a terminally-failing job does
-    /// NOT latch the worker idle: the circuit opens briefly (short
-    /// `recovery_timeout`) and then closes so subsequent jobs can run. This is
-    /// the key behavioral contract of the best-effort worker design.
+    /// A terminally-failing best-effort job does NOT latch the worker idle:
+    /// subsequent jobs must still run. This is the key behavioral contract of
+    /// the best-effort worker design.
     ///
-    /// Regression test: the previous code passed the conductor-wide fail-stop
-    /// config (threshold 1, 1-year timeout) to the best-effort worker,
-    /// permanently blocking all sibling jobs after the first terminal failure.
+    /// Regression test: installing Apalis' circuit-breaker layer on a
+    /// best-effort worker can permanently block sibling jobs after retries are
+    /// exhausted because an open circuit returns `Poll::Pending` without
+    /// scheduling a wakeup.
     ///
-    /// Goes through `build_best_effort_worker!` with the same permissive
-    /// `CircuitBreakerConfig` that `register_resume_tokenization_worker` in
-    /// `conductor/builder.rs` constructs, so the test validates the real
-    /// production path.
+    /// Goes through `build_best_effort_worker!`, so the test validates the real
+    /// production path used by `register_resume_tokenization_worker` in
+    /// `conductor/builder.rs`.
     #[tokio::test]
-    async fn best_effort_circuit_does_not_latch_on_single_terminal_failure() {
+    async fn best_effort_worker_does_not_latch_on_single_terminal_failure() {
         let apalis_pool = setup_test_apalis_pool().await;
 
         let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
-        // Failing job first, then a successful one. With a permissive circuit
-        // breaker (threshold = u32::MAX), the second job must still complete.
         queue.push(TestJob { should_fail: true }).await.unwrap();
-        queue.push(TestJob { should_fail: false }).await.unwrap();
+        let mut push_queue = queue.clone();
 
         // success_notify is wired into TestCtx; TestJob::perform calls
         // notify_waiters() after each successful run.
@@ -1059,13 +1126,6 @@ mod tests {
         });
         let ctx_for_assert = ctx.clone();
 
-        // Mirror the production config from register_resume_tokenization_worker:
-        // high threshold + short recovery so a single failure reopens the circuit
-        // quickly but does not permanently latch the worker idle.
-        let best_effort_circuit = CircuitBreakerConfig::default()
-            .with_failure_threshold(u32::MAX)
-            .with_recovery_timeout(Duration::from_secs(10));
-
         let monitor_handle = tokio::spawn({
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
@@ -1075,25 +1135,31 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
-                        best_effort_circuit.clone(),
                         FailureInjector::new(),
                     )
                 });
             async move { monitor.run().await }
         });
 
+        wait_for_terminal_test_job(&apalis_pool).await;
+        push_queue
+            .push(TestJob { should_fail: false })
+            .await
+            .unwrap();
+
         // Wait deterministically for the successful job to complete.
         // TestJob::perform fires success_notify after incrementing success_count,
         // so this unblocks as soon as job 2 succeeds -- no fixed sleep needed.
-        //
-        // The 30s budget accounts for the production RETRY_BACKOFF baked into
-        // build_best_effort_worker! via build_worker_inner!: 3 retries at 1s,
-        // 2s, 4s = 7s before the failing job goes terminal, plus the 10s
-        // recovery_timeout before the circuit closes. 30s gives ~3x headroom
-        // over the 17s worst case so the test is not flaky under CI load.
-        tokio::time::timeout(Duration::from_secs(30), success_notify.notified())
+        if tokio::time::timeout(Duration::from_secs(10), success_notify.notified())
             .await
-            .expect("second job must complete within 30s; circuit must not latch indefinitely");
+            .is_err()
+        {
+            panic!(
+                "second job must complete after the first job reaches terminal state; \
+                 job rows at timeout: {:?}",
+                job_rows_for_assertion(&apalis_pool).await
+            );
+        }
 
         monitor_handle.abort();
 
