@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
+
 use st0x_execution::AccountActivity;
 
 use super::builder::build_pnl_response_from_rows;
@@ -132,7 +133,10 @@ fn query_to_timestamp_uses_exact_exclusive_bound() {
 
 #[test]
 fn malformed_persisted_payloads_are_rejected() {
-    assert!(parse_payload_string("{not-json").is_err());
+    let error = parse_payload_string("{not-json").unwrap_err();
+    assert_eq!(error.classify(), serde_json::error::Category::Syntax);
+    assert_eq!(error.line(), 1);
+    assert_eq!(error.column(), 2);
 }
 
 fn position_row(symbol: &str, net_position: &str) -> PositionViewRow {
@@ -394,6 +398,7 @@ fn carries_offchain_origin_inventory_until_later_fills_close_it() {
     assert_eq!(report.entries[0].opening_venue, Venue::Offchain);
     assert_eq!(report.entries[0].closing_venue, Venue::Onchain);
     assert_eq!(report.entries[0].pnl_bucket, PnlBucket::DirectionalExposure);
+    assert!(!report.entries[0].delayed_counter_trade);
 }
 
 #[test]
@@ -446,6 +451,8 @@ fn date_filter_and_windows_use_new_york_trading_date() {
     assert_eq!(report.total, 1);
     assert_eq!(report.entries[0].closing_rowid, 2);
     assert_eq!(report.windows[0].label, "2026-05-15");
+    assert_eq!(report.windows[0].start_at, "2026-05-15T04:00:00.000Z");
+    assert_eq!(report.windows[0].end_at, "2026-05-16T03:59:59.999Z");
 }
 
 #[test]

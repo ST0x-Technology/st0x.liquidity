@@ -1,11 +1,52 @@
 use std::collections::{BTreeSet, HashMap};
 
+use chrono::{NaiveDate, SecondsFormat, TimeZone, Utc};
+use chrono_tz::America::New_York;
 use num_decimal::Num;
 
 use super::parsing::fmt_decimal;
 use super::response::{PnlEntry, PnlWindow, PnlWindowSymbol};
 use super::sessions::{counter_trading_session_for_iso, date_key, market_session_for_iso};
 use super::state::PnlBucket;
+
+fn et_day_boundary(date: &str, is_end: bool) -> String {
+    let Some(day) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
+        return if is_end {
+            format!("{date}T23:59:59.999Z")
+        } else {
+            format!("{date}T00:00:00.000Z")
+        };
+    };
+    let local_time = if is_end {
+        day.and_hms_milli_opt(23, 59, 59, 999)
+    } else {
+        day.and_hms_milli_opt(0, 0, 0, 0)
+    };
+    let Some(local_time) = local_time else {
+        return if is_end {
+            format!("{date}T23:59:59.999Z")
+        } else {
+            format!("{date}T00:00:00.000Z")
+        };
+    };
+    New_York
+        .from_local_datetime(&local_time)
+        .single()
+        .map_or_else(
+            || {
+                if is_end {
+                    format!("{date}T23:59:59.999Z")
+                } else {
+                    format!("{date}T00:00:00.000Z")
+                }
+            },
+            |local| {
+                local
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Millis, true)
+            },
+        )
+}
 
 pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<PnlWindow> {
     let mut by_date: HashMap<String, Vec<&PnlEntry>> = HashMap::new();
@@ -68,8 +109,8 @@ pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[String]) -> Vec<Pnl
 
             PnlWindow {
                 window_id: date.clone(),
-                start_at: format!("{date}T00:00:00.000Z"),
-                end_at: format!("{date}T23:59:59.999Z"),
+                start_at: et_day_boundary(&date, false),
+                end_at: et_day_boundary(&date, true),
                 label: date,
                 is_weekend,
                 market_session,

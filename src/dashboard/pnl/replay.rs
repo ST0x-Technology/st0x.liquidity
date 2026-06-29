@@ -295,9 +295,10 @@ fn match_fill_against_lots(
         }
 
         let elapsed_seconds = seconds_between(&front_lot.opened_at, &fill.executed_at);
-        let effective_bucket = if front_lot.opened_venue == Venue::Offchain
-            || (bucket == PnlBucket::CounterTrade
-                && elapsed_seconds > COUNTER_TRADE_THRESHOLD_SECONDS)
+        let delayed_counter_trade = bucket == PnlBucket::CounterTrade
+            && front_lot.opened_venue != Venue::Offchain
+            && elapsed_seconds > COUNTER_TRADE_THRESHOLD_SECONDS;
+        let effective_bucket = if front_lot.opened_venue == Venue::Offchain || delayed_counter_trade
         {
             PnlBucket::DirectionalExposure
         } else {
@@ -405,7 +406,7 @@ fn match_fill_against_lots(
             realized_pnl_usd: realized_pnl,
             elapsed_seconds,
             counter_trade_threshold_seconds: COUNTER_TRADE_THRESHOLD_SECONDS,
-            delayed_counter_trade: effective_bucket == PnlBucket::DirectionalExposure,
+            delayed_counter_trade,
             attribution_method: ATTRIBUTION_METHOD,
         });
 
