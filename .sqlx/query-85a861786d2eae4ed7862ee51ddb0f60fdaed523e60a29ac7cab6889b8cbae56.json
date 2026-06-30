@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO skipped_fills (tx_hash, log_index, event_type, reason, detail, skipped_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (tx_hash, log_index) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "85a861786d2eae4ed7862ee51ddb0f60fdaed523e60a29ac7cab6889b8cbae56"
+}
