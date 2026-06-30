@@ -235,7 +235,7 @@ mod tests {
 
     use st0x_config::IngestionCutoff;
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::FractionalShares;
+    use st0x_execution::{Direction, FractionalShares};
     use st0x_float_macro::float;
     use st0x_registry::SymbolCache;
 
@@ -367,6 +367,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
+        // No token-metadata RPC here: symbols come from the pre-seeded address
+        // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -390,6 +392,10 @@ mod tests {
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
+        // Alice's order takes USDC in / wtAAPL out -> sold tokenized equity
+        // onchain. direction is the single field that decides which way the
+        // bot hedges; an inverted IO-index mapping would silently flip it.
+        assert_eq!(trade.direction, Direction::Sell);
     }
 
     #[tokio::test]
@@ -442,6 +448,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
+        // No token-metadata RPC here: symbols come from the pre-seeded address
+        // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -465,6 +473,9 @@ mod tests {
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
+        // Bob's order takes wtAAPL in / USDC out -> bought tokenized equity
+        // onchain, the opposite of alice; the hedge direction must flip.
+        assert_eq!(trade.direction, Direction::Buy);
     }
 
     #[tokio::test]
@@ -791,6 +802,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
+        // No token-metadata RPC here: symbols come from the pre-seeded address
+        // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -815,6 +828,11 @@ mod tests {
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
+        // both_match resolves Alice's order (alice_hash_matches is checked
+        // first): USDC in / wtAAPL out -> sold equity onchain, so direction is
+        // Sell. Like the single-match siblings, this is sensitive to an
+        // inverted IO-index mapping.
+        assert_eq!(trade.direction, Direction::Sell);
     }
 
     fn create_parameterized_after_clear_event(
