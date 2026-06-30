@@ -26,8 +26,8 @@ use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
+use crate::tokenization::{IssuerRequestId, TokenizationRequestId};
 use crate::tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Pending mints and redemptions aggregated by symbol.
@@ -977,7 +977,7 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::tokenized_equity_mint::issuer_request_id;
+    use crate::tokenization::issuer_request_id;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     #[derive(Clone, Default)]

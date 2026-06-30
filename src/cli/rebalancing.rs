@@ -33,11 +33,10 @@ use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, Usd
 use crate::telemetry::TelemetrySender;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
+    AlpacaTokenizationService, IssuerRequestId, TokenizationRequest, TokenizationRequestStatus,
+    Tokenizer,
 };
-use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
-};
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 use crate::usdc_rebalance::{
     RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
@@ -1636,7 +1635,7 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
+    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
     use crate::vault_lookup::MockVaultLookup;
 

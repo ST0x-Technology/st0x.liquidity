@@ -47,12 +47,11 @@ use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
 use crate::tokenization::{
-    AlpacaTokenizationError, MintVerificationError, TokenizationRequest, TokenizationRequestStatus,
-    Tokenizer, TokenizerError,
+    AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
+    TokenizationRequestId, TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
-    TokenizedEquityMintCommand,
+    TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 use crate::vault_lookup::{VaultLookup, VaultLookupError};
 
@@ -1701,10 +1700,11 @@ mod tests {
     };
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
+    use crate::tokenization::issuer_request_id;
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
     };
-    use crate::tokenized_equity_mint::{TokenizedEquityMintEvent, issuer_request_id};
+    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistry;

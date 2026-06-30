@@ -51,7 +51,8 @@ use st0x_wrapper::{WrapConfirmation, Wrapper, WrapperError, node_sync_attempts};
 
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
-use crate::tokenized_equity_mint::{IssuerRequestId, TOKENIZED_EQUITY_DECIMALS};
+use crate::tokenization::IssuerRequestId;
+use crate::tokenized_equity_mint::TOKENIZED_EQUITY_DECIMALS;
 use crate::vault_lookup::VaultLookup;
 
 /// Aggregate identifier. Each detection creates a fresh UUID; multiple
@@ -854,8 +855,8 @@ mod tests {
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::{ConfirmTxBehavior, DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::tokenization::issuer_request_id;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::issuer_request_id;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
     use super::*;

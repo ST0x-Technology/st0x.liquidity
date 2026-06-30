@@ -35,7 +35,8 @@ use super::{CrossVenueEquityTransfer, MintTransferError, RedemptionError};
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::trigger::GuardState;
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
+use crate::tokenization::IssuerRequestId;
+use crate::tokenized_equity_mint::TokenizedEquityMint;
 
 /// Apalis queue type for [`TransferEquityToMarketMaking`].
 pub(crate) type TransferEquityToMarketMakingJobQueue = JobQueue<TransferEquityToMarketMaking>;
@@ -444,8 +445,9 @@ mod tests {
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
+    use crate::tokenization::issuer_request_id;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::{TokenizedEquityMintCommand, issuer_request_id};
+    use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::vault_lookup::MockVaultLookup;
 
     /// Builds a test ctx with recovery enabled for AAPL and an empty guard map.

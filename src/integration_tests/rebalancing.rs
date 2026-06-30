@@ -64,9 +64,8 @@ use crate::tokenization::alpaca::tests::{
     tokenization_requests_path,
 };
 use crate::tokenization::mock::MockTokenizer;
-use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
-};
+use crate::tokenization::{IssuerRequestId, issuer_request_id};
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 use crate::unwrapped_equity_recovery::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
 };

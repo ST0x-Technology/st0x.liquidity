@@ -3403,9 +3403,8 @@ mod tests {
         setup_test_db, setup_test_pools,
     };
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::{
-        TokenizationRequestId, TokenizedEquityMintCommand, issuer_request_id,
-    };
+    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
+    use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::AccountForDexTrade;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
@@ -3512,7 +3511,7 @@ mod tests {
         pool: sqlx::SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
         services: crate::rebalancing::equity::EquityTransferServices,
-        mint_id: crate::tokenized_equity_mint::IssuerRequestId,
+        mint_id: crate::tokenization::IssuerRequestId,
         redemption_id: crate::equity_redemption::RedemptionAggregateId,
         tokenizer: Arc<crate::tokenization::mock::MockTokenizer>,
         rebalancing_service: RebalancingService,

@@ -12,6 +12,11 @@ pub(crate) mod mock;
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::str::FromStr;
+use uuid::Uuid;
+
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, Symbol};
 
@@ -20,7 +25,49 @@ pub(crate) use alpaca::{
     TokenizationRequestStatus, TokenizationRequestType,
 };
 
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
+/// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.
+///
+/// Mirrors [`crate::usdc_rebalance::UsdcRebalanceId`]: a UUID so invalid ids are
+/// unrepresentable and apalis/CLI retries always target the same aggregate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct IssuerRequestId(pub(crate) Uuid);
+
+impl IssuerRequestId {
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Display for IssuerRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for IssuerRequestId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+/// Deterministic issuer request id for tests. Maps a human-readable label to a
+/// UUID v5 so test aggregate ids stay valid [`IssuerRequestId`] values.
+#[cfg(test)]
+pub(crate) fn issuer_request_id(label: &str) -> IssuerRequestId {
+    IssuerRequestId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
+}
+
+/// Alpaca tokenization request identifier used to track the mint operation through their API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct TokenizationRequestId(pub(crate) String);
+
+impl std::fmt::Display for TokenizationRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Error type for Tokenizer operations.
 #[derive(Debug, thiserror::Error)]
