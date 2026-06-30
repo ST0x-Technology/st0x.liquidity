@@ -171,7 +171,10 @@ impl Positive<FractionalShares> {
             return Err(ToWholeSharesError::Fractional(inner));
         }
 
-        let formatted = inner.inner().format().map_err(ToWholeSharesError::Float)?;
+        let formatted = inner
+            .inner()
+            .format_with_scientific(false)
+            .map_err(ToWholeSharesError::Float)?;
 
         let integer_str = formatted.split('.').next().unwrap_or(&formatted);
         integer_str
@@ -259,6 +262,16 @@ mod tests {
         let positive = Positive::new(FractionalShares::new(float!(1.5))).unwrap();
         let error = positive.to_whole_shares().unwrap_err();
         assert!(matches!(error, ToWholeSharesError::Fractional(_)));
+    }
+
+    #[test]
+    fn to_whole_shares_handles_values_above_one_billion() {
+        // Float::format() switches to scientific notation ("1e10") for
+        // magnitudes above 1e9, so extracting the integer part before the
+        // '.' produced the wrong value. A non-scientific formatter must be
+        // used instead.
+        let positive = Positive::new(FractionalShares::new(float!(10000000000))).unwrap();
+        assert_eq!(positive.to_whole_shares().unwrap(), 10_000_000_000);
     }
 
     #[test]

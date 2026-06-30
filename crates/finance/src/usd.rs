@@ -67,7 +67,7 @@ impl Usd {
             return Err(UsdToCentsError::SubCentPrecision(self));
         }
 
-        let formatted = scaled.format()?;
+        let formatted = scaled.format_with_scientific(false)?;
         let integer_str = formatted.split('.').next().unwrap_or(&formatted);
         integer_str
             .parse::<i64>()
@@ -258,6 +258,25 @@ mod tests {
     #[test]
     fn to_cents_converts_zero() {
         assert_eq!(Usd::ZERO.to_cents().unwrap(), 0);
+    }
+
+    #[test]
+    fn to_cents_handles_values_above_one_billion_cents() {
+        // $10,000,001 -> 1,000,000,100 cents. Float::format() switches to
+        // scientific notation ("1.0000001e9") for magnitudes above 1e9, so
+        // extracting the integer part before the '.' truncated the result
+        // to 1 cent. A non-scientific formatter must be used instead.
+        let usd = Usd::new(float!(10000001));
+        assert_eq!(usd.to_cents().unwrap(), 1_000_000_100);
+    }
+
+    #[test]
+    fn to_cents_handles_negative_values_below_negative_one_billion_cents() {
+        // to_cents returns a signed i64, and the scientific-notation truncation
+        // hit negative magnitudes just as badly (-1.0000001e9 -> -1). Lock in
+        // the negative side of the fix too.
+        let usd = Usd::new(float!(-10000001));
+        assert_eq!(usd.to_cents().unwrap(), -1_000_000_100);
     }
 
     #[test]
