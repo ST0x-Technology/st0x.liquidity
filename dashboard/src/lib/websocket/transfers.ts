@@ -2,6 +2,7 @@ import type { QueryClient } from '@tanstack/svelte-query'
 import type { CurrentState } from '$lib/api/CurrentState'
 import type { TransferOperation } from '$lib/api/TransferOperation'
 import type { TransferWarning } from '$lib/api/TransferWarning'
+import { isTerminalStatus } from '$lib/transfer'
 
 const MAX_RECENT = 100
 
@@ -21,7 +22,7 @@ export const upsertTransfer = (queryClient: QueryClient, transfer: TransferOpera
     const existing = old ?? []
     const index = existing.findIndex((item) => transferKey(item) === key)
 
-    if (transfer.status.status === 'completed' || transfer.status.status === 'failed') {
+    if (isTerminalStatus(transfer.status.status)) {
       const filtered = index >= 0 ? existing.filter((_, idx) => idx !== index) : existing
 
       queryClient.setQueryData<TransferOperation[]>(

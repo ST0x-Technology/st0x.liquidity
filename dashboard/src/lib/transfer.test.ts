@@ -61,6 +61,19 @@ describe('statusStyle', () => {
     expect(statusStyle('pending').text).toBe('text-muted-foreground')
     expect(statusStyle('').text).toBe('text-muted-foreground')
   })
+
+  it('returns amber for reconciled status (case-insensitive)', () => {
+    expect(statusStyle('reconciled').text).toBe('text-amber-500')
+    expect(statusStyle('reconciled').dot).toBe('bg-amber-500')
+    expect(statusStyle('RECONCILED').text).toBe('text-amber-500')
+    expect(statusStyle('Reconciled').text).toBe('text-amber-500')
+  })
+
+  it('returns amber for OperatorReconciled event name (timeline side-effect)', () => {
+    // OperatorReconciled is a raw PascalCase event name that contains 'reconciled';
+    // the substring check intentionally renders it amber in the event timeline.
+    expect(statusStyle('OperatorReconciled').text).toBe('text-amber-500')
+  })
 })
 
 describe('isTxHash', () => {
@@ -454,6 +467,41 @@ describe('transferRecoveryCommands', () => {
         })
       ).toEqual([])
     }
+  })
+
+  it('returns no commands for a reconciled equity mint (any casing)', () => {
+    for (const status of ['reconciled', 'Reconciled', 'RECONCILED']) {
+      expect(
+        transferRecoveryCommands({
+          deployment: PROD,
+          kind: 'equity_mint',
+          id: 'ISS001',
+          status
+        })
+      ).toEqual([])
+    }
+  })
+
+  it('returns no commands for a reconciled equity redemption', () => {
+    expect(
+      transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'equity_redemption',
+        id: 'RED001',
+        status: 'reconciled'
+      })
+    ).toEqual([])
+  })
+
+  it('returns no commands for a reconciled usdc bridge', () => {
+    expect(
+      transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'usdc_bridge',
+        id: 'BRIDGE001',
+        status: 'reconciled'
+      })
+    ).toEqual([])
   })
 
   it('uses the mock cli prefix in a simulation build', () => {

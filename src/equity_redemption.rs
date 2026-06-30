@@ -1149,12 +1149,11 @@ impl EquityRedemption {
                 updated_at: *failed_at,
             }),
 
-            // Reconciliation is a terminal operator resolution, so it maps to the
-            // existing `Completed` DTO status (no new status needed) -- mirrors the
-            // USDC `Reconciled -> Completed` mapping.
             Self::Reconciled {
                 symbol,
                 quantity,
+                failure_reason,
+                reconcile_reason,
                 started_at,
                 reconciled_at,
                 ..
@@ -1162,8 +1161,10 @@ impl EquityRedemption {
                 id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
-                status: EquityRedemptionStatus::Completed {
-                    completed_at: *reconciled_at,
+                status: EquityRedemptionStatus::Reconciled {
+                    reconciled_at: *reconciled_at,
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reconcile_reason.clone(),
                 },
                 started_at: *started_at,
                 updated_at: *reconciled_at,
@@ -5101,6 +5102,7 @@ mod tests {
             .expect("event stream should materialize a state");
         let EquityRedemption::Reconciled {
             reconcile_reason,
+            failure_reason,
             quantity,
             ..
         } = state
@@ -5108,6 +5110,13 @@ mod tests {
             panic!("reconciled redemption should be Reconciled, got {state:?}");
         };
         assert_eq!(reconcile_reason, "deposited manually via vault-deposit");
+        // DetectionFailure::Operator carries a reason string; the Failed state
+        // stores it as Some(_) and apply(OperatorReconciled) propagates it.
+        assert_eq!(
+            failure_reason,
+            Some("operator forced terminal".to_string()),
+            "reconciled state must carry the source failure reason from Failed"
+        );
         assert!(
             quantity.eq(float!(50.25)).unwrap(),
             "reconciled state must preserve the requested quantity, got {quantity:?}"
@@ -5178,7 +5187,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciled_to_dto_reports_completed_preserving_quantity() {
+    fn to_dto_reconciled_carries_failure_and_reconcile_reason() {
         let started_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled = EquityRedemption::Reconciled {
@@ -5198,13 +5207,17 @@ mod tests {
         else {
             panic!("expected an EquityRedemption operation");
         };
-        let EquityRedemptionStatus::Completed { completed_at } = operation.status else {
-            panic!(
-                "reconciled redemption must map to the Completed DTO status, got {:?}",
-                operation.status
-            );
-        };
-        assert_eq!(completed_at, reconciled_at);
+        let serialized = serde_json::to_value(&operation.status).expect("serialization failed");
+        assert_eq!(serialized["status"], serde_json::json!("reconciled"));
+        assert_eq!(
+            serialized["reconciledAt"],
+            serde_json::json!("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(serialized["failureReason"], serde_json::json!(null));
+        assert_eq!(
+            serialized["reconcileReason"],
+            serde_json::json!("deposited manually")
+        );
         assert_eq!(operation.updated_at, reconciled_at);
         assert_eq!(operation.started_at, started_at);
         assert_eq!(
@@ -5382,6 +5395,41 @@ mod tests {
                 failed_at: now,
             }
             .is_terminal(),
+        );
+    }
+
+    #[test]
+    fn to_dto_reconciled_with_failure_reason_serializes_non_null() {
+        // When the Failed state carried an operator-supplied reason (e.g. from
+        // DetectionFailure::Operator), apply(OperatorReconciled) propagates it
+        // to the Reconciled state's failure_reason; to_dto must forward it to
+        // the DTO as a non-null string so the dashboard can display the
+        // original failure context alongside the reconciliation note.
+        let started_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reconciled = EquityRedemption::Reconciled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(50.25),
+            raindex_withdraw_tx: Some(TxHash::random()),
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: None,
+            failure_reason: Some("operator forced terminal".to_string()),
+            reconcile_reason: "deposited manually".to_string(),
+            started_at,
+            reconciled_at,
+        };
+
+        let TransferOperation::EquityRedemption(operation) =
+            reconciled.to_dto(&redemption_aggregate_id("RED-002"))
+        else {
+            panic!("expected an EquityRedemption operation");
+        };
+        let serialized = serde_json::to_value(&operation.status).expect("serialization failed");
+        assert_eq!(serialized["status"], serde_json::json!("reconciled"));
+        assert_eq!(
+            serialized["failureReason"],
+            serde_json::json!("operator forced terminal"),
+            "failure_reason: Some(...) must serialize as a non-null string in the DTO"
         );
     }
 }

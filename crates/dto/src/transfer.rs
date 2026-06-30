@@ -53,8 +53,25 @@ pub enum EquityMintStatus {
     Minting,
     Wrapping,
     Depositing,
-    Completed { completed_at: DateTime<Utc> },
-    Failed { failed_at: DateTime<Utc> },
+    Completed {
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+    },
+    // Plain `//` comment, not `///` -- ts-rs propagates doc comments into the
+    // generated TS binding and a field-level doc trips the dashboard's
+    // type-aware eslint. Keep rationale here in Rust.
+    Reconciled {
+        reconciled_at: DateTime<Utc>,
+        // The mint aggregate's Failed.reason is always a non-optional String, so
+        // the DTO field is String (not Option<String>). Redemption and USDC
+        // reconciled variants use Option<String> because their failure paths can
+        // legitimately produce None (e.g. Timeout detection failure for
+        // redemption, pre-existing-field replays for USDC).
+        failure_reason: String,
+        reconcile_reason: String,
+    },
 }
 
 /// Redeeming tokenized equity back to real shares.
@@ -84,8 +101,20 @@ pub enum EquityRedemptionStatus {
     Unwrapping,
     Sending,
     PendingConfirmation,
-    Completed { completed_at: DateTime<Utc> },
-    Failed { failed_at: DateTime<Utc> },
+    Completed {
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+    },
+    // Plain `//` comment, not `///` -- ts-rs propagates doc comments into the
+    // generated TS binding and a field-level doc trips the dashboard's
+    // type-aware eslint. Keep rationale here in Rust.
+    Reconciled {
+        reconciled_at: DateTime<Utc>,
+        failure_reason: Option<String>,
+        reconcile_reason: String,
+    },
 }
 
 /// Direction for USDC bridge transfers.
@@ -138,10 +167,18 @@ pub enum UsdcBridgeStatus {
         // trips the dashboard's type-aware eslint. Keep the rationale here in Rust.
         post_burn: bool,
     },
+    // Plain `//` comment, not `///` -- ts-rs propagates doc comments into the
+    // generated TS binding and a field-level doc trips the dashboard's
+    // type-aware eslint. Keep rationale here in Rust.
+    Reconciled {
+        reconciled_at: DateTime<Utc>,
+        failure_reason: Option<String>,
+        reconcile_reason: String,
+    },
 }
 
 impl TransferOperation {
-    /// Whether this transfer is in a terminal state (completed or failed).
+    /// Whether this transfer is in a terminal state (completed, failed, or reconciled).
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         match self {
@@ -149,7 +186,7 @@ impl TransferOperation {
                 use EquityMintStatus::*;
 
                 match &op.status {
-                    Completed { .. } | Failed { .. } => true,
+                    Completed { .. } | Failed { .. } | Reconciled { .. } => true,
                     Minting | Wrapping | Depositing => false,
                 }
             }
@@ -157,7 +194,7 @@ impl TransferOperation {
                 use EquityRedemptionStatus::*;
 
                 match &op.status {
-                    Completed { .. } | Failed { .. } => true,
+                    Completed { .. } | Failed { .. } | Reconciled { .. } => true,
                     Withdrawing | Unwrapping | Sending | PendingConfirmation => false,
                 }
             }
@@ -165,7 +202,7 @@ impl TransferOperation {
                 use UsdcBridgeStatus::*;
 
                 match &op.status {
-                    Completed { .. } | Failed { .. } => true,
+                    Completed { .. } | Failed { .. } | Reconciled { .. } => true,
                     Converting | Withdrawing | Bridging | Depositing => false,
                 }
             }
@@ -347,6 +384,17 @@ mod tests {
             mint_operation(EquityMintStatus::Completed { completed_at: now }, now).is_terminal()
         );
         assert!(mint_operation(EquityMintStatus::Failed { failed_at: now }, now).is_terminal());
+        assert!(
+            mint_operation(
+                EquityMintStatus::Reconciled {
+                    reconciled_at: now,
+                    failure_reason: "timed out".to_string(),
+                    reconcile_reason: "wrapped manually".to_string(),
+                },
+                now,
+            )
+            .is_terminal()
+        );
 
         assert!(!mint_operation(EquityMintStatus::Minting, now).is_terminal());
         assert!(!mint_operation(EquityMintStatus::Wrapping, now).is_terminal());
@@ -364,6 +412,17 @@ mod tests {
         assert!(
             redemption_operation(EquityRedemptionStatus::Failed { failed_at: now }, now)
                 .is_terminal()
+        );
+        assert!(
+            redemption_operation(
+                EquityRedemptionStatus::Reconciled {
+                    reconciled_at: now,
+                    failure_reason: None,
+                    reconcile_reason: "deposited manually".to_string(),
+                },
+                now,
+            )
+            .is_terminal()
         );
 
         assert!(!redemption_operation(EquityRedemptionStatus::Withdrawing, now).is_terminal());
@@ -405,10 +464,109 @@ mod tests {
             .is_terminal()
         );
 
+        assert!(
+            bridge_operation(
+                UsdcBridgeStatus::Reconciled {
+                    reconciled_at: now,
+                    failure_reason: None,
+                    reconcile_reason: "funds moved manually".to_string(),
+                },
+                now,
+            )
+            .is_terminal()
+        );
+
         assert!(!bridge_operation(UsdcBridgeStatus::Converting, now).is_terminal());
         assert!(!bridge_operation(UsdcBridgeStatus::Withdrawing, now).is_terminal());
         assert!(!bridge_operation(UsdcBridgeStatus::Bridging, now).is_terminal());
         assert!(!bridge_operation(UsdcBridgeStatus::Depositing, now).is_terminal());
+    }
+
+    #[test]
+    fn equity_mint_reconciled_serializes_correctly() {
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let operation = TransferOperation::EquityMint(EquityMintOperation {
+            id: Id::new("mint-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            status: EquityMintStatus::Reconciled {
+                reconciled_at,
+                failure_reason: "timed out".to_string(),
+                reconcile_reason: "wrapped manually".to_string(),
+            },
+            started_at: reconciled_at,
+            updated_at: reconciled_at,
+        });
+
+        let serialized = serde_json::to_value(&operation).expect("serialization should succeed");
+        assert_eq!(serialized["status"]["status"], json!("reconciled"));
+        assert_eq!(
+            serialized["status"]["reconciledAt"],
+            json!("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(serialized["status"]["failureReason"], json!("timed out"));
+        assert_eq!(
+            serialized["status"]["reconcileReason"],
+            json!("wrapped manually")
+        );
+    }
+
+    #[test]
+    fn equity_redemption_reconciled_serializes_correctly() {
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let operation = TransferOperation::EquityRedemption(EquityRedemptionOperation {
+            id: Id::new("redeem-001"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(50)),
+            status: EquityRedemptionStatus::Reconciled {
+                reconciled_at,
+                failure_reason: None,
+                reconcile_reason: "deposited manually".to_string(),
+            },
+            started_at: reconciled_at,
+            updated_at: reconciled_at,
+        });
+
+        let serialized = serde_json::to_value(&operation).expect("serialization should succeed");
+        assert_eq!(serialized["status"]["status"], json!("reconciled"));
+        assert_eq!(
+            serialized["status"]["reconciledAt"],
+            json!("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(serialized["status"]["failureReason"], json!(null));
+        assert_eq!(
+            serialized["status"]["reconcileReason"],
+            json!("deposited manually")
+        );
+    }
+
+    #[test]
+    fn usdc_bridge_reconciled_serializes_correctly() {
+        let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let operation = TransferOperation::UsdcBridge(UsdcBridgeOperation {
+            id: Id::new("bridge-001"),
+            direction: UsdcBridgeDirection::AlpacaToBase,
+            amount: Usdc::new(float!(1000)),
+            status: UsdcBridgeStatus::Reconciled {
+                reconciled_at,
+                failure_reason: None,
+                reconcile_reason: "funds moved manually".to_string(),
+            },
+            started_at: reconciled_at,
+            updated_at: reconciled_at,
+        });
+
+        let serialized = serde_json::to_value(&operation).expect("serialization should succeed");
+        assert_eq!(serialized["status"]["status"], json!("reconciled"));
+        assert_eq!(
+            serialized["status"]["reconciledAt"],
+            json!("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(serialized["status"]["failureReason"], json!(null));
+        assert_eq!(
+            serialized["status"]["reconcileReason"],
+            json!("funds moved manually")
+        );
     }
 
     #[test]
