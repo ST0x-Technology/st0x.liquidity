@@ -11,6 +11,7 @@ members = [
   "crates/float-serde",
   "crates/raindex",
   "crates/registry",
+  "crates/tokenization",
   "crates/wrapper",
 ]
 resolver = "2"
@@ -108,6 +109,7 @@ st0x-float-serde = { path = "crates/float-serde" }
 st0x-hedge = { path = "." }
 st0x-raindex = { path = "crates/raindex" }
 st0x-registry = { path = "crates/registry" }
+st0x-tokenization = { path = "crates/tokenization" }
 st0x-wrapper = { path = "crates/wrapper" }
 temp-env = "0.3.6"
 tempfile = "3.24.0"
@@ -169,6 +171,7 @@ test-support = [
 mock = [
   "st0x-execution/mock",
   "st0x-evm/mock",
+  "st0x-tokenization/mock",
   "dep:httpmock",
   "wallet-private-key",
 ]
@@ -222,6 +225,7 @@ st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
 st0x-raindex = { workspace = true, features = ["rain"] }
 st0x-registry.workspace = true
+st0x-tokenization.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -264,6 +268,7 @@ st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }
 st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
+st0x-tokenization = { workspace = true, features = ["test-support", "mock"] }
 st0x-wrapper = { workspace = true, features = ["mock"] }
 temp-env.workspace = true
 tempfile.workspace = true

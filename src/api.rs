@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 
 use st0x_dto::{HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue};
 use st0x_execution::FractionalShares;
+use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
@@ -30,7 +31,6 @@ use crate::performance::reliability::{
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
-use crate::tokenization::IssuerRequestId;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 
 /// Comma-separated filter for transfer kinds in query parameters.
@@ -1487,12 +1487,15 @@ async fn recheck_transfer(
 /// not leak internals (the full error is logged at the call site).
 fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     use RecheckError::{
-        Database, MalformedWallet, Mint, MissingTxHash, NoAcceptedRequest, Rebalancing, Redemption,
-        Tokenizer,
+        Database, MalformedTokenizationRequestId, MalformedWallet, Mint, MissingTxHash,
+        NoAcceptedRequest, Rebalancing, Redemption, Tokenizer,
     };
 
     match error {
-        NoAcceptedRequest(_) | MissingTxHash(_) | MalformedWallet { .. } => {
+        NoAcceptedRequest(_)
+        | MissingTxHash(_)
+        | MalformedWallet { .. }
+        | MalformedTokenizationRequestId { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
         Tokenizer(_) => (
@@ -1681,13 +1684,15 @@ mod tests {
 
     use st0x_config::{Ctx, RestApiCtx, create_test_ctx_with_order_owner};
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_tokenization::{
+        MintVerificationError, TokenizerError, issuer_request_id, tokenization_request_id,
+    };
 
     use super::*;
     use crate::dashboard;
     use crate::inventory::{self, BroadcastingInventory};
     use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
     use crate::performance::reliability::LifecycleFailureProjection;
-    use crate::tokenization::issuer_request_id;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -3353,9 +3358,6 @@ mod tests {
 
     #[test]
     fn recheck_error_response_distinguishes_recoverability() {
-        use crate::tokenization::{MintVerificationError, TokenizerError};
-        use crate::tokenization::{TokenizationRequestId, issuer_request_id};
-
         // Not-recoverable: the persisted aggregate state forbids recovery, so
         // retrying will not help -> 422 carrying the typed reason.
         let mint_id = issuer_request_id("mint-1");
@@ -3368,7 +3370,7 @@ mod tests {
         );
 
         let (status, _) = recheck_error_response(&RecheckError::MissingTxHash(
-            TokenizationRequestId("tok-1".to_string()),
+            tokenization_request_id("tok-1"),
         ));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 

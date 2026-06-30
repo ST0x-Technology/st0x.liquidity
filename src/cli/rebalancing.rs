@@ -20,6 +20,10 @@ use st0x_execution::{
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_tokenization::{
+    AlpacaTokenizationService, IssuerRequestId, TokenizationRequest, TokenizationRequestStatus,
+    Tokenizer,
+};
 use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::{TransferDirection, TransferType};
@@ -32,10 +36,6 @@ use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
 use crate::telemetry::TelemetrySender;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
-use crate::tokenization::{
-    AlpacaTokenizationService, IssuerRequestId, TokenizationRequest, TokenizationRequestStatus,
-    Tokenizer,
-};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 use crate::usdc_rebalance::{
     RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -1028,7 +1028,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
         )
         .await?;
 
-    writeln!(stdout, "   Request ID: {}", request.id.0)?;
+    writeln!(stdout, "   Request ID: {}", request.id)?;
     writeln!(stdout, "   Status: {:?}", request.status)?;
 
     if request.status == TokenizationRequestStatus::Pending {
@@ -1143,7 +1143,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
 
     let request = Tokenizer::poll_for_redemption(&tokenization_service, &tx_hash).await?;
 
-    writeln!(stdout, "   Request ID: {}", request.id.0)?;
+    writeln!(stdout, "   Request ID: {}", request.id)?;
     writeln!(stdout, "   Status: {:?}", request.status)?;
 
     if request.status == TokenizationRequestStatus::Pending {
@@ -1225,7 +1225,7 @@ fn format_tokenization_request<Writer: Write>(
     };
 
     writeln!(stdout, "   ─────────────────────────────────────")?;
-    writeln!(stdout, "   ID:       {}", request.id.0)?;
+    writeln!(stdout, "   ID:       {}", request.id)?;
     writeln!(stdout, "   Type:     {type_str}")?;
     writeln!(stdout, "   Status:   {status_str}")?;
     writeln!(stdout, "   Symbol:   {}", request.underlying_symbol)?;
@@ -1627,6 +1627,8 @@ mod tests {
     };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -1634,8 +1636,6 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::test_utils::setup_test_db;
-    use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
     use crate::vault_lookup::MockVaultLookup;
 
@@ -3724,7 +3724,7 @@ mod tests {
             &pool,
             &id,
             EquityRedemptionCommand::Detect {
-                tokenization_request_id: TokenizationRequestId("tok-cli-test".to_string()),
+                tokenization_request_id: tokenization_request_id("tok-cli-test"),
             },
         )
         .await;
@@ -3816,7 +3816,7 @@ mod tests {
             &pool,
             &id,
             EquityRedemptionCommand::Detect {
-                tokenization_request_id: TokenizationRequestId("tok-done".to_string()),
+                tokenization_request_id: tokenization_request_id("tok-done"),
             },
         )
         .await;

@@ -50,14 +50,14 @@ use super::{
 /// High-level service for Alpaca tokenization operations.
 ///
 /// Wraps `AlpacaTokenizationClient` with default polling configuration.
-pub(crate) struct AlpacaTokenizationService<W: Wallet> {
+pub struct AlpacaTokenizationService<W: Wallet> {
     client: AlpacaTokenizationClient<W>,
     polling_config: PollingConfig,
 }
 
 impl<W: Wallet> AlpacaTokenizationService<W> {
     /// Create a new tokenization service.
-    pub(crate) fn new(
+    pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
@@ -78,6 +78,13 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             client,
             polling_config: PollingConfig::default(),
         }
+    }
+
+    /// Overrides the polling configuration (intervals, timeout, retry budget).
+    #[must_use]
+    pub fn with_polling_config(mut self, polling_config: PollingConfig) -> Self {
+        self.polling_config = polling_config;
+        self
     }
 
     /// Request a mint operation to convert offchain shares to onchain tokens.
@@ -166,9 +173,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
     }
 
     /// List all tokenization requests.
-    pub(crate) async fn list_requests(
-        &self,
-    ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
+    pub async fn list_requests(&self) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
         self.client
             .list_requests(ListRequestsParams::default())
             .await
@@ -250,7 +255,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
 /// Type of tokenization request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum TokenizationRequestType {
+pub enum TokenizationRequestType {
     Mint,
     Redeem,
 }
@@ -267,7 +272,7 @@ impl std::fmt::Display for TokenizationRequestType {
 /// Status of a tokenization request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum TokenizationRequestStatus {
+pub enum TokenizationRequestStatus {
     Pending,
     Completed,
     Rejected,
@@ -295,40 +300,42 @@ impl Issuer {
 
 /// A tokenization request returned by the Alpaca API.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct TokenizationRequest {
+pub struct TokenizationRequest {
     #[serde(rename = "tokenization_request_id")]
-    pub(crate) id: TokenizationRequestId,
+    pub id: TokenizationRequestId,
     #[serde(default)]
-    pub(crate) r#type: Option<TokenizationRequestType>,
-    pub(crate) status: TokenizationRequestStatus,
-    pub(crate) underlying_symbol: Symbol,
+    pub r#type: Option<TokenizationRequestType>,
+    pub status: TokenizationRequestStatus,
+    pub underlying_symbol: Symbol,
     #[serde(default, deserialize_with = "deserialize_token_symbol")]
-    pub(crate) token_symbol: Option<String>,
+    pub token_symbol: Option<String>,
     #[serde(rename = "qty")]
-    pub(crate) quantity: FractionalShares,
+    pub quantity: FractionalShares,
     #[serde(rename = "wallet_address")]
-    pub(crate) wallet: Option<Address>,
-    pub(crate) issuer_request_id: Option<IssuerRequestId>,
+    pub wallet: Option<Address>,
+    pub issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
-    pub(crate) tx_hash: Option<TxHash>,
+    pub tx_hash: Option<TxHash>,
     #[serde(
         default,
         serialize_with = "st0x_float_serde::serialize_option_float",
         deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
     )]
-    pub(crate) fees: Option<Float>,
-    pub(crate) created_at: DateTime<Utc>,
+    pub fees: Option<Float>,
+    pub created_at: DateTime<Utc>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TokenizationRequest {
     /// Create a mock TokenizationRequest for testing.
-    pub(crate) fn mock(status: TokenizationRequestStatus) -> Self {
+    pub fn mock(status: TokenizationRequestStatus) -> Self {
         Self {
-            id: TokenizationRequestId("MOCK_REQ_ID".to_string()),
+            id: TokenizationRequestId::try_new("MOCK_REQ_ID")
+                .unwrap_or_else(|_| unreachable!("MOCK_REQ_ID is a valid tokenization request id")),
             r#type: None,
             status,
-            underlying_symbol: Symbol::new("AAPL").unwrap(),
+            underlying_symbol: Symbol::new("AAPL")
+                .unwrap_or_else(|_| unreachable!("AAPL is a valid symbol")),
             token_symbol: None,
             quantity: FractionalShares::ZERO,
             wallet: None,
@@ -340,12 +347,14 @@ impl TokenizationRequest {
     }
 
     /// Create a mock completed TokenizationRequest with tx_hash for testing.
-    pub(crate) fn mock_completed() -> Self {
+    pub fn mock_completed() -> Self {
         Self {
-            id: TokenizationRequestId("MOCK_REQ_ID".to_string()),
+            id: TokenizationRequestId::try_new("MOCK_REQ_ID")
+                .unwrap_or_else(|_| unreachable!("MOCK_REQ_ID is a valid tokenization request id")),
             r#type: None,
             status: TokenizationRequestStatus::Completed,
-            underlying_symbol: Symbol::new("AAPL").unwrap(),
+            underlying_symbol: Symbol::new("AAPL")
+                .unwrap_or_else(|_| unreachable!("AAPL is a valid symbol")),
             token_symbol: Some("tAAPL".to_string()),
             quantity: FractionalShares::ZERO,
             wallet: None,
@@ -404,7 +413,7 @@ struct ListRequestsParams {
 
 /// Errors that can occur when interacting with the Alpaca tokenization API.
 #[derive(Debug, Error)]
-pub(crate) enum AlpacaTokenizationError {
+pub enum AlpacaTokenizationError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 
@@ -415,7 +424,10 @@ pub(crate) enum AlpacaTokenizationError {
     Utf8(#[from] std::string::FromUtf8Error),
 
     #[error("API error (status {status}): {message}")]
-    ApiError { status: StatusCode, message: String },
+    ApiError {
+        status: StatusCode,
+        message: AlpacaApiErrorMessage,
+    },
 
     #[error("Insufficient position for symbol: {symbol}")]
     InsufficientPosition { symbol: Symbol },
@@ -424,7 +436,9 @@ pub(crate) enum AlpacaTokenizationError {
     UnsupportedAccount,
 
     #[error("Invalid parameters: {details}")]
-    InvalidParameters { details: String },
+    InvalidParameters {
+        details: InvalidTokenizationParameters,
+    },
 
     #[error("Request not found: {id}")]
     RequestNotFound { id: TokenizationRequestId },
@@ -442,9 +456,49 @@ pub(crate) enum AlpacaTokenizationError {
     MissingRedemptionWallet,
 }
 
+/// Opaque body text from an Alpaca tokenization API error response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlpacaApiErrorMessage(String);
+
+impl AlpacaApiErrorMessage {
+    pub(crate) fn from_response(message: String) -> Self {
+        Self(message)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AlpacaApiErrorMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// Opaque validation details from an Alpaca tokenization 422 response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidTokenizationParameters(String);
+
+impl InvalidTokenizationParameters {
+    pub(crate) fn from_response(details: String) -> Self {
+        Self(details)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for InvalidTokenizationParameters {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 impl AlpacaTokenizationError {
     /// Returns the HTTP status code if this error was caused by an API response.
-    pub(crate) fn status_code(&self) -> Option<StatusCode> {
+    pub fn status_code(&self) -> Option<StatusCode> {
         match self {
             Self::ApiError { status, .. } => Some(*status),
             Self::Reqwest(error) => error.status(),
@@ -462,10 +516,13 @@ fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> Alpaca
                 AlpacaTokenizationError::UnsupportedAccount
             }
         }
-        StatusCode::UNPROCESSABLE_ENTITY => {
-            AlpacaTokenizationError::InvalidParameters { details: message }
-        }
-        _ => AlpacaTokenizationError::ApiError { status, message },
+        StatusCode::UNPROCESSABLE_ENTITY => AlpacaTokenizationError::InvalidParameters {
+            details: InvalidTokenizationParameters::from_response(message),
+        },
+        _ => AlpacaTokenizationError::ApiError {
+            status,
+            message: AlpacaApiErrorMessage::from_response(message),
+        },
     }
 }
 
@@ -562,7 +619,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                     );
                 })?;
 
-            info!(target: "tokenization", request_id = %tokenization_request.id.0, "Mint request created");
+            info!(target: "tokenization", request_id = %tokenization_request.id, "Mint request created");
             return Ok(tokenization_request);
         }
 
@@ -870,7 +927,9 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
 
         Err(AlpacaTokenizationError::ApiError {
             status,
-            message: String::from_utf8_lossy(&bytes).into_owned(),
+            message: AlpacaApiErrorMessage::from_response(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ),
         })
     }
 }
@@ -1003,7 +1062,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
                 if request.status != TokenizationRequestStatus::Pending {
                     warn!(
                         target: "tokenization",
-                        id = %request.id.0,
+                        id = %request.id,
                         ?request.status,
                         "Alpaca returned non-pending request despite status=pending filter"
                     );
@@ -1033,7 +1092,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
-    use crate::tokenization::issuer_request_id;
+    use crate::issuer_request_id;
+    use crate::tokenization_request_id;
     use st0x_float_macro::float;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
@@ -1158,7 +1218,7 @@ pub(crate) mod tests {
         let expected_issuer_id = request.issuer_request_id.clone();
         let result = client.request_mint(request).await.unwrap();
 
-        assert_eq!(result.id, TokenizationRequestId("tok_req_123".to_string()));
+        assert_eq!(result.id, tokenization_request_id("tok_req_123"));
         assert_eq!(result.r#type, Some(TokenizationRequestType::Mint));
         assert_eq!(result.status, TokenizationRequestStatus::Pending);
         assert_eq!(result.underlying_symbol.to_string(), "AAPL");
@@ -1231,7 +1291,11 @@ pub(crate) mod tests {
 
         let err = client.request_mint(request).await.unwrap_err();
         assert!(
-            matches!(&err, AlpacaTokenizationError::InvalidParameters { details } if details.contains("invalid wallet address")),
+            matches!(
+                &err,
+                AlpacaTokenizationError::InvalidParameters { details }
+                    if details.as_str().contains("invalid wallet address")
+            ),
             "expected InvalidParameters with 'invalid wallet address', got: {err:?}"
         );
 
@@ -1297,9 +1361,9 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
+        assert_eq!(result[0].id, tokenization_request_id("req_1"));
         assert_eq!(result[0].r#type, Some(TokenizationRequestType::Mint));
-        assert_eq!(result[1].id, TokenizationRequestId("req_2".to_string()));
+        assert_eq!(result[1].id, tokenization_request_id("req_2"));
         assert_eq!(result[1].r#type, Some(TokenizationRequestType::Redeem));
 
         list_mock.assert();
@@ -1353,7 +1417,7 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, TokenizationRequestId("req_2".to_string()));
+        assert_eq!(result[0].id, tokenization_request_id("req_2"));
         assert_eq!(result[0].r#type, Some(TokenizationRequestType::Redeem));
 
         list_mock.assert();
@@ -1433,7 +1497,7 @@ pub(crate) mod tests {
                 ]));
         });
 
-        let id = TokenizationRequestId("req_2".to_string());
+        let id = tokenization_request_id("req_2");
         let result = client.get_request(&id).await.unwrap();
 
         assert_eq!(result.id, id);
@@ -1459,7 +1523,7 @@ pub(crate) mod tests {
                 ]));
         });
 
-        let id = TokenizationRequestId("req_target".to_string());
+        let id = tokenization_request_id("req_target");
         let result = client.get_request(&id).await.unwrap();
 
         assert_eq!(result.id, id);
@@ -1484,7 +1548,7 @@ pub(crate) mod tests {
                 )]));
         });
 
-        let id = TokenizationRequestId("nonexistent".to_string());
+        let id = tokenization_request_id("nonexistent");
 
         let err = client.get_request(&id).await.unwrap_err();
         assert!(
@@ -1662,7 +1726,7 @@ pub(crate) mod tests {
 
         assert!(result.is_some(), "expected to find redemption request");
         let request = result.unwrap();
-        assert_eq!(request.id, TokenizationRequestId("redeem_1".to_string()));
+        assert_eq!(request.id, tokenization_request_id("redeem_1"));
         assert_eq!(request.tx_hash, Some(hash));
 
         list_mock.assert();
@@ -1691,10 +1755,7 @@ pub(crate) mod tests {
 
         let request = client.find_redemption_by_tx(&hash).await.unwrap().unwrap();
 
-        assert_eq!(
-            request.id,
-            TokenizationRequestId("redeem_target".to_string())
-        );
+        assert_eq!(request.id, tokenization_request_id("redeem_target"));
         assert_eq!(request.tx_hash, Some(hash));
 
         list_mock.assert();
@@ -1738,10 +1799,7 @@ pub(crate) mod tests {
 
         let request = client.find_redemption_by_tx(&hash).await.unwrap().unwrap();
 
-        assert_eq!(
-            request.id,
-            TokenizationRequestId("redeem_uppercase".to_string())
-        );
+        assert_eq!(request.id, tokenization_request_id("redeem_uppercase"));
         assert_eq!(request.tx_hash, Some(hash));
 
         list_mock.assert();
@@ -1809,7 +1867,7 @@ pub(crate) mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let id = TokenizationRequestId("req_1".to_string());
+        let id = tokenization_request_id("req_1");
         let result = client.poll_until_terminal(&id, &config).await.unwrap();
 
         assert_eq!(result.status, TokenizationRequestStatus::Completed);
@@ -1842,7 +1900,7 @@ pub(crate) mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let id = TokenizationRequestId("req_target".to_string());
+        let id = tokenization_request_id("req_target");
         let result = client.poll_until_terminal(&id, &config).await.unwrap();
 
         assert_eq!(result.id, id);
@@ -1872,7 +1930,7 @@ pub(crate) mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let id = TokenizationRequestId("req_1".to_string());
+        let id = tokenization_request_id("req_1");
         let result = client.poll_until_terminal(&id, &config).await.unwrap();
 
         assert_eq!(result.status, TokenizationRequestStatus::Rejected);
@@ -1917,7 +1975,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.id, TokenizationRequestId("redeem_1".to_string()));
+        assert_eq!(result.id, tokenization_request_id("redeem_1"));
         assert_eq!(result.tx_hash, Some(hash));
         list_mock.assert();
     }
@@ -1943,7 +2001,7 @@ pub(crate) mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let id = TokenizationRequestId("req_1".to_string());
+        let id = tokenization_request_id("req_1");
         let result = client.poll_until_terminal(&id, &config).await;
 
         assert!(
@@ -1982,10 +2040,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            mint_result.id,
-            TokenizationRequestId("mint_123".to_string())
-        );
+        assert_eq!(mint_result.id, tokenization_request_id("mint_123"));
         assert_eq!(mint_result.status, TokenizationRequestStatus::Pending);
 
         let poll_result = service
@@ -2051,7 +2106,7 @@ pub(crate) mod tests {
 
         let detected = service.poll_for_redemption(&hash).await.unwrap();
 
-        assert_eq!(detected.id, TokenizationRequestId("redeem_456".to_string()));
+        assert_eq!(detected.id, tokenization_request_id("redeem_456"));
         assert_eq!(detected.status, TokenizationRequestStatus::Pending);
 
         let completed = service
@@ -2581,7 +2636,7 @@ pub(crate) mod tests {
         let result = service.list_pending_requests().await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
+        assert_eq!(result[0].id, tokenization_request_id("req_1"));
         pending_mock.assert();
     }
 
@@ -2610,7 +2665,7 @@ pub(crate) mod tests {
         let result = service.list_pending_requests().await.unwrap();
 
         assert_eq!(result.len(), 1, "Should filter out non-pending requests");
-        assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
+        assert_eq!(result[0].id, tokenization_request_id("req_1"));
         pending_mock.assert();
     }
 }

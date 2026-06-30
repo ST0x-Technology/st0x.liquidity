@@ -27,6 +27,7 @@ use st0x_event_sorcery::{
 };
 use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
+use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::freeze::FreezeStatusReader;
@@ -51,7 +52,6 @@ use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
     TransferUsdcToMarketMakingJobQueue,
 };
-use crate::tokenization::IssuerRequestId;
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
 };
@@ -199,7 +199,7 @@ impl std::fmt::Display for MintTrackingStage {
 struct MintTracking {
     symbol: Symbol,
     quantity: FractionalShares,
-    tokenization_request_id: Option<crate::tokenization::TokenizationRequestId>,
+    tokenization_request_id: Option<TokenizationRequestId>,
     stage: MintTrackingStage,
     last_progress_at: DateTime<Utc>,
 }
@@ -299,7 +299,7 @@ impl std::fmt::Display for RedemptionTrackingStage {
 struct RedemptionTracking {
     symbol: Symbol,
     quantity: FractionalShares,
-    tokenization_request_id: Option<crate::tokenization::TokenizationRequestId>,
+    tokenization_request_id: Option<TokenizationRequestId>,
     redemption_tx: Option<TxHash>,
     stage: RedemptionTrackingStage,
     last_progress_at: DateTime<Utc>,
@@ -421,7 +421,7 @@ impl RedemptionTracking {
 
 fn mint_event_tokenization_request_id(
     event: &TokenizedEquityMintEvent,
-) -> Option<&crate::tokenization::TokenizationRequestId> {
+) -> Option<&TokenizationRequestId> {
     match event {
         TokenizedEquityMintEvent::MintAccepted {
             tokenization_request_id,
@@ -4076,7 +4076,7 @@ impl RebalancingService {
         &self,
         id: &IssuerRequestId,
         entity: &TokenizedEquityMint,
-        tokenization_request_id: crate::tokenization::TokenizationRequestId,
+        tokenization_request_id: TokenizationRequestId,
     ) -> Result<RecoveryClaim, RebalancingServiceError> {
         let TokenizedEquityMint::Failed {
             symbol, quantity, ..
@@ -4827,6 +4827,8 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -4845,8 +4847,6 @@ mod tests {
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::rebalancing_enabled_equities;
-    use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
         ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -5140,7 +5140,7 @@ mod tests {
                     quantity: float!(10),
                     wallet: Address::ZERO,
                     issuer_request_id: mint_id.clone(),
-                    tokenization_request_id: TokenizationRequestId("TOK-1".to_string()),
+                    tokenization_request_id: tokenization_request_id("TOK-1"),
                     requested_at: Utc::now(),
                     accepted_at,
                 },
@@ -5167,7 +5167,7 @@ mod tests {
         assert_eq!(tracking.quantity, FractionalShares::new(float!(10)));
         assert_eq!(
             tracking.tokenization_request_id,
-            Some(TokenizationRequestId("TOK-1".to_string()))
+            Some(tokenization_request_id("TOK-1"))
         );
         assert_eq!(tracking.stage, MintTrackingStage::Accepted);
         assert_eq!(tracking.last_progress_at, accepted_at);
@@ -5177,7 +5177,7 @@ mod tests {
         assert!(
             ownership
                 .mint_tokenizations
-                .contains(&TokenizationRequestId("TOK-1".to_string()))
+                .contains(&tokenization_request_id("TOK-1"))
         );
 
         let inflight = {
@@ -5283,7 +5283,7 @@ mod tests {
                 quantity: float!(5),
                 wallet: Address::ZERO,
                 issuer_request_id: issuer_request_id("startup-tokens-received"),
-                tokenization_request_id: TokenizationRequestId("TOK-TR".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK-TR"),
                 tx_hash: TxHash::ZERO,
                 shares_minted: U256::from(5u64),
                 fees: None,
@@ -5305,7 +5305,7 @@ mod tests {
                 quantity: float!(5),
                 wallet: Address::ZERO,
                 issuer_request_id: issuer_request_id("startup-wrap-submitted"),
-                tokenization_request_id: TokenizationRequestId("TOK-WS".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK-WS"),
                 tx_hash: TxHash::ZERO,
                 shares_minted: U256::from(5u64),
                 fees: None,
@@ -5355,7 +5355,7 @@ mod tests {
                 quantity: float!(5),
                 wallet: Address::ZERO,
                 issuer_request_id: issuer_request_id("startup-tokens-wrapped"),
-                tokenization_request_id: TokenizationRequestId("TOK-TW".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK-TW"),
                 tx_hash: TxHash::ZERO,
                 shares_minted: U256::from(5u64),
                 requested_at: now,
@@ -5380,7 +5380,7 @@ mod tests {
                 quantity: float!(5),
                 wallet: Address::ZERO,
                 issuer_request_id: issuer_request_id("startup-vault-deposit-submitted"),
-                tokenization_request_id: TokenizationRequestId("TOK-VDS".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK-VDS"),
                 tx_hash: TxHash::ZERO,
                 shares_minted: U256::from(5u64),
                 requested_at: now,
@@ -5405,7 +5405,7 @@ mod tests {
                 quantity: float!(5),
                 wallet: Address::ZERO,
                 issuer_request_id: issuer_request_id("startup-tokens-received-disabled"),
-                tokenization_request_id: TokenizationRequestId("TOK-TR-D".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK-TR-D"),
                 tx_hash: TxHash::ZERO,
                 shares_minted: U256::from(5u64),
                 fees: None,
@@ -5434,7 +5434,7 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(12),
                     redemption_tx,
-                    tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
+                    tokenization_request_id: tokenization_request_id("TOK-2"),
                     sent_at: Utc::now(),
                     detected_at,
                 },
@@ -5461,7 +5461,7 @@ mod tests {
         assert_eq!(tracking.quantity, FractionalShares::new(float!(12)));
         assert_eq!(
             tracking.tokenization_request_id,
-            Some(TokenizationRequestId("TOK-2".to_string()))
+            Some(tokenization_request_id("TOK-2"))
         );
         assert_eq!(tracking.stage, RedemptionTrackingStage::Detected);
         assert_eq!(tracking.last_progress_at, detected_at);
@@ -5470,7 +5470,7 @@ mod tests {
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&TokenizationRequestId("TOK-2".to_string()))
+                .contains(&tokenization_request_id("TOK-2"))
         );
         assert!(ownership.redemption_txs.contains(&redemption_tx));
 
@@ -5486,7 +5486,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-explicit-recovery");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
 
         // An explicit MintAcceptanceFailed cancelled the in-flight back to
         // Hedging (offchain) available, so available holds the full 100 and
@@ -5539,7 +5539,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-timeout-recovery");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
 
         // A timeout cleared the in-flight without crediting available (Hedging
         // (offchain) available stays debited at 90) and tombstoned the aggregate
@@ -5620,7 +5620,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("rejected".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -5635,7 +5635,7 @@ mod tests {
             .on_redemption(
                 redemption_id.clone(),
                 EquityRedemptionEvent::ProviderCompletionRecovered {
-                    tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
+                    tokenization_request_id: tokenization_request_id("TOK-2"),
                     recovered_at: Utc::now(),
                 },
             )
@@ -5674,7 +5674,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("timeout".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -5697,7 +5697,7 @@ mod tests {
             .on_redemption(
                 redemption_id.clone(),
                 EquityRedemptionEvent::ProviderCompletionRecovered {
-                    tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
+                    tokenization_request_id: tokenization_request_id("TOK-2"),
                     recovered_at: Utc::now(),
                 },
             )
@@ -5720,7 +5720,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-resume-failure");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
 
         *trigger.inventory.write().await =
             InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
@@ -5785,7 +5785,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let recovering = issuer_request_id("recovering-mint");
         let other = issuer_request_id("other-mint");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
 
         // Explicit-failure shape (available 100, in-flight 0) but a *different*
         // mint owns the slot. The claim must refuse and touch nothing -- the
@@ -5831,7 +5831,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let recovering = issuer_request_id("recovering-mint");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
 
         // The slot is still owned by the recovering mint itself (e.g. a
         // reactor-less failure injection the live process never observed) -> NOT
@@ -5888,7 +5888,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("timeout".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -5953,7 +5953,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("timeout".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -6005,7 +6005,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-explicit-rollback");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
 
         // Explicit failure cancelled the in-flight back to available: 100/0.
         *trigger.inventory.write().await =
@@ -6074,7 +6074,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-timeout-rollback");
-        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tok = tokenization_request_id("TOK-1");
         let tombstone_at = Utc::now();
 
         // Timeout shape: available debited to 90, in-flight cleared, tombstoned.
@@ -6185,7 +6185,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("timeout".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -6274,7 +6274,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("rejected".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -6342,7 +6342,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("rejected".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -6388,7 +6388,7 @@ mod tests {
             quantity: float!(10),
             raindex_withdraw_tx: None,
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
             reason: Some("rejected".to_string()),
             started_at: Utc::now(),
             failed_at: Utc::now(),
@@ -6426,7 +6426,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("owned-mint");
-        let tokenization_request_id = TokenizationRequestId("owned-tokenization".to_string());
+        let tokenization_request_id = tokenization_request_id("owned-tokenization");
 
         *trigger.inventory.write().await =
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
@@ -6485,7 +6485,7 @@ mod tests {
 
         let success_mint_id = issuer_request_id("owned-success-mint");
         let success_tokenization_request_id =
-            TokenizationRequestId("owned-success-tokenization".to_string());
+            st0x_tokenization::tokenization_request_id("owned-success-tokenization");
 
         trigger
             .on_mint(
@@ -6535,7 +6535,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_id = redemption_aggregate_id("owned-redemption");
-        let tokenization_request_id = TokenizationRequestId("owned-redemption-request".to_string());
+        let tokenization_request_id = tokenization_request_id("owned-redemption-request");
         let redemption_tx = TxHash::random();
 
         *trigger.inventory.write().await =
@@ -6634,8 +6634,7 @@ mod tests {
             let trigger = make_trigger().await;
             let symbol = Symbol::new("AAPL").unwrap();
             let redemption_id = redemption_aggregate_id("failing-redemption");
-            let tokenization_request_id =
-                TokenizationRequestId("failing-redemption-request".to_string());
+            let tokenization_request_id = tokenization_request_id("failing-redemption-request");
             let redemption_tx = TxHash::random();
 
             *trigger.inventory.write().await =
@@ -8073,7 +8072,7 @@ mod tests {
     fn make_mint_accepted() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
             issuer_request_id: issuer_request_id("ISS123"),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK456"),
             accepted_at: Utc::now(),
         }
     }
@@ -10906,7 +10905,7 @@ mod tests {
 
     fn make_redemption_detected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::Detected {
-            tokenization_request_id: TokenizationRequestId("REQ123".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ123"),
             detected_at: Utc::now(),
         }
     }
@@ -11444,7 +11443,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::ProviderCompletionRecovered {
-                    tokenization_request_id: TokenizationRequestId("nav-surplus-tok".to_string()),
+                    tokenization_request_id: tokenization_request_id("nav-surplus-tok"),
                     recovered_at: Utc::now(),
                 },
             )
@@ -19548,7 +19547,7 @@ mod tests {
         let trigger = reactor.clone();
         let id = redemption_aggregate_id("timed-out-still-pending");
         let redemption_tx = TxHash::random();
-        let tokenization_request_id = TokenizationRequestId("stuck-at-alpaca".to_string());
+        let tokenization_request_id = tokenization_request_id("stuck-at-alpaca");
 
         trigger.redemption_tracking.write().await.insert(
             id.clone(),

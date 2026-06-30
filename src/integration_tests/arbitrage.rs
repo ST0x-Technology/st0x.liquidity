@@ -33,7 +33,7 @@ use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
 
-use super::{ExpectedEvent, StoredEvent, assert_events, fetch_events};
+use super::{ExpectedEvent, StoredEvent, anvil, assert_events, fetch_events};
 use crate::bindings::IRaindexV6::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, Parser, RaindexV6, Store as RainStore,
@@ -50,7 +50,6 @@ use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
 use crate::test_utils::{deploy_tofu_singleton, setup_test_pools};
-use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
@@ -477,7 +476,7 @@ async fn etch_rainlang<P: Provider>(provider: &P) {
 }
 
 async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provider + Clone> {
-    let (anvil, endpoint, key) = setup_anvil();
+    let (anvil, endpoint, key) = anvil::setup_anvil();
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
     let wallet = EthereumWallet::from(signer.clone());
     let provider = ProviderBuilder::new()

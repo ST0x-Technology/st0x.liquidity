@@ -50,9 +50,9 @@ use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
+use st0x_tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequestStatus};
 
 use crate::rebalancing::equity::EquityTransferServices;
-use crate::tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequestStatus};
 
 /// Errors that can occur during tokenized equity mint operations.
 ///
@@ -1851,7 +1851,7 @@ impl EventSourced for TokenizedEquityMint {
         info!(
             target: "tokenization",
             symbol = %alpaca_request.underlying_symbol,
-            request_id = %alpaca_request.id.0,
+            request_id = %alpaca_request.id,
             "Mint request accepted by Alpaca"
         );
 
@@ -2181,12 +2181,12 @@ mod tests {
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_float_macro::float;
     use st0x_raindex::RaindexVaultId;
+    use st0x_tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
+    use st0x_tokenization::{Tokenizer, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
-    use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
-    use crate::tokenization::{Tokenizer, issuer_request_id};
     use crate::vault_lookup::MockVaultLookup;
 
     fn mock_vault_lookup() -> MockVaultLookup {
@@ -2223,7 +2223,7 @@ mod tests {
     fn mint_accepted_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
             issuer_request_id: issuer_request_id("ISS123"),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK456"),
             accepted_at: Utc::now(),
         }
     }
@@ -2305,7 +2305,7 @@ mod tests {
             matches!(
                 &events[1],
                 TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if *issuer_request_id == crate::tokenization::issuer_request_id("ISS001")
+                    if *issuer_request_id == st0x_tokenization::issuer_request_id("ISS001")
             ),
             "Expected MintAccepted with ISS001, got: {:?}",
             events[1]
@@ -2446,7 +2446,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             issuer_request_id: issuer_request_id("ISS123"),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK456"),
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
             vault_deposit_tx_hash: TxHash::random(),
@@ -2456,7 +2456,7 @@ mod tests {
 
         let event = TokenizedEquityMintEvent::MintAccepted {
             issuer_request_id: issuer_request_id("ISS999"),
-            tokenization_request_id: TokenizationRequestId("TOK999".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK999"),
             accepted_at: Utc::now(),
         };
 
@@ -2491,7 +2491,7 @@ mod tests {
             quantity: float!(100.5),
             wallet: Address::random(),
             issuer_request_id: issuer_request_id("ISS123"),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK456"),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
         };
@@ -2572,7 +2572,7 @@ mod tests {
             quantity: float!(100.5),
             wallet: Address::random(),
             issuer_request_id: issuer_request_id("ISS123"),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK456"),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
         };
@@ -2621,7 +2621,7 @@ mod tests {
             quantity: float!(100.5),
             wallet: Address::random(),
             issuer_request_id: issuer_request_id("ISS123"),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK456"),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
         };
@@ -2757,7 +2757,7 @@ mod tests {
             quantity: float!(10),
             wallet: Address::random(),
             issuer_request_id: issuer_request_id("ISS001"),
-            tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ001"),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             fees: None,
@@ -2955,7 +2955,7 @@ mod tests {
             quantity: float!(10),
             wallet: Address::ZERO,
             issuer_request_id: issuer_request_id("ISS001"),
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             requested_at: now,
             accepted_at: later,
         };
@@ -2975,7 +2975,7 @@ mod tests {
             quantity: float!(10),
             wallet: Address::ZERO,
             issuer_request_id: issuer_request_id("ISS001"),
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             fees: None,
@@ -2999,7 +2999,7 @@ mod tests {
             quantity: float!(10),
             wallet: Address::ZERO,
             issuer_request_id: issuer_request_id("ISS001"),
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             wrap_tx_hash: TxHash::random(),
@@ -3033,7 +3033,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(10),
             issuer_request_id: issuer_request_id("ISS001"),
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
             vault_deposit_tx_hash: TxHash::random(),
@@ -3088,7 +3088,7 @@ mod tests {
         let recovered = TokenizedEquityMintEvent::ProviderCompletionRecovered {
             issuer_request_id: issuer_request_id("ISS001"),
             wallet: Address::ZERO,
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             tx_hash: TxHash::ZERO,
             shares_minted: U256::from(10) * U256::from(10).pow(U256::from(18)),
             fees: None,
@@ -3107,7 +3107,7 @@ mod tests {
                     ref tokenization_request_id,
                     ..
                 } if *recovered_symbol == symbol
-                    && *tokenization_request_id == TokenizationRequestId("TOK001".to_string())
+                    && *tokenization_request_id == st0x_tokenization::tokenization_request_id("TOK001")
             ),
             "expected recovered mint to move to TokensReceived, got {result:?}"
         );
@@ -3125,7 +3125,7 @@ mod tests {
         let event = TokenizedEquityMintEvent::ProviderCompletionRecovered {
             issuer_request_id: issuer_request_id("ISS001"),
             wallet: Address::ZERO,
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             tx_hash: TxHash::ZERO,
             shares_minted: U256::from(10),
             fees: Some(float!("0.25")),
@@ -3153,7 +3153,7 @@ mod tests {
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
                 issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
-                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK001"),
                 tx_hash: TxHash::ZERO,
                 fees: None,
             })
@@ -3182,7 +3182,7 @@ mod tests {
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
                 issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
-                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK001"),
                 tx_hash: TxHash::ZERO,
                 fees: None,
             })
@@ -3211,7 +3211,7 @@ mod tests {
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
                 issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
-                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK001"),
                 tx_hash: TxHash::ZERO,
                 fees: None,
             })
@@ -3642,7 +3642,7 @@ mod tests {
         let now = Utc::now();
         let sym = Symbol::new("tAAPL").unwrap();
         let id = issuer_request_id("ISS001");
-        let tok = TokenizationRequestId("TOK001".to_string());
+        let tok = tokenization_request_id("TOK001");
 
         assert!(
             !TokenizedEquityMint::MintRequested {
