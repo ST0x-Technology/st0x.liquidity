@@ -51,6 +51,19 @@ fn build_log_file_appender(dir: &str) -> Result<RollingFileAppender, InitError> 
         .build(dir)
 }
 
+/// Build the OTel [`Resource`] shared by the trace and log providers. Carries
+/// `service.name` and the `deployment.environment` attribute so signals from
+/// different environments are distinguishable in VictoriaTraces/VictoriaLogs.
+fn build_resource(service_name: &str, environment: &str) -> Resource {
+    Resource::builder()
+        .with_service_name(service_name.to_string())
+        .with_attributes(vec![KeyValue::new(
+            "deployment.environment",
+            environment.to_string(),
+        )])
+        .build()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
@@ -104,13 +117,7 @@ impl TelemetryCtx {
             std::thread::spawn(|| reqwest::blocking::Client::builder().gzip(true).build())
                 .join()??;
 
-        let resource = Resource::builder()
-            .with_service_name(self.service_name.clone())
-            .with_attributes(vec![KeyValue::new(
-                "deployment.environment",
-                self.environment.clone(),
-            )])
-            .build();
+        let resource = build_resource(&self.service_name, &self.environment);
 
         let tracer_provider = {
             let span_exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -513,6 +520,26 @@ mod tests {
             "retention should leave exactly {LOG_RETENTION_DAYS} files \
              (max_files - 1 pruned survivors + today's file), found {remaining}"
         );
+    }
+
+    #[test]
+    fn build_resource_carries_service_name_and_environment() {
+        use opentelemetry::Key;
+
+        // The whole point of the environment field (Juan's review): the values
+        // must actually land on the OTel resource, or staging and prod telemetry
+        // are indistinguishable downstream.
+        let resource = build_resource("st0x-liquidity", "staging");
+
+        let service_name = resource
+            .get(&Key::new("service.name"))
+            .expect("service.name attribute must be set");
+        assert_eq!(&*service_name.as_str(), "st0x-liquidity");
+
+        let environment = resource
+            .get(&Key::new("deployment.environment"))
+            .expect("deployment.environment attribute must be set");
+        assert_eq!(&*environment.as_str(), "staging");
     }
 
     #[test]
