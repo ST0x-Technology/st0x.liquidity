@@ -5,9 +5,10 @@ use num_decimal::Num;
 use st0x_execution::AccountActivity;
 
 use super::parsing::{
-    abs_decimal, decimal_field, fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal,
-    text_field,
+    abs_decimal, fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal,
+    persisted_decimal_value, text_field,
 };
+use super::query::PnlError;
 use super::response::{PnlCostCoverage, PnlCostSummary, PnlSummary};
 use super::state::CostEventRow;
 
@@ -15,7 +16,7 @@ const FEE_ACTIVITY_TYPES: &[&str] = &["FEE", "PTC"];
 const FEE_REBATE_ACTIVITY_TYPES: &[&str] = &["PTR"];
 const INTEREST_ACTIVITY_TYPES: &[&str] = &["INT", "INTNRA", "INTTW"];
 const DIVIDEND_ACTIVITY_TYPES: &[&str] = &[
-    "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT", "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX",
+    "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT", "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "CGD",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +392,7 @@ fn parse_tokenized_equity_mint_cost_event(
     row: &CostEventRow,
     symbols_by_mint_aggregate: &mut HashMap<String, String>,
     warnings: &mut Vec<String>,
-) -> (Option<CostEntryInternal>, bool) {
+) -> Result<(Option<CostEntryInternal>, bool), PnlError> {
     if row.event_type == "TokenizedEquityMintEvent::MintRequested" {
         let requested = nested_record(&row.payload, "MintRequested");
         let symbol = requested.and_then(|payload| text_field(payload, "symbol"));
@@ -404,13 +405,13 @@ fn parse_tokenized_equity_mint_cost_event(
                 ));
             }
         }
-        return (None, false);
+        return Ok((None, false));
     }
 
     let terminal_key = match row.event_type.as_str() {
         "TokenizedEquityMintEvent::TokensReceived" => "TokensReceived",
         "TokenizedEquityMintEvent::ProviderCompletionRecovered" => "ProviderCompletionRecovered",
-        _ => return (None, false),
+        _ => return Ok((None, false)),
     };
 
     let Some(terminal) = nested_record(&row.payload, terminal_key) else {
@@ -418,7 +419,7 @@ fn parse_tokenized_equity_mint_cost_event(
             "Skipped malformed tokenization cost event row {}",
             row.rowid
         ));
-        return (None, false);
+        return Ok((None, false));
     };
 
     let occurred_at = if terminal_key == "TokensReceived" {
@@ -426,21 +427,27 @@ fn parse_tokenized_equity_mint_cost_event(
     } else {
         text_field(terminal, "recovered_at")
     };
-    let fees = decimal_field(terminal, "fees");
+    let fees = persisted_decimal_value(
+        row.rowid,
+        "TokenizedEquityMint",
+        row.event_type.clone(),
+        terminal,
+        "fees",
+    )?;
     let Some(occurred_at) = occurred_at else {
         warnings.push(format!(
             "Skipped tokenization fee row {} without timestamp",
             row.rowid
         ));
-        return (None, false);
+        return Ok((None, false));
     };
 
     let Some(fees) = fees else {
-        return (None, true);
+        return Ok((None, true));
     };
 
     if fees.is_zero() {
-        return (None, false);
+        return Ok((None, false));
     }
 
     let entry = cost_entry(
@@ -453,21 +460,32 @@ fn parse_tokenized_equity_mint_cost_event(
         "Alpaca tokenization fee reported by tokenization provider",
         symbols_by_mint_aggregate.get(&row.aggregate_id).cloned(),
     );
-    (Some(entry), false)
+    Ok((Some(entry), false))
 }
 
 fn parse_usdc_rebalance_cost_event(
     row: &CostEventRow,
     warnings: &mut Vec<String>,
-) -> Option<CostEntryInternal> {
+) -> Result<Option<CostEntryInternal>, PnlError> {
     let bridge_key = match row.event_type.as_str() {
         "UsdcRebalanceEvent::Bridged" => "Bridged",
         "UsdcRebalanceEvent::BridgingCompletionRecovered" => "BridgingCompletionRecovered",
-        _ => return None,
+        _ => return Ok(None),
     };
 
     let bridged = nested_record(&row.payload, bridge_key);
-    let fee_collected = bridged.and_then(|payload| decimal_field(payload, "fee_collected"));
+    let fee_collected = bridged
+        .map(|payload| {
+            persisted_decimal_value(
+                row.rowid,
+                "UsdcRebalance",
+                row.event_type.clone(),
+                payload,
+                "fee_collected",
+            )
+        })
+        .transpose()?
+        .flatten();
     let occurred_at = bridged.and_then(|payload| {
         if bridge_key == "Bridged" {
             text_field(payload, "minted_at")
@@ -481,14 +499,14 @@ fn parse_usdc_rebalance_cost_event(
             "Skipped malformed CCTP bridge fee row {}",
             row.rowid
         ));
-        return None;
+        return Ok(None);
     };
 
     if fee_collected.is_zero() {
-        return None;
+        return Ok(None);
     }
 
-    Some(cost_entry(
+    Ok(Some(cost_entry(
         row,
         CostCategory::CctpFee,
         AccountingBucket::Generic,
@@ -497,7 +515,7 @@ fn parse_usdc_rebalance_cost_event(
         occurred_at,
         "CCTP fee_collected from bridge mint",
         None,
-    ))
+    )))
 }
 
 pub(crate) struct CostReplay {
@@ -505,7 +523,10 @@ pub(crate) struct CostReplay {
     pub(crate) missing_cost_observation_count: usize,
 }
 
-pub(crate) fn build_cost_entries(rows: &[CostEventRow], warnings: &mut Vec<String>) -> CostReplay {
+pub(crate) fn build_cost_entries(
+    rows: &[CostEventRow],
+    warnings: &mut Vec<String>,
+) -> Result<CostReplay, PnlError> {
     let mut entries = Vec::new();
     let mut symbols_by_mint_aggregate = HashMap::new();
     let mut missing_cost_observation_count = 0;
@@ -527,7 +548,7 @@ pub(crate) fn build_cost_entries(rows: &[CostEventRow], warnings: &mut Vec<Strin
                     &row,
                     &mut symbols_by_mint_aggregate,
                     warnings,
-                );
+                )?;
                 if missing {
                     missing_cost_observation_count += 1;
                 }
@@ -536,7 +557,7 @@ pub(crate) fn build_cost_entries(rows: &[CostEventRow], warnings: &mut Vec<Strin
                 }
             }
             "UsdcRebalance" => {
-                if let Some(entry) = parse_usdc_rebalance_cost_event(&row, warnings) {
+                if let Some(entry) = parse_usdc_rebalance_cost_event(&row, warnings)? {
                     entries.push(entry);
                 }
             }
@@ -556,10 +577,10 @@ pub(crate) fn build_cost_entries(rows: &[CostEventRow], warnings: &mut Vec<Strin
         ));
     }
 
-    CostReplay {
+    Ok(CostReplay {
         entries,
         missing_cost_observation_count,
-    }
+    })
 }
 
 fn activity_timestamp(activity: &AccountActivity) -> Option<String> {
@@ -567,9 +588,13 @@ fn activity_timestamp(activity: &AccountActivity) -> Option<String> {
         return Some(transaction_time.to_rfc3339());
     }
 
+    if let Some(date) = activity.date {
+        return Some(date.format("%Y-%m-%d").to_string());
+    }
+
     activity
-        .date
-        .map(|date| format!("{}T16:00:00.000Z", date.format("%Y-%m-%d")))
+        .created_at
+        .map(|created_at| created_at.to_rfc3339())
 }
 
 fn classify_activity(
@@ -689,6 +714,34 @@ pub(crate) fn build_alpaca_activity_cost_entries(
             };
             if signed_amount.is_zero() {
                 return None;
+            }
+            if let Some(currency) = activity.currency.as_deref()
+                && !currency.eq_ignore_ascii_case("USD")
+            {
+                warnings.push(format!(
+                    "Skipped Alpaca account activity {}: unsupported currency {}",
+                    activity.id, currency
+                ));
+                return None;
+            }
+            if let Some(status) = activity.status.as_deref() {
+                match status {
+                    "executed" | "correct" => {}
+                    "canceled" => {
+                        warnings.push(format!(
+                            "Skipped canceled Alpaca account activity {}",
+                            activity.id
+                        ));
+                        return None;
+                    }
+                    other => {
+                        warnings.push(format!(
+                            "Skipped Alpaca account activity {}: unsupported status {}",
+                            activity.id, other
+                        ));
+                        return None;
+                    }
+                }
             }
             let (category, accounting_bucket, effect) =
                 classify_activity(&activity.activity_type, &signed_amount)?;

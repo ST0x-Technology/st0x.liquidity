@@ -147,8 +147,8 @@
     },
     {
       label: 'Net realized PnL',
-      formula: 'realized_gross_pnl - tracked_persisted_costs + tracked_persisted_revenue',
-      note: 'Tracked persisted costs currently include explicit tokenization fees, CCTP fees, Alpaca account fees, and margin interest when available. Tracked revenue includes dividends and account activity credits when available.'
+      formula: 'realized_gross_pnl - tracked_costs + tracked_revenue',
+      note: 'Tracked costs currently include explicit tokenization fees, CCTP fees, and live Alpaca account fees and margin interest when available. Tracked revenue includes live Alpaca dividends and account activity credits when available.'
     }
   ]
 

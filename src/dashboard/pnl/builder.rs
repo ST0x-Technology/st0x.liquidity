@@ -8,12 +8,12 @@ use super::costs::{
 };
 use super::diagnostics::append_replay_diagnostics;
 use super::parsing::{is_safe_symbol, ordered_position_events};
-use super::query::PnlQuery;
+use super::query::{PnlError, PnlQuery};
 use super::replay::{
-    add_summary, apply_offchain_fill, apply_offchain_placement, apply_onchain_fill, finalize_book,
-    merge_symbol_replay_exposure, parse_offchain_fill, parse_onchain_fill, reset_symbol_costs,
-    summary_from_entries, summary_to_dto, symbol_summary_to_dto, with_direct_symbol_costs,
-    with_replay_exposure,
+    add_summary, apply_manual_position_adjustment, apply_offchain_fill, apply_offchain_placement,
+    apply_onchain_fill, finalize_book, merge_symbol_replay_exposure, parse_offchain_fill,
+    parse_onchain_fill, reset_symbol_costs, summary_from_entries, summary_to_dto,
+    symbol_summary_to_dto, with_direct_symbol_costs, with_replay_exposure,
 };
 use super::response::{PnlCostEntry, PnlResponse};
 use super::samples::{build_sample_stats, parse_position_view};
@@ -29,7 +29,7 @@ pub(crate) fn build_pnl_response_from_rows(
     query: &PnlQuery,
     symbols: &BTreeSet<String>,
     mut warnings: Vec<String>,
-) -> PnlResponse {
+) -> Result<PnlResponse, PnlError> {
     let event_rows = if symbols.is_empty() {
         event_rows
     } else {
@@ -38,7 +38,7 @@ pub(crate) fn build_pnl_response_from_rows(
             .filter(|row| symbols.contains(&row.symbol))
             .collect()
     };
-    let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings);
+    let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings)?;
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
     let mut books: HashMap<String, SymbolBook> = HashMap::new();
     let mut entries = Vec::new();
@@ -57,7 +57,7 @@ pub(crate) fn build_pnl_response_from_rows(
         let book = books.entry(row.symbol.clone()).or_default();
         match row.event_type.as_str() {
             "PositionEvent::OnChainOrderFilled" => {
-                if let Some(fill) = parse_onchain_fill(&row, &mut warnings) {
+                if let Some(fill) = parse_onchain_fill(&row, &mut warnings)? {
                     apply_onchain_fill(book, &fill, &mut entries, &mut warnings);
                 }
             }
@@ -65,7 +65,7 @@ pub(crate) fn build_pnl_response_from_rows(
                 apply_offchain_placement(book, &row, &mut warnings);
             }
             "PositionEvent::OffChainOrderFilled" => {
-                if let Some(fill) = parse_offchain_fill(&row, &mut warnings) {
+                if let Some(fill) = parse_offchain_fill(&row, &mut warnings)? {
                     apply_offchain_fill(
                         book,
                         &fill,
@@ -74,6 +74,9 @@ pub(crate) fn build_pnl_response_from_rows(
                         &mut unmatched_offchain_allocations,
                     );
                 }
+            }
+            "PositionEvent::ManualPositionAdjusted" => {
+                apply_manual_position_adjustment(book, &row, &mut warnings)?;
             }
             _ => {}
         }
@@ -118,7 +121,7 @@ pub(crate) fn build_pnl_response_from_rows(
     let end = (start + query.normalized_limit()).min(total);
     let page_entries = filtered_entries[start..end].to_vec();
 
-    let mut cost_replay = build_cost_entries(cost_rows, &mut warnings);
+    let mut cost_replay = build_cost_entries(cost_rows, &mut warnings)?;
     let alpaca_entries = build_alpaca_activity_cost_entries(alpaca_activities, &mut warnings);
     cost_replay.entries.extend(alpaca_entries);
 
@@ -172,7 +175,7 @@ pub(crate) fn build_pnl_response_from_rows(
         .map(PnlCostEntry::from)
         .collect();
 
-    PnlResponse {
+    Ok(PnlResponse {
         attribution_method: ATTRIBUTION_METHOD,
         warnings,
         sample_stats,
@@ -185,5 +188,5 @@ pub(crate) fn build_pnl_response_from_rows(
         total,
         has_more: end < total,
         windows: build_windows(&filtered_entries, &symbol_universe),
-    }
+    })
 }

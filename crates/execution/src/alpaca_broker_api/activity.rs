@@ -13,7 +13,7 @@ use super::client::AlpacaBrokerApiClient;
 
 pub const PNL_ACTIVITY_TYPES: &[&str] = &[
     "FEE", "PTC", "PTR", "INT", "INTNRA", "INTTW", "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT",
-    "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX",
+    "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "CGD",
 ];
 
 const ACCOUNT_ACTIVITIES_PAGE_SIZE: usize = 100;
@@ -187,6 +187,18 @@ mod tests {
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
+    }
+
+    #[test]
+    fn pnl_activity_query_requests_capital_gain_distributions() {
+        let query = AccountActivitiesQuery::pnl(None, None);
+
+        assert!(
+            query
+                .activity_types
+                .iter()
+                .any(|activity_type| activity_type == "CGD")
+        );
     }
 
     #[tokio::test]

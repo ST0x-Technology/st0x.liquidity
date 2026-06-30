@@ -1,7 +1,9 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use num_decimal::Num;
+use num_decimal::num_bigint::BigInt;
+use num_traits::Zero;
 use serde_json::Value;
 
 use super::SAFE_SYMBOL_CHARS;
@@ -10,27 +12,6 @@ use super::state::{Direction, PositionEventRow};
 
 pub(crate) fn parse_payload_string(payload: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(payload)
-}
-
-pub(crate) fn parse_query_datetime(
-    value: &str,
-    field: &'static str,
-) -> Result<DateTime<Utc>, PnlError> {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
-        return Ok(parsed.with_timezone(&Utc));
-    }
-
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| PnlError::InvalidDate {
-        field,
-        value: value.to_owned(),
-    })?;
-    let datetime = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| PnlError::InvalidDate {
-            field,
-            value: value.to_owned(),
-        })?;
-    Ok(DateTime::from_naive_utc_and_offset(datetime, Utc))
 }
 
 pub(crate) fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -65,8 +46,47 @@ pub(crate) fn number_text_field(payload: &Value, key: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn decimal_field(payload: &Value, key: &str) -> Option<Num> {
-    number_text_field(payload, key).and_then(|value| Num::from_str(&value).ok())
+pub(crate) fn persisted_decimal_field(
+    row: &PositionEventRow,
+    payload: &Value,
+    key: &'static str,
+) -> Result<Option<Num>, PnlError> {
+    persisted_decimal_value(row.rowid, "Position", row.event_type.clone(), payload, key)
+}
+
+pub(crate) fn persisted_decimal_value(
+    rowid: i64,
+    aggregate_type: &'static str,
+    event_type: String,
+    payload: &Value,
+    key: &'static str,
+) -> Result<Option<Num>, PnlError> {
+    let value = match payload.get(key) {
+        None => return Ok(None),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(value) => {
+            return Err(PnlError::InvalidFinancialField {
+                rowid,
+                aggregate_type,
+                event_type,
+                field: key,
+                value: value.to_string(),
+                parse_error: "expected string or number".to_owned(),
+            });
+        }
+    };
+
+    Num::from_str(&value)
+        .map(Some)
+        .map_err(|error| PnlError::InvalidFinancialField {
+            rowid,
+            aggregate_type,
+            event_type,
+            field: key,
+            value,
+            parse_error: error.to_string(),
+        })
 }
 
 pub(crate) fn direction_field(payload: &Value, key: &str) -> Option<Direction> {
@@ -85,6 +105,10 @@ pub(crate) fn position_event_replay_timestamp(row: &PositionEventRow) -> Option<
             .and_then(|filled| text_field(filled, "broker_timestamp")),
         "PositionEvent::OffChainOrderPlaced" => nested_record(&row.payload, "OffChainOrderPlaced")
             .and_then(|placed| text_field(placed, "placed_at")),
+        "PositionEvent::ManualPositionAdjusted" => {
+            nested_record(&row.payload, "ManualPositionAdjusted")
+                .and_then(|adjusted| text_field(adjusted, "adjusted_at"))
+        }
         _ => None,
     }
 }
@@ -117,13 +141,69 @@ pub(crate) fn ordered_position_events(
 }
 
 pub(crate) fn fmt_decimal(value: &Num) -> String {
-    let rounded = format!("{value:.9}");
-    let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-0" {
-        "0".to_owned()
-    } else {
-        trimmed.to_owned()
+    let (mut numerator, denominator): (BigInt, BigInt) = value.clone().into();
+    if numerator.is_zero() {
+        return "0".to_owned();
     }
+
+    let negative = numerator.sign() == num_decimal::num_bigint::Sign::Minus;
+    if negative {
+        numerator = -numerator;
+    }
+
+    let mut denominator = denominator;
+    let twos = factor_count(&mut denominator, 2);
+    let fives = factor_count(&mut denominator, 5);
+    assert!(
+        denominator == BigInt::from(1),
+        "PnL decimal output must be a finite decimal: {value:?}"
+    );
+
+    let scale = twos.max(fives);
+    let scaled = multiply_factor(
+        multiply_factor(numerator, 2, scale - twos),
+        5,
+        scale - fives,
+    );
+    let mut digits = scaled.to_string();
+
+    if scale > 0 {
+        if digits.len() <= scale {
+            digits.insert_str(0, &"0".repeat(scale + 1 - digits.len()));
+        }
+        let dot_index = digits.len() - scale;
+        digits.insert(dot_index, '.');
+        while digits.ends_with('0') {
+            digits.pop();
+        }
+        if digits.ends_with('.') {
+            digits.pop();
+        }
+    }
+
+    if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    }
+}
+
+fn factor_count(value: &mut BigInt, factor: u8) -> usize {
+    let factor = BigInt::from(factor);
+    let mut count = 0;
+    while (&*value % &factor).is_zero() {
+        *value /= &factor;
+        count += 1;
+    }
+    count
+}
+
+fn multiply_factor(mut value: BigInt, factor: u8, count: usize) -> BigInt {
+    let factor = BigInt::from(factor);
+    for _ in 0..count {
+        value *= &factor;
+    }
+    value
 }
 
 pub(crate) fn abs_decimal(value: &Num) -> Num {

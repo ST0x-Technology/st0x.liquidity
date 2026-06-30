@@ -47,7 +47,8 @@ export const fetchPnlReport = async (query: PnlQuery): Promise<PnlResponse> => {
   })
 
   if (!response.ok) {
-    throw new Error(`HTTP ${String(response.status)}`)
+    const message = (await response.text()).trim()
+    throw new Error(message === '' ? `HTTP ${String(response.status)}` : message)
   }
 
   const contentType = response.headers.get('content-type') ?? ''

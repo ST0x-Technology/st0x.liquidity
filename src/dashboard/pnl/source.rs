@@ -20,7 +20,7 @@ pub(crate) async fn build_pnl_report(
         BASELINE_WARNING.to_owned(),
         COST_WARNING.to_owned(),
     ];
-    let symbols = query.symbol_filter(&mut warnings);
+    let symbols = query.symbol_filter(&mut warnings)?;
 
     let (event_rows, position_rows, cost_rows) = tokio::try_join!(
         load_position_events(pool, &symbols),
@@ -28,7 +28,7 @@ pub(crate) async fn build_pnl_report(
         load_cost_events(pool),
     )?;
 
-    Ok(build_pnl_response_from_rows(
+    build_pnl_response_from_rows(
         event_rows,
         &position_rows,
         &cost_rows,
@@ -36,7 +36,7 @@ pub(crate) async fn build_pnl_report(
         query,
         &symbols,
         warnings,
-    ))
+    )
 }
 
 async fn load_position_events(
@@ -50,7 +50,8 @@ async fn load_position_events(
            AND event_type IN ( \
              'PositionEvent::OnChainOrderFilled', \
              'PositionEvent::OffChainOrderPlaced', \
-             'PositionEvent::OffChainOrderFilled' \
+             'PositionEvent::OffChainOrderFilled', \
+             'PositionEvent::ManualPositionAdjusted' \
            )",
     );
     if !symbols.is_empty() {

@@ -1,16 +1,20 @@
 use std::collections::BTreeSet;
+use std::str::FromStr;
 
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
+use num_decimal::Num;
 use serde_json::Value;
+use sqlx::SqlitePool;
+use sqlx::sqlite::SqlitePoolOptions;
 
 use st0x_execution::AccountActivity;
 
 use super::builder::build_pnl_response_from_rows;
 use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp};
-use super::query::{PnlCounterTradingFilter, PnlMarketSessionFilter, PnlQuery};
+use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, PnlQuery};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
 use super::state::{CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow, Venue};
-use super::{ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING};
+use super::{ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING, build_pnl_report};
 
 fn event(rowid: i64, symbol: &str, event_type: &str, payload: Value) -> PositionEventRow {
     PositionEventRow {
@@ -88,6 +92,31 @@ fn offchain_sell(rowid: i64, timestamp: &str, price: &str, shares: &str) -> Posi
     offchain_fill(rowid, "RKLB", "Sell", timestamp, price, shares)
 }
 
+fn manual_adjustment(
+    rowid: i64,
+    target_net: &str,
+    price_usdc: Option<&str>,
+    timestamp: &str,
+) -> PositionEventRow {
+    let mut payload = serde_json::json!({
+        "ManualPositionAdjusted": {
+            "previous_net": "0",
+            "target_net": target_net,
+            "reason": "test repair",
+            "adjusted_at": timestamp
+        }
+    });
+    if let Some(price_usdc) = price_usdc {
+        payload["ManualPositionAdjusted"]["price_usdc"] = serde_json::json!(price_usdc);
+    }
+    event(
+        rowid,
+        "RKLB",
+        "PositionEvent::ManualPositionAdjusted",
+        payload,
+    )
+}
+
 fn position_rows() -> Vec<PositionViewRow> {
     vec![PositionViewRow {
         symbol: "RKLB".to_owned(),
@@ -114,21 +143,31 @@ fn query_to_date_uses_exclusive_next_day_for_date_values() {
 
     assert_eq!(
         query.activity_until().unwrap(),
-        Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).single()
+        Utc.with_ymd_and_hms(2026, 5, 23, 4, 0, 0).single()
     );
 }
 
 #[test]
-fn query_to_timestamp_uses_exact_exclusive_bound() {
+fn query_from_date_uses_padded_new_york_day_boundary() {
+    let query = PnlQuery {
+        from_date: Some("2026-05-15".to_owned()),
+        ..PnlQuery::default()
+    };
+
+    assert_eq!(
+        query.activity_after().unwrap(),
+        Utc.with_ymd_and_hms(2026, 5, 8, 4, 0, 0).single()
+    );
+}
+
+#[test]
+fn query_timestamp_bounds_are_rejected() {
     let query = PnlQuery {
         to_date: Some("2026-05-15T14:30:00Z".to_owned()),
         ..PnlQuery::default()
     };
 
-    assert_eq!(
-        query.activity_until().unwrap(),
-        Utc.with_ymd_and_hms(2026, 5, 15, 14, 30, 0).single()
-    );
+    assert!(query.activity_until().is_err());
 }
 
 #[test]
@@ -137,6 +176,62 @@ fn malformed_persisted_payloads_are_rejected() {
     assert_eq!(error.classify(), serde_json::error::Category::Syntax);
     assert_eq!(error.line(), 1);
     assert_eq!(error.column(), 2);
+}
+
+#[test]
+fn decimal_formatting_preserves_accounting_precision() {
+    assert_eq!(fmt_decimal(&Num::from_str("100").unwrap()), "100");
+    assert_eq!(
+        fmt_decimal(&Num::from_str("0.0000000001").unwrap()),
+        "0.0000000001"
+    );
+    assert_eq!(
+        fmt_decimal(&Num::from_str("0.0000000000000000001").unwrap()),
+        "0.0000000000000000001"
+    );
+
+    let high_precision_product = &Num::from_str("0.123456789012345678").unwrap()
+        * &Num::from_str("0.000000000000000001").unwrap();
+    assert_eq!(
+        fmt_decimal(&high_precision_product),
+        "0.000000000000000000123456789012345678"
+    );
+}
+
+#[test]
+fn invalid_persisted_financial_fields_fail_the_report() {
+    let error = report_result(vec![onchain_sell(
+        1,
+        "not-a-decimal",
+        "2026-05-15T14:00:00Z",
+    )])
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidFinancialField {
+            rowid: 1,
+            field: "price_usdc",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn wrong_typed_persisted_fill_decimals_fail_the_report() {
+    let mut row = onchain_sell(1, "10", "2026-05-15T14:00:00Z");
+    row.payload["OnChainOrderFilled"]["amount"] = serde_json::json!(true);
+
+    let error = report_result(vec![row]).unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidFinancialField {
+            rowid: 1,
+            field: "amount",
+            ..
+        }
+    ));
 }
 
 fn position_row(symbol: &str, net_position: &str) -> PositionViewRow {
@@ -239,6 +334,19 @@ fn account_activity(
     }
 }
 
+fn date_only_account_activity(
+    id: &str,
+    activity_type: &str,
+    amount: &str,
+    symbol: Option<&str>,
+    date: &str,
+) -> AccountActivity {
+    let mut activity = account_activity(id, activity_type, amount, symbol, "2026-05-15T00:00:00Z");
+    activity.transaction_time = None;
+    activity.date = Some(NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap());
+    activity
+}
+
 fn report_with(
     events: Vec<PositionEventRow>,
     position_rows: Vec<PositionViewRow>,
@@ -247,6 +355,25 @@ fn report_with(
     query: PnlQuery,
     symbols: BTreeSet<String>,
 ) -> PnlResponse {
+    report_with_result(
+        events,
+        position_rows,
+        cost_rows,
+        alpaca_activities,
+        query,
+        symbols,
+    )
+    .unwrap()
+}
+
+fn report_with_result(
+    events: Vec<PositionEventRow>,
+    position_rows: Vec<PositionViewRow>,
+    cost_rows: Vec<CostEventRow>,
+    alpaca_activities: Vec<AccountActivity>,
+    query: PnlQuery,
+    symbols: BTreeSet<String>,
+) -> Result<PnlResponse, PnlError> {
     struct ReportInput {
         events: Vec<PositionEventRow>,
         position_rows: Vec<PositionViewRow>,
@@ -280,6 +407,73 @@ fn report_with(
         &alpaca_activities,
         &query,
         &symbols,
+        vec![
+            ATTRIBUTION_WARNING.to_owned(),
+            BASELINE_WARNING.to_owned(),
+            COST_WARNING.to_owned(),
+        ],
+    )
+}
+
+async fn pnl_test_pool(
+    events: Vec<PositionEventRow>,
+    positions: Vec<PositionViewRow>,
+) -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE events ( \
+           aggregate_type TEXT NOT NULL, \
+           aggregate_id TEXT NOT NULL, \
+           event_type TEXT NOT NULL, \
+           payload TEXT NOT NULL \
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE position_view (symbol TEXT, net_position TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for row in events {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, event_type, payload) \
+             VALUES ('Position', ?, ?, ?)",
+        )
+        .bind(row.symbol)
+        .bind(row.event_type)
+        .bind(row.payload.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for row in positions {
+        sqlx::query("INSERT INTO position_view (symbol, net_position) VALUES (?, ?)")
+            .bind(row.symbol)
+            .bind(row.net_position)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    pool
+}
+
+fn report_result(events: Vec<PositionEventRow>) -> Result<PnlResponse, PnlError> {
+    build_pnl_response_from_rows(
+        events,
+        &position_rows(),
+        &Vec::new(),
+        &Vec::new(),
+        &query(),
+        &BTreeSet::new(),
         vec![
             ATTRIBUTION_WARNING.to_owned(),
             BASELINE_WARNING.to_owned(),
@@ -426,6 +620,69 @@ fn reports_current_unmatched_offchain_origin_inventory() {
     assert_eq!(report.summary.unmatched_offchain_shares, "2");
     assert_eq!(report.summary.unmatched_offchain_notional_usd, "16");
     assert_eq!(report.summary.unmatched_offchain_fill_count, 1);
+}
+
+#[test]
+fn manual_position_adjustment_resets_open_lots_before_later_fills() {
+    let report = report(vec![
+        onchain_sell(1, "10", "2026-05-15T13:00:00Z"),
+        manual_adjustment(2, "0", None, "2026-05-15T13:30:00Z"),
+        offchain_buy(3, "2026-05-15T14:00:00Z", "8", "1"),
+    ]);
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "0");
+    assert_eq!(report.summary.open_long_shares, "1");
+    assert_eq!(report.summary.unmatched_offchain_shares, "1");
+    assert_eq!(report.entries.len(), 0);
+}
+
+#[test]
+fn manual_position_adjustment_seeds_priced_target_exposure() {
+    let report = report(vec![
+        manual_adjustment(1, "-1", Some("10"), "2026-05-15T13:30:00Z"),
+        offchain_buy(2, "2026-05-15T14:00:00Z", "8", "1"),
+    ]);
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "2");
+    assert_eq!(report.summary.open_short_shares, "0");
+    assert_eq!(report.entries.len(), 1);
+}
+
+#[test]
+fn wrong_typed_manual_adjustment_decimals_fail_the_report() {
+    let mut row = manual_adjustment(1, "0", None, "2026-05-15T13:30:00Z");
+    row.payload["ManualPositionAdjusted"]["target_net"] = serde_json::json!({});
+
+    let error = report_result(vec![row]).unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidFinancialField {
+            rowid: 1,
+            field: "target_net",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn source_loader_includes_manual_position_adjustments() {
+    let pool = pnl_test_pool(
+        vec![
+            onchain_sell(1, "10", "2026-05-15T13:00:00Z"),
+            manual_adjustment(2, "0", None, "2026-05-15T13:30:00Z"),
+            offchain_buy(3, "2026-05-15T14:00:00Z", "8", "1"),
+        ],
+        vec![position_row("RKLB", "1")],
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new()).await.unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "0");
+    assert_eq!(report.summary.open_long_shares, "1");
+    assert_eq!(report.summary.unmatched_offchain_shares, "1");
+    assert_eq!(report.entries.len(), 0);
 }
 
 #[test]
@@ -694,6 +951,96 @@ fn tracked_costs_follow_counter_trading_session_filter() {
 }
 
 #[test]
+fn wrong_typed_tokenization_fee_decimals_fail_the_report() {
+    let mut cost = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
+    cost.payload["TokensReceived"]["fees"] = serde_json::json!([]);
+
+    let error = report_with_result(
+        Vec::new(),
+        position_rows(),
+        vec![tokenized_mint_requested(10, "mint-1", "RKLB"), cost],
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidFinancialField {
+            rowid: 11,
+            field: "fees",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn wrong_typed_cctp_fee_decimals_fail_the_report() {
+    let mut cost = usdc_bridged(11, "bridge-1", "0.25", "2026-05-15T12:02:00Z");
+    cost.payload["Bridged"]["fee_collected"] = serde_json::json!({});
+
+    let error = report_with_result(
+        Vec::new(),
+        position_rows(),
+        vec![cost],
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidFinancialField {
+            rowid: 11,
+            field: "fee_collected",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn date_only_alpaca_activities_are_not_forced_into_session_filters() {
+    let all_sessions = report_with(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![date_only_account_activity(
+            "fee-date-only",
+            "FEE",
+            "-0.25",
+            None,
+            "2026-05-15",
+        )],
+        query(),
+        BTreeSet::new(),
+    );
+    let active_only = report_with(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![date_only_account_activity(
+            "fee-date-only",
+            "FEE",
+            "-0.25",
+            None,
+            "2026-05-15",
+        )],
+        PnlQuery {
+            counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingActive),
+            ..query()
+        },
+        BTreeSet::new(),
+    );
+
+    assert_eq!(all_sessions.summary.tracked_costs_usd, "0.25");
+    assert_eq!(all_sessions.cost_entries[0].occurred_at, "2026-05-15");
+    assert_eq!(active_only.summary.tracked_costs_usd, "0");
+    assert_eq!(active_only.cost_entries.len(), 0);
+}
+
+#[test]
 fn adds_symbol_dividends_to_aggregate_and_symbol_net_pnl() {
     let report = report_with(
         Vec::new(),
@@ -717,6 +1064,104 @@ fn adds_symbol_dividends_to_aggregate_and_symbol_net_pnl() {
     assert_eq!(report.symbols[0].symbol, "SGOV");
     assert_eq!(report.symbols[0].tracked_revenue_usd, "1.25");
     assert_eq!(report.symbols[0].net_realized_pnl_usd, "1.25");
+}
+
+#[test]
+fn capital_gain_distributions_are_tracked_as_dividend_revenue() {
+    let report = report_with(
+        Vec::new(),
+        vec![position_row("SGOV", "0")],
+        Vec::new(),
+        vec![account_activity(
+            "cgd-1",
+            "CGD",
+            "1.25",
+            Some("SGOV"),
+            "2026-05-15T14:02:00Z",
+        )],
+        query(),
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.summary.tracked_revenue_usd, "1.25");
+    assert_eq!(report.costs.dividend_revenue_usd, "1.25");
+    assert_eq!(report.symbols[0].tracked_revenue_usd, "1.25");
+}
+
+#[test]
+fn non_usd_alpaca_activities_are_skipped() {
+    let mut activity = account_activity("fee-eur-1", "FEE", "-0.25", None, "2026-05-15T14:02:00Z");
+    activity.currency = Some("EUR".to_owned());
+
+    let report = report_with(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![activity],
+        query(),
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.summary.tracked_costs_usd, "0");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unsupported currency EUR"))
+    );
+}
+
+#[test]
+fn canceled_alpaca_activities_are_skipped() {
+    let mut activity = account_activity(
+        "fee-canceled-1",
+        "FEE",
+        "-0.25",
+        None,
+        "2026-05-15T14:02:00Z",
+    );
+    activity.status = Some("canceled".to_owned());
+
+    let report = report_with(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![activity],
+        query(),
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.summary.tracked_costs_usd, "0");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Skipped canceled Alpaca account activity"))
+    );
+}
+
+#[test]
+fn corrected_alpaca_activities_are_included() {
+    let mut activity = account_activity(
+        "fee-correct-1",
+        "FEE",
+        "-0.25",
+        None,
+        "2026-05-15T14:02:00Z",
+    );
+    activity.status = Some("correct".to_owned());
+
+    let report = report_with(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![activity],
+        query(),
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.summary.tracked_costs_usd, "0.25");
+    assert_eq!(report.costs.broker_fees_usd, "0.25");
 }
 
 #[test]
@@ -1127,7 +1572,8 @@ fn invalid_symbol_filter_warns_and_drops_input() {
         symbol: Some("RKLB,RKLB'); DROP TABLE events; --".to_owned()),
         ..PnlQuery::default()
     }
-    .symbol_filter(&mut warnings);
+    .symbol_filter(&mut warnings)
+    .unwrap();
 
     assert_eq!(symbols.into_iter().collect::<Vec<_>>(), vec!["RKLB"]);
     assert!(
@@ -1135,6 +1581,19 @@ fn invalid_symbol_filter_warns_and_drops_input() {
             .iter()
             .any(|warning| { warning.contains("Skipped 1 invalid symbol filters") })
     );
+}
+
+#[test]
+fn invalid_only_symbol_filter_is_rejected() {
+    let mut warnings = Vec::new();
+    let error = PnlQuery {
+        symbol: Some("RKLB'); DROP TABLE events; --".to_owned()),
+        ..PnlQuery::default()
+    }
+    .symbol_filter(&mut warnings)
+    .unwrap_err();
+
+    assert!(matches!(error, PnlError::InvalidSymbolFilter { .. }));
 }
 
 #[test]
@@ -1147,6 +1606,31 @@ fn reports_position_view_reconciliation_delta() {
         warning.contains("Reconciliation note")
             && warning.contains("RKLB: replay -1, position_view 0")
     }));
+}
+
+#[test]
+fn invalid_position_view_decimal_fails_the_report() {
+    let error = report_with_result(
+        Vec::new(),
+        vec![PositionViewRow {
+            symbol: "RKLB".to_owned(),
+            net_position: Some("not-a-decimal".to_owned()),
+        }],
+        Vec::new(),
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidFinancialField {
+            aggregate_type: "PositionView",
+            field: "net_position",
+            ..
+        }
+    ));
 }
 
 #[test]

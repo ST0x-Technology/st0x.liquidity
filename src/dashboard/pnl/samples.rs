@@ -4,7 +4,7 @@ use std::str::FromStr;
 use num_decimal::Num;
 
 use super::parsing::{is_safe_symbol, position_event_replay_timestamp};
-use super::query::PnlQuery;
+use super::query::{PnlError, PnlQuery};
 use super::response::{PnlSampleStats, PnlSampleSymbolStats};
 use super::sessions::{matches_date_bounds_for_iso, matches_trade_filters};
 use super::state::{PositionEventRow, PositionViewRow, SampleStatsAcc};
@@ -12,7 +12,7 @@ use super::state::{PositionEventRow, PositionViewRow, SampleStatsAcc};
 pub(crate) fn parse_position_view(
     rows: &[PositionViewRow],
     warnings: &mut Vec<String>,
-) -> (HashMap<String, Num>, Vec<String>) {
+) -> Result<(HashMap<String, Num>, Vec<String>), PnlError> {
     let mut position_nets = HashMap::new();
     let mut symbols = BTreeSet::new();
 
@@ -31,17 +31,21 @@ pub(crate) fn parse_position_view(
                 Ok(value) => {
                     position_nets.insert(row.symbol.clone(), value);
                 }
-                Err(_) => {
-                    warnings.push(format!(
-                        "Skipped malformed position net for {}: {}",
-                        row.symbol, net_position
-                    ));
+                Err(error) => {
+                    return Err(PnlError::InvalidFinancialField {
+                        rowid: 0,
+                        aggregate_type: "PositionView",
+                        event_type: "position_view".to_owned(),
+                        field: "net_position",
+                        value: net_position.clone(),
+                        parse_error: error.to_string(),
+                    });
                 }
             }
         }
     }
 
-    (position_nets, symbols.into_iter().collect())
+    Ok((position_nets, symbols.into_iter().collect()))
 }
 
 fn add_sample_fill(sample: &mut SampleStatsAcc, event_type: &str, timestamp: &str) {

@@ -60,4 +60,29 @@ describe('fetchPnlReport', () => {
       })
     ).rejects.toThrow('Backend /pnl returned a non-JSON response')
   })
+
+  it('preserves backend error messages for failed reports', async () => {
+    vi.stubGlobal('window', {
+      location: {
+        origin: 'http://localhost:5176'
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('invalid symbol filter: DROP', {
+          status: 400,
+          headers: { 'content-type': 'text/plain' }
+        })
+      )
+    )
+
+    await expect(
+      fetchPnlReport({
+        limit: 1,
+        offset: 0,
+        symbols: new Set()
+      })
+    ).rejects.toThrow('invalid symbol filter: DROP')
+  })
 })

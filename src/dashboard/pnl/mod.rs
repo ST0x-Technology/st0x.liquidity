@@ -40,5 +40,7 @@ const COST_WARNING: &str = "Tracked costs and revenues are built bottom-up by ec
      equivalent reporting currency, so USD/USDC conversion basis is not modeled as PnL; only \
      explicit persisted fees are deducted. Persisted SQLite costs currently include tokenization \
      fees and CCTP fees. Alpaca account fees, margin interest, and dividends are fetched from \
-     Alpaca account activities. Oracle write cost is zero for the current setup. Wallet transfer \
-     fees and bot gas require additional ledger/receipt ingestion before they can be included.";
+     Alpaca account activities by activity creation-time window and then filtered locally by \
+     report date; exact long-horizon coverage requires a persisted Alpaca activity ledger. Oracle \
+     write cost is zero for the current setup. Wallet transfer fees and bot gas require additional \
+     ledger/receipt ingestion before they can be included.";

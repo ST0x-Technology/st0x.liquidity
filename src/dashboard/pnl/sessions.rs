@@ -109,7 +109,20 @@ pub(crate) fn matches_date_filter(entry: &PnlEntry, query: &PnlQuery) -> bool {
 
 pub(crate) fn matches_cost_date_filter(entry: &CostEntryInternal, query: &PnlQuery) -> bool {
     matches_date_bounds_for_iso(&entry.occurred_at, query)
-        && matches_trade_filters(&entry.occurred_at, query)
+        && matches_cost_session_filter(&entry.occurred_at, query)
+}
+
+fn matches_cost_session_filter(iso: &str, query: &PnlQuery) -> bool {
+    if parse_timestamp(iso).is_some() {
+        return matches_trade_filters(iso, query);
+    }
+
+    query
+        .market_session_filter
+        .is_none_or(|filter| filter == PnlMarketSessionFilter::All)
+        && query
+            .counter_trading_filter
+            .is_none_or(|filter| filter == PnlCounterTradingFilter::All)
 }
 
 pub(crate) fn matches_cost_symbol_filter(
