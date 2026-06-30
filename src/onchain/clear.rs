@@ -236,7 +236,7 @@ mod tests {
 
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::FractionalShares;
+    use st0x_execution::{Direction, FractionalShares};
 
     use st0x_config::IngestionCutoff;
 
@@ -317,10 +317,30 @@ mod tests {
         })
     }
 
+    /// A `SymbolCache` pre-seeded so the two `get_test_order` token addresses
+    /// resolve by ADDRESS, not RPC call order: 0xaaaa -> USDC, 0xbbbb -> wtAAPL.
+    /// This makes the direction assertions sensitive to an inverted IO-index
+    /// mapping -- the positional symbol mock returned USDC-then-wtAAPL regardless
+    /// of which token was queried, so a swapped input/output index went undetected.
+    fn symbol_cache_for_test_order() -> SymbolCache {
+        let cache = SymbolCache::default();
+        cache.map.write().expect("cache lock poisoned").extend([
+            (
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                "USDC".to_string(),
+            ),
+            (
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                "wtAAPL".to_string(),
+            ),
+        ]);
+        cache
+    }
+
     #[tokio::test]
     async fn test_try_from_clear_v3_alice_order_match() {
         let ctx = create_test_ctx();
-        let cache = SymbolCache::default();
+        let cache = symbol_cache_for_test_order();
 
         let order = get_test_order();
         let different_order = {
@@ -367,16 +387,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
+        // No token-metadata RPC here: symbols come from the pre-seeded address
+        // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -400,12 +412,16 @@ mod tests {
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
+        // Alice's order takes USDC in / wtAAPL out -> sold tokenized equity
+        // onchain. direction is the single field that decides which way the
+        // bot hedges; an inverted IO-index mapping would silently flip it.
+        assert_eq!(trade.direction, Direction::Sell);
     }
 
     #[tokio::test]
     async fn test_try_from_clear_v3_bob_order_match() {
         let ctx = create_test_ctx();
-        let cache = SymbolCache::default();
+        let cache = symbol_cache_for_test_order();
 
         let order = get_test_order();
         let different_order = {
@@ -451,16 +467,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
+        // No token-metadata RPC here: symbols come from the pre-seeded address
+        // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -484,6 +492,9 @@ mod tests {
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
+        // Bob's order takes wtAAPL in / USDC out -> bought tokenized equity
+        // onchain, the opposite of alice; the hedge direction must flip.
+        assert_eq!(trade.direction, Direction::Buy);
     }
 
     #[tokio::test]
@@ -762,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_clear_v3_alice_and_bob_both_match() {
         let ctx = create_test_ctx();
-        let cache = SymbolCache::default();
+        let cache = symbol_cache_for_test_order();
 
         let order = get_test_order();
 
@@ -804,16 +815,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
+        // No token-metadata RPC here: symbols come from the pre-seeded address
+        // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -838,6 +841,11 @@ mod tests {
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
+        // both_match resolves Alice's order (alice_hash_matches is checked
+        // first): USDC in / wtAAPL out -> sold equity onchain, so direction is
+        // Sell. Like the single-match siblings, this is sensitive to an
+        // inverted IO-index mapping.
+        assert_eq!(trade.direction, Direction::Sell);
     }
 
     fn create_parameterized_after_clear_event(
