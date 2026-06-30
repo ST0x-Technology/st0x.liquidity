@@ -2181,6 +2181,129 @@ enum BridgeStage { Burn, Attestation, Mint }
 - **Circle Attestation API**: Poll for attestation using CCTP nonce
 - **Rain OrderBook**: deposit2()/withdraw2() for vault operations
 
+##### CCTP Allowance (Standing U256::MAX Approval)
+
+Before each `depositForBurn`, the bridge checks the wallet's USDC allowance to
+the TokenMessenger. The bridge maintains a **standing `U256::MAX` allowance**
+rather than approving the exact burn amount each time.
+
+**Hot path (steady state):** If the allowance is at or above `U256::MAX / 2`
+(the threshold), no approve tx is submitted. This is the normal case.
+
+**Cold path (first use or allowance has been externally reduced):** An
+`approve(TokenMessenger, U256::MAX)` tx is submitted and confirmed. After
+confirmation, the bridge calls `wait_for_node_sync` to poll `eth_blockNumber`
+until at least one poll through the load-balanced endpoint returns a block at or
+above the approve block. This significantly reduces (but does not fully
+eliminate) the chance that the subsequent `depositForBurn` pre-flight `eth_call`
+hits a lagging node that reads allowance = 0 and reverts. The cross-node race is
+bounded by (a) the standing `U256::MAX` allowance meaning the cold path fires
+only on first use or a manual reset, and (b) the defense-in-depth retry below.
+
+**Defense-in-depth retry:** If `depositForBurn` reverts despite the above
+(structurally: re-read allowance < burn amount), the bridge re-runs the cold
+path and retries the burn exactly once. This handles rare cases where the
+node-sync poll window expires before a node catches up. If the bridge-level
+one-shot retry also fails, the job-level bounded redrive (described below) takes
+over.
+
+#### Self-Healing and Alerting
+
+##### Transient burn-revert self-heal (bounded redrive)
+
+A Base->Alpaca transfer job that receives a revert-class CCTP burn error (where
+`CctpError::is_revert()` is true, indicating a pre-submission chain revert with
+no on-chain effect) is reclassified as a safe redrive rather than a
+circuit-breaker trip. The job returns `Ok` and re-enqueues itself with a 15 s
+delay, re-entering the `resume_bridging_submitting` scan-or-reburn path on the
+next pickup.
+
+The double-burn safety guarantee is NOT `is_revert()` classification -- it is
+the `resume_bridging_submitting` scan: `find_recent_burn` scans for an existing
+burn before re-attempting, using the `from_block` lower bound durably recorded
+in the `BridgingSubmitting` aggregate event before the burn call. Even a
+misclassified error cannot cause a double-burn because the scan adopts any
+existing burn.
+
+A per-attempt wall-clock timeout is similarly reclassified: the hung attempt is
+aborted and the job re-enqueues with a 30 s delay. The scan alone is
+mempool-blind -- it adopts only a MINED burn, not one that was broadcast but not
+yet mined -- so the two-phase burn records the tx hash as soon as it is
+broadcast: `submit_burn` broadcasts and returns the hash without awaiting the
+receipt, `RecordPendingBurn` commits it to the `BridgingSubmitting` aggregate
+(`pending_burn_tx`), then `confirm_burn` awaits and validates the receipt. The
+`submit_burn -> RecordPendingBurn` critical section runs on a detached task so
+the per-attempt timeout can never cancel it between broadcasting the burn and
+recording its hash. A process crash in that same window is NOT prevented -- the
+hash is lost -- but it cannot double-burn: resume then finds no recorded hash,
+the mempool-blind scan adopts the burn only if it already mined, and otherwise
+the transfer fails closed (`BurnSubmitInconclusive`) for operator reconciliation
+rather than reburning a possibly-still-pending burn. On re-pickup,
+`resume_bridging_submitting` checks the recorded tx's on-chain status
+(`burn_status`) before the scan: a mined burn is adopted (re-validated via
+`confirm_burn`), a still-pending burn yields a delayed redrive (never a reburn),
+and a reverted burn (which moved no funds) falls through to the scan-or-reburn
+path. A burn classified **dropped** does **not** auto-reburn: once a burn tx
+hash is durably recorded, an ambiguous "dropped" classification pages the
+operator (a terminal `BurnTxDropped` error) for manual on-chain verification,
+because a load-balanced RPC could misreport a still-pending burn as dropped and
+a reburn there would double-burn. `burn_status` mirrors the wallet's
+`wait_for_receipt` drop policy (a grace window plus consecutive mempool-absence
+misses) so a still-pending tx is never misclassified as dropped.
+
+**Bound**: Both revert and timeout redrives count against a shared
+`max_burn_revert_redrives` counter persisted in the job payload (durable across
+restarts). Once the bound is reached, the job propagates a
+`BurnRevertLimitReached` error so the circuit opens and the operator is alerted.
+Genuinely ambiguous failures (where the burn may have landed and `is_revert()`
+returns false, e.g. `MessageSentEventNotFound`) are never reclassified and
+always halt for operator review.
+
+**Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
+redrives), at the limit, and before any terminal non-redriven error propagates.
+
+##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
+
+On startup, `recover_usdc_guard` re-arms transfer jobs for aggregates at
+`BridgingSubmitting` (both directions) or `WithdrawalSubmitting{BaseToAlpaca}`
+state that have no pending job row. These states are non-terminal and resumable:
+the process either crashed before the burn tx was submitted, or before the
+apalis enqueue committed. The re-arm is idempotent (suppressed if a job row
+exists) and runs before the apalis monitor starts so there is no live-job race.
+
+`WithdrawalSubmitting{AlpacaToBase}` is **NOT** auto-re-armed: the withdrawal
+transfer ID has not yet been persisted in that state (it is persisted only when
+`Withdrawing` is entered), so `resume_alpaca_to_base` returns
+`ResumeDirectionMismatch` and cannot reconstruct which Alpaca withdrawal to
+poll. When a crash leaves an aggregate in this state, `recover_usdc_guard`
+latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
+alert via `self.notifier` so the operator is paged to run `transfer resume` or
+`transfer reconcile` manually.
+
+These states do NOT receive a tracking seed (unlike `DepositFailed` /
+`ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a
+mid-flight resumable state would wedge the `DepositConfirmed` path which
+requires `bridged_amount_received` that the seed cannot supply. The re-arm path
+(job re-enqueue) handles them; the sweep path is for manually-reconcilable
+terminal states only.
+
+###### Known limitations / follow-ups
+
+- **`WithdrawalSubmitting{AlpacaToBase}` is not auto-resumable**: Making this
+  state resumable requires persisting the withdrawal identity (Alpaca transfer
+  ID) before entering `WithdrawalSubmitting` and adding a corresponding resume
+  arm in `resume_alpaca_to_base`. This is deferred work; for now the operator is
+  alerted and must reconcile manually.
+- **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
+  store or have unparseable IDs also latch the guard with an operator alert.
+  These indicate store inconsistency and require manual investigation.
+
+Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
+`transferFrom`. At realistic rebalancing sizes the allowance never drops below
+`U256::MAX / 2`, so the approve fires once at startup and not again. The
+single-USDC-rebalance-in-flight invariant ensures two concurrent burns cannot
+race the same allowance.
+
 ##### CCTP Flow (using V2 Fast Transfer)
 
 Alpaca to Base:
@@ -2205,37 +2328,41 @@ Alpaca to Base:
        USDC from a prior rebalance is present. Emits `FailBridging` (no burn
        attempted) and surfaces `WalletUsdcAmbientBalance` for operator
        reconciliation; the job treats this as a clean terminal (no redrive).
-5. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
-6. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
+5. Ensure standing allowance to TokenMessenger (see above)
+6. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
+   allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)
+7. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
    with minFinalityThreshold=1000 and calculated maxFee for fast transfer
-7. Wait for burn tx confirmation and extract CCTP nonce from event logs
-8. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
+8. Wait for burn tx confirmation and extract CCTP nonce from event logs
+9. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
    for fast transfer)
-9. Submit receiveMessage() tx on Base MessageTransmitter with attestation
-10. Wait for mint tx confirmation (~8 seconds on Base)
-11. Submit deposit tx to Rain orderbook vault on Base
-12. Wait for deposit tx confirmation
+10. Submit receiveMessage() tx on Base MessageTransmitter with attestation
+11. Wait for mint tx confirmation (~8 seconds on Base)
+12. Submit deposit tx to Rain orderbook vault on Base
+13. Wait for deposit tx confirmation
 
 Base to Alpaca:
 
 1. Submit withdraw tx from Rain orderbook vault on Base
 2. Wait for withdraw tx confirmation
-3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
-4. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0) with
+3. Ensure standing allowance to TokenMessenger on Base (see above)
+4. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
+   allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)
+5. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0) with
    minFinalityThreshold=1000 and calculated maxFee for fast transfer
-5. Wait for burn tx confirmation and extract CCTP nonce from event logs
-6. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
+6. Wait for burn tx confirmation and extract CCTP nonce from event logs
+7. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
    for fast transfer)
-7. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
+8. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
    (mints USDC to the bot's own Ethereum wallet)
-8. Wait for mint tx confirmation (~20 seconds on Ethereum)
-9. Send the minted USDC from the bot wallet to Alpaca's deposit address (see
-   "BaseToAlpaca deposit send"; fresh sends directly, resume adopts an existing
-   send)
-10. Poll Alpaca API by the send tx until deposit status is COMPLETE
-11. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
+9. Wait for mint tx confirmation (~20 seconds on Ethereum)
+10. Send the minted USDC from the bot wallet to Alpaca's deposit address (see
+    "BaseToAlpaca deposit send"; fresh sends directly, resume adopts an existing
+    send)
+11. Poll Alpaca API by the send tx until deposit status is COMPLETE
+12. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
     USDC)
-12. Poll Alpaca until conversion order is filled
+13. Poll Alpaca until conversion order is filled
 
 ###### Fast Transfer Benefits
 
@@ -3103,7 +3230,7 @@ named exemptions defined after the list:**
   a mandatory audit reason.
 - `rebuild` -- recompute a projection from the event log; emits no events.
 
-Two commands sit deliberately outside the six-verb set, named for their exact
+Three commands sit deliberately outside the six-verb set, named for their exact
 effect rather than a generic intent:
 
 - `cctp complete-mint` -- the `cctp` group exposes raw on-chain primitives that
@@ -3114,6 +3241,20 @@ effect rather than a generic intent:
   `fail-pending-offchain-order` command. `fail` would be the wrong verb here:
   the Position itself never fails -- only its orphaned order does; `--reason`
   required.
+- `process-tx` -- account an onchain fill the bot never recorded, given its
+  transaction hash: it witnesses the fill into the `OnChainTrade` log,
+  acknowledges it on the `Position`, and places the opposite-side hedge, running
+  the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
+  sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
+  commands above it belongs to no object group -- there is no stuck aggregate to
+  recover, only a missing fill to backfill. It **fails closed on a fill already
+  recorded** in the `OnChainTrade` log, whether acknowledged or merely
+  witnessed: re-applying it would double-count the position, so only a fill with
+  no record is accounted. It runs in direct-DB mode and **must not run while the
+  bot is concurrently accounting the same symbol** -- the CLI and the bot are
+  separate processes that no in-process lock can serialize, so the persisted
+  pending-acknowledgement set (see ADR 0010), not process isolation, is what
+  makes a cross-process re-drive reject as a duplicate rather than double-count.
 
 **Standing rules:**
 

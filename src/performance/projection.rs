@@ -41,7 +41,11 @@ impl HedgeLatencyProjection {
         event: PositionEvent,
     ) -> Result<(), ProjectionError> {
         match event {
-            PositionEvent::Initialized { .. } | PositionEvent::ThresholdUpdated { .. } => Ok(()),
+            // Dedup bookkeeping only (ADR 0010): no performance signal.
+            PositionEvent::Initialized { .. }
+            | PositionEvent::ThresholdUpdated { .. }
+            | PositionEvent::OnChainFillApplied { .. }
+            | PositionEvent::OnChainFillSettled { .. } => Ok(()),
             PositionEvent::OnChainOrderFilled {
                 trade_id,
                 block_timestamp,
@@ -278,7 +282,11 @@ impl HedgeLatencyProjection {
         event: OffchainOrderEvent,
     ) -> Result<(), ProjectionError> {
         match event {
-            OffchainOrderEvent::Submitted { submitted_at, .. } => {
+            // `Accepted` is the post-extraction broker-acceptance event; it
+            // carries the same `submitted_at` as the legacy `Submitted`, so both
+            // stamp the hedge submission time for latency.
+            OffchainOrderEvent::Submitted { submitted_at, .. }
+            | OffchainOrderEvent::Accepted { submitted_at, .. } => {
                 // Record submission in its own table, keyed by order id, so it
                 // survives regardless of whether the placement row exists yet:
                 // the Position and OffchainOrder streams are independent, and a
@@ -298,7 +306,8 @@ impl HedgeLatencyProjection {
                 if updated.rows_affected() == 0 {
                     debug!(
                         %id,
-                        "Duplicate Submitted event, keeping first submitted_at timestamp"
+                        "Duplicate hedge-submission event (Submitted/Accepted), keeping first \
+                         submitted_at timestamp"
                     );
                 }
 

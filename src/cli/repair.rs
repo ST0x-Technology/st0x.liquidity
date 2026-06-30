@@ -1,36 +1,18 @@
 //! Repair CLI commands for manually recovering stuck local CQRS state.
 
 use anyhow::{Context, bail};
-use async_trait::async_trait;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
-use std::sync::Arc;
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
-use st0x_execution::{FractionalShares, MarketOrder, Symbol};
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
-    OrderPlacer, build_offchain_order_cqrs,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId,
 };
 use crate::position::{Position, PositionCommand};
-
-/// An [`OrderPlacer`] for repair commands that must never place an order:
-/// `MarkFailed` is a pure terminal transition that never touches the placer.
-/// Returns an error on the unreachable placement path rather than panicking.
-struct RepairOrderPlacer;
-
-#[async_trait]
-impl OrderPlacer for RepairOrderPlacer {
-    async fn place_market_order(
-        &self,
-        _order: MarketOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
-    }
-}
 
 /// Fails a position's pending offchain order pointer and drives the orphaned
 /// `OffchainOrder` aggregate to `Failed`.
@@ -270,8 +252,8 @@ async fn fail_offchain_order_aggregate<W: Write>(
     // The wired store (not bare send_command) so the offchain_order_view
     // projection updates immediately -- a stale 'Submitted' row in the view is
     // the very symptom this command exists to repair.
-    let placer: Arc<dyn OrderPlacer> = Arc::new(RepairOrderPlacer);
-    let (store, _projection) = build_offchain_order_cqrs(pool, placer)
+    let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+        .build(())
         .await
         .context("failed to build offchain order store")?;
     let send_result = store
@@ -408,13 +390,11 @@ mod tests {
     use alloy::primitives::TxHash;
 
     use st0x_config::ExecutionThreshold;
-    use st0x_execution::{ClientOrderId, Direction, FractionalShares};
+    use st0x_execution::{Direction, ExecutorOrderId, FractionalShares};
     use st0x_finance::Usd;
     use st0x_float_macro::float;
-    use uuid::Uuid;
 
     use super::*;
-    use crate::offchain::order::noop_order_placer;
     use crate::position::TradeId;
     use crate::test_utils::{positive_shares, setup_test_db};
 
@@ -430,9 +410,24 @@ mod tests {
                 shares: positive_shares("0.5"),
                 direction: Direction::Sell,
                 executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             },
-            noop_order_placer(),
+            (),
+        )
+        .await
+        .unwrap();
+
+        // The pure `Place` handler only records the order as `Pending`; broker
+        // acceptance is a separate step (a job in production). Seed it directly
+        // so the order reaches `Submitted`, the state these repair tests exercise.
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            pool,
+            &order_id,
+            OffchainOrderCommand::MarkAccepted {
+                executor_order_id: ExecutorOrderId::new("seed-accept"),
+                placed_shares: positive_shares("0.5"),
+                submitted_at: chrono::Utc::now(),
+            },
+            (),
         )
         .await
         .unwrap();
@@ -596,7 +591,7 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -654,7 +649,7 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -703,7 +698,7 @@ mod tests {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -775,7 +770,7 @@ mod tests {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -796,7 +791,7 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -817,7 +812,7 @@ mod tests {
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it".to_string(),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -863,7 +858,7 @@ mod tests {
             OffchainOrderCommand::CompleteFill {
                 price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -904,7 +899,7 @@ mod tests {
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it concurrently".to_string(),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -955,7 +950,7 @@ mod tests {
             OffchainOrderCommand::MarkFailed {
                 error: "pre-failed".to_string(),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();
@@ -1146,7 +1141,7 @@ mod tests {
                 shares_filled: FractionalShares::new(float!(0.25)),
                 avg_price: Usd::new(float!(100)),
             },
-            noop_order_placer(),
+            (),
         )
         .await
         .unwrap();

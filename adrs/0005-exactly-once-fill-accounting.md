@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Accepted. The single-slot dedup decision (Decision point 4 / the
+`last_acknowledged_trade_id` Consequence) is **superseded in part by
+[ADR 0010](0010-bounded-pending-ack-set-for-cross-process-exactly-once.md)**:
+the single slot is correct only under serialized per-symbol processing, which
+the separate-process `process-tx` recovery CLI breaks. ADR 0010 keeps the slot
+(as a cross-upgrade bridge) and adds a bounded, event-sourced
+pending-acknowledgement set that closes the cross-process / out-of-order
+double-count.
 
 ## Context
 

@@ -437,6 +437,7 @@ fn offchain_order_failure(event: &OffchainOrderEvent) -> Option<(FailureEventTyp
         }
         OffchainOrderEvent::Placed { .. }
         | OffchainOrderEvent::Submitted { .. }
+        | OffchainOrderEvent::Accepted { .. }
         | OffchainOrderEvent::PartiallyFilled { .. }
         | OffchainOrderEvent::Filled { .. } => None,
     }
@@ -466,6 +467,8 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         | UsdcRebalanceEvent::Initiated { .. }
         | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
         | UsdcRebalanceEvent::BridgingSubmitting { .. }
+        | UsdcRebalanceEvent::PendingBurnRecorded { .. }
+        | UsdcRebalanceEvent::PendingBurnCleared { .. }
         | UsdcRebalanceEvent::BridgingInitiated { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::Bridged { .. }

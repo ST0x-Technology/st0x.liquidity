@@ -138,6 +138,7 @@ impl Reactor for Broadcaster {
                     }
                     Placed { .. }
                     | Submitted { .. }
+                    | Accepted { .. }
                     | PartiallyFilled { .. }
                     | Failed { .. } => {}
                 }
@@ -179,7 +180,7 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent, noop_order_placer};
+    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_db;
 
@@ -245,7 +246,7 @@ mod tests {
     async fn offchain_order_filled_broadcasts_fill() {
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
+            .build(())
             .await
             .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
@@ -265,7 +266,20 @@ mod tests {
                     .unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("test"),
+                    placed_shares: st0x_execution::Positive::new(
+                        st0x_execution::FractionalShares::new(st0x_float_macro::float!(5)),
+                    )
+                    .unwrap(),
+                    submitted_at: now,
                 },
             )
             .await

@@ -288,6 +288,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     ));
 
     let position_cqrs = build_position_cqrs_with_service(&pool, &service).await;
@@ -795,6 +796,11 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
                 "PositionEvent::OffChainOrderPlaced",
             ),
             ExpectedEvent::new(
@@ -811,6 +817,11 @@ async fn equity_offchain_imbalance_triggers_mint() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
             ),
             ExpectedEvent::new(
                 "TokenizedEquityMint",
@@ -851,14 +862,14 @@ async fn equity_offchain_imbalance_triggers_mint() {
     )
     .await;
 
-    let mint_requested = &events[6].payload["MintRequested"];
+    let mint_requested = &events[8].payload["MintRequested"];
     assert_eq!(
         mint_requested["symbol"].as_str().unwrap(),
         "AAPL",
         "MintRequested should target the correct symbol"
     );
 
-    let mint_accepted = &events[7].payload["MintAccepted"];
+    let mint_accepted = &events[9].payload["MintAccepted"];
     assert_eq!(
         mint_accepted["tokenization_request_id"].as_str().unwrap(),
         "mint_int_test",
@@ -1026,6 +1037,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
                 "PositionEvent::OffChainOrderPlaced",
             ),
             ExpectedEvent::new(
@@ -1042,6 +1058,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -1098,21 +1119,21 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     assert_eq!(
-        events[6].payload["VaultWithdrawPending"]["symbol"]
+        events[8].payload["VaultWithdrawPending"]["symbol"]
             .as_str()
             .unwrap(),
         "AAPL",
         "VaultWithdrawPending should target the correct symbol"
     );
     assert_eq!(
-        events[13].payload["TokensSent"]["redemption_tx"]
+        events[15].payload["TokensSent"]["redemption_tx"]
             .as_str()
             .unwrap(),
         format!("{expected_tx_hash:#x}"),
         "TokensSent redemption_tx should match the deterministic Anvil hash"
     );
     assert_eq!(
-        events[14].payload["Detected"]["tokenization_request_id"]
+        events[16].payload["Detected"]["tokenization_request_id"]
             .as_str()
             .unwrap(),
         "redeem_int_test",
@@ -1158,6 +1179,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1242,6 +1264,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1344,6 +1367,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     ));
 
     // Build snapshot store with the service as the CQRS subscriber — mirrors
@@ -1487,6 +1511,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1543,6 +1568,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1589,6 +1615,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1719,6 +1746,11 @@ async fn mint_api_failure_produces_rejected_event() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
                 "PositionEvent::OffChainOrderPlaced",
             ),
             ExpectedEvent::new(
@@ -1735,6 +1767,11 @@ async fn mint_api_failure_produces_rejected_event() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainFillApplied",
             ),
         ],
     )
@@ -1802,6 +1839,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     // Cycle 1: excess = 450, capped to 100
@@ -1929,6 +1967,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
+        Arc::new(crate::alerts::NoopNotifier),
     );
 
     // First trigger fires: excess = 400, capped to 100
@@ -2025,6 +2064,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -2083,6 +2123,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::NoopNotifier),
         );
 
         trigger.check_and_trigger_usdc().await;

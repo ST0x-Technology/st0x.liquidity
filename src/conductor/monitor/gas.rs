@@ -285,10 +285,7 @@ mod tests {
 
     #[async_trait]
     impl Notifier for CapturingNotifier {
-        async fn notify(
-            &self,
-            message: &str,
-        ) -> Result<(), crate::alerts::telegram::NotifierError> {
+        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
             self.messages.lock().unwrap().push(message.to_owned());
             Ok(())
         }

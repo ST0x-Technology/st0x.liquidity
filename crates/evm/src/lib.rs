@@ -22,7 +22,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
-use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +33,7 @@ use tracing::{debug, warn};
 pub mod error_decoding;
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
+pub use rain_error_decoding::AbiDecodedErrorType;
 
 pub mod nonce;
 pub use nonce::ResettableNonceManager;
@@ -237,6 +237,50 @@ pub enum EvmError {
 }
 
 impl EvmError {
+    /// `true` if this error represents an EVM transaction revert (as opposed
+    /// to a transport failure or other non-revert error).
+    ///
+    /// Handles both post-mining reverts ([`Self::Reverted`],
+    /// [`Self::DecodedRevert`], [`Self::Contract`] with actual revert data)
+    /// and pre-mining preflight rejections via [`Self::Transport`]:
+    ///
+    /// - Code 3: the Ethereum JSON-RPC spec execution-revert code; Anvil uses
+    ///   this in simulation mode. Unambiguously a revert regardless of message.
+    /// - Codes -32000 / -32003: shared by multiple failure types ("nonce too
+    ///   low", "underpriced", "execution reverted"). Only classified as revert
+    ///   when the message contains `"execution reverted"`.
+    ///
+    /// All other variants (`Transaction`, `AbiDecode`, `WalletConfigParse`,
+    /// `NodeBehindRequiredBlock`, and all feature-gated variants) are
+    /// non-revert by definition.
+    pub fn is_revert(&self) -> bool {
+        match self {
+            Self::Reverted { .. } | Self::DecodedRevert(_) => true,
+            // Contract wraps alloy::contract::Error, which is also produced for
+            // pure transport failures (connection reset, timeout) when revert
+            // data cannot be decoded. Only classify as revert when actual EVM
+            // revert data is present.
+            Self::Contract(contract_err) => contract_err.as_revert_data().is_some(),
+            Self::Transport(rpc_error) => rpc_error.as_error_resp().is_some_and(|payload| {
+                payload.code == 3 || payload.message.contains("execution reverted")
+            }),
+            Self::Transaction(_) | Self::AbiDecode(_) | Self::WalletConfigParse(_) => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReceiptTimeout { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::TransactionDropped { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementUnderpriced { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementFeeOverflow => false,
+            #[cfg(feature = "local-signer")]
+            Self::InvalidPrivateKey(_) => false,
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey(_) => false,
+            Self::NodeBehindRequiredBlock { .. } => false,
+        }
+    }
+
     /// `true` if this reports a transaction dropped from the mempool (it will
     /// never mine) -- a terminal failure, distinct from a still-pending tx that
     /// merely has not confirmed yet. Only the wallet builds (`turnkey` /

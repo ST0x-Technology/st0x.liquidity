@@ -5,6 +5,8 @@
 //! position, and decides when the imbalance exceeds the
 //! threshold to trigger an offsetting broker order.
 
+use std::collections::BTreeSet;
+
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -42,15 +44,31 @@ pub struct Position {
     /// rebalance cycle gets a fresh idempotency key.
     #[serde(default)]
     pub last_failed_offchain_order_id: Option<OffchainOrderId>,
-    /// The most recently applied onchain fill, rejected if re-driven.
-    /// Guards the resume path's crash window between this position
-    /// write and the `OnChainTrade` acknowledgement marker (ADR 0005).
-    /// One slot suffices: accounting jobs are serialized per symbol and
-    /// re-deliveries drain in enqueue order, so only the most recent
-    /// trade can ever be re-driven against an unmarked acknowledgement;
-    /// the upstream marker blocks all longer-range duplicates.
+    /// The most recently applied onchain fill (single slot, ADR 0005).
+    /// Retained as the zero-migration cross-upgrade bridge (ADR 0010): a
+    /// fill applied under pre-`pending_acknowledged_trade_ids` code but
+    /// left unmarked when the deploy restarts has no `OnChainFillApplied`
+    /// event in its history, so the rebuilt set cannot guard it -- this
+    /// slot, written by the unchanged `OnChainOrderFilled` evolve, still
+    /// equals that trade and rejects its re-drive.
     #[serde(default)]
     pub last_acknowledged_trade_id: Option<TradeId>,
+    /// Trade ids applied to the position but whose `OnChainTrade`
+    /// acknowledgement marker is not yet settle-pruned (ADR 0010).
+    /// Closes the cross-process / out-of-order double-count the single
+    /// slot cannot: the slot only remembers the LAST applied trade, so a
+    /// re-drive of an older fill after a newer one displaced the slot --
+    /// reachable once serialization breaks (the process-tx CLI runs in a
+    /// separate process from the bot) -- slips through. This set, fed by a
+    /// dedicated `OnChainFillApplied` event in the same atomic batch as the
+    /// position move and pruned by `SettleOnChainFill` after
+    /// the marker is durable, rejects such a re-drive regardless of how
+    /// many fills intervened. Bounded: empty at rest, one entry per
+    /// in-flight job. `OnChainFillApplied` has zero pre-`ADR 0010`
+    /// occurrences, so a full event replay rebuilds it empty rather than
+    /// re-accumulating every historical trade id.
+    #[serde(default)]
+    pub pending_acknowledged_trade_ids: BTreeSet<TradeId>,
     pub threshold: ExecutionThreshold,
     #[serde(
         serialize_with = "st0x_float_serde::serialize_option_float",
@@ -75,6 +93,10 @@ impl std::fmt::Debug for Position {
             .field(
                 "last_acknowledged_trade_id",
                 &self.last_acknowledged_trade_id,
+            )
+            .field(
+                "pending_acknowledged_trade_ids",
+                &self.pending_acknowledged_trade_ids,
             )
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
@@ -111,7 +133,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 3;
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -128,6 +150,7 @@ impl EventSourced for Position {
                 pending_offchain_order_id: None,
                 last_failed_offchain_order_id: None,
                 last_acknowledged_trade_id: None,
+                pending_acknowledged_trade_ids: BTreeSet::new(),
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
@@ -180,6 +203,30 @@ impl EventSourced for Position {
                     last_acknowledged_trade_id: Some(trade_id.clone()),
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
+                    ..entity.clone()
+                }))
+            }
+
+            // Bookkeeping only (ADR 0010): track the applied fill in the
+            // pending-acknowledgement set without touching net or
+            // last_updated -- the position move already happened in the
+            // `OnChainOrderFilled` of the same atomic batch.
+            OnChainFillApplied { trade_id, .. } => {
+                let mut pending_acknowledged_trade_ids =
+                    entity.pending_acknowledged_trade_ids.clone();
+                pending_acknowledged_trade_ids.insert(trade_id.clone());
+                Ok(Some(Self {
+                    pending_acknowledged_trade_ids,
+                    ..entity.clone()
+                }))
+            }
+
+            OnChainFillSettled { trade_id, .. } => {
+                let mut pending_acknowledged_trade_ids =
+                    entity.pending_acknowledged_trade_ids.clone();
+                pending_acknowledged_trade_ids.remove(trade_id);
+                Ok(Some(Self {
+                    pending_acknowledged_trade_ids,
                     ..entity.clone()
                 }))
             }
@@ -318,15 +365,23 @@ impl EventSourced for Position {
                         initialized_at: now,
                     },
                     PositionEvent::OnChainOrderFilled {
-                        trade_id,
+                        trade_id: trade_id.clone(),
                         amount,
                         direction,
                         price_usdc,
                         block_timestamp,
                         seen_at: now,
                     },
+                    PositionEvent::OnChainFillApplied {
+                        trade_id,
+                        applied_at: now,
+                    },
                 ])
             }
+
+            // Pruning a fill the position never applied is a no-op; never
+            // initialize the aggregate just to settle an absent trade.
+            SettleOnChainFill { .. } => Ok(vec![]),
 
             ManuallyAdjustPosition {
                 symbol,
@@ -388,18 +443,43 @@ impl EventSourced for Position {
                 block_timestamp,
                 ..
             } => {
-                if self.last_acknowledged_trade_id.as_ref() == Some(&trade_id) {
+                // Dual guard (ADR 0010): the retained slot bridges a fill
+                // applied under pre-set code and left unmarked at the
+                // deploy restart; the set rejects an out-of-order /
+                // cross-process re-drive the single slot cannot, because a
+                // newer fill displaces the slot but never the set entry.
+                if self.last_acknowledged_trade_id.as_ref() == Some(&trade_id)
+                    || self.pending_acknowledged_trade_ids.contains(&trade_id)
+                {
                     return Err(PositionError::DuplicateTrade { trade_id });
                 }
 
-                Ok(vec![PositionEvent::OnChainOrderFilled {
-                    trade_id,
-                    amount,
-                    direction,
-                    price_usdc,
-                    block_timestamp,
-                    seen_at: Utc::now(),
-                }])
+                let now = Utc::now();
+                Ok(vec![
+                    PositionEvent::OnChainOrderFilled {
+                        trade_id: trade_id.clone(),
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_timestamp,
+                        seen_at: now,
+                    },
+                    PositionEvent::OnChainFillApplied {
+                        trade_id,
+                        applied_at: now,
+                    },
+                ])
+            }
+
+            SettleOnChainFill { trade_id } => {
+                if self.pending_acknowledged_trade_ids.contains(&trade_id) {
+                    Ok(vec![PositionEvent::OnChainFillSettled {
+                        trade_id,
+                        settled_at: Utc::now(),
+                    }])
+                } else {
+                    Ok(vec![])
+                }
             }
 
             PlaceOffChainOrder {
@@ -783,6 +863,13 @@ pub enum PositionCommand {
         price_usdc: Float,
         block_timestamp: DateTime<Utc>,
     },
+    /// Prunes `trade_id` from the pending-acknowledgement set after its
+    /// `OnChainTrade` marker is durable (ADR 0010). A no-op (emits no
+    /// events) when the trade is not in the set, so a re-driven prune is
+    /// idempotent and optimistic-concurrency-safe.
+    SettleOnChainFill {
+        trade_id: TradeId,
+    },
     PlaceOffChainOrder {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -838,6 +925,21 @@ pub enum PositionEvent {
         block_timestamp: DateTime<Utc>,
         seen_at: DateTime<Utc>,
     },
+    /// Records that `trade_id` was applied to the position, in the same
+    /// atomic batch as the `OnChainOrderFilled` move (ADR 0010). A
+    /// dedicated event -- not folded into `OnChainOrderFilled` -- so that
+    /// pre-`ADR 0010` history (which has none) rebuilds the pending set
+    /// empty on full replay instead of re-accumulating every trade id.
+    OnChainFillApplied {
+        trade_id: TradeId,
+        applied_at: DateTime<Utc>,
+    },
+    /// Prunes `trade_id` from the pending-acknowledgement set once its
+    /// `OnChainTrade` marker is durable (ADR 0010).
+    OnChainFillSettled {
+        trade_id: TradeId,
+        settled_at: DateTime<Utc>,
+    },
     OffChainOrderPlaced {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -884,6 +986,8 @@ impl PositionEvent {
         match self {
             Initialized { initialized_at, .. } => *initialized_at,
             OnChainOrderFilled { seen_at, .. } => *seen_at,
+            OnChainFillApplied { applied_at, .. } => *applied_at,
+            OnChainFillSettled { settled_at, .. } => *settled_at,
             OffChainOrderPlaced { placed_at, .. } => *placed_at,
             OffChainOrderFilled {
                 broker_timestamp, ..
@@ -901,6 +1005,8 @@ impl DomainEvent for PositionEvent {
         match self {
             Initialized { .. } => "PositionEvent::Initialized".to_string(),
             OnChainOrderFilled { .. } => "PositionEvent::OnChainOrderFilled".to_string(),
+            OnChainFillApplied { .. } => "PositionEvent::OnChainFillApplied".to_string(),
+            OnChainFillSettled { .. } => "PositionEvent::OnChainFillSettled".to_string(),
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
@@ -965,6 +1071,26 @@ impl PartialEq for PositionEvent {
                     && bt1 == bt2
                     && sa1 == sa2
             }
+            (
+                Self::OnChainFillApplied {
+                    trade_id: t1,
+                    applied_at: a1,
+                },
+                Self::OnChainFillApplied {
+                    trade_id: t2,
+                    applied_at: a2,
+                },
+            ) => t1 == t2 && a1 == a2,
+            (
+                Self::OnChainFillSettled {
+                    trade_id: t1,
+                    settled_at: c1,
+                },
+                Self::OnChainFillSettled {
+                    trade_id: t2,
+                    settled_at: c2,
+                },
+            ) => t1 == t2 && c1 == c2,
             (
                 Self::OffChainOrderPlaced {
                     offchain_order_id: o1,
@@ -1048,7 +1174,7 @@ impl PartialEq for PositionEvent {
 
 impl Eq for PositionEvent {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TradeId {
     pub tx_hash: TxHash,
     pub log_index: u64,
@@ -1159,6 +1285,10 @@ impl std::fmt::Debug for PositionCommand {
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
                 .finish(),
+            Self::SettleOnChainFill { trade_id } => f
+                .debug_struct("SettleOnChainFill")
+                .field("trade_id", trade_id)
+                .finish(),
             Self::PlaceOffChainOrder {
                 offchain_order_id,
                 shares,
@@ -1251,6 +1381,22 @@ impl std::fmt::Debug for PositionEvent {
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
                 .field("seen_at", seen_at)
+                .finish(),
+            Self::OnChainFillApplied {
+                trade_id,
+                applied_at,
+            } => f
+                .debug_struct("OnChainFillApplied")
+                .field("trade_id", trade_id)
+                .field("applied_at", applied_at)
+                .finish(),
+            Self::OnChainFillSettled {
+                trade_id,
+                settled_at,
+            } => f
+                .debug_struct("OnChainFillSettled")
+                .field("trade_id", trade_id)
+                .field("settled_at", settled_at)
                 .finish(),
             Self::OffChainOrderPlaced {
                 offchain_order_id,
@@ -1385,7 +1531,20 @@ mod tests {
             .await
             .events();
 
-        assert_eq!(events.len(), 2, "Expected Initialized + OnChainOrderFilled");
+        assert_eq!(
+            events.len(),
+            3,
+            "Expected Initialized + OnChainOrderFilled + OnChainFillApplied"
+        );
+        assert!(matches!(events[0], PositionEvent::Initialized { .. }));
+        assert!(matches!(
+            events[1],
+            PositionEvent::OnChainOrderFilled { .. }
+        ));
+        assert!(matches!(
+            events[2],
+            PositionEvent::OnChainFillApplied { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1413,15 +1572,27 @@ mod tests {
             .await
             .events();
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected OnChainOrderFilled + OnChainFillApplied"
+        );
+        assert!(matches!(
+            events[0],
+            PositionEvent::OnChainOrderFilled { .. }
+        ));
+        assert!(matches!(
+            events[1],
+            PositionEvent::OnChainFillApplied { .. }
+        ));
     }
 
     /// Reproduction for the double-count half of the Witness/Acknowledge
     /// gap (ADR 0005): the position must reject a trade id it has
-    /// already applied. The resume path re-drives the acknowledge step
-    /// after a crash between the position write and the acknowledgement
-    /// marker; without this rejection the re-drive counts the same fill
-    /// twice.
+    /// already applied. Here the seeded history has only `OnChainOrderFilled`
+    /// (no `OnChainFillApplied`), mirroring a fill applied under pre-ADR-0010
+    /// code and left unmarked at the deploy restart, so the rejection comes
+    /// from the retained single slot -- the cross-upgrade bridge (ADR 0010).
     #[tokio::test]
     async fn duplicate_acknowledge_on_chain_fill_is_rejected() {
         let threshold = one_share_threshold();
@@ -1467,6 +1638,260 @@ mod tests {
             ),
             "Re-driving an already-applied trade must be rejected as a \
              duplicate, not double-counted; got: {error:?}",
+        );
+    }
+
+    /// The pending-acknowledgement set rejects an out-of-order re-drive the
+    /// single slot cannot (ADR 0010): once a newer fill (B) displaces the slot,
+    /// the slot no longer equals an older applied-but-unmarked fill (A), but the
+    /// set still holds A. This is the cross-process / process-tx-CLI double-count
+    /// the slot alone misses. Remove the set check from the dedup and this fails.
+    #[tokio::test]
+    async fn out_of_order_redrive_rejected_by_pending_set() {
+        let threshold = one_share_threshold();
+        let trade_a = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let trade_b = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 2,
+        };
+        let now = Utc::now();
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_a.clone(),
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::OnChainFillApplied {
+                    trade_id: trade_a.clone(),
+                    applied_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_b.clone(),
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::OnChainFillApplied {
+                    trade_id: trade_b,
+                    applied_at: now,
+                },
+            ])
+            .when(PositionCommand::AcknowledgeOnChainFill {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                trade_id: trade_a.clone(),
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::DuplicateTrade {
+                    trade_id: ref rejected
+                }) if *rejected == trade_a
+            ),
+            "An older applied-but-unmarked fill must be rejected by the pending \
+             set even after a newer fill displaced the slot; got: {error:?}",
+        );
+    }
+
+    /// A full replay of pre-ADR-0010 history (only `OnChainOrderFilled`, no
+    /// `OnChainFillApplied`) rebuilds the pending set EMPTY -- the regression
+    /// guard against re-accumulating every historical trade id on the
+    /// snapshot-clearing schema bump.
+    #[test]
+    fn replay_of_pre_migration_history_yields_empty_pending_set() {
+        let now = Utc::now();
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 2,
+                },
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            position.pending_acknowledged_trade_ids.is_empty(),
+            "Pre-ADR-0010 history has no OnChainFillApplied events, so replay must \
+             rebuild an empty pending set; got: {:?}",
+            position.pending_acknowledged_trade_ids,
+        );
+    }
+
+    /// Applied/Settled pairs cancel on replay, leaving only the genuinely
+    /// in-flight tail (ADR 0010): A is applied then settled (pruned); B is
+    /// applied but not yet settled (crash before its mark), so the rebuilt set
+    /// is exactly {B} -- bounded, and B stays durably guarded.
+    #[test]
+    fn replay_applied_settled_pairs_converge_to_inflight_tail() {
+        let now = Utc::now();
+        let trade_a = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let trade_b = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 2,
+        };
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_a.clone(),
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::OnChainFillApplied {
+                trade_id: trade_a.clone(),
+                applied_at: now,
+            },
+            PositionEvent::OnChainFillSettled {
+                trade_id: trade_a,
+                settled_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_b.clone(),
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::OnChainFillApplied {
+                trade_id: trade_b.clone(),
+                applied_at: now,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.pending_acknowledged_trade_ids,
+            BTreeSet::from([trade_b]),
+            "Settled fills must prune; only the unsettled tail remains",
+        );
+    }
+
+    /// Settle emits the prune event when the trade is in the pending set.
+    #[tokio::test]
+    async fn settle_emits_settled_when_member() {
+        let threshold = one_share_threshold();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let now = Utc::now();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::OnChainFillApplied {
+                    trade_id: trade_id.clone(),
+                    applied_at: now,
+                },
+            ])
+            .when(PositionCommand::SettleOnChainFill {
+                trade_id: trade_id.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            PositionEvent::OnChainFillSettled { trade_id: settled, .. }
+                if *settled == trade_id
+        ));
+    }
+
+    /// Settle for a trade not in the set is a no-op: zero events, so a
+    /// re-driven prune is idempotent and optimistic-concurrency-safe.
+    #[tokio::test]
+    async fn settle_is_noop_when_not_member() {
+        let threshold = one_share_threshold();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                initialized_at: Utc::now(),
+            }])
+            .when(PositionCommand::SettleOnChainFill {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 99,
+                },
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "Settling an absent trade must emit no events"
         );
     }
 
@@ -2684,6 +3109,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2712,6 +3138,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2740,6 +3167,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2771,6 +3199,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2802,6 +3231,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2832,6 +3262,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2863,6 +3294,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2894,6 +3326,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
@@ -2975,6 +3408,7 @@ mod tests {
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),

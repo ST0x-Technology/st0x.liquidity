@@ -7,7 +7,7 @@ use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::rpc::types::{Log, TransactionRequest};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -273,6 +273,7 @@ impl OnchainTradeBuilder {
                 amount: FractionalShares::new(Float::parse("1".to_string()).unwrap()),
                 direction: Direction::Buy,
                 price: Usdc::new(Float::parse("150".to_string()).unwrap()).unwrap(),
+                block_number: Some(1),
                 block_timestamp: Some(Utc::now()),
                 gas_used: None,
                 effective_gas_price: None,
@@ -304,6 +305,18 @@ impl OnchainTradeBuilder {
     #[must_use]
     pub(crate) fn with_log_index(mut self, index: u64) -> Self {
         self.trade.log_index = index;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_block_number(mut self, block_number: Option<u64>) -> Self {
+        self.trade.block_number = block_number;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_block_timestamp(mut self, block_timestamp: Option<DateTime<Utc>>) -> Self {
+        self.trade.block_timestamp = block_timestamp;
         self
     }
 

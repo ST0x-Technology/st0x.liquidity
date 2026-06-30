@@ -2313,6 +2313,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [wallet]
             kind = "private-key"
@@ -2425,6 +2426,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [wallet]
             kind = "private-key"
@@ -2577,6 +2579,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [rebalancing.equity]
             target = "0.5"
@@ -2639,6 +2642,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [rebalancing.equity]
             target = "0.5"
@@ -2703,6 +2707,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [rebalancing.equity]
             target = "0.5"
@@ -3275,6 +3280,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
 
             [wallet]
             kind = "private-key"

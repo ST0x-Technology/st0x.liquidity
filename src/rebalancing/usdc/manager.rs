@@ -13,7 +13,7 @@ use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
-use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
+use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::{
@@ -28,6 +28,34 @@ use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
+
+/// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
+/// task before failing terminally. The burn is already broadcast (irreversible)
+/// by the time we record, so a transient SQLite lock must not lose the hash --
+/// retrying a few times clears the common contention case.
+const BURN_RECORD_ATTEMPTS: u32 = 3;
+
+/// Base delay between `RecordPendingBurn` attempts; scaled linearly by attempt
+/// number (100ms, 200ms). A SQLite write-lock clears fast, so a short linear
+/// backoff is enough.
+const BURN_RECORD_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Upper bound on the whole `submit_burn` call -- the allowance check, fee query,
+/// AND the `depositForBurn` broadcast. These normally return in seconds; the
+/// bound exists so a black-holed RPC connection cannot hang the burn
+/// indefinitely. On elapse the submission is treated as INCONCLUSIVE (the
+/// broadcast may already have reached the network) and the transfer fails closed
+/// (`BurnSubmitInconclusive`) rather than reburning. Bounding the whole call (not
+/// just the broadcast) means a slow pre-broadcast step can also trip the
+/// fail-closed even though no burn went out -- a deliberately conservative
+/// trade-off: an unnecessary operator reconciliation is far cheaper than a
+/// double burn, and at 120 s a non-hung allowance/fee query never reaches it.
+///
+/// MUST stay well below the job's per-attempt `transfer_attempt_timeout` (1h in
+/// prod) so this fail-closed result propagates out of the detached task while the
+/// outer per-attempt-timeout await is still active -- otherwise the outer timeout
+/// could cancel the await and redrive before the fail-closed surfaced.
+const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Tuning parameters for the USDC settlement flow.
 ///
@@ -49,15 +77,80 @@ pub(crate) struct UsdcSettlementParams {
     pub(crate) message_transmitter: Address,
 }
 
+/// Ethereum-specific helpers used by [`CrossVenueCashTransfer`] that fall
+/// outside the generic [`Bridge`] interface (chain-specific queries, USDC
+/// transfers, and scan utilities). Defined here so the struct can be generic
+/// over `B` while still calling these operations through the trait in the
+/// shared impl block. [`CctpBridge`] implements this by delegating to its
+/// inherent methods. Tests implement it with `unimplemented!()` stubs for
+/// code paths that do not exercise these operations.
+#[async_trait::async_trait]
+pub(crate) trait UsdcBridgeHelper: Send + Sync + 'static {
+    /// Returns the number of confirmations for `tx_hash` on Ethereum, or
+    /// `None` if the transaction has not yet been mined.
+    async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError>;
+
+    /// Returns the block in which `tx_hash` was mined on Ethereum.
+    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError>;
+
+    /// Returns the USDC balance of `holder` on Ethereum.
+    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError>;
+
+    /// Sends `amount` USDC (6-decimal) from the bot wallet to `to` on
+    /// Ethereum, waits for confirmation, and returns the transaction hash.
+    async fn send_usdc_on_ethereum(&self, to: Address, amount: U256) -> Result<TxHash, CctpError>;
+
+    /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` event
+    /// at or after `from_block`, returning the most recent matching tx hash.
+    async fn find_recent_usdc_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, CctpError>;
+}
+
+#[async_trait::async_trait]
+impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthWallet, BaseWallet> {
+    async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
+        self.ethereum_tx_confirmations(tx_hash).await
+    }
+
+    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+        self.ethereum_tx_block(tx_hash).await
+    }
+
+    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+        self.ethereum_usdc_balance(holder).await
+    }
+
+    async fn send_usdc_on_ethereum(&self, to: Address, amount: U256) -> Result<TxHash, CctpError> {
+        self.send_usdc_on_ethereum(to, amount).await
+    }
+
+    async fn find_recent_usdc_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, CctpError> {
+        self.find_recent_usdc_transfer(from, to, amount, from_block)
+            .await
+    }
+}
+
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
 /// # Type Parameters
 ///
 /// * `Chain` - Wallet type used for both Ethereum and Base chains
-pub(crate) struct CrossVenueCashTransfer<Chain: Wallet> {
+/// * `B` - Bridge implementation; defaults to [`CctpBridge<Chain, Chain>`]
+pub(crate) struct CrossVenueCashTransfer<Chain: Wallet, B = CctpBridge<Chain, Chain>> {
     alpaca_broker: InstrumentedAlpacaBroker,
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<CctpBridge<Chain, Chain>>,
+    cctp_bridge: Arc<B>,
     raindex: Arc<RaindexService<Chain>>,
     cqrs: Arc<Store<UsdcRebalance>>,
     market_maker_wallet: Address,
@@ -71,11 +164,15 @@ enum AttestationPollOutcome {
     TimedOut,
 }
 
-impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
+impl<
+    Chain: Wallet,
+    B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
+> CrossVenueCashTransfer<Chain, B>
+{
     pub(crate) fn new(
         alpaca_broker: InstrumentedAlpacaBroker,
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<CctpBridge<Chain, Chain>>,
+        cctp_bridge: Arc<B>,
         raindex: Arc<RaindexService<Chain>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
@@ -817,6 +914,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 amount,
                 from_block,
                 burn_amount,
+                pending_burn_tx,
                 ..
             }) => {
                 let nominal_u256 = usdc_to_u256(amount)?;
@@ -833,7 +931,12 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                     nominal_u256
                 };
                 let burn_receipt = self
-                    .resume_bridging_submitting_ethereum(id, scan_amount, from_block)
+                    .resume_bridging_submitting_ethereum(
+                        id,
+                        scan_amount,
+                        from_block,
+                        pending_burn_tx,
+                    )
                     .await?;
                 // Pass burn_receipt.amount (what was actually burned, per the scan)
                 // so BurnReceipt records the real amount, not the nominal.
@@ -1702,12 +1805,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 direction,
                 amount,
                 from_block,
+                pending_burn_tx,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
                 let amount_u256 = usdc_to_u256(amount)?;
                 let burn_receipt = self
-                    .resume_bridging_submitting(id, amount_u256, from_block)
+                    .resume_bridging_submitting(id, amount_u256, from_block, pending_burn_tx)
                     .await?;
                 self.continue_from_bridging(id, amount, burn_receipt.tx)
                     .await
@@ -2574,7 +2678,14 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             )
             .await?;
 
-        let burn_receipt = self.burn_on_base(amount).await?;
+        let burn_receipt = self
+            .burn_recording_pending(
+                id,
+                BridgeDirection::BaseToEthereum,
+                amount,
+                self.market_maker_wallet,
+            )
+            .await?;
         self.record_cctp_burn(id, burn_receipt).await
     }
 
@@ -2582,12 +2693,39 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     /// already-submitted burn (adopting it to avoid a double-burn) and otherwise
     /// issues the burn, then records it. Returns the burn receipt so the caller
     /// can continue the bridge.
+    ///
+    /// `pending_burn_tx` is the burn hash durably recorded by `RecordPendingBurn`
+    /// before the receipt was awaited: when present, its on-chain status is
+    /// checked directly (`burn_status`) instead of a mempool-blind log scan,
+    /// closing the double-burn window on the timeout/crash redrive path.
+    ///
+    /// An empty scan (no recorded hash and no burn found on-chain) FAILS CLOSED
+    /// (`BurnSubmitInconclusive`) rather than reburning, because reaching this
+    /// resume path means a burn submission was already initiated (`BeginBridging`
+    /// emitted) and a broadcast may be in flight. A reburn is issued ONLY when the
+    /// recorded burn mined REVERTED (`pending_burn_tx.is_some()` -- no funds moved),
+    /// the one case where rescanning and reburning is safe. The genuine first burn
+    /// is issued by `execute_cctp_burn_on_base`, never here.
     async fn resume_bridging_submitting(
         &self,
         id: &UsdcRebalanceId,
         amount: U256,
         from_block: u64,
+        pending_burn_tx: Option<TxHash>,
     ) -> Result<BurnReceipt, UsdcTransferError> {
+        if let Some(adopted) = self
+            .check_pending_burn(id, BridgeDirection::BaseToEthereum, amount, pending_burn_tx)
+            .await?
+        {
+            return self.record_cctp_burn(id, adopted).await;
+        }
+
+        // `check_pending_burn` returned `Ok(None)`: scan for an already-mined burn to
+        // adopt. The scan-EMPTY action depends on why we fell through -- a recorded
+        // burn that mined REVERTED (`Some`, no funds moved) reburns safely; no
+        // recorded hash (`None`) fails closed (a broadcast may be in flight).
+        let reburn_on_empty = pending_burn_tx.is_some();
+
         let burn_receipt = match self
             .cctp_bridge
             .find_recent_burn(
@@ -2605,7 +2743,41 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                     amount,
                 }
             }
-            Ok(None) => self.burn_on_base(amount).await?,
+            Ok(None) if reburn_on_empty => {
+                self.burn_recording_pending(
+                    id,
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    self.market_maker_wallet,
+                )
+                .await?
+            }
+            Ok(None) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    "BridgingSubmitting resume: no recorded burn tx and none found on-chain; \
+                     a broadcast may be in flight, failing closed for operator reconciliation \
+                     (no auto-reburn)"
+                );
+                return Err(UsdcTransferError::BurnSubmitInconclusive { id: id.clone() });
+            }
+            // ScanInconclusive: the chain head hasn't advanced far enough past
+            // `from_block` to trust an empty scan result. The aggregate is at
+            // `BridgingSubmitting` (a durable state), so return
+            // `SettlementCheckTransient` so the job delayed-redrives instead of
+            // consuming the apalis retry budget.
+            Err(error @ CctpError::ScanInconclusive { .. }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "CCTP burn scan on Base inconclusive; will retry after delay"
+                );
+                return Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP burn scan on Base failed: {error}");
                 return Err(UsdcTransferError::Cctp(Box::new(error)));
@@ -2615,22 +2787,340 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         self.record_cctp_burn(id, burn_receipt).await
     }
 
-    /// Burns USDC on Base. On failure the aggregate stays at `BridgingSubmitting`
-    /// (no terminal event is emitted) so an apalis retry re-enters the scan path
-    /// rather than re-burning, and exhausted retries latch the in-progress guard
-    /// for operator reconciliation.
-    async fn burn_on_base(&self, amount: U256) -> Result<BurnReceipt, UsdcTransferError> {
-        self.cctp_bridge
-            .burn(
-                BridgeDirection::BaseToEthereum,
-                amount,
-                self.market_maker_wallet,
+    /// Two-phase CCTP burn that records the broadcast tx hash BEFORE awaiting its
+    /// receipt. `submit_burn` broadcasts and returns the hash; `RecordPendingBurn`
+    /// durably persists it; `confirm_burn` then awaits the receipt. A crash/timeout
+    /// between submit and confirm leaves `pending_burn_tx` set, so the redrive
+    /// checks that exact tx (`burn_status`) instead of a mempool-blind log scan --
+    /// closing the double-burn window on the timeout path.
+    ///
+    /// The `submit_burn -> RecordPendingBurn` critical section runs on a detached
+    /// task (`tokio::spawn`) so the hedging job's per-attempt `tokio::time::timeout`
+    /// can never cancel the resume future between broadcasting the burn and durably
+    /// recording its hash: the spawned task completes regardless, leaving
+    /// `pending_burn_tx` set for the redrive to adopt. `confirm_burn` runs after and
+    /// stays cancellable (and bounded) by that job timeout.
+    ///
+    /// The one-shot allowance retry lives here at the manager level (not inside the
+    /// bridge) so each broadcast's hash is recorded: `submit_burn` re-runs the
+    /// allowance check and fee query on every call, preserving the atomic burn's
+    /// retry-on-revert semantics while making each attempt's hash durable. Bounded
+    /// to exactly TWO attempts (unrolled below so the bound is obvious): a burn
+    /// that mines REVERTED on confirm moved no funds, so re-submitting once is
+    /// safe; a second revert (or any non-revert confirm error) is terminal. On
+    /// failure the aggregate stays at `BridgingSubmitting` (no terminal event), so
+    /// an apalis retry re-enters the resume path.
+    ///
+    /// This two-attempt retry covers only CONFIRM-time reverts (a recorded hash
+    /// that mined `MinedReverted`). A SUBMISSION-time revert is different: because
+    /// each `submit_and_record_burn` clears `pending_burn_tx` before broadcasting,
+    /// a revert at submission leaves `pending_burn_tx: None`, so the `BurnRevert`
+    /// redrive's resume FAILS CLOSED (`BurnSubmitInconclusive`) rather than
+    /// auto-reburning off a stale hash.
+    async fn burn_recording_pending(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        // First attempt.
+        let burn_tx = self
+            .submit_and_record_burn(id, direction, amount, recipient)
+            .await?;
+        match self
+            .cctp_bridge
+            .confirm_burn(direction, burn_tx, amount)
+            .await
+        {
+            Ok(burn_receipt) => return Ok(burn_receipt),
+            Err(error) if error.is_revert() => {
+                warn!(target: "rebalance", %burn_tx, "CCTP burn reverted on confirm; re-submitting once");
+            }
+            Err(error) => {
+                warn!(target: "rebalance", "CCTP burn confirm failed: {error}");
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
+            }
+        }
+
+        // Final attempt after the first burn reverted: re-submit (which re-records
+        // the new hash) and re-confirm. Its outcome is returned unconditionally.
+        let burn_tx = self
+            .submit_and_record_burn(id, direction, amount, recipient)
+            .await?;
+        match self
+            .cctp_bridge
+            .confirm_burn(direction, burn_tx, amount)
+            .await
+        {
+            Ok(burn_receipt) => Ok(burn_receipt),
+            Err(error) if error.is_revert() => {
+                warn!(target: "rebalance", "CCTP burn reverted on confirm after retry: {error}");
+                Err(UsdcTransferError::BurnRevert(Box::new(error)))
+            }
+            Err(error) => {
+                warn!(target: "rebalance", "CCTP burn confirm failed: {error}");
+                Err(UsdcTransferError::Cctp(Box::new(error)))
+            }
+        }
+    }
+
+    /// Broadcasts the burn and durably records its hash via `RecordPendingBurn`,
+    /// on a detached task so a cancelling job timeout cannot drop the future
+    /// between the (irreversible) broadcast and the record. The task captures only
+    /// owned values plus the shared `Arc`s, so it outlives a cancelled caller.
+    /// Returns the broadcast tx hash once the hash is committed. The record is
+    /// retried a bounded number of times; if every attempt fails the task returns
+    /// the TERMINAL `BurnRecordFailed` (never a silent hash loss), and a JoinError
+    /// (panic) surfaces as `BurnRecordTaskFailed`.
+    ///
+    /// The broadcast itself is bounded by [`BURN_BROADCAST_TIMEOUT`]. A submission
+    /// that times out or fails with a NON-revert (transport) error after the
+    /// request was sent is INCONCLUSIVE -- the broadcast may have reached the
+    /// network -- and surfaces the TERMINAL `BurnSubmitInconclusive` so the
+    /// transfer fails closed rather than letting a retry reburn a possibly-live
+    /// burn. Only a clean revert (no funds moved) stays on the `BurnRevert`
+    /// bounded-redrive path. The error-level `burn_tx` log emitted after
+    /// exhausting record retries is the operator's recovery signal -- it
+    /// persists in the log sink even if the calling `JoinHandle` is dropped.
+    async fn submit_and_record_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let cctp_bridge = Arc::clone(&self.cctp_bridge);
+        let cqrs = Arc::clone(&self.cqrs);
+        let task_id = id.clone();
+
+        tokio::spawn(async move {
+            // Clear any stale recorded burn hash BEFORE broadcasting, so that if recording THIS
+            // burn's hash fails, the resume path sees `pending_burn_tx: None` and fails closed
+            // instead of reburning off the stale hash (double-burn). A no-op (no event) on the
+            // first burn where pending_burn_tx is already None.
+            cqrs.send(&task_id, UsdcRebalanceCommand::ClearPendingBurn)
+                .await
+                .inspect_err(|error| {
+                    error!(
+                        target: "rebalance",
+                        id = %task_id,
+                        ?error,
+                        "Failed to clear pending burn before broadcast; not broadcasting"
+                    );
+                })
+                .map_err(UsdcTransferError::from)?;
+
+            let burn_tx = match tokio::time::timeout(
+                BURN_BROADCAST_TIMEOUT,
+                cctp_bridge.submit_burn(direction, amount, recipient),
             )
             .await
-            .map_err(|error| {
-                warn!(target: "rebalance", "CCTP burn on Base failed: {error}");
-                UsdcTransferError::Cctp(Box::new(error))
+            {
+                Ok(Ok(burn_tx)) => burn_tx,
+                // A clean revert moved no funds, so the bounded revert-redrive can
+                // safely reburn. NOTE: the pre-broadcast `ClearPendingBurn` above
+                // already reset `pending_burn_tx` to None, so a SUBMISSION-time
+                // revert leaves the aggregate at
+                // `BridgingSubmitting { pending_burn_tx: None }`. The redrive's
+                // resume therefore FAILS CLOSED (`BurnSubmitInconclusive`) rather
+                // than auto-reburning; only a CONFIRM-time revert (a recorded hash
+                // that mined `MinedReverted`) takes the scan+reburn path.
+                Ok(Err(error)) if error.is_revert() => {
+                    warn!(target: "rebalance", id = %task_id, "CCTP burn reverted on submission: {error}");
+                    return Err(UsdcTransferError::BurnRevert(Box::new(error)));
+                }
+                // A non-revert (transport/RPC) error during submission is
+                // INCONCLUSIVE: it may have fired BEFORE the broadcast (e.g. the
+                // allowance read or fee query, or connection-refused -- no burn) or
+                // AFTER the request reached the network (the burn may be live). We
+                // cannot distinguish, so fail closed conservatively rather than let a
+                // retry reburn a possibly-live burn.
+                Ok(Err(error)) => {
+                    error!(
+                        target: "rebalance",
+                        id = %task_id,
+                        ?error,
+                        "CCTP burn submission failed with a non-revert error; broadcast may \
+                         have landed, failing closed"
+                    );
+                    return Err(UsdcTransferError::BurnSubmitInconclusive { id: task_id });
+                }
+                // A timed-out broadcast may likewise have reached the network.
+                Err(_) => {
+                    error!(
+                        target: "rebalance",
+                        id = %task_id,
+                        timeout = ?BURN_BROADCAST_TIMEOUT,
+                        "CCTP burn submission timed out; broadcast may have landed, failing closed"
+                    );
+                    return Err(UsdcTransferError::BurnSubmitInconclusive { id: task_id });
+                }
+            };
+
+            // The burn is now broadcast (irreversible). Record its hash durably,
+            // retrying transient commit failures (e.g. a SQLite write-lock). If
+            // every attempt fails, return a TERMINAL error rather than proceeding
+            // to confirm as if the burn were safely recorded: a lost hash would let
+            // a later redrive treat the burn as un-broadcast and reburn off a
+            // mempool-blind scan.
+            for attempt in 1..=BURN_RECORD_ATTEMPTS {
+                match cqrs
+                    .send(
+                        &task_id,
+                        UsdcRebalanceCommand::RecordPendingBurn { burn_tx },
+                    )
+                    .await
+                {
+                    Ok(()) => return Ok(burn_tx),
+                    Err(error) => {
+                        error!(
+                            target: "rebalance",
+                            id = %task_id,
+                            %burn_tx,
+                            attempt,
+                            max = BURN_RECORD_ATTEMPTS,
+                            ?error,
+                            "Failed to commit RecordPendingBurn for broadcast burn"
+                        );
+                        if attempt < BURN_RECORD_ATTEMPTS {
+                            tokio::time::sleep(BURN_RECORD_RETRY_BACKOFF * attempt).await;
+                        }
+                    }
+                }
+            }
+
+            error!(
+                target: "rebalance",
+                id = %task_id,
+                %burn_tx,
+                "Exhausted RecordPendingBurn retries for broadcast burn; failing terminally \
+                 to avoid silently losing the burn tx hash"
+            );
+            Err(UsdcTransferError::BurnRecordFailed {
+                id: task_id,
+                burn_tx,
             })
+        })
+        .await
+        .map_err(|join_error| {
+            error!(
+                target: "rebalance",
+                %id,
+                %join_error,
+                "Burn submit-and-record task failed to join (panicked)"
+            );
+            UsdcTransferError::BurnRecordTaskFailed { id: id.clone() }
+        })?
+    }
+
+    /// Checks the durably-recorded pending burn tx before the mempool-blind log
+    /// scan, so a burn broadcast on a crashed/timed-out attempt is adopted rather
+    /// than re-burned. Called only from the `BridgingSubmitting` RESUME path (after
+    /// `BeginBridging`); the genuine first burn is issued by `execute_cctp_burn_on_*`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(receipt))` to adopt a MINED-success burn (validated via
+    ///   `confirm_burn`, so the MessageSent check matches the normal path);
+    /// - `Ok(None)` to fall through to the chain scan (which adopts an already-mined
+    ///   burn if found). This covers two cases the CALLER distinguishes by
+    ///   `pending_burn_tx`: a recorded tx that mined REVERTED (`Some`; an empty scan
+    ///   then reburns safely -- a reverted burn moved no funds), and NO recorded hash
+    ///   (`None`; an empty scan then FAILS CLOSED -- a broadcast may be in flight, so
+    ///   the resume path must NEVER auto-reburn). See `resume_bridging_submitting`;
+    /// - `Err(SettlementCheckTransient)` when the tx is still PENDING (delayed
+    ///   redrive -- the caller must NOT reburn); and
+    /// - `Err(BurnTxDropped)` when the tx is classified DROPPED -- TERMINAL. Once a
+    ///   burn tx hash is durably recorded, an ambiguous "dropped" classification
+    ///   (which a load-balanced RPC can produce for a still-pending burn) NEVER
+    ///   auto-issues a second burn; it pages the operator for manual on-chain
+    ///   verification instead.
+    async fn check_pending_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        pending_burn_tx: Option<TxHash>,
+    ) -> Result<Option<BurnReceipt>, UsdcTransferError> {
+        let Some(burn_tx) = pending_burn_tx else {
+            // No recorded hash: fall through to the scan, which ADOPTS an already-mined
+            // burn if one is found (crash-safe recovery). The caller decides the
+            // scan-EMPTY action by `pending_burn_tx.is_none()`: fail closed (a broadcast
+            // may be in flight), never auto-reburn. See `resume_bridging_submitting`.
+            return Ok(None);
+        };
+
+        let status = self
+            .cctp_bridge
+            .burn_status(direction, burn_tx)
+            .await
+            .map_err(|error| UsdcTransferError::SettlementCheckTransient {
+                id: id.clone(),
+                source: Box::new(error),
+            })?;
+
+        match status {
+            BurnTxStatus::MinedSuccess => {
+                info!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Adopting durably-recorded CCTP burn on resume (mined successfully)"
+                );
+                // Adopt via confirm_burn (not a bare BurnReceipt) so the adopt path
+                // runs the same MessageSent validation as the normal burn path. The
+                // receipt is already mined-success, so a non-revert confirm error
+                // (e.g. MessageSentEventNotFound) is the actionable failure -> Cctp.
+                let burn_receipt = self
+                    .cctp_bridge
+                    .confirm_burn(direction, burn_tx, amount)
+                    .await
+                    .map_err(|error| {
+                        warn!(target: "rebalance", %id, %burn_tx, "Adopt-path confirm of recorded burn failed: {error}");
+                        UsdcTransferError::Cctp(Box::new(error))
+                    })?;
+                Ok(Some(burn_receipt))
+            }
+            BurnTxStatus::Pending => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Recorded CCTP burn not yet mined; will retry after delay (no reburn)"
+                );
+                Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(CctpError::BurnTxPending { burn_tx }),
+                })
+            }
+            BurnTxStatus::MinedReverted => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Recorded CCTP burn reverted (no on-chain effect); rescanning and reburning"
+                );
+                Ok(None)
+            }
+            BurnTxStatus::Dropped => {
+                // A burn tx hash is durably recorded, so we must NEVER auto-issue a
+                // second burn for an ambiguous "dropped" classification: a
+                // load-balanced RPC can falsely report a still-pending burn as
+                // dropped, and a reburn there would double-burn. Page the operator
+                // for manual on-chain verification instead.
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %burn_tx,
+                    "Recorded CCTP burn not mined and no longer in mempool (dropped); \
+                     NOT reburning -- operator must verify on-chain"
+                );
+                Err(UsdcTransferError::BurnTxDropped {
+                    id: id.clone(),
+                    burn_tx,
+                })
+            }
+        }
     }
 
     /// Records the submitted CCTP burn transaction, advancing to `Bridging`.
@@ -2691,19 +3181,49 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             )
             .await?;
 
-        let burn_receipt = self.burn_on_ethereum(amount).await?;
+        let burn_receipt = self
+            .burn_recording_pending(
+                id,
+                BridgeDirection::EthereumToBase,
+                amount,
+                self.market_maker_wallet,
+            )
+            .await?;
         self.record_cctp_burn(id, burn_receipt).await
     }
 
     /// Resumes a transfer stalled at `BridgingSubmitting` (AlpacaToBase direction):
     /// scans Ethereum for an already-submitted burn (adopting it to avoid a
     /// double-burn) and otherwise issues the burn, then records it.
+    ///
+    /// `pending_burn_tx` is the burn hash durably recorded by `RecordPendingBurn`
+    /// before the receipt was awaited: when present, its on-chain status is
+    /// checked directly (`burn_status`) instead of a mempool-blind log scan,
+    /// closing the double-burn window on the timeout/crash redrive path.
+    ///
+    /// An empty scan (no recorded hash and no burn found on-chain) FAILS CLOSED
+    /// (`BurnSubmitInconclusive`) rather than reburning; a reburn is issued ONLY
+    /// when the recorded burn mined REVERTED (`pending_burn_tx.is_some()`). The
+    /// genuine first burn is issued by `execute_cctp_burn_on_ethereum`, never here.
     async fn resume_bridging_submitting_ethereum(
         &self,
         id: &UsdcRebalanceId,
         amount: U256,
         from_block: u64,
+        pending_burn_tx: Option<TxHash>,
     ) -> Result<BurnReceipt, UsdcTransferError> {
+        if let Some(adopted) = self
+            .check_pending_burn(id, BridgeDirection::EthereumToBase, amount, pending_burn_tx)
+            .await?
+        {
+            return self.record_cctp_burn(id, adopted).await;
+        }
+
+        // Scan-EMPTY action: reburn only for a recorded-burn revert (`Some`, no funds
+        // moved); fail closed when no hash was recorded (`None`, a broadcast may be
+        // in flight). See `resume_bridging_submitting` for the full rationale.
+        let reburn_on_empty = pending_burn_tx.is_some();
+
         let burn_receipt = match self
             .cctp_bridge
             .find_recent_burn(
@@ -2725,7 +3245,25 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                     amount,
                 }
             }
-            Ok(None) => self.burn_on_ethereum(amount).await?,
+            Ok(None) if reburn_on_empty => {
+                self.burn_recording_pending(
+                    id,
+                    BridgeDirection::EthereumToBase,
+                    amount,
+                    self.market_maker_wallet,
+                )
+                .await?
+            }
+            Ok(None) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    "BridgingSubmitting resume (Ethereum): no recorded burn tx and none found \
+                     on-chain; a broadcast may be in flight, failing closed for operator \
+                     reconciliation (no auto-reburn)"
+                );
+                return Err(UsdcTransferError::BurnSubmitInconclusive { id: id.clone() });
+            }
             // ScanInconclusive: the chain head hasn't advanced far enough past
             // `from_block` to trust an empty scan result. The aggregate is at
             // `BridgingSubmitting` (a durable state), so return
@@ -2749,23 +3287,6 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         };
 
         self.record_cctp_burn(id, burn_receipt).await
-    }
-
-    /// Burns USDC on Ethereum (EthereumToBase direction). On failure the
-    /// aggregate stays at `BridgingSubmitting` (no terminal event is emitted)
-    /// so an apalis retry re-enters the scan path rather than re-burning.
-    async fn burn_on_ethereum(&self, amount: U256) -> Result<BurnReceipt, UsdcTransferError> {
-        self.cctp_bridge
-            .burn(
-                BridgeDirection::EthereumToBase,
-                amount,
-                self.market_maker_wallet,
-            )
-            .await
-            .map_err(|error| {
-                warn!(target: "rebalance", "CCTP burn on Ethereum failed: {error}");
-                UsdcTransferError::Cctp(Box::new(error))
-            })
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
@@ -2913,6 +3434,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::{Uuid, uuid};
 
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
@@ -2928,14 +3450,184 @@ mod tests {
     };
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{Evm, IERC20, NoOpErrorRegistry, Wallet};
+    use st0x_evm::{Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
     use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
     use st0x_raindex::RaindexService;
 
     use super::*;
     use crate::telemetry::TelemetrySender;
-    use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
+    use crate::usdc_rebalance::{
+        RebalanceDirection, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
+    };
     use st0x_finance::UsdcConversionError;
+
+    /// A minimal bridge double for tests that exercise `burn_recording_pending`.
+    ///
+    /// `submit_burn` returns a different hash on each call (first: all-1 bytes,
+    /// second: all-2 bytes). `confirm_burn` returns an `EvmError::Reverted` on
+    /// the first call and a successful `BurnReceipt` on the second call.
+    /// All other Bridge and UsdcBridgeHelper methods `unimplemented!()`.
+    struct MockBridge {
+        submit_call_count: AtomicUsize,
+        confirm_call_count: AtomicUsize,
+    }
+
+    impl MockBridge {
+        fn new() -> Self {
+            Self {
+                submit_call_count: AtomicUsize::new(0),
+                confirm_call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl st0x_bridge::Bridge for MockBridge {
+        type Error = CctpError;
+        type Attestation = AttestationResponse;
+
+        async fn burn(
+            &self,
+            _direction: BridgeDirection,
+            _amount: U256,
+            _recipient: Address,
+        ) -> Result<BurnReceipt, CctpError> {
+            unimplemented!("MockBridge: burn not used in this test")
+        }
+
+        async fn submit_burn(
+            &self,
+            _direction: BridgeDirection,
+            _amount: U256,
+            _recipient: Address,
+        ) -> Result<TxHash, CctpError> {
+            let count = self.submit_call_count.fetch_add(1, Ordering::SeqCst);
+            // Distinct, deterministic hash per call: first burn -> [1; 32],
+            // second (retry) burn -> [2; 32]. The retry path issues exactly two
+            // burns, so any further call is a test-logic error.
+            let hash_byte: u8 = match count {
+                0 => 1,
+                1 => 2,
+                other => panic!(
+                    "MockBridge::submit_burn called {} times; expected exactly 2",
+                    other + 1
+                ),
+            };
+            Ok(TxHash::from([hash_byte; 32]))
+        }
+
+        async fn confirm_burn(
+            &self,
+            _direction: BridgeDirection,
+            tx_hash: TxHash,
+            amount: U256,
+        ) -> Result<BurnReceipt, CctpError> {
+            let count = self.confirm_call_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Err(CctpError::Evm(EvmError::Reverted { tx_hash }))
+            } else {
+                Ok(BurnReceipt {
+                    tx: tx_hash,
+                    amount,
+                })
+            }
+        }
+
+        async fn burn_status(
+            &self,
+            _direction: BridgeDirection,
+            _tx_hash: TxHash,
+        ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
+            unimplemented!("MockBridge: burn_status not used in this test")
+        }
+
+        async fn poll_attestation(
+            &self,
+            _direction: BridgeDirection,
+            _burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            unimplemented!("MockBridge: poll_attestation not used in this test")
+        }
+
+        async fn mint(
+            &self,
+            _direction: BridgeDirection,
+            _attestation: &AttestationResponse,
+        ) -> Result<st0x_bridge::MintReceipt, CctpError> {
+            unimplemented!("MockBridge: mint not used in this test")
+        }
+
+        fn reconstruct_attestation(
+            &self,
+            _message: Vec<u8>,
+            _attestation: Vec<u8>,
+        ) -> Result<AttestationResponse, CctpError> {
+            unimplemented!("MockBridge: reconstruct_attestation not used in this test")
+        }
+
+        async fn find_recent_burn(
+            &self,
+            _direction: BridgeDirection,
+            _amount: U256,
+            _recipient: Address,
+            _from_block: u64,
+        ) -> Result<Option<TxHash>, CctpError> {
+            unimplemented!("MockBridge: find_recent_burn not used in this test")
+        }
+
+        async fn find_recent_mint(
+            &self,
+            _direction: BridgeDirection,
+            _recipient: Address,
+            _from_block: u64,
+        ) -> Result<Option<st0x_bridge::MintReceipt>, CctpError> {
+            unimplemented!("MockBridge: find_recent_mint not used in this test")
+        }
+
+        async fn destination_block(&self, _direction: BridgeDirection) -> Result<u64, CctpError> {
+            unimplemented!("MockBridge: destination_block not used in this test")
+        }
+
+        async fn source_block(&self, _direction: BridgeDirection) -> Result<u64, CctpError> {
+            unimplemented!("MockBridge: source_block not used in this test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UsdcBridgeHelper for MockBridge {
+        async fn ethereum_tx_confirmations(
+            &self,
+            _tx_hash: TxHash,
+        ) -> Result<Option<u64>, CctpError> {
+            unimplemented!("MockBridge: ethereum_tx_confirmations not used in this test")
+        }
+
+        async fn ethereum_tx_block(&self, _tx_hash: TxHash) -> Result<u64, CctpError> {
+            unimplemented!("MockBridge: ethereum_tx_block not used in this test")
+        }
+
+        async fn ethereum_usdc_balance(&self, _holder: Address) -> Result<U256, CctpError> {
+            unimplemented!("MockBridge: ethereum_usdc_balance not used in this test")
+        }
+
+        async fn send_usdc_on_ethereum(
+            &self,
+            _to: Address,
+            _amount: U256,
+        ) -> Result<TxHash, CctpError> {
+            unimplemented!("MockBridge: send_usdc_on_ethereum not used in this test")
+        }
+
+        async fn find_recent_usdc_transfer(
+            &self,
+            _from: Address,
+            _to: Address,
+            _amount: U256,
+            _from_block: u64,
+        ) -> Result<Option<TxHash>, CctpError> {
+            unimplemented!("MockBridge: find_recent_usdc_transfer not used in this test")
+        }
+    }
 
     fn usdc(value: &str) -> Usdc {
         Usdc::from_str(value).unwrap()
@@ -3756,8 +4448,13 @@ mod tests {
         );
     }
 
+    /// A non-revert CCTP burn-submission failure on the forward path (here: the
+    /// burn RPCs fail because no CCTP contracts are deployed) must FAIL CLOSED as
+    /// `BurnSubmitInconclusive` -- the broadcast may have reached the network, so a
+    /// later retry must not reburn. (A clean revert, by contrast, would surface
+    /// `BurnRevert` and take the bounded revert-redrive path.)
     #[tokio::test]
-    async fn test_execute_base_to_alpaca_cctp_burn_fails_with_contract_error() {
+    async fn test_execute_base_to_alpaca_cctp_burn_submit_failure_fails_closed() {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
@@ -3792,8 +4489,9 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error when CCTP burn contract call fails, got: {error:?}"
+            matches!(error, UsdcTransferError::BurnSubmitInconclusive { .. }),
+            "a non-revert CCTP burn submission failure must fail closed as \
+             BurnSubmitInconclusive (the broadcast may have landed), got: {error:?}"
         );
     }
 
@@ -7525,6 +8223,44 @@ mod tests {
         (manager, cqrs)
     }
 
+    /// Like [`build_manager_with_ethereum_chain`] but applies the fast burn-drop
+    /// policy so an absent recorded burn tx classifies as `Dropped` immediately
+    /// (no production 30 s grace), letting the dropped-burn resume test run fast.
+    #[cfg(feature = "test-support")]
+    async fn build_manager_with_ethereum_chain_fast_burn_drop(
+        chain: &EthereumUsdcChain,
+        server: &MockServer,
+        market_maker_wallet: Address,
+    ) -> (
+        CrossVenueCashTransfer<
+            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
+        >,
+        Arc<Store<UsdcRebalance>>,
+    ) {
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(server));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cctp_bridge = cctp_bridge.with_fast_burn_drop_policy();
+        let cqrs = create_test_store_instance().await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        (manager, cqrs)
+    }
+
     /// Stages the aggregate at `WithdrawalComplete` (AlpacaToBase direction).
     async fn advance_to_withdrawal_complete_alpaca_to_base(
         cqrs: &Store<UsdcRebalance>,
@@ -7591,10 +8327,16 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // Deploy a REVERT-only contract at TOKEN_MESSENGER_V2 so the burn
-        // attempt fails predictably: BeginBridging fires before the burn,
-        // leaving the aggregate at BridgingSubmitting (not BridgingFailed).
-        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        // Deploy a REVERT contract at TOKEN_MESSENGER_V2 so the burn fails
+        // predictably. The bytecode is PUSH1 0 PUSH1 0 REVERT (0x60 0x00 0x60
+        // 0x00 0xFD), which pushes two zero arguments for the REVERT opcode so
+        // the stack is not underflowed. This produces a proper EVM revert
+        // (error code 3 / "execution reverted"), recognized by is_revert().
+        // A bare 0xFD with empty stack would cause StackUnderflow (code -32603),
+        // which is_revert() does not classify as a revert-class error.
+        // BeginBridging fires before the burn attempt; the REVERT leaves the
+        // aggregate at BridgingSubmitting (not BridgingFailed).
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
         let provider = ProviderBuilder::new()
             .connect(&chain.endpoint)
             .await
@@ -7618,8 +8360,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error, not a balance-gate wedge; got: {error:?}"
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "Expected BurnRevert error from REVERT-bytecode burn (0xFD), got: {error:?}"
         );
 
         // Aggregate at BridgingSubmitting confirms BeginBridging was emitted
@@ -7726,8 +8468,12 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // REVERT-only contract: confirms burn was attempted (not wedged).
-        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        // REVERT contract: confirms burn was attempted (not wedged by gates).
+        // The bytecode PUSH1 0 PUSH1 0 REVERT (0x60 0x00 0x60 0x00 0xFD)
+        // produces a proper EVM revert (code 3 / "execution reverted") so
+        // is_revert() classifies it as a BurnRevert. A bare 0xFD with empty
+        // stack causes StackUnderflow (code -32603), which is_revert() rejects.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
         let provider = ProviderBuilder::new()
             .connect(&chain.endpoint)
             .await
@@ -7745,16 +8491,16 @@ mod tests {
         // withdrawal_tx = None: no confirmation gate is entered at all.
         // If the confirmation gate ran, the mock server would return 404 (no
         // tx-confirmation endpoint registered), producing SettlementCheckTransient.
-        // A Cctp error proves the gate was skipped and the burn was attempted.
+        // A BurnRevert error proves the gate was skipped and the burn was attempted.
         let error = manager
             .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
             .await
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error (burn attempted, tx-confirmation gate skipped); \
-             SettlementCheckTransient would indicate the confirmation gate incorrectly fired; \
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "Expected BurnRevert error from REVERT-bytecode burn (0xFD, confirmation gate \
+             skipped); SettlementCheckTransient would indicate the gate incorrectly fired; \
              got: {error:?}"
         );
 
@@ -7923,9 +8669,13 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // Deploy a REVERT-only contract at TOKEN_MESSENGER_V2 (0xFD = REVERT opcode)
-        // to ensure any call that reaches the contract level also reverts.
-        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        // Deploy a REVERT contract at TOKEN_MESSENGER_V2. The bytecode is
+        // PUSH1 0 PUSH1 0 REVERT (0x60 0x00 0x60 0x00 0xFD): two zero
+        // arguments for REVERT so the stack is not underflowed. This produces
+        // a proper EVM revert (code 3 / "execution reverted") recognized by
+        // is_revert(). A bare 0xFD with empty stack causes StackUnderflow
+        // (code -32603) which is_revert() does not classify as a revert.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
         let provider = ProviderBuilder::new()
             .connect(&chain.endpoint)
             .await
@@ -7950,8 +8700,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "Expected Cctp error from pre-commit burn failure, got: {error:?}"
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "Expected BurnRevert error from REVERT-bytecode burn (0xFD pre-commit), got: {error:?}"
         );
 
         // Aggregate must be in BridgingSubmitting (BeginBridging was emitted before
@@ -8765,6 +9515,44 @@ mod tests {
         );
     }
 
+    /// `resume_bridging_submitting` (Base->Alpaca, burning via BaseToEthereum)
+    /// returns `SettlementCheckTransient` -- not `Cctp` -- when the burn scan is
+    /// inconclusive (chain head not yet `SCAN_FINALITY_MARGIN` blocks past
+    /// `from_block`). Mirrors the Ethereum counterpart so an inconclusive scan
+    /// delayed-redrives instead of tripping the terminal circuit. The aggregate
+    /// stays at `BridgingSubmitting`.
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_scan_inconclusive_returns_settlement_transient() {
+        let server = MockServer::start();
+        let (manager, cqrs, anvil) = make_resume_test_manager(&server).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+        let from_block = provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+        let error = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+            "an inconclusive Base burn scan must yield SettlementCheckTransient (delayed \
+             redrive), not Cctp (terminal); got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "Aggregate must stay at BridgingSubmitting after an inconclusive scan; got: {state:?}"
+        );
+    }
+
     /// `execute_cctp_burn_on_ethereum` emits `BeginBridging`
     /// BEFORE the burn and leaves the aggregate at `BridgingSubmitting` when the
     /// burn fails (STOP-bytecode path: tx mines but MessageSent event is absent).
@@ -8856,7 +9644,7 @@ mod tests {
         drop(chain);
 
         let error = manager
-            .resume_bridging_submitting_ethereum(&id, amount_u256, 0)
+            .resume_bridging_submitting_ethereum(&id, amount_u256, 0, None)
             .await
             .unwrap_err();
 
@@ -9283,7 +10071,7 @@ mod tests {
             .unwrap();
 
         let burn_receipt = manager
-            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block)
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, None)
             .await
             .unwrap();
 
@@ -9313,6 +10101,1496 @@ mod tests {
                 } if burn_tx_hash == existing_burn.tx
             ),
             "Aggregate must reach Bridging with the adopted burn tx; got: {state:?}"
+        );
+    }
+
+    /// `burn_recording_pending` persists `RecordPendingBurn` BEFORE awaiting the
+    /// burn receipt (and thus before `InitiateBridging`). Uses a STOP-only
+    /// TokenMessenger so the burn broadcasts and is recorded, then `confirm_burn`
+    /// fails with `MessageSentEventNotFound`: the aggregate must be left at
+    /// `BridgingSubmitting` with `pending_burn_tx` set, proving the hash was
+    /// durably recorded before the (failed) confirm -- never advancing to
+    /// `Bridging`.
+    #[tokio::test]
+    async fn burn_recording_pending_records_pending_burn_before_confirm() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let required = U256::from(1_000_000u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(required, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // STOP-only TokenMessenger: the burn tx mines (status = 1) with no
+        // MessageSent event, so submit_burn broadcasts and RecordPendingBurn fires,
+        // then confirm_burn returns MessageSentEventNotFound.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let error = manager
+            .execute_cctp_burn_on_ethereum(&id, amount_u256, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "STOP-contract confirm must fail with Cctp (MessageSentEventNotFound); got: {error:?}"
+        );
+
+        // The aggregate must be at BridgingSubmitting with pending_burn_tx set:
+        // RecordPendingBurn was committed before the confirm, and InitiateBridging
+        // (which would advance to Bridging) never ran.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::BridgingSubmitting {
+            direction,
+            pending_burn_tx,
+            ..
+        } = state
+        else {
+            panic!("expected BridgingSubmitting, got: {state:?}");
+        };
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        let Some(recorded_tx) = pending_burn_tx else {
+            panic!(
+                "RecordPendingBurn must be persisted before the (failed) confirm, \
+                 so pending_burn_tx is Some"
+            );
+        };
+        assert_ne!(
+            recorded_tx,
+            TxHash::ZERO,
+            "the recorded pending burn tx must be the real broadcast hash"
+        );
+    }
+
+    /// `burn_recording_pending` retries the burn when the first `confirm_burn`
+    /// returns a revert: the second `submit_burn` broadcasts a new hash and the
+    /// second `confirm_burn` succeeds. Verified via `MockBridge` so the test
+    /// runs without an Anvil instance or a real CCTP contract.
+    ///
+    /// Asserts:
+    /// 1. Returns `Ok` whose `receipt.tx` equals the SECOND submitted hash.
+    /// 2. The aggregate stays at `BridgingSubmitting` with `pending_burn_tx`
+    ///    set to the second hash.
+    /// 3. Exactly 2 `PendingBurnRecorded` events exist in the event store
+    ///    and the last one carries the second hash.
+    #[tokio::test]
+    async fn burn_recording_pending_retries_and_succeeds_on_second_attempt() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        // A real wallet is required for the Chain type parameter even though
+        // burn_recording_pending never calls into RaindexService.
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, recipient);
+
+        let mock_bridge = Arc::new(MockBridge::new());
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&mock_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            recipient,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let receipt = manager
+            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .await
+            .unwrap();
+
+        // Assertion 1: the returned receipt carries the SECOND submitted hash.
+        let expected_second_hash = TxHash::from([2u8; 32]);
+        assert_eq!(
+            receipt.tx, expected_second_hash,
+            "burn_recording_pending must return the second-attempt hash after a revert"
+        );
+        assert_eq!(
+            receipt.amount, amount_u256,
+            "receipt amount must match input amount"
+        );
+
+        // Assertion 2: the aggregate is at BridgingSubmitting with the second hash.
+        let state = cqrs.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx, ..
+        } = state
+        else {
+            panic!("expected BridgingSubmitting after burn_recording_pending, got: {state:?}");
+        };
+        assert_eq!(
+            pending_burn_tx,
+            Some(expected_second_hash),
+            "pending_burn_tx must be the second hash after a successful retry"
+        );
+
+        // Assertion 3: exactly 2 PendingBurnRecorded events; the last carries [2u8; 32].
+        let id_str = id.to_string();
+        let pending_burn_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_id = ? \
+             AND event_type = 'UsdcRebalanceEvent::PendingBurnRecorded'",
+        )
+        .bind(&id_str)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_burn_count, 2,
+            "expected exactly 2 PendingBurnRecorded events, got: {pending_burn_count}"
+        );
+
+        let last_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_id = ? \
+             AND event_type = 'UsdcRebalanceEvent::PendingBurnRecorded' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(&id_str)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let last_event: UsdcRebalanceEvent = serde_json::from_str(&last_payload).unwrap();
+        let UsdcRebalanceEvent::PendingBurnRecorded {
+            burn_tx: last_burn_tx,
+            ..
+        } = last_event
+        else {
+            panic!("expected PendingBurnRecorded variant in last event payload");
+        };
+        assert_eq!(
+            last_burn_tx, expected_second_hash,
+            "last PendingBurnRecorded must carry the second-attempt hash"
+        );
+    }
+
+    /// CORRECTION C: when `pending_burn_tx` is set and `burn_status` reports the
+    /// recorded burn MINED, resume adopts it via `confirm_burn` (which runs the
+    /// MessageSent validation, not a bare receipt) and advances to `Bridging`
+    /// WITHOUT a log scan or a second burn. The scan lower bound is set ABOVE the
+    /// burn block, so the scan alone could not have found it -- proving the
+    /// receipt-based adopt path, not the scan, did the adoption.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_adopts_pending_burn_when_mined() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            amount_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        let existing_burn = cctp_bridge
+            .burn(
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        // Scan lower bound ABOVE the burn block: a log scan from here cannot find
+        // the burn (it is at an earlier block), so adoption can only come from the
+        // pending-tx receipt check.
+        let from_block = ethereum_provider.get_block_number().await.unwrap() + 1_000;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        let nonce_before = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(
+                &id,
+                amount_u256,
+                from_block,
+                Some(existing_burn.tx),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            burn_receipt.tx, existing_burn.tx,
+            "adopt path must return the recorded pending burn tx"
+        );
+        assert_eq!(
+            ethereum_provider
+                .get_transaction_count(chains.bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "adopting the pending burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == existing_burn.tx
+            ),
+            "aggregate must reach Bridging with the adopted pending burn; got: {state:?}"
+        );
+    }
+
+    /// The adopt path in `check_pending_burn` calls `confirm_burn` (not a bare
+    /// `BurnReceipt` construction) so that a recorded burn whose receipt mines
+    /// successfully but emits NO `MessageSent` event is REJECTED -- never silently
+    /// adopted. Uses a STOP-only contract at TOKEN_MESSENGER_V2 so the tx mines
+    /// with status=1 and no logs. Staging its hash as `pending_burn_tx` then
+    /// driving through `resume_bridging_submitting_ethereum` proves the adopt path
+    /// runs the MessageSent check and surfaces
+    /// `UsdcTransferError::Cctp(MessageSentEventNotFound)` rather than advancing
+    /// the aggregate to `Bridging` with a hash whose message was never emitted.
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_adopt_path_rejects_missing_message_sent() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+
+        // STOP-only contract at TOKEN_MESSENGER_V2: any tx to this address mines
+        // with status=1 (success) and emits no logs. This mimics a burn tx whose
+        // EVM call succeeded but whose MessageSent event was somehow absent --
+        // the post-commit error class that `confirm_burn` catches.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        // Submit a raw tx to TOKEN_MESSENGER_V2 (STOP bytecode) so we have a
+        // mined-success hash with no logs without going through `submit_burn` (which
+        // would require a live Circle fee endpoint). This is the hash that would
+        // have been durably recorded by `RecordPendingBurn` in production.
+        let bot_signer = PrivateKeySigner::from_bytes(&chain.bot_key).unwrap();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(bot_signer))
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        let stop_receipt = bot_provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(st0x_bridge::cctp::TOKEN_MESSENGER_V2.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(
+            stop_receipt.status(),
+            "STOP-bytecode tx must mine with status=1 (success)"
+        );
+        let stop_tx = stop_receipt.transaction_hash;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        // Stage `stop_tx` as the durably-recorded pending burn hash, exactly as
+        // `submit_and_record_burn` would in production.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::RecordPendingBurn { burn_tx: stop_tx },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(stop_tx))
+            .await
+            .unwrap_err();
+
+        // The adopt path must call `confirm_burn` and reject the no-MessageSent receipt.
+        let UsdcTransferError::Cctp(cctp_err) = &error else {
+            panic!("expected UsdcTransferError::Cctp (MessageSentEventNotFound); got: {error:?}");
+        };
+        assert!(
+            matches!(**cctp_err, CctpError::MessageSentEventNotFound { .. }),
+            "inner CCTP error must be MessageSentEventNotFound; got: {cctp_err:?}"
+        );
+
+        // Aggregate must remain at BridgingSubmitting -- no terminal failure emitted.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "aggregate must stay at BridgingSubmitting when the adopt-path MessageSent \
+             check fails; got: {state:?}"
+        );
+    }
+
+    /// CORRECTION A: when `pending_burn_tx` is set but `burn_status` reports the
+    /// recorded burn still PENDING (no receipt, but the tx is visible in the
+    /// mempool), resume returns `SettlementCheckTransient` (delayed redrive) and
+    /// does NOT reburn -- the aggregate stays at `BridgingSubmitting`. The pending
+    /// tx is created on a `--no-mining`-equivalent (auto-mine disabled) chain so it
+    /// sits in the mempool unmined, exactly the case a chain-head-margin heuristic
+    /// alone would misclassify as dropped.
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_pending_burn_returns_transient_no_reburn() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // Disable auto-mining and broadcast a tx so it sits unmined in the mempool:
+        // get_transaction_receipt is None while get_transaction_by_hash is Some.
+        let bot_signer = PrivateKeySigner::from_bytes(&chain.bot_key).unwrap();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(bot_signer))
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        bot_provider.anvil_set_auto_mine(false).await.unwrap();
+        let pending = bot_provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(market_maker_wallet.into()),
+                value: Some(U256::from(1u64)),
+                gas: Some(21_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pending_tx = *pending.tx_hash();
+        let nonce_before = bot_provider
+            .get_transaction_count(chain.bot_address)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = bot_provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        let error = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(pending_tx))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+            "a mempool-visible (still-pending) recorded burn must yield \
+             SettlementCheckTransient (delayed redrive), not reburn; got: {error:?}"
+        );
+        assert_eq!(
+            bot_provider
+                .get_transaction_count(chain.bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "a still-pending recorded burn must NOT submit a burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "aggregate must stay at BridgingSubmitting on a pending recorded burn; got: {state:?}"
+        );
+    }
+
+    /// When `pending_burn_tx` is set but `burn_status` reports the recorded burn
+    /// DROPPED (no receipt and absent from the mempool past the grace + miss
+    /// threshold), resume returns the TERMINAL `BurnTxDropped` and does NOT reburn:
+    /// once a burn tx hash is durably recorded, an ambiguous drop pages the operator
+    /// rather than risking a double-burn off a load-balanced RPC misclassification.
+    /// A fabricated, never-broadcast tx hash drives the drop; the fast burn-drop
+    /// policy concludes `Dropped` without waiting out the production grace window.
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_dropped_burn_pages_operator_no_reburn() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain_fast_burn_drop(&chain, &server, market_maker_wallet)
+                .await;
+
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        let nonce_before = provider
+            .get_transaction_count(chain.bot_address)
+            .await
+            .unwrap();
+
+        // A hash that was never broadcast: no receipt and absent from the mempool,
+        // so the fast drop policy classifies it Dropped on the first poll.
+        let dropped_tx =
+            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        let error = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(dropped_tx))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::BurnTxDropped { burn_tx, .. } if burn_tx == dropped_tx
+            ),
+            "a dropped recorded burn must page the operator with terminal BurnTxDropped, \
+             not reburn; got: {error:?}"
+        );
+        assert_eq!(
+            provider
+                .get_transaction_count(chain.bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "a dropped recorded burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "aggregate must stay at BridgingSubmitting on a dropped recorded burn \
+             (operator reconciles); got: {state:?}"
+        );
+    }
+
+    /// When `pending_burn_tx` is set but `burn_status` reports the recorded burn
+    /// MINED-REVERTED, resume falls through to the scan-or-reburn path and issues a
+    /// NEW burn (a reverted burn moved no funds, so reburning is SAFE) -- never a
+    /// transient or terminal error. The recorded tx is a REVERT-opcode tx (mines
+    /// with status 0); the scan finds no prior burn, so a fresh burn is submitted
+    /// and the aggregate advances to `Bridging` carrying the NEW burn tx.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_reverted_burn_reburns() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            amount_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        // A REVERT-opcode tx (PUSH1 0, PUSH1 0, REVERT): explicit gas skips
+        // estimation so it broadcasts and mines with status 0. Its hash stands in
+        // for a recorded burn whose receipt reverted.
+        let bot_signer = PrivateKeySigner::from_bytes(&chains.bot_key).unwrap();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(bot_signer))
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        let revert_addr = address!("0x00000000000000000000000000000000000000bb");
+        bot_provider
+            .anvil_set_code(
+                revert_addr,
+                alloy::primitives::Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+            )
+            .await
+            .unwrap();
+        let reverted_receipt = bot_provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(revert_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(
+            !reverted_receipt.status(),
+            "the recorded burn tx must mine reverted"
+        );
+        let reverted_tx = reverted_receipt.transaction_hash;
+
+        // Scan lower bound below the head, then advance well past it so the burn
+        // scan is conclusive-empty (no prior burn) and the reburn proceeds.
+        let from_block = bot_provider.get_block_number().await.unwrap();
+        bot_provider.anvil_mine(Some(5), None).await.unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(reverted_tx))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            burn_receipt.tx, reverted_tx,
+            "a reverted recorded burn must trigger a NEW burn, not adopt the reverted tx"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == burn_receipt.tx && burn_tx_hash != reverted_tx
+            ),
+            "aggregate must reach Bridging carrying the NEW burn tx; got: {state:?}"
+        );
+    }
+
+    /// CORRECTION B regression: a per-attempt timeout that cancels the resume
+    /// future during the receipt/confirm wait -- AFTER the burn was broadcast and
+    /// `RecordPendingBurn` committed -- must NOT lose the tx hash. The
+    /// `submit_burn -> RecordPendingBurn` critical section runs on a detached task,
+    /// so it completes despite the cancellation; the redrive then ADOPTS the
+    /// recorded tx (no second burn). Mining is disabled so the confirm wait hangs
+    /// (forcing the timeout) and the burn stays pending until the redrive mines it.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn timeout_during_confirm_records_burn_then_redrive_adopts_no_double_burn() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            amount_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        // A first real burn sets the standing allowance to MAX, so the timed-out
+        // burn below need not mine an approve (which would hang with mining off).
+        cctp_bridge
+            .burn(
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        let from_block = ethereum_provider.get_block_number().await.unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        // Disable mining so confirm_burn (await_receipt) hangs, forcing the timeout
+        // to cancel the resume future AFTER the burn broadcast and RecordPendingBurn.
+        ethereum_provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.execute_cctp_burn_on_ethereum(&id, amount_u256, Some(from_block)),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "the burn confirm must not return while mining is disabled (the per-attempt \
+             timeout must fire); got: {timed_out:?}"
+        );
+
+        // The detached submit-and-record task commits RecordPendingBurn despite the
+        // cancellation: poll until pending_burn_tx is durably set. A deadline-bounded
+        // loop (not a fixed iteration count) waits on the actual condition, so it is
+        // not timing-flaky -- it returns as soon as the event commits and fails only
+        // if the commit never lands within the generous timeout.
+        let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(tx),
+                    ..
+                }) = cqrs.load(&id).await.unwrap()
+                {
+                    break tx;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect(
+            "the detached submit-and-record task must commit RecordPendingBurn even though the \
+             confirm wait was cancelled by the timeout",
+        );
+
+        // Mine the still-pending burn, then redrive: burn_status now reports
+        // MinedSuccess and the redrive adopts the recorded tx, no second burn.
+        ethereum_provider.anvil_set_auto_mine(true).await.unwrap();
+        ethereum_provider.anvil_mine(Some(1), None).await.unwrap();
+
+        let nonce_before_redrive = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(recorded))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            burn_receipt.tx, recorded,
+            "the redrive must adopt the durably-recorded burn tx, not reburn"
+        );
+        assert_eq!(
+            ethereum_provider
+                .get_transaction_count(chains.bot_address)
+                .await
+                .unwrap(),
+            nonce_before_redrive,
+            "adopting the recorded burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == recorded
+            ),
+            "aggregate must reach Bridging with the adopted recorded burn; got: {state:?}"
+        );
+    }
+
+    /// Base-direction (hedging) counterpart of
+    /// `resume_bridging_submitting_ethereum_pending_burn_returns_transient_no_reburn`:
+    /// `resume_bridging_submitting` (Base->Alpaca, burning BaseToEthereum) must also
+    /// return `SettlementCheckTransient` (no reburn) when the recorded burn is still
+    /// pending in the mempool, proving `check_pending_burn` is symmetric across
+    /// directions. The aggregate stays at `BridgingSubmitting`.
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_pending_burn_returns_transient_no_reburn() {
+        let server = MockServer::start();
+        let (manager, cqrs, anvil) = make_resume_test_manager(&server).await;
+
+        // Broadcast a tx into the mempool unmined (auto-mine off): no receipt, but
+        // get_transaction_by_hash returns it -> burn_status classifies Pending.
+        let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let bot_signer = PrivateKeySigner::from_bytes(&bot_key).unwrap();
+        let bot_address = bot_signer.address();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(bot_signer))
+            .connect(&anvil.endpoint())
+            .await
+            .unwrap();
+        bot_provider.anvil_set_auto_mine(false).await.unwrap();
+        let pending = bot_provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(address!("0x00000000000000000000000000000000000000dd").into()),
+                value: Some(U256::from(1u64)),
+                gas: Some(21_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pending_tx = *pending.tx_hash();
+        let nonce_before = bot_provider
+            .get_transaction_count(bot_address)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = bot_provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+
+        let error = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block, Some(pending_tx))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+            "a mempool-visible recorded burn must yield SettlementCheckTransient on the \
+             Base direction too; got: {error:?}"
+        );
+        assert_eq!(
+            bot_provider
+                .get_transaction_count(bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "a still-pending recorded burn must NOT submit a burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "aggregate must stay at BridgingSubmitting on a pending recorded burn; got: {state:?}"
+        );
+    }
+
+    /// Base-direction (hedging) counterpart of
+    /// `resume_bridging_submitting_ethereum_adopts_pending_burn_when_mined`: when
+    /// `pending_burn_tx` is set and `burn_status` reports the recorded burn MINED,
+    /// `resume_bridging_submitting` (Base->Alpaca, burning via BaseToEthereum) adopts
+    /// it via `confirm_burn` and advances to `Bridging` WITHOUT a second burn. The
+    /// scan lower bound sits ABOVE the burn block, so the scan alone could not have
+    /// found it -- proving the receipt-based adopt path, not the scan, did the work.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_adopts_pending_burn_when_mined() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // `deploy_dual_chain_cctp` pre-funds the Base bot wallet with USDC, so the
+        // burn proceeds without a separate mint.
+        let existing_burn = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let base_provider = ProviderBuilder::new()
+            .connect(&chains.base_endpoint)
+            .await
+            .unwrap();
+        // Scan lower bound ABOVE the burn block: a log scan from here cannot find
+        // the burn (it is at an earlier block), so adoption can only come from the
+        // pending-tx receipt check.
+        let from_block = base_provider.get_block_number().await.unwrap() + 1_000;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+
+        let nonce_before = base_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        let burn_receipt = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block, Some(existing_burn.tx))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            burn_receipt.tx, existing_burn.tx,
+            "adopt path must return the recorded pending burn tx"
+        );
+        assert_eq!(
+            base_provider
+                .get_transaction_count(chains.bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "adopting the pending burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == existing_burn.tx
+            ),
+            "aggregate must reach Bridging with the adopted pending burn; got: {state:?}"
+        );
+    }
+
+    /// Base-direction (hedging) counterpart of
+    /// `resume_bridging_submitting_ethereum_dropped_burn_pages_operator_no_reburn`:
+    /// when `pending_burn_tx` is set but `burn_status` reports the recorded burn
+    /// DROPPED, `resume_bridging_submitting` returns the TERMINAL `BurnTxDropped`
+    /// and does NOT reburn -- once a burn tx hash is durably recorded, an ambiguous
+    /// drop pages the operator rather than risking a double-burn off a load-balanced
+    /// RPC misclassification. A fabricated, never-broadcast tx hash drives the drop;
+    /// the fast burn-drop policy concludes `Dropped` without waiting out the
+    /// production grace window.
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_dropped_burn_pages_operator_no_reburn() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cctp_bridge = cctp_bridge.with_fast_burn_drop_policy();
+        let cqrs = create_test_store_instance().await;
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        // The bridge's Base wallet (Anvil account 0) is the address a reburn would
+        // send from, so its nonce is what must stay unchanged.
+        let bridge_wallet = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        let nonce_before = provider.get_transaction_count(bridge_wallet).await.unwrap();
+
+        // A hash that was never broadcast: no receipt and absent from the mempool,
+        // so the fast drop policy classifies it Dropped on the first poll.
+        let dropped_tx =
+            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = provider.get_block_number().await.unwrap();
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+
+        let error = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block, Some(dropped_tx))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::BurnTxDropped { burn_tx, .. } if burn_tx == dropped_tx
+            ),
+            "a dropped recorded burn must page the operator with terminal BurnTxDropped, \
+             not reburn; got: {error:?}"
+        );
+        assert_eq!(
+            provider.get_transaction_count(bridge_wallet).await.unwrap(),
+            nonce_before,
+            "a dropped recorded burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "aggregate must stay at BridgingSubmitting on a dropped recorded burn \
+             (operator reconciles); got: {state:?}"
+        );
+    }
+
+    /// Base-direction (hedging) counterpart of
+    /// `resume_bridging_submitting_ethereum_reverted_burn_reburns`: when
+    /// `pending_burn_tx` is set but `burn_status` reports the recorded burn
+    /// MINED-REVERTED, `resume_bridging_submitting` (Base->Alpaca, burning via
+    /// BaseToEthereum) falls through to scan-or-reburn and issues a NEW burn (a
+    /// reverted burn moved no funds, so reburning is SAFE), advancing to `Bridging`
+    /// carrying the NEW tx. The recorded tx is a REVERT-opcode tx (mines status 0);
+    /// the scan finds no prior burn, so a fresh burn is submitted.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_reverted_burn_reburns() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        // A REVERT-opcode tx (PUSH1 0, PUSH1 0, REVERT): explicit gas skips
+        // estimation so it broadcasts and mines with status 0. Its hash stands in
+        // for a recorded burn whose receipt reverted. Burned on the BASE chain
+        // because `BaseToEthereum` reads burn status from Base.
+        let bot_signer = PrivateKeySigner::from_bytes(&chains.bot_key).unwrap();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(bot_signer))
+            .connect(&chains.base_endpoint)
+            .await
+            .unwrap();
+        let revert_addr = address!("0x00000000000000000000000000000000000000bb");
+        bot_provider
+            .anvil_set_code(
+                revert_addr,
+                alloy::primitives::Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+            )
+            .await
+            .unwrap();
+        let reverted_receipt = bot_provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(revert_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(
+            !reverted_receipt.status(),
+            "the recorded burn tx must mine reverted"
+        );
+        let reverted_tx = reverted_receipt.transaction_hash;
+
+        // Scan lower bound below the head, then advance well past it so the burn
+        // scan is conclusive-empty (no prior burn) and the reburn proceeds.
+        let from_block = bot_provider.get_block_number().await.unwrap();
+        bot_provider.anvil_mine(Some(5), None).await.unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+
+        let burn_receipt = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block, Some(reverted_tx))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            burn_receipt.tx, reverted_tx,
+            "a reverted recorded burn must trigger a NEW burn, not adopt the reverted tx"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == burn_receipt.tx && burn_tx_hash != reverted_tx
+            ),
+            "aggregate must reach Bridging carrying the NEW burn tx; got: {state:?}"
+        );
+    }
+
+    /// Fail-closed: a NON-revert (transport/RPC) submit error must classify as the
+    /// TERMINAL `BurnSubmitInconclusive`, never the bounded-redrive `BurnRevert` nor
+    /// `Cctp` -- the broadcast may have reached the network, so a retry could
+    /// double-burn. The CCTP bridge's Base wallet points at a dead endpoint, so
+    /// every submission RPC (the pre-broadcast allowance read / fee query included)
+    /// fails with a non-revert transport error; that conservative fail-closed is
+    /// intended.
+    #[tokio::test]
+    async fn submit_and_record_burn_non_revert_submit_error_fails_closed_inconclusive() {
+        // Nothing listens on port 1: every RPC fails fast with connection-refused
+        // (a non-revert transport error), never a revert.
+        let dead_endpoint = "http://127.0.0.1:1";
+        let bot_key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let wallet = create_test_wallet(dead_endpoint, &bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let cqrs = create_test_store_instance().await;
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        // Stage to BridgingSubmitting so the pre-broadcast ClearPendingBurn (a
+        // no-op, since no burn is recorded yet) succeeds and the burn submission is
+        // actually attempted -- production only burns from BridgingSubmitting.
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, 0).await;
+
+        let error = manager
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                market_maker_wallet,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnSubmitInconclusive { .. }),
+            "a non-revert (transport) submit error must fail closed as \
+             BurnSubmitInconclusive, never BurnRevert (clean reburn) or Cctp; got: {error:?}"
+        );
+    }
+
+    /// `check_pending_burn` maps a transient RPC failure from `burn_status` (the
+    /// recorded burn's on-chain status cannot be read) to `SettlementCheckTransient`
+    /// so the job delayed-redrives rather than surfacing a terminal error. The CCTP
+    /// bridge's wallet points at a dead endpoint, so the `burn_status` receipt read
+    /// fails with a transport error.
+    #[tokio::test]
+    async fn check_pending_burn_rpc_error_maps_to_settlement_transient() {
+        let dead_endpoint = "http://127.0.0.1:1";
+        let bot_key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let wallet = create_test_wallet(dead_endpoint, &bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let cqrs = create_test_store_instance().await;
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount_u256 = usdc_to_u256(usdc("100")).unwrap();
+        let pending_tx =
+            b256!("0x00000000000000000000000000000000000000000000000000000000feedface");
+
+        let error = manager
+            .check_pending_burn(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                Some(pending_tx),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+            "a transient burn_status RPC error must map to SettlementCheckTransient \
+             (delayed redrive), not a terminal error; got: {error:?}"
+        );
+    }
+
+    /// Fail-closed: a burn that broadcasts (irreversible) but whose
+    /// `RecordPendingBurn` commit never lands must surface the TERMINAL
+    /// `BurnRecordFailed`, never silently lose the hash. The CCTP bridge and Base
+    /// wallet are real and funded, so `submit_burn` actually broadcasts. The
+    /// aggregate is staged via a writable pool, then driven through a READ-ONLY
+    /// pool: the pre-broadcast `ClearPendingBurn` is a no-op (no recorded burn yet)
+    /// that only reads, so it succeeds and the burn broadcasts, but every
+    /// `RecordPendingBurn` write fails READONLY and the bounded retries exhaust.
+    /// (A fully-closed pool would instead fail the pre-broadcast `ClearPendingBurn`
+    /// load, so it cannot isolate the post-broadcast record-failure path.)
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn burn_recording_pending_record_failure_after_broadcast_fails_closed() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+
+        // Stage the aggregate on a file-backed WRITABLE pool, then close it so the
+        // committed events live in the DB file. A rollback journal (Delete) keeps
+        // all data in the main file, so a later read-only connection sees it
+        // without WAL sidecar files.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite");
+
+        let writable = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
+        )
+        .await
+        .unwrap();
+        sqlx::migrate!().run(&writable).await.unwrap();
+        let writable_cqrs = test_store::<UsdcRebalance>(writable.clone(), ());
+
+        let base_provider = ProviderBuilder::new()
+            .connect(&chains.base_endpoint)
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_base_to_alpaca(&writable_cqrs, &id, amount, from_block)
+            .await;
+        writable.close().await;
+
+        // Reopen the same DB READ-ONLY: the pre-broadcast `ClearPendingBurn` is a
+        // no-op (no recorded burn yet) needing only a read, so it succeeds and the
+        // burn broadcasts; every `RecordPendingBurn` write then fails READONLY,
+        // exhausting the bounded retries.
+        let read_only = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+        let cqrs = Arc::new(test_store(read_only, ()));
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let error = manager
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::BurnRecordFailed {
+            id: error_id,
+            burn_tx,
+        } = error
+        else {
+            panic!(
+                "a burn that broadcasts but whose pending-burn record never commits                  must fail closed as BurnRecordFailed; got: {error:?}"
+            );
+        };
+        assert_eq!(
+            error_id, id,
+            "BurnRecordFailed id must match the transfer id"
+        );
+        assert_ne!(
+            burn_tx,
+            TxHash::ZERO,
+            "BurnRecordFailed must carry the broadcast burn tx hash, not zero"
         );
     }
 
@@ -9450,7 +11728,7 @@ mod tests {
         // existing 98-USDC burn and adopt it; searching for nominal (100 USDC)
         // would miss it and issue a second burn.
         let burn_receipt = manager
-            .resume_bridging_submitting_ethereum(&id, received_u256, from_block)
+            .resume_bridging_submitting_ethereum(&id, received_u256, from_block, None)
             .await
             .unwrap();
 
@@ -9489,12 +11767,15 @@ mod tests {
         );
     }
 
-    /// When `find_recent_burn` returns None (no prior burn),
-    /// `resume_bridging_submitting_ethereum` issues a fresh burn and records it.
-    /// Uses a `from_block` ABOVE the current head so no prior burn can be found.
+    /// When `pending_burn_tx` is None and `find_recent_burn` finds no prior burn,
+    /// `resume_bridging_submitting_ethereum` FAILS CLOSED (`BurnSubmitInconclusive`)
+    /// rather than reburning: reaching the resume path means a burn submission was
+    /// already initiated (`BeginBridging`), so a broadcast may be in flight and an
+    /// auto-reburn could double-burn. The genuine first burn is the forward
+    /// `execute_cctp_burn_on_ethereum` path, never the resume path.
     #[cfg(feature = "test-support")]
     #[tokio::test]
-    async fn resume_bridging_submitting_ethereum_burns_when_no_existing_burn_found() {
+    async fn resume_bridging_submitting_ethereum_fails_closed_when_no_recorded_burn() {
         let chains = deploy_dual_chain_cctp().await;
         let amount = usdc("100");
         let amount_u256 = usdc_to_u256(amount).unwrap();
@@ -9568,38 +11849,122 @@ mod tests {
             .await
             .unwrap();
 
-        let burn_receipt = manager
-            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block)
+        let error = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, None)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        // A new burn was issued (nonce increased by at least one transaction).
+        assert!(
+            matches!(error, UsdcTransferError::BurnSubmitInconclusive { .. }),
+            "resume with no recorded burn and none found on-chain must FAIL CLOSED, \
+             never reburn; got: {error:?}"
+        );
+
+        // No burn was issued -- the bot wallet nonce is unchanged.
         let nonce_after = ethereum_provider
             .get_transaction_count(chains.bot_address)
             .await
             .unwrap();
-        assert!(
-            nonce_after > nonce_before,
-            "resume with no existing burn must issue a new burn (nonce must increase); \
+        assert_eq!(
+            nonce_after, nonce_before,
+            "a fail-closed resume must NOT issue a burn (nonce unchanged); \
              nonce_before={nonce_before} nonce_after={nonce_after}"
         );
-        assert_ne!(
-            burn_receipt.tx,
-            TxHash::ZERO,
-            "burn receipt must carry a real tx hash"
-        );
 
-        // Aggregate must be at Bridging.
+        // Aggregate stays at BridgingSubmitting for operator reconciliation.
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
                 state,
-                UsdcRebalance::Bridging {
+                UsdcRebalance::BridgingSubmitting {
                     direction: RebalanceDirection::AlpacaToBase,
                     ..
                 }
             ),
-            "Aggregate must reach Bridging after a fresh burn on resume; got: {state:?}"
+            "aggregate must stay at BridgingSubmitting on a fail-closed resume; got: {state:?}"
+        );
+    }
+
+    /// Base-direction (hedging) counterpart of
+    /// `resume_bridging_submitting_ethereum_fails_closed_when_no_recorded_burn`:
+    /// when `pending_burn_tx` is None and `find_recent_burn` finds no prior burn,
+    /// `resume_bridging_submitting` FAILS CLOSED (`BurnSubmitInconclusive`) rather
+    /// than reburning. Reaching the resume path means a burn submission was already
+    /// initiated (`BeginBridging`), so a broadcast may be in flight and an
+    /// auto-reburn could double-burn.
+    #[tokio::test]
+    async fn resume_bridging_submitting_base_fails_closed_when_no_recorded_burn() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        // The bridge's Base wallet (Anvil account 0) is the address a reburn would
+        // send from, so its nonce is what must stay unchanged.
+        let bridge_wallet = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        let nonce_before = provider.get_transaction_count(bridge_wallet).await.unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        // Capture the scan lower bound at the current head BEFORE any burn (none is
+        // ever submitted here), then mine past the finality margin
+        // (SCAN_FINALITY_MARGIN=2) so an empty scan resolves to Ok(None) rather than
+        // ScanInconclusive -- driving the no-recorded-burn fail-closed branch.
+        let from_block = provider.get_block_number().await.unwrap();
+        provider.anvil_mine(Some(3), None).await.unwrap();
+
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+
+        let error = manager
+            .resume_bridging_submitting(&id, amount_u256, from_block, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnSubmitInconclusive { .. }),
+            "resume with no recorded burn and none found on-chain must FAIL CLOSED, \
+             never reburn; got: {error:?}"
+        );
+
+        assert_eq!(
+            provider.get_transaction_count(bridge_wallet).await.unwrap(),
+            nonce_before,
+            "a fail-closed resume must NOT issue a burn (nonce unchanged)"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "aggregate must stay at BridgingSubmitting on a fail-closed resume; got: {state:?}"
         );
     }
 
@@ -9712,7 +12077,7 @@ mod tests {
         //   .unwrap_or(nominal_u256)` == nominal_u256 when burn_amount=None.
         // The scan finds the existing nominal burn and adopts it without re-burning.
         let burn_receipt = manager
-            .resume_bridging_submitting_ethereum(&id, nominal_u256, from_block)
+            .resume_bridging_submitting_ethereum(&id, nominal_u256, from_block, None)
             .await
             .unwrap();
 

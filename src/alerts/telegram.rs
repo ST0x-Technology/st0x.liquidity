@@ -5,17 +5,9 @@
 //! monitor can be exercised against a capturing mock in tests.
 
 use async_trait::async_trait;
-use reqwest::StatusCode;
 use serde_json::json;
 
-/// Sends an operational alert over some channel.
-///
-/// Kept as a trait so monitors depend on the capability, not the concrete
-/// Telegram transport, which keeps them unit-testable with a capturing mock.
-#[async_trait]
-pub(crate) trait Notifier: Send + Sync {
-    async fn notify(&self, message: &str) -> Result<(), NotifierError>;
-}
+use super::{Notifier, NotifierError};
 
 /// Telegram Bot API client that posts alerts to a fixed chat.
 pub(crate) struct TelegramNotifier {
@@ -107,20 +99,11 @@ impl Notifier for TelegramNotifier {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum NotifierError {
-    #[error("failed to build Telegram HTTP client")]
-    ClientBuild(#[source] reqwest::Error),
-    #[error("Telegram sendMessage request failed")]
-    Request(#[source] reqwest::Error),
-    #[error("Telegram API returned error status {status}: {body}")]
-    ApiError { status: StatusCode, body: String },
-}
-
 #[cfg(test)]
 mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
+    use reqwest::StatusCode;
     use serde_json::{Value, json};
 
     use super::*;

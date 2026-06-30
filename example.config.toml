@@ -87,6 +87,12 @@ transfer_attempt_timeout_secs = 3600
 # CCTP attestation polling timeouts stay retryable until this deadline.
 # 86400 = 24 hours.
 attestation_retry_deadline_secs = 86400
+# Maximum number of consecutive revert-class CCTP burn failures that will be
+# reclassified as safe redrives (scan-or-reburn path) before the circuit
+# opens and the operator is alerted. Required when usdc.mode = "enabled".
+# Suggested value: 5 (covers transient RPC oscillation; halts for permanent
+# contract reverts such as USDC blocklist or paused TokenMessenger).
+max_burn_revert_redrives = 5
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 

@@ -157,6 +157,10 @@ pub struct OnchainTrade {
     pub(crate) amount: FractionalShares,
     pub(crate) direction: Direction,
     pub(crate) price: Usdc,
+    /// Block the fill was confirmed in. Needed to witness the fill into the
+    /// `OnChainTrade` log (the `Witness` command requires it). Absent only when
+    /// neither the log nor the receipt carried a block number.
+    pub(crate) block_number: Option<u64>,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
     pub(crate) gas_used: Option<u64>,
     pub(crate) effective_gas_price: Option<u128>,
@@ -296,6 +300,7 @@ impl OnchainTrade {
             amount: trade_details.equity_amount(),
             direction: trade_details.direction(),
             price,
+            block_number: log.block_number.or(receipt_block_number),
             block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
                 let secs: i64 = timestamp_secs.try_into().ok()?;
                 DateTime::from_timestamp(secs, 0)

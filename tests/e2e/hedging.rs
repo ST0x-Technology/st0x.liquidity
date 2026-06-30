@@ -415,9 +415,13 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
         pre_shutdown_onchain_events + ONCHAIN_EVENTS_PER_TRADE,
         "Restart should persist exactly one new witnessed-and-acknowledged trade",
     );
+    // One hedged fill emits five Position events: OnChainOrderFilled +
+    // OnChainFillApplied (dedup bookkeeping, ADR 0010) + the marker's
+    // OnChainFillSettled, then OffChainOrderPlaced and
+    // OffChainOrderFilled.
     assert_eq!(
         post_restart_position_events,
-        pre_shutdown_position_events + 3,
+        pre_shutdown_position_events + 5,
         "Restart should emit exact Position success transition events for one hedge",
     );
     assert_eq!(
@@ -1162,10 +1166,20 @@ async fn delayed_fill() -> anyhow::Result<()> {
         "Should fill at configured broker price"
     );
 
-    // Order was polled multiple times before filling
-    assert_eq!(
-        broker_orders[0].poll_count, 3,
-        "Broker order should have exactly 3 status polls before delayed fill",
+    // The mock fills on exactly the 3rd broker poll (the configured DelayedFill
+    // threshold), so 3 is both the floor and the typical count: the self-poll
+    // loop stops the moment it observes the fill. The periodic submitted-order
+    // poll catch-up (position_check.rs) can race a couple of extra polls in
+    // after broker-fill but before ReconcileOrderFill flips the aggregate to
+    // Filled (which makes further polls drop without a broker GET). Bound both
+    // ends rather than leaving an open-ended floor: below 3 means the order
+    // filled too eagerly, while an unbounded count would hide a runaway-poll
+    // regression. A precise per-order poll dedup is a tracked follow-up.
+    let poll_count = broker_orders[0].poll_count;
+    assert!(
+        (3..=6).contains(&poll_count),
+        "Broker order should be polled the configured 3 times (plus at most a few \
+         catch-up races) before its delayed fill; got {poll_count}",
     );
 
     pool.close().await;
@@ -1333,13 +1347,31 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
         .find(|order| order.symbol == "TSLA")
         .expect("TSLA order should exist");
 
-    assert_eq!(
-        tsla_order.poll_count, 1,
-        "TSLA should fill immediately with a single poll",
+    // AAPL fills on exactly the 5th broker poll (its configured fill delay) and
+    // TSLA on the 1st (no delay), so 5 and 1 are the floors and typical counts.
+    // The periodic submitted-order poll catch-up (position_check.rs) can race a
+    // couple of extra polls in after broker-fill but before ReconcileOrderFill
+    // flips the aggregate to Filled (after which polls drop without a broker
+    // GET). Bound both ends rather than leaving an open-ended floor: below the
+    // delay means a premature fill, while an unbounded count would hide a
+    // runaway-poll regression. A precise per-order poll dedup is a tracked
+    // follow-up.
+    let aapl_polls = aapl_order.poll_count;
+    let tsla_polls = tsla_order.poll_count;
+    assert!(
+        (5..=8).contains(&aapl_polls),
+        "AAPL must fill on the configured 5-poll delay (plus at most a few \
+         catch-up races); got {aapl_polls}",
     );
-    assert_eq!(
-        aapl_order.poll_count, 5,
-        "AAPL should fill after the configured 5-poll delay",
+    assert!(
+        (1..=4).contains(&tsla_polls),
+        "TSLA (immediate fill) must fill on its first poll (plus at most a few \
+         catch-up races); got {tsla_polls}",
+    );
+    assert!(
+        tsla_polls < aapl_polls,
+        "TSLA (immediate fill) must take fewer polls than AAPL (5-poll delay); \
+         tsla={tsla_polls}, aapl={aapl_polls}",
     );
 
     bot.abort();

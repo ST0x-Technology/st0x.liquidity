@@ -7,17 +7,17 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
-use st0x_execution::{
-    ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
-};
+use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderId, PollOrderStatus, PollOrderStatusJobQueue,
+    OffchainOrder, OffchainOrderId, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
+    client_order_id_for_placement, place_offchain_order_at_broker,
 };
 use crate::position::{Position, PositionCommand, PositionError};
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -29,7 +29,15 @@ pub(crate) type HedgeJobQueue = JobQueue<PlaceHedge>;
 pub(crate) struct HedgeCtx {
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    /// Places the broker order, lifted out of the (now pure)
+    /// `OffchainOrder::Place` handler.
+    pub(crate) order_placer: Arc<dyn OrderPlacer>,
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    /// Shared with the trade-processing path so every broker-placement attempt
+    /// for a symbol serializes (ADR 0014): the original placement and any
+    /// recovery re-drive of the same order cannot interleave and race
+    /// `MarkFailed` against `MarkAccepted`.
+    pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
 }
 
 /// A durable job that places an offsetting broker order for an accumulated
@@ -49,15 +57,22 @@ pub(crate) struct PlaceHedge {
     pub(crate) offchain_order_id: OffchainOrderId,
 }
 
-/// Recovery path for the `PendingExecution` rejection. The previous attempt
-/// for this position may have already submitted the order to the broker but
-/// failed before enqueueing the `PollOrderStatus` job (e.g. the queue push
-/// returned a transient error and apalis re-ran us). Without this re-enqueue,
-/// `Submitted`/`PartiallyFilled` orders stay un-polled until the bot restarts
-/// and the startup recovery sweep finds them.
+/// Recovery path for the `PendingExecution` rejection. A previous attempt for
+/// this position already claimed it, but may not have completed the broker
+/// placement, so this retry reconciles the pending order's actual state:
 ///
-/// Duplicate poll jobs are harmless: `dispatch_for_order_state` drops jobs
-/// whose target order is already in a terminal state.
+/// - `Submitted`/`PartiallyFilled`: the order reached the broker but the prior
+///   attempt may have failed to enqueue the `PollOrderStatus` job (e.g. the
+///   queue push returned a transient error and apalis re-ran us), so re-enqueue
+///   it. Duplicate poll jobs are harmless -- `dispatch_for_order_state` drops
+///   jobs whose target order is already terminal.
+/// - `Pending`: the broker outcome was never committed -- the `MarkAccepted`/
+///   `MarkFailed` write was lost after a successful broker call, or a crash hit
+///   before the broker call. Re-drive the idempotent placement so the order
+///   reaches a submitted/terminal state instead of sitting `Pending` with a
+///   live, unpolled broker order until the next bot restart. `Place` is a no-op
+///   on the existing aggregate and the broker dedupes on `client_order_id`.
+/// - terminal/absent: nothing to do.
 async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
     pending_id: OffchainOrderId,
@@ -73,8 +88,115 @@ async fn recover_pending_poll_status(
                 .await?;
             Ok(())
         }
-        Some(Pending { .. } | Filled { .. } | Failed { .. }) | None => Ok(()),
+        Some(Pending {
+            symbol,
+            shares,
+            direction,
+            executor,
+            ..
+        }) => {
+            let anchor = ctx
+                .position
+                .load(&symbol)
+                .await?
+                .and_then(|position| position.last_failed_offchain_order_id);
+            let client_order_id = client_order_id_for_placement(pending_id, anchor);
+
+            let placed = place_offchain_order_at_broker(
+                &ctx.offchain_order,
+                ctx.order_placer.as_ref(),
+                &pending_id,
+                symbol.clone(),
+                shares,
+                direction,
+                executor,
+                client_order_id,
+            )
+            .await?;
+
+            route_placement_outcome(ctx, &symbol, pending_id, placed).await
+        }
+        Some(Filled { .. } | Failed { .. }) | None => Ok(()),
     }
+}
+
+/// Routes the result of [`place_offchain_order_at_broker`] to its follow-up,
+/// resolving the position claim for every outcome so it can never be left
+/// stranded:
+///
+/// - `Failed`: roll the position back (clear the claim).
+/// - `Submitted`/`PartiallyFilled`: enqueue a `PollOrderStatus` job.
+/// - `None` (no order after a successful `Place`): clear the claim, since there
+///   is nothing left to track.
+/// - `Pending`/`Filled`: surface a retryable error without clearing the claim,
+///   since the order may be live at the broker.
+///
+/// Shared by the primary placement path and the `Pending` re-drive in
+/// [`recover_pending_poll_status`], and kept in lockstep with the
+/// trade-processing path's `dispatch_post_place_state`, so the placement paths
+/// cannot diverge.
+async fn route_placement_outcome(
+    ctx: &HedgeCtx,
+    symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+    placed: Option<OffchainOrder>,
+) -> Result<(), TradeAccountingError> {
+    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    match placed {
+        Some(Failed { error, .. }) => {
+            ctx.position
+                .send(
+                    symbol,
+                    PositionCommand::FailOffChainOrder {
+                        offchain_order_id,
+                        error,
+                    },
+                )
+                .await?;
+        }
+
+        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+            ctx.poll_status_queue
+                .clone()
+                .push(PollOrderStatus { offchain_order_id })
+                .await?;
+        }
+
+        // No order exists after a successful `Place` -- there is nothing to
+        // track, so clear the position claim (matching `dispatch_post_place_state`)
+        // instead of leaving the position stuck behind a phantom id.
+        None => {
+            ctx.position
+                .send(
+                    symbol,
+                    PositionCommand::FailOffChainOrder {
+                        offchain_order_id,
+                        error: "Offchain order missing after Place".to_string(),
+                    },
+                )
+                .await?;
+        }
+
+        // `place_offchain_order_at_broker` only returns once the order has left
+        // `Pending`, and the broker never reports `Filled` synchronously, so
+        // observing either here means the outcome commit was lost. Surface it as
+        // a retryable error (matching `dispatch_post_place_state`) and -- unlike
+        // the `None` arm -- do NOT clear the position claim, which would strand a
+        // possibly-live broker order.
+        Some(state @ (Pending { .. } | Filled { .. })) => {
+            warn!(
+                target: "hedge",
+                %offchain_order_id,
+                "placement returned an unexpected post-place state; the broker outcome commit was lost -- retrying"
+            );
+            return Err(TradeAccountingError::UnexpectedPostPlaceState {
+                offchain_order_id,
+                state,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 impl Job<HedgeCtx> for PlaceHedge {
@@ -94,6 +216,14 @@ impl Job<HedgeCtx> for PlaceHedge {
     }
 
     async fn perform(&self, ctx: &HedgeCtx) -> Result<Self::Output, Self::Error> {
+        // Serialize every broker placement (ADR 0014): the trade-processing path
+        // holds this same lock across its placement, so the original placement and
+        // any recovery re-drive of the same order cannot interleave -- closing the
+        // window where a stale `MarkFailed` could strand a live order accepted by
+        // a concurrent attempt. Held for the whole job, including
+        // `recover_pending_poll_status`.
+        let _submission_guard = ctx.counter_trade_submission_lock.lock().await;
+
         // Only specific business rejections are safe to swallow:
         // - PendingExecution: another attempt already claimed this position
         //   — usually idempotent, but if that attempt got the broker submitted
@@ -165,62 +295,20 @@ impl Job<HedgeCtx> for PlaceHedge {
             .and_then(|position| position.last_failed_offchain_order_id);
         let client_order_id = client_order_id_for_placement(self.offchain_order_id, anchor);
 
-        ctx.offchain_order
-            .send(
-                &self.offchain_order_id,
-                OffchainOrderCommand::Place {
-                    symbol: self.symbol.clone(),
-                    shares: self.shares,
-                    direction: self.direction,
-                    executor: self.executor,
-                    client_order_id,
-                },
-            )
-            .await?;
+        let placed = place_offchain_order_at_broker(
+            &ctx.offchain_order,
+            ctx.order_placer.as_ref(),
+            &self.offchain_order_id,
+            self.symbol.clone(),
+            self.shares,
+            self.direction,
+            self.executor,
+            client_order_id,
+        )
+        .await?;
 
-        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
-        match ctx.offchain_order.load(&self.offchain_order_id).await? {
-            Some(Failed { error, .. }) => {
-                ctx.position
-                    .send(
-                        &self.symbol,
-                        PositionCommand::FailOffChainOrder {
-                            offchain_order_id: self.offchain_order_id,
-                            error,
-                        },
-                    )
-                    .await?;
-            }
-
-            Some(Submitted { .. } | PartiallyFilled { .. }) => {
-                let mut queue = ctx.poll_status_queue.clone();
-
-                queue
-                    .push(PollOrderStatus {
-                        offchain_order_id: self.offchain_order_id,
-                    })
-                    .await?;
-            }
-
-            Some(Filled { .. } | Pending { .. }) | None => {}
-        }
-
-        Ok(())
+        route_placement_outcome(ctx, &self.symbol, self.offchain_order_id, placed).await
     }
-}
-
-/// Derives the broker-side [`ClientOrderId`] for a placement attempt.
-///
-/// When a prior attempt failed after the broker accepted the order, the
-/// position aggregate stashes that attempt's [`OffchainOrderId`] as the
-/// idempotency anchor. Retries must reuse its UUID as `client_order_id` so
-/// the broker dedupes rather than double-submitting.
-fn client_order_id_for_placement(
-    offchain_order_id: OffchainOrderId,
-    last_failed_offchain_order_id: Option<OffchainOrderId>,
-) -> ClientOrderId {
-    let idempotency_source = last_failed_offchain_order_id.unwrap_or(offchain_order_id);
-    ClientOrderId::from_uuid(idempotency_source.as_uuid())
 }
 
 #[cfg(test)]
@@ -236,11 +324,14 @@ mod tests {
         ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
         Symbol,
     };
+    use st0x_finance::Usd;
     use st0x_float_macro::float;
 
     use super::*;
     use crate::conductor::job::Job;
-    use crate::offchain::order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
+    use crate::offchain::order::{
+        OffchainOrder, OffchainOrderCommand, OrderPlacementResult, OrderPlacer,
+    };
     use crate::position::{Position, PositionCommand, TradeId};
     use st0x_config::ExecutionThreshold;
 
@@ -300,7 +391,7 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer)
+                .build(())
                 .await
                 .unwrap();
 
@@ -308,6 +399,8 @@ mod tests {
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
         };
 
         TestInfra {
@@ -353,6 +446,166 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn route_placement_outcome_errors_when_order_left_pending() {
+        // `place_offchain_order_at_broker` only returns `Pending` when the broker
+        // outcome commit was lost. `route_placement_outcome` must surface that as
+        // a retryable error so apalis re-drives the job, rather than silently
+        // succeeding and leaving a live, unpolled order stuck `Pending`.
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+
+        let pending = OffchainOrder::Pending {
+            symbol: symbol.clone(),
+            shares: Positive::new(FractionalShares::new(float!(1.0))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            placed_at: chrono::Utc::now(),
+        };
+
+        let error =
+            route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(pending.clone()))
+                .await
+                .unwrap_err();
+
+        let TradeAccountingError::UnexpectedPostPlaceState {
+            offchain_order_id: returned,
+            state,
+        } = error
+        else {
+            panic!("expected UnexpectedPostPlaceState, got {error:?}");
+        };
+        assert_eq!(returned, offchain_order_id);
+        assert_eq!(state, pending);
+    }
+
+    #[tokio::test]
+    async fn route_placement_outcome_errors_and_keeps_claim_when_order_filled() {
+        // `place_offchain_order_at_broker` never returns `Filled`, so observing it
+        // here means the broker outcome commit was lost. `route_placement_outcome`
+        // must surface a retryable error and -- crucially -- must NOT clear the
+        // position claim, which would strand an order that has already filled.
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let filled = OffchainOrder::Filled {
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("test-order-123"),
+            price: Usd::new(float!(150.0)),
+            placed_at: chrono::Utc::now(),
+            submitted_at: chrono::Utc::now(),
+            filled_at: chrono::Utc::now(),
+        };
+
+        let error = route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(filled.clone()))
+            .await
+            .unwrap_err();
+
+        let TradeAccountingError::UnexpectedPostPlaceState {
+            offchain_order_id: returned,
+            state,
+        } = error
+        else {
+            panic!("expected UnexpectedPostPlaceState, got {error:?}");
+        };
+        assert_eq!(returned, offchain_order_id);
+        assert_eq!(state, filled);
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "an unexpected Filled state must not clear the position claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_placement_outcome_clears_claim_when_order_missing() {
+        // A missing order after a successful `Place` leaves nothing to track, so
+        // `route_placement_outcome` must clear the position claim rather than
+        // leaving the position stuck behind a phantom id.
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        route_placement_outcome(&ctx, &symbol, offchain_order_id, None)
+            .await
+            .unwrap();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "a missing order after Place must clear the position claim"
+        );
     }
 
     #[tokio::test]
@@ -547,6 +800,143 @@ mod tests {
         assert_eq!(
             poll_jobs_after_retry, 2,
             "Retry must re-enqueue PollOrderStatus when the order is still Submitted"
+        );
+    }
+
+    /// A prior attempt claimed the position and recorded the offchain order as
+    /// `Pending`, but the broker outcome commit was lost before `MarkAccepted`.
+    /// A fresh `perform` hits `PendingExecution`, so `recover_pending_poll_status`
+    /// must re-drive the still-`Pending` order through the broker to `Submitted`
+    /// and enqueue its `PollOrderStatus` job, rather than leaving it stuck with a
+    /// live, unpolled broker order until the next bot restart.
+    #[tokio::test]
+    async fn pending_redrive_advances_order_to_submitted_and_enqueues_poll() {
+        let TestInfra {
+            ctx,
+            apalis_pool,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // Seed the lost-commit state: the position claims the order and the
+        // offchain order sits `Pending`, with no broker outcome committed.
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: job.offchain_order_id,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    threshold: job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Fresh perform: PlaceOffChainOrder is rejected with PendingExecution, so
+        // recover_pending_poll_status re-drives the Pending order to Submitted.
+        job.perform(&ctx).await.unwrap();
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "Pending re-drive must advance the order to Submitted, got {order:?}"
+        );
+
+        let poll_jobs: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll_jobs, 1,
+            "Pending re-drive must enqueue exactly one PollOrderStatus job"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_blocks_while_submission_lock_held() {
+        // ADR 0014: PlaceHedge::perform serializes on the shared submission lock,
+        // so it cannot place while another placement (the trade-processing path or
+        // a recovery re-drive) holds it -- closing the MarkFailed/MarkAccepted race.
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // Hold the lock; perform must block on it and never reach placement.
+        // `perform`'s first statement is `lock().await`, so it parks immediately
+        // and `timeout` always elapses (perform can never resolve while the lock
+        // is held). The window only needs to outlast `perform` reaching the lock,
+        // so keep it small to avoid burning wall-clock on every run.
+        let guard = ctx.counter_trade_submission_lock.clone().lock_owned().await;
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(20), job.perform(&ctx)).await;
+        blocked.unwrap_err();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "no placement may occur while the submission lock is held"
+        );
+
+        // Releasing the lock lets the same job proceed and place.
+        drop(guard);
+        job.perform(&ctx).await.unwrap();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(job.offchain_order_id),
+            "placement proceeds once the lock is released"
         );
     }
 

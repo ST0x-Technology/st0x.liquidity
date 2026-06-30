@@ -370,6 +370,12 @@ pub enum CctpError {
     /// rather than a true absence. Retryable -- the caller must NOT re-burn on it.
     #[error("burn scan inconclusive: node not caught up past block {from_block}")]
     ScanInconclusive { from_block: u64 },
+    /// A durably-recorded burn tx is still pending: no receipt yet, but the tx
+    /// is still visible via `get_transaction_by_hash` (broadcast but unmined). A
+    /// crash/timeout resume returns this so the caller delayed-redrives and
+    /// never re-burns a tx that may still land. Retryable -- not a revert.
+    #[error("recorded burn tx {burn_tx} still pending: broadcast but not yet mined")]
+    BurnTxPending { burn_tx: TxHash },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -425,6 +431,73 @@ pub enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
+}
+
+impl CctpError {
+    /// Returns `true` if this error represents a transaction revert (as opposed
+    /// to a transport failure or other non-revert EVM error).
+    ///
+    /// Revert classification is an intentional, supported part of `CctpError`'s
+    /// public contract: a two-phase burn consumer that records the returned burn
+    /// tx before confirmation calls it to distinguish a redrivable revert-class
+    /// burn failure from a terminal one.
+    ///
+    /// Used by `burn_internal` to gate the allowance-check retry: only reverts
+    /// can be allowance-related; transport errors and other non-revert errors
+    /// are not.
+    ///
+    /// For `CctpError::Evm` variants, delegates to [`EvmError::is_revert()`],
+    /// which is exhaustive over all `EvmError` variants (including feature-gated
+    /// ones). See that method for the full revert-classification rules.
+    ///
+    /// For `CctpError::Contract` (top-level, from `#[from] alloy::contract::Error`):
+    /// only revert-class when the inner error carries actual revert data (same
+    /// reasoning as `EvmError::Contract` — a network blip wraps as Contract with
+    /// no revert data and must not trigger the retry).
+    pub fn is_revert(&self) -> bool {
+        match self {
+            // Delegate to EvmError::is_revert(), which is exhaustive over all
+            // EvmError variants (including feature-gated ones) and lives in
+            // crates/evm where the feature flags are visible. This gives
+            // compile-time enforcement: a new EvmError variant forces an explicit
+            // revert/non-revert classification in EvmError::is_revert() before
+            // it can compile.
+            Self::Evm(evm_err) => evm_err.is_revert(),
+            // `CctpError::Contract` (from `#[from] alloy::contract::Error`):
+            // only revert-class when the inner error carries actual revert data.
+            // A pure transport failure (connection reset, timeout) produces a
+            // Contract error with no revert data and must not trigger the retry.
+            Self::Contract(contract_err) => contract_err.as_revert_data().is_some(),
+            // `CctpError::RpcTransport` is produced exclusively by direct provider
+            // calls (get_logs, get_block_number) in scan/recovery paths — never by
+            // the depositForBurn submission path. It cannot carry an EVM revert.
+            Self::RpcTransport(_)
+            | Self::SolType(_)
+            | Self::ScanInconclusive { .. }
+            | Self::BurnTxPending { .. }
+            | Self::Http(_)
+            | Self::AttestationTimeout { .. }
+            | Self::MalformedAttestation { .. }
+            | Self::MessageSentEventNotFound { .. }
+            | Self::MintAndWithdrawEventNotFound
+            | Self::TxReceiptMissingBlock { .. }
+            | Self::MessageTooShort { .. }
+            | Self::MessageTooShortForRecovery { .. }
+            | Self::MessageDestinationDomainMismatch { .. }
+            | Self::AlreadyMintedMessageNotFound { .. }
+            | Self::RecoveredMintMessageMismatch { .. }
+            | Self::RecoveredMintLogMissingTxHash { .. }
+            | Self::RecoveredMintReceiptReverted { .. }
+            | Self::RecoveredMintAndWithdrawEventNotFound { .. }
+            | Self::PlaceholderNonce
+            | Self::FeeCalculationOverflow
+            | Self::Float(_)
+            | Self::AmountConversion(_)
+            | Self::FastTransferFeeNotAvailable { .. }
+            | Self::HexDecode(_)
+            | Self::FeeValueParse(_) => false,
+        }
+    }
 }
 
 /// Errors specific to attestation polling from Circle's API.
@@ -537,6 +610,21 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         #[cfg(not(any(test, feature = "test-support")))]
         Self::new(ethereum, base)
+    }
+
+    /// Applies the zero-grace, single-miss fast drop policy to both endpoints'
+    /// `burn_status`. Test-only seam: lets downstream consumers' resume tests
+    /// classify an absent recorded burn tx as `Dropped` immediately rather than
+    /// waiting out the production 30 s grace window, without exposing
+    /// `BurnDropConfig` across the crate boundary.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_fast_burn_drop_policy(mut self) -> Self {
+        self.ethereum = self
+            .ethereum
+            .with_burn_drop_config(evm::BurnDropConfig::fast());
+        self.base = self.base.with_burn_drop_config(evm::BurnDropConfig::fast());
+        self
     }
 
     fn new(
@@ -729,30 +817,120 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
+    ///
+    /// Internal retry logic: if the first `depositForBurn` reverts, `ensure_standing_allowance`
+    /// is re-run on the endpoint and the Circle fee is re-queried immediately before the
+    /// retry burn. This avoids a stale fee from a Circle fee spike that occurs during the
+    /// ~30 s `wait_for_node_sync` window on the cold allowance path.
+    ///
+    /// The retry is one-shot: if the second burn also fails, the error propagates to the
+    /// job retry queue. Retrying on any revert-class failure (not just allowance reverts)
+    /// is intentional: the dRPC load-balancing race can route the post-revert allowance
+    /// re-read to a fresh node, making the allowance appear sufficient and incorrectly
+    /// skipping the retry. One-shot bounds the cost for non-allowance reverts.
     async fn burn_internal<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
     ) -> Result<crate::BurnReceipt, CctpError> {
-        let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
-
+        // ensure_standing_allowance runs first: on the cold path it submits an
+        // approve and then spins wait_for_node_sync (~30 s worst case). Fetching
+        // max_fee afterward keeps the Circle fee fresh immediately before the burn
+        // and avoids a stale bound from a spike that occurs during the sync window.
         match direction {
             BridgeDirection::EthereumToBase => {
                 self.ethereum
-                    .ensure_usdc_approval::<Registry>(amount)
+                    .ensure_standing_allowance::<Registry>()
                     .await?;
-                self.ethereum
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                let first = self
+                    .ethereum
                     .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
-                    .await
+                    .await;
+                self.retry_burn_if_revert::<Registry, _>(
+                    &self.ethereum,
+                    first,
+                    amount,
+                    recipient,
+                    direction,
+                )
+                .await
             }
             BridgeDirection::BaseToEthereum => {
-                self.base.ensure_usdc_approval::<Registry>(amount).await?;
-                self.base
+                self.base.ensure_standing_allowance::<Registry>().await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                let first = self
+                    .base
                     .deposit_for_burn::<Registry>(amount, recipient, direction, max_fee)
-                    .await
+                    .await;
+                self.retry_burn_if_revert::<Registry, _>(
+                    &self.base, first, amount, recipient, direction,
+                )
+                .await
             }
         }
+    }
+
+    /// Performs the one-shot retry burn if `first_result` is a revert-class error.
+    ///
+    /// Re-runs `ensure_standing_allowance` on `endpoint` and re-queries the Circle
+    /// fast-transfer fee immediately before the retry burn, so the retry uses a
+    /// fresh fee bound rather than the potentially-stale one from the first attempt.
+    ///
+    /// If `ensure_standing_allowance` fails during the retry, returns the original
+    /// burn error (not the sync error) as the actionable root cause.
+    ///
+    /// Retrying on any revert-class failure is intentional (see `burn_internal` doc).
+    /// The one-shot bound prevents double-burning: a pre-flight revert or confirmed
+    /// on-chain revert rolls back state, so one retry cannot double-burn.
+    async fn retry_burn_if_revert<Registry: IntoErrorRegistry, EndpointWallet: Wallet>(
+        &self,
+        endpoint: &evm::CctpEndpoint<EndpointWallet>,
+        first_result: Result<crate::BurnReceipt, CctpError>,
+        amount: U256,
+        recipient: Address,
+        direction: BridgeDirection,
+    ) -> Result<crate::BurnReceipt, CctpError> {
+        let Err(original_error) = first_result else {
+            return first_result;
+        };
+
+        if !original_error.is_revert() {
+            return Err(original_error);
+        }
+
+        warn!(
+            target: "bridge",
+            ?original_error,
+            "depositForBurn reverted; re-running ensure_standing_allowance and retrying once"
+        );
+
+        let sync_result = endpoint.ensure_standing_allowance::<Registry>().await;
+
+        if let Err(sync_err) = &sync_result {
+            // Note: a TxReceiptMissingBlock sync_err here means the approve tx
+            // was mined (a receipt was returned) but lacked a block number in
+            // the receipt. The allowance is live on-chain; the next job-level
+            // retry will find allowance >= threshold and skip the approve.
+            warn!(
+                target: "bridge",
+                ?sync_err,
+                ?original_error,
+                "node-sync gate failed during allowance retry; returning original burn revert"
+            );
+        }
+
+        evm::apply_sync_result(original_error, sync_result)?;
+
+        // Re-query the fee immediately before the retry burn so a Circle fee
+        // spike during the sync window does not cause the retry to fail with a
+        // stale fee bound.
+        let retry_max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+
+        endpoint
+            .deposit_for_burn::<Registry>(amount, recipient, direction, retry_max_fee)
+            .await
     }
 
     /// Mints USDC on the destination chain for the given bridge direction.
@@ -930,6 +1108,69 @@ where
             .await
     }
 
+    /// Broadcasts the burn and returns its tx hash without awaiting the receipt.
+    /// Re-runs `ensure_standing_allowance` and re-queries the Circle fast-transfer
+    /// fee on every call (matching `burn_internal`'s cold-path ordering), so a
+    /// caller's one-shot retry re-broadcasts with a fresh allowance and fee.
+    async fn submit_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<TxHash, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.ethereum
+                    .submit_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.base
+                    .submit_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+        }
+    }
+
+    async fn confirm_burn(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+        amount: U256,
+    ) -> Result<crate::BurnReceipt, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .confirm_burn::<OpenChainErrorRegistry>(tx_hash, amount)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .confirm_burn::<OpenChainErrorRegistry>(tx_hash, amount)
+                    .await
+            }
+        }
+    }
+
+    async fn burn_status(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<crate::BurnTxStatus, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.burn_status(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.burn_status(tx_hash).await,
+        }
+    }
+
     async fn poll_attestation(
         &self,
         direction: BridgeDirection,
@@ -1036,25 +1277,250 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::contract::Error as ContractError;
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::address;
-    use alloy::primitives::{B256, b256, keccak256};
+    use alloy::primitives::{B256, Bytes, b256, keccak256};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
+    use alloy::transports::{RpcError, TransportError};
     use httpmock::prelude::*;
     use itertools::Itertools;
     use proptest::prelude::*;
     use rand::Rng;
+    use serde_json::value::to_raw_value;
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    use st0x_evm::AbiDecodedErrorType;
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 
     use super::*;
     use crate::{Attestation, Bridge};
+
+    // --- is_revert unit tests ---
+
+    fn transport_error(code: i64, message: &'static str) -> CctpError {
+        CctpError::Evm(EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+            code,
+            message: Cow::Borrowed(message),
+            data: None,
+        })))
+    }
+
+    /// Code 3 (Ethereum JSON-RPC spec, Anvil simulation mode) is revert-class
+    /// regardless of the message content. This test uses a non-matching message to
+    /// prove the `code == 3` branch fires independently of the message fallback.
+    #[test]
+    fn is_revert_true_for_transport_code_3() {
+        assert!(transport_error(3, "some unrelated error").is_revert());
+    }
+
+    /// Code -32000 + "execution reverted" message (Geth/Infura/Alchemy/dRPC
+    /// preflight; repo submit.rs mock) is revert-class.
+    #[test]
+    fn is_revert_true_for_transport_code_minus_32000_execution_reverted() {
+        assert!(transport_error(-32000, "execution reverted").is_revert());
+    }
+
+    /// Code -32003 + "execution reverted" message (some Alchemy endpoints) is
+    /// revert-class.
+    #[test]
+    fn is_revert_true_for_transport_code_minus_32003_execution_reverted() {
+        assert!(transport_error(-32003, "execution reverted").is_revert());
+    }
+
+    /// Message-based detection: any code with `"execution reverted"` in the
+    /// message is revert-class.
+    #[test]
+    fn is_revert_true_for_transport_message_execution_reverted() {
+        assert!(
+            transport_error(-32099, "execution reverted: ERC20: insufficient allowance")
+                .is_revert()
+        );
+    }
+
+    /// Code -32000 + "nonce too low" is NOT revert-class: the code is shared by
+    /// multiple failure types; only the message distinguishes them.
+    #[test]
+    fn is_revert_false_for_transport_nonce_too_low() {
+        assert!(!transport_error(-32000, "nonce too low").is_revert());
+    }
+
+    /// Code -32001 with no revert message is NOT revert-class.
+    #[test]
+    fn is_revert_false_for_transport_unrelated_code() {
+        assert!(!transport_error(-32001, "some other error").is_revert());
+    }
+
+    /// `ScanInconclusive` is not revert-class.
+    #[test]
+    fn is_revert_false_for_scan_inconclusive() {
+        assert!(!CctpError::ScanInconclusive { from_block: 0 }.is_revert());
+    }
+
+    /// `BurnTxPending` is not revert-class: a still-pending recorded burn is a
+    /// retryable settlement-wait, never an on-chain revert.
+    #[test]
+    fn is_revert_false_for_burn_tx_pending() {
+        assert!(
+            !CctpError::BurnTxPending {
+                burn_tx: TxHash::ZERO
+            }
+            .is_revert()
+        );
+    }
+
+    /// `PlaceholderNonce` is not revert-class.
+    #[test]
+    fn is_revert_false_for_placeholder_nonce() {
+        assert!(!CctpError::PlaceholderNonce.is_revert());
+    }
+
+    /// `TxReceiptMissingBlock` is not revert-class: it is a post-mining
+    /// infrastructure error, not an on-chain revert.
+    #[test]
+    fn is_revert_false_for_tx_receipt_missing_block() {
+        assert!(
+            !CctpError::TxReceiptMissingBlock {
+                tx_hash: TxHash::ZERO
+            }
+            .is_revert()
+        );
+    }
+
+    /// `MessageSentEventNotFound` is not revert-class: it is a post-commit
+    /// receipt-parsing error, not an on-chain revert.
+    #[test]
+    fn is_revert_false_for_message_sent_event_not_found() {
+        assert!(
+            !CctpError::MessageSentEventNotFound {
+                tx_hash: TxHash::ZERO
+            }
+            .is_revert()
+        );
+    }
+
+    /// `Http` (reqwest) is not revert-class: network transport errors must not
+    /// trigger the allowance retry.
+    #[test]
+    fn is_revert_false_for_http_error() {
+        // Construct a reqwest error from a known-bad URL via the blocking client.
+        let err = reqwest::blocking::get("http://0.0.0.0:0").unwrap_err();
+        assert!(!CctpError::Http(err.without_url()).is_revert());
+    }
+
+    /// `EvmError::Transaction` (PendingTransactionError) is not revert-class:
+    /// it covers errors while WAITING for a submitted tx to confirm (not a
+    /// pre-flight simulation reject). Ensures the unconditional non-revert arm
+    /// in `EvmError::is_revert()` covers this variant.
+    #[test]
+    fn is_revert_false_for_evm_transaction() {
+        use alloy::providers::PendingTransactionError;
+        let err = CctpError::Evm(EvmError::Transaction(
+            PendingTransactionError::FailedToRegister,
+        ));
+        assert!(
+            !err.is_revert(),
+            "EvmError::Transaction must not be revert-class"
+        );
+    }
+
+    /// `EvmError::NodeBehindRequiredBlock` is not revert-class: it is a
+    /// node-sync timeout, not an EVM revert. Ensures the unconditional
+    /// non-revert arm in `EvmError::is_revert()` covers this variant.
+    #[test]
+    fn is_revert_false_for_evm_node_behind_required_block() {
+        let err = CctpError::Evm(EvmError::NodeBehindRequiredBlock {
+            observed_tip: 10,
+            required_block: 20,
+            attempts: 30,
+        });
+        assert!(
+            !err.is_revert(),
+            "EvmError::NodeBehindRequiredBlock must not be revert-class"
+        );
+    }
+
+    /// `EvmError::Reverted` (confirmed on-chain revert, post-mining) is
+    /// revert-class. This is the primary production path the retry defends against.
+    #[test]
+    fn is_revert_true_for_evm_reverted() {
+        assert!(
+            CctpError::Evm(EvmError::Reverted {
+                tx_hash: TxHash::ZERO
+            })
+            .is_revert()
+        );
+    }
+
+    /// `EvmError::DecodedRevert` (decoded Solidity error from a confirmed revert)
+    /// is revert-class.
+    #[test]
+    fn is_revert_true_for_evm_decoded_revert() {
+        assert!(
+            CctpError::Evm(EvmError::DecodedRevert(AbiDecodedErrorType::Unknown(
+                vec![]
+            )))
+            .is_revert()
+        );
+    }
+
+    /// `EvmError::Contract` carrying actual EVM revert data (a `TransportError::ErrorResp`
+    /// with message containing "revert" and hex-encoded data) is revert-class.
+    #[test]
+    fn is_revert_true_for_evm_contract_with_revert_data() {
+        let raw = to_raw_value(&"0x1234").expect("valid json");
+        let payload = ErrorPayload {
+            code: 3,
+            message: Cow::Borrowed("execution reverted"),
+            data: Some(raw),
+        };
+        let contract_err = ContractError::TransportError(TransportError::ErrorResp(payload));
+        assert!(CctpError::Evm(EvmError::Contract(contract_err)).is_revert());
+    }
+
+    /// `EvmError::Contract` from a transport failure (no revert data) is NOT
+    /// revert-class. This is the path that `decode_rpc_revert` produces for
+    /// network errors -- see `error_decoding.rs::decode_rpc_revert_returns_contract_for_non_revert`.
+    #[test]
+    fn is_revert_false_for_evm_contract_without_revert_data() {
+        let contract_err =
+            ContractError::TransportError(TransportError::local_usage_str("connection refused"));
+        assert!(!CctpError::Evm(EvmError::Contract(contract_err)).is_revert());
+    }
+
+    /// `CctpError::Contract` with actual revert data is revert-class.
+    #[test]
+    fn is_revert_true_for_top_level_contract_error_with_revert_data() {
+        let raw = to_raw_value(&"0x1234").expect("valid json");
+        let payload = ErrorPayload {
+            code: 3,
+            message: Cow::Borrowed("execution reverted"),
+            data: Some(raw),
+        };
+        let contract_err = ContractError::TransportError(TransportError::ErrorResp(payload));
+        assert!(CctpError::Contract(contract_err).is_revert());
+    }
+
+    /// `CctpError::Contract` from a pure transport failure (no revert data) is NOT
+    /// revert-class. A local client error or network blip must not trigger the
+    /// allowance retry.
+    #[test]
+    fn is_revert_false_for_top_level_contract_error_without_revert_data() {
+        let contract_err =
+            ContractError::TransportError(TransportError::local_usage_str("connection refused"));
+        assert!(!CctpError::Contract(contract_err).is_revert());
+    }
+
+    // --- end is_revert unit tests ---
 
     fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
@@ -1087,14 +1553,16 @@ mod tests {
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
             ethereum_wallet,
-        );
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
 
         let base = CctpEndpoint::new(
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
             base_wallet,
-        );
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -1575,7 +2043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_usdc_approval_ethereum_with_zero_allowance() {
+    async fn ensure_standing_allowance_sets_max_when_allowance_is_zero_ethereum() {
         let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
         let (_base_anvil, base_endpoint, _) = setup_anvil();
 
@@ -1592,7 +2060,6 @@ mod tests {
         .await
         .unwrap();
 
-        let amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
         let spender = bridge.ethereum.token_messenger_address();
 
@@ -1603,11 +2070,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(initial_allowance, U256::ZERO);
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "initial allowance should be zero"
+        );
 
         bridge
             .ethereum
-            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
             .await
             .unwrap();
 
@@ -1618,11 +2089,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(final_allowance, amount);
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "standing allowance must be set to U256::MAX"
+        );
     }
 
     #[tokio::test]
-    async fn test_ensure_usdc_approval_ethereum_with_sufficient_allowance() {
+    async fn ensure_standing_allowance_no_op_when_above_threshold_ethereum() {
         let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
         let (_base_anvil, base_endpoint, _) = setup_anvil();
 
@@ -1639,31 +2114,41 @@ mod tests {
         .await
         .unwrap();
 
-        let amount = U256::from(1_000_000u64);
-        let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.ethereum.owner();
         let spender = bridge.ethereum.token_messenger_address();
 
+        // Pre-set allowance to U256::MAX (the standing target).
         bridge
             .ethereum
-            .approve_usdc::<NoOpErrorRegistry>(spender, higher_amount)
+            .approve_usdc::<NoOpErrorRegistry>(spender, U256::MAX)
             .await
             .unwrap();
 
-        let initial_allowance = bridge
-            .ethereum
-            .usdc()
-            .allowance(owner, spender)
-            .call()
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
             .await
             .unwrap();
-        assert_eq!(initial_allowance, higher_amount);
+
+        let tx_count_before = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
 
         bridge
             .ethereum
-            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
             .await
             .unwrap();
+
+        let tx_count_after = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tx_count_before, tx_count_after,
+            "no approve tx must be submitted when allowance is at or above threshold"
+        );
 
         let final_allowance = bridge
             .ethereum
@@ -1672,11 +2157,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(final_allowance, higher_amount);
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "allowance must remain U256::MAX"
+        );
     }
 
     #[tokio::test]
-    async fn test_ensure_usdc_approval_ethereum_with_insufficient_allowance() {
+    async fn ensure_standing_allowance_tops_up_when_below_threshold_ethereum() {
         let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
         let (_base_anvil, base_endpoint, _) = setup_anvil();
 
@@ -1693,14 +2182,13 @@ mod tests {
         .await
         .unwrap();
 
-        let initial_allowance_amount = U256::from(500_000u64);
-        let required_amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
         let spender = bridge.ethereum.token_messenger_address();
 
+        // Pre-set allowance to 1 (well below threshold).
         bridge
             .ethereum
-            .approve_usdc::<NoOpErrorRegistry>(spender, initial_allowance_amount)
+            .approve_usdc::<NoOpErrorRegistry>(spender, U256::from(1u8))
             .await
             .unwrap();
 
@@ -1711,11 +2199,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(initial_allowance, initial_allowance_amount);
+        assert_eq!(
+            initial_allowance,
+            U256::from(1u8),
+            "initial allowance should be 1"
+        );
 
         bridge
             .ethereum
-            .ensure_usdc_approval::<NoOpErrorRegistry>(required_amount)
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
             .await
             .unwrap();
 
@@ -1726,7 +2218,11 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(final_allowance, required_amount);
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "allowance must be topped up to U256::MAX"
+        );
     }
 
     async fn create_bridge_with_base_usdc(
@@ -1753,20 +2249,22 @@ mod tests {
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
             ethereum_wallet,
-        );
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
 
         let base = CctpEndpoint::new(
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
             base_wallet,
-        );
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
 
     #[tokio::test]
-    async fn test_ensure_usdc_approval_base_with_zero_allowance() {
+    async fn ensure_standing_allowance_sets_max_when_allowance_is_zero_base() {
         let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
         let (_base_anvil, base_endpoint, base_key) = setup_anvil();
 
@@ -1781,7 +2279,6 @@ mod tests {
         .await
         .unwrap();
 
-        let amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
         let spender = bridge.base.token_messenger_address();
 
@@ -1792,11 +2289,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(initial_allowance, U256::ZERO);
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "initial allowance should be zero"
+        );
 
         bridge
             .base
-            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
             .await
             .unwrap();
 
@@ -1807,11 +2308,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(final_allowance, amount);
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "standing allowance must be set to U256::MAX"
+        );
     }
 
     #[tokio::test]
-    async fn test_ensure_usdc_approval_base_with_sufficient_allowance() {
+    async fn ensure_standing_allowance_no_op_when_above_threshold_base() {
         let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
         let (_base_anvil, base_endpoint, base_key) = setup_anvil();
 
@@ -1826,31 +2331,35 @@ mod tests {
         .await
         .unwrap();
 
-        let amount = U256::from(1_000_000u64);
-        let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.base.owner();
         let spender = bridge.base.token_messenger_address();
 
+        // Pre-set allowance to U256::MAX (the standing target).
         bridge
             .base
-            .approve_usdc::<NoOpErrorRegistry>(spender, higher_amount)
+            .approve_usdc::<NoOpErrorRegistry>(spender, U256::MAX)
             .await
             .unwrap();
 
-        let initial_allowance = bridge
-            .base
-            .usdc()
-            .allowance(owner, spender)
-            .call()
+        let base_provider = ProviderBuilder::new()
+            .connect(&base_endpoint)
             .await
             .unwrap();
-        assert_eq!(initial_allowance, higher_amount);
+
+        let tx_count_before = base_provider.get_transaction_count(owner).await.unwrap();
 
         bridge
             .base
-            .ensure_usdc_approval::<NoOpErrorRegistry>(amount)
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
             .await
             .unwrap();
+
+        let tx_count_after = base_provider.get_transaction_count(owner).await.unwrap();
+
+        assert_eq!(
+            tx_count_before, tx_count_after,
+            "no approve tx must be submitted when allowance is at or above threshold"
+        );
 
         let final_allowance = bridge
             .base
@@ -1859,11 +2368,142 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(final_allowance, higher_amount);
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "allowance must remain U256::MAX"
+        );
+    }
+
+    /// The threshold is `U256::MAX / 2`. At exactly this value the condition is
+    /// `allowance >= threshold`, so no approve must fire.
+    #[tokio::test]
+    async fn ensure_standing_allowance_no_op_at_exact_threshold() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let owner = bridge.ethereum.owner();
+        let spender = bridge.ethereum.token_messenger_address();
+
+        // STANDING_ALLOWANCE_THRESHOLD = U256::MAX / 2 (defined in evm.rs)
+        let threshold = U256::MAX / U256::from(2u8);
+
+        bridge
+            .ethereum
+            .approve_usdc::<NoOpErrorRegistry>(spender, threshold)
+            .await
+            .unwrap();
+
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+
+        let tx_count_before = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+
+        bridge
+            .ethereum
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
+            .await
+            .unwrap();
+
+        let tx_count_after = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tx_count_before, tx_count_after,
+            "no approve tx must fire when allowance equals the threshold exactly"
+        );
+
+        let final_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_allowance, threshold,
+            "allowance must remain unchanged at exactly the threshold"
+        );
+    }
+
+    /// One below the threshold (`U256::MAX / 2 - 1`) must trigger a top-up to
+    /// `U256::MAX`: guards the `>=` boundary condition in
+    /// `ensure_standing_allowance`.
+    #[tokio::test]
+    async fn ensure_standing_allowance_tops_up_at_threshold_minus_one() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let owner = bridge.ethereum.owner();
+        let spender = bridge.ethereum.token_messenger_address();
+
+        // STANDING_ALLOWANCE_THRESHOLD = U256::MAX / 2 (defined in evm.rs).
+        // One below it must trigger a top-up.
+        let below_threshold = U256::MAX / U256::from(2u8) - U256::from(1u8);
+
+        bridge
+            .ethereum
+            .approve_usdc::<NoOpErrorRegistry>(spender, below_threshold)
+            .await
+            .unwrap();
+
+        bridge
+            .ethereum
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
+            .await
+            .unwrap();
+
+        let final_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "allowance one below threshold must be topped up to U256::MAX"
+        );
     }
 
     #[tokio::test]
-    async fn test_ensure_usdc_approval_base_with_insufficient_allowance() {
+    async fn ensure_standing_allowance_tops_up_when_below_threshold_base() {
         let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
         let (_base_anvil, base_endpoint, base_key) = setup_anvil();
 
@@ -1878,14 +2518,13 @@ mod tests {
         .await
         .unwrap();
 
-        let initial_allowance_amount = U256::from(500_000u64);
-        let required_amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
         let spender = bridge.base.token_messenger_address();
 
+        // Pre-set allowance to 1 (well below threshold).
         bridge
             .base
-            .approve_usdc::<NoOpErrorRegistry>(spender, initial_allowance_amount)
+            .approve_usdc::<NoOpErrorRegistry>(spender, U256::from(1u8))
             .await
             .unwrap();
 
@@ -1896,11 +2535,15 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(initial_allowance, initial_allowance_amount);
+        assert_eq!(
+            initial_allowance,
+            U256::from(1u8),
+            "initial allowance should be 1"
+        );
 
         bridge
             .base
-            .ensure_usdc_approval::<NoOpErrorRegistry>(required_amount)
+            .ensure_standing_allowance::<NoOpErrorRegistry>()
             .await
             .unwrap();
 
@@ -1911,7 +2554,11 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(final_allowance, required_amount);
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "allowance must be topped up to U256::MAX"
+        );
     }
 
     // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
@@ -2292,14 +2939,16 @@ mod tests {
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
                 ethereum_wallet,
-            );
+            )
+            .with_node_sync_poll_interval(Duration::ZERO);
 
             let base = CctpEndpoint::new(
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
                 base_wallet,
-            );
+            )
+            .with_node_sync_poll_interval(Duration::ZERO);
 
             Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
@@ -3109,7 +3758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_usdc_approval_approves_when_existing_allowance_is_lower() {
+    async fn standing_allowance_set_on_first_burn_and_persists_across_burns() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
@@ -3117,7 +3766,6 @@ mod tests {
         let owner = bridge.ethereum.owner();
         let spender = bridge.ethereum.token_messenger_address();
 
-        // Check initial allowance is 0
         let initial_allowance = bridge
             .ethereum
             .usdc()
@@ -3128,10 +3776,10 @@ mod tests {
         assert_eq!(
             initial_allowance,
             U256::ZERO,
-            "Initial allowance should be 0"
+            "initial allowance should be 0 before first burn"
         );
 
-        // First burn sets allowance to 1 USDC
+        // First burn: ensure_standing_allowance sets U256::MAX, then burn succeeds.
         let small_amount = U256::from(1_000_000u64); // 1 USDC
         bridge
             .burn_internal::<NoOpErrorRegistry>(
@@ -3142,7 +3790,6 @@ mod tests {
             .await
             .unwrap();
 
-        // After burn, allowance should be consumed (0) since we approved exactly what we needed
         let after_first_burn = bridge
             .ethereum
             .usdc()
@@ -3152,11 +3799,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             after_first_burn,
-            U256::ZERO,
-            "Allowance should be 0 after burn consumed it"
+            U256::MAX - U256::from(small_amount),
+            "allowance must be U256::MAX minus the burned amount"
         );
 
-        // Second burn with larger amount should update allowance and succeed
+        // Second burn: allowance is still far above threshold, so ensure_standing_allowance
+        // is a no-op. The burn succeeds without re-approving.
         let large_amount = U256::from(100_000_000u64); // 100 USDC
         let receipt = bridge
             .burn_internal::<NoOpErrorRegistry>(
@@ -3167,7 +3815,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!receipt.tx.is_zero(), "Second burn should succeed");
+        assert!(!receipt.tx.is_zero(), "second burn should succeed");
         assert_eq!(receipt.amount, large_amount);
     }
 
@@ -3801,6 +4449,257 @@ mod tests {
         );
     }
 
+    /// The two-phase burn split (`submit_burn` -> `confirm_burn`) completes a real
+    /// CCTP burn: `submit_burn` returns the broadcast tx hash WITHOUT awaiting the
+    /// receipt, and `confirm_burn` then awaits it and returns a `BurnReceipt`
+    /// carrying that tx and the burned amount.
+    #[tokio::test]
+    async fn submit_burn_returns_hash_then_confirm_burn_validates_receipt() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_000_000u64); // 1 USDC
+
+        let burn_tx =
+            Bridge::submit_burn(&bridge, BridgeDirection::EthereumToBase, amount, recipient)
+                .await
+                .unwrap();
+
+        assert!(
+            !burn_tx.is_zero(),
+            "submit_burn must return the broadcast burn tx hash"
+        );
+
+        let burn_receipt =
+            Bridge::confirm_burn(&bridge, BridgeDirection::EthereumToBase, burn_tx, amount)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            burn_receipt.tx, burn_tx,
+            "confirm_burn must return the same tx hash submit_burn broadcast"
+        );
+        assert_eq!(
+            burn_receipt.amount, amount,
+            "confirm_burn must carry the burned input amount through onto the receipt"
+        );
+    }
+
+    /// `confirm_burn` returns `MessageSentEventNotFound` when the burn receipt
+    /// mines successfully but emits no `MessageSent` event (the post-commit error
+    /// class). Uses a STOP-only TokenMessenger so the tx succeeds (status = 1) with
+    /// no logs.
+    #[tokio::test]
+    async fn confirm_burn_returns_message_sent_event_not_found_when_log_absent() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let no_wallet_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        no_wallet_provider
+            .anvil_set_code(TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        let fee_server = MockServer::start();
+        fee_server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(fee_server.base_url());
+
+        let recipient = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+        let amount = U256::from(1_000u64);
+
+        let burn_tx =
+            Bridge::submit_burn(&bridge, BridgeDirection::EthereumToBase, amount, recipient)
+                .await
+                .unwrap();
+
+        let error = Bridge::confirm_burn(&bridge, BridgeDirection::EthereumToBase, burn_tx, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::MessageSentEventNotFound { .. }),
+            "confirm_burn must return MessageSentEventNotFound when the receipt has \
+             no MessageSent event; got: {error:?}"
+        );
+    }
+
+    /// `burn_status` maps a mined-success and a mined-revert receipt to the right
+    /// variants, regardless of the drop policy (a present receipt short-circuits).
+    #[tokio::test]
+    async fn burn_status_maps_mined_receipts_to_success_and_revert() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        // STOP contract: a tx to it mines successfully (status = 1).
+        let stop_addr = address!("0x00000000000000000000000000000000000000aa");
+        provider
+            .anvil_set_code(stop_addr, alloy::primitives::Bytes::from(vec![0x00u8]))
+            .await
+            .unwrap();
+        let success_receipt = provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(stop_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(success_receipt.status(), "STOP tx must mine successfully");
+
+        // REVERT contract (PUSH1 0, PUSH1 0, REVERT): explicit gas skips estimation
+        // so the reverting tx is broadcast and mines with status = 0.
+        let revert_addr = address!("0x00000000000000000000000000000000000000bb");
+        provider
+            .anvil_set_code(
+                revert_addr,
+                alloy::primitives::Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+            )
+            .await
+            .unwrap();
+        let reverted_receipt = provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(revert_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(!reverted_receipt.status(), "REVERT tx must mine reverted");
+
+        assert_eq!(
+            bridge
+                .ethereum
+                .burn_status(success_receipt.transaction_hash)
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::MinedSuccess
+        );
+        assert_eq!(
+            bridge
+                .ethereum
+                .burn_status(reverted_receipt.transaction_hash)
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::MinedReverted
+        );
+    }
+
+    /// The CRITICAL case for double-burn safety: a tx with no receipt that is
+    /// still visible in the mempool classifies as `Pending`, NEVER `Dropped`, so
+    /// the caller never re-burns a still-pending burn. Uses `--no-mining` anvil so
+    /// the tx is accepted into the mempool but never mined.
+    #[tokio::test]
+    async fn burn_status_reports_pending_for_mempool_visible_tx() {
+        let anvil = Anvil::new().arg("--no-mining").spawn();
+        let endpoint = anvil.endpoint();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        // Submitted to the mempool but never mined (no auto-mining): the receipt
+        // is absent while get_transaction_by_hash returns the pending tx.
+        let pending = provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(address!("0x00000000000000000000000000000000000000cc").into()),
+                value: Some(U256::from(1u64)),
+                gas: Some(21_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pending_tx = *pending.tx_hash();
+
+        // Even with a zero-grace, single-miss config (which would conclude Dropped
+        // for a truly-absent tx), a mempool-visible tx must be Pending.
+        let status = bridge
+            .ethereum
+            .burn_status_with_config(pending_tx, super::evm::BurnDropConfig::fast())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::BurnTxStatus::Pending,
+            "a mempool-visible (still-pending) burn must classify as Pending, never Dropped"
+        );
+    }
+
+    /// A tx absent from both the receipt lookup and the mempool, observed past the
+    /// grace window and the consecutive-miss threshold, classifies as `Dropped`
+    /// so the caller can fail closed and require operator verification. Uses a
+    /// zero grace + single miss to keep the test fast.
+    #[tokio::test]
+    async fn burn_status_reports_dropped_for_absent_tx_past_grace() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        let unknown_tx =
+            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let status = bridge
+            .ethereum
+            .burn_status_with_config(unknown_tx, super::evm::BurnDropConfig::fast())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::BurnTxStatus::Dropped,
+            "an absent tx past the grace + consecutive-miss threshold must classify as Dropped"
+        );
+    }
+
     /// Hypothesis: deposit_for_burn (via burn()) returns
     /// CctpError::MessageSentEventNotFound when the token messenger accepts the
     /// call and mines a receipt (tx succeeds) but emits no MessageSent log.
@@ -3813,7 +4712,7 @@ mod tests {
         let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
         let (_base_anvil, base_endpoint, _) = setup_anvil();
 
-        // Deploy real USDC so ensure_usdc_approval succeeds.
+        // Deploy real USDC so ensure_standing_allowance succeeds.
         let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
             .await
             .unwrap();
@@ -3863,6 +4762,275 @@ mod tests {
             matches!(error, CctpError::MessageSentEventNotFound { .. }),
             "burn must return MessageSentEventNotFound when the receipt has no \
              MessageSent event (post-commit error); got: {error:?}"
+        );
+    }
+
+    /// Verifies that `deposit_for_burn_with_allowance_retry` retries exactly once
+    /// when the first `depositForBurn` reverts due to insufficient allowance (zero
+    /// allowance at the token messenger).
+    ///
+    /// This exercises the defense-in-depth retry path. The retry calls
+    /// `ensure_standing_allowance`, which sets allowance to `U256::MAX`, and then
+    /// the second `depositForBurn` succeeds.
+    #[tokio::test]
+    async fn deposit_for_burn_retries_once_on_allowance_revert() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let owner = bridge.ethereum.owner();
+        let spender = bridge.ethereum.token_messenger_address();
+        let amount = U256::from(1_000_000u64); // 1 USDC
+
+        // Start with zero allowance to guarantee the first depositForBurn reverts.
+        let initial_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "test precondition: allowance must be zero"
+        );
+
+        let max_fee = bridge
+            .query_fast_transfer_fee(amount, BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        // Call the retry wrapper directly, bypassing ensure_standing_allowance.
+        // The first depositForBurn should revert (zero allowance), the retry should
+        // re-approve to U256::MAX via ensure_standing_allowance, then succeed.
+        let burn_receipt = bridge
+            .ethereum
+            .deposit_for_burn_with_allowance_retry::<NoOpErrorRegistry>(
+                amount,
+                recipient,
+                BridgeDirection::EthereumToBase,
+                max_fee,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !burn_receipt.tx.is_zero(),
+            "retry must produce a valid burn tx"
+        );
+        assert_eq!(burn_receipt.amount, amount, "burn amount must match");
+
+        // Verify that the approve tx was submitted during the retry path.
+        let final_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance,
+            U256::MAX - U256::from(amount),
+            "after a successful retry, allowance must be U256::MAX minus the burn amount"
+        );
+    }
+
+    /// Verifies that `deposit_for_burn_with_allowance_retry` retries exactly once
+    /// on any revert-class error, and terminates after the second attempt regardless
+    /// of why the burn reverted.
+    ///
+    /// Uses `Address::ZERO` as an invalid `mintRecipient`: Circle's TokenMessenger
+    /// V2 reverts with `InvalidMintRecipient` on both the first and second attempts.
+    /// With `U256::MAX` allowance, `ensure_standing_allowance` is a no-op (no
+    /// approve tx mined). Both deposit attempts are pre-flight reverts in Anvil
+    /// simulation mode, so no transactions are mined and the nonce does not advance.
+    /// The returned error is a revert-class error.
+    #[tokio::test]
+    async fn deposit_for_burn_retries_once_on_any_revert_then_propagates() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let owner = bridge.ethereum.owner();
+        let spender = bridge.ethereum.token_messenger_address();
+        let amount = U256::from(1_000_000u64); // 1 USDC
+
+        // Pre-set allowance to U256::MAX so ensure_standing_allowance is a no-op.
+        bridge
+            .ethereum
+            .approve_usdc::<NoOpErrorRegistry>(spender, U256::MAX)
+            .await
+            .unwrap();
+
+        let max_fee = bridge
+            .query_fast_transfer_fee(amount, BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        // Take the tx count after the approve so the subsequent deposit_for_burn
+        // call is the baseline for measuring retry attempts.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&cctp.ethereum_endpoint)
+            .await
+            .unwrap();
+        let tx_count_before = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+
+        let zero_recipient = Address::ZERO;
+        let result = bridge
+            .ethereum
+            .deposit_for_burn_with_allowance_retry::<NoOpErrorRegistry>(
+                amount,
+                zero_recipient,
+                BridgeDirection::EthereumToBase,
+                max_fee,
+            )
+            .await;
+
+        // The second depositForBurn revert propagates; it is revert-class.
+        let error = result.unwrap_err();
+        assert!(
+            error.is_revert(),
+            "revert error must propagate after one retry; got: {error:?}"
+        );
+
+        // PRIMARY proof: no transactions were mined. Both depositForBurn calls
+        // reverted as pre-flight in Anvil simulation; ensure_standing_allowance was
+        // a no-op (allowance already MAX, no approve tx). No nonce was consumed.
+        let tx_count_after = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            tx_count_after,
+            tx_count_before,
+            "no transactions must have been mined (both burns pre-flight revert, \
+             ensure_standing_allowance no-op); got {} unexpected additional txs",
+            tx_count_after.saturating_sub(tx_count_before)
+        );
+
+        // The allowance must be unchanged (ensure_standing_allowance was a no-op).
+        let final_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance,
+            U256::MAX,
+            "allowance must be unchanged when ensure_standing_allowance is a no-op"
+        );
+    }
+
+    // NOTE: Integration-level tests for the two remaining paths from finding #5
+    // are skipped as not cheaply constructible:
+    //
+    // 1. "sync-failure branch" (wait_for_node_sync exhausts during retry):
+    //    Requires a provider that always returns a stale block number for the
+    //    sync wait while still supporting real `submit()` calls for the approve.
+    //    CctpEndpoint uses a single wallet/provider for both, so there is no
+    //    injection point short of introducing a split-provider wrapper that
+    //    does not exist in the current test infrastructure.
+    //
+    // 2. "non-revert transport error no-retry" at the integration level:
+    //    Requires injecting a transport error into wallet.submit() inside
+    //    deposit_for_burn. No mock wallet exists; the Wallet trait has no
+    //    error-injection hook. The property IS covered at the unit level:
+    //    `is_revert_false_for_transport_nonce_too_low` and related tests prove
+    //    that transport errors return false from is_revert(), and the guard
+    //    `if !original_error.is_revert() { return Err(original_error); }` in
+    //    deposit_for_burn_with_allowance_retry returns immediately.
+
+    /// Verifies the exactly-once retry guarantee: when the first `depositForBurn`
+    /// reverts with insufficient allowance, the retry re-approves and fires a
+    /// second burn, but if that second burn also reverts, the error is returned
+    /// immediately with no third attempt.
+    #[tokio::test]
+    async fn deposit_for_burn_retry_fires_exactly_once_on_second_revert() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let owner = bridge.ethereum.owner();
+        let spender = bridge.ethereum.token_messenger_address();
+
+        // Start with zero allowance so the first depositForBurn reverts with an
+        // allowance-class error, triggering the retry path.
+        let initial_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "test precondition: allowance must be zero"
+        );
+
+        let amount = U256::from(1_000_000u64); // 1 USDC
+        let max_fee = bridge
+            .query_fast_transfer_fee(amount, BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        // Take tx count after setup so we can count only retry-path txs.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&cctp.ethereum_endpoint)
+            .await
+            .unwrap();
+        let tx_count_before = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+
+        // Use zero recipient for the second burn to cause a non-allowance revert:
+        // TokenMessenger V2 reverts with `InvalidMintRecipient` on Address::ZERO,
+        // which is not allowance-related, so no third attempt must fire.
+        let zero_recipient = Address::ZERO;
+        let result = bridge
+            .ethereum
+            .deposit_for_burn_with_allowance_retry::<NoOpErrorRegistry>(
+                amount,
+                zero_recipient,
+                BridgeDirection::EthereumToBase,
+                max_fee,
+            )
+            .await;
+
+        // The second burn reverted for a non-allowance reason; that error propagates.
+        let error = result.unwrap_err();
+        assert!(
+            error.is_revert(),
+            "second burn revert must propagate; got: {error:?}"
+        );
+
+        // PRIMARY proof of exactly-once: exactly one tx was mined (the approve
+        // from ensure_standing_allowance). The first and second depositForBurn
+        // calls both revert as pre-flight (Anvil simulation), so they do not mine
+        // a transaction or advance the nonce. No third depositForBurn was issued.
+        //
+        // Note: the "no nonce advance on revert" property is specific to Anvil's
+        // simulation mode (failed `eth_sendRawTransaction` pre-flights are rejected
+        // before mining). On a live network, a reverting transaction that makes it
+        // into a block DOES advance the nonce. The `is_revert()` check above is a
+        // secondary sanity check confirming the error kind is preserved across the
+        // retry chain — it cannot prove exactly-once because it would also pass if
+        // three deposit attempts were made and the final one reverted.
+        let tx_count_after = ethereum_provider
+            .get_transaction_count(owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            tx_count_after,
+            tx_count_before + 1,
+            "exactly one tx (the approve) must have been mined; \
+             got {} additional txs",
+            tx_count_after.saturating_sub(tx_count_before)
         );
     }
 }
