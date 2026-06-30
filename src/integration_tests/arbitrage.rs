@@ -31,6 +31,7 @@ use st0x_execution::{
 };
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
+use st0x_registry::SymbolCache;
 
 use super::{ExpectedEvent, StoredEvent, assert_events, fetch_events};
 use crate::bindings::IRaindexV6::{self, TakeOrderV3};
@@ -48,7 +49,6 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
-use crate::symbol::cache::SymbolCache;
 use crate::test_utils::{deploy_tofu_singleton, setup_test_pools};
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;

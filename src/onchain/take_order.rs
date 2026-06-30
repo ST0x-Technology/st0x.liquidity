@@ -4,12 +4,12 @@ use alloy::primitives::Address;
 use alloy::rpc::types::Log;
 
 use st0x_evm::Evm;
+use st0x_registry::SymbolCache;
 
 use super::OnChainError;
 use crate::bindings::IRaindexV6::{TakeOrderConfigV4, TakeOrderV3};
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
-use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
     /// Creates OnchainTrade directly from TakeOrderV3 blockchain events
@@ -59,17 +59,16 @@ mod tests {
     use chrono::DateTime;
     use rain_math_float::Float;
 
-    use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_evm::IPyth::getPriceUnsafeCall;
     use st0x_evm::PythStructs::Price;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{FractionalShares, Symbol};
+    use st0x_registry::SymbolCache;
 
     use super::*;
     use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::io::WrappedTokenizedShares;
     use crate::onchain::pyth::PythFeedIds;
-    use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
     use st0x_float_macro::float;
@@ -125,6 +124,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_match() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
         let target_order_owner = order.owner;
 
@@ -136,17 +136,6 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
-
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -177,6 +166,7 @@ mod tests {
     #[tokio::test]
     async fn enrichment_falls_back_to_receipt_block_number_when_log_has_none() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
         let target_order_owner = order.owner;
 
@@ -199,14 +189,6 @@ mod tests {
         // The receipt carries blockNumber 0x1; with the log's block number
         // absent, enrichment must fall back to it instead of skipping.
         asserter.push_success(&mocked_receipt_hex(tx_hash));
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         asserter.push_success(&Bytes::from(getPriceUnsafeCall::abi_encode_returns(&price)));
 
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
@@ -238,6 +220,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_no_match() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
 
         // Create a different target owner that won't match
@@ -267,6 +250,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_different_input_output_indices() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
         let target_order_owner = order.owner;
 
@@ -303,17 +287,6 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -339,6 +312,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_with_different_amounts() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
         let target_order_owner = order.owner;
 
@@ -374,17 +348,6 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
-
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -418,6 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_zero_amounts() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
         let target_order_owner = order.owner;
 
@@ -444,17 +408,6 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
-
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -475,6 +428,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_invalid_io_index() {
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
         let order = get_test_order();
         let target_order_owner = order.owner;
 

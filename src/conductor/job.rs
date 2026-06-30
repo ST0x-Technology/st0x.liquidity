@@ -709,12 +709,8 @@ pub(crate) fn on_terminal_failure_log_only(
 
 #[cfg(test)]
 mod tests {
-    use apalis::layers::WorkerBuilderExt;
-    use apalis::layers::retry::RetryPolicy;
-    use apalis::prelude::{Monitor, Status, WorkerBuilder};
-    use apalis_core::worker::event::Event;
-    use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
-    use apalis_core::worker::ext::event_listener::EventListenerExt;
+    use apalis::prelude::{Monitor, Status};
+    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -910,6 +906,7 @@ mod tests {
     struct TestCtx {
         success_count: AtomicUsize,
         success_notify: Arc<tokio::sync::Notify>,
+        failing_job_started: Arc<tokio::sync::Notify>,
     }
 
     impl Job<TestCtx> for TestJob {
@@ -925,6 +922,7 @@ mod tests {
 
         async fn perform(&self, ctx: &TestCtx) -> Result<Self::Output, Self::Error> {
             if self.should_fail {
+                ctx.failing_job_started.notify_waiters();
                 return Err(TestJobError);
             }
 
@@ -946,54 +944,124 @@ mod tests {
 
         let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
         queue.push(TestJob { should_fail: true }).await.unwrap();
-        queue.push(TestJob { should_fail: false }).await.unwrap();
+        let mut push_queue = queue.clone();
 
+        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let failing_job_started = Arc::new(tokio::sync::Notify::new());
         let ctx = Arc::new(TestCtx {
             success_count: AtomicUsize::new(0),
             success_notify: Arc::new(tokio::sync::Notify::new()),
+            failing_job_started: failing_job_started.clone(),
         });
         let ctx_for_assert = ctx.clone();
 
+        let fail_stop = CircuitBreakerConfig::default()
+            .with_failure_threshold(1)
+            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+
+        let failing_job_started_wait = failing_job_started.notified();
+
         let monitor_handle = tokio::spawn({
+            let failure_notify = failure_notify.clone();
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
-                    let fail_stop = CircuitBreakerConfig::default()
-                        .with_failure_threshold(1)
-                        .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-
-                    WorkerBuilder::new(format!("test-worker-{index}"))
-                        .backend(queue.clone().into_storage())
-                        .data(ctx.clone())
-                        .data(FailureInjector::new())
-                        .data(JobKind::OrderFill)
-                        .concurrency(1)
-                        .retry(RetryPolicy::retries(3))
-                        .break_circuit_with(fail_stop)
-                        .on_event(|ctx, event| {
-                            if let Event::Error(_) = event {
-                                let _ = ctx.stop();
-                            }
-                        })
-                        .build(work::<TestCtx, TestJob>)
+                    build_supervised_worker!(
+                        ::<TestCtx, TestJob>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        fail_stop.clone(),
+                        failure_notify.clone(),
+                        FailureInjector::new(),
+                    )
                 });
 
-            async move { monitor.run().await }
+            async move {
+                let _ = monitor.run().await;
+            }
         });
 
-        // RetryPolicy retries instantly, so the monitor should exit
-        // quickly once the failing job exhausts retries.
-        let join_result = tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+        if tokio::time::timeout(Duration::from_secs(10), failing_job_started_wait)
             .await
-            .expect("Monitor should exit within 5s after terminal job failure");
-        let _ = join_result.expect("Monitor task should not panic");
+            .is_err()
+        {
+            panic!(
+                "failing job should start before sibling is enqueued; job rows: {:?}",
+                job_rows_for_assertion(&apalis_pool).await
+            );
+        }
+
+        push_queue
+            .push(TestJob { should_fail: false })
+            .await
+            .unwrap();
+
+        wait_for_fail_stop_without_processing_sibling(
+            &apalis_pool,
+            &failure_notify,
+            monitor_handle,
+        )
+        .await;
 
         assert_eq!(
             ctx_for_assert.success_count.load(Ordering::SeqCst),
             0,
             "The second job should NOT have been processed after a prior \
-             job failed all retries."
+             job failed all retries; job rows: {:?}",
+            job_rows_for_assertion(&apalis_pool).await
         );
+    }
+
+    async fn wait_for_fail_stop_without_processing_sibling(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        failure_notify: &Arc<tokio::sync::Notify>,
+        monitor_handle: tokio::task::JoinHandle<()>,
+    ) {
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let rows = job_rows_for_assertion(apalis_pool).await;
+                if rows
+                    .iter()
+                    .any(|(_, status, _, _, _)| status == &Status::Done.to_string())
+                {
+                    panic!(
+                        "pre-queued sibling job must not reach Done while the failing job \
+                         is still retrying or before the worker halts; job rows: {rows:?}"
+                    );
+                }
+
+                if monitor_handle.is_finished() {
+                    return;
+                }
+
+                tokio::select! {
+                    () = failure_notify.notified() => {
+                        // Terminal failure fired stop; give the monitor a moment to exit.
+                        for _ in 0..100 {
+                            if monitor_handle.is_finished() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        return;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            terminal.is_ok(),
+            "failing job should reach terminal state and halt the worker; job rows at timeout: {:?}",
+            job_rows_for_assertion(apalis_pool).await
+        );
+
+        let join_result = tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+            .await
+            .expect("Monitor should exit within 5s after terminal job failure");
+        join_result.expect("Monitor task should not panic");
     }
 
     async fn insert_job(
@@ -1123,6 +1191,7 @@ mod tests {
         let ctx = Arc::new(TestCtx {
             success_count: AtomicUsize::new(0),
             success_notify: success_notify.clone(),
+            failing_job_started: Arc::new(tokio::sync::Notify::new()),
         });
         let ctx_for_assert = ctx.clone();
 
