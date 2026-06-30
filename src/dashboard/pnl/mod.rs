@@ -39,8 +39,8 @@ const COST_WARNING: &str = "Tracked costs and revenues are built bottom-up by ec
      directional drift have no direct bot-paid execution cost. USD and USDC are treated as \
      equivalent reporting currency, so USD/USDC conversion basis is not modeled as PnL; only \
      explicit persisted fees are deducted. Persisted SQLite costs currently include tokenization \
-     fees and CCTP fees. Alpaca account fees, margin interest, and dividends are fetched from \
-     Alpaca account activities by activity creation-time window and then filtered locally by \
-     report date; exact long-horizon coverage requires a persisted Alpaca activity ledger. Oracle \
-     write cost is zero for the current setup. Wallet transfer fees and bot gas require additional \
-     ledger/receipt ingestion before they can be included.";
+     fees and CCTP fees. Alpaca account fees, fee credits, margin interest, dividends, and \
+     capital-gain distributions are fetched from Alpaca account activities by activity creation-time \
+     window and then filtered locally by report date; exact long-horizon coverage requires a \
+     persisted Alpaca activity ledger. Oracle write cost is zero for the current setup. Wallet \
+     transfer fees and bot gas require additional ledger/receipt ingestion before they can be included.";

@@ -167,7 +167,14 @@ fn query_timestamp_bounds_are_rejected() {
         ..PnlQuery::default()
     };
 
-    assert!(query.activity_until().is_err());
+    let error = query.activity_until().unwrap_err();
+    assert!(matches!(
+        error,
+        PnlError::InvalidDate {
+            field: "toDate",
+            ref value,
+        } if value == "2026-05-15T14:30:00Z"
+    ));
 }
 
 #[test]

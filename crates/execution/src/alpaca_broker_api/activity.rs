@@ -11,7 +11,7 @@ use super::AlpacaBrokerApiError;
 use super::auth::AlpacaBrokerApiCtx;
 use super::client::AlpacaBrokerApiClient;
 
-pub const PNL_ACTIVITY_TYPES: &[&str] = &[
+const PNL_ACTIVITY_TYPES: &[&str] = &[
     "FEE", "PTC", "PTR", "INT", "INTNRA", "INTTW", "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT",
     "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "CGD",
 ];

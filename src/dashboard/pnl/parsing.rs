@@ -7,7 +7,7 @@ use num_traits::Zero;
 use serde_json::Value;
 
 use super::SAFE_SYMBOL_CHARS;
-use super::query::PnlError;
+use super::query::{PnlError, PnlFinancialFieldError};
 use super::state::{Direction, PositionEventRow};
 
 pub(crate) fn parse_payload_string(payload: &str) -> Result<Value, serde_json::Error> {
@@ -72,7 +72,7 @@ pub(crate) fn persisted_decimal_value(
                 event_type,
                 field: key,
                 value: value.to_string(),
-                parse_error: "expected string or number".to_owned(),
+                source: PnlFinancialFieldError::InvalidJsonType,
             });
         }
     };
@@ -85,7 +85,7 @@ pub(crate) fn persisted_decimal_value(
             event_type,
             field: key,
             value,
-            parse_error: error.to_string(),
+            source: PnlFinancialFieldError::InvalidDecimal(error),
         })
 }
 

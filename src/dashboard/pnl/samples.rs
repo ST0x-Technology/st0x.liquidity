@@ -4,7 +4,7 @@ use std::str::FromStr;
 use num_decimal::Num;
 
 use super::parsing::{is_safe_symbol, position_event_replay_timestamp};
-use super::query::{PnlError, PnlQuery};
+use super::query::{PnlError, PnlFinancialFieldError, PnlQuery};
 use super::response::{PnlSampleStats, PnlSampleSymbolStats};
 use super::sessions::{matches_date_bounds_for_iso, matches_trade_filters};
 use super::state::{PositionEventRow, PositionViewRow, SampleStatsAcc};
@@ -38,7 +38,7 @@ pub(crate) fn parse_position_view(
                         event_type: "position_view".to_owned(),
                         field: "net_position",
                         value: net_position.clone(),
-                        parse_error: error.to_string(),
+                        source: PnlFinancialFieldError::InvalidDecimal(error),
                     });
                 }
             }

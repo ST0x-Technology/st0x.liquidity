@@ -9,6 +9,14 @@ use super::parsing::is_safe_symbol;
 const ALPACA_ACTIVITY_FETCH_PADDING_DAYS: i64 = 7;
 
 #[derive(Debug, thiserror::Error)]
+pub(crate) enum PnlFinancialFieldError {
+    #[error("expected string or number")]
+    InvalidJsonType,
+    #[error("invalid decimal: {0}")]
+    InvalidDecimal(#[source] num_decimal::ParseNumError),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum PnlError {
     #[error("invalid {field}: {value}")]
     InvalidDate { field: &'static str, value: String },
@@ -21,7 +29,8 @@ pub(crate) enum PnlError {
         source: serde_json::Error,
     },
     #[error(
-        "failed to parse persisted financial field {field} at row {rowid} ({aggregate_type}/{event_type}): {value} ({parse_error})"
+        "failed to parse persisted financial field {field} at row {rowid} \
+         ({aggregate_type}/{event_type}): {value} ({source})"
     )]
     InvalidFinancialField {
         rowid: i64,
@@ -29,7 +38,8 @@ pub(crate) enum PnlError {
         event_type: String,
         field: &'static str,
         value: String,
-        parse_error: String,
+        #[source]
+        source: PnlFinancialFieldError,
     },
     #[error("invalid symbol filter: {value}")]
     InvalidSymbolFilter { value: String },
