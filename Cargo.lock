@@ -6595,6 +6595,7 @@ dependencies = [
  "httpmock",
  "itertools 0.14.0",
  "lazy_static",
+ "num-decimal",
  "num-traits",
  "opentelemetry",
  "opentelemetry-otlp",

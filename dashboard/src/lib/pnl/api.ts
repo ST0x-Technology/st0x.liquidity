@@ -1,7 +1,6 @@
-import { getApiBaseUrl, getPnlSqlApiUrl } from '$lib/env'
+import { getApiBaseUrl } from '$lib/env'
 import { FETCH_TIMEOUT_MS } from '$lib/time'
-import { fetchPnlReportFromSql } from '$lib/pnl/sql-source'
-import type { PnlResponse } from '$lib/pnl/report'
+import type { PnlCounterTradingFilter, PnlMarketSessionFilter, PnlResponse } from '$lib/pnl/report'
 
 export type PnlQuery = {
   limit: number
@@ -9,7 +8,8 @@ export type PnlQuery = {
   symbols: Set<string>
   fromDate?: string
   toDate?: string
-  dayFilter?: 'all' | 'weekday' | 'weekend'
+  marketSessionFilter?: PnlMarketSessionFilter
+  counterTradingFilter?: PnlCounterTradingFilter
 }
 
 export const buildPnlParams = (query: PnlQuery): URLSearchParams => {
@@ -30,25 +30,30 @@ export const buildPnlParams = (query: PnlQuery): URLSearchParams => {
     params.set('toDate', query.toDate)
   }
 
-  if (query.dayFilter !== undefined && query.dayFilter !== 'all') {
-    params.set('dayFilter', query.dayFilter)
+  if (query.marketSessionFilter !== undefined && query.marketSessionFilter !== 'all') {
+    params.set('marketSessionFilter', query.marketSessionFilter)
+  }
+
+  if (query.counterTradingFilter !== undefined && query.counterTradingFilter !== 'all') {
+    params.set('counterTradingFilter', query.counterTradingFilter)
   }
 
   return params
 }
 
 export const fetchPnlReport = async (query: PnlQuery): Promise<PnlResponse> => {
-  const sqlApiUrl = getPnlSqlApiUrl()
-  if (sqlApiUrl !== null) {
-    return await fetchPnlReportFromSql(sqlApiUrl, query)
-  }
-
   const response = await fetch(`${getApiBaseUrl()}/pnl?${buildPnlParams(query).toString()}`, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
 
   if (!response.ok) {
-    throw new Error(`HTTP ${String(response.status)}`)
+    const message = (await response.text()).trim()
+    throw new Error(message === '' ? `HTTP ${String(response.status)}` : message)
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('application/json')) {
+    throw new Error('Backend /pnl returned a non-JSON response')
   }
 
   return (await response.json()) as PnlResponse

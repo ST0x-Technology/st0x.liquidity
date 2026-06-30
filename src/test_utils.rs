@@ -3,6 +3,7 @@
 
 use alloy::hex;
 use alloy::network::TransactionBuilder;
+use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
@@ -11,6 +12,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
@@ -18,6 +20,66 @@ use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
+
+const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
+
+static ANVIL_PERMITS: LazyLock<(Mutex<usize>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+
+pub(crate) struct TestAnvilInstance {
+    instance: AnvilInstance,
+    _permit: AnvilPermit,
+}
+
+impl std::ops::Deref for TestAnvilInstance {
+    type Target = AnvilInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
+}
+
+struct AnvilPermit;
+
+impl Drop for AnvilPermit {
+    fn drop(&mut self) {
+        let (lock, available) = &*ANVIL_PERMITS;
+        let mut in_use = match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *in_use = in_use.saturating_sub(1);
+        drop(in_use);
+        available.notify_one();
+    }
+}
+
+fn acquire_anvil_permit() -> AnvilPermit {
+    let (lock, available) = &*ANVIL_PERMITS;
+    let mut in_use = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    while *in_use >= MAX_CONCURRENT_TEST_ANVILS {
+        in_use = match available.wait(in_use) {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+    }
+
+    *in_use += 1;
+    AnvilPermit
+}
+
+pub(crate) fn spawn_anvil(anvil: Anvil) -> TestAnvilInstance {
+    let permit = acquire_anvil_permit();
+    let instance = anvil.spawn();
+    TestAnvilInstance {
+        instance,
+        _permit: permit,
+    }
+}
 
 /// Builds an equity assets config with the given symbols whitelisted for
 /// rebalancing. The trigger only dispatches transfers for symbols configured

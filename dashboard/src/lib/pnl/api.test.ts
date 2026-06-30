@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { buildPnlParams } from './api'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { buildPnlParams, fetchPnlReport } from './api'
 
 describe('buildPnlParams', () => {
   it('serializes filters for the backend PnL endpoint', () => {
@@ -9,22 +9,80 @@ describe('buildPnlParams', () => {
       symbols: new Set(['SPYM', 'MSTR']),
       fromDate: '2026-05-19',
       toDate: '2026-05-24',
-      dayFilter: 'weekday'
+      marketSessionFilter: 'rth',
+      counterTradingFilter: 'counter_trading_active'
     })
 
     expect(params.toString()).toBe(
-      'limit=500&offset=25&symbol=MSTR%2CSPYM&fromDate=2026-05-19&toDate=2026-05-24&dayFilter=weekday'
+      'limit=500&offset=25&symbol=MSTR%2CSPYM&fromDate=2026-05-19&toDate=2026-05-24&marketSessionFilter=rth&counterTradingFilter=counter_trading_active'
     )
   })
 
-  it('omits optional filters when all symbols and all days are selected', () => {
+  it('omits optional filters when all symbols and all sessions are selected', () => {
     const params = buildPnlParams({
       limit: 100,
       offset: 0,
       symbols: new Set(),
-      dayFilter: 'all'
+      marketSessionFilter: 'all',
+      counterTradingFilter: 'all'
     })
 
     expect(params.toString()).toBe('limit=100&offset=0')
+  })
+})
+
+describe('fetchPnlReport', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('rejects non-JSON backend responses', async () => {
+    vi.stubGlobal('window', {
+      location: {
+        origin: 'http://localhost:5176'
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('<html></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' }
+        })
+      )
+    )
+
+    await expect(
+      fetchPnlReport({
+        limit: 1,
+        offset: 0,
+        symbols: new Set()
+      })
+    ).rejects.toThrow('Backend /pnl returned a non-JSON response')
+  })
+
+  it('preserves backend error messages for failed reports', async () => {
+    vi.stubGlobal('window', {
+      location: {
+        origin: 'http://localhost:5176'
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('invalid symbol filter: DROP', {
+          status: 400,
+          headers: { 'content-type': 'text/plain' }
+        })
+      )
+    )
+
+    await expect(
+      fetchPnlReport({
+        limit: 1,
+        offset: 0,
+        symbols: new Set()
+      })
+    ).rejects.toThrow('invalid symbol filter: DROP')
   })
 })
