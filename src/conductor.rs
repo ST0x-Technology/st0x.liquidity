@@ -1948,13 +1948,10 @@ async fn build_position_cqrs(
         .build(())
         .await?;
 
-    // Seed the position_shares gauge for already-open positions. evolve()
-    // maintains the gauge for live changes, but a normal restart does not
-    // replay positions whose projection is already current, so without this
-    // seeding the gauge stays absent until each symbol's next position event.
-    for (symbol, position) in projection.load_all().await? {
-        crate::position::record_position_gauge(&symbol, &position.net);
-    }
+    // Seed the position_shares gauge for already-open positions: a normal
+    // restart does not replay current positions through evolve(), so the gauge
+    // would otherwise stay absent until each symbol's next position event.
+    crate::position::hydrate_position_gauges(&projection).await?;
 
     Ok((store, projection))
 }

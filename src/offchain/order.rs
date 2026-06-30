@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use st0x_dto::{Direction, Trade, TradingVenue};
@@ -565,10 +565,19 @@ impl EventSourced for OffchainOrder {
                     // Wall-clock placement-to-fill latency. A negative delta can
                     // only come from clock skew (never a real latency), so
                     // `to_std()` rejects it and the sample is skipped rather than
-                    // recorded as a bogus value.
-                    if let Ok(latency) = (filled_at - *placed_at).to_std() {
-                        histogram!("hedge_fill_latency_seconds", "symbol" => symbol.to_string())
-                            .record(latency.as_secs_f64());
+                    // recorded as a bogus value -- logged so the skew is not
+                    // silently swallowed.
+                    match (filled_at - *placed_at).to_std() {
+                        Ok(latency) => {
+                            histogram!("hedge_fill_latency_seconds", "symbol" => symbol.to_string())
+                                .record(latency.as_secs_f64());
+                        }
+                        Err(error) => {
+                            debug!(
+                                %symbol, %error,
+                                "Skipping hedge_fill_latency sample: fill precedes placement (clock skew)"
+                            );
+                        }
                     }
 
                     Ok(vec![OffchainOrderEvent::Filled { price, filled_at }])

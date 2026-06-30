@@ -380,9 +380,11 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     let enqueued_count = trade_events.len();
 
     for trade_event in trade_events {
-        // Count each decoded fill accepted into the accounting pipeline, keyed
-        // by event type, so ingestion volume is observable even before any
-        // hedge is placed downstream. `kind()` yields "ClearV3"/"TakeOrderV3".
+        // Count each decoded fill enqueued into the accounting pipeline, keyed by
+        // event type, so ingestion volume is observable even before any hedge is
+        // placed downstream. This counts enqueue attempts, not unique fills: a
+        // backfill replay re-enqueues already-processed events (the pipeline
+        // dedupes on (tx_hash, log_index)). `kind()` yields "ClearV3"/"TakeOrderV3".
         counter!("onchain_events_total", "event_type" => trade_event.event.kind()).increment(1);
         job_queue
             .push(AccountForDexTrade { trade: trade_event })

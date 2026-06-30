@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use st0x_config::ExecutionThreshold;
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, ProjectionError, Table};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
 };
@@ -113,13 +113,28 @@ impl std::fmt::Debug for Position {
 // possible. The precision loss is intentional and acceptable here — this gauge
 // is for monitoring dashboards only. All financial accounting uses the lossless
 // Float arithmetic in the Position aggregate itself.
-pub(crate) fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
+fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
     match net.to_string().parse::<f64>() {
         Ok(value) => gauge!("position_shares", "symbol" => symbol.to_string()).set(value),
         Err(err) => {
             warn!(%symbol, %err, "position_shares gauge skipped: could not parse net position as f64");
         }
     }
+}
+
+/// Seed the `position_shares` gauge for every open position once, after building
+/// the projection. The gauge is otherwise only written from `evolve()`, which
+/// does not run for positions whose projection is already current on a normal
+/// restart -- so without this seeding the gauge stays absent until each symbol's
+/// next position event. The metrics recorder must already be installed.
+pub(crate) async fn hydrate_position_gauges(
+    projection: &Projection<Position>,
+) -> Result<(), ProjectionError<Position>> {
+    for (symbol, position) in projection.load_all().await? {
+        record_position_gauge(&symbol, &position.net);
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -2387,6 +2402,49 @@ mod tests {
         assert!(
             (value - 5.0).abs() < f64::EPSILON,
             "position_shares gauge should equal net 5, got {value}\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_position_gauges_seeds_open_positions_on_restart() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Seed an open position with the recorder NOT yet installed, so the
+        // evolve() gauge write during this send no-ops -- mirroring a position
+        // that predates a restart and never replays through evolve().
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(3)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Simulate restart: install the recorder, then hydrate from the
+        // already-current projection. Only hydration can populate the gauge here.
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        hydrate_position_gauges(&projection).await.unwrap();
+
+        let rendered = handle.render();
+        let value = gauge_value(&rendered, "position_shares", "AAPL").unwrap_or_else(|| {
+            panic!("hydration must seed position_shares for the open position, got:\n{rendered}")
+        });
+        assert!(
+            (value - 3.0).abs() < f64::EPSILON,
+            "hydrated gauge should equal the open net 3, got {value}\n{rendered}"
         );
     }
 
