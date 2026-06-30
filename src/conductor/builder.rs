@@ -577,21 +577,6 @@ where
         let fail_stop_for_transfer_usdc_to_market_making = fail_stop.clone();
         let fail_stop_for_transfer_equity_to_market_making = fail_stop.clone();
         let fail_stop_for_transfer_equity_to_hedging = fail_stop.clone();
-        // Best-effort workers must not latch idle after failures. We WANT a
-        // never-opening circuit, but apalis-core 1.0.0-rc.9's live worker path
-        // (`CircuitBreakerService::call`) hardcodes `failure_count >= 5` and
-        // never consults the configured `failure_threshold`, so `u32::MAX` does
-        // NOT keep the circuit closed: after 5 failed calls (e.g. interrupted
-        // aggregates exhausting retries while the issuer is down) the circuit
-        // opens and throttles resume. The short `recovery_timeout` is the real
-        // bound -- it IS honored by `call`, so the open state self-heals within
-        // 10s and resume keeps making progress instead of latching idle. The
-        // `with_failure_threshold(u32::MAX)` records the intended behavior and
-        // takes effect only if a future apalis release honors the config.
-        let best_effort_circuit = CircuitBreakerConfig::default()
-            .with_failure_threshold(u32::MAX)
-            .with_recovery_timeout(std::time::Duration::from_secs(10));
-
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
         tokio::spawn(async move {
@@ -792,7 +777,6 @@ where
                 apalis_monitor,
                 resume_tokenization_ctx,
                 resume_tokenization_queue,
-                BestEffortCircuit(best_effort_circuit),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_resume_tokenization,
             );
@@ -876,12 +860,6 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
 /// worker-registration site -- passing the wrong one would be a compile error
 /// rather than a silent freeze.
 struct FailStopCircuit(CircuitBreakerConfig);
-
-/// A circuit-breaker config for a BEST-EFFORT worker: a failing job must not
-/// latch the worker idle (see `spawn_apalis_monitor` for the apalis caveat on
-/// the hardcoded open threshold). A distinct type from [`FailStopCircuit`] so
-/// the two policies cannot be cross-assigned.
-struct BestEffortCircuit(CircuitBreakerConfig);
 
 /// Conditionally registers the wrapped-equity recovery worker against the
 /// apalis monitor. Extracted because this is the only `Option`-gated worker
@@ -1088,7 +1066,6 @@ fn register_resume_tokenization_worker(
     monitor: Monitor,
     resume_ctx: Option<Arc<ResumeTokenizationCtx>>,
     resume_queue: ResumeTokenizationJobQueue,
-    BestEffortCircuit(circuit): BestEffortCircuit,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(resume_ctx) = resume_ctx else {
@@ -1105,7 +1082,6 @@ fn register_resume_tokenization_worker(
             index,
             resume_queue.clone(),
             resume_ctx.clone(),
-            circuit.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )

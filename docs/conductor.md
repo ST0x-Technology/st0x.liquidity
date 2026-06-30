@@ -106,6 +106,12 @@ mid-execution reset their own orphaned rows at startup, before the monitor
 spawns (where every `Running` row is by definition orphaned): see
 `JobQueue::requeue_orphaned`, wired for the Base->Alpaca USDC transfer.
 
+apalis also defaults to fetching multiple rows per poll and marking the whole
+batch `Queued` before the single-concurrency worker can run them. A process kill
+then loses the in-memory fetch buffer while the durable rows are no longer
+`Pending`. Use `Config::set_buffer_size(1)` for these workers so SQLite
+reservation matches actual handler execution.
+
 ### apalis Jobs table: status semantics and payload encoding
 
 **Status lifecycle** (apalis-sqlite v1.0.0-rc.8, source-verified via
@@ -201,7 +207,10 @@ WorkerBuilder::new(name)
 - **`.break_circuit_with(config)`** — opens the circuit after
   `failure_threshold` errors, returning `Poll::Pending` from `poll_ready` to
   block new job pickup. Use `failure_threshold(1)` + very long
-  `recovery_timeout` for fail-stop.
+  `recovery_timeout` for fail-stop. Do not install this layer on best-effort
+  workers: in apalis-core 1.0.0-rc.9, an open circuit can return `Poll::Pending`
+  without scheduling a wakeup, so a short `recovery_timeout` does not guarantee
+  the worker will resume.
 - **`.on_event()`** — fires on `Event::Error` (after retries exhaust),
   `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging AND for
   calling `ctx.stop()` on terminal failure. The circuit breaker alone only
