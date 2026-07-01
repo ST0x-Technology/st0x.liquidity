@@ -44,7 +44,7 @@ ingestion_cutoff = "safe"
 [wallet]
 kind = "turnkey"
 # On-chain address controlled by the Turnkey key.
-address = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
+address = "0x16ca08a5825612aAe805D172a81B1a52b43574bf"
 # Turnkey organization that owns the signing key.
 organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 
@@ -112,7 +112,7 @@ rebalancing = "disabled"
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
-extended_hours_counter_trading = "disabled"
+extended_hours_counter_trading = "enabled"
 # operational_limit = 1
 vault_id = "0xfab"
 tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
