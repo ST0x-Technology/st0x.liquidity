@@ -183,7 +183,7 @@ in
     // {
       inherit cargoArtifacts;
 
-      cargoExtraArgs = "--bin server --bin validate-config --features wallet-turnkey";
+      cargoExtraArgs = "--bin server --bin validate-config --bin verify-migrations --features wallet-turnkey";
 
       meta = {
         description = "st0x liquidity market making server";

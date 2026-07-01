@@ -283,6 +283,23 @@ NEVER use workarounds like `DATABASE_URL=sqlite://:memory:`.
 compile errors like "unable to open database file". Run `sqlx db reset -y` to
 create and migrate the local database before any cargo commands.
 
+**Verifying a migration against real data**: `sqlx db reset -y` only proves a
+migration applies to an empty schema, not that it behaves correctly against real
+prod/staging data or that legacy events still deserialize under current code.
+While developing a migration, run `nix run .#prod-verify-migrations` (or
+`.#staging-verify-migrations`) -- it takes a _consistent_ server-side
+`VACUUM INTO` snapshot of the live database (`<env>-db-snapshot` in
+`infra/default.nix`; a plain `scp` of a live WAL-mode SQLite file can race the
+bot's writes and download a torn/corrupt copy, so never `scp` the `.db` file
+directly for this purpose), downloads only that snapshot, and runs it through
+the `verify-migrations` binary. That binary never mutates the file it's pointed
+at (runs against its own internal `VACUUM INTO` copy) and replays every
+persisted aggregate under current code, catching legacy event shapes a migration
+needs to repair. The same binary gates staging/prod deploys in `deploy.nix`
+before the real restart. To point it at an already-downloaded snapshot instead
+of pulling a fresh one, run `cargo run --bin verify-migrations -- --db <path>`
+directly.
+
 ### Dependency Management
 
 **CRITICAL: NEVER manually edit `Cargo.toml` to add dependencies.** Use

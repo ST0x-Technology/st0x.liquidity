@@ -59,6 +59,16 @@ let
           # Validate config + secrets before restarting. If validation fails,
           # the activation script exits non-zero and deploy-rs rolls back.
           "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
+          # Dry-run migrations + full event replay against the live DB before
+          # restarting -- the service is already stopped above (no
+          # concurrent writer), and this only ever reads that file: it
+          # VACUUM INTOs a scratch copy internally and runs the new binary's
+          # embedded migrations plus an aggregate replay check against the
+          # copy, never touching the real one. Catches both broken migration
+          # SQL and legacy prod events that no longer deserialize under the
+          # code being deployed. Skipped on first deploy, before the DB
+          # exists. Same rollback behavior as validate-config on failure.
+          "if [ -f /mnt/data/${name}.db ]; then ${cfg.profilePath}/bin/verify-migrations --db /mnt/data/${name}.db; fi"
           "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
           "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
           "echo '${gitRev}' > /run/st0x/${name}.git-rev"
