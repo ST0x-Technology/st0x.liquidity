@@ -140,7 +140,9 @@ impl Reactor for Broadcaster {
                     | Submitted { .. }
                     | Accepted { .. }
                     | PartiallyFilled { .. }
-                    | Failed { .. } => {}
+                    | CancelRequested { .. }
+                    | Failed { .. }
+                    | Cancelled { .. } => {}
                 }
             })
 
@@ -246,7 +248,7 @@ mod tests {
     async fn offchain_order_filled_broadcasts_fill() {
         let pool = setup_test_db().await;
         let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(())
+            .build(crate::offchain::order::noop_order_placer())
             .await
             .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
@@ -266,6 +268,8 @@ mod tests {
                     .unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -280,6 +284,8 @@ mod tests {
                     )
                     .unwrap(),
                     submitted_at: now,
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
                 },
             )
             .await
@@ -289,6 +295,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::CompleteFill {
                     price: st0x_finance::Usd::new(st0x_float_macro::float!(245)),
+                    filled_at: now,
                 },
             )
             .await

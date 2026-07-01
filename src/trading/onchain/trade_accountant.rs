@@ -330,7 +330,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(noop_order_placer())
                 .await
                 .unwrap();
 
@@ -459,7 +459,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(noop_order_placer())
                 .await
                 .unwrap();
 

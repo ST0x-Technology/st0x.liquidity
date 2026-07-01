@@ -16,8 +16,8 @@ use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, S
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderId, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
-    client_order_id_for_placement, place_offchain_order_at_broker,
+    OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer, PollOrderStatus,
+    PollOrderStatusJobQueue, client_order_id_for_placement, place_offchain_order_at_broker,
 };
 use crate::position::{Position, PositionCommand, PositionError};
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -77,9 +77,11 @@ async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
     pending_id: OffchainOrderId,
 ) -> Result<(), TradeAccountingError> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
     match ctx.offchain_order.load(&pending_id).await? {
-        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+        Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             ctx.poll_status_queue
                 .clone()
                 .push(PollOrderStatus {
@@ -106,17 +108,19 @@ async fn recover_pending_poll_status(
                 &ctx.offchain_order,
                 ctx.order_placer.as_ref(),
                 &pending_id,
-                symbol.clone(),
-                shares,
-                direction,
-                executor,
-                client_order_id,
+                OffchainOrderPlacement::market(
+                    symbol.clone(),
+                    shares,
+                    direction,
+                    executor,
+                    client_order_id,
+                ),
             )
             .await?;
 
             route_placement_outcome(ctx, &symbol, pending_id, placed).await
         }
-        Some(Filled { .. } | Failed { .. }) | None => Ok(()),
+        Some(Filled { .. } | Failed { .. } | Cancelled { .. }) | None => Ok(()),
     }
 }
 
@@ -141,7 +145,9 @@ async fn route_placement_outcome(
     offchain_order_id: OffchainOrderId,
     placed: Option<OffchainOrder>,
 ) -> Result<(), TradeAccountingError> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
     match placed {
         Some(Failed { error, .. }) => {
             ctx.position
@@ -155,7 +161,7 @@ async fn route_placement_outcome(
                 .await?;
         }
 
-        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+        Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             ctx.poll_status_queue
                 .clone()
                 .push(PollOrderStatus { offchain_order_id })
@@ -194,6 +200,8 @@ async fn route_placement_outcome(
                 state,
             });
         }
+
+        Some(Cancelled { .. }) => {}
     }
 
     Ok(())
@@ -299,11 +307,13 @@ impl Job<HedgeCtx> for PlaceHedge {
             &ctx.offchain_order,
             ctx.order_placer.as_ref(),
             &self.offchain_order_id,
-            self.symbol.clone(),
-            self.shares,
-            self.direction,
-            self.executor,
-            client_order_id,
+            OffchainOrderPlacement::market(
+                self.symbol.clone(),
+                self.shares,
+                self.direction,
+                self.executor,
+                client_order_id,
+            ),
         )
         .await?;
 
@@ -348,7 +358,30 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-order-123"),
                     placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
                 })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-limit-order-123"),
+                    placed_shares: order.shares,
+                    is_extended_hours: order.extended_hours,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
@@ -368,6 +401,24 @@ mod tests {
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Err("Broker rejected: insufficient buying power".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<
+                crate::offchain::order::OrderPlacementResult,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err("Broker rejected: insufficient buying power".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
@@ -391,7 +442,7 @@ mod tests {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(())
+                .build(order_placer.clone())
                 .await
                 .unwrap();
 
@@ -464,6 +515,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             placed_at: chrono::Utc::now(),
+            market_session: st0x_execution::MarketSession::Regular,
         };
 
         let error =
@@ -852,6 +904,10 @@ mod tests {
                     shares: job.shares,
                     direction: job.direction,
                     executor: job.executor,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(
+                        job.offchain_order_id.as_uuid(),
+                    ),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
