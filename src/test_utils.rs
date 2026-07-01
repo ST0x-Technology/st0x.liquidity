@@ -132,7 +132,7 @@ pub(crate) fn create_log(log_index: u64) -> Log {
         },
         block_hash: None,
         block_number: Some(12345),
-        block_timestamp: None,
+        block_timestamp: Some(1_700_000_000),
         transaction_hash: Some(fixed_bytes!(
             "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         )),
@@ -309,8 +309,8 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_block_number(mut self, block_number: Option<u64>) -> Self {
-        self.trade.block_number = block_number;
+    pub(crate) fn with_block_number(mut self, block_number: impl IntoOptionalBlockNumber) -> Self {
+        self.trade.block_number = block_number.into_optional_block_number();
         self
     }
 
@@ -335,5 +335,21 @@ impl OnchainTradeBuilder {
 
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
+    }
+}
+
+pub(crate) trait IntoOptionalBlockNumber {
+    fn into_optional_block_number(self) -> Option<u64>;
+}
+
+impl IntoOptionalBlockNumber for u64 {
+    fn into_optional_block_number(self) -> Option<u64> {
+        Some(self)
+    }
+}
+
+impl IntoOptionalBlockNumber for Option<u64> {
+    fn into_optional_block_number(self) -> Option<u64> {
+        self
     }
 }

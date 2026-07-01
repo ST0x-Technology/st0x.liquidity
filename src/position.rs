@@ -967,7 +967,7 @@ impl DomainEvent for PositionEvent {
         use PositionEvent::*;
         match self {
             Initialized { .. } => "PositionEvent::Initialized".to_string(),
-            OnChainOrderFilled { .. } => "PositionEvent::OnChainOrderFilled".to_string(),
+            OnChainOrderFilled { .. } => Self::ON_CHAIN_ORDER_FILLED_EVENT_TYPE.to_string(),
             OnChainFillApplied { .. } => "PositionEvent::OnChainFillApplied".to_string(),
             OnChainFillSettled { .. } => "PositionEvent::OnChainFillSettled".to_string(),
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
@@ -981,6 +981,11 @@ impl DomainEvent for PositionEvent {
     fn event_version(&self) -> String {
         "1.0".to_string()
     }
+}
+
+impl PositionEvent {
+    pub(crate) const ON_CHAIN_ORDER_FILLED_EVENT_TYPE: &'static str =
+        "PositionEvent::OnChainOrderFilled";
 }
 
 /// Compares two optional `Float` prices, treating both-absent as equal.

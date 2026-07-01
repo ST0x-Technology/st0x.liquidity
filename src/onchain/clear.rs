@@ -250,6 +250,8 @@ mod tests {
     use crate::tokenized_symbol;
     use st0x_float_macro::float;
 
+    const TEST_BLOCK_TIMESTAMP: u64 = 1_700_000_000;
+
     fn create_test_ctx() -> EvmCtx {
         EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -342,7 +344,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(1),
@@ -357,7 +359,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(2), // Higher than clear log
@@ -426,7 +428,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(1),
@@ -441,7 +443,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(2), // Higher than clear log
@@ -583,7 +585,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(fixed_bytes!(
                 "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
             )),
@@ -642,7 +644,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(1),
@@ -657,7 +659,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(fixed_bytes!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )), // Different tx hash
@@ -714,7 +716,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(5), // Higher log index
@@ -729,7 +731,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(2), // Lower than clear log index
@@ -779,7 +781,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(1),
@@ -794,7 +796,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(2),
@@ -877,7 +879,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(log_index),
@@ -1017,7 +1019,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(5),
@@ -1032,7 +1034,7 @@ mod tests {
             },
             block_hash: None,
             block_number: Some(1),
-            block_timestamp: None,
+            block_timestamp: Some(TEST_BLOCK_TIMESTAMP),
             transaction_hash: Some(tx_hash),
             transaction_index: None,
             log_index: Some(5),

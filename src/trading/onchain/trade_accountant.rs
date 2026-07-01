@@ -233,6 +233,8 @@ pub(crate) enum TradeAccountingError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("Failed to enqueue PollOrderStatus job: {0}")]
     EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
+    #[error("Position fill lookup failed: {0}")]
+    PositionFillLookup(#[from] crate::conductor::PositionFillLookupError),
     #[error("Missing block_timestamp for fill {trade_id}; cannot account for it")]
     MissingBlockTimestamp {
         trade_id: crate::onchain_trade::OnChainTradeId,
@@ -244,6 +246,10 @@ pub(crate) enum TradeAccountingError {
     UnexpectedPostPlaceState {
         offchain_order_id: crate::offchain::order::OffchainOrderId,
         state: crate::offchain::order::OffchainOrder,
+    },
+    #[error("Witness command for fill {trade_id} was rejected but the trade is missing on reload")]
+    InconsistentOnChainTradeState {
+        trade_id: crate::onchain_trade::OnChainTradeId,
     },
 }
 
@@ -335,6 +341,7 @@ mod tests {
                 .unwrap();
 
         let cqrs = TradeProcessingCqrs {
+            pool: pool.clone(),
             onchain_trade,
             position,
             position_projection,
@@ -463,6 +470,7 @@ mod tests {
                 .unwrap();
 
         let cqrs = TradeProcessingCqrs {
+            pool: pool.clone(),
             onchain_trade,
             position,
             position_projection,
