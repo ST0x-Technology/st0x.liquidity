@@ -11,10 +11,9 @@ use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{
-    AlpacaTokenizationError, MintVerificationError, TokenizationRequest, TokenizationRequestStatus,
-    Tokenizer, TokenizerError,
+    AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
+    TokenizationRequestId, TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 /// Configurable outcome for mint request.
 #[derive(Clone, Copy)]

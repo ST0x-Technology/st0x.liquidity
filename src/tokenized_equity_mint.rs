@@ -44,10 +44,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::fmt::Display;
-use std::str::FromStr;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -55,51 +52,7 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
 
 use crate::rebalancing::equity::EquityTransferServices;
-use crate::tokenization::TokenizationRequestStatus;
-
-/// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.
-///
-/// Mirrors [`crate::usdc_rebalance::UsdcRebalanceId`]: a UUID so invalid ids are
-/// unrepresentable and apalis/CLI retries always target the same aggregate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) struct IssuerRequestId(pub(crate) Uuid);
-
-impl IssuerRequestId {
-    pub(crate) fn generate() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Display for IssuerRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl FromStr for IssuerRequestId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(value)?))
-    }
-}
-
-/// Deterministic issuer request id for tests. Maps a human-readable label to a
-/// UUID v5 so test aggregate ids stay valid [`IssuerRequestId`] values.
-#[cfg(test)]
-pub(crate) fn issuer_request_id(label: &str) -> IssuerRequestId {
-    IssuerRequestId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
-}
-
-/// Alpaca tokenization request identifier used to track the mint operation through their API.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) struct TokenizationRequestId(pub(crate) String);
-
-impl std::fmt::Display for TokenizationRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+use crate::tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequestStatus};
 
 /// Errors that can occur during tokenized equity mint operations.
 ///
@@ -2232,8 +2185,8 @@ mod tests {
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
-    use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
+    use crate::tokenization::{Tokenizer, issuer_request_id};
     use crate::vault_lookup::MockVaultLookup;
 
     fn mock_vault_lookup() -> MockVaultLookup {
@@ -2352,7 +2305,7 @@ mod tests {
             matches!(
                 &events[1],
                 TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if *issuer_request_id == super::issuer_request_id("ISS001")
+                    if *issuer_request_id == crate::tokenization::issuer_request_id("ISS001")
             ),
             "Expected MintAccepted with ISS001, got: {:?}",
             events[1]

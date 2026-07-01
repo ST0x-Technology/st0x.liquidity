@@ -44,7 +44,8 @@ use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
 use crate::rebalancing::trigger::{GuardState, claim_guard_for_recovery_or_orphan};
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
+use crate::tokenization::IssuerRequestId;
+use crate::tokenized_equity_mint::TokenizedEquityMint;
 
 /// Apalis queue type for [`WrappedEquityRecoveryJob`].
 pub(crate) type WrappedEquityRecoveryJobQueue = JobQueue<WrappedEquityRecoveryJob>;

@@ -77,15 +77,15 @@ use st0x_finance::{FractionalShares, Id};
 use st0x_wrapper::WrapperError;
 
 use crate::rebalancing::equity::EquityTransferServices;
+use crate::tokenization::TokenizationRequestId;
 use crate::tokenization::Tokenizer;
-use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// Our tokenized equity tokens use 18 decimals.
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
 ///
-/// Mirrors [`crate::tokenized_equity_mint::IssuerRequestId`]: a UUID chosen at
+/// Mirrors [`crate::tokenization::IssuerRequestId`]: a UUID chosen at
 /// enqueue time so apalis retries and bot restarts always target the same
 /// aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

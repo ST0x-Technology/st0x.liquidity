@@ -43,8 +43,9 @@ use st0x_evm::{
 };
 use st0x_execution::{AlpacaAccountId, FractionalShares, Network, PollingConfig, Symbol};
 
-use super::{MintVerificationError, Tokenizer, TokenizerError};
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
+use super::{
+    IssuerRequestId, MintVerificationError, TokenizationRequestId, Tokenizer, TokenizerError,
+};
 
 /// High-level service for Alpaca tokenization operations.
 ///
@@ -1032,7 +1033,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
-    use crate::tokenized_equity_mint::issuer_request_id;
+    use crate::tokenization::issuer_request_id;
     use st0x_float_macro::float;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
