@@ -19,10 +19,13 @@
 }:
 
 let
-  inherit (import ../services.nix { inherit lib; }) enabled;
+  inherit (import ../services.nix { inherit lib; }) enabled hasUnit;
 
-  # Services with a systemd unit (everything except kind = "static").
-  unitServices = lib.filterAttrs (_: v: v.kind != "static") enabled;
+  # Services with a systemd unit. "static" (nginx-served assets) and "cli"
+  # (config/secret installed for on-demand CLI use) have none, so mkService would
+  # throw for them at eval time; `hasUnit` (services.nix) is the single source of
+  # truth for which kinds get a unit.
+  unitServices = lib.filterAttrs (_: v: hasUnit v.kind) enabled;
 
   mkService =
     name: cfg:

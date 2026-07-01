@@ -76,6 +76,34 @@ let
           "systemctl restart ${name}"
         ]
       )
+    else if cfg.kind == "cli" then
+      # On-demand CLI config: install the config, decrypt the secret, and
+      # validate -- exactly like the st0x kind, but start no systemd unit. The
+      # files land at the paths the wrapper in os.nix reads (e.g. `s01`). A
+      # validation failure exits non-zero, so deploy-rs rolls the profile back.
+      #
+      # config + secret live under /run (tmpfs), populated only by this
+      # deploy-time activation (no unit, no tmpfiles rule). A host reboot clears
+      # them, so the s01-issuer profile must be redeployed before the next CLI
+      # run -- same deploy-to-populate model as st0x-hedge's /run config.
+      let
+        # cli configs are environment-agnostic (one config/secret pair), unlike
+        # st0x services whose plaintext configs live under config/<env>/.
+        configFile = ./config/${name}.toml;
+        secretsFile = ./secret/${cfg.encryptedSecret};
+      in
+      activate.custom pkg (
+        builtins.concatStringsSep " && " [
+          "mkdir -p /run/st0x"
+          "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
+          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
+          "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
+          # Match st0x's DB ownership so the CLI's SQLite DB is st0x:st0x
+          # regardless of who runs `s01` (glob is a no-op until the DB exists).
+          "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
+          "echo '${gitRev}' > /run/st0x/${name}.git-rev"
+        ]
+      )
     else if cfg.kind == "plain" then
       # Marker must exist BEFORE systemctl restart, because the unit's
       # ConditionPathExists is evaluated when systemd processes the start
