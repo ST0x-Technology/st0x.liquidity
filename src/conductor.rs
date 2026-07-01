@@ -1944,11 +1944,18 @@ async fn build_position_cqrs(
     pool: &SqlitePool,
     broadcaster: Arc<Broadcaster>,
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
-    Ok(StoreBuilder::<Position>::new(pool.clone())
+    let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(broadcaster)
         .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
         .build(())
-        .await?)
+        .await?;
+
+    // Seed the position_shares gauge for already-open positions: a normal
+    // restart does not replay current positions through evolve(), so the gauge
+    // would otherwise stay absent until each symbol's next position event.
+    crate::position::hydrate_position_gauges(&projection).await?;
+
+    Ok((store, projection))
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.

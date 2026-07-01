@@ -26,6 +26,7 @@ bon.workspace = true
 clap.workspace = true
 itertools.workspace = true
 opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 proptest = { workspace = true, optional = true }

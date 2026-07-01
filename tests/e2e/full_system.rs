@@ -342,7 +342,11 @@ board_port = {board_port}
 log_level = "debug"
 database_url = "{database_url}"
 apalis_finished_job_cleanup_interval_secs = 3600
-hyperdx.service_name = "st0x-simulate-failures"
+[telemetry]
+service_name = "st0x-simulate-failures"
+environment = "e2e"
+traces_endpoint = "http://localhost:10428"
+logs_endpoint = "http://localhost:9428"
 
 [broker]
 counter_trade_slippage_bps = 100
@@ -400,8 +404,7 @@ rebalancing = "enabled"
     );
 
     let secrets = format!(
-        r#"hyperdx.api_key = "simulate-failures"
-
+        r#"
 [evm]
 rpc_url = "{rpc_url}"
 base_rpc_url = "{base_rpc_url}"

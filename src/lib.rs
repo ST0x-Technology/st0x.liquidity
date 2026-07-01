@@ -9,6 +9,7 @@ use apalis_board::axum::framework::{ApiBuilder, RegisterRoute};
 use apalis_board::axum::sse::TracingBroadcaster;
 use apalis_board::axum::ui::ServeUI;
 use axum::{Extension, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::SqlitePool;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,6 +48,7 @@ mod conductor;
 pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
+pub(crate) mod metrics;
 mod offchain;
 mod onchain;
 mod onchain_trade;
@@ -138,6 +140,7 @@ pub(crate) struct AppState {
     pub(crate) settings: st0x_dto::Settings,
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
+    pub(crate) metrics_handle: PrometheusHandle,
 }
 
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
@@ -182,6 +185,8 @@ async fn run_bot_session_inner(
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
     conductor::setup_apalis_tables(&apalis_pool).await?;
 
+    let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
+
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
         event_sender.clone(),
@@ -205,16 +210,17 @@ async fn run_bot_session_inner(
         apalis: apalis_pool,
     };
 
-    let server_supervisor = spawn_server_supervisor(
-        &ctx,
-        &pools,
-        event_sender.clone(),
-        inventory.clone(),
-        recovery_cell.clone(),
+    let state = AppState {
+        ctx: ctx.clone(),
+        pool: pools.cqrs.clone(),
+        event_sender: event_sender.clone(),
+        inventory: inventory.clone(),
+        settings: dashboard::settings_from_ctx(&ctx),
+        recovery: recovery_cell.clone(),
         resume_lock,
-        main_listener,
-        board_listener,
-    );
+        metrics_handle,
+    };
+    let server_supervisor = spawn_server_supervisor(state, &pools, main_listener, board_listener);
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pools,
@@ -321,28 +327,15 @@ impl SupervisedTask for ServerTask {
 }
 
 fn spawn_server_supervisor(
-    ctx: &Ctx,
+    state: AppState,
     pools: &DatabasePools,
-    event_sender: broadcast::Sender<Statement>,
-    inventory: Arc<inventory::BroadcastingInventory>,
-    recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
-    resume_lock: Arc<api::ResumeLock>,
     main_listener: TcpListener,
     board_listener: TcpListener,
 ) -> SupervisorHandle {
-    let state = AppState {
-        ctx: ctx.clone(),
-        pool: pools.cqrs.clone(),
-        event_sender,
-        inventory,
-        settings: dashboard::settings_from_ctx(ctx),
-        recovery,
-        resume_lock,
-    };
-
     let main_router = Router::new()
         .merge(api::routes())
         .nest("/api", dashboard::routes())
+        .route("/metrics", axum::routing::get(metrics::endpoint))
         .with_state(state);
 
     // apalis-board's embedded UI is built with hardcoded absolute paths

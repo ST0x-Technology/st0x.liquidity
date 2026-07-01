@@ -1,78 +1,34 @@
-//! HyperDX observability integration for trace export.
+//! OpenTelemetry observability integration for the self-hosted st0x stack.
 //!
-//! This module provides optional OpenTelemetry trace export to HyperDX for real-time
-//! monitoring and debugging of bot operations. When enabled via the `[hyperdx]` section
-//! in the secrets TOML file, traces are batched and exported to HyperDX. When disabled,
-//! the bot runs normally with console-only logging.
-//!
-//! # Architecture
-//!
-//! Uses OpenTelemetry's [`BatchSpanProcessor`] for efficient trace export:
-//! - **Batch size**: 512 spans per batch
-//! - **Queue size**: 2048 spans maximum
-//! - **Export interval**: 3 seconds
-//! - **Protocol**: gRPC via OTLP
+//! Exports traces to VictoriaTraces and logs to VictoriaLogs using OTLP/HTTP.
+//! When `[telemetry]` is absent from config, the bot runs with console-only
+//! logging. No external SaaS dependency or API key required.
 //!
 //! ## Blocking HTTP Client Requirement
 //!
-//! **CRITICAL**: The [`BatchSpanProcessor`] spawns background threads that run outside
-//! the tokio runtime. These threads require a blocking HTTP client (from `reqwest::blocking`)
-//! rather than an async client. Using an async client would panic with "no reactor running"
-//! because the background threads have no tokio runtime available.
-//!
-//! The blocking client is created in a separate thread to avoid blocking the main tokio
-//! runtime during initialization.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! // Optional telemetry setup through ctx
-//! let ctx = Ctx::load_files(&config_path, &secrets_path)?;
-//! let log_level: tracing::Level = (&ctx.log_level).into();
-//!
-//! let telemetry_guard = if let Some(ref telemetry) = ctx.telemetry {
-//!     match telemetry.setup(log_level, ctx.log_dir.as_deref()) {
-//!         Ok((_file_guard, guard)) => Some(guard),
-//!         Err(e) => {
-//!             eprintln!("Failed to setup telemetry: {e}");
-//!             None
-//!         }
-//!     }
-//! } else {
-//!     None
-//! };
-//!
-//! // Bot runs normally regardless of telemetry availability
-//! // ...
-//!
-//! // Guard flushes remaining traces on drop
-//! drop(telemetry_guard);
-//! ```
-//!
-//! # Trace Filtering
-//!
-//! The module sets up per-layer filtering to control what gets logged to console vs
-//! exported to HyperDX:
-//! - Console layer: Respects `RUST_LOG` environment variable, defaults to bot crates only
-//! - Telemetry layer: Independent filter, defaults to bot crates only
-//!
-//! This prevents external crate spam (e.g., from `alloy`, `rocket`) from cluttering
-//! traces while still allowing those logs in console if needed.
+//! **CRITICAL**: Both batch processors spawn background threads that run outside
+//! the tokio runtime and require `reqwest::blocking`. Using an async client panics
+//! with "no reactor running". The client is created in a separate thread to avoid
+//! blocking the main tokio runtime during initialization.
 
 use itertools::Itertools;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::{
+    BatchConfigBuilder as LogBatchConfigBuilder, BatchLogProcessor, SdkLoggerProvider,
+};
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
+use url::Url;
 
 use crate::LogLevel;
 
@@ -95,104 +51,144 @@ fn build_log_file_appender(dir: &str) -> Result<RollingFileAppender, InitError> 
         .build(dir)
 }
 
+/// Build the OTel [`Resource`] shared by the trace and log providers. Carries
+/// `service.name` and the `deployment.environment` attribute so signals from
+/// different environments are distinguishable in VictoriaTraces/VictoriaLogs.
+fn build_resource(service_name: &str, environment: &str) -> Resource {
+    Resource::builder()
+        .with_service_name(service_name.to_string())
+        .with_attributes(vec![KeyValue::new(
+            "deployment.environment",
+            environment.to_string(),
+        )])
+        .build()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     pub service_name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TelemetrySecrets {
-    pub api_key: String,
+    /// Deployment environment (e.g. `production`, `staging`) exported as the
+    /// `deployment.environment` resource attribute. Without it, staging and
+    /// prod traces/logs are indistinguishable in VictoriaTraces/VictoriaLogs.
+    pub environment: String,
+    pub traces_endpoint: Url,
+    pub logs_endpoint: Url,
 }
 
 #[derive(Clone)]
 pub struct TelemetryCtx {
-    pub api_key: String,
     pub service_name: String,
+    pub environment: String,
+    pub traces_endpoint: Url,
+    pub logs_endpoint: Url,
 }
 
 impl std::fmt::Debug for TelemetryCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryCtx")
-            .field("api_key", &"[REDACTED]")
             .field("service_name", &self.service_name)
+            .field("environment", &self.environment)
+            .field("traces_endpoint", &self.traces_endpoint)
+            .field("logs_endpoint", &self.logs_endpoint)
             .finish()
     }
 }
 
-impl TelemetryCtx {
-    pub fn new(
-        config: Option<TelemetryConfig>,
-        secrets: Option<TelemetrySecrets>,
-    ) -> Result<Option<Self>, TelemetryAssemblyError> {
-        match (config, secrets) {
-            (Some(config), Some(secrets)) => Ok(Some(Self {
-                api_key: secrets.api_key,
-                service_name: config.service_name,
-            })),
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(TelemetryAssemblyError::SecretsMissing),
-            (None, Some(_)) => Err(TelemetryAssemblyError::ConfigMissing),
+impl From<TelemetryConfig> for TelemetryCtx {
+    fn from(config: TelemetryConfig) -> Self {
+        Self {
+            service_name: config.service_name,
+            environment: config.environment,
+            traces_endpoint: config.traces_endpoint,
+            logs_endpoint: config.logs_endpoint,
         }
     }
+}
 
+impl TelemetryCtx {
     pub fn setup(
         &self,
         log_level: tracing::Level,
         log_dir: Option<&str>,
         extra_layer: Option<ExtraLayer>,
     ) -> Result<(Option<FileLogGuard>, TelemetryGuard), TelemetryError> {
-        let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
-
         let http_client =
             std::thread::spawn(|| reqwest::blocking::Client::builder().gzip(true).build())
                 .join()??;
 
-        let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_http_client(http_client)
-            .with_endpoint("https://in-otel.hyperdx.io/v1/traces")
-            .with_headers(headers)
-            .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-            .build()?;
+        let resource = build_resource(&self.service_name, &self.environment);
 
-        let batch_exporter = BatchSpanProcessor::builder(otlp_exporter)
-            .with_batch_config(
-                BatchConfigBuilder::default()
-                    .with_max_export_batch_size(512)
-                    .with_max_queue_size(2048)
-                    .with_scheduled_delay(Duration::from_secs(3))
-                    .build(),
-            )
-            .build();
+        let tracer_provider = {
+            let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_http_client(http_client.clone())
+                .with_endpoint(
+                    self.traces_endpoint
+                        .join("opentelemetry/v1/traces")?
+                        .as_str(),
+                )
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .build()?;
 
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_span_processor(batch_exporter)
-            .with_resource(
-                Resource::builder()
-                    .with_service_name(self.service_name.clone())
-                    .with_attributes(vec![KeyValue::new("deployment.environment", "production")])
-                    .build(),
-            )
-            .build();
+            let batch_processor = BatchSpanProcessor::builder(span_exporter)
+                .with_batch_config(
+                    BatchConfigBuilder::default()
+                        .with_max_export_batch_size(512)
+                        .with_max_queue_size(2048)
+                        .with_scheduled_delay(Duration::from_secs(3))
+                        .build(),
+                )
+                .build();
+
+            SdkTracerProvider::builder()
+                .with_span_processor(batch_processor)
+                .with_resource(resource.clone())
+                .build()
+        };
+
+        let logger_provider = {
+            let log_exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_http()
+                .with_http_client(http_client)
+                .with_endpoint(
+                    self.logs_endpoint
+                        .join("insert/opentelemetry/v1/logs")?
+                        .as_str(),
+                )
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .build()?;
+
+            SdkLoggerProvider::builder()
+                .with_log_processor(
+                    BatchLogProcessor::builder(log_exporter)
+                        .with_batch_config(
+                            LogBatchConfigBuilder::default()
+                                .with_max_export_batch_size(512)
+                                .with_max_queue_size(2048)
+                                .with_scheduled_delay(Duration::from_secs(3))
+                                .build(),
+                        )
+                        .build(),
+                )
+                .with_resource(resource)
+                .build()
+        };
 
         let tracer = tracer_provider.tracer(TRACER_NAME);
-
         let telemetry_layer = tracing_opentelemetry::layer()
             .with_tracer(tracer)
-            .with_level(true);
+            .with_level(true)
+            .with_filter(mk_crate_filter(log_level));
+
+        let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
+            .with_filter(mk_crate_filter(log_level));
 
         let fmt_layer = tracing_subscriber::fmt::layer().with_filter(mk_env_filter(log_level));
-        let telemetry_layer = telemetry_layer.with_filter(mk_telemetry_filter(log_level));
 
         let file_appender = log_dir.and_then(|dir| match build_log_file_appender(dir) {
             Ok(appender) => Some(appender),
             Err(error) => {
-                // A misconfigured log directory must not take HyperDX export
-                // down with it: keep the OTLP layer alive and continue without
-                // file logging rather than failing the whole telemetry setup.
                 eprintln!("Failed to build rolling file appender, continuing without file logging: {error}");
                 None
             }
@@ -210,6 +206,7 @@ impl TelemetryCtx {
                 .with(extra_layer)
                 .with(fmt_layer)
                 .with(telemetry_layer)
+                .with(otel_log_layer)
                 .with(file_layer);
 
             tracing::subscriber::set_global_default(subscriber)?;
@@ -219,45 +216,44 @@ impl TelemetryCtx {
             let subscriber = Registry::default()
                 .with(extra_layer)
                 .with(fmt_layer)
-                .with(telemetry_layer);
+                .with(telemetry_layer)
+                .with(otel_log_layer);
 
             tracing::subscriber::set_global_default(subscriber)?;
 
             None
         };
 
-        Ok((file_guard, TelemetryGuard { tracer_provider }))
+        Ok((
+            file_guard,
+            TelemetryGuard {
+                tracer_provider,
+                logger_provider,
+            },
+        ))
     }
 }
 
 pub struct TelemetryGuard {
     tracer_provider: SdkTracerProvider,
+    logger_provider: SdkLoggerProvider,
 }
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        // Flush any pending spans to HyperDX before shutdown.
-        // This blocks until all pending exports complete or timeout.
-        // The BatchSpanProcessor uses scheduled_delay (3s) as its export interval,
-        // and force_flush waits for pending exports with its own internal timeout.
         if let Err(error) = self.tracer_provider.force_flush() {
             eprintln!("Failed to flush telemetry spans: {error:?}");
         }
-
-        // Shutdown the tracer provider to clean up background threads and resources.
-        // This ensures the BatchSpanProcessor's background thread terminates cleanly.
         if let Err(error) = self.tracer_provider.shutdown() {
-            eprintln!("Failed to shutdown telemetry provider: {error:?}");
+            eprintln!("Failed to shutdown tracer provider: {error:?}");
+        }
+        if let Err(error) = self.logger_provider.force_flush() {
+            eprintln!("Failed to flush log records: {error:?}");
+        }
+        if let Err(error) = self.logger_provider.shutdown() {
+            eprintln!("Failed to shutdown logger provider: {error:?}");
         }
     }
-}
-
-#[derive(Debug, Error)]
-pub enum TelemetryAssemblyError {
-    #[error("telemetry config present but telemetry secrets missing")]
-    SecretsMissing,
-    #[error("telemetry secrets present but telemetry config missing")]
-    ConfigMissing,
 }
 
 #[derive(Debug, Error)]
@@ -268,6 +264,8 @@ pub enum TelemetryError {
     HttpClient(#[from] reqwest::Error),
     #[error("Failed to build OTLP exporter")]
     OtlpExporter(#[from] ExporterBuildError),
+    #[error("Invalid telemetry endpoint URL")]
+    EndpointUrl(#[from] url::ParseError),
     #[error("Failed to set global subscriber")]
     Subscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
 }
@@ -379,10 +377,6 @@ pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or(fallback_filter)
 }
 
-fn mk_telemetry_filter(level: tracing::Level) -> EnvFilter {
-    mk_crate_filter(level)
-}
-
 fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     // TODO: parse from the manifest or something
     const CRATES: [&str; 10] = [
@@ -491,26 +485,6 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_setup_continues_without_file_logging_when_log_dir_is_invalid() {
-        let file = NamedTempFile::new().unwrap();
-        let uncreatable_dir = file.path().join("nested");
-
-        let ctx = TelemetryCtx {
-            api_key: "test-key".to_string(),
-            service_name: "test-service".to_string(),
-        };
-
-        let (file_guard, _telemetry_guard) = ctx
-            .setup(tracing::Level::INFO, uncreatable_dir.to_str(), None)
-            .unwrap();
-
-        assert!(
-            file_guard.is_none(),
-            "an invalid log dir must not produce a file guard nor fail telemetry setup"
-        );
-    }
-
-    #[test]
     fn build_log_file_appender_prunes_files_beyond_retention_limit() {
         let dir = tempdir().unwrap();
 
@@ -545,6 +519,53 @@ mod tests {
             remaining, LOG_RETENTION_DAYS,
             "retention should leave exactly {LOG_RETENTION_DAYS} files \
              (max_files - 1 pruned survivors + today's file), found {remaining}"
+        );
+    }
+
+    #[test]
+    fn build_resource_carries_service_name_and_environment() {
+        use opentelemetry::Key;
+
+        // The whole point of the environment field (Juan's review): the values
+        // must actually land on the OTel resource, or staging and prod telemetry
+        // are indistinguishable downstream.
+        let resource = build_resource("st0x-liquidity", "staging");
+
+        let service_name = resource
+            .get(&Key::new("service.name"))
+            .expect("service.name attribute must be set");
+        assert_eq!(&*service_name.as_str(), "st0x-liquidity");
+
+        let environment = resource
+            .get(&Key::new("deployment.environment"))
+            .expect("deployment.environment attribute must be set");
+        assert_eq!(&*environment.as_str(), "staging");
+    }
+
+    #[test]
+    fn telemetry_setup_continues_without_file_logging_when_log_dir_is_invalid() {
+        // A regular file cannot contain a subdirectory, so the log directory
+        // cannot be created. setup() must keep the OTLP trace/log pipeline live
+        // and degrade only the file-logging half, returning a None file guard
+        // rather than failing the whole telemetry stack.
+        let file = NamedTempFile::new().unwrap();
+        let uncreatable_dir = file.path().join("nested");
+
+        let ctx = TelemetryCtx {
+            service_name: "test-service".to_string(),
+            environment: "test".to_string(),
+            traces_endpoint: Url::parse("http://localhost:10428").unwrap(),
+            logs_endpoint: Url::parse("http://localhost:9428").unwrap(),
+        };
+
+        let (file_guard, _telemetry_guard) = ctx
+            .setup(tracing::Level::INFO, uncreatable_dir.to_str(), None)
+            .unwrap();
+
+        assert!(
+            file_guard.is_none(),
+            "an invalid log dir must degrade to console-only logging (None file \
+             guard) while the OTLP exporters stay live"
         );
     }
 }

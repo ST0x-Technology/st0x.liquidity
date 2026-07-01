@@ -32,11 +32,12 @@ pub(crate) use reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use st0x_dto::{Direction, Trade, TradingVenue};
@@ -139,6 +140,13 @@ pub(crate) async fn place_offchain_order_at_broker(
         | None) => return Ok(settled),
     }
 
+    // Capture metric labels before `symbol` is moved into the market order.
+    let symbol_label = symbol.to_string();
+    let direction_label = match direction {
+        Direction::Buy => "buy",
+        Direction::Sell => "sell",
+    };
+
     let market_order = MarketOrder {
         symbol,
         shares,
@@ -147,6 +155,13 @@ pub(crate) async fn place_offchain_order_at_broker(
     };
     let outcome = match order_placer.place_market_order(market_order).await {
         Ok(result) => {
+            counter!(
+                "hedge_trades_total",
+                "symbol" => symbol_label,
+                "direction" => direction_label
+            )
+            .increment(1);
+
             if result.placed_shares > shares {
                 // A broker over-fill is real shares we now hold; record it as an
                 // acceptance (ADR 0009) so the order keeps its executor_order_id
@@ -168,9 +183,18 @@ pub(crate) async fn place_offchain_order_at_broker(
                 submitted_at: Utc::now(),
             }
         }
-        Err(error) => OffchainOrderCommand::MarkPlacementFailed {
-            error: error.to_string(),
-        },
+        Err(error) => {
+            counter!(
+                "broker_errors_total",
+                "symbol" => symbol_label,
+                "kind" => "place_order_failed"
+            )
+            .increment(1);
+
+            OffchainOrderCommand::MarkPlacementFailed {
+                error: error.to_string(),
+            }
+        }
     };
 
     store.send(offchain_order_id, outcome).await?;
@@ -531,11 +555,32 @@ impl EventSourced for OffchainOrder {
             },
 
             OffchainOrderCommand::CompleteFill { price } => match self {
-                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    Ok(vec![OffchainOrderEvent::Filled {
-                        price,
-                        filled_at: Utc::now(),
-                    }])
+                Self::Submitted {
+                    symbol, placed_at, ..
+                }
+                | Self::PartiallyFilled {
+                    symbol, placed_at, ..
+                } => {
+                    let filled_at = Utc::now();
+                    // Wall-clock placement-to-fill latency. A negative delta can
+                    // only come from clock skew (never a real latency), so
+                    // `to_std()` rejects it and the sample is skipped rather than
+                    // recorded as a bogus value -- logged so the skew is not
+                    // silently swallowed.
+                    match (filled_at - *placed_at).to_std() {
+                        Ok(latency) => {
+                            histogram!("hedge_fill_latency_seconds", "symbol" => symbol.to_string())
+                                .record(latency.as_secs_f64());
+                        }
+                        Err(error) => {
+                            debug!(
+                                %symbol, %error,
+                                "Skipping hedge_fill_latency sample: fill precedes placement (clock skew)"
+                            );
+                        }
+                    }
+
+                    Ok(vec![OffchainOrderEvent::Filled { price, filled_at }])
                 }
                 Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
                 Self::Filled { .. } | Self::Failed { .. } => {
@@ -1020,6 +1065,51 @@ mod tests {
         .unwrap()
     }
 
+    // These tests install the process-global Prometheus recorder via
+    // crate::metrics::setup() and assert on its rendered output. nextest (which
+    // CI and local runs use) runs each test in its own process, so the
+    // install-once recorder is fresh per test and the negative assertions below
+    // are not contaminated by the sibling test's counter. The counters live in
+    // the durable placement path (place_offchain_order_at_broker), so the tests
+    // drive that path rather than the now-pure Place handler.
+
+    #[tokio::test]
+    async fn placement_increments_hedge_trades_counter_on_success() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let placer = noop_order_placer();
+
+        place_at_broker(placer.as_ref()).await;
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("hedge_trades_total{") && rendered.contains("direction=\"buy\""),
+            "a successful placement must increment hedge_trades_total{{direction=buy}}, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("broker_errors_total{"),
+            "a successful placement must not touch broker_errors_total, got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_increments_broker_errors_counter_on_failure() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let placer = failing_order_placer();
+
+        place_at_broker(placer.as_ref()).await;
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("broker_errors_total{")
+                && rendered.contains("kind=\"place_order_failed\""),
+            "a failed placement must increment broker_errors_total{{kind=place_order_failed}}, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("hedge_trades_total{"),
+            "a failed placement must not increment hedge_trades_total, got:\n{rendered}"
+        );
+    }
+
     fn overfilling_order_placer() -> Arc<dyn OrderPlacer> {
         struct Overfill;
 
@@ -1502,6 +1592,32 @@ mod tests {
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Filled { .. }));
+    }
+
+    #[tokio::test]
+    async fn complete_fill_records_hedge_fill_latency_sample() {
+        // Process-isolated under nextest; only this fill is sampled. The default
+        // Prometheus summary rendering emits a `_count` series we can assert on.
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let store = TestStore::<OffchainOrder>::new(());
+        let id = OffchainOrderId::new();
+
+        place_and_submit(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(150.00)),
+                },
+            )
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("hedge_fill_latency_seconds_count{symbol=\"AAPL\"} 1"),
+            "completing a fill must record exactly one hedge_fill_latency_seconds sample, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]

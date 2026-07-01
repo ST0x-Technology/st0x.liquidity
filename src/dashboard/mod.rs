@@ -365,6 +365,7 @@ mod tests {
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
+            metrics_handle: crate::metrics::setup().expect("metrics setup"),
         }
     }
 

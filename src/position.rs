@@ -10,12 +10,13 @@ use std::collections::BTreeSet;
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use metrics::gauge;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use st0x_config::ExecutionThreshold;
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, ProjectionError, Table};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
 };
@@ -104,6 +105,38 @@ impl std::fmt::Debug for Position {
     }
 }
 
+// Called from evolve(), so it runs on both live events and event-store replay.
+// Safe for a gauge (set is idempotent); after replay the value correctly
+// reflects the current position.
+//
+// f64 precision: Prometheus gauges are natively f64 so lossless export is not
+// possible. The precision loss is intentional and acceptable here — this gauge
+// is for monitoring dashboards only. All financial accounting uses the lossless
+// Float arithmetic in the Position aggregate itself.
+fn record_position_gauge(symbol: &Symbol, net: &FractionalShares) {
+    match net.to_string().parse::<f64>() {
+        Ok(value) => gauge!("position_shares", "symbol" => symbol.to_string()).set(value),
+        Err(err) => {
+            warn!(%symbol, %err, "position_shares gauge skipped: could not parse net position as f64");
+        }
+    }
+}
+
+/// Seed the `position_shares` gauge for every open position once, after building
+/// the projection. The gauge is otherwise only written from `evolve()`, which
+/// does not run for positions whose projection is already current on a normal
+/// restart -- so without this seeding the gauge stays absent until each symbol's
+/// next position event. The metrics recorder must already be installed.
+pub(crate) async fn hydrate_position_gauges(
+    projection: &Projection<Position>,
+) -> Result<(), ProjectionError<Position>> {
+    for (symbol, position) in projection.load_all().await? {
+        record_position_gauge(&symbol, &position.net);
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl EventSourced for Position {
     type Id = Symbol;
@@ -154,14 +187,19 @@ impl EventSourced for Position {
                 price_usdc,
                 seen_at,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net + *amount)?,
-                accumulated_long: (entity.accumulated_long + *amount)?,
-                last_acknowledged_trade_id: Some(trade_id.clone()),
-                last_price_usdc: Some(*price_usdc),
-                last_updated: Some(*seen_at),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net + *amount)?;
+                let new_accumulated_long = (entity.accumulated_long + *amount)?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    accumulated_long: new_accumulated_long,
+                    last_acknowledged_trade_id: Some(trade_id.clone()),
+                    last_price_usdc: Some(*price_usdc),
+                    last_updated: Some(*seen_at),
+                    ..entity.clone()
+                }))
+            }
 
             OnChainOrderFilled {
                 trade_id,
@@ -170,14 +208,19 @@ impl EventSourced for Position {
                 price_usdc,
                 seen_at,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net - *amount)?,
-                accumulated_short: (entity.accumulated_short + *amount)?,
-                last_acknowledged_trade_id: Some(trade_id.clone()),
-                last_price_usdc: Some(*price_usdc),
-                last_updated: Some(*seen_at),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net - *amount)?;
+                let new_accumulated_short = (entity.accumulated_short + *amount)?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    accumulated_short: new_accumulated_short,
+                    last_acknowledged_trade_id: Some(trade_id.clone()),
+                    last_price_usdc: Some(*price_usdc),
+                    last_updated: Some(*seen_at),
+                    ..entity.clone()
+                }))
+            }
 
             // Bookkeeping only (ADR 0010): track the applied fill in the
             // pending-acknowledgement set without touching net or
@@ -224,28 +267,34 @@ impl EventSourced for Position {
                 shares_filled,
                 broker_timestamp,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net + shares_filled.inner())?,
-                pending_offchain_order_id: None,
-                // Successful fill: drop the failed-attempt anchor so the
-                // next rebalance cycle gets a fresh idempotency key.
-                last_failed_offchain_order_id: None,
-                last_updated: Some(*broker_timestamp),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net + shares_filled.inner())?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    pending_offchain_order_id: None,
+                    last_failed_offchain_order_id: None,
+                    last_updated: Some(*broker_timestamp),
+                    ..entity.clone()
+                }))
+            }
 
             OffChainOrderFilled {
                 direction: Sell,
                 shares_filled,
                 broker_timestamp,
                 ..
-            } => Ok(Some(Self {
-                net: (entity.net - shares_filled.inner())?,
-                pending_offchain_order_id: None,
-                last_failed_offchain_order_id: None,
-                last_updated: Some(*broker_timestamp),
-                ..entity.clone()
-            })),
+            } => {
+                let new_net = (entity.net - shares_filled.inner())?;
+                record_position_gauge(&entity.symbol, &new_net);
+                Ok(Some(Self {
+                    net: new_net,
+                    pending_offchain_order_id: None,
+                    last_failed_offchain_order_id: None,
+                    last_updated: Some(*broker_timestamp),
+                    ..entity.clone()
+                }))
+            }
 
             OffChainOrderFailed {
                 offchain_order_id, ..
@@ -289,17 +338,20 @@ impl EventSourced for Position {
                 price_usdc,
                 adjusted_at,
                 ..
-            } => Ok(Some(Self {
-                net: *target_net,
-                last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
-                last_updated: Some(*adjusted_at),
-                // A manual reconciliation supersedes any prior failed hedge, so
-                // clear the broker-idempotency anchor. Otherwise the next hedge
-                // could reuse the failed order's client_order_id and be deduped
-                // by the broker against a stale order.
-                last_failed_offchain_order_id: None,
-                ..entity.clone()
-            })),
+            } => {
+                record_position_gauge(&entity.symbol, target_net);
+                Ok(Some(Self {
+                    net: *target_net,
+                    last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
+                    last_updated: Some(*adjusted_at),
+                    // A manual reconciliation supersedes any prior failed hedge,
+                    // so clear the broker-idempotency anchor. Otherwise the next
+                    // hedge could reuse the failed order's client_order_id and be
+                    // deduped by the broker against a stale order.
+                    last_failed_offchain_order_id: None,
+                    ..entity.clone()
+                }))
+            }
 
             Initialized { .. } => Ok(None),
         }
@@ -2304,6 +2356,101 @@ mod tests {
         assert_eq!(position.accumulated_long, FractionalShares::new(float!(5)));
         assert_eq!(position.accumulated_short, FractionalShares::ZERO);
         assert_eq!(position.last_updated, Some(adjusted_at));
+    }
+
+    /// Reads the value of a single-label gauge line out of Prometheus exposition
+    /// text, e.g. `position_shares{symbol="SPYM"} 5` -> `5.0`. Parsing the value
+    /// rather than substring-matching a formatted float keeps the assertion
+    /// robust to how the exporter renders the number.
+    fn gauge_value(rendered: &str, metric: &str, symbol: &str) -> Option<f64> {
+        let needle = format!("{metric}{{symbol=\"{symbol}\"}}");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&needle)?.trim().parse::<f64>().ok())
+    }
+
+    #[test]
+    fn position_shares_gauge_reflects_net_after_replay() {
+        // Installs the process-global Prometheus recorder; nextest (used by CI
+        // and local runs) isolates each test in its own process, so the rendered
+        // registry reflects only this replay. Exercises record_position_gauge
+        // end-to-end through evolve().
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("SPYM").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(position.net, FractionalShares::new(float!(5)));
+
+        let rendered = handle.render();
+        let value = gauge_value(&rendered, "position_shares", "SPYM").unwrap_or_else(|| {
+            panic!("position_shares{{symbol=SPYM}} must be present after replay, got:\n{rendered}")
+        });
+        assert!(
+            (value - 5.0).abs() < f64::EPSILON,
+            "position_shares gauge should equal net 5, got {value}\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_position_gauges_seeds_open_positions_on_restart() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Seed an open position with the recorder NOT yet installed, so the
+        // evolve() gauge write during this send no-ops -- mirroring a position
+        // that predates a restart and never replays through evolve().
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(3)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Simulate restart: install the recorder, then hydrate from the
+        // already-current projection. Only hydration can populate the gauge here.
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        hydrate_position_gauges(&projection).await.unwrap();
+
+        let rendered = handle.render();
+        let value = gauge_value(&rendered, "position_shares", "AAPL").unwrap_or_else(|| {
+            panic!("hydration must seed position_shares for the open position, got:\n{rendered}")
+        });
+        assert!(
+            (value - 3.0).abs() < f64::EPSILON,
+            "hydrated gauge should equal the open net 3, got {value}\n{rendered}"
+        );
     }
 
     #[tokio::test]

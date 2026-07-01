@@ -7,7 +7,17 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Each tick enqueues a backfill range over the unprocessed blocks, capped at the
 # configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
 order_fill_poll_interval = 5
-hyperdx.service_name = "st0x-hedge"
+
+[telemetry]
+service_name = "st0x-hedge"
+# Deployment environment exported as the `deployment.environment` resource
+# attribute (e.g. "production", "staging") so signals from different envs are
+# distinguishable in VictoriaTraces/VictoriaLogs.
+environment = "production"
+# OTLP/HTTP endpoints for the self-hosted observability box (VictoriaTraces
+# :10428, VictoriaLogs :9428), reached over Tailscale.
+traces_endpoint = "http://100.x.x.x:10428"
+logs_endpoint = "http://100.x.x.x:9428"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).
 # Only needed when using Alpaca Broker API.
