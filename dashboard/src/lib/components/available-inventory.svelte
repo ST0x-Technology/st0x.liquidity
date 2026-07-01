@@ -98,6 +98,11 @@
   const formatRatio = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`
 
   type PositionInfo = { net: string; priceUsdc: string | null }
+  type AssetFlags = {
+    counterTrading: boolean
+    rebalancing: boolean
+    extendedHours: boolean
+  }
 
   const positionMap = $derived(
     new Map(
@@ -108,6 +113,19 @@
           priceUsdc: position.last_price_usdc
         } satisfies PositionInfo
       ])
+    )
+  )
+
+  const assetFlagsMap = $derived(
+    new Map(
+      settings?.assets.map((asset) => [
+        asset.symbol,
+        {
+          counterTrading: asset.trading,
+          rebalancing: asset.rebalancing,
+          extendedHours: asset.extendedHours
+        } satisfies AssetFlags
+      ]) ?? []
     )
   )
 
@@ -123,12 +141,11 @@
     exposure: number
     netShares: string
     priceUsdc: string | null
+    counterTrading: boolean
+    rebalancing: boolean
+    extendedHours: boolean
     trading: boolean
   }
-
-  const tradingSet = $derived(
-    new Set(settings?.assets.filter((asset) => asset.trading).map((asset) => asset.symbol) ?? [])
-  )
 
   const equityRows = $derived<EquityRow[]>(
     symbols.map((item) => {
@@ -139,6 +156,11 @@
       )
       const stripped = stripPrefix(item.symbol)
       const pos = positionMap.get(stripped)
+      const flags = assetFlagsMap.get(stripped) ?? {
+        counterTrading: false,
+        rebalancing: false,
+        extendedHours: false
+      }
 
       return {
         asset: stripped,
@@ -152,7 +174,10 @@
         exposure: pos?.priceUsdc ? parseFloat(pos.net) * parseFloat(pos.priceUsdc) : 0,
         netShares: pos?.net ?? '0',
         priceUsdc: pos?.priceUsdc ?? null,
-        trading: tradingSet.has(stripped)
+        counterTrading: flags.counterTrading,
+        rebalancing: flags.rebalancing,
+        extendedHours: flags.extendedHours,
+        trading: flags.counterTrading
       }
     })
   )
@@ -235,6 +260,22 @@
       : 'cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4'
 
   const dimClass = (base: string, trading = true): string => (trading ? base : `${base} opacity-40`)
+
+  const statusLightClass = (enabled: boolean, trading: boolean): string => {
+    const color = enabled
+      ? 'border-green-500/70 bg-green-500 shadow-[0_0_0_3px_rgba(34,197,94,0.12)]'
+      : 'border-red-500/70 bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.10)]'
+
+    return `mx-auto block h-2.5 w-2.5 rounded-full border ${color} ${trading ? '' : 'opacity-50'}`
+  }
+
+  const statusGroupHeadClass = 'px-4 text-center font-normal normal-case tracking-normal'
+  const statusGroupClass =
+    'mx-auto grid w-max grid-cols-[1.25rem_2.5rem_1.25rem] items-center justify-items-center gap-1'
+  const statusCellClass = 'px-4 text-center'
+
+  const statusLabel = (label: string, enabled: boolean): string =>
+    `${label} ${enabled ? 'enabled' : 'disabled'}`
 
   type DeviationStyle = 'normal' | 'high' | 'low'
 
@@ -507,6 +548,22 @@
           </button>
         </Table.Head>
 
+        <Table.Head class={statusGroupHeadClass}>
+          <div class={statusGroupClass}>
+            <span title="Green when counter-trading / hedging is enabled for this asset; red when disabled."
+              >CT</span
+            >
+
+            <span title="Green when automatic equity rebalancing is enabled for this asset; red when disabled."
+              >Rebal</span
+            >
+
+            <span title="Green when extended-hours counter-trading is enabled for this asset; red when disabled."
+              >Ext</span
+            >
+          </div>
+        </Table.Head>
+
         <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'raindex')}>
           <button
             class="{sortBtnClass} text-left"
@@ -597,6 +654,31 @@
           <Table.Cell class="font-mono font-medium {row.trading ? '' : 'opacity-40'}"
             >{row.asset}</Table.Cell
           >
+
+          <Table.Cell class={statusCellClass}>
+            <div class={statusGroupClass}>
+              <span
+                class={statusLightClass(row.counterTrading, row.trading)}
+                role="img"
+                title={statusLabel('Counter-trading', row.counterTrading)}
+                aria-label={statusLabel('Counter-trading', row.counterTrading)}
+              ></span>
+
+              <span
+                class={statusLightClass(row.rebalancing, row.trading)}
+                role="img"
+                title={statusLabel('Rebalancing', row.rebalancing)}
+                aria-label={statusLabel('Rebalancing', row.rebalancing)}
+              ></span>
+
+              <span
+                class={statusLightClass(row.extendedHours, row.trading)}
+                role="img"
+                title={statusLabel('Extended hours', row.extendedHours)}
+                aria-label={statusLabel('Extended hours', row.extendedHours)}
+              ></span>
+            </div>
+          </Table.Cell>
 
           <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue

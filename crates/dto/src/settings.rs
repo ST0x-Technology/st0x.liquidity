@@ -59,5 +59,6 @@ pub struct AssetSettings {
     pub symbol: Symbol,
     pub trading: bool,
     pub rebalancing: bool,
+    pub extended_hours: bool,
     pub operational_limit: Option<String>,
 }
