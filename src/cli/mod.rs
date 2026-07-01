@@ -1864,6 +1864,7 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -3346,6 +3347,7 @@ mod tests {
 
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"
+                inventory = "0x2222222222222222222222222222222222222222"
                 deployment_block = 1
                 required_confirmations = 3
                 ingestion_cutoff = "safe"

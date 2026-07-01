@@ -38,6 +38,12 @@ impl std::fmt::Display for IngestionCutoff {
 #[serde(deny_unknown_fields)]
 pub struct EvmConfig {
     pub orderbook: Address,
+    /// Shared `RaindexInventory` (raindex.governance) that owns the Raindex
+    /// vaults. All venue adapters (Bebop hook, univ4 hook) and this bot's own
+    /// rebalancing path settle through it — `deposit4`/`withdraw4` on this
+    /// address instead of on the orderbook. Fill events on the pooled vaults
+    /// are also surfaced here as `OperatorDeposit`/`OperatorWithdraw`.
+    pub inventory: Address,
     pub deployment_block: u64,
     pub required_confirmations: u64,
     pub ingestion_cutoff: IngestionCutoff,
@@ -65,6 +71,7 @@ pub struct EvmSecrets {
 pub struct EvmCtx {
     pub rpc_url: Url,
     pub orderbook: Address,
+    pub inventory: Address,
     pub deployment_block: u64,
     pub required_confirmations: u64,
     pub ingestion_cutoff: IngestionCutoff,
@@ -75,6 +82,7 @@ impl std::fmt::Debug for EvmCtx {
         f.debug_struct("EvmCtx")
             .field("rpc_url", &"[REDACTED]")
             .field("orderbook", &self.orderbook)
+            .field("inventory", &self.inventory)
             .field("deployment_block", &self.deployment_block)
             .field("required_confirmations", &self.required_confirmations)
             .field("ingestion_cutoff", &self.ingestion_cutoff)
@@ -87,6 +95,7 @@ impl EvmCtx {
         Self {
             rpc_url: secrets.rpc,
             orderbook: config.orderbook,
+            inventory: config.inventory,
             deployment_block: config.deployment_block,
             required_confirmations: config.required_confirmations,
             ingestion_cutoff: config.ingestion_cutoff,
@@ -138,6 +147,7 @@ mod tests {
         // The field is required; a config without it must fail to deserialize.
         let result: Result<EvmConfig, _> = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
              deployment_block = 1\n\
              required_confirmations = 3",
         );

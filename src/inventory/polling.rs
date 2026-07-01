@@ -1193,6 +1193,7 @@ mod tests {
             ReadOnlyEvm::new(provider),
             Address::ZERO,
             Address::ZERO,
+            Address::ZERO,
         ))
     }
 

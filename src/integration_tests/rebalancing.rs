@@ -1412,6 +1412,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let raindex_service = Arc::new(RaindexService::new(
         ReadOnlyEvm::new(provider),
         TEST_ORDERBOOK,
+        TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
     ));
 
