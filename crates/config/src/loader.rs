@@ -1241,6 +1241,7 @@ impl Ctx {
             evm: EvmCtx {
                 rpc_url,
                 orderbook,
+                inventory: orderbook,
                 deployment_block,
                 required_confirmations,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -1507,6 +1508,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
             #[allow(clippy::unwrap_used)]
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
+            inventory: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1595,6 +1597,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -1623,6 +1626,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1653,6 +1657,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1829,6 +1834,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1875,6 +1881,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1918,6 +1925,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1961,6 +1969,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2040,6 +2049,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2127,6 +2137,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2163,6 +2174,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2199,6 +2211,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2241,6 +2254,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2278,6 +2292,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2318,6 +2333,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2357,6 +2373,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2414,6 +2431,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2477,6 +2495,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2531,6 +2550,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2624,6 +2644,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2682,6 +2703,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2743,6 +2765,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2808,6 +2831,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2879,6 +2903,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2930,6 +2955,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3028,6 +3054,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3082,6 +3109,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3135,6 +3163,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3514,6 +3543,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3669,6 +3699,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3732,6 +3763,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3883,6 +3915,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3916,6 +3949,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3953,6 +3987,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3985,6 +4020,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -4070,6 +4106,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -5047,6 +5084,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -5096,6 +5134,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5131,6 +5170,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5181,6 +5221,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5267,6 +5308,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3
@@ -5309,6 +5351,7 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory = "0x2222222222222222222222222222222222222222"
 
             deployment_block = 1
             required_confirmations = 3

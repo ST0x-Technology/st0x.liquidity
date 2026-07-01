@@ -1347,6 +1347,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let raindex_service = Arc::new(RaindexService::new(
             base_wallet.clone(),
+            deps.ctx.evm.inventory,
             deps.ctx.evm.orderbook,
             market_maker_wallet,
         ));

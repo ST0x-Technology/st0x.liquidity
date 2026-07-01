@@ -25,6 +25,10 @@ let
       inherit pkgs mkAbi;
       src = sources.rain-orderbook;
     };
+    raindexGovernance = import ./raindex-governance.nix {
+      inherit pkgs mkAbi;
+      src = sources.raindex-governance;
+    };
     pyth = import ./pyth.nix { inherit pkgs; };
   };
 

@@ -72,11 +72,13 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     let sender_address = wallet_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
+    writeln!(stdout, "   Inventory: {}", ctx.evm.inventory)?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
+        ctx.evm.inventory,
         ctx.evm.orderbook,
         sender_address,
     );
@@ -125,11 +127,13 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     let sender_address = wallet_ctx.base_wallet().address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
+    writeln!(stdout, "   Inventory: {}", ctx.evm.inventory)?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
+        ctx.evm.inventory,
         ctx.evm.orderbook,
         sender_address,
     );
@@ -217,6 +221,7 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: address!("0x2345678901234567890123456789012345678901"),
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -256,6 +261,7 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: address!("0x2345678901234567890123456789012345678901"),
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

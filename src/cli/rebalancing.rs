@@ -95,7 +95,12 @@ async fn build_equity_transfer_services(
         wallet,
     ));
 
-    let raindex = Arc::new(RaindexService::new(base_caller, ctx.evm.orderbook, wallet));
+    let raindex = Arc::new(RaindexService::new(
+        base_caller,
+        ctx.evm.inventory,
+        ctx.evm.orderbook,
+        wallet,
+    ));
 
     let services = EquityTransferServices {
         raindex: raindex.clone(),
@@ -470,6 +475,7 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let vault_service = Arc::new(RaindexService::new(
         wallet_ctx.base_wallet().clone(),
+        ctx.evm.inventory,
         ctx.evm.orderbook,
         owner,
     ));
@@ -1970,6 +1976,7 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -2033,6 +2040,7 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

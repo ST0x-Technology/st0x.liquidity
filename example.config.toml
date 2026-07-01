@@ -29,6 +29,12 @@ beneficiary_entity_name = "Acme Corp"
 
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
+# Shared RaindexInventory (rainlanguage/raindex.governance) that owns the
+# Raindex orders/vaults. Rebalance deposits/withdrawals settle through this
+# contract; fills across every venue adapter (Bebop hook, univ4 hook) surface
+# here as OperatorDeposit/OperatorWithdraw events. The bot's EOA must hold
+# OPERATOR_ROLE on this address for rebalancing to succeed.
+inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 deployment_block = 1
 # Block-confirmation depth required before a transaction this bot submits is
 # treated as settled (the primary gate for USDC rebalancing withdrawals). This

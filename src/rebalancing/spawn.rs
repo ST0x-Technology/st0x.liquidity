@@ -338,7 +338,12 @@ mod tests {
         );
 
         let owner = base_wallet.address();
-        let raindex = Arc::new(RaindexService::new(base_wallet, TEST_ORDERBOOK, owner));
+        let raindex = Arc::new(RaindexService::new(
+            base_wallet,
+            TEST_ORDERBOOK,
+            TEST_ORDERBOOK,
+            owner,
+        ));
 
         let services = RebalancerServices {
             broker,
