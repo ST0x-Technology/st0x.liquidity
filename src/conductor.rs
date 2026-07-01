@@ -1268,6 +1268,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
 > {
+    let rebalancing_ctx = Arc::new(rebalancing_ctx);
+
     Box::pin(async move {
         info!("Initializing rebalancing infrastructure");
 

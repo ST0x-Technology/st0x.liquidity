@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use st0x_execution::{
-    CounterTradePreflight, Executor, InventoryResult, MarketOrder, OrderPlacement, OrderState,
-    SupportedExecutor,
+    CancellationOutcome, CounterTradePreflight, Executor, InventoryResult, LimitOrder, MarketOrder,
+    MarketSession, OrderPlacement, OrderState, Positive, SupportedExecutor, Symbol, Usd,
 };
 
 use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
@@ -133,6 +133,43 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         let started = Instant::now();
         let result = self.inner.preflight_counter_trade(order).await;
         self.record("preflight_counter_trade", started, &result);
+        result
+    }
+
+    async fn market_session(&self) -> Result<MarketSession, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.market_session().await;
+        self.record("market_session", started, &result);
+        result
+    }
+
+    async fn fetch_latest_trade_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<Positive<Usd>>, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.fetch_latest_trade_price(symbol).await;
+        self.record("fetch_latest_trade_price", started, &result);
+        result
+    }
+
+    async fn place_limit_order(
+        &self,
+        order: LimitOrder,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.place_limit_order(order).await;
+        self.record("place_limit_order", started, &result);
+        result
+    }
+
+    async fn cancel_order(
+        &self,
+        order_id: &Self::OrderId,
+    ) -> Result<CancellationOutcome, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.cancel_order(order_id).await;
+        self.record("cancel_order", started, &result);
         result
     }
 }

@@ -13,8 +13,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use st0x_event_sorcery::Projection;
-use st0x_execution::{Executor, ExecutorOrderId, OrderState, SupportedExecutor, Symbol};
+use st0x_event_sorcery::{Projection, Store};
+use st0x_execution::{
+    Executor, ExecutorOrderId, FractionalShares, OrderState, SupportedExecutor, Symbol,
+};
 use st0x_finance::Usd;
 
 use crate::conductor::job::{Job, JobQueue, Label};
@@ -22,7 +24,7 @@ use crate::offchain::order::handle_rejection::{
     HandleOrderRejection, HandleOrderRejectionJobQueue,
 };
 use crate::offchain::order::reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
-use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderId};
+use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
 
 pub(crate) type PollOrderStatusJobQueue = JobQueue<PollOrderStatus>;
 
@@ -32,6 +34,7 @@ pub(crate) type PollOrderStatusJobQueue = JobQueue<PollOrderStatus>;
 /// enqueues via their respective queues.
 pub(crate) struct PollOrderStatusCtx<E: Executor + Clone + Send + Sync + 'static> {
     pub(crate) executor: E,
+    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
     pub(crate) reconcile_queue: ReconcileOrderFillJobQueue,
@@ -96,7 +99,7 @@ where
             PollAction::Drop => Ok(()),
             PollAction::Reschedule => reschedule_self(ctx, self.offchain_order_id).await,
             PollAction::Query { executor_order_id } => {
-                self.query_broker_and_dispatch(ctx, order.symbol(), executor_order_id)
+                self.query_broker_and_dispatch(ctx, &order, executor_order_id)
                     .await
             }
         }
@@ -107,7 +110,7 @@ impl PollOrderStatus {
     async fn query_broker_and_dispatch<E>(
         &self,
         ctx: &PollOrderStatusCtx<E>,
-        symbol: &Symbol,
+        order: &OffchainOrder,
         executor_order_id: ExecutorOrderId,
     ) -> Result<(), JobError>
     where
@@ -117,32 +120,78 @@ impl PollOrderStatus {
         let parsed_order_id = ctx.executor.parse_order_id(executor_order_id.as_ref())?;
         let order_state = ctx.executor.get_order_status(&parsed_order_id).await?;
 
-        self.dispatch_for_broker_state(ctx, symbol, order_state)
+        self.dispatch_for_broker_state(ctx, order, order_state)
             .await
     }
 
     async fn dispatch_for_broker_state<E>(
         &self,
         ctx: &PollOrderStatusCtx<E>,
-        symbol: &Symbol,
+        order: &OffchainOrder,
         order_state: OrderState,
     ) -> Result<(), JobError>
     where
         E: Executor + Clone + Send + Sync + 'static,
         JobError: From<E::Error>,
     {
-        use OrderState::{Failed, Filled, Pending, Submitted};
+        use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
+        let symbol = order.symbol();
         match order_state {
             Filled {
                 price,
                 order_id,
                 executed_at,
             } => {
-                self.enqueue_reconcile(ctx, symbol, price, order_id, executed_at)
+                self.enqueue_reconcile(ctx, symbol, price.into(), order_id, executed_at)
                     .await
             }
 
-            Failed { error_reason, .. } => self.enqueue_rejection(ctx, symbol, error_reason).await,
+            Failed {
+                error_reason,
+                shares_filled,
+                avg_price,
+                ..
+            } => {
+                if let Some(shares_filled) = shares_filled {
+                    self.record_partial_fill(ctx, order, shares_filled, avg_price)
+                        .await?;
+                }
+
+                self.enqueue_rejection(ctx, symbol, error_reason).await
+            }
+
+            // The execution layer now surfaces broker-side cancellations as a
+            // distinct state; treat as a rejection until the aggregate learns
+            // to reconcile cancellations against the pending position.
+            Cancelled {
+                shares_filled,
+                avg_price,
+                ..
+            } => {
+                self.record_partial_fill(ctx, order, shares_filled, avg_price)
+                    .await?;
+
+                self.enqueue_rejection(ctx, symbol, Some("Order cancelled by broker".to_string()))
+                    .await
+            }
+
+            PartiallyFilled {
+                shares_filled,
+                avg_price,
+                ..
+            } => {
+                self.record_partial_fill(ctx, order, shares_filled, avg_price)
+                    .await?;
+
+                debug!(
+                    target: "broker",
+                    %symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    "PollOrderStatus: broker reports partial fill, re-enqueuing with delay"
+                );
+
+                reschedule_self(ctx, self.offchain_order_id).await
+            }
 
             Pending | Submitted { .. } => {
                 debug!(
@@ -162,7 +211,7 @@ impl PollOrderStatus {
         ctx: &PollOrderStatusCtx<E>,
         symbol: &Symbol,
         price: rain_math_float::Float,
-        order_id: String,
+        order_id: ExecutorOrderId,
         executed_at: DateTime<Utc>,
     ) -> Result<(), JobError>
     where
@@ -180,9 +229,59 @@ impl PollOrderStatus {
             .push(ReconcileOrderFill {
                 offchain_order_id: self.offchain_order_id,
                 price: Usd::new(price),
-                executor_order_id: ExecutorOrderId::new(&order_id),
+                executor_order_id: order_id,
                 broker_timestamp: executed_at,
             })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn record_partial_fill<E>(
+        &self,
+        ctx: &PollOrderStatusCtx<E>,
+        order: &OffchainOrder,
+        shares_filled: FractionalShares,
+        avg_price: Option<Usd>,
+    ) -> Result<(), JobError>
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+    {
+        if shares_filled == FractionalShares::ZERO {
+            return Ok(());
+        }
+
+        let Some(avg_price) = avg_price else {
+            return Err(JobError::MissingPartialFillPrice {
+                offchain_order_id: self.offchain_order_id,
+                shares_filled,
+            });
+        };
+
+        let already_recorded = match order {
+            OffchainOrder::PartiallyFilled {
+                shares_filled: current_shares_filled,
+                avg_price: current_avg_price,
+                ..
+            } => *current_shares_filled == shares_filled && *current_avg_price == avg_price,
+            OffchainOrder::Pending { .. }
+            | OffchainOrder::Submitted { .. }
+            | OffchainOrder::Filled { .. }
+            | OffchainOrder::Failed { .. } => false,
+        };
+
+        if already_recorded {
+            return Ok(());
+        }
+
+        ctx.offchain_order
+            .send(
+                &self.offchain_order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled,
+                    avg_price,
+                },
+            )
             .await?;
 
         Ok(())
@@ -389,6 +488,7 @@ mod tests {
 
         let ctx = PollOrderStatusCtx {
             executor,
+            offchain_order: offchain_order.clone(),
             offchain_order_projection,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             reconcile_queue: ReconcileOrderFillJobQueue::new(&apalis_pool),
@@ -533,6 +633,31 @@ mod tests {
         .unwrap()
     }
 
+    async fn assert_partially_filled_order<E: Executor + Clone + Send + Sync + 'static>(
+        infra: &TestInfra<E>,
+        order_id: OffchainOrderId,
+        expected_shares_filled: FractionalShares,
+        expected_avg_price: Usd,
+    ) {
+        let order = infra
+            .offchain_order
+            .load(&order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        let OffchainOrder::PartiallyFilled {
+            shares_filled,
+            avg_price,
+            ..
+        } = order
+        else {
+            panic!("expected OffchainOrder::PartiallyFilled, got {order:?}");
+        };
+
+        assert_eq!(shares_filled, expected_shares_filled);
+        assert_eq!(avg_price, expected_avg_price);
+    }
+
     #[tokio::test]
     async fn poll_with_filled_broker_enqueues_reconcile_fill() {
         let infra = build_test_infra(MockExecutor::new()).await;
@@ -616,6 +741,8 @@ mod tests {
         let executor = MockExecutor::new().with_order_status(OrderState::Failed {
             failed_at: Utc::now(),
             error_reason: Some("broker rejected".to_string()),
+            shares_filled: None,
+            avg_price: None,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -644,6 +771,162 @@ mod tests {
             count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Terminal state must not re-enqueue PollOrderStatus"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_failed_partial_fill_records_fill_before_rejection() {
+        let shares_filled = FractionalShares::new(float!(1));
+        let avg_price = Usd::new(float!(150.0));
+        let executor = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at: Utc::now(),
+            error_reason: Some("broker rejected after partial fill".to_string()),
+            shares_filled: Some(shares_filled),
+            avg_price: Some(avg_price),
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        assert_partially_filled_order(&infra, order_id, shares_filled, avg_price).await;
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            1,
+            "Failed partial fill must still enqueue HandleOrderRejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_cancelled_broker_enqueues_handle_rejection() {
+        let executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("some-broker-order-id"),
+            shares_filled: FractionalShares::ZERO,
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            1,
+            "Cancelled broker state must enqueue exactly one HandleOrderRejection"
+        );
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
+            0,
+            "Cancelled state must not enqueue ReconcileOrderFill"
+        );
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            0,
+            "Terminal state must not re-enqueue PollOrderStatus"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_cancelled_partial_fill_records_fill_before_rejection() {
+        let shares_filled = FractionalShares::new(float!(1));
+        let avg_price = Usd::new(float!(150.0));
+        let executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("some-broker-order-id"),
+            shares_filled,
+            avg_price: Some(avg_price),
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        assert_partially_filled_order(&infra, order_id, shares_filled, avg_price).await;
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            1,
+            "Cancelled partial fill must still enqueue HandleOrderRejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_partially_filled_broker_reschedules_self_with_delay() {
+        let shares_filled = FractionalShares::new(float!(1));
+        let avg_price = Usd::new(float!(150.0));
+        let executor = MockExecutor::new().with_order_status(OrderState::PartiallyFilled {
+            order_id: ExecutorOrderId::new("some-broker-order-id"),
+            shares_filled,
+            avg_price: Some(avg_price),
+            partially_filled_at: Utc::now(),
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        let before_now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .try_into()
+            .unwrap();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        assert_partially_filled_order(&infra, order_id, shares_filled, avg_price).await;
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            1,
+            "PartiallyFilled broker state must self-reschedule a PollOrderStatus job"
+        );
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
+            0,
+            "PartiallyFilled state must not enqueue ReconcileOrderFill"
+        );
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            0,
+            "PartiallyFilled state must not enqueue HandleOrderRejection"
+        );
+
+        let scheduled_at = min_run_at(&infra.apalis_pool, poll_order_status_job_type()).await;
+        let poll_interval_secs: i64 = TEST_POLL_INTERVAL.as_secs().try_into().unwrap();
+        let expected_min = before_now + poll_interval_secs;
+        assert!(
+            scheduled_at >= expected_min,
+            "Re-enqueued poll should run at >= now + poll_interval ({expected_min}s); got {scheduled_at}s"
         );
     }
 
@@ -678,6 +961,20 @@ mod tests {
                 order: st0x_execution::MarketOrder,
             ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
                 self.inner.place_market_order(order).await
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+                self.inner.place_limit_order(order).await
+            }
+
+            async fn cancel_order(
+                &self,
+                order_id: &Self::OrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
+                self.inner.cancel_order(order_id).await
             }
 
             async fn get_order_status(

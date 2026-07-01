@@ -15,6 +15,7 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use bon::bon;
 use chrono::Utc;
+use chrono_tz::America::New_York;
 use httpmock::prelude::*;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -106,10 +107,33 @@ struct MockOrder {
 }
 
 /// A single calendar entry controlling market open/close times.
+///
+/// Mirrors the real Alpaca calendar payload: `open`/`close` are the regular
+/// trading hours and `session_open`/`session_close` span the full extended
+/// session. All four are required by the `CalendarDay` parser.
 struct CalendarEntry {
     pub date: String,
     pub open: String,
     pub close: String,
+    pub session_open: String,
+    pub session_close: String,
+}
+
+/// Builds a calendar entry that keeps the regular session open all day.
+///
+/// The date is computed in Eastern Time because the market-hours client
+/// queries the calendar with today's ET date and rejects entries for any
+/// other day; a UTC date would mismatch between 19:00 and 24:00 ET.
+fn market_open_calendar_entry() -> CalendarEntry {
+    let today = Utc::now().with_timezone(&New_York).format("%Y-%m-%d");
+
+    CalendarEntry {
+        date: today.to_string(),
+        open: "00:00".to_string(),
+        close: "23:59".to_string(),
+        session_open: "00:00".to_string(),
+        session_close: "23:59".to_string(),
+    }
 }
 
 /// A mock wallet transfer tracked in shared state.
@@ -293,13 +317,7 @@ impl AlpacaBrokerMock {
         symbol_positions: Vec<MockPosition>,
         initial_cash: Option<Float>,
     ) -> Self {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-
-        let calendar_entries = vec![CalendarEntry {
-            date: today,
-            open: "00:00".to_string(),
-            close: "23:59".to_string(),
-        }];
+        let calendar_entries = vec![market_open_calendar_entry()];
 
         let symbol_fill_prices = symbol_fill_prices.into_iter().collect();
         let positions = symbol_positions
@@ -410,22 +428,16 @@ impl AlpacaBrokerMock {
 
     /// Switches the calendar to market-open (all day) for today.
     pub fn set_market_open(&self) {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-        lock(&self.state).calendar_entries = vec![CalendarEntry {
-            date: today,
-            open: "00:00".to_string(),
-            close: "23:59".to_string(),
-        }];
+        lock(&self.state).calendar_entries = vec![market_open_calendar_entry()];
     }
 
     /// Switches the calendar to market-closed for today.
     pub fn set_market_closed(&self) {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-        lock(&self.state).calendar_entries = vec![CalendarEntry {
-            date: today,
-            open: "04:00".to_string(),
-            close: "04:01".to_string(),
-        }];
+        // An empty calendar is how the real API reports a non-trading day
+        // and is the only representation with no open window at all -- a
+        // tiny synthetic session window would still classify as open if a
+        // test happened to run inside it.
+        lock(&self.state).calendar_entries = Vec::new();
     }
 
     /// Sets the USDC balance reported by the Alpaca crypto wallet endpoints.
@@ -825,7 +837,9 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
                     json!({
                         "date": entry.date,
                         "open": entry.open,
-                        "close": entry.close
+                        "close": entry.close,
+                        "session_open": entry.session_open,
+                        "session_close": entry.session_close
                     })
                 })
                 .collect();
@@ -1358,14 +1372,22 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                 }
 
                 let order = &state.orders[&order_id];
+                // The real API always reports filled_qty ("0" when unfilled);
+                // the client fails closed on terminal responses without it.
                 let filled_quantity = if order.status == OrderStatus::Filled {
-                    Some(format_float_with_fallback(&order.quantity))
+                    format_float_with_fallback(&order.quantity)
                 } else {
-                    None
+                    "0".to_string()
                 };
                 let filled_price: Option<String> =
                     order.filled_price.as_ref().map(format_float_with_fallback);
                 let quantity = format_float_with_fallback(&order.quantity);
+                // The real API stamps per-status timestamps; the client fails
+                // fast when a terminal status lacks its specific timestamp.
+                let filled_at =
+                    (order.status == OrderStatus::Filled).then_some("2025-01-01T00:00:01Z");
+                let failed_at =
+                    (order.status == OrderStatus::Rejected).then_some("2025-01-01T00:00:01Z");
                 let body = json!({
                     "id": order_id,
                     "symbol": order.symbol,
@@ -1375,6 +1397,9 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     "filled_avg_price": filled_price,
                     "filled_qty": filled_quantity,
                     "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:01Z",
+                    "filled_at": filled_at,
+                    "failed_at": failed_at,
                 });
                 drop(state);
                 body
@@ -1830,14 +1855,80 @@ fn json_response(status: u16, body: &Value) -> HttpMockResponse {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use alloy::primitives::{Address, U256};
+    use chrono::{NaiveTime, Utc};
+    use chrono_tz::America::New_York;
+    use uuid::Uuid;
 
     use super::{
-        MockAccount, MockMode, MockState, OrderSide, format_u256_as_usdc, handle_crypto_order,
+        AlpacaBrokerMock, MockAccount, MockMode, MockState, OrderSide, TEST_ACCOUNT_ID,
+        TEST_API_KEY, TEST_API_SECRET, format_u256_as_usdc, handle_crypto_order,
     };
-    use crate::Symbol;
+    use crate::alpaca_broker_api::auth::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    };
+    use crate::alpaca_broker_api::client::AlpacaBrokerApiClient;
+    use crate::alpaca_broker_api::{TimeInForce, market_hours};
+    use crate::{MarketSession, Symbol};
     use st0x_float_macro::float;
+
+    /// Regression test for the calendar contract between `AlpacaBrokerMock`
+    /// and the market-hours parser: `CalendarDay` requires `session_open` /
+    /// `session_close`, so the mock's `/v1/calendar` payload must include
+    /// them or every `is_market_open()` / `market_session()` call against
+    /// the mock fails deserialization.
+    #[tokio::test]
+    async fn market_hours_parse_the_mock_calendar() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+
+        let ctx = AlpacaBrokerApiCtx {
+            api_key: TEST_API_KEY.to_string(),
+            api_secret: TEST_API_SECRET.to_string(),
+            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
+            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        };
+
+        // Use market_session_at with a pinned noon-ET timestamp so the test is
+        // deterministic regardless of when it runs. The mock's calendar entry
+        // uses today's ET date with regular hours [00:00, 23:59), so noon ET
+        // always falls within the regular window -- unlike Utc::now() which
+        // would hit the 1-minute gap at 23:59 ET.
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let today_et = Utc::now().with_timezone(&New_York).date_naive();
+        let noon_et = today_et
+            .and_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap())
+            .and_local_timezone(New_York)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+
+        mock.set_market_open();
+        assert_eq!(
+            market_hours::market_session_at(&client, noon_et)
+                .await
+                .unwrap(),
+            MarketSession::Regular,
+            "market_session_at must return Regular at noon ET when the calendar is set open"
+        );
+
+        mock.set_market_closed();
+        assert_eq!(
+            market_hours::market_session_at(&client, noon_et)
+                .await
+                .unwrap(),
+            MarketSession::Closed,
+            "market_session_at must return Closed when the calendar is set closed"
+        );
+    }
 
     #[test]
     fn format_u256_as_usdc_cases() {

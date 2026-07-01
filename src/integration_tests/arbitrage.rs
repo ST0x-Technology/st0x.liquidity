@@ -15,7 +15,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -29,7 +29,6 @@ use st0x_evm::{ReadOnlyEvm, USDC_BASE};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
 };
-use st0x_finance::Usd;
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
@@ -55,6 +54,13 @@ use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
+
+struct RetainedPollFill {
+    shares_filled: Positive<FractionalShares>,
+    executor_order_id: ExecutorOrderId,
+    price: st0x_finance::Usd,
+    broker_timestamp: DateTime<Utc>,
+}
 
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";
@@ -192,7 +198,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
             .await
             .map_err(|error| format!("get_order_status: {error}"))?;
 
-        use OrderState::{Failed, Filled, Pending, Submitted};
+        use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
         match state {
             Filled {
                 price,
@@ -200,12 +206,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 executed_at,
             } => {
                 offchain_order
-                    .send(
-                        &order_id,
-                        OffchainOrderCommand::CompleteFill {
-                            price: Usd::new(price),
-                        },
-                    )
+                    .send(&order_id, OffchainOrderCommand::CompleteFill { price })
                     .await?;
 
                 position
@@ -216,16 +217,52 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                             shares_filled: order.shares(),
                             direction: order.direction(),
                             executor_order_id: ExecutorOrderId::new(&broker_order_id),
-                            price: Usd::new(price),
+                            price,
                             broker_timestamp: executed_at,
                         },
                     )
                     .await?;
             }
 
-            Failed { error_reason, .. } => {
+            Failed {
+                error_reason,
+                shares_filled,
+                avg_price,
+                failed_at,
+            } => {
                 let error =
                     error_reason.unwrap_or_else(|| "Order failed with no error reason".to_string());
+                let partial_fill = match shares_filled {
+                    Some(shares_filled) => {
+                        record_poll_partial_fill(
+                            &order_id,
+                            executor_order_id,
+                            &order,
+                            offchain_order,
+                            shares_filled,
+                            avg_price,
+                            failed_at,
+                        )
+                        .await?
+                    }
+                    None => None,
+                };
+
+                if let Some(fill) = &partial_fill {
+                    position
+                        .send(
+                            order.symbol(),
+                            PositionCommand::CompleteOffChainOrder {
+                                offchain_order_id: order_id,
+                                shares_filled: fill.shares_filled,
+                                direction: order.direction(),
+                                executor_order_id: fill.executor_order_id.clone(),
+                                price: fill.price,
+                                broker_timestamp: fill.broker_timestamp,
+                            },
+                        )
+                        .await?;
+                }
 
                 offchain_order
                     .send(
@@ -236,15 +273,91 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                     )
                     .await?;
 
-                position
+                if partial_fill.is_none() {
+                    position
+                        .send(
+                            order.symbol(),
+                            PositionCommand::FailOffChainOrder {
+                                offchain_order_id: order_id,
+                                error,
+                            },
+                        )
+                        .await?;
+                }
+            }
+
+            Cancelled {
+                shares_filled,
+                avg_price,
+                cancelled_at,
+                ..
+            } => {
+                let error = "Order cancelled by broker".to_string();
+                let partial_fill = record_poll_partial_fill(
+                    &order_id,
+                    executor_order_id,
+                    &order,
+                    offchain_order,
+                    shares_filled,
+                    avg_price,
+                    cancelled_at,
+                )
+                .await?;
+
+                if let Some(fill) = &partial_fill {
+                    position
+                        .send(
+                            order.symbol(),
+                            PositionCommand::CompleteOffChainOrder {
+                                offchain_order_id: order_id,
+                                shares_filled: fill.shares_filled,
+                                direction: order.direction(),
+                                executor_order_id: fill.executor_order_id.clone(),
+                                price: fill.price,
+                                broker_timestamp: fill.broker_timestamp,
+                            },
+                        )
+                        .await?;
+                }
+
+                offchain_order
                     .send(
-                        order.symbol(),
-                        PositionCommand::FailOffChainOrder {
-                            offchain_order_id: order_id,
-                            error,
+                        &order_id,
+                        OffchainOrderCommand::MarkFailed {
+                            error: error.clone(),
                         },
                     )
                     .await?;
+
+                if partial_fill.is_none() {
+                    position
+                        .send(
+                            order.symbol(),
+                            PositionCommand::FailOffChainOrder {
+                                offchain_order_id: order_id,
+                                error,
+                            },
+                        )
+                        .await?;
+                }
+            }
+
+            PartiallyFilled {
+                shares_filled,
+                avg_price,
+                partially_filled_at,
+                ..
+            } => {
+                record_poll_partial_fill(
+                    &order_id,
+                    executor_order_id,
+                    &order,
+                    offchain_order,
+                    shares_filled,
+                    avg_price,
+                    partially_filled_at,
+                )
+                .await?;
             }
 
             Pending | Submitted { .. } => {}
@@ -252,6 +365,51 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
     }
 
     Ok(())
+}
+
+async fn record_poll_partial_fill(
+    order_id: &OffchainOrderId,
+    executor_order_id: &ExecutorOrderId,
+    order: &OffchainOrder,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+    shares_filled: FractionalShares,
+    avg_price: Option<st0x_finance::Usd>,
+    broker_timestamp: DateTime<Utc>,
+) -> Result<Option<RetainedPollFill>, Box<dyn std::error::Error>> {
+    if shares_filled == FractionalShares::ZERO {
+        return Ok(None);
+    }
+
+    let Some(avg_price) = avg_price else {
+        return Err(format!("order {order_id} reported shares_filled without avg_price").into());
+    };
+
+    if !matches!(
+        order,
+        OffchainOrder::PartiallyFilled {
+            shares_filled: current_shares_filled,
+            avg_price: current_avg_price,
+            ..
+        } if *current_shares_filled == shares_filled && *current_avg_price == avg_price
+    ) {
+        offchain_order
+            .send(
+                order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled,
+                    avg_price,
+                },
+            )
+            .await?;
+    }
+
+    Ok(Some(RetainedPollFill {
+        shares_filled: Positive::new(shares_filled)
+            .map_err(|error| format!("order {order_id} reported invalid partial fill: {error}"))?,
+        executor_order_id: executor_order_id.clone(),
+        price: avg_price,
+        broker_timestamp,
+    }))
 }
 
 /// Holds a deployed Rain OrderBook on a local Anvil node, ready to create real take-order events.
@@ -964,6 +1122,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected order".to_string()),
+        shares_filled: None,
+        avg_price: None,
     });
     poll_submitted_orders(
         &failed_executor,
@@ -1077,6 +1237,94 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ]);
     assert_events(&pool, &expected).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn retains_terminal_partial_fill() -> Result<(), Box<dyn std::error::Error>> {
+    let mut orderbook = setup_anvil_orderbook().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool, &apalis_pool).await;
+    let symbol = Symbol::new(TEST_AAPL).unwrap();
+
+    let trade = orderbook
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(float!(1.2))
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
+        .await;
+    let order_id = trade.submit(&cqrs).await?.expect("Threshold crossed");
+
+    let partially_filled_executor =
+        MockExecutor::new().with_order_status(OrderState::PartiallyFilled {
+            order_id: ExecutorOrderId::new("broker-order-id"),
+            shares_filled: FractionalShares::new(float!(0.4)),
+            avg_price: Some(st0x_finance::Usd::new(float!(100.25))),
+            partially_filled_at: Utc::now(),
+        });
+    poll_submitted_orders(
+        &partially_filled_executor,
+        offchain_order_projection.as_ref(),
+        &offchain_order,
+        &position,
+    )
+    .await?;
+
+    let order = offchain_order
+        .load(&order_id)
+        .await?
+        .expect("offchain order should exist");
+    assert!(
+        matches!(order, OffchainOrder::PartiallyFilled { .. }),
+        "poll helper must retain partial fill details before terminal state"
+    );
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(float!(-1.2)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(float!(1.2)))
+        .pending(Some(order_id))
+        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
+        .call()
+        .await;
+
+    let cancelled_executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+        cancelled_at: Utc::now(),
+        order_id: ExecutorOrderId::new("broker-order-id"),
+        shares_filled: FractionalShares::new(float!(0.4)),
+        avg_price: Some(st0x_finance::Usd::new(float!(100.25))),
+    });
+    poll_submitted_orders(
+        &cancelled_executor,
+        offchain_order_projection.as_ref(),
+        &offchain_order,
+        &position,
+    )
+    .await?;
+
+    let order = offchain_order
+        .load(&order_id)
+        .await?
+        .expect("offchain order should exist");
+    assert!(
+        matches!(order, OffchainOrder::Failed { .. }),
+        "terminal partial fill must still mark the offchain order failed"
+    );
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(float!(-0.8)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(float!(1.2)))
+        .pending(None)
+        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
+        .call()
+        .await;
 
     Ok(())
 }
@@ -2638,6 +2886,8 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected".to_string()),
+        shares_filled: None,
+        avg_price: None,
     });
     poll_submitted_orders(
         &failed_executor,
