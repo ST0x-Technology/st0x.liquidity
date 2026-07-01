@@ -2167,6 +2167,7 @@ mod tests {
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
         };
 
         // The trade_event payload is never accessed because process_queued_trade

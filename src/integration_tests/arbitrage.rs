@@ -222,7 +222,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                             offchain_order_id: order_id,
                             shares_filled: order.shares(),
                             direction: order.direction(),
-                            executor_order_id: ExecutorOrderId::new(&broker_order_id),
+                            executor_order_id: broker_order_id.clone(),
                             price,
                             broker_timestamp: executed_at,
                         },
@@ -293,61 +293,20 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 }
             }
 
-            Cancelled {
-                shares_filled,
-                avg_price,
-                cancelled_at,
-                ..
-            } => {
-                let error = "Order cancelled by broker".to_string();
-                let partial_fill = record_poll_partial_fill(
-                    &order_id,
-                    executor_order_id,
-                    &order,
-                    offchain_order,
-                    shares_filled,
-                    avg_price,
-                    cancelled_at,
+            // This helper cannot faithfully replay a broker cancellation:
+            // the production path (recover_unrequested_cancellation) drives
+            // CancelOrder + ConfirmCancellation through the aggregate's
+            // OrderPlacer services, but this store is wired with its own
+            // MockExecutor whose status reads would reconcile against the
+            // wrong broker state. Fail loudly so a future test that needs
+            // cancellations drives the real PollOrderStatus job instead of
+            // silently leaving the position stuck.
+            Cancelled { .. } => {
+                return Err(format!(
+                    "poll_submitted_orders does not support broker cancellations \
+                     (order {order_id}); drive the real PollOrderStatus job instead"
                 )
-                .await?;
-
-                if let Some(fill) = &partial_fill {
-                    position
-                        .send(
-                            order.symbol(),
-                            PositionCommand::CompleteOffChainOrder {
-                                offchain_order_id: order_id,
-                                shares_filled: fill.shares_filled,
-                                direction: order.direction(),
-                                executor_order_id: fill.executor_order_id.clone(),
-                                price: fill.price,
-                                broker_timestamp: fill.broker_timestamp,
-                            },
-                        )
-                        .await?;
-                }
-
-                offchain_order
-                    .send(
-                        &order_id,
-                        OffchainOrderCommand::MarkFailed {
-                            error: error.clone(),
-                            failed_at: cancelled_at,
-                        },
-                    )
-                    .await?;
-
-                if partial_fill.is_none() {
-                    position
-                        .send(
-                            order.symbol(),
-                            PositionCommand::FailOffChainOrder {
-                                offchain_order_id: order_id,
-                                error,
-                            },
-                        )
-                        .await?;
-                }
+                .into());
             }
 
             PartiallyFilled {
@@ -911,6 +870,7 @@ async fn create_test_cqrs_with_assets(
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
         order_placer,
+        hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
     };
 
     (
@@ -1251,7 +1211,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn retains_terminal_partial_fill() -> Result<(), Box<dyn std::error::Error>> {
+async fn retains_failed_terminal_partial_fill() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
     let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
@@ -1302,14 +1262,14 @@ async fn retains_terminal_partial_fill() -> Result<(), Box<dyn std::error::Error
         .call()
         .await;
 
-    let cancelled_executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
-        cancelled_at: Utc::now(),
-        order_id: ExecutorOrderId::new("broker-order-id"),
-        shares_filled: FractionalShares::new(float!(0.4)),
+    let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
+        failed_at: Utc::now(),
+        error_reason: Some("broker rejected after partial fill".to_string()),
+        shares_filled: Some(FractionalShares::new(float!(0.4))),
         avg_price: Some(st0x_finance::Usd::new(float!(100.25))),
     });
     poll_submitted_orders(
-        &cancelled_executor,
+        &failed_executor,
         offchain_order_projection.as_ref(),
         &offchain_order,
         &position,

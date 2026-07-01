@@ -401,6 +401,28 @@ mod tests {
         offchain_order_id
     }
 
+    async fn mark_order_accepted(
+        infra: &TestInfra,
+        order_id: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+    ) {
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn handle_order_rejection_emits_offchain_and_position_commands() {
         let infra = build_test_infra().await;
@@ -457,6 +479,7 @@ mod tests {
         let order_id =
             submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
         let broker_timestamp = Utc::now();
+        mark_order_accepted(&infra, order_id, shares).await;
 
         infra
             .ctx
@@ -593,6 +616,7 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let order_id =
             submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+        mark_order_accepted(&infra, order_id, shares).await;
 
         infra
             .ctx
@@ -739,6 +763,7 @@ mod tests {
             submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
 
         let broker_fill_time = Utc::now() - chrono::Duration::minutes(30);
+        mark_order_accepted(&infra, order_id, shares).await;
         infra
             .ctx
             .offchain_order
