@@ -48,7 +48,7 @@ jobs:
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          authkey: ${{ secrets.TS_AUTHKEY_STAGING }}
 
       - name: Resolve deploy host via Tailscale
         run: |

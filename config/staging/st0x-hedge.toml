@@ -71,8 +71,11 @@ url = "https://api.st0x.io"
 # Shares the encrypted secret (and thus bot_token) with prod, so this section
 # must be present whenever the secret carries [alerts].
 [alerts]
-# Telegram chat alerts are delivered to (St0x Product Operations supergroup).
-chat_id = -1003850406522
+# Intentionally bogus chat id so staging alert deliveries fail instead of
+# posting into the shared St0x Product Operations supergroup. The field is
+# required whenever the shared secret carries [alerts], so it cannot be
+# omitted; send failures are logged as warnings and are otherwise harmless.
+chat_id = -1
 # Forum topic alerts post into (the "DEX Liquidity" topic).
 message_thread_id = 50
 # Native-ETH balance below which a low-gas alert fires (decimal ETH).
@@ -109,10 +112,10 @@ rebalancing = "disabled"
 #   enrichment (analytics) for that symbol — hedging is unaffected.
 
 [assets.equities.RKLB]
-trading = "enabled"
-rebalancing = "enabled"
+trading = "disabled"
+rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
-extended_hours_counter_trading = "enabled"
+extended_hours_counter_trading = "disabled"
 # operational_limit = 1
 vault_id = "0xfab"
 tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
