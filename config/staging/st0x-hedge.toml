@@ -26,6 +26,11 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 [raindex]
 # Rain Orderbook contract on Base.
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
+# Shared RaindexInventory (rainlanguage/raindex.governance) that owns the
+# Raindex orders/vaults. All venue adapters (Bebop hook, univ4 hook) and
+# this bot's rebalancing settle through it; the bot's EOA must hold
+# OPERATOR_ROLE on this address.
+inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
 # Block confirmations required before a submitted transaction is treated as

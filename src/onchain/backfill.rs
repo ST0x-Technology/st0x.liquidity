@@ -475,6 +475,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -491,6 +492,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -509,6 +511,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -551,6 +554,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -581,6 +585,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -618,6 +623,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -653,6 +659,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -773,6 +780,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -840,6 +848,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -908,6 +917,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1008,6 +1018,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1049,6 +1060,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1137,6 +1149,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1233,6 +1246,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1286,6 +1300,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1000,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1328,6 +1343,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 500,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1371,6 +1387,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1415,6 +1432,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1453,6 +1471,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1545,6 +1564,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1592,6 +1612,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1629,6 +1650,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1670,6 +1692,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1719,6 +1742,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1777,6 +1801,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1825,6 +1850,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 42,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1859,6 +1885,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1912,6 +1939,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1959,6 +1987,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1992,6 +2021,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2052,6 +2082,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2107,6 +2138,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2150,6 +2182,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 100,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2180,6 +2213,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2259,6 +2293,7 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,

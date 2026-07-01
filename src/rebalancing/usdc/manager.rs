@@ -4053,7 +4053,8 @@ mod tests {
 
         let owner = wallet.address();
 
-        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, owner);
+        let vault_service =
+            RaindexService::new(wallet, ORDERBOOK_ADDRESS, ORDERBOOK_ADDRESS, owner);
 
         (cctp_bridge, vault_service)
     }
@@ -4079,7 +4080,8 @@ mod tests {
         .unwrap();
 
         let owner = wallet.address();
-        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, owner);
+        let vault_service =
+            RaindexService::new(wallet, ORDERBOOK_ADDRESS, ORDERBOOK_ADDRESS, owner);
 
         (cctp_bridge, vault_service)
     }
@@ -7392,6 +7394,7 @@ mod tests {
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             ORDERBOOK_ADDRESS,
+            ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -7572,6 +7575,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
             ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
@@ -10473,6 +10477,7 @@ mod tests {
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             ORDERBOOK_ADDRESS,
+            ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -10642,7 +10647,8 @@ mod tests {
         // burn_recording_pending never calls into RaindexService.
         let (_anvil, endpoint, private_key) = setup_anvil();
         let wallet = create_test_wallet(&endpoint, &private_key);
-        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, recipient);
+        let vault_service =
+            RaindexService::new(wallet, ORDERBOOK_ADDRESS, ORDERBOOK_ADDRESS, recipient);
 
         let mock_bridge = Arc::new(MockBridge::new());
 
@@ -10779,6 +10785,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
             ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
@@ -11155,6 +11162,7 @@ mod tests {
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             ORDERBOOK_ADDRESS,
+            ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -11292,6 +11300,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
             ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
@@ -11518,6 +11527,7 @@ mod tests {
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             ORDERBOOK_ADDRESS,
+            ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -11704,6 +11714,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
             ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
@@ -11939,6 +11950,7 @@ mod tests {
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             ORDERBOOK_ADDRESS,
+            ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
 
@@ -12106,6 +12118,7 @@ mod tests {
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             ORDERBOOK_ADDRESS,
+            ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -12243,6 +12256,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
             ORDERBOOK_ADDRESS,
             chains.bot_address,
         );
@@ -12462,6 +12476,7 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
             ORDERBOOK_ADDRESS,
             chains.bot_address,
         );

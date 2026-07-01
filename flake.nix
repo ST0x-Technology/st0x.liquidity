@@ -29,6 +29,13 @@
       flake = false;
     };
 
+    raindex-governance = {
+      type = "git";
+      url = "https://github.com/rainlanguage/raindex.governance";
+      rev = "fb7092e7fb4273c170a1c91133a642bd95a23694";
+      flake = false;
+    };
+
     forge-std = {
       type = "github";
       owner = "foundry-rs";
@@ -68,6 +75,7 @@
       rainix,
       rain-math-float,
       rain-orderbook,
+      raindex-governance,
       forge-std,
       ragenix,
       deploy-rs,
@@ -207,7 +215,12 @@
           (import ./nix/abis.nix {
             inherit pkgs mkAbi;
             sources = {
-              inherit forge-std rain-math-float rain-orderbook;
+              inherit
+                forge-std
+                rain-math-float
+                rain-orderbook
+                raindex-governance
+                ;
             };
           })
           abis

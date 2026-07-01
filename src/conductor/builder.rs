@@ -188,6 +188,7 @@ where
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
         evm,
+        context.ctx.evm.inventory,
         context.ctx.evm.orderbook,
         order_owner,
     ));
