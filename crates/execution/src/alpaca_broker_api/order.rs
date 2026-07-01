@@ -1636,6 +1636,46 @@ mod tests {
         );
     }
 
+    // Boundary cases for Alpaca's minimum price variance. Per the order docs
+    // (https://docs.alpaca.markets/us/docs/orders-at-alpaca): "Limit price
+    // >=$1.00: Max Decimals = 2" and "Limit price <$1.00: Max Decimals = 4".
+    // A price exactly at $1.00 falls in the >= $1.00 (2-decimal) bucket, and a
+    // sub-penny there is rejected at submission with error 42210000. These pin
+    // that boundary so a rounding regression that mis-buckets the $1.00 edge
+    // (emitting a sub-penny limit Alpaca would reject) fails locally.
+    #[test]
+    fn alpaca_limit_price_accepts_penny_increments_at_one_dollar_boundary() {
+        // Exactly $1.00 and a penny just above it are both in the 2-decimal
+        // bucket and accepted.
+        AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(1.00))).unwrap()).unwrap();
+        AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(1.01))).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn alpaca_limit_price_rejects_sub_penny_at_one_dollar_boundary() {
+        // $1.005 is sub-penny in the >= $1.00 bucket: the boundary uses the
+        // 2-decimal rule (NOT the sub-dollar 4-decimal rule), so it is rejected.
+        let error =
+            AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(1.005))).unwrap()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::InvalidLimitPricePrecision {
+                    limit_price,
+                    max_decimals: 2,
+                } if limit_price == Positive::new(Usd::new(float!(1.005))).unwrap()
+            ),
+            "a sub-penny price at the $1.00 boundary must use the 2-decimal rule, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn alpaca_limit_price_accepts_four_decimals_just_below_one_dollar() {
+        // $0.9999 is in the < $1.00 bucket, where 4 decimals are allowed.
+        AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(0.9999))).unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn test_place_limit_order_accepts_price_with_four_decimals_below_one() {
         let server = MockServer::start();
