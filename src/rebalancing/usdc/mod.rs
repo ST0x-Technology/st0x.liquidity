@@ -77,6 +77,11 @@ pub(crate) enum UsdcTransferError {
     )]
     MissingFilledQuantity { order_id: ClientOrderId },
     #[error(
+        "Conversion order {order_id} filled but \
+         filled_average_price is missing"
+    )]
+    MissingFilledAveragePrice { order_id: ClientOrderId },
+    #[error(
         "USDC rebalance {id} conversion could not be completed on resume \
          (order not found at Alpaca or terminally failed); failed for \
          operator reconciliation"
