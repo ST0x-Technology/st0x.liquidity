@@ -197,7 +197,7 @@ where
 
         let eligible: Vec<Symbol> = all_positions
             .iter()
-            .filter(|(symbol, _)| self.ctx.is_trading_enabled(symbol))
+            .filter(|(symbol, _)| self.ctx.assets.is_trading_enabled(symbol))
             .filter(|(symbol, _)| {
                 if active_transfers.contains(symbol) {
                     debug!(%symbol, "Skipping hedge: equity transfer in progress");

@@ -118,7 +118,9 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
         .equities
         .symbols
         .keys()
-        .filter(|symbol| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .filter(|symbol| {
+            ctx.assets.is_trading_enabled(symbol) || ctx.assets.is_rebalancing_enabled(symbol)
+        })
         .cloned()
         .collect();
 

@@ -676,7 +676,7 @@ pub(super) async fn process_found_trade<W: Write>(
         }
     }
 
-    let trading_enabled = ctx.is_trading_enabled(base_symbol);
+    let trading_enabled = ctx.assets.is_trading_enabled(base_symbol);
 
     if !trading_enabled {
         writeln!(
