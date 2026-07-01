@@ -9,13 +9,13 @@ use tracing::debug;
 
 use st0x_config::EvmCtx;
 use st0x_evm::Evm;
+use st0x_registry::SymbolCache;
 
 use super::OnChainError;
 use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::TradeValidationError;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
-use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
@@ -229,26 +229,23 @@ mod tests {
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
-    use alloy::sol_types::SolCall;
     use rain_math_float::Float;
     use serde_json::json;
     use url::Url;
 
-    use st0x_evm::IERC20::{decimalsCall, symbolCall};
+    use st0x_config::IngestionCutoff;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::FractionalShares;
-
-    use st0x_config::IngestionCutoff;
+    use st0x_float_macro::float;
+    use st0x_registry::SymbolCache;
 
     use super::*;
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::io::WrappedTokenizedShares;
     use crate::onchain::pyth::PythFeedIds;
-    use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
-    use st0x_float_macro::float;
 
     const TEST_BLOCK_TIMESTAMP: u64 = 1_700_000_000;
 
@@ -323,6 +320,7 @@ mod tests {
     async fn test_try_from_clear_v3_alice_order_match() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -369,16 +367,6 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -408,6 +396,7 @@ mod tests {
     async fn test_try_from_clear_v3_bob_order_match() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -453,16 +442,6 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -492,6 +471,7 @@ mod tests {
     async fn test_try_from_clear_v3_no_order_match() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let different_order1 = {
             let mut order = get_test_order();
@@ -530,6 +510,7 @@ mod tests {
     async fn test_try_from_clear_v3_missing_block_number() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -568,6 +549,7 @@ mod tests {
     async fn test_try_from_clear_v3_missing_after_clear_log() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -623,6 +605,7 @@ mod tests {
     async fn test_try_from_clear_v3_after_clear_wrong_transaction() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -695,6 +678,7 @@ mod tests {
     async fn test_try_from_clear_v3_after_clear_wrong_log_index() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -765,6 +749,7 @@ mod tests {
     async fn test_try_from_clear_v3_alice_and_bob_both_match() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
 
@@ -806,16 +791,6 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -933,6 +908,7 @@ mod tests {
     async fn test_fetch_after_clear_multiple_logs_picks_first_match() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -961,16 +937,6 @@ mod tests {
         asserter.push_success(&json!([after_clear_log_1, after_clear_log_2])); // get_logs returns multiple AfterClearV2
         let receipt_json = create_receipt_json_with_logs(tx_hash, &[]);
         asserter.push_success(&receipt_json); // receipt for gas info
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -998,6 +964,7 @@ mod tests {
     async fn test_fetch_after_clear_equal_log_index_rejected() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1069,6 +1036,7 @@ mod tests {
     async fn test_fetch_after_clear_mixed_transactions_finds_correct() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1109,16 +1077,6 @@ mod tests {
         // Receipt mock needed for gas info in try_from_order_and_fill_details (empty is fine)
         let receipt_json = create_receipt_json_with_logs(target_tx_hash, &[]);
         asserter.push_success(&receipt_json);
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtAAPL decimals
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -1156,6 +1114,7 @@ mod tests {
     async fn test_fallback_to_receipt_when_get_logs_returns_empty() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1181,16 +1140,6 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
         asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -1220,6 +1169,7 @@ mod tests {
     async fn test_fallback_receipt_with_multiple_logs_picks_correct_after_clear() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1259,16 +1209,6 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
         asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 
@@ -1296,6 +1236,7 @@ mod tests {
     async fn test_fallback_receipt_rejects_wrong_contract_address() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1350,6 +1291,7 @@ mod tests {
     async fn test_fallback_receipt_rejects_log_index_less_than_or_equal_to_clear() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1403,6 +1345,7 @@ mod tests {
     async fn test_fallback_after_clear_missing_from_receipt_error() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1452,6 +1395,7 @@ mod tests {
     async fn test_fallback_receipt_ignores_wrong_event_signature() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1508,6 +1452,7 @@ mod tests {
     async fn test_fallback_get_logs_has_wrong_tx_but_receipt_has_correct() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
+        crate::test_utils::seed_get_test_order_token_symbols(&cache);
 
         let order = get_test_order();
         let different_order = {
@@ -1546,16 +1491,6 @@ mod tests {
         asserter.push_success(&json!([wrong_tx_log])); // get_logs returns wrong tx
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
         asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
-        // Mock decimals() then symbol() calls for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        // Mock decimals() then symbol() calls for output token (wtAAPL)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtAAPL".to_string(),
-        ));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
         let pyth_feed_ids = PythFeedIds::default();
 

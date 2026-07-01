@@ -45,6 +45,7 @@ use st0x_execution::{
     MarketOrder, MarketSession, Symbol, TryIntoExecutor,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_registry::SymbolCache;
 use st0x_wrapper::WrapperService;
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
@@ -92,7 +93,6 @@ use crate::rebalancing::{
     RebalancerServices, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
     to_wrapped_equities,
 };
-use crate::symbol::cache::SymbolCache;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;

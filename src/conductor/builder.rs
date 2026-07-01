@@ -18,6 +18,7 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
 use st0x_raindex::RaindexService;
+use st0x_registry::SymbolCache;
 
 use super::Conductor;
 use super::exit::MonitorTaskError;
@@ -62,7 +63,6 @@ use crate::rebalancing::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
 };
-use crate::symbol::cache::SymbolCache;
 use crate::tokenization::Tokenizer;
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{

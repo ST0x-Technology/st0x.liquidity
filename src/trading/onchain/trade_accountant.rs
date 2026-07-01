@@ -19,6 +19,7 @@ use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{ExecutionError, Executor};
+use st0x_registry::{SymbolCache, get_symbol_lock};
 
 use super::inclusion::EmittedOnChain;
 use crate::conductor::job::{Job, JobQueue, Label};
@@ -28,8 +29,6 @@ use crate::conductor::{
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
-use crate::symbol::cache::SymbolCache;
-use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
 
 /// Persistent job queue for DEX trade accounting.
