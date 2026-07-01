@@ -556,6 +556,17 @@ enum UsdcTimeoutCleanup {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
     },
+    /// The timed-out aggregate is in an Alpaca-to-Base pre-burn state whose
+    /// source withdrawal may already have moved funds, with no live apalis job.
+    /// The caller must re-enqueue a fresh `TransferUsdcToMarketMaking` redrive
+    /// rather than clearing the guard. Resume is idempotent for these states:
+    /// `Withdrawing` only re-polls Alpaca, and `WithdrawalComplete` scans for an
+    /// existing burn before submitting one. The guard stays held throughout.
+    ReArmAlpacaToBaseWithdrawal {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+        amount: Usdc,
+    },
 }
 
 /// How [`RebalancingService::rearm_stranded_transfers`] gates re-arm for a
@@ -575,6 +586,13 @@ enum RearmPolicy {
     /// means the redrive budget is exhausted with no driver -- strand it for an
     /// operator alert rather than silently resetting the counter to zero.
     MidFlightPreBurn,
+    /// Alpaca-to-Base states after the source withdrawal may have moved funds:
+    /// re-arm whenever no LIVE job row exists. Unlike `MidFlightPreBurn`, a
+    /// terminal (exhausted/Killed) job row does NOT block re-arm. Resume is
+    /// idempotent from these states and never starts a second Alpaca withdrawal,
+    /// so job-budget exhaustion means the chain lost its driver, not that the
+    /// transfer is unrecoverable.
+    AlpacaToBaseIdempotentRedrive,
 }
 
 /// A stranded USDC rebalance to re-arm on startup, with the [`RearmPolicy`] that
@@ -964,20 +982,35 @@ impl RebalancingService {
         };
 
         for id in candidate_ids {
-            // A timed-out transfer whose apalis row is still in flight is NOT
+            // A timed-out transfer whose apalis row is still live is NOT
             // abandoned: the job will resume and may have an irreversible on-chain
-            // withdraw/burn already submitted. Skip the cleanup entirely so we
-            // neither clear the in-progress guard / inventory inflight nor mark it
-            // timed-out (which would make the reactor ignore its eventual terminal
-            // event and latch the guard forever). Let apalis drive it to terminal.
-            if self.transfer_in_flight_for_id(&id).await {
-                warn!(
-                    target: "rebalance",
-                    aggregate_id = %id,
-                    "USDC transfer exceeded its timeout but its apalis row is still in \
-                     flight; deferring cleanup to the job rather than clearing the guard"
-                );
-                continue;
+            // withdraw/burn already submitted. "Live" includes retryable Failed
+            // rows (`attempts < max_attempts`), because apalis will re-fetch them
+            // on its own. Skip the cleanup entirely so we neither clear the
+            // in-progress guard / inventory inflight nor mark it timed-out (which
+            // would make the reactor ignore its eventual terminal event and latch
+            // the guard forever). Let apalis drive it to terminal.
+            match self.transfer_live_job_for_id(&id).await {
+                Ok(true) => {
+                    warn!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        "USDC transfer exceeded its timeout but its apalis row is still live; \
+                         deferring cleanup to the job rather than clearing the guard"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        ?error,
+                        "Failed to query live USDC transfer job row; treating transfer as live \
+                         for this sweep tick to avoid unsafe timeout cleanup"
+                    );
+                    continue;
+                }
             }
 
             let Some(cleanup) = self.cleanup_timed_out_usdc_rebalance(&id, now).await? else {
@@ -1047,74 +1080,42 @@ impl RebalancingService {
                         }
                     }
                 }
+                UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
+                    tracking,
+                    elapsed,
+                    amount,
+                } => {
+                    // An Alpaca-to-Base pre-burn state timed out with no live job:
+                    // re-arm a fresh `TransferUsdcToMarketMaking` redrive instead
+                    // of clearing the guard. Resume is idempotent from these states
+                    // and never starts a second Alpaca withdrawal.
+                    warn!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        direction = ?tracking.direction,
+                        ?elapsed,
+                        "AlpacaToBase withdrawal state timed out with no live job; \
+                         re-arming TransferUsdcToMarketMaking redrive (guard preserved)"
+                    );
+                    self.transfer_usdc_to_market_making_queue
+                        .clone()
+                        .push(TransferUsdcToMarketMaking {
+                            id: id.clone(),
+                            amount,
+                            revert_redrive_attempts: 0,
+                        })
+                        .await?;
+                    self.usdc_in_progress.store(true, Ordering::SeqCst);
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Returns true if a USDC transfer apalis row for `id` -- in *either*
-    /// direction -- is still non-terminal (Pending/Queued/Running). The timeout
-    /// sweeper must not clear the `usdc_in_progress` guard while such a row exists:
-    /// the resuming job may have an irreversible withdraw/burn/mint already
-    /// submitted, and clearing the guard would let a second transfer touch the same
-    /// vault/wallet.
-    ///
-    /// Checks BOTH directions (mirroring [`Self::in_flight_usdc_transfer`]): an
-    /// `AlpacaToBase` rebalance is driven by a `TransferUsdcToMarketMaking` job, so
-    /// checking only the hedging queue would miss it and clear the guard while a
-    /// market-making transfer is still in flight. Scoped to the aggregate `id`
-    /// (carried in the job payload) so an unrelated in-flight transfer never defers
-    /// this id's cleanup. On query/decode failure the safe default is to report
-    /// "in flight" so automation stays latched.
-    async fn transfer_in_flight_for_id(&self, id: &UsdcRebalanceId) -> bool {
-        // Both transfer payloads serialize as `{ id, amount, .. }`; only the id is
-        // needed to scope the sweep, so decode just that field for either direction.
-        #[derive(serde::Deserialize)]
-        struct TransferJobId {
-            id: UsdcRebalanceId,
-        }
-
-        let rows: Result<Vec<(Vec<u8>,)>, _> = sqlx_apalis::query_as(
-            "SELECT job FROM Jobs \
-             WHERE job_type IN (?, ?) \
-             AND status IN ('Pending', 'Queued', 'Running')",
-        )
-        .bind(std::any::type_name::<TransferUsdcToHedging>())
-        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-        .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
-        .await;
-
-        match rows {
-            Ok(rows) => rows.iter().any(|(payload,)| {
-                match serde_json::from_slice::<TransferJobId>(payload) {
-                    Ok(job) => job.id == *id,
-                    Err(error) => {
-                        warn!(
-                            target: "rebalance",
-                            %error,
-                            "Failed to decode a non-terminal USDC transfer payload during \
-                             timeout sweep; treating as in flight to stay latched"
-                        );
-                        true
-                    }
-                }
-            }),
-            Err(error) => {
-                warn!(
-                    target: "rebalance",
-                    %error,
-                    "Failed to query in-flight USDC transfer rows during timeout sweep; \
-                     keeping the in-progress guard latched to avoid re-arming"
-                );
-                true
-            }
-        }
-    }
-
     /// Whether a USDC transfer apalis row for `id` exists in *either* direction in
     /// ANY status -- including terminal `Failed`/`Done`, unlike
-    /// [`Self::transfer_in_flight_for_id`].
+    /// [`Self::transfer_live_job_for_id`].
     ///
     /// Used by startup re-arm for the pre-mint-confirmation post-burn states to
     /// fire only for the true "no job row at all" strand (a failed redrive
@@ -1126,7 +1127,7 @@ impl RebalancingService {
     /// transfer is the manual `transfer resume --kind usdc` CLI, not an automatic re-arm.
     ///
     /// A recoverable post-burn `BridgingFailed` is the exception: it gates on
-    /// [`Self::transfer_in_flight_for_id`] instead (only an in-flight row blocks),
+    /// [`Self::transfer_live_job_for_id`] instead (only a live row blocks),
     /// because recovery is new work rather than a continuation of the exhausted
     /// budget. See [`Self::rearm_stranded_transfers`].
     ///
@@ -1362,8 +1363,8 @@ impl RebalancingService {
             // that a CLI `transfer reconcile` issued before the failed
             // transfer ages past `transfer_timeout` takes effect on the next
             // sweep tick rather than waiting for the full timeout window.
-            let usdc_store_guard = self.usdc_store.read().await;
-            if let Some(store) = usdc_store_guard.as_ref() {
+            let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+            if let Some(store) = usdc_store {
                 match store.load(id).await {
                     Ok(Some(UsdcRebalance::Reconciled { .. })) => {
                         // Durable state is Reconciled: the CLI's separate-process
@@ -1388,7 +1389,6 @@ impl RebalancingService {
                         // set.
                         tracking_guard.remove(id);
                         drop(tracking_guard);
-                        drop(usdc_store_guard);
 
                         let mut inventory = self.inventory.write().await;
                         let result = inventory
@@ -1429,7 +1429,6 @@ impl RebalancingService {
                     Ok(Some(_) | None) => {
                         // Guard-holding state or aggregate not yet in store:
                         // fall through to the timeout gate below.
-                        drop(usdc_store_guard);
                     }
                     Err(load_error) => {
                         // Store read failed (I/O error, deserialization error,
@@ -1445,7 +1444,6 @@ impl RebalancingService {
                             "Failed to load UsdcRebalance from store during \
                              post-burn sweep; preserving guard"
                         );
-                        drop(usdc_store_guard);
                         return Ok(Some(UsdcTimeoutCleanup::PreservedPostBurn {
                             tracking,
                             elapsed,
@@ -1471,6 +1469,52 @@ impl RebalancingService {
         // Pre-burn path: only act after the timeout has elapsed.
         if elapsed < self.config.transfer_timeout {
             return Ok(None);
+        }
+
+        // Before clearing the guard for a pre-burn timeout, check the
+        // aggregate's durable state. If the aggregate is an Alpaca-to-Base
+        // state after the source withdrawal may have moved funds, the guard must
+        // NOT be cleared. Return `ReArmAlpacaToBaseWithdrawal` so the caller
+        // re-enqueues a fresh `TransferUsdcToMarketMaking` redrive instead of
+        // releasing the guard and potentially triggering a re-withdrawal on the
+        // next tick.
+        let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+        if let Some(store) = usdc_store {
+            match store.load(id).await {
+                Ok(Some(
+                    UsdcRebalance::Withdrawing {
+                        direction: RebalanceDirection::AlpacaToBase,
+                        amount,
+                        ..
+                    }
+                    | UsdcRebalance::WithdrawalComplete {
+                        direction: RebalanceDirection::AlpacaToBase,
+                        amount,
+                        ..
+                    },
+                )) => {
+                    drop(tracking_guard);
+                    return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
+                        tracking,
+                        elapsed,
+                        amount,
+                    }));
+                }
+                Ok(_) => {}
+                Err(load_error) => {
+                    // Store read failed. Fail safe: skip cleanup so a
+                    // possibly-retryable Alpaca-to-Base aggregate does not
+                    // have its guard cleared. The next sweep tick retries.
+                    warn!(
+                        target: "rebalance",
+                        id = %id,
+                        ?load_error,
+                        "Failed to load UsdcRebalance from store during pre-burn \
+                         sweep; skipping cleanup to preserve guard"
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
         let mut inventory = self.inventory.write().await;
@@ -3580,10 +3624,10 @@ impl RebalancingService {
     /// after its `TimeoutAttestation` already committed (or a crash in that
     /// window) leaves the aggregate durably `AwaitingAttestation`/`Attested` with
     /// no job to retry it -- the guard would then stay latched forever. So for
-    /// each post-burn resumable aggregate with no in-flight job row, this
-    /// re-enqueues a transfer job keyed by the existing id. The
-    /// `transfer_in_flight_for_id` check makes this idempotent with apalis's own
-    /// re-pick of still-pending rows. See ADR 2.
+    /// each post-burn resumable aggregate with no blocking job row, this
+    /// re-enqueues a transfer job keyed by the existing id. The live/row-existence
+    /// checks make this idempotent with apalis's own re-pick of still-owned rows.
+    /// See ADR 2.
     pub(crate) async fn recover_usdc_guard(
         &self,
         pool: &SqlitePool,
@@ -3654,24 +3698,56 @@ impl RebalancingService {
                     }
 
                     if let Some((direction, amount)) = entity.resumable_post_burn_transfer() {
+                        let policy = match &entity {
+                            UsdcRebalance::BridgingFailed {
+                                direction: RebalanceDirection::BaseToAlpaca,
+                                burn_tx_hash: Some(_),
+                                ..
+                            } => RearmPolicy::RecoverableFailure,
+                            UsdcRebalance::Bridging { .. }
+                            | UsdcRebalance::AwaitingAttestation { .. }
+                            | UsdcRebalance::Attested { .. } => RearmPolicy::PostBurnResumable,
+                            // Listing every unreachable variant mirrors the
+                            // mid-flight policy match below: if a new aggregate
+                            // variant is later added and classified as resumable,
+                            // this match must assign it a policy at compile time.
+                            UsdcRebalance::Converting { .. }
+                            | UsdcRebalance::ConversionComplete { .. }
+                            | UsdcRebalance::ConversionFailed { .. }
+                            | UsdcRebalance::WithdrawalSubmitting { .. }
+                            | UsdcRebalance::Withdrawing { .. }
+                            | UsdcRebalance::WithdrawalComplete { .. }
+                            | UsdcRebalance::WithdrawalFailed { .. }
+                            | UsdcRebalance::BridgingSubmitting { .. }
+                            | UsdcRebalance::Bridged { .. }
+                            | UsdcRebalance::DepositInitiated { .. }
+                            | UsdcRebalance::DepositConfirmed { .. }
+                            | UsdcRebalance::DepositFailed { .. }
+                            | UsdcRebalance::BridgingFailed { .. }
+                            | UsdcRebalance::Reconciled { .. } => unreachable!(
+                                "only BridgingFailed{{BaseToAlpaca,burn_tx=Some}}, Bridging, AwaitingAttestation, and Attested reach here via resumable_post_burn_transfer"
+                            ),
+                        };
                         rearm_candidates.push(RearmCandidate {
-                            policy: if matches!(&entity, UsdcRebalance::BridgingFailed { .. }) {
-                                RearmPolicy::RecoverableFailure
-                            } else {
-                                RearmPolicy::PostBurnResumable
-                            },
                             id,
                             direction,
                             amount,
+                            policy,
                         });
                     } else if let Some((direction, amount)) = entity.is_resumable_mid_flight_data()
                     {
-                        // Pre-burn states (BridgingSubmitting / WithdrawalSubmitting{BaseToAlpaca})
-                        // with no job row: the process crashed before the enqueue
-                        // committed or before the tx was submitted. Safe to re-arm
+                        // Pre-burn states (BridgingSubmitting / WithdrawalSubmitting{BaseToAlpaca}
+                        // / Withdrawing{AlpacaToBase}) with no job row: the process crashed before
+                        // the enqueue committed or before the tx was submitted. Safe to re-arm
                         // because these states are non-terminal and resumable: the
                         // resume path scans for any existing on-chain effect before
                         // re-attempting.
+                        //
+                        // Withdrawing{AlpacaToBase} IS re-armed here: the AlpacaTransferId is
+                        // durably recorded in Withdrawing; resume_alpaca_to_base re-polls the
+                        // same transfer (idempotent). This is the fix for the re-withdrawal
+                        // window: the guard stays held in Withdrawing so no fresh withdrawal
+                        // starts while the prior one may still be in progress.
                         //
                         // WithdrawalSubmitting{AlpacaToBase} is excluded by
                         // is_resumable_mid_flight_data: resume_alpaca_to_base returns
@@ -3688,11 +3764,67 @@ impl RebalancingService {
                         // The transfer_has_job_row_for_id gate below provides idempotency
                         // on the very first check; we collect here and gate in
                         // rearm_stranded_transfers.
+                        // Alpaca-to-Base states whose source withdrawal may have
+                        // moved funds use a separate policy: resume is idempotent,
+                        // so a terminal job row does NOT indicate the transfer is
+                        // unrecoverable. All other mid-flight pre-burn states use
+                        // MidFlightPreBurn.
+                        let policy = match &entity {
+                            UsdcRebalance::Withdrawing {
+                                direction: RebalanceDirection::AlpacaToBase,
+                                ..
+                            }
+                            | UsdcRebalance::WithdrawalComplete {
+                                direction: RebalanceDirection::AlpacaToBase,
+                                ..
+                            } => RearmPolicy::AlpacaToBaseIdempotentRedrive,
+                            UsdcRebalance::WithdrawalSubmitting {
+                                direction: RebalanceDirection::BaseToAlpaca,
+                                ..
+                            }
+                            | UsdcRebalance::BridgingSubmitting { .. } => {
+                                RearmPolicy::MidFlightPreBurn
+                            }
+                            // is_resumable_mid_flight_data is fully exhaustive (no
+                            // wildcard `None` arm). Listing every unreachable variant
+                            // here turns a future "added to Some but forgot to assign
+                            // a policy" mistake into a compile error rather than a
+                            // runtime unreachable panic.
+                            UsdcRebalance::WithdrawalSubmitting {
+                                direction: RebalanceDirection::AlpacaToBase,
+                                ..
+                            }
+                            | UsdcRebalance::Converting { .. }
+                            | UsdcRebalance::ConversionComplete { .. }
+                            | UsdcRebalance::ConversionFailed { .. }
+                            | UsdcRebalance::Withdrawing {
+                                direction: RebalanceDirection::BaseToAlpaca,
+                                ..
+                            }
+                            | UsdcRebalance::WithdrawalComplete {
+                                direction: RebalanceDirection::BaseToAlpaca,
+                                ..
+                            }
+                            | UsdcRebalance::WithdrawalFailed { .. }
+                            | UsdcRebalance::Bridging { .. }
+                            | UsdcRebalance::AwaitingAttestation { .. }
+                            | UsdcRebalance::Attested { .. }
+                            | UsdcRebalance::Bridged { .. }
+                            | UsdcRebalance::DepositInitiated { .. }
+                            | UsdcRebalance::DepositConfirmed { .. }
+                            | UsdcRebalance::DepositFailed { .. }
+                            | UsdcRebalance::BridgingFailed { .. }
+                            | UsdcRebalance::Reconciled { .. } => unreachable!(
+                                "filtered by is_resumable_mid_flight_data; only AlpacaToBase \
+                                 Withdrawing/WithdrawalComplete, WithdrawalSubmitting{{BaseToAlpaca}}, \
+                                 and BridgingSubmitting reach here"
+                            ),
+                        };
                         rearm_candidates.push(RearmCandidate {
-                            policy: RearmPolicy::MidFlightPreBurn,
                             id,
                             direction,
                             amount,
+                            policy,
                         });
                     } else if entity.holds_rebalance_guard()
                         && entity.guard_recovery_tracking_data().is_none()
@@ -3842,6 +3974,13 @@ impl RebalancingService {
     ///   terminal-only row means the redrive budget is exhausted with no driver:
     ///   rather than silently re-arming with a fresh budget, the id is stranded
     ///   and returned for the operator alert.
+    /// - [`RearmPolicy::AlpacaToBaseIdempotentRedrive`] (`Withdrawing` or
+    ///   `WithdrawalComplete` for `AlpacaToBase`): re-arm whenever no LIVE job
+    ///   exists (same gate as `RecoverableFailure`). A terminal job row does NOT
+    ///   block re-arm: resume is idempotent and never starts a second Alpaca
+    ///   withdrawal, so job-budget exhaustion means only that the chain lost its
+    ///   driver. Stranding here would latch the guard with no driver, defeating
+    ///   the durable-withdrawal guarantee.
     ///
     /// An enqueue failure (or a probe failure) is propagated so startup recovery
     /// fails fast and the supervisor retries -- consistent with the
@@ -3861,7 +4000,9 @@ impl RebalancingService {
         } in candidates
         {
             let blocked = match policy {
-                RearmPolicy::RecoverableFailure => self.transfer_live_job_for_id(&id).await?,
+                RearmPolicy::RecoverableFailure | RearmPolicy::AlpacaToBaseIdempotentRedrive => {
+                    self.transfer_live_job_for_id(&id).await?
+                }
                 RearmPolicy::PostBurnResumable => self.transfer_has_job_row_for_id(&id).await?,
                 RearmPolicy::MidFlightPreBurn => {
                     let live = self.transfer_live_job_for_id(&id).await?;
@@ -7295,6 +7436,21 @@ mod tests {
         .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
         .await
         .expect("count pending TransferUsdcToMarketMaking jobs")
+    }
+
+    async fn pending_transfer_usdc_to_market_making_job(
+        service: &RebalancingService,
+    ) -> TransferUsdcToMarketMaking {
+        let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .expect("fetch pending TransferUsdcToMarketMaking job");
+
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToMarketMaking")
     }
 
     /// Counts pending `TransferEquityToMarketMaking` rows in the apalis Jobs
@@ -12313,7 +12469,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_in_flight_check_is_scoped_to_aggregate_id() {
+    async fn timeout_preserves_guard_when_transfer_live_job_probe_errors() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.transfer_usdc_to_hedging_queue.pool().close().await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a live-job probe error must preserve the guard for this sweep tick"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "a live-job probe error must not drop USDC tracking"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "a live-job probe error must not mark the transfer timed out"
+        );
+
+        let marketmaking_inflight = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_inflight(Venue::MarketMaking);
+
+        assert_eq!(
+            marketmaking_inflight,
+            Some(usdc(400)),
+            "a live-job probe error must preserve source-side inflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_live_job_check_is_scoped_to_aggregate_id() {
         let trigger = make_trigger_with_inventory_config(
             InventoryView::default(),
             test_config_with_timeout(Duration::from_secs(1)),
@@ -12333,17 +12551,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            trigger.transfer_in_flight_for_id(&id).await,
-            "a non-terminal transfer row for this id must report in flight",
+            trigger.transfer_live_job_for_id(&id).await.unwrap(),
+            "a live transfer row for this id must report live",
         );
         assert!(
-            !trigger.transfer_in_flight_for_id(&other_id).await,
-            "a transfer row for a different aggregate id must NOT report this id as in flight",
+            !trigger.transfer_live_job_for_id(&other_id).await.unwrap(),
+            "a transfer row for a different aggregate id must NOT report this id as live",
         );
     }
 
     #[tokio::test]
-    async fn transfer_in_flight_for_id_checks_market_making_direction() {
+    async fn transfer_live_job_for_id_checks_market_making_direction() {
         let trigger = make_trigger_with_inventory_config(
             InventoryView::default(),
             test_config_with_timeout(Duration::from_secs(1)),
@@ -12367,8 +12585,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            trigger.transfer_in_flight_for_id(&id).await,
-            "a non-terminal market-making (Alpaca->Base) transfer row must report this id as in flight",
+            trigger.transfer_live_job_for_id(&id).await.unwrap(),
+            "a market-making (Alpaca->Base) transfer row must report this id as live",
         );
     }
 
@@ -12394,11 +12612,13 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
-            .bind(std::any::type_name::<TransferUsdcToHedging>())
-            .execute(queue.pool())
-            .await
-            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(queue.pool())
+        .await
+        .unwrap();
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
         trigger.usdc_tracking.write().await.insert(
@@ -14766,6 +14986,92 @@ mod tests {
         drop(inventory);
     }
 
+    /// A pre-burn Alpaca-to-Base transfer whose store load fails must also
+    /// preserve the guard. This pins the `Err(load_error) => Ok(None)` arm in
+    /// the pre-burn cleanup path; the post-burn branch is covered above.
+    #[tokio::test]
+    async fn sweep_preserves_pre_burn_alpaca_to_base_guard_on_store_load_error() {
+        let now = Utc::now();
+        let amount = usdc(400);
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, amount),
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        let unmigrated_pool = SqlitePool::connect(":memory:").await.unwrap();
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    unmigrated_pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    unmigrated_pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone(), ())),
+            )
+            .await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: amount,
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "pre-burn store-load errors must preserve the guard"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "pre-burn store-load errors must preserve tracking for a retry"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "pre-burn store-load errors must not tombstone an active transfer"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "pre-burn store-load errors must skip cleanup rather than enqueue a redrive"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(amount),
+            "pre-burn store-load errors must leave source-venue inflight unchanged"
+        );
+        drop(inventory);
+    }
+
     /// AlpacaToBase direction: sweep clears the Hedging-venue inflight when
     /// durable state is Reconciled, mirroring
     /// `sweep_clears_guard_after_cli_reconcile_without_restart` for the
@@ -14880,6 +15186,213 @@ mod tests {
             "sweep must clear active_usdc_rebalance after reconcile"
         );
         drop(inventory);
+    }
+
+    /// A `Withdrawing{AlpacaToBase}` aggregate that has timed out (elapsed >=
+    /// `transfer_timeout`) with NO in-flight apalis job must NOT have its guard
+    /// cleared. Instead the sweeper must re-enqueue a fresh
+    /// `TransferUsdcToMarketMaking` redrive so the idempotent poll chain
+    /// continues. This is the runtime complement to the startup
+    /// `RearmPolicy::AlpacaToBaseIdempotentRedrive` path in `recover_usdc_guard`.
+    ///
+    /// A cleared guard would allow the next rebalancing tick to start a fresh
+    /// Alpaca withdrawal while the prior one may still be settling -- exactly
+    /// the re-withdrawal scenario this branch was created to prevent.
+    #[tokio::test]
+    async fn sweep_rearms_withdrawing_alpaca_to_base_instead_of_clearing() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        // Drive aggregate to Withdrawing{AlpacaToBase} -- no apalis job row exists.
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+
+        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::Initiated,
+            now,
+        )
+        .await;
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        // Guard must STAY held -- the withdrawal may still be settling.
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay latched for Withdrawing{{AlpacaToBase}} on timeout; releasing would allow a re-withdrawal"
+        );
+
+        // A fresh TransferUsdcToMarketMaking redrive must be enqueued.
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            1,
+            "sweep must re-arm a TransferUsdcToMarketMaking job for Withdrawing{{AlpacaToBase}} instead of clearing the guard"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "Withdrawing{{AlpacaToBase}} sweep re-arm must enqueue a market-making job, not a hedging job"
+        );
+        let rescheduled = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(
+            rescheduled.id, id,
+            "sweep re-arm must resume the same aggregate id",
+        );
+        assert!(
+            rescheduled.amount.eq(&amount).unwrap(),
+            "sweep re-arm must carry the same USDC amount",
+        );
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, 0,
+            "withdrawal re-poll redrive must reset the burn-revert budget",
+        );
+
+        // Tracking must NOT be removed (the sweep left it for future ticks).
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved for Withdrawing{{AlpacaToBase}} on timeout re-arm"
+        );
+
+        // The id must NOT be tombstoned (the transfer is still active).
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "must not tombstone a Withdrawing{{AlpacaToBase}} aggregate on timeout re-arm"
+        );
+
+        // Source-venue inflight must remain unchanged -- the guard was not cleared.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(amount),
+            "source-venue inflight must not be zeroed for re-arm path"
+        );
+        drop(inventory);
+    }
+
+    /// A retryable `Failed` apalis row (`attempts < max_attempts`) is still
+    /// live: apalis will re-fetch it. The timeout sweep must not enqueue a
+    /// duplicate redrive while that row still owns the transfer.
+    #[tokio::test]
+    async fn sweep_does_not_duplicate_withdrawing_alpaca_to_base_retryable_failed_job() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::Initiated,
+            now,
+        )
+        .await;
+
+        trigger
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .execute(trigger.transfer_usdc_to_market_making_queue.pool())
+            .await
+            .unwrap();
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "sweep must not enqueue a duplicate Pending job while apalis owns a retryable Failed row",
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay latched while the retryable Failed row remains live",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must stay present while live apalis retry owns the transfer",
+        );
+    }
+
+    /// `WithdrawalComplete{AlpacaToBase}` has already moved funds out of Alpaca.
+    /// If its redrive chain dies before the CCTP burn, the runtime sweep must
+    /// preserve the guard and re-arm the market-making resume job.
+    #[tokio::test]
+    async fn sweep_rearms_withdrawal_complete_alpaca_to_base_instead_of_clearing() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawal_complete_alpaca_to_base(&store, &id, amount).await;
+        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+            now,
+        )
+        .await;
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay latched for WithdrawalComplete{{AlpacaToBase}} on timeout",
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            1,
+            "sweep must re-arm a market-making job for timed-out WithdrawalComplete{{AlpacaToBase}}",
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "WithdrawalComplete{{AlpacaToBase}} must be resumed through the market-making queue",
+        );
+        let rescheduled = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(
+            rescheduled.id, id,
+            "WithdrawalComplete sweep re-arm must resume the same aggregate id",
+        );
+        assert!(
+            rescheduled.amount.eq(&amount).unwrap(),
+            "WithdrawalComplete sweep re-arm must carry the same USDC amount",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved for WithdrawalComplete{{AlpacaToBase}} timeout re-arm",
+        );
     }
 
     /// Exercises the real restart-then-CLI-reconcile path end-to-end:
@@ -15779,6 +16292,380 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Seeds a `Withdrawing{AlpacaToBase}` aggregate using the real production
+    /// event path: `InitiateConversion -> ConfirmConversion -> Initiate`.
+    /// This mirrors `initiate_alpaca_withdrawal` in manager.rs, which emits
+    /// `Initiate{AlpacaToBase}` directly from `ConversionComplete` without
+    /// going through `BeginWithdrawal` (that step is BaseToAlpaca only).
+    async fn seed_withdrawing_alpaca_to_base(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmConversion {
+                    conversion: ConversionAmounts::new(amount, amount),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_withdrawal_complete_alpaca_to_base(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) {
+        seed_withdrawing_alpaca_to_base(store, id, amount).await;
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn make_trigger_with_timed_out_alpaca_to_base_tracking(
+        pool: &SqlitePool,
+        store: Arc<Store<UsdcRebalance>>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        stage: usdc::UsdcRebalanceStage,
+        now: DateTime<Utc>,
+    ) -> Arc<RebalancingService> {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, amount),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store,
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: amount,
+                bridged_amount_received: None,
+                stage,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+    }
+
+    /// `Withdrawing{AlpacaToBase}` with no live job row must be re-armed on
+    /// startup as a market-making job. The AlpacaTransferId is durably recorded
+    /// in `Withdrawing`; `resume_alpaca_to_base` re-polls the same transfer.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_withdrawing_alpaca_to_base() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            1,
+            "a Withdrawing{{AlpacaToBase}} with no job row must be re-armed as a market-making job",
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "Withdrawing{{AlpacaToBase}} must NOT be re-armed as a hedging job",
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress must be latched after re-arming a Withdrawing{{AlpacaToBase}} job",
+        );
+    }
+
+    /// `WithdrawalComplete{AlpacaToBase}` with no live job row must be re-armed
+    /// on startup as a market-making job. The source withdrawal has already moved
+    /// funds out of Alpaca; clearing the guard or merely alerting would leave the
+    /// wallet-funded transfer stranded with no automated driver.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_withdrawal_complete_alpaca_to_base() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawal_complete_alpaca_to_base(&store, &id, amount).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            1,
+            "a WithdrawalComplete{{AlpacaToBase}} with no job row must be re-armed as a market-making job",
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "WithdrawalComplete{{AlpacaToBase}} must NOT be re-armed as a hedging job",
+        );
+        let rescheduled = pending_transfer_usdc_to_market_making_job(&service).await;
+        assert_eq!(
+            rescheduled.id, id,
+            "the re-armed job must resume the same aggregate id",
+        );
+        assert!(
+            rescheduled.amount.eq(&amount).unwrap(),
+            "the re-armed job must carry the same amount",
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress must be latched after re-arming a WithdrawalComplete{{AlpacaToBase}} job",
+        );
+    }
+
+    /// A `Withdrawing{AlpacaToBase}` aggregate with an existing Pending
+    /// job row (e.g. a delayed redrive already enqueued by the inconclusive arm)
+    /// must NOT be re-armed again. Idempotency is enforced by
+    /// `transfer_live_job_for_id` (checks Pending/Queued/Running status).
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_rearm_withdrawing_alpaca_to_base_with_live_job() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        // Pre-seed a Pending job row (as the delayed-redrive enqueue would have).
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            1,
+            "a Withdrawing{{AlpacaToBase}} with an existing Pending job row must NOT \
+             be re-armed again (idempotency via transfer_live_job_for_id)",
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress must be latched even when no re-arm is enqueued \
+             (Withdrawing{{AlpacaToBase}} holds the guard regardless)",
+        );
+    }
+
+    /// `Withdrawing{AlpacaToBase}` with a Queued job row must NOT be re-armed.
+    /// `transfer_live_job_for_id` checks Pending, Queued, and Running -- this
+    /// test pins the Queued branch so a refactor that accidentally narrows the
+    /// IN clause to only Pending cannot go undetected.
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_rearm_withdrawing_alpaca_to_base_with_queued_job() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        // Push (Pending), then UPDATE to Queued -- same pattern as apalis re-dispatch.
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Queued' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .execute(service.transfer_usdc_to_market_making_queue.pool())
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        let pending = count_pending_transfer_usdc_to_market_making_jobs(&service).await;
+        assert_eq!(
+            pending, 0,
+            "a Withdrawing{{AlpacaToBase}} with a Queued job row must NOT enqueue an additional \
+             Pending job (transfer_live_job_for_id must treat Queued as live)"
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress must be latched even when no re-arm is enqueued \
+             (Withdrawing{{AlpacaToBase}} holds the guard regardless)",
+        );
+    }
+
+    /// `Withdrawing{AlpacaToBase}` with a terminal (Failed, exhausted) job row
+    /// MUST be re-armed on startup. The Alpaca-to-Base idempotent policy gates
+    /// only on a LIVE job (Pending/Queued/Running/retryable Failed); a terminal row means the
+    /// delayed-push path failed to re-enqueue, NOT that the withdrawal is
+    /// unrecoverable. Stranding here would latch the guard with no driver,
+    /// defeating the durable-withdrawal guarantee.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_withdrawing_alpaca_to_base_with_terminal_job_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        // Push (Pending), then UPDATE to Failed with attempts == max_attempts
+        // (exhausted budget -- no retries remaining, i.e., terminal).
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts, \
+             done_at = strftime('%s','now') \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .execute(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            1,
+            "a Withdrawing{{AlpacaToBase}} with only a terminal job row must be re-armed \
+             (AlpacaToBaseIdempotentRedrive policy; terminal row does not block)",
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress must be latched after re-arming a Withdrawing{{AlpacaToBase}} \
+             with a terminal job row"
+        );
+    }
+
+    /// `Withdrawing{AlpacaToBase}` with a Running job row must NOT be re-armed.
+    /// `transfer_live_job_for_id` checks Pending, Queued, and Running; this test
+    /// pins the Running branch so a refactor that accidentally narrows the IN clause
+    /// cannot go undetected (a duplicate re-arm while a Running job owns the same
+    /// transfer ID would be unsafe).
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_rearm_withdrawing_alpaca_to_base_with_running_job() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, amount).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        // Push (Pending), then UPDATE to Running -- simulates a job currently executing.
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Running' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .execute(service.transfer_usdc_to_market_making_queue.pool())
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            0,
+            "a Withdrawing{{AlpacaToBase}} with a Running job row must NOT enqueue an \
+             additional Pending job (transfer_live_job_for_id must treat Running as live)"
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress must be latched even when no re-arm is enqueued \
+             (Withdrawing{{AlpacaToBase}} holds the guard regardless)",
+        );
     }
 
     /// KNOWN LIMITATION: `WithdrawalSubmitting{AlpacaToBase}` is deliberately

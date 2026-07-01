@@ -18,8 +18,8 @@ use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
-    AlpacaTransferId, AlpacaWalletService, ClientOrderId, ConversionDirection, CryptoOrderOutcome,
-    Network, Positive, TokenSymbol, Transfer, TransferStatus,
+    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId, ConversionDirection,
+    CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
@@ -699,13 +699,16 @@ impl<
                 direction: AlpacaToBase,
                 amount,
                 withdrawal_ref,
+                initiated_at,
                 ..
             }) => {
                 let TransferRef::AlpacaId(transfer_id) = withdrawal_ref else {
                     return Err(UsdcTransferError::WithdrawalRefMustBeAlpacaId { id: id.clone() });
                 };
 
-                let withdrawal_tx = self.poll_and_confirm_withdrawal(id, &transfer_id).await?;
+                let withdrawal_tx = self
+                    .poll_and_confirm_withdrawal(id, &transfer_id, initiated_at)
+                    .await?;
                 // Thread the confirmed withdrawal_tx so the burn-scan lower bound
                 // is derived from the withdrawal tx block (not the raw chain head).
                 self.continue_alpaca_to_base_from_withdrawal_complete(id, amount, withdrawal_tx)
@@ -969,7 +972,14 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         let transfer = self.initiate_alpaca_withdrawal(id, filled_amount).await?;
 
-        let withdrawal_tx = self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
+        // Approximate initiated_at: the aggregate's initiated_at was just set
+        // moments ago by the Initiate command handler. Reading it back from the
+        // aggregate is not worth an extra DB round-trip; on any re-poll redrive,
+        // resume_alpaca_to_base reads the exact aggregate value anyway. The
+        // 4-hour operator-alert deadline absorbs any sub-second discrepancy here.
+        let withdrawal_tx = self
+            .poll_and_confirm_withdrawal(id, &transfer.id, Utc::now())
+            .await?;
         // Thread the confirmed withdrawal_tx so the burn-scan lower bound
         // is derived from the withdrawal tx block (not the raw chain head).
         self.continue_alpaca_to_base_from_withdrawal_complete(id, filled_amount, withdrawal_tx)
@@ -1376,7 +1386,13 @@ impl<
 
         let transfer = self.initiate_alpaca_withdrawal(id, usdc_amount).await?;
 
-        let withdrawal_tx = self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
+        // Approximate initiated_at: same reasoning as
+        // continue_alpaca_to_base_from_conversion_complete -- the aggregate's value
+        // was set moments ago; resume_alpaca_to_base uses the exact stored value on
+        // any re-poll redrive.
+        let withdrawal_tx = self
+            .poll_and_confirm_withdrawal(id, &transfer.id, Utc::now())
+            .await?;
 
         // Thread the confirmed withdrawal_tx so the burn-scan lower bound is
         // derived from the withdrawal tx block (not the raw chain head).
@@ -1428,6 +1444,7 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         transfer_id: &AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
     ) -> Result<Option<alloy::primitives::TxHash>, UsdcTransferError> {
         let transfer = match self
             .alpaca_wallet
@@ -1436,18 +1453,72 @@ impl<
         {
             Ok(transfer) => transfer,
             Err(error) => {
-                warn!(target: "rebalance", "Alpaca withdrawal polling failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailWithdrawal {
-                            reason: format!("Polling failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::AlpacaWallet(error));
+                // CONSERVATIVE FAIL-CLOSED: every `AlpacaWalletError` returned by
+                // `poll_transfer_until_complete` (including ApiError{4xx/5xx},
+                // TransferTimeout, Reqwest, ParseError, TransferNotFound, and
+                // InvalidStatusTransition) is treated as INDETERMINATE -- the
+                // withdrawal may have already succeeded on Alpaca's side even if
+                // the poll did not confirm it. This is intentional: Alpaca's
+                // documented determinate terminal failure is delivered as
+                // `Ok(transfer)` with `status == TransferStatus::Failed` and no
+                // tx hash, which is handled below. Error responses from the polling
+                // endpoint do NOT constitute a determinate "funds never left" signal
+                // in the Alpaca Broker API, so we never emit `FailWithdrawal` on an
+                // error path.
+                //
+                // TransferNotFound specifically (the by-id endpoint returns 404)
+                // is also classified as INDETERMINATE here. This is intentionally
+                // fail-closed: an absent transfer ID does not confirm the
+                // withdrawal never left. Guard is held, re-poll continues. Recovery
+                // for a permanently-absent UUID is operational (see docs/cli-ops.md
+                // "Withdrawal poll inconclusive"), not automated.
+                //
+                // Alpaca Broker API: GET
+                // /v1/accounts/{account_id}/wallets/transfers/{transfer_id}
+                // (docs.alpaca.markets/us/reference/getcryptofundingtransfer-1).
+                // The transfer lifecycle terminates in COMPLETE or FAILED status
+                // delivered as a Transfer payload. HTTP 4xx/5xx responses are
+                // transient (auth, network, Alpaca-side load) and do not indicate
+                // the transfer's ultimate fate -- the same transfer ID must be
+                // re-polled to determine the outcome.
+                //
+                // Consequence of the conservative assumption: if a poll error is
+                // encountered the aggregate stays in Withdrawing (guard held,
+                // AlpacaTransferId recorded). The job redrive re-polls the same
+                // transfer ID. After 4 hours of failed polls the operator is paged.
+                // Worst case: a stuck operator page + manual intervention. No funds
+                // are lost and no re-withdrawal can occur, which is the correct
+                // safe failure direction for a money-movement operation.
+                warn!(
+                    target: "rebalance",
+                    %id, %transfer_id,
+                    "Alpaca withdrawal polling inconclusive; keeping Withdrawing \
+                     state for delayed redrive (will re-poll same transfer ID): {error}"
+                );
+                return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                    id: id.clone(),
+                    initiated_at,
+                    source: error,
+                });
             }
         };
+
+        if let (TransferStatus::Failed, Some(tx_hash)) = (transfer.status, transfer.tx) {
+            warn!(
+                target: "rebalance",
+                %id, %transfer_id, %tx_hash,
+                "Alpaca withdrawal reported Failed with an on-chain tx hash; treating as \
+                 inconclusive and keeping Withdrawing state for delayed redrive"
+            );
+            return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: AlpacaWalletError::FailedTransferHasTx {
+                    transfer_id: *transfer_id,
+                    tx_hash,
+                },
+            });
+        }
 
         if transfer.status != TransferStatus::Complete {
             let status = format!("{:?}", transfer.status);
@@ -9163,10 +9234,12 @@ mod tests {
 
         server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
+                .json_body(json!({
                     "id": transfer_uuid.to_string(),
                     "direction": "OUTGOING",
                     "amount": "100",
@@ -9180,7 +9253,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0",
                     "fees": "0"
-                }]));
+                }));
         })
     }
 
@@ -9246,7 +9319,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap_err();
 
@@ -9332,7 +9405,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap_err();
 
@@ -9425,7 +9498,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap_err();
 
@@ -9516,7 +9589,7 @@ mod tests {
         .unwrap();
 
         manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap();
 
@@ -9587,7 +9660,7 @@ mod tests {
 
         // Falls through to ConfirmWithdrawal even without a tx hash.
         manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap();
 
@@ -9661,7 +9734,7 @@ mod tests {
         // poll_and_confirm_withdrawal succeeds (no tx hash to check) and advances
         // the aggregate to WithdrawalComplete.
         manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap();
 
@@ -9703,6 +9776,688 @@ mod tests {
                 }
             ),
             "Aggregate must remain WithdrawalComplete after zero balance; got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: on ANY poll error (ApiError, TransferTimeout, reqwest::Error),
+    /// `poll_and_confirm_withdrawal` returns `WithdrawalPollInconclusive` WITHOUT
+    /// emitting `FailWithdrawal`. The aggregate stays in `Withdrawing` with the
+    /// guard held so no fresh re-withdrawal can be started on the next tick.
+    #[tokio::test]
+    async fn poll_and_confirm_withdrawal_on_poll_error_returns_inconclusive_without_failing() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let withdrawal_uuid = Uuid::new_v4();
+        let withdrawal_id = AlpacaTransferId::from(withdrawal_uuid);
+
+        // Mock the transfers endpoint to return a 400 Bad Request, triggering
+        // AlpacaWalletError::ApiError -- an indeterminate poll error.
+        let _error_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{withdrawal_uuid}"
+                ));
+            then.status(400)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"message": "bad request"}));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        // Stage aggregate at Withdrawing{AlpacaToBase}.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        // The error must be WithdrawalPollInconclusive, NOT AlpacaWallet or
+        // WithdrawalFailed. The indeterminate path does not emit FailWithdrawal.
+        assert!(
+            matches!(error, UsdcTransferError::WithdrawalPollInconclusive { .. }),
+            "Expected WithdrawalPollInconclusive on poll error, got: {error:?}"
+        );
+
+        // Aggregate must still be Withdrawing (guard held, no FailWithdrawal emitted).
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Withdrawing {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must stay in Withdrawing on inconclusive poll error; got: {state:?}"
+        );
+        assert!(
+            state.holds_rebalance_guard(),
+            "Guard must stay held when poll is inconclusive (Withdrawing state)"
+        );
+    }
+
+    /// Hypothesis: a DETERMINATE poll failure (Alpaca returns
+    /// TransferStatus::Failed with no tx hash) still sends FailWithdrawal and moves
+    /// the aggregate to WithdrawalFailed (guard released).
+    #[tokio::test]
+    async fn poll_and_confirm_withdrawal_on_alpaca_transfer_failed_sends_fail_withdrawal() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let transfer_uuid = Uuid::new_v4();
+        // Mock Alpaca to return a FAILED terminal status with no on-chain tx.
+        let _failed_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": transfer_uuid.to_string(),
+                    "direction": "OUTGOING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x2222222222222222222222222222222222222222",
+                    "status": "FAILED",
+                    "tx_hash": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+
+        // Stage aggregate at Withdrawing{AlpacaToBase}.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        // Determinate Alpaca FAILED -> WithdrawalFailed error returned.
+        assert!(
+            matches!(error, UsdcTransferError::WithdrawalFailed { .. }),
+            "Expected WithdrawalFailed on determinate Alpaca Failed status, got: {error:?}"
+        );
+
+        // Aggregate must be in WithdrawalFailed (guard released).
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalFailed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must be in WithdrawalFailed after determinate Alpaca Failed; got: {state:?}"
+        );
+        assert!(
+            !state.holds_rebalance_guard(),
+            "Guard must be released after WithdrawalFailed"
+        );
+    }
+
+    /// Hypothesis: a FAILED Alpaca withdrawal that includes an on-chain tx hash is
+    /// not a determinate "funds never left" signal. The aggregate stays in
+    /// Withdrawing with the guard held so the same transfer can be re-polled.
+    #[tokio::test]
+    async fn poll_and_confirm_withdrawal_on_failed_transfer_with_tx_returns_inconclusive() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+        let _failed_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": transfer_uuid.to_string(),
+                    "direction": "OUTGOING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x2222222222222222222222222222222222222222",
+                    "status": "FAILED",
+                    "tx_hash": format!("{tx_hash:#x}"),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::WithdrawalPollInconclusive {
+                    source: AlpacaWalletError::FailedTransferHasTx { tx_hash: observed, .. },
+                    ..
+                } if observed == tx_hash
+            ),
+            "FAILED with a tx hash must be treated as inconclusive, got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Withdrawing {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must stay Withdrawing when FAILED carries a tx hash; got: {state:?}"
+        );
+        assert!(
+            state.holds_rebalance_guard(),
+            "Guard must stay held when FAILED carries a tx hash"
+        );
+    }
+
+    /// Hypothesis: Alpaca returning 404 for the by-id transfer lookup
+    /// (`TransferNotFound`) does NOT emit `FailWithdrawal`. The aggregate stays
+    /// in `Withdrawing` with the guard held.
+    ///
+    /// This pins the contract that only `Ok(transfer)` with
+    /// `TransferStatus::Failed` and no tx hash is a determinate terminal that
+    /// yields `FailWithdrawal`. A missing UUID is intentionally fail-closed: the
+    /// transfer may still be in progress and the UUID absence does not confirm
+    /// funds never left. Recovery is operational (see docs/cli-ops.md).
+    #[tokio::test]
+    async fn poll_and_confirm_withdrawal_on_transfer_not_found_returns_inconclusive() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let _not_found_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"message": "transfer not found"}));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+
+        // Stage aggregate at Withdrawing{AlpacaToBase}.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        // TransferNotFound -> WithdrawalPollInconclusive, NOT WithdrawalFailed.
+        // The guard stays held.
+        assert!(
+            matches!(error, UsdcTransferError::WithdrawalPollInconclusive { .. }),
+            "TransferNotFound must map to WithdrawalPollInconclusive (not FailWithdrawal); got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Withdrawing {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must stay Withdrawing on TransferNotFound (guard held); got: {state:?}"
+        );
+        assert!(
+            state.holds_rebalance_guard(),
+            "Guard must stay held on TransferNotFound -- UUID absence is not a determinate failure signal"
+        );
+    }
+
+    /// Hypothesis: after a prior inconclusive poll (aggregate stays Withdrawing),
+    /// a resumed call that finds Alpaca now reports Complete advances the aggregate
+    /// to WithdrawalComplete. Re-polling the same AlpacaTransferId is idempotent
+    /// and the withdraw is adopted.
+    #[tokio::test]
+    async fn poll_and_confirm_withdrawal_after_prior_inconclusive_adopts_complete() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        // Stage aggregate at Withdrawing{AlpacaToBase}.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        // First call: poll returns a 400 error -> inconclusive, aggregate stays Withdrawing.
+        let mut error_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
+            then.status(400)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"message": "bad request"}));
+        });
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::WithdrawalPollInconclusive { .. }),
+            "First call must return WithdrawalPollInconclusive, got: {error:?}"
+        );
+        error_mock.assert();
+        // Explicitly delete the 400 mock before registering the 200 mock so the
+        // second call is not matched by the still-registered 400 handler.
+        error_mock.delete();
+
+        // Second call (simulating the delayed-redrive re-poll): Alpaca now reports COMPLETE.
+        // No tx hash so the aggregate goes to WithdrawalComplete without a confirmation check.
+        let complete_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": transfer_uuid.to_string(),
+                    "direction": "OUTGOING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x2222222222222222222222222222222222222222",
+                    "status": "COMPLETE",
+                    "tx_hash": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }));
+        });
+
+        manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap();
+
+        complete_mock.assert();
+
+        // Aggregate must have advanced to WithdrawalComplete.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must advance to WithdrawalComplete after second (Complete) poll; got: {state:?}"
+        );
+    }
+
+    /// Regression: `resume_alpaca_to_base` from `Withdrawing{AlpacaToBase}` must
+    /// thread the aggregate's stored `initiated_at` into `WithdrawalPollInconclusive`,
+    /// NOT a fresh `Utc::now()`. The durable 4-hour operator-alert deadline is derived
+    /// from this field and must survive restarts without resetting. A regression that
+    /// changed manager.rs line 719 from `initiated_at` (destructured from the aggregate)
+    /// to `Utc::now()` would silently pass all other tests while breaking the guarantee.
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_withdrawing_threads_aggregate_initiated_at() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let withdrawal_uuid = Uuid::new_v4();
+        let withdrawal_id = AlpacaTransferId::from(withdrawal_uuid);
+
+        // Mock Alpaca's transfers endpoint to return a 400 -- triggers
+        // WithdrawalPollInconclusive via the fail-closed indeterminate error path.
+        let _error_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{withdrawal_uuid}"
+                ));
+            then.status(400)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"message": "bad request"}));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        // Stage at Withdrawing{AlpacaToBase} via the real CQRS store.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Load the aggregate to read the stored initiated_at (withdrawal initiation time).
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::Withdrawing {
+            initiated_at: aggregate_initiated_at,
+            ..
+        } = state
+        else {
+            panic!("Expected Withdrawing state; got: {state:?}");
+        };
+
+        // Call resume_alpaca_to_base (the full path, not just poll_and_confirm_withdrawal).
+        // This is the path that destructures initiated_at from the aggregate.
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::WithdrawalPollInconclusive {
+            initiated_at: error_initiated_at,
+            ..
+        } = error
+        else {
+            panic!("Expected WithdrawalPollInconclusive; got: {error:?}");
+        };
+
+        // The error's initiated_at must equal the aggregate's stored value.
+        // If this path were changed to Utc::now(), the timestamps would differ
+        // and this assertion would catch the regression.
+        assert_eq!(
+            error_initiated_at, aggregate_initiated_at,
+            "resume_alpaca_to_base must thread the aggregate's stored initiated_at \
+             into WithdrawalPollInconclusive, not a fresh Utc::now()"
+        );
+    }
+
+    /// Hypothesis: `ConfirmWithdrawal` from a non-Withdrawing state (e.g.
+    /// WithdrawalComplete) is rejected by the aggregate cleanly via a SendError.
+    /// The guard stays held; no double-adoption or panic occurs.
+    #[tokio::test]
+    async fn confirm_withdrawal_rejected_from_non_withdrawing_state() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        // Seed aggregate to WithdrawalComplete.
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+
+        // Mock Alpaca to return COMPLETE (poll call will succeed, but ConfirmWithdrawal
+        // command will be rejected by the aggregate).
+        let _complete_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+                ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": transfer_uuid.to_string(),
+                    "direction": "OUTGOING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x2222222222222222222222222222222222222222",
+                    "status": "COMPLETE",
+                    "tx_hash": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }));
+        });
+
+        let result = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await;
+
+        // ConfirmWithdrawal from WithdrawalComplete is rejected by the aggregate.
+        // The error propagates as UsdcTransferError::Aggregate (no panic, no guard corruption).
+        assert!(
+            matches!(result, Err(UsdcTransferError::Aggregate(_))),
+            "Expected Aggregate error when ConfirmWithdrawal is rejected from WithdrawalComplete, \
+             got: {result:?}"
+        );
+
+        // Aggregate must still be in WithdrawalComplete (no corruption, guard held).
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must remain WithdrawalComplete after rejected ConfirmWithdrawal; got: {state:?}"
+        );
+        assert!(
+            state.holds_rebalance_guard(),
+            "Guard must remain held after rejected ConfirmWithdrawal"
         );
     }
 
@@ -12010,7 +12765,7 @@ mod tests {
         } = error
         else {
             panic!(
-                "a burn that broadcasts but whose pending-burn record never commits                  must fail closed as BurnRecordFailed; got: {error:?}"
+                "a burn that broadcasts but whose pending-burn record never commits must fail closed as BurnRecordFailed; got: {error:?}"
             );
         };
         assert_eq!(
@@ -12683,7 +13438,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id)
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
             .unwrap_err();
 

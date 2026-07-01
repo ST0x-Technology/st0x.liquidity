@@ -401,11 +401,12 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            when.method(GET).path(format!(
+                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
+                .json_body(json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100",
@@ -419,7 +420,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let tid = transfer::AlpacaTransferId::from(transfer_id);

@@ -493,6 +493,7 @@ impl AlpacaBrokerMock {
         register_whitelist_post_endpoint(&self.server, &self.state);
         register_wallet_transfers_post_endpoint(&self.server, &self.state);
         register_wallet_transfers_get_endpoint(&self.server, &self.state);
+        register_wallet_transfer_get_by_id_endpoint(&self.server, &self.state);
     }
 
     /// Returns a snapshot of all wallet transfers.
@@ -1758,57 +1759,99 @@ fn register_wallet_transfers_get_endpoint(server: &MockServer, state: &Arc<Mutex
                 let mut state = lock(&state);
 
                 for transfer in &mut state.wallet_transfers {
-                    let is_pending = matches!(
-                        transfer.status,
-                        TransferStatus::Pending | TransferStatus::Processing
-                    );
-                    if is_pending {
-                        transfer.poll_count += 1;
-
-                        if transfer.poll_count >= transfer.polls_until_complete {
-                            transfer.status = TransferStatus::Complete;
-                            if transfer.tx_hash.is_empty() {
-                                transfer.tx_hash = format!("0x{}", "cd".repeat(32));
-                            }
-                        } else {
-                            transfer.status = TransferStatus::Processing;
-                        }
-                    }
+                    advance_wallet_transfer_status(transfer);
                 }
 
                 state
                     .wallet_transfers
                     .iter()
-                    .map(|transfer| {
-                        let tx_hash: Value = if transfer.tx_hash.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::String(transfer.tx_hash.clone())
-                        };
-                        let amount = format_float_with_fallback(&transfer.amount);
-
-                        json!({
-                            "id": transfer.transfer_id,
-                            "direction": transfer.direction.to_string(),
-                            "amount": amount.as_str(),
-                            "usd_value": amount.as_str(),
-                            "asset": transfer.asset,
-                            "chain": "ETH",
-                            "from_address": transfer.from_address,
-                            "to_address": transfer.to_address,
-                            "status": transfer.status.to_string(),
-                            "tx_hash": tx_hash,
-                            "created_at": "2025-01-01T00:00:00Z",
-                            "network_fee": "0",
-                            "fees": "0"
-                        })
-                    })
+                    .map(wallet_transfer_response)
                     .collect()
             };
 
             json_response(200, &Value::Array(transfers))
         });
     });
+}
+
+fn register_wallet_transfer_get_by_id_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+    let prefix = format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/");
+
+    server.mock(|when, then| {
+        when.method(GET).path_prefix(&prefix);
+        then.respond_with(move |request: &HttpMockRequest| {
+            let path = request.uri().path().to_string();
+            let transfer_id = path.strip_prefix(&prefix).unwrap_or("");
+
+            if transfer_id.is_empty() || transfer_id.contains('/') {
+                return json_response(404, &json!({"message": "transfer not found"}));
+            }
+
+            let Some(response_body) = wallet_transfer_response_by_id(&state, transfer_id) else {
+                return json_response(404, &json!({"message": "transfer not found"}));
+            };
+
+            json_response(200, &response_body)
+        });
+    });
+}
+
+fn wallet_transfer_response_by_id(state: &Mutex<MockState>, transfer_id: &str) -> Option<Value> {
+    let mut state = lock(state);
+    let transfer = state
+        .wallet_transfers
+        .iter_mut()
+        .find(|transfer| transfer.transfer_id == transfer_id)?;
+
+    advance_wallet_transfer_status(transfer);
+    let response = wallet_transfer_response(transfer);
+    drop(state);
+
+    Some(response)
+}
+
+fn advance_wallet_transfer_status(transfer: &mut MockWalletTransfer) {
+    match transfer.status {
+        TransferStatus::Pending | TransferStatus::Processing => {}
+        TransferStatus::Complete => return,
+    }
+
+    transfer.poll_count += 1;
+
+    if transfer.poll_count >= transfer.polls_until_complete {
+        transfer.status = TransferStatus::Complete;
+        if transfer.tx_hash.is_empty() {
+            transfer.tx_hash = format!("0x{}", "cd".repeat(32));
+        }
+    } else {
+        transfer.status = TransferStatus::Processing;
+    }
+}
+
+fn wallet_transfer_response(transfer: &MockWalletTransfer) -> Value {
+    let tx_hash: Value = if transfer.tx_hash.is_empty() {
+        Value::Null
+    } else {
+        Value::String(transfer.tx_hash.clone())
+    };
+    let amount = format_float_with_fallback(&transfer.amount);
+
+    json!({
+        "id": transfer.transfer_id,
+        "direction": transfer.direction.to_string(),
+        "amount": amount.as_str(),
+        "usd_value": amount.as_str(),
+        "asset": transfer.asset,
+        "chain": "ETH",
+        "from_address": transfer.from_address,
+        "to_address": transfer.to_address,
+        "status": transfer.status.to_string(),
+        "tx_hash": tx_hash,
+        "created_at": "2025-01-01T00:00:00Z",
+        "network_fee": "0",
+        "fees": "0"
+    })
 }
 
 /// Formats a U256 raw amount as a USDC decimal string (6 decimal places).
@@ -1946,6 +1989,70 @@ mod tests {
         // Beyond u64::MAX - the bug the refactor fixed
         let beyond_u64 = U256::from(u64::MAX) + U256::from(1);
         assert_eq!(format_u256_as_usdc(beyond_u64), "18446744073709.551616");
+    }
+
+    #[tokio::test]
+    async fn wallet_transfer_by_id_endpoint_returns_single_transfer_and_advances_status() {
+        let broker = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let owner = Address::random();
+        broker.set_wallet_usdc_balance(float!(25));
+        broker.register_wallet_endpoints(owner);
+
+        let client = reqwest::Client::new();
+        let transfer_url = format!(
+            "{}/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers",
+            broker.base_url()
+        );
+        let created: serde_json::Value = client
+            .post(&transfer_url)
+            .json(&serde_json::json!({
+                "amount": "12.5",
+                "asset": "USDC",
+                "address": format!("{owner:#x}")
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let transfer_id = created["id"].as_str().unwrap();
+        let by_id_url = format!("{transfer_url}/{transfer_id}");
+
+        let first_poll: serde_json::Value = client
+            .get(&by_id_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(first_poll["id"], transfer_id);
+        assert_eq!(first_poll["status"], "PROCESSING");
+        assert!(first_poll["tx_hash"].is_null());
+
+        let second_poll: serde_json::Value = client
+            .get(&by_id_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(second_poll["id"], transfer_id);
+        assert_eq!(second_poll["status"], "COMPLETE");
+        assert!(second_poll["tx_hash"].as_str().unwrap().starts_with("0x"));
+
+        let missing = client
+            .get(format!("{transfer_url}/missing-transfer-id"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
     }
 
     #[test]

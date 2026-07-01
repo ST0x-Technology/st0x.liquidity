@@ -6,6 +6,7 @@
 
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
+use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
@@ -199,19 +200,27 @@ pub(super) async fn get_transfer_status(
     client: &AlpacaWalletClient,
     transfer_id: &AlpacaTransferId,
 ) -> Result<Transfer, AlpacaWalletError> {
-    // Fetch all transfers and filter by ID on our side.
-    // The API's transfer_id query param appears to be unreliable.
-    let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
+    // Use the documented by-id endpoint for a single transfer:
+    // https://docs.alpaca.markets/us/reference/getcryptofundingtransfer-1.
+    // The list endpoint returns an account-wide array and has no documented
+    // transfer_id filter, so status polling must not depend on client-side
+    // filtering of a potentially capped transfer list.
+    let path = format!(
+        "/v1/accounts/{}/wallets/transfers/{}",
+        client.account_id(),
+        transfer_id
+    );
 
-    let body = client.get(&path).await?;
-    let transfers: Vec<Transfer> = serde_json::from_str(&body)?;
+    let body = client.get(&path).await.map_err(|error| match error {
+        AlpacaWalletError::ApiError { status, .. } if status == StatusCode::NOT_FOUND => {
+            AlpacaWalletError::TransferNotFound {
+                transfer_id: *transfer_id,
+            }
+        }
+        error => error,
+    })?;
 
-    transfers
-        .into_iter()
-        .find(|transfer| transfer.id == *transfer_id)
-        .ok_or_else(|| AlpacaWalletError::TransferNotFound {
-            transfer_id: *transfer_id,
-        })
+    Ok(serde_json::from_str(&body)?)
 }
 
 /// Lists all transfers for the account.
@@ -461,44 +470,27 @@ mod tests {
     async fn test_get_transfer_status_pending() {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
-        let other_transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": other_transfer_id,
-                        "direction": "INCOMING",
-                        "amount": "50.0",
-                        "usd_value": "49.99",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0x9999999999999999999999999999999999999999",
-                        "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "status": "COMPLETE",
-                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                        "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    },
-                    {
-                        "id": transfer_id,
-                        "direction": "OUTGOING",
-                        "amount": "100.0",
-                        "usd_value": "99.98",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
-                        "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "status": "PENDING",
-                        "tx_hash": null,
-                        "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee": "0.5",
-                        "fees": "0"
-                    }
-                ]));
+                .json_body(json!({
+                    "id": transfer_id,
+                    "direction": "OUTGOING",
+                    "amount": "100.0",
+                    "usd_value": "99.98",
+                    "chain": "ETH",
+                    "asset": "USDC",
+                    "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
+                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "status": "PENDING",
+                    "tx_hash": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0.5",
+                    "fees": "0"
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -523,11 +515,12 @@ mod tests {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
+                .json_body(json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -541,7 +534,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -566,11 +559,12 @@ mod tests {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
+                .json_body(json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -584,7 +578,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -608,11 +602,12 @@ mod tests {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
+                .json_body(json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -626,7 +621,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -649,27 +644,13 @@ mod tests {
     async fn test_get_transfer_status_not_found() {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
-        let other_transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(200)
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
+            then.status(404)
                 .header("content-type", "application/json")
-                .json_body(json!([{
-                    "id": other_transfer_id,
-                    "direction": "INCOMING",
-                    "amount": "50.0",
-                    "usd_value": "49.99",
-                    "chain": "ETH",
-                    "asset": "USDC",
-                    "from_address": "0x9999999999999999999999999999999999999999",
-                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "status": "COMPLETE",
-                    "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee": "0",
-                    "fees": "0"
-                }]));
+                .json_body(json!({ "message": "transfer not found" }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -693,8 +674,9 @@ mod tests {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(500).body("Internal Server Error");
         });
 
@@ -722,8 +704,9 @@ mod tests {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
                 .body("not valid json");
@@ -745,83 +728,34 @@ mod tests {
         status_mock.assert();
     }
 
-    /// Regression test: The Alpaca API ignores the transfer_id query parameter
-    /// and returns all transfers. A previous bug blindly took the first
-    /// transfer from the response, causing the wrong transfer to be returned.
-    /// This test verifies we correctly filter by transfer ID on our side.
+    /// Regression test: status polling must use Alpaca's by-id endpoint rather
+    /// than the list endpoint, so an account-wide response cap cannot hide an
+    /// older in-flight withdrawal.
     #[tokio::test]
-    async fn test_get_transfer_status_finds_correct_transfer_among_many() {
+    async fn test_get_transfer_status_uses_by_id_endpoint() {
         let server = MockServer::start();
-        let target_transfer_id = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
 
-        // Simulate the API returning many transfers in arbitrary order.
-        // The target transfer is buried in the middle.
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": Uuid::new_v4(),
-                        "direction": "INCOMING",
-                        "amount": "0.01",
-                        "usd_value": "0.01",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0x1111111111111111111111111111111111111111",
-                        "to_address": "0xF48c3Bcb8981ed53DcA2455D7462EAAAC20ee760",
-                        "status": "COMPLETE",
-                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                        "created_at": "2024-12-19T22:29:36Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    },
-                    {
-                        "id": Uuid::new_v4(),
-                        "direction": "INCOMING",
-                        "amount": "0.01",
-                        "usd_value": "0.01",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0x2222222222222222222222222222222222222222",
-                        "to_address": "0xF48c3Bcb8981ed53DcA2455D7462EAAAC20ee760",
-                        "status": "COMPLETE",
-                        "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
-                        "created_at": "2024-12-20T10:00:00Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    },
-                    {
-                        "id": target_transfer_id,
-                        "direction": "OUTGOING",
-                        "amount": "100",
-                        "usd_value": "99.98",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0xA0D2C7210D7e2112A4F7888B8658CB579226dB3B",
-                        "to_address": "0x5A379C330c84Af97864507FfeA4c23aEAF3476d9",
-                        "status": "PROCESSING",
-                        "created_at": "2024-12-26T20:43:29Z",
-                        "network_fee": "0.5",
-                        "fees": "0"
-                    },
-                    {
-                        "id": Uuid::new_v4(),
-                        "direction": "INCOMING",
-                        "amount": "0.01",
-                        "usd_value": "0.01",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0x3333333333333333333333333333333333333333",
-                        "to_address": "0xF48c3Bcb8981ed53DcA2455D7462EAAAC20ee760",
-                        "status": "COMPLETE",
-                        "tx_hash": "0x3333333333333333333333333333333333333333333333333333333333333333",
-                        "created_at": "2024-12-21T15:00:00Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    }
-                ]));
+                .json_body(json!({
+                    "id": transfer_id,
+                    "direction": "OUTGOING",
+                    "amount": "100",
+                    "usd_value": "99.98",
+                    "chain": "ETH",
+                    "asset": "USDC",
+                    "from_address": "0xA0D2C7210D7e2112A4F7888B8658CB579226dB3B",
+                    "to_address": "0x5A379C330c84Af97864507FfeA4c23aEAF3476d9",
+                    "status": "PROCESSING",
+                    "created_at": "2024-12-26T20:43:29Z",
+                    "network_fee": "0.5",
+                    "fees": "0"
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -831,18 +765,18 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let transfer = get_transfer_status(&client, &AlpacaTransferId::from(target_transfer_id))
+        let transfer = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
             .unwrap();
 
         assert_eq!(
             transfer.id,
-            AlpacaTransferId::from(target_transfer_id),
-            "Should return the transfer with matching ID, not the first one in the list"
+            AlpacaTransferId::from(transfer_id),
+            "status polling must request the transfer by ID"
         );
         assert!(
             transfer.amount.eq(float!(100)).unwrap(),
-            "Should return the 100 USDC withdrawal, not a 0.01 USDC deposit"
+            "status polling must parse the by-id transfer payload"
         );
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
         assert_eq!(transfer.status, TransferStatus::Processing);

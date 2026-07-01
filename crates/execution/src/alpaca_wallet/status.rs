@@ -290,11 +290,12 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let complete_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body_obj(&json!([{
+                .json_body_obj(&json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -308,7 +309,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -341,11 +342,12 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body_obj(&json!([{
+                .json_body_obj(&json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -359,7 +361,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -392,11 +394,12 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body_obj(&json!([{
+                .json_body_obj(&json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -410,7 +413,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let client = AlpacaWalletClient::new(
@@ -443,8 +446,9 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let error_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(503).body("Service Unavailable");
         });
 
@@ -489,11 +493,12 @@ mod tests {
         ));
 
         let mut processing_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body_obj(&json!([{
+                .json_body_obj(&json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -507,7 +512,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let config = PollingConfig {
@@ -531,11 +536,12 @@ mod tests {
         processing_mock.delete();
 
         let pending_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body_obj(&json!([{
+                .json_body_obj(&json!({
                     "id": transfer_id,
                     "direction": "OUTGOING",
                     "amount": "100.0",
@@ -549,7 +555,7 @@ mod tests {
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0.5",
                     "fees": "0"
-                }]));
+                }));
         });
 
         let error = poll_handle.await.unwrap().unwrap_err();

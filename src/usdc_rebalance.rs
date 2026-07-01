@@ -1364,9 +1364,17 @@ impl UsdcRebalance {
     /// `WithdrawalSubmitting` is resumable only for `BaseToAlpaca`:
     /// `resume_base_to_alpaca` handles it; `resume_alpaca_to_base` returns
     /// `ResumeDirectionMismatch` for `WithdrawalSubmitting{AlpacaToBase}`.
+    /// `Withdrawing{AlpacaToBase, AlpacaId}` is resumable: the
+    /// `AlpacaTransferId` is durably recorded and `resume_alpaca_to_base`
+    /// re-polls the same transfer (idempotent). `WithdrawalComplete` in the
+    /// `AlpacaToBase` direction is also resumable: the source withdrawal has
+    /// already moved funds and the resume path scans for an existing burn before
+    /// submitting one. `Withdrawing{BaseToAlpaca}`,
+    /// `Withdrawing{AlpacaToBase, OnchainTx}`, and
+    /// `WithdrawalComplete{BaseToAlpaca}` are NOT resumable here: those paths
+    /// use on-chain txs, handled by the post-burn path.
     ///
-    /// This method covers ONLY pre-burn / pre-withdrawal-tx states: post-burn
-    /// states (`Bridging`, `AwaitingAttestation`, `Attested`) are already
+    /// Post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`) are
     /// handled by `resumable_post_burn_transfer`.
     pub(crate) fn is_resumable_mid_flight_data(&self) -> Option<(RebalanceDirection, Usdc)> {
         match self {
@@ -1375,6 +1383,24 @@ impl UsdcRebalance {
             // ResumeDirectionMismatch for this state regardless of direction.
             Self::WithdrawalSubmitting {
                 direction: direction @ RebalanceDirection::BaseToAlpaca,
+                amount,
+                ..
+            }
+            // AlpacaToBase `Withdrawing`: the AlpacaTransferId is durably
+            // recorded; `resume_alpaca_to_base` re-polls the same transfer
+            // (idempotent). `WithdrawalComplete{AlpacaToBase}` is one step
+            // further: funds have left Alpaca, and resume scans for any existing
+            // burn before submitting one. Both are safe to re-arm on startup.
+            // `WithdrawalSubmitting{AlpacaToBase}` remains non-re-armable
+            // because the Alpaca transfer ID is not persisted in that state.
+            | Self::Withdrawing {
+                direction: direction @ RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal_ref: TransferRef::AlpacaId(_),
+                ..
+            }
+            | Self::WithdrawalComplete {
+                direction: direction @ RebalanceDirection::AlpacaToBase,
                 amount,
                 ..
             }
@@ -1389,7 +1415,10 @@ impl UsdcRebalance {
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
             | Self::Withdrawing { .. }
-            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
@@ -1529,7 +1558,13 @@ impl EventSourced for UsdcRebalance {
     // `ConversionConfirmed` event now carry `ConversionAmounts` (source +
     // received) instead of a single `filled_amount`. Bumped to clear stale
     // snapshots so they rebuild under the new schema.
-    const SCHEMA_VERSION: u64 = 7;
+    // v8: `Withdrawing.initiated_at` semantics changed -- it now records the
+    // withdrawal initiation time (from the `Initiated` event's `initiated_at`
+    // field) rather than the overall rebalance start. Stale `Withdrawing`
+    // snapshots carry the old timestamp, which would skew the 4-hour operator
+    // alert deadline. Bumped so snapshots are cleared and `initiated_at` is
+    // rebuilt from events on the next load.
+    const SCHEMA_VERSION: u64 = 8;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1650,33 +1685,41 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
-                Initiated { withdrawal_ref, .. },
-                Self::WithdrawalSubmitting {
-                    direction,
-                    amount,
-                    initiated_at,
+                Initiated {
+                    withdrawal_ref,
+                    initiated_at: withdrawal_initiated_at,
                     ..
+                },
+                Self::WithdrawalSubmitting {
+                    direction, amount, ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
-                initiated_at: *initiated_at,
+                // Use the event's initiated_at (set by transition_initiate_withdrawal to
+                // Utc::now() at the moment the Alpaca withdrawal is initiated), NOT the
+                // prior state's initiated_at which tracks the overall rebalance start.
+                // This is the correct epoch for the durable 4-hour operator alert deadline.
+                initiated_at: *withdrawal_initiated_at,
             },
 
             (
-                Initiated { withdrawal_ref, .. },
+                Initiated {
+                    withdrawal_ref,
+                    initiated_at: withdrawal_initiated_at,
+                    ..
+                },
                 Self::ConversionComplete {
                     direction,
                     conversion,
-                    initiated_at,
                     ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
                 amount: conversion.received_amount,
                 withdrawal_ref: withdrawal_ref.clone(),
-                initiated_at: *initiated_at,
+                initiated_at: *withdrawal_initiated_at,
             },
 
             (
@@ -7861,12 +7904,18 @@ mod tests {
         assert_eq!(bridge.updated_at, original_initiated_at);
     }
 
+    /// After the fix that makes `Withdrawing.initiated_at` reflect the actual
+    /// Alpaca withdrawal initiation time (from the `Initiated` event), the DTO's
+    /// `started_at` and `updated_at` fields reflect when the withdrawal step began,
+    /// not when the overall rebalance started. This is correct: the deadline alert
+    /// is anchored to the withdrawal start, and the display is more precise.
     #[test]
-    fn to_dto_preserves_original_initiated_at_when_withdrawal_begins_after_conversion() {
+    fn to_dto_uses_withdrawal_initiation_time_not_rebalance_start_when_withdrawing() {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let original_initiated_at = Utc::now();
         let conversion_completed_at = original_initiated_at + chrono::Duration::seconds(30);
+        let withdrawal_initiated_at = original_initiated_at + chrono::Duration::seconds(60);
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -7883,7 +7932,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(999.99)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-                initiated_at: original_initiated_at + chrono::Duration::seconds(60),
+                initiated_at: withdrawal_initiated_at,
             },
         ])
         .expect("event stream should replay into withdrawing state");
@@ -7895,11 +7944,17 @@ mod tests {
         };
 
         assert!(matches!(bridge.status, UsdcBridgeStatus::Withdrawing));
+        // Withdrawing.initiated_at now reflects when the Alpaca withdrawal was initiated
+        // (from the Initiated event), so the DTO's started_at and updated_at reflect
+        // the withdrawal start time, not the overall rebalance start.
         assert_eq!(
-            bridge.started_at, original_initiated_at,
-            "initiated_at should remain anchored to the original rebalance initiation time"
+            bridge.started_at, withdrawal_initiated_at,
+            "started_at must reflect the withdrawal initiation time (from the Initiated event)"
         );
-        assert_eq!(bridge.updated_at, original_initiated_at);
+        assert_eq!(
+            bridge.updated_at, withdrawal_initiated_at,
+            "updated_at must reflect the withdrawal initiation time in Withdrawing state"
+        );
     }
 
     #[test]
@@ -9670,6 +9725,205 @@ mod tests {
             result, None,
             "WithdrawalSubmitting AlpacaToBase must NOT be resumable \
              (resume_alpaca_to_base returns ResumeDirectionMismatch)"
+        );
+    }
+
+    /// `Withdrawing{AlpacaToBase}` is resumable mid-flight: the AlpacaTransferId
+    /// is durably recorded and `resume_alpaca_to_base` re-polls the same transfer.
+    /// The returned `(direction, amount)` tuple must match exactly.
+    #[test]
+    fn withdrawing_alpaca_to_base_is_resumable_mid_flight_data() {
+        let amount = Usdc::new(float!(100));
+        let state = UsdcRebalance::Withdrawing {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            Some((RebalanceDirection::AlpacaToBase, amount)),
+            "Withdrawing{{AlpacaToBase}} must be resumable mid-flight with the correct amount"
+        );
+    }
+
+    /// A malformed persisted `Withdrawing{AlpacaToBase}` carrying an on-chain
+    /// withdrawal ref has no Alpaca transfer ID to re-poll, so startup recovery
+    /// must not re-arm it as a mid-flight Alpaca withdrawal.
+    #[test]
+    fn withdrawing_alpaca_to_base_onchain_ref_is_not_resumable_mid_flight_data() {
+        let state = UsdcRebalance::Withdrawing {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100)),
+            withdrawal_ref: TransferRef::OnchainTx(alloy::primitives::TxHash::ZERO),
+            initiated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            None,
+            "Withdrawing{{AlpacaToBase}} with an on-chain withdrawal ref must not be \
+             auto-rearmed without an Alpaca transfer id"
+        );
+    }
+
+    /// `WithdrawalComplete{AlpacaToBase}` is resumable mid-flight: Alpaca has
+    /// already moved the source funds, and `resume_alpaca_to_base` scans for an
+    /// existing burn before submitting one.
+    #[test]
+    fn withdrawal_complete_alpaca_to_base_is_resumable_mid_flight_data() {
+        let amount = Usdc::new(float!(100));
+        let state = UsdcRebalance::WithdrawalComplete {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            initiated_at: Utc::now(),
+            confirmed_at: Utc::now(),
+            withdrawal_tx: None,
+        };
+
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            Some((RebalanceDirection::AlpacaToBase, amount)),
+            "WithdrawalComplete{{AlpacaToBase}} must be resumable mid-flight with the correct amount"
+        );
+    }
+
+    /// `Withdrawing{BaseToAlpaca}` is NOT resumable mid-flight. BaseToAlpaca
+    /// reaches Withdrawing via an on-chain tx (handled by the post-burn path,
+    /// not the mid-flight re-arm path).
+    #[test]
+    fn withdrawing_base_to_alpaca_is_not_resumable_mid_flight_data() {
+        let state = UsdcRebalance::Withdrawing {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            withdrawal_ref: TransferRef::OnchainTx(alloy::primitives::TxHash::ZERO),
+            initiated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            None,
+            "Withdrawing{{BaseToAlpaca}} must not be resumable mid-flight"
+        );
+    }
+
+    /// `WithdrawalComplete{BaseToAlpaca}` is NOT resumable mid-flight. That
+    /// direction's post-withdrawal leg is handled by the post-burn recovery path.
+    #[test]
+    fn withdrawal_complete_base_to_alpaca_is_not_resumable_mid_flight_data() {
+        let state = UsdcRebalance::WithdrawalComplete {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            initiated_at: Utc::now(),
+            confirmed_at: Utc::now(),
+            withdrawal_tx: Some(alloy::primitives::TxHash::ZERO),
+        };
+
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            None,
+            "WithdrawalComplete{{BaseToAlpaca}} must not be resumable mid-flight"
+        );
+    }
+
+    /// `WithdrawalSubmitting{AlpacaToBase}` STILL returns None after this change
+    /// -- regression pin. It must not accidentally become resumable.
+    #[test]
+    fn withdrawal_submitting_alpaca_to_base_remains_not_resumable_mid_flight() {
+        assert_eq!(
+            withdrawal_submitting_alpaca_to_base().is_resumable_mid_flight_data(),
+            None,
+            "WithdrawalSubmitting{{AlpacaToBase}} must still not be resumable mid-flight \
+             (transfer ID not yet persisted in that state)"
+        );
+    }
+
+    /// Regression: `Withdrawing.initiated_at` must come from the `Initiated`
+    /// event's timestamp (set at withdrawal initiation time in
+    /// `transition_initiate_withdrawal`), NOT from the prior state's `initiated_at`
+    /// which tracks the overall rebalance start. Before this fix both evolve arms
+    /// for `AlpacaToBase` copied the prior state's value, so a rebalance with a
+    /// long conversion phase would have an already-elapsed 4-hour operator-alert
+    /// deadline at the first inconclusive withdrawal poll after restart.
+    #[tokio::test]
+    async fn withdrawing_alpaca_to_base_initiated_at_reflects_withdrawal_time_not_rebalance_start()
+    {
+        // Represent the rebalance start as 5 hours ago -- well past the 4-hour
+        // operator-alert deadline. After the fix, Withdrawing.initiated_at must be
+        // the withdrawal initiation time (recent), not the old rebalance start.
+        let old_rebalance_start = Utc::now() - chrono::Duration::hours(5);
+        let amount = Usdc::new(float!(100));
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let prior_events = vec![
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: old_rebalance_start,
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                conversion: par_conversion(amount),
+                converted_at: old_rebalance_start + chrono::Duration::minutes(10),
+            },
+        ];
+
+        // Apply the Initiate command; transition_initiate_withdrawal emits
+        // Initiated { initiated_at: Utc::now() } at the withdrawal moment.
+        let before_initiate = Utc::now();
+        let new_events = TestHarness::<UsdcRebalance>::with(())
+            .given(prior_events.clone())
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            })
+            .await
+            .events();
+        let after_initiate = Utc::now();
+
+        assert_eq!(
+            new_events.len(),
+            1,
+            "Initiate must emit exactly one Initiated event"
+        );
+
+        // Extract the event's initiated_at before consuming new_events in the replay.
+        let event_initiated_at = match &new_events[0] {
+            UsdcRebalanceEvent::Initiated { initiated_at, .. } => *initiated_at,
+            other => panic!("Expected Initiated event, got {other:?}"),
+        };
+
+        // Replay all events to get the Withdrawing state.
+        let all_events: Vec<_> = prior_events.into_iter().chain(new_events).collect();
+        let state = replay::<UsdcRebalance>(all_events)
+            .expect("events must replay cleanly into Withdrawing")
+            .expect("aggregate must have state after events");
+
+        let UsdcRebalance::Withdrawing {
+            initiated_at: withdrawing_initiated_at,
+            ..
+        } = state
+        else {
+            panic!("Expected Withdrawing state, got: {state:?}");
+        };
+
+        // The Withdrawing state's initiated_at must equal the event's timestamp.
+        assert_eq!(
+            withdrawing_initiated_at, event_initiated_at,
+            "Withdrawing.initiated_at must match the Initiated event's initiated_at \
+             (withdrawal initiation time), not the prior ConversionComplete.initiated_at"
+        );
+
+        // The withdrawal initiation time must be recent (near the Initiate call),
+        // not the old rebalance start (5 hours ago).
+        assert!(
+            withdrawing_initiated_at >= before_initiate
+                && withdrawing_initiated_at <= after_initiate,
+            "Withdrawing.initiated_at must be the withdrawal initiation time (recent), \
+             not the old rebalance start {old_rebalance_start:?}; got {withdrawing_initiated_at:?}"
         );
     }
 
