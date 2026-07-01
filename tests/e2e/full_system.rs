@@ -56,8 +56,8 @@ use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
-    connect_db, count_events, count_events_of_type, poll_for_broker_fills, poll_for_events,
-    poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
+    connect_db, count_events, count_events_of_type, free_port, poll_for_broker_fills,
+    poll_for_events, poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
 use crate::test_infra::TestInfra;
@@ -79,6 +79,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     cash_reserved: Option<Positive<Usd>>,
     server_port: u16,
     board_port: u16,
+    issuance_base_url: url::Url,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -164,6 +165,10 @@ fn build_full_system_ctx<P: Provider + Clone>(
         )
         .redemption_wallet(REDEMPTION_WALLET)
         .call()
+        .map(|mut ctx| {
+            ctx.issuance.base_url = issuance_base_url;
+            ctx
+        })
         .map_err(Into::into)
 }
 
@@ -584,6 +589,7 @@ async fn full_system() -> anyhow::Result<()> {
 
     let (event_sender, _) = broadcast::channel::<Statement>(256);
 
+    let server_port = free_port();
     let ctx = build_full_system_ctx()
         .chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
@@ -594,13 +600,14 @@ async fn full_system() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
-        .server_port(8001)
-        .board_port(8002)
+        .server_port(server_port)
+        .board_port(server_port + 1)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
 
-    poll_for_ready(&mut bot, 8001).await;
+    poll_for_ready(&mut bot, server_port).await;
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     // === Phase 1: AAPL sell hedge ===
@@ -911,6 +918,7 @@ async fn simulate() -> anyhow::Result<()> {
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
         .board_port(server_port + 1)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 
@@ -1110,6 +1118,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
         .board_port(server_port + 1)
+        .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
     let cli_ctx = ctx.clone();

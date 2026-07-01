@@ -19,6 +19,16 @@ use st0x_hedge::{
     run_bot_session_with_injector,
 };
 
+/// Returns an available TCP port by binding to port 0 and reading the assigned
+/// port. The socket is dropped immediately, freeing the port for the caller.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind ephemeral port")
+        .local_addr()
+        .expect("failed to get local addr")
+        .port()
+}
+
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_bot_session(ctx))
