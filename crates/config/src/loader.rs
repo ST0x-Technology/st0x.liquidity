@@ -36,7 +36,15 @@ static DRY_RUN_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(
     Positive::new(FractionalShares::new(float!(1))).unwrap_or_else(|_| unreachable!())
 });
 const MIN_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 1;
-const MAX_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 10_000;
+/// Slippage must be strictly less than 100%: 10_000 bps (exactly 100%) zeroes a
+/// sell-side limit price and fails `Positive::new` at runtime.
+///
+/// NOTE: this bound only rules out the exact-100% zero. It does NOT guarantee a
+/// positive sell price for every symbol: a near-100% slippage on a sub-dollar
+/// reference still floors to $0.0000 and fails `Positive::new` (fail-fast, not
+/// silent). Such a value is a gross misconfiguration; the bound exists to reject
+/// the degenerate exact-zero case, not to validate operationally sane slippage.
+const MAX_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 9_999;
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -81,6 +89,10 @@ pub struct EquityAssetConfig {
     pub trading: OperationMode,
     pub rebalancing: OperationMode,
     pub wrapped_equity_recovery: OperationMode,
+    /// When enabled, counter-trades for this equity may be placed during
+    /// extended (pre-/after-market) sessions as limit orders, instead of
+    /// waiting for the regular open. Must be explicitly configured.
+    pub extended_hours_counter_trading: OperationMode,
     pub operational_limit: Option<Positive<FractionalShares>>,
 }
 
@@ -1135,6 +1147,29 @@ impl Ctx {
     }
 }
 
+impl AssetsConfig {
+    /// Returns whether extended-hours counter-trading is enabled for the
+    /// given equity.
+    ///
+    /// Fail-closed: assets not present in the config are treated as
+    /// disabled.
+    pub fn is_extended_hours_enabled(&self, symbol: &Symbol) -> bool {
+        self.equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| config.extended_hours_counter_trading == OperationMode::Enabled)
+    }
+
+    /// Returns whether any configured equity enables extended-hours
+    /// counter-trading.
+    pub fn any_extended_hours_enabled(&self) -> bool {
+        self.equities
+            .symbols
+            .values()
+            .any(|config| config.extended_hours_counter_trading == OperationMode::Enabled)
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 use crate::IngestionCutoff;
 
@@ -2151,6 +2186,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extended_hours_counter_trading_is_required_per_equity() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing extended-hours flag, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("extended_hours_counter_trading"),
+            "expected parse error to mention extended-hours flag, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
     async fn apalis_finished_job_cleanup_interval_must_be_non_zero() {
         let config = toml_file(
             r#"
@@ -2896,7 +2973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alpaca_broker_api_counter_trade_slippage_must_be_positive_and_at_most_10_000_bps() {
+    async fn alpaca_broker_api_counter_trade_slippage_must_be_positive_and_under_10_000_bps() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -2940,12 +3017,130 @@ mod tests {
                 CtxError::CounterTradeSlippageBpsOutOfRange {
                     configured: 0,
                     min: 1,
-                    max: 10_000,
+                    max: 9_999,
                 }
             ),
             "Expected CounterTradeSlippageBpsOutOfRange, got: {err:?}"
         );
     }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_counter_trade_slippage_rejects_10_000_bps() {
+        // 10_000 bps (=100%) zeroes sell-side limit prices and fails
+        // Positive::new at runtime. Must be rejected at config load.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            counter_trade_slippage_bps = 10000
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let err = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CtxError::CounterTradeSlippageBpsOutOfRange {
+                    configured: 10_000,
+                    min: 1,
+                    max: 9_999,
+                }
+            ),
+            "Expected CounterTradeSlippageBpsOutOfRange{{configured: 10000}}, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_counter_trade_slippage_accepts_9_999_bps() {
+        // 9_999 bps is the maximum accepted value (MAX_COUNTER_TRADE_SLIPPAGE_BPS).
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            counter_trade_slippage_bps = 9999
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        "#,
+        );
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let BrokerCtx::AlpacaBrokerApi(broker) = ctx.broker else {
+            panic!("expected AlpacaBrokerApi broker");
+        };
+
+        assert_eq!(broker.counter_trade_slippage_bps, 9999);
+    }
+
     #[tokio::test]
     async fn alpaca_broker_api_executor_uses_dollar_threshold() {
         let config = alpaca_config_toml();
@@ -3399,6 +3594,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#
         );
 
@@ -3486,6 +3682,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             }
         }
@@ -3665,6 +3862,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
             bogus_field = "should fail"
 
             [raindex]
@@ -3842,6 +4040,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
             operational_limit = 5
 
             [equities.SPYM]
@@ -3850,6 +4049,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
 
             [cash]
             vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
@@ -3879,6 +4079,32 @@ mod tests {
     }
 
     #[test]
+    fn extended_hours_counter_trading_parses_enabled_and_disabled_from_toml() {
+        let toml_str = r#"
+            [equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "disabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "enabled"
+
+            [equities.TSLA]
+            tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
+            tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+            trading = "disabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+        "#;
+        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        assert!(config.is_extended_hours_enabled(&aapl));
+        assert!(!config.is_extended_hours_enabled(&tsla));
+    }
+
+    #[test]
     fn short_vault_id_left_pads_to_b256() {
         let toml_str = r#"
             [equities.RKLB]
@@ -3888,6 +4114,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -3908,6 +4135,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -3932,6 +4160,7 @@ mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -3949,6 +4178,7 @@ mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -3966,6 +4196,7 @@ mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             rebalancing = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -3984,6 +4215,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
             operational_limit = 10
 
             [equities.TSLA]
@@ -3992,6 +4224,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -4020,6 +4253,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -4056,6 +4290,68 @@ mod tests {
     }
 
     #[test]
+    fn is_extended_hours_enabled_returns_configured_value() {
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            Symbol::new("TSLA").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let assets = AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols,
+            },
+            cash: None,
+        };
+
+        assert!(
+            assets.is_extended_hours_enabled(&Symbol::new("AAPL").unwrap()),
+            "AAPL extended-hours counter-trading should be enabled"
+        );
+        assert!(
+            !assets.is_extended_hours_enabled(&Symbol::new("TSLA").unwrap()),
+            "TSLA extended-hours counter-trading should be disabled"
+        );
+        assert!(
+            !assets.is_extended_hours_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to disabled (fail-closed)"
+        );
+        assert!(
+            assets.any_extended_hours_enabled(),
+            "At least one equity enables extended-hours counter-trading"
+        );
+        assert!(
+            !AssetsConfig::default().any_extended_hours_enabled(),
+            "No configured equities means no extended-hours counter-trading"
+        );
+    }
+
+    #[test]
     fn is_rebalancing_enabled_returns_configured_value() {
         let mut symbols = HashMap::new();
         symbols.insert(
@@ -4068,6 +4364,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -4116,6 +4413,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -4164,6 +4462,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -4295,6 +4594,7 @@ mod tests {
                     trading = "{trading}"
                     rebalancing = "{rebalancing}"
                     wrapped_equity_recovery = "disabled"
+                    extended_hours_counter_trading = "disabled"
                     "#,
                     "", "",
                 );

@@ -104,6 +104,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -382,6 +383,7 @@ vault_ids = ["{aapl_vault_id:#x}"]
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
 
 [assets.equities.TSLA]
 tokenized_equity = "{tsla_unwrapped}"
@@ -390,6 +392,7 @@ vault_ids = ["{tsla_vault_id:#x}"]
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
 
 [assets.cash]
 vault_ids = ["{usdc_vault_id:#x}"]
