@@ -750,6 +750,22 @@ fn parse_and_validate(
         });
     }
 
+    // Extended-hours counter-trading depends on counter-trading itself: the
+    // hedge path gates on `trading` before it ever consults the extended-hours
+    // session (see `check_execution_readiness`), so
+    // `extended_hours_counter_trading = enabled` with `trading = disabled` is a
+    // dead configuration that can never execute. Reject it so the invalid
+    // combination never loads and never reaches the dashboard.
+    for (symbol, equity) in &config.assets.equities.symbols {
+        if equity.extended_hours_counter_trading == OperationMode::Enabled
+            && equity.trading == OperationMode::Disabled
+        {
+            return Err(CtxError::ExtendedHoursWithoutCounterTrading {
+                symbol: symbol.clone(),
+            });
+        }
+    }
+
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
     let alerts = AlertsCtx::new(config.alerts, secrets.alerts)?;
@@ -1337,6 +1353,13 @@ pub enum CtxError {
          rebalancing is enabled but not configured"
     )]
     MissingEquityVaultId { symbol: Symbol },
+    #[error(
+        "assets.equities.{symbol}: extended_hours_counter_trading cannot be \
+         enabled when trading is disabled -- extended-hours counter-trades only \
+         run while counter-trading is enabled, so this combination can never \
+         execute"
+    )]
+    ExtendedHoursWithoutCounterTrading { symbol: Symbol },
     #[error("{field} polling interval must be non-zero")]
     ZeroPollingInterval { field: &'static str },
     #[error("server_port and board_port must differ; both set to {port}")]
@@ -1378,6 +1401,9 @@ impl CtxError {
             }
             Self::MissingCashVaultId => "missing cash vault_ids",
             Self::MissingEquityVaultId { .. } => "missing equity vault_ids",
+            Self::ExtendedHoursWithoutCounterTrading { .. } => {
+                "extended hours enabled without counter-trading"
+            }
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
             Self::FloatComparison(_) => "float comparison failed",
@@ -4103,7 +4129,7 @@ mod tests {
             [equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            trading = "disabled"
+            trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
@@ -4893,6 +4919,80 @@ mod tests {
     #[test]
     fn validate_files_accepts_example_config_and_secrets() {
         Ctx::validate_files(example_config_toml(), example_secrets_toml()).unwrap();
+    }
+
+    #[test]
+    fn validate_files_rejects_extended_hours_without_counter_trading() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "disabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "enabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::ExtendedHoursWithoutCounterTrading { ref symbol }
+                    if symbol.to_string() == "AAPL"
+            ),
+            "Expected ExtendedHoursWithoutCounterTrading for AAPL, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_accepts_extended_hours_with_counter_trading() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "enabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
     #[test]

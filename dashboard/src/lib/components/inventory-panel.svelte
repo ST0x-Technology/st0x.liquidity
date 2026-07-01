@@ -51,6 +51,9 @@
 
   const equityEntries: GlossaryEntry[] = [
     { name: 'Asset', def: 'Equity symbol with the t/wt prefix stripped (e.g. AAPL for tAAPL / wtAAPL). Non-trading assets are dimmed.' },
+    { name: 'CT', def: 'Counter-trading / hedging status for this asset. Green means enabled; red means disabled; grey means not configured.' },
+    { name: 'Rebal', def: 'Automatic equity rebalancing status for this asset. Green means enabled; red means disabled; grey means not configured.' },
+    { name: 'Ext', def: 'Extended-hours counter-trading status for this asset (only active while counter-trading is enabled). Green means enabled; red means disabled; grey means not configured.' },
     { name: 'Raindex', def: 'tSTOCK tokens available in the Raindex vault to settle takers.' },
     { name: 'Inflight', def: 'Shares the books track as in motion between venues (pending mints, redeems, transfers). Part of imbalance math.' },
     { name: 'Alpaca', def: 'Shares held at Alpaca (offchain available).' },

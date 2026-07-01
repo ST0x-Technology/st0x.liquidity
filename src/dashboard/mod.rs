@@ -189,9 +189,21 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
                     .unwrap_or_else(|_| "?".to_string())
             });
 
+            // Extended hours lives under `Enabled` only. Config validation
+            // rejects `extended_hours_counter_trading = enabled` with
+            // `trading = disabled`, so a disabled asset never carries a live
+            // extended-hours flag -- this maps valid config, it does not
+            // coerce a contradictory pair.
+            let counter_trading = match config.trading {
+                OperationMode::Enabled => st0x_dto::CounterTrading::Enabled {
+                    extended_hours: config.extended_hours_counter_trading == OperationMode::Enabled,
+                },
+                OperationMode::Disabled => st0x_dto::CounterTrading::Disabled,
+            };
+
             st0x_dto::AssetSettings {
                 symbol: symbol.clone(),
-                trading: config.trading == OperationMode::Enabled,
+                counter_trading,
                 rebalancing: config.rebalancing == OperationMode::Enabled,
                 operational_limit: limit,
             }
@@ -297,11 +309,11 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
 
+    use st0x_config::{EquityAssetConfig, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
 
     use super::*;
     use crate::inventory::{self, BroadcastingInventory};
-    use st0x_config::create_test_ctx_with_order_owner;
 
     fn dummy_fill(symbol: &str) -> Statement {
         Statement::TradeFill(Trade {
@@ -345,6 +357,78 @@ mod tests {
             recent_transfers: Vec::new(),
             warnings: Vec::new(),
         })
+    }
+
+    #[test]
+    fn settings_from_ctx_includes_asset_operation_flags() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let settings = settings_from_ctx(&ctx);
+        let asset = settings
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .expect("RKLB settings should be present");
+
+        assert!(matches!(
+            asset.counter_trading,
+            st0x_dto::CounterTrading::Enabled {
+                extended_hours: true
+            }
+        ));
+        assert!(!asset.rebalancing);
+    }
+
+    #[test]
+    fn settings_from_ctx_maps_disabled_trading_to_counter_trading_disabled() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let settings = settings_from_ctx(&ctx);
+        let asset = settings
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .expect("RKLB settings should be present");
+
+        assert!(matches!(
+            asset.counter_trading,
+            st0x_dto::CounterTrading::Disabled
+        ));
+        assert!(asset.rebalancing);
     }
 
     async fn create_test_state() -> AppState {
