@@ -34,11 +34,21 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     );
     metrics::describe_counter!(
         "onchain_events_total",
-        "ClearV3 and TakeOrderV3 events received from Raindex, by event_type"
+        "ClearV3, TakeOrderV3 and InventoryTrade events received from Raindex, by event_type"
     );
     metrics::describe_counter!(
         "broker_errors_total",
         "Broker API errors, by symbol and kind"
+    );
+    metrics::describe_counter!(
+        "inventory_ambiguous_settlement_total",
+        "Inventory settlements quarantined because a tx emitted multiple \
+         OperatorDeposits or multiple OperatorWithdraws and could not be safely paired"
+    );
+    metrics::describe_counter!(
+        "inventory_unpaired_settlement_total",
+        "Inventory OperatorDeposit/OperatorWithdraw legs with no same-tx counterpart in the \
+         batch, by leg"
     );
 
     let _ = HANDLE.set(handle.clone());

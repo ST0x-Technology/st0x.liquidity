@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
 pub use st0x_evm::{IERC20, USDC_BASE};
 pub use st0x_hedge::bindings::DeployableERC20;
+use st0x_hedge::bindings::IRaindexInventory;
 use st0x_hedge::bindings::IRaindexV6::{self, TakeOrderV3};
 use st0x_hedge::bindings::{Deployer, Interpreter, Parser, RaindexV6, Store as RainStore};
 
@@ -951,6 +952,122 @@ impl<P: Provider + Clone> BaseChain<P> {
             output_vault_balance_after_take,
         })
     }
+
+    /// Deploys a `RaindexInventory` (raindex.governance) pointing at this
+    /// chain's OrderBook, with `self.owner` as `DEFAULT_ADMIN_ROLE` holder.
+    /// Used by inventory e2e tests to exercise `OperatorDeposit`/
+    /// `OperatorWithdraw` settlements from a venue adapter that isn't the
+    /// bot itself.
+    pub async fn deploy_inventory(&self) -> anyhow::Result<Address> {
+        let inventory = IRaindexInventory::deploy(&self.provider, self.owner, self.orderbook)
+            .await?
+            .address()
+            .to_owned();
+        Ok(inventory)
+    }
+
+    /// Grants `OPERATOR_ROLE` on `inventory` to `operator`, signed by
+    /// `self.owner` (the inventory's `DEFAULT_ADMIN_ROLE` holder).
+    pub async fn grant_inventory_operator(
+        &self,
+        inventory: Address,
+        operator: Address,
+    ) -> anyhow::Result<()> {
+        let inventory_instance = IRaindexInventory::new(inventory, &self.provider);
+        let operator_role = inventory_instance.OPERATOR_ROLE().call().await?;
+        inventory_instance
+            .grantRole(operator_role, operator)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        Ok(())
+    }
+
+    /// Seeds `inventory`'s `vault_id` for `token` with `amount` (raw units,
+    /// `decimals` decimal places), deposited by `self.owner` (admin). Used to
+    /// give an inventory-owned vault an initial balance before a synthetic
+    /// venue operator withdraws against it -- `withdraw4` reverts against an
+    /// empty vault, exactly like the underlying OrderBook.
+    pub async fn seed_inventory_vault(
+        &self,
+        inventory: Address,
+        token: Address,
+        vault_id: B256,
+        amount: U256,
+        decimals: u8,
+    ) -> anyhow::Result<()> {
+        // Over-approve for Rain float precision rounding, matching
+        // `deposit_into_raindex_vault`'s orderbook-deposit precedent.
+        IERC20::new(token, &self.provider)
+            .approve(inventory, amount * U256::from(2))
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let deposit_float = Float::from_fixed_decimal(amount, decimals)
+            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+            .get_inner();
+
+        IRaindexInventory::new(inventory, &self.provider)
+            .deposit4(token, vault_id, deposit_float, vec![])
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// Performs a genuine venue-style settlement against `inventory`, signed by
+/// `operator_provider`'s wallet (an account holding `OPERATOR_ROLE`, distinct
+/// from the bot/order owner): a `deposit4` + `withdraw4` batched into a
+/// single tx via the contract's inherited `Multicall`, so both legs land in
+/// one settlement tx the way a real adapter (Bebop hook, univ4 hook) would --
+/// `enqueue_batch_events` pairs `OperatorDeposit`/`OperatorWithdraw` by
+/// `tx_hash`.
+///
+/// `deposit`/`withdraw` are `(token, vault_id, amount, decimals)`; `amount`
+/// is in raw fixed-decimal units. Returns the settlement tx hash.
+pub async fn inventory_operator_settle<P: Provider>(
+    operator_provider: &P,
+    inventory: Address,
+    deposit: (Address, B256, U256, u8),
+    withdraw: (Address, B256, U256, u8),
+) -> anyhow::Result<B256> {
+    let (deposit_token, deposit_vault_id, deposit_amount, deposit_decimals) = deposit;
+    let (withdraw_token, withdraw_vault_id, withdraw_amount, withdraw_decimals) = withdraw;
+
+    let deposit_float = Float::from_fixed_decimal(deposit_amount, deposit_decimals)
+        .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+        .get_inner();
+    let withdraw_float = Float::from_fixed_decimal(withdraw_amount, withdraw_decimals)
+        .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+        .get_inner();
+
+    let inventory_instance = IRaindexInventory::new(inventory, operator_provider);
+
+    let deposit_calldata = inventory_instance
+        .deposit4(deposit_token, deposit_vault_id, deposit_float, vec![])
+        .calldata()
+        .to_owned();
+    let withdraw_calldata = inventory_instance
+        .withdraw4(withdraw_token, withdraw_vault_id, withdraw_float, vec![])
+        .calldata()
+        .to_owned();
+
+    let receipt = inventory_instance
+        .multicall(vec![deposit_calldata, withdraw_calldata])
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    anyhow::ensure!(receipt.status(), "inventory multicall settlement reverted");
+
+    Ok(receipt.transaction_hash)
 }
 
 /// Deploys a USDC ERC20 at the given address using `anvil_set_code` with

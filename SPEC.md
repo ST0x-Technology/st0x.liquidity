@@ -206,6 +206,42 @@ excellent async ecosystem for handling concurrent trading flows.
   tracking (idempotent ingestion -- overlapping ranges dedupe by
   `(tx_hash, log_index)`)
 
+##### InventoryTrade: a third fill source
+
+Alongside `Clear`/`TakeOrder`, the backfill worker also fetches
+`OperatorDeposit`/`OperatorWithdraw` logs from the shared `RaindexInventory`
+(`managed` inventory mode only; see "Shared-Inventory Settlement" above) for the
+same block range and cutoff. Any settlement a venue adapter (Bebop hook, univ4
+hook, or a future venue holding `OPERATOR_ROLE`) routes through the inventory
+surfaces as one deposit + one withdraw on the same tx -- the vault deltas
+themselves are the trade, agnostic to which adapter routed it, so a new venue is
+hedged for free without adapter-specific integration work.
+
+Pairing rules:
+
+- `OperatorDeposit`s are bucketed by settlement tx; each `OperatorWithdraw` is
+  matched against its same-tx bucket.
+- A leg whose `operator` is the bot's own signing wallet is the bot's own
+  rebalancing (`deposit4`/`withdraw4`), not a venue fill, and is filtered out
+  before pairing.
+- `deposit4`/`withdraw4` are independent contract calls with no atomic settle
+  entrypoint linking a deposit to its withdraw. A tx with more than one
+  `OperatorDeposit` cannot be safely paired, so the whole tx is quarantined
+  (fail closed) rather than risk overwriting a real amount and mis-hedging. An
+  unpaired leg (a deposit or withdraw with no counterpart in the batch) is
+  likewise dropped.
+- Both quarantine cases emit no `InventoryTrade` and increment
+  `inventory_ambiguous_settlement_total` / `inventory_unpaired_settlement_total`
+  (labeled by leg) so a dropped settlement is observable, not silent.
+- The manual `process-tx` recovery CLI command supports `InventoryTrade`
+  settlements too, using the same pairing rules.
+
+RUNBOOK: the persisted backfill checkpoint predates inventory ingestion, so
+resuming from it silently skips any inventory fills mined before this code's
+deploy block. On rollout to an already-running deployment, manually rewind the
+checkpoint to the inventory deploy block (or run a one-shot backfill over that
+range) so pre-deploy inventory fills get ingested.
+
 #### Orchestration
 
 Orchestration is split into two layers:
@@ -3517,6 +3553,12 @@ checkpoint as `AccountForDexTrade` jobs into the same queue. The worker starts
 after backfill completes, so historical jobs are enqueued before live events are
 processed. Successful backfill advances the checkpoint to the cutoff block.
 
+The diagram above shows `ClearV3`/`TakeOrderV3`, the direct-orderbook fill
+source. In `managed` inventory mode, `OperatorDeposit`/`OperatorWithdraw`
+settlement pairs on the shared `RaindexInventory` are a third fill source pushed
+into the same `AccountForDexTrade` queue as an `InventoryTrade`; see
+"InventoryTrade: a third fill source" above for the pairing rules.
+
 **Target Flow** (lifecycle workflows, future):
 
 ```mermaid
@@ -3587,10 +3629,10 @@ All work managed by the Conductor falls into one of these categories:
 
 **Long-running services** (streaming, restart on failure):
 
-| Service             | Description                                               |
-| ------------------- | --------------------------------------------------------- |
-| Order fill monitor  | WS subscription to ClearV3/TakeOrderV3, pushes trade jobs |
-| Rebalancing trigger | Detects inventory imbalances, pushes rebalancing jobs     |
+| Service             | Description                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------- |
+| Order fill monitor  | Polls ClearV3/TakeOrderV3 and inventory OperatorDeposit/OperatorWithdraw settlements, pushes trade jobs |
+| Rebalancing trigger | Detects inventory imbalances, pushes rebalancing jobs                                                   |
 
 **Scheduled jobs** (periodic, future — currently long-running with sleep loops):
 

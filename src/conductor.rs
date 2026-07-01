@@ -2198,6 +2198,11 @@ pub(crate) async fn discover_vaults_for_trade(
             take_event.config.inputIOIndex,
             take_event.config.outputIOIndex,
         ),
+        // InventoryTrade events settle on vaults owned by the inventory
+        // contract; those vaults reach the registry via the Raindex ClearV3
+        // / TakeOrderV3 that first funded them, so nothing new to auto-
+        // discover here.
+        RaindexTradeEvent::InventoryTrade(_) => Vec::new(),
     };
 
     let our_vaults = owned_vaults
@@ -3525,6 +3530,7 @@ mod tests {
     use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
 
     use super::*;
+    use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
@@ -3534,7 +3540,7 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain::order::{CancellationReason, OrderPlacementResult, RetainedFill};
     use crate::onchain::mock::MockRaindex;
-    use crate::onchain::trade::OnchainTrade;
+    use crate::onchain::trade::{InventoryTrade, OnchainTrade};
     use crate::rebalancing::equity::{
         EquityTransferServices, ResumeTokenizationAggregate, ResumeTokenizationJobQueue,
         ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToMarketMaking,
@@ -4838,6 +4844,29 @@ mod tests {
         .unwrap()
     }
 
+    fn create_emitted_inventory_event() -> EmittedOnChain<RaindexTradeEvent> {
+        let inventory_trade = InventoryTrade {
+            deposit: OperatorDeposit {
+                operator: address!("0x1111111111111111111111111111111111111111"),
+                token: address!("0x2222222222222222222222222222222222222222"),
+                vaultId: B256::ZERO,
+                amount: U256::from(1u64),
+            },
+            withdraw: OperatorWithdraw {
+                operator: address!("0x1111111111111111111111111111111111111111"),
+                token: address!("0x3333333333333333333333333333333333333333"),
+                vaultId: B256::ZERO,
+                amount: U256::from(1u64),
+            },
+        };
+
+        EmittedOnChain::from_log(
+            RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade)),
+            &get_test_log(),
+        )
+        .unwrap()
+    }
+
     async fn load_vault_registry(vault_registry: &Store<VaultRegistry>) -> Option<VaultRegistry> {
         let registry_id = VaultRegistryId {
             orderbook: TEST_ORDERBOOK,
@@ -4988,6 +5017,30 @@ mod tests {
         assert!(
             !registry.equity_vaults.is_empty(),
             "Expected equity vault to be discovered from take order"
+        );
+    }
+
+    /// An `InventoryTrade` event never auto-discovers vaults: its vaults are
+    /// owned by the inventory contract and reach the registry via the
+    /// ClearV3/TakeOrderV3 that first funded them, not via this path.
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_inventory_trade_discovers_nothing() {
+        let pool = setup_test_db().await;
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+
+        let queued_event = create_emitted_inventory_event();
+        let trade = create_test_trade("MSFT");
+
+        let context = create_vault_discovery_context(&vault_registry);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("InventoryTrade must not error even though it discovers nothing");
+
+        let registry = load_vault_registry(&vault_registry).await;
+
+        assert!(
+            registry.is_none(),
+            "InventoryTrade events must never auto-discover a vault registry"
         );
     }
 

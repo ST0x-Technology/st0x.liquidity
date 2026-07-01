@@ -1228,6 +1228,16 @@ impl Ctx {
         trading_mode: TradingMode,
         order_owner: Address,
         wallet: Option<crate::wallet::OnchainWalletCtx>,
+        /// Rebalancing settlement mode. Defaults to `Legacy` (bot-EOA-owned
+        /// vaults settling directly against the orderbook), matching every
+        /// e2e test that predates the shared-inventory migration. Tests that
+        /// need a distinct `RaindexInventory` (e.g. InventoryTrade fills from
+        /// a venue adapter) pass `Managed { inventory }` explicitly; the
+        /// vault owner then becomes the inventory address (mirroring
+        /// `crate::onchain::raindex_contracts`'s production wiring) instead
+        /// of `order_owner`.
+        #[builder(default = InventoryMode::Legacy)]
+        inventory_mode: InventoryMode,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
@@ -1252,6 +1262,18 @@ impl Ctx {
             return Err(CtxError::MissingTokenization);
         }
 
+        // Legacy: tests simulate the pre-migration state where the bot owns
+        // the vaults and settles on the orderbook, so the startup
+        // OPERATOR_ROLE preflight is skipped (there is no distinct inventory
+        // contract) and the vault owner is the bot's own order-owner address.
+        // Managed: a distinct RaindexInventory owns the vaults (production
+        // wiring in `crate::onchain::raindex_contracts`), so the vault owner
+        // becomes the inventory address instead.
+        let vault_owner = match inventory_mode {
+            InventoryMode::Legacy => order_owner,
+            InventoryMode::Managed { inventory } => inventory,
+        };
+
         Ok(Self {
             database_url,
             log_level: LogLevel::Debug,
@@ -1261,13 +1283,8 @@ impl Ctx {
             evm: EvmCtx {
                 rpc_url,
                 orderbook,
-                // Legacy: tests simulate the pre-migration state where the bot
-                // owns the vaults and settles on the orderbook, so the startup
-                // OPERATOR_ROLE preflight is skipped (there is no distinct
-                // inventory contract). inventory_address() resolves to the
-                // orderbook, unchanged from before the InventoryMode split.
-                inventory: InventoryMode::Legacy,
-                vault_owner: order_owner,
+                inventory: inventory_mode,
+                vault_owner,
                 deployment_block,
                 required_confirmations,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -1587,6 +1604,53 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file
+    }
+
+    /// `Ctx::for_test`'s `vault_owner` derivation mirrors the production
+    /// `EvmCtx` wiring: `Legacy` (no distinct inventory contract) resolves to
+    /// `order_owner`, `Managed` resolves to the inventory address. A swapped
+    /// branch would misattribute which vaults the bot considers its own for
+    /// ClearV3/TakeOrderV3 matching and inventory-mode discovery.
+    #[test]
+    fn for_test_vault_owner_matches_legacy_order_owner() {
+        let order_owner = address!("0x1111111111111111111111111111111111111111");
+
+        let ctx = Ctx::for_test()
+            .database_url(":memory:".to_owned())
+            .rpc_url(url::Url::parse("http://localhost:8545").unwrap())
+            .orderbook(address!("0x2222222222222222222222222222222222222222"))
+            .deployment_block(1)
+            .broker(BrokerCtx::DryRun)
+            .trading_mode(TradingMode::Standalone)
+            .order_owner(order_owner)
+            .assets(AssetsConfig::default())
+            .call()
+            .unwrap();
+
+        assert_eq!(ctx.evm.inventory, InventoryMode::Legacy);
+        assert_eq!(ctx.evm.vault_owner, order_owner);
+    }
+
+    #[test]
+    fn for_test_vault_owner_matches_managed_inventory_address() {
+        let order_owner = address!("0x1111111111111111111111111111111111111111");
+        let inventory = address!("0x3333333333333333333333333333333333333333");
+
+        let ctx = Ctx::for_test()
+            .database_url(":memory:".to_owned())
+            .rpc_url(url::Url::parse("http://localhost:8545").unwrap())
+            .orderbook(address!("0x2222222222222222222222222222222222222222"))
+            .deployment_block(1)
+            .broker(BrokerCtx::DryRun)
+            .trading_mode(TradingMode::Standalone)
+            .order_owner(order_owner)
+            .assets(AssetsConfig::default())
+            .inventory_mode(InventoryMode::Managed { inventory })
+            .call()
+            .unwrap();
+
+        assert_eq!(ctx.evm.inventory, InventoryMode::Managed { inventory });
+        assert_eq!(ctx.evm.vault_owner, inventory);
     }
 
     /// Pins the first line of defense against database contention: every

@@ -328,7 +328,7 @@ where
     let maintenance_interval = context.executor.maintenance_interval();
 
     let accountant_ctx = Arc::new(AccountantCtx {
-        orderbook: context.ctx.evm.orderbook,
+        contracts: crate::onchain::raindex_contracts(&context.ctx.evm),
         ctx: context.ctx.clone(),
         cache: context.cache,
         pyth_feed_ids: PythFeedIds::new(context.ctx.pyth_feed_ids()),

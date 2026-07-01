@@ -31,6 +31,7 @@ use crate::offchain::order::{
 };
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::PythFeedIds;
+use crate::onchain::trade::BotOperator;
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 use crate::position::{Position, PositionCommand};
@@ -433,6 +434,9 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
     // inventory contract post-migration, the bot EOA before it.
     let order_owner = ctx.vault_owner();
+    // Filters the bot's own inventory rebalancing legs out of an
+    // InventoryTrade settlement recovery, same as the backfill path.
+    let bot_operator = BotOperator(ctx.order_owner());
     let read_evm = ReadOnlyEvm::new(provider.clone());
 
     match OnchainTrade::try_from_tx_hash(
@@ -440,8 +444,10 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         &read_evm,
         cache,
         evm_ctx,
+        &ctx.assets,
         &pyth_feed_ids,
         order_owner,
+        bot_operator,
     )
     .await
     {

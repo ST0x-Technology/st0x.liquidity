@@ -5,6 +5,7 @@ use sqlx::SqlitePool;
 pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
 
+pub(crate) use st0x_config::InventoryMode;
 use st0x_config::{AssetsConfig, BrokerCtx, Ctx};
 pub(crate) use st0x_event_sorcery::Projection;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
@@ -42,6 +43,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     /// `broker.base_url()`. Used by chaos tests to route broker calls
     /// through a fault-injecting proxy.
     broker_url_override: Option<url::Url>,
+    /// Rebalancing settlement mode; defaults to `Legacy` (see
+    /// `Ctx::for_test`). Tests exercising a shared `RaindexInventory` pass
+    /// `Managed { inventory }` explicitly.
+    inventory_mode_override: Option<InventoryMode>,
 ) -> anyhow::Result<Ctx> {
     let broker_url = broker_url_override.map_or_else(
         || broker.base_url(),
@@ -72,6 +77,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .order_owner(chain.owner)
         .assets(assets)
         .maybe_execution_threshold_override(execution_threshold_override)
+        .maybe_inventory_mode(inventory_mode_override)
         .call()
         .map_err(Into::into)
 }

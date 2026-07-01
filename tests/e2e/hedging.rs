@@ -10,6 +10,11 @@
 
 pub(crate) mod assertions;
 
+use alloy::network::EthereumWallet;
+use alloy::primitives::{B256, U256, utils::parse_units};
+use alloy::providers::ProviderBuilder;
+use alloy::providers::ext::AnvilApi as _;
+use alloy::signers::local::PrivateKeySigner;
 use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_float_macro::float;
@@ -17,6 +22,8 @@ use st0x_float_macro::float;
 use st0x_hedge::FailureInjector;
 
 use self::assertions::*;
+use crate::assert::{assert_broker_state, assert_cqrs_state};
+use crate::base_chain::{self, DeployableERC20, IERC20, USDC_BASE};
 use crate::poll::poll_for_all_jobs_done;
 
 #[test_log::test(tokio::test)]
@@ -1569,5 +1576,137 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         "No new OnChainTrade events should be persisted after terminal failure"
     );
 
+    Ok(())
+}
+
+/// An `InventoryTrade` fill (settlement through a shared `RaindexInventory`,
+/// as a real venue adapter like the Bebop hook or univ4 hook would submit)
+/// must hedge exactly like a direct ClearV3/TakeOrderV3 fill.
+///
+/// Deploys `RaindexInventory` on the same Anvil chain, grants `OPERATOR_ROLE`
+/// to a synthetic venue operator distinct from the bot/order owner, funds it
+/// with equity shares, and has it perform a genuine `deposit4` (equity in) +
+/// `withdraw4` (USDC out) settlement batched into one tx via the contract's
+/// inherited `Multicall` -- mirroring how a real adapter settles atomically.
+/// The bot runs in `inventory_mode = "managed"` pointed at this contract, so
+/// the live `OrderFillMonitor` must pick up the `OperatorDeposit`/
+/// `OperatorWithdraw` pair through the real backfill -> pairing -> accountant
+/// -> hedge pipeline (no test-only shortcuts) and place the expected hedge.
+#[test_log::test(tokio::test)]
+async fn e2e_inventory_trade_settlement_hedges() -> anyhow::Result<()> {
+    let equity_symbol = "AAPL";
+    let onchain_price = float!(150.00);
+    let broker_fill_price = float!(148.50);
+    let equity_amount = float!(4);
+
+    // BuyEquity hedges Sell, which the extended-hours guard treats as a
+    // short unless the broker already reports enough shares -- pre-seed a
+    // broker position, mirroring `multi_asset_sustained_load`'s TSLA leg.
+    let infra = TestInfra::start(
+        vec![(equity_symbol, broker_fill_price)],
+        vec![(equity_symbol, float!(100))],
+    )
+    .await?;
+
+    let (_, equity_vault_token, _) = infra
+        .equity_addresses
+        .iter()
+        .find(|(symbol, ..)| symbol == equity_symbol)
+        .expect("AAPL equity vault must be deployed by TestInfra::start")
+        .clone();
+
+    // Deploy the shared inventory pointed at this chain's OrderBook, with
+    // the same account TestInfra uses as order owner/admin.
+    let inventory = infra.base_chain.deploy_inventory().await?;
+
+    // A synthetic venue operator: a fresh, funded account distinct from the
+    // bot's own order owner, holding OPERATOR_ROLE only.
+    let operator_signer = PrivateKeySigner::random();
+    let operator = operator_signer.address();
+    let operator_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(operator_signer))
+        .connect(&infra.base_chain.endpoint())
+        .await?;
+    let ten_eth: U256 = parse_units("10", 18)?.into();
+    infra
+        .base_chain
+        .provider
+        .anvil_set_balance(operator, ten_eth)
+        .await?;
+
+    infra
+        .base_chain
+        .grant_inventory_operator(inventory, operator)
+        .await?;
+
+    // Seed the inventory's USDC vault (admin-funded) so the operator's
+    // withdraw4(USDC) below has a real balance to draw from.
+    let usdc_vault_id = B256::random();
+    let usdc_amount: U256 = parse_units("600", 6)?.into();
+    infra
+        .base_chain
+        .seed_inventory_vault(inventory, USDC_BASE, usdc_vault_id, usdc_amount, 6)
+        .await?;
+
+    // Fund the operator with equity shares to deposit, and have it approve
+    // the inventory to pull them.
+    let equity_vault_id = B256::random();
+    let equity_amount_raw: U256 = parse_units("4", 18)?.into();
+    DeployableERC20::new(equity_vault_token, &infra.base_chain.provider)
+        .transfer(operator, equity_amount_raw)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    IERC20::new(equity_vault_token, &operator_provider)
+        .approve(inventory, equity_amount_raw * U256::from(2))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    // Everything above is setup noise the bot must not backfill; only scan
+    // from here on.
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .inventory_mode_override(InventoryMode::Managed { inventory })
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The real settlement: the pool received equity (deposit) and sent USDC
+    // out (withdraw), i.e. it bought equity onchain, so the bot must hedge
+    // Sell -- both legs batched into one tx via Multicall.
+    base_chain::inventory_operator_settle(
+        &operator_provider,
+        inventory,
+        (equity_vault_token, equity_vault_id, equity_amount_raw, 18),
+        (USDC_BASE, usdc_vault_id, usdc_amount, 6),
+    )
+    .await?;
+
+    poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    let expected_positions = [ExpectedPosition::builder()
+        .symbol(equity_symbol)
+        .amount(equity_amount)
+        .direction(TakeDirection::BuyEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(equity_amount)
+        .expected_accumulated_short(float!(0))
+        .expected_net(float!(0))
+        .build()];
+
+    assert_broker_state(&expected_positions, &infra.broker_service);
+    assert_cqrs_state(&expected_positions, 1, &infra.db_path.display().to_string()).await?;
+
+    bot.abort();
     Ok(())
 }
