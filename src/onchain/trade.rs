@@ -19,19 +19,41 @@ use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 
 use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
-use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
+use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
+use crate::bindings::IRaindexV6::{ClearV3, IOV2, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain_trade::PythPrice;
 use crate::symbol::cache::SymbolCache;
 
-/// Onchain trade event emitted by the Raindex orderbook, wrapping either
-/// a `ClearV3` or `TakeOrderV3` payload for downstream processing.
+/// Onchain trade event feeding the hedge pipeline.
+///
+/// * `ClearV3` / `TakeOrderV3` — direct Raindex clears against the orderbook.
+///   Emitted when a solver clears a Raindex order the bot owns; unchanged path.
+/// * `InventoryTrade` — settlement through the shared `RaindexInventory` on
+///   behalf of a venue adapter (Bebop hook, univ4 hook, or any future venue
+///   holding `OPERATOR_ROLE`). Emitted as a pair of `OperatorWithdraw` +
+///   `OperatorDeposit` events on the same tx: the vault deltas ARE the trade,
+///   agnostic to which adapter routed it. The `operator` topic identifies the
+///   venue for attribution but is not used as a hedge signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaindexTradeEvent {
     ClearV3(Box<ClearV3>),
     TakeOrderV3(Box<TakeOrderV3>),
+    InventoryTrade(Box<InventoryTrade>),
+}
+
+/// One venue-driven settlement against the shared inventory: the vault
+/// balances went down by `withdraw.amount` for `withdraw.token` and up by
+/// `deposit.amount` for `deposit.token`, both within the same tx. Direction
+/// is determined by which side is the equity token (non-USDC): a withdraw of
+/// the equity vault means the pool sent equity out (bot is now short) and a
+/// deposit means the pool received equity (bot is now long).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryTrade {
+    pub deposit: OperatorDeposit,
+    pub withdraw: OperatorWithdraw,
 }
 
 impl RaindexTradeEvent {
@@ -39,6 +61,7 @@ impl RaindexTradeEvent {
         match self {
             Self::ClearV3(_) => "ClearV3",
             Self::TakeOrderV3(_) => "TakeOrderV3",
+            Self::InventoryTrade(_) => "InventoryTrade",
         }
     }
 }
@@ -215,6 +238,13 @@ async fn enrich_with_pyth_price<P: Provider>(
     }
 }
 
+async fn fetch_token_decimals<E: Evm>(evm: &E, token: Address) -> Result<u8, OnChainError> {
+    use st0x_evm::{IERC20, OpenChainErrorRegistry};
+    Ok(evm
+        .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+        .await?)
+}
+
 impl OnchainTrade {
     /// Core parsing logic for converting blockchain events to trades
     pub(crate) async fn try_from_order_and_fill_details<EvmImpl: Evm>(
@@ -311,6 +341,106 @@ impl OnchainTrade {
         };
 
         Ok(Some(trade))
+    }
+
+    /// Converts a paired [`InventoryTrade`] (an `OperatorDeposit` +
+    /// `OperatorWithdraw` for the same tx on the shared inventory) into an
+    /// [`OnchainTrade`] the hedge pipeline can consume.
+    ///
+    /// The pool received `deposit.amount` of `deposit.token` and sent
+    /// `withdraw.amount` of `withdraw.token` out. One side must be USDC and
+    /// the other a tokenized-equity ERC20; anything else fails validation the
+    /// same way a mis-shaped Raindex clear would.
+    pub(crate) async fn try_from_inventory_trade<EvmImpl: Evm>(
+        cache: &SymbolCache,
+        evm: &EvmImpl,
+        trade: &InventoryTrade,
+        log: Log,
+        pyth_feed_ids: &PythFeedIds,
+    ) -> Result<Option<Self>, OnChainError> {
+        let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
+        let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
+
+        let receipt = evm.provider().get_transaction_receipt(tx_hash).await?;
+        let (gas_used, effective_gas_price, receipt_block_number) = match receipt {
+            Some(receipt) => (
+                Some(receipt.gas_used),
+                Some(receipt.effective_gas_price),
+                receipt.block_number,
+            ),
+            None => (None, None, None),
+        };
+
+        // Deposit is IN (pool received), Withdraw is OUT (pool sent) --
+        // mirroring the input/output convention `TradeDetails::try_from_io`
+        // expects for the ClearV3/TakeOrderV3 path.
+        let input_io = IOV2 {
+            token: trade.deposit.token,
+            vaultId: trade.deposit.vaultId,
+        };
+        let output_io = IOV2 {
+            token: trade.withdraw.token,
+            vaultId: trade.withdraw.vaultId,
+        };
+
+        let input_symbol = cache.get_io_symbol(evm, &input_io).await?;
+        let output_symbol = cache.get_io_symbol(evm, &output_io).await?;
+
+        let input_decimals = fetch_token_decimals(evm, trade.deposit.token).await?;
+        let output_decimals = fetch_token_decimals(evm, trade.withdraw.token).await?;
+
+        let input_amount = Float::from_fixed_decimal(trade.deposit.amount, input_decimals)?;
+        let output_amount = Float::from_fixed_decimal(trade.withdraw.amount, output_decimals)?;
+
+        let trade_details =
+            TradeDetails::try_from_io(&input_symbol, input_amount, &output_symbol, output_amount)?;
+
+        if trade_details.equity_amount().is_zero()? {
+            return Ok(None);
+        }
+
+        let price_per_share_usdc =
+            (trade_details.usdc_amount().value() / trade_details.equity_amount().inner())?;
+
+        if price_per_share_usdc.lt(Float::zero()?)? || price_per_share_usdc.is_zero()? {
+            return Ok(None);
+        }
+
+        let (equity_symbol_str, equity_token) = if input_symbol == "USDC" {
+            (output_symbol, trade.withdraw.token)
+        } else {
+            (input_symbol, trade.deposit.token)
+        };
+        let equity_symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse(&equity_symbol_str)?;
+
+        let pyth_price = enrich_with_pyth_price(
+            evm.provider(),
+            pyth_feed_ids,
+            equity_symbol.base(),
+            log.block_number.or(receipt_block_number),
+            tx_hash,
+        )
+        .await;
+
+        let price = Usdc::new(price_per_share_usdc)?;
+
+        Ok(Some(Self {
+            tx_hash,
+            log_index,
+            symbol: equity_symbol,
+            equity_token,
+            amount: trade_details.equity_amount(),
+            direction: trade_details.direction(),
+            price,
+            block_number: log.block_number.or(receipt_block_number),
+            block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
+                let secs: i64 = timestamp_secs.try_into().ok()?;
+                DateTime::from_timestamp(secs, 0)
+            }),
+            gas_used,
+            effective_gas_price,
+            pyth_price,
+        }))
     }
 
     /// Attempts to create an OnchainTrade from a transaction hash by looking up

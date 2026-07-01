@@ -5,6 +5,7 @@
 //! after downtime. A persisted checkpoint records the last block that was
 //! fully enqueued.
 
+use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
@@ -21,9 +22,10 @@ use st0x_evm::Evm;
 use st0x_execution::Executor;
 
 use super::OnChainError;
+use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{Job, Label};
-use crate::onchain::trade::RaindexTradeEvent;
+use crate::onchain::trade::{InventoryTrade, RaindexTradeEvent};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
@@ -293,10 +295,25 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .to_block(batch_end)
         .event_signature(TakeOrderV3::SIGNATURE_HASH);
 
+    // Inventory events: OperatorDeposit + OperatorWithdraw are emitted as a
+    // pair per settlement tx that routes through the shared inventory (Bebop
+    // adapter, univ4 hook, or any future venue). The pair -- one deposit +
+    // one withdraw, one side equity + one side USDC -- is the trade to hedge.
+    let inventory_filter = Filter::new()
+        .address(evm_ctx.inventory)
+        .from_block(batch_start)
+        .to_block(batch_end)
+        .event_signature(vec![
+            OperatorDeposit::SIGNATURE_HASH,
+            OperatorWithdraw::SIGNATURE_HASH,
+        ]);
+
     let provider_clear = provider.clone();
     let provider_take = provider.clone();
+    let provider_inv = provider.clone();
     let clear_filter_clone = clear_filter.clone();
     let take_filter_clone = take_filter.clone();
+    let inv_filter_clone = inventory_filter.clone();
 
     let get_clear_logs = move || {
         let provider = provider_clear.clone();
@@ -308,17 +325,27 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         let filter = take_filter_clone.clone();
         async move { fetch_logs_with_tip_check(&provider, &filter, batch_end).await }
     };
+    let get_inv_logs = move || {
+        let provider = provider_inv.clone();
+        let filter = inv_filter_clone.clone();
+        async move { fetch_logs_with_tip_check(&provider, &filter, batch_end).await }
+    };
 
-    let (clear_logs, take_logs) = future::try_join(
+    let (clear_logs, take_logs, inv_logs) = future::try_join3(
         get_clear_logs
             .retry(retry_strategy.clone().build())
             .notify(|err, dur| {
                 trace!(target: "orderbook", "Retrying clear_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
             }),
         get_take_logs
-            .retry(retry_strategy.build())
+            .retry(retry_strategy.clone().build())
             .notify(|err, dur| {
                 trace!(target: "orderbook", "Retrying take_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
+            }),
+        get_inv_logs
+            .retry(retry_strategy.build())
+            .notify(|err, dur| {
+                trace!(target: "inventory", "Retrying inv_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
             }),
     )
     .await?;
@@ -327,12 +354,35 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         target: "orderbook",
         total_clear_logs = %clear_logs.len(),
         total_take_logs = %take_logs.len(),
+        total_inventory_logs = %inv_logs.len(),
         "Processed a batch of blocks from {batch_start} to {batch_end}",
     );
+
+    // Bucket inventory logs by tx so each OperatorWithdraw can find its
+    // paired OperatorDeposit within the same settlement without an extra
+    // RPC round-trip.
+    let mut deposits_by_tx: std::collections::HashMap<TxHash, OperatorDeposit> =
+        std::collections::HashMap::new();
+    let mut withdraw_logs: Vec<alloy::rpc::types::Log> = Vec::new();
+    for log in inv_logs {
+        let Some(topic0) = log.topic0().copied() else {
+            continue;
+        };
+        if topic0 == OperatorDeposit::SIGNATURE_HASH {
+            if let (Ok(decoded), Some(tx_hash)) =
+                (log.log_decode::<OperatorDeposit>(), log.transaction_hash)
+            {
+                deposits_by_tx.insert(tx_hash, decoded.data().clone());
+            }
+        } else if topic0 == OperatorWithdraw::SIGNATURE_HASH {
+            withdraw_logs.push(log);
+        }
+    }
 
     let trade_events = clear_logs
         .into_iter()
         .chain(take_logs)
+        .chain(withdraw_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
         .filter(|log| {
             // Callers cap `to_block` at the ingestion cutoff block.
@@ -357,12 +407,29 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
             true
         })
         .filter_map(|log| {
+            let topic0 = log.topic0().copied();
             if let Ok(clear_event) = log.log_decode::<ClearV3>() {
                 let event = RaindexTradeEvent::ClearV3(Box::new(clear_event.data().clone()));
                 Some((event, log))
             } else if let Ok(take_event) = log.log_decode::<TakeOrderV3>() {
                 let event = RaindexTradeEvent::TakeOrderV3(Box::new(take_event.data().clone()));
                 Some((event, log))
+            } else if topic0 == Some(OperatorWithdraw::SIGNATURE_HASH) {
+                let withdraw_event = log.log_decode::<OperatorWithdraw>().ok()?;
+                let tx_hash = log.transaction_hash?;
+                let deposit = deposits_by_tx.get(&tx_hash).cloned().or_else(|| {
+                    warn!(
+                        target: "inventory",
+                        ?tx_hash,
+                        "OperatorWithdraw without a paired OperatorDeposit in the same batch; skipping",
+                    );
+                    None
+                })?;
+                let inv = InventoryTrade {
+                    deposit,
+                    withdraw: withdraw_event.data().clone(),
+                };
+                Some((RaindexTradeEvent::InventoryTrade(Box::new(inv)), log))
             } else {
                 None
             }
@@ -552,7 +619,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -831,7 +899,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         backfill_events(
@@ -902,7 +971,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         backfill_events(
@@ -1004,6 +1074,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1083,7 +1155,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         backfill_events(
@@ -1198,6 +1271,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!(reversed));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         backfill_events(
@@ -1290,6 +1365,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log2, take_log1]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1328,11 +1405,15 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         // Batch 2: blocks 2000-2500
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
         push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1372,11 +1453,15 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         // Batch 2: blocks 1500-1900
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
         push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1424,6 +1509,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1462,6 +1549,8 @@ mod tests {
             asserter.push_success(&serde_json::json!([]));
             push_tip_response(&asserter);
             asserter.push_success(&serde_json::json!([]));
+            push_tip_response(&asserter);
+            asserter.push_success(&serde_json::json!([])); // inventory events
             push_tip_response(&asserter);
         }
 
@@ -1524,6 +1613,8 @@ mod tests {
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([valid_log, invalid_log]));
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
         push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1608,6 +1699,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1647,7 +1740,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result = enqueue_batch_events(
@@ -1728,6 +1822,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take logs
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         // Second batch fails completely (after retries)
         // Need double the failures since clear_logs and take_logs retry in parallel
@@ -1796,6 +1892,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1847,6 +1945,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([removed_log]));
         push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1886,6 +1986,8 @@ mod tests {
         asserter.push_success(&serde_json::json!([]));
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // inventory events
         push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1936,7 +2038,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         // Close the apalis pool to simulate job-queue connection failure.
@@ -2027,7 +2130,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result = enqueue_batch_events(
@@ -2088,7 +2192,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log1, take_log2])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result = enqueue_batch_events(
@@ -2144,6 +2249,8 @@ mod tests {
                 asserter.push_success(&serde_json::json!([])); // take events
             }
             push_tip_response(&asserter);
+            asserter.push_success(&serde_json::json!([])); // inventory events
+            push_tip_response(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2185,7 +2292,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events (retry)
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let start_time = std::time::Instant::now();
@@ -2302,7 +2410,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let result = enqueue_batch_events(
@@ -2340,7 +2449,8 @@ mod tests {
         push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events for 50-100
         push_tip_response(&asserter);
-
+        asserter.push_success(&serde_json::json!([])); // inventory events
+        push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         backfill_events(

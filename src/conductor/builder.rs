@@ -318,6 +318,7 @@ where
 
     let accountant_ctx = Arc::new(AccountantCtx {
         orderbook: context.ctx.evm.orderbook,
+        inventory: context.ctx.evm.inventory,
         ctx: context.ctx.clone(),
         cache: context.cache,
         pyth_feed_ids: PythFeedIds::new(context.ctx.pyth_feed_ids()),

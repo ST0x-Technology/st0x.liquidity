@@ -50,6 +50,10 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) cache: SymbolCache,
     pub(crate) pyth_feed_ids: PythFeedIds,
     pub(crate) orderbook: Address,
+    /// Shared `RaindexInventory` -- source contract for `InventoryTrade`
+    /// events (`OperatorDeposit`/`OperatorWithdraw`). Used to reconstruct
+    /// the emitting log's address for downstream processing.
+    pub(crate) inventory: Address,
     pub(crate) evm: ReadOnlyEvm<Node>,
     pub(crate) cqrs: TradeProcessingCqrs,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
@@ -85,14 +89,14 @@ where
 
     #[allow(clippy::cognitive_complexity)]
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
-        use RaindexTradeEvent::{ClearV3, TakeOrderV3};
+        use RaindexTradeEvent::{ClearV3, InventoryTrade, TakeOrderV3};
 
         let trade_event = &self.trade;
         // The Raindex order/vault owner — the inventory contract post-migration,
         // the bot EOA before it. Used to match ClearV3/TakeOrderV3 fills to our
         // orders and to scope vault discovery.
         let order_owner = ctx.ctx.vault_owner();
-        let reconstructed_log = reconstruct_log(ctx.orderbook, trade_event);
+        let reconstructed_log = reconstruct_log(ctx.orderbook, ctx.inventory, trade_event);
 
         let trade_result = match &trade_event.event {
             ClearV3(clear_event) => {
@@ -115,6 +119,17 @@ where
                     *take_event.clone(),
                     reconstructed_log,
                     order_owner,
+                    &ctx.pyth_feed_ids,
+                )
+                .await
+            }
+
+            InventoryTrade(inv) => {
+                OnchainTrade::try_from_inventory_trade(
+                    &ctx.cache,
+                    &ctx.evm,
+                    inv.as_ref(),
+                    reconstructed_log,
                     &ctx.pyth_feed_ids,
                 )
                 .await
@@ -189,12 +204,21 @@ where
     }
 }
 
-fn reconstruct_log(orderbook: Address, trade: &EmittedOnChain<RaindexTradeEvent>) -> Log {
-    use RaindexTradeEvent::{ClearV3, TakeOrderV3};
+fn reconstruct_log(
+    orderbook: Address,
+    inventory: Address,
+    trade: &EmittedOnChain<RaindexTradeEvent>,
+) -> Log {
+    use RaindexTradeEvent::{ClearV3, InventoryTrade, TakeOrderV3};
 
-    let log_data = match &trade.event {
-        ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
-        TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
+    // Pick the emitting contract for each event type. InventoryTrade events
+    // are emitted by the inventory contract; the paired-event log data
+    // encodes the OperatorWithdraw (the equity-side change the hedge cares
+    // about), which is enough for the downstream parser.
+    let (address, log_data) = match &trade.event {
+        ClearV3(clear_event) => (orderbook, clear_event.as_ref().clone().into_log_data()),
+        TakeOrderV3(take_event) => (orderbook, take_event.as_ref().clone().into_log_data()),
+        InventoryTrade(inv) => (inventory, inv.withdraw.clone().into_log_data()),
     };
 
     let block_timestamp = trade
@@ -203,7 +227,7 @@ fn reconstruct_log(orderbook: Address, trade: &EmittedOnChain<RaindexTradeEvent>
 
     Log {
         inner: alloy::primitives::Log {
-            address: orderbook,
+            address,
             data: log_data,
         },
         block_hash: None,
@@ -353,6 +377,7 @@ mod tests {
 
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,
+            inventory: ctx.evm.inventory,
             ctx,
             cache: SymbolCache::default(),
             pyth_feed_ids: PythFeedIds::default(),
@@ -481,6 +506,7 @@ mod tests {
 
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,
+            inventory: ctx.evm.inventory,
             ctx,
             cache: SymbolCache::default(),
             pyth_feed_ids: PythFeedIds::default(),

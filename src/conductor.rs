@@ -2061,6 +2061,11 @@ pub(crate) async fn discover_vaults_for_trade(
             take_event.config.inputIOIndex,
             take_event.config.outputIOIndex,
         ),
+        // InventoryTrade events settle on vaults owned by the inventory
+        // contract; those vaults reach the registry via the Raindex ClearV3
+        // / TakeOrderV3 that first funded them, so nothing new to auto-
+        // discover here.
+        RaindexTradeEvent::InventoryTrade(_) => Vec::new(),
     };
 
     let our_vaults = owned_vaults
