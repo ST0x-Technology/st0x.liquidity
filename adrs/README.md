@@ -120,7 +120,8 @@ decision.
 | [0004](0004-typed-identifiers.md)                                       | Model identifiers by what determines them; derive the string form                    | Accepted |
 | [0005](0005-max-token-approvals-on-startup.md)                          | Grant one-time MAX token approvals to trusted spenders on startup                    | Accepted |
 | [0006](0006-base-to-alpaca-explicit-alpaca-deposit-send.md)             | BaseToAlpaca deposit sends USDC to Alpaca explicitly, idempotently                   | Accepted |
-| [0008](0008-counter-trading-during-dividend-freeze.md)                  | Counter-trading (broker hedging) during a dividend freeze                            | Proposed |
+| [0008](0008-counter-trading-during-dividend-freeze.md)                  | Counter-trading (broker hedging) during a dividend freeze                            | Accepted |
 | [0009](0009-record-overfill-as-acceptance.md)                           | Record a broker over-fill as an acceptance, not a failure                            | Accepted |
 | [0010](0010-bounded-pending-ack-set-for-cross-process-exactly-once.md)  | Bounded pending-acknowledgement set for cross-process exactly-once                   | Accepted |
+| [0011](0011-decouple-ingestion-latency-from-reorg-safety.md)            | Decouple fill-ingestion latency from reorg safety via first-class reorg handling     | Proposed |
 | [0014](0014-runtime-stuck-pending-recovery-and-serialized-placement.md) | Recover stuck Pending placements at runtime, and serialize broker-placement attempts | Accepted |
