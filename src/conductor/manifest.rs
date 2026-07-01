@@ -150,6 +150,7 @@ mod tests {
     use st0x_execution::{Direction, FractionalShares, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -164,7 +165,6 @@ mod tests {
         RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
     };
     use crate::test_utils::{rebalancing_enabled_equities, setup_test_pools};
-    use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
     use st0x_config::{AssetsConfig, ExecutionThreshold};

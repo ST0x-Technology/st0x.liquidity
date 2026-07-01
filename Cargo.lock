@@ -6727,6 +6727,7 @@ dependencies = [
  "st0x-issuance-dto",
  "st0x-raindex",
  "st0x-registry",
+ "st0x-tokenization",
  "st0x-wrapper",
  "task-supervisor",
  "temp-env",
@@ -6799,6 +6800,31 @@ dependencies = [
  "st0x-evm",
  "st0x-execution",
  "tokio",
+]
+
+[[package]]
+name = "st0x-tokenization"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "httpmock",
+ "rain-math-float",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "st0x-evm",
+ "st0x-execution",
+ "st0x-float-macro",
+ "st0x-float-serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "uuid",
 ]
 
 [[package]]

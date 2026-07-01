@@ -20,10 +20,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use st0x_tokenization::IssuerRequestId;
+
 use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::tokenization::IssuerRequestId;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
 pub(crate) type ResumeTokenizationJobQueue = JobQueue<ResumeTokenizationAggregate>;
@@ -98,6 +99,8 @@ mod tests {
     use st0x_event_sorcery::test_store;
     use st0x_float_macro::float;
     use st0x_raindex::{Raindex, RaindexVaultId};
+    use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
+    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
@@ -106,8 +109,6 @@ mod tests {
     };
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
-    use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
-    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
 
@@ -334,7 +335,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Detect {
-                    tokenization_request_id: TokenizationRequestId("test-req-id".to_string()),
+                    tokenization_request_id: tokenization_request_id("test-req-id"),
                 },
             )
             .await

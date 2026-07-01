@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_tokenization::IssuerRequestId;
 
 use super::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCommand, UnwrappedEquityRecoveryError,
@@ -51,7 +52,6 @@ use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
 use crate::rebalancing::trigger::{GuardState, claim_guard_for_recovery_or_orphan};
-use crate::tokenization::IssuerRequestId;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 
 /// Apalis queue type for [`UnwrappedEquityRecoveryJob`].
@@ -701,6 +701,9 @@ mod tests {
 
     use st0x_event_sorcery::test_store;
     use st0x_raindex::{Raindex, RaindexVaultId};
+    use st0x_tokenization::Tokenizer;
+    use st0x_tokenization::issuer_request_id;
+    use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use crate::equity_redemption::{
@@ -709,9 +712,6 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::rebalancing::trigger::InProgressGuard;
-    use crate::tokenization::Tokenizer;
-    use crate::tokenization::issuer_request_id;
-    use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
 

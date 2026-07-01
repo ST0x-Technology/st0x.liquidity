@@ -354,12 +354,12 @@ mod tests {
     use st0x_execution::{ClientOrderId, FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
     use st0x_float_macro::float;
+    use st0x_tokenization::{IssuerRequestId, issuer_request_id};
 
     use super::*;
     use crate::equity_redemption::{
         EquityRedemptionEvent, RedemptionAggregateId, redemption_aggregate_id,
     };
-    use crate::tokenization::{IssuerRequestId, issuer_request_id};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 

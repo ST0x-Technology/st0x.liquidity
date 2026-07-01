@@ -1060,8 +1060,8 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
 ) -> anyhow::Result<()> {
     use chrono::Utc;
     use st0x_event_sorcery::DomainEvent;
+    use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
 
-    use crate::tokenization::{IssuerRequestId, TokenizationRequestId};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 
     let symbol = Symbol::new(symbol_str.to_string())?;
@@ -1077,9 +1077,7 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
         },
         TokenizedEquityMintEvent::MintAccepted {
             issuer_request_id: mint_id.clone(),
-            tokenization_request_id: TokenizationRequestId(
-                "seeded-tokenization-request-id".to_string(),
-            ),
+            tokenization_request_id: tokenization_request_id("seeded-tokenization-request-id"),
             accepted_at: now,
         },
         TokenizedEquityMintEvent::TokensReceived {

@@ -47,11 +47,11 @@ use uuid::Uuid;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_raindex::Raindex;
+use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{WrapConfirmation, Wrapper, WrapperError, node_sync_attempts};
 
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
-use crate::tokenization::IssuerRequestId;
 use crate::tokenized_equity_mint::TOKENIZED_EQUITY_DECIMALS;
 use crate::vault_lookup::VaultLookup;
 
@@ -850,13 +850,13 @@ mod tests {
     use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_raindex::RaindexVaultId;
+    use st0x_tokenization::issuer_request_id;
+    use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::MockWrapper;
 
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::{ConfirmTxBehavior, DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
-    use crate::tokenization::issuer_request_id;
-    use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
     use super::*;
