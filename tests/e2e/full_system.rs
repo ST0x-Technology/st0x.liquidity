@@ -49,6 +49,7 @@ use st0x_hedge::mock_api::{
 use st0x_hedge::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
     OperationMode, Position, RebalancingCtx, TradingMode, UsdcRebalancing,
+    seed_simulated_hedge_latency_history,
 };
 
 use crate::assert::ExpectedPosition;
@@ -165,6 +166,79 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .redemption_wallet(REDEMPTION_WALLET)
         .call()
         .map_err(Into::into)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SimulationPorts {
+    server_port: u16,
+    board_port: u16,
+}
+
+fn simulation_ports(command: &str) -> anyhow::Result<SimulationPorts> {
+    let raw_server_port = std::env::var("SIMULATE_BOT_PORT").map_err(|error| {
+        anyhow::anyhow!("SIMULATE_BOT_PORT must be set (run via `nix run .#{command}`): {error}")
+    })?;
+
+    let raw_board_port = match std::env::var("SIMULATE_BOARD_PORT") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "SIMULATE_BOARD_PORT could not be read for `nix run .#{command}`: {error}"
+            ));
+        }
+    };
+
+    simulation_ports_from_raw(&raw_server_port, raw_board_port.as_deref())
+}
+
+fn simulation_ports_from_raw(
+    raw_server_port: &str,
+    raw_board_port: Option<&str>,
+) -> anyhow::Result<SimulationPorts> {
+    let server_port = parse_simulation_port("SIMULATE_BOT_PORT", raw_server_port)?;
+    let board_port = match raw_board_port {
+        Some(raw) => parse_simulation_port("SIMULATE_BOARD_PORT", raw)?,
+        None => server_port.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("SIMULATE_BOARD_PORT must be set when SIMULATE_BOT_PORT is 65535")
+        })?,
+    };
+
+    Ok(SimulationPorts {
+        server_port,
+        board_port,
+    })
+}
+
+fn parse_simulation_port(env_name: &str, raw: &str) -> anyhow::Result<u16> {
+    raw.parse()
+        .map_err(|error| anyhow::anyhow!("{env_name} must be a valid u16 port number: {error}"))
+}
+
+#[test]
+fn simulation_ports_default_board_port_follows_server_port() {
+    let ports = simulation_ports_from_raw("8101", None).unwrap();
+
+    assert_eq!(
+        ports,
+        SimulationPorts {
+            server_port: 8101,
+            board_port: 8102,
+        }
+    );
+}
+
+#[test]
+fn simulation_ports_accept_independent_board_port() {
+    let ports = simulation_ports_from_raw("8101", Some("8201")).unwrap();
+
+    assert_eq!(
+        ports,
+        SimulationPorts {
+            server_port: 8101,
+            board_port: 8201,
+        }
+    );
 }
 
 struct AcceptedMintIds {
@@ -797,10 +871,9 @@ async fn full_system() -> anyhow::Result<()> {
 #[ignore = "infinite simulation -- run via nix run .#simulate"]
 #[allow(clippy::too_many_lines)]
 async fn simulate() -> anyhow::Result<()> {
-    let server_port: u16 = std::env::var("SIMULATE_BOT_PORT")
-        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate`)")
-        .parse()
-        .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
+    let ports = simulation_ports("simulate")?;
+    let server_port = ports.server_port;
+    let board_port = ports.board_port;
 
     let log_dir = std::path::PathBuf::from(format!("/tmp/st0x-simulate-logs-{server_port}"));
     std::fs::create_dir_all(&log_dir)?;
@@ -910,7 +983,7 @@ async fn simulate() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
-        .board_port(server_port + 1)
+        .board_port(board_port)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 
@@ -918,6 +991,16 @@ async fn simulate() -> anyhow::Result<()> {
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
 
     poll_for_ready(&mut bot, server_port).await;
+    if let Ok(raw_days) = std::env::var("SIMULATE_LATENCY_FIXTURE_DAYS") {
+        let days: u32 = raw_days.parse()?;
+        let pool = connect_db(&infra.db_path).await?;
+        seed_simulated_hedge_latency_history(&pool, chrono::Utc::now(), days).await?;
+        pool.close().await;
+        info!(
+            days,
+            "Seeded simulated hedge-latency history for dashboard inspection"
+        );
+    }
     info!("Bot ready. Starting continuous trade simulation.");
 
     let orders = [
@@ -990,10 +1073,9 @@ async fn simulate() -> anyhow::Result<()> {
 #[ignore = "failure simulation -- run via nix run .#simulate-failures"]
 #[allow(clippy::too_many_lines)]
 async fn simulate_failures() -> anyhow::Result<()> {
-    let server_port: u16 = std::env::var("SIMULATE_BOT_PORT")
-        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate-failures`)")
-        .parse()
-        .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
+    let ports = simulation_ports("simulate-failures")?;
+    let server_port = ports.server_port;
+    let board_port = ports.board_port;
 
     let log_dir =
         std::path::PathBuf::from(format!("/tmp/st0x-simulate-failures-logs-{server_port}"));
@@ -1109,7 +1191,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
-        .board_port(server_port + 1)
+        .board_port(board_port)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
     let cli_ctx = ctx.clone();
@@ -1118,7 +1200,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         &infra,
         &cctp,
         server_port,
-        server_port + 1,
+        board_port,
         current_block,
         usdc_vault_id,
         &equity_vault_ids,

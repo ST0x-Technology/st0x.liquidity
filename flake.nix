@@ -236,11 +236,18 @@
             ];
 
             # Mock infra + bot + dashboard + e2e driver. Picks the lowest port
-            # offset whose bot/vite/mock-api ports are all free so multiple
-            # instances can run side-by-side without collisions. The dashboard
-            # auto-opens in the browser on start. Press `q` to exit.
+            # offset whose bot/board/vite/mock-api ports are all free so
+            # multiple instances can run side-by-side without collisions. The
+            # dashboard auto-opens in the browser on start. Press `q` to exit.
             mkSimulation =
-              { name, testFilter }:
+              {
+                name,
+                testFilter,
+                backendEnv ? "",
+              }:
+              let
+                backendEnvPrefix = if backendEnv == "" then "" else "${backendEnv} ";
+              in
               pkgs.writeShellApplication {
                 inherit name;
                 runtimeInputs = simulationRuntimeInputs;
@@ -259,9 +266,11 @@
                   max_offset=9
                   while (( offset <= max_offset )); do
                     bot_port=$((8001 + offset))
+                    board_port=$((8002 + offset))
                     vite_port=$((5173 + offset))
                     mock_api_port=$((8099 + offset))
                     if port_free "$bot_port" \
+                      && port_free "$board_port" \
                       && port_free "$vite_port" \
                       && port_free "$mock_api_port"; then
                       break
@@ -275,9 +284,10 @@
                   fi
 
                   echo "${name}: offset=$offset (bot=$bot_port \
-                    vite=$vite_port mock_api=$mock_api_port)"
+                    board=$board_port vite=$vite_port mock_api=$mock_api_port)"
 
-                  backend="SIMULATE_BOT_PORT=$bot_port \
+                  backend="${backendEnvPrefix}SIMULATE_BOT_PORT=$bot_port \
+                    SIMULATE_BOARD_PORT=$board_port \
                     cargo nextest run --test e2e \
                     -E 'test(=full_system::${testFilter})' \
                     --run-ignored ignored-only --no-capture"
@@ -343,6 +353,15 @@
               simulate = mkSimulation {
                 name = "simulate";
                 testFilter = "simulate";
+              };
+
+              # Same live dashboard stack as `simulate`, but preloads the
+              # hedge-latency read model with 14 days of completed cycles so
+              # Performance tab trends can be inspected immediately.
+              "simulate-14d" = mkSimulation {
+                name = "simulate-14d";
+                testFilter = "simulate";
+                backendEnv = "SIMULATE_LATENCY_FIXTURE_DAYS=14";
               };
 
               # Same live dashboard stack as `simulate`, but first creates

@@ -11,7 +11,7 @@ import {
   layoutDependencySparkline,
   layoutPercentileSeries,
   layoutRebalanceBars,
-  layoutWaterfall,
+  layoutWaterfall
 } from './charts'
 
 const cycle = (overrides: Partial<HedgeCycleReport>): HedgeCycleReport => ({
@@ -27,7 +27,7 @@ const cycle = (overrides: Partial<HedgeCycleReport>): HedgeCycleReport => ({
   submissionMs: 2_000,
   executionMs: 8_000,
   exposureWindowMs: 20_000,
-  ...overrides,
+  ...overrides
 })
 
 describe('layoutWaterfall', () => {
@@ -36,7 +36,7 @@ describe('layoutWaterfall', () => {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 10,
-      now: new Date('2026-06-02T00:00:00Z'),
+      now: new Date('2026-06-02T00:00:00Z')
     })
 
     expect(rows).toHaveLength(1)
@@ -44,11 +44,9 @@ describe('layoutWaterfall', () => {
     expect(rows[0]?.segments.map((segment) => segment.name)).toEqual([
       'unhedged',
       'submission',
-      'execution',
+      'execution'
     ])
-    expect(rows[0]?.segments.map((segment) => segment.ms)).toEqual([
-      10_000, 2_000, 8_000,
-    ])
+    expect(rows[0]?.segments.map((segment) => segment.ms)).toEqual([10_000, 2_000, 8_000])
     // Slowest row spans the full plot width.
     const lastSegment = rows[0]?.segments.at(-1)
     expect((lastSegment?.x ?? 0) + (lastSegment?.width ?? 0)).toBeCloseTo(100)
@@ -57,22 +55,22 @@ describe('layoutWaterfall', () => {
   it('sorts slowest first and caps rows', () => {
     const fast = cycle({
       offchainOrderId: 'fast',
-      completedAt: '2026-06-01T00:00:13Z',
+      completedAt: '2026-06-01T00:00:13Z'
     })
     const slow = cycle({
       offchainOrderId: 'slow',
-      completedAt: '2026-06-01T00:01:00Z',
+      completedAt: '2026-06-01T00:01:00Z'
     })
     const mid = cycle({
       offchainOrderId: 'mid',
-      completedAt: '2026-06-01T00:00:30Z',
+      completedAt: '2026-06-01T00:00:30Z'
     })
 
     const rows = layoutWaterfall([fast, slow, mid], {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 2,
-      now: new Date('2026-06-02T00:00:00Z'),
+      now: new Date('2026-06-02T00:00:00Z')
     })
 
     expect(rows.map((row) => row.id)).toEqual(['slow', 'mid'])
@@ -81,18 +79,18 @@ describe('layoutWaterfall', () => {
   it('sorts newest first by placement time', () => {
     const earlier = cycle({
       offchainOrderId: 'earlier',
-      placedAt: '2026-06-01T00:00:10Z',
+      placedAt: '2026-06-01T00:00:10Z'
     })
     const later = cycle({
       offchainOrderId: 'later',
-      placedAt: '2026-06-02T00:00:10Z',
+      placedAt: '2026-06-02T00:00:10Z'
     })
 
     const rows = layoutWaterfall([earlier, later], {
       plotWidth: 100,
       sort: 'newest',
       maxRows: 10,
-      now: new Date('2026-06-02T00:00:00Z'),
+      now: new Date('2026-06-02T00:00:00Z')
     })
 
     expect(rows.map((row) => row.id)).toEqual(['later', 'earlier'])
@@ -102,14 +100,14 @@ describe('layoutWaterfall', () => {
     const pending = cycle({
       status: 'pending',
       submittedAt: null,
-      completedAt: null,
+      completedAt: null
     })
 
     const rows = layoutWaterfall([pending], {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 10,
-      now: new Date('2026-06-01T00:01:00Z'),
+      now: new Date('2026-06-01T00:01:00Z')
     })
 
     expect(rows[0]?.segments.map((segment) => segment.name)).toEqual(['unhedged'])
@@ -123,8 +121,8 @@ describe('layoutWaterfall', () => {
         plotWidth: 100,
         sort: 'slowest',
         maxRows: 10,
-        now: new Date('2026-06-02T00:00:00Z'),
-      }),
+        now: new Date('2026-06-02T00:00:00Z')
+      })
     ).toEqual([])
   })
 
@@ -136,14 +134,14 @@ describe('layoutWaterfall', () => {
       // window (now - earliest fill) counts as unhedged so it ranks correctly in
       // the slowest sort, regardless of whether it was already submitted.
       submittedAt: '2026-06-01T00:00:15Z',
-      completedAt: null,
+      completedAt: null
     })
 
     const rows = layoutWaterfall([submitted], {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 10,
-      now: new Date('2026-06-02T00:00:00Z'),
+      now: new Date('2026-06-02T00:00:00Z')
     })
 
     expect(rows[0]?.segments.map((segment) => segment.name)).toEqual(['unhedged'])
@@ -151,9 +149,7 @@ describe('layoutWaterfall', () => {
   })
 })
 
-const operation = (
-  overrides: Partial<RebalanceOperationTiming>,
-): RebalanceOperationTiming => ({
+const operation = (overrides: Partial<RebalanceOperationTiming>): RebalanceOperationTiming => ({
   operationId: 'op-1',
   direction: 'alpaca_to_base',
   amount: '1000',
@@ -166,25 +162,25 @@ const operation = (
       startedAt: '2026-06-01T00:00:00Z',
       endedAt: '2026-06-01T00:00:30Z',
       durationMs: 30_000,
-      outcome: 'succeeded',
+      outcome: 'succeeded'
     },
     {
       stage: 'attestation',
       startedAt: '2026-06-01T00:01:00Z',
       endedAt: '2026-06-01T00:11:00Z',
       durationMs: 600_000,
-      outcome: 'succeeded',
+      outcome: 'succeeded'
     },
     {
       stage: 'deposit',
       startedAt: '2026-06-01T00:11:30Z',
       endedAt: null,
       durationMs: null,
-      outcome: 'unmeasured',
-    },
+      outcome: 'unmeasured'
+    }
   ],
   totalMs: 730_000,
-  ...overrides,
+  ...overrides
 })
 
 const NOW_REBALANCE = new Date('2026-06-01T00:12:10Z')
@@ -194,23 +190,18 @@ describe('layoutRebalanceBars', () => {
     const rows = layoutRebalanceBars([operation({})], {
       plotWidth: 100,
       maxRows: 10,
-      now: NOW_REBALANCE,
+      now: NOW_REBALANCE
     })
 
     expect(rows).toHaveLength(1)
     // The DTO's elapsed time wins over the sum of completed stages so an
     // open stage does not understate the operation.
     expect(rows[0]?.totalMs).toBe(730_000)
-    expect(rows[0]?.segments.map((segment) => segment.stage)).toEqual([
-      'withdrawal',
-      'attestation',
-    ])
+    expect(rows[0]?.segments.map((segment) => segment.stage)).toEqual(['withdrawal', 'attestation'])
     const lastSegment = rows[0]?.segments.at(-1)
     // Completed stages cover 630s of the 730s elapsed total; the unfilled
     // remainder represents the still-open deposit stage.
-    expect((lastSegment?.x ?? 0) + (lastSegment?.width ?? 0)).toBeCloseTo(
-      (630_000 / 730_000) * 100,
-    )
+    expect((lastSegment?.x ?? 0) + (lastSegment?.width ?? 0)).toBeCloseTo((630_000 / 730_000) * 100)
   })
 
   it('uses now - startedAt as totalMs for in-progress operations', () => {
@@ -231,16 +222,16 @@ describe('layoutRebalanceBars', () => {
               startedAt,
               endedAt: null,
               durationMs: null,
-              outcome: 'unmeasured',
-            },
-          ],
-        }),
+              outcome: 'unmeasured'
+            }
+          ]
+        })
       ],
       {
         plotWidth: 100,
         maxRows: 10,
-        now,
-      },
+        now
+      }
     )
 
     // Elapsed = now - startedAt = 3600000ms. No completed stages.
@@ -266,16 +257,16 @@ describe('layoutRebalanceBars', () => {
               startedAt,
               endedAt: '2026-06-01T00:00:30Z',
               durationMs: 30_000,
-              outcome: 'succeeded',
-            },
-          ],
-        }),
+              outcome: 'succeeded'
+            }
+          ]
+        })
       ],
       {
         plotWidth: 100,
         maxRows: 10,
-        now,
-      },
+        now
+      }
     )
 
     // now - startedAt = 0, so totalMs = 0. The clamped result is 0.
@@ -287,13 +278,13 @@ describe('layoutRebalanceBars', () => {
       [
         operation({ operationId: 'newest' }),
         operation({ operationId: 'older' }),
-        operation({ operationId: 'oldest' }),
+        operation({ operationId: 'oldest' })
       ],
       {
         plotWidth: 100,
         maxRows: 2,
-        now: NOW_REBALANCE,
-      },
+        now: NOW_REBALANCE
+      }
     )
 
     expect(rows.map((row) => row.id)).toEqual(['newest', 'older'])
@@ -312,16 +303,16 @@ describe('layoutRebalanceBars', () => {
               startedAt: '2026-06-01T00:00:00Z',
               endedAt: '2026-06-01T00:00:30Z',
               durationMs: 30_000,
-              outcome: 'failed',
-            },
-          ],
-        }),
+              outcome: 'failed'
+            }
+          ]
+        })
       ],
       {
         plotWidth: 100,
         maxRows: 10,
-        now: NOW_REBALANCE,
-      },
+        now: NOW_REBALANCE
+      }
     )
 
     expect(rows[0]?.segments[0]?.failed).toBe(true)
@@ -334,13 +325,13 @@ describe('layoutAttestationTrend', () => {
       [
         {
           burnedAt: '2026-06-01T00:00:00Z',
-          durationMs: 300_000,
-        },
+          durationMs: 300_000
+        }
       ],
       {
         plotWidth: 100,
-        plotHeight: 50,
-      },
+        plotHeight: 50
+      }
     )
 
     expect(layout.points[0]?.x).toBeCloseTo(50)
@@ -355,17 +346,17 @@ describe('layoutAttestationTrend', () => {
       [
         {
           burnedAt: '2026-06-01T00:00:00Z',
-          durationMs: 300_000,
+          durationMs: 300_000
         },
         {
           burnedAt: '2026-06-02T00:00:00Z',
-          durationMs: 600_000,
-        },
+          durationMs: 600_000
+        }
       ],
       {
         plotWidth: 100,
-        plotHeight: 50,
-      },
+        plotHeight: 50
+      }
     )
 
     expect(layout.maxMs).toBe(600_000)
@@ -381,13 +372,13 @@ describe('layoutBlockLagTrend', () => {
       [
         {
           start: '2026-06-01T00:00:00Z',
-          maxLagBlocks: 12,
-        },
+          maxLagBlocks: 12
+        }
       ],
       {
         plotWidth: 100,
-        plotHeight: 50,
-      },
+        plotHeight: 50
+      }
     )
 
     expect(layout.points[0]?.x).toBeCloseTo(50)
@@ -401,13 +392,13 @@ describe('layoutBlockLagTrend', () => {
       [
         {
           start: '2026-06-01T00:00:00Z',
-          maxLagBlocks: 0,
-        },
+          maxLagBlocks: 0
+        }
       ],
       {
         plotWidth: 100,
-        plotHeight: 50,
-      },
+        plotHeight: 50
+      }
     )
 
     expect(layout.points[0]?.x).toBeCloseTo(50)
@@ -420,17 +411,17 @@ describe('layoutBlockLagTrend', () => {
       [
         {
           start: '2026-06-01T00:00:00Z',
-          maxLagBlocks: 10,
+          maxLagBlocks: 10
         },
         {
           start: '2026-06-01T01:00:00Z',
-          maxLagBlocks: 40,
-        },
+          maxLagBlocks: 40
+        }
       ],
       {
         plotWidth: 100,
-        plotHeight: 50,
-      },
+        plotHeight: 50
+      }
     )
 
     expect(layout.maxLagBlocks).toBe(40)
@@ -445,17 +436,17 @@ describe('layoutBlockLagTrend', () => {
       [
         {
           start: '2026-06-01T00:00:00Z',
-          maxLagBlocks: 0,
+          maxLagBlocks: 0
         },
         {
           start: '2026-06-01T01:00:00Z',
-          maxLagBlocks: 0,
-        },
+          maxLagBlocks: 0
+        }
       ],
       {
         plotWidth: 100,
-        plotHeight: 50,
-      },
+        plotHeight: 50
+      }
     )
 
     // The reported maximum is the true series maximum, not the y-scale's
@@ -467,7 +458,7 @@ describe('layoutBlockLagTrend', () => {
   it('returns an empty layout for no buckets', () => {
     const layout = layoutBlockLagTrend([], {
       plotWidth: 100,
-      plotHeight: 50,
+      plotHeight: 50
     })
 
     expect(layout.points).toEqual([])
@@ -484,28 +475,28 @@ describe('layoutDependencySparkline', () => {
           start: '2026-06-01T00:00:00Z',
           calls: 10,
           errors: 0,
-          p50Ms: 50,
+          p50Ms: 50
         },
         {
           start: '2026-06-01T01:00:00Z',
           calls: 8,
           errors: 2,
-          p50Ms: 200,
+          p50Ms: 200
         },
         {
           start: '2026-06-01T02:00:00Z',
           calls: 0,
           errors: 0,
-          p50Ms: null,
-        },
+          p50Ms: null
+        }
       ],
-      { plotHeight: 12 },
+      { plotHeight: 12 }
     )
 
     expect(bars).toEqual([
       { height: 3, hasErrors: false },
       { height: 12, hasErrors: true },
-      { height: 0, hasErrors: false },
+      { height: 0, hasErrors: false }
     ])
   })
 })
@@ -516,7 +507,7 @@ const stats = (p50: number, p90: number, p99: number): LatencyStats => ({
   p95Ms: p90,
   p99Ms: p99,
   maxMs: p99,
-  sampleCount: 10,
+  sampleCount: 10
 })
 
 const bucket = (start: string, detection: LatencyStats | null): LatencyBucket => ({
@@ -526,8 +517,8 @@ const bucket = (start: string, detection: LatencyStats | null): LatencyBucket =>
     decision: null,
     submission: null,
     execution: null,
-    exposureWindow: null,
-  },
+    exposureWindow: null
+  }
 })
 
 describe('layoutPercentileSeries', () => {
@@ -537,14 +528,14 @@ describe('layoutPercentileSeries', () => {
     const layout = layoutPercentileSeries(
       [
         bucket('2026-06-01T00:00:00Z', stats(100, 200, 400)),
-        bucket('2026-06-02T00:00:00Z', stats(150, 300, 800)),
+        bucket('2026-06-02T00:00:00Z', stats(150, 300, 800))
       ],
       'detection',
       {
         plotWidth: 100,
         plotHeight,
-        maxXLabels: 6,
-      },
+        maxXLabels: 6
+      }
     )
 
     expect(layout.maxMs).toBe(800)
@@ -576,14 +567,14 @@ describe('layoutPercentileSeries', () => {
       [
         bucket('2026-06-01T00:00:00Z', stats(100, 200, 400)),
         bucket('2026-06-02T00:00:00Z', null),
-        bucket('2026-06-03T00:00:00Z', stats(100, 200, 400)),
+        bucket('2026-06-03T00:00:00Z', stats(100, 200, 400))
       ],
       'detection',
       {
         plotWidth: 100,
         plotHeight: 50,
-        maxXLabels: 6,
-      },
+        maxXLabels: 6
+      }
     )
 
     expect(layout.lines[0]?.points).toHaveLength(2)
@@ -596,11 +587,32 @@ describe('layoutPercentileSeries', () => {
       {
         plotWidth: 100,
         plotHeight: 50,
-        maxXLabels: 6,
-      },
+        maxXLabels: 6
+      }
     )
 
     expect(layout.lines[0]?.points[0]?.x).toBeCloseTo(50)
+  })
+
+  it('keeps edge buckets inside the viewport when horizontal padding is requested', () => {
+    const layout = layoutPercentileSeries(
+      [
+        bucket('2026-06-01T00:00:00Z', stats(100, 200, 400)),
+        bucket('2026-06-02T00:00:00Z', stats(100, 200, 400))
+      ],
+      'detection',
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+        maxXLabels: 6,
+        horizontalPadding: 20
+      }
+    )
+
+    expect(layout.lines[0]?.points[0]?.x).toBeCloseTo(20)
+    expect(layout.lines[0]?.points[1]?.x).toBeCloseTo(80)
+    expect(layout.xLabels[0]?.x).toBeCloseTo(20)
+    expect(layout.xLabels.at(-1)?.x).toBeCloseTo(80)
   })
 
   it('always includes the last bucket label even when it does not fall on a step boundary', () => {
@@ -611,13 +623,13 @@ describe('layoutPercentileSeries', () => {
       bucket('2026-06-02T00:00:00Z', stats(100, 200, 400)),
       bucket('2026-06-03T00:00:00Z', stats(100, 200, 400)),
       bucket('2026-06-04T00:00:00Z', stats(100, 200, 400)),
-      bucket('2026-06-05T00:00:00Z', stats(100, 200, 400)),
+      bucket('2026-06-05T00:00:00Z', stats(100, 200, 400))
     ]
 
     const layout = layoutPercentileSeries(buckets, 'detection', {
       plotWidth: 100,
       plotHeight: 50,
-      maxXLabels: 2,
+      maxXLabels: 2
     })
 
     // Expect 3 labels: indices 0, 3, and 4 (last)

@@ -30,17 +30,15 @@ export type WaterfallSort = 'slowest' | 'newest'
 
 const segmentDurations = (
   cycle: HedgeCycleReport,
-  now: Date,
+  now: Date
 ): { name: WaterfallSegmentName; ms: number }[] => {
   const placedAt = new Date(cycle.placedAt).getTime()
   const earliestFill =
     cycle.earliestFillBlockTimestamp !== null
       ? new Date(cycle.earliestFillBlockTimestamp).getTime()
       : placedAt
-  const submittedAt =
-    cycle.submittedAt !== null ? new Date(cycle.submittedAt).getTime() : null
-  const completedAt =
-    cycle.completedAt !== null ? new Date(cycle.completedAt).getTime() : null
+  const submittedAt = cycle.submittedAt !== null ? new Date(cycle.submittedAt).getTime() : null
+  const completedAt = cycle.completedAt !== null ? new Date(cycle.completedAt).getTime() : null
 
   // A cycle that has not reached a terminal state is live exposure: its
   // whole elapsed time still counts as unhedged, so it ranks where it
@@ -49,26 +47,26 @@ const segmentDurations = (
     return [
       {
         name: 'unhedged',
-        ms: Math.max(0, now.getTime() - earliestFill),
-      },
+        ms: Math.max(0, now.getTime() - earliestFill)
+      }
     ]
   }
 
   const segments: { name: WaterfallSegmentName; ms: number }[] = [
     {
       name: 'unhedged',
-      ms: Math.max(0, placedAt - earliestFill),
-    },
+      ms: Math.max(0, placedAt - earliestFill)
+    }
   ]
 
   if (submittedAt !== null) {
     segments.push({
       name: 'submission',
-      ms: Math.max(0, submittedAt - placedAt),
+      ms: Math.max(0, submittedAt - placedAt)
     })
     segments.push({
       name: 'execution',
-      ms: Math.max(0, completedAt - submittedAt),
+      ms: Math.max(0, completedAt - submittedAt)
     })
   }
 
@@ -86,7 +84,7 @@ export const layoutWaterfall = (
     sort: WaterfallSort
     maxRows: number
     now: Date
-  },
+  }
 ): WaterfallRow[] => {
   const rows = cycles.map((cycle) => {
     const durations = segmentDurations(cycle, options.now)
@@ -98,14 +96,12 @@ export const layoutWaterfall = (
       status: cycle.status,
       placedAt: new Date(cycle.placedAt).getTime(),
       totalMs,
-      durations,
+      durations
     }
   })
 
   rows.sort((left, right) =>
-    options.sort === 'slowest'
-      ? right.totalMs - left.totalMs
-      : right.placedAt - left.placedAt,
+    options.sort === 'slowest' ? right.totalMs - left.totalMs : right.placedAt - left.placedAt
   )
   const visible = rows.slice(0, options.maxRows)
 
@@ -118,7 +114,7 @@ export const layoutWaterfall = (
       const positioned = {
         ...segment,
         x: cursor,
-        width,
+        width
       }
       cursor += width
       return positioned
@@ -129,7 +125,7 @@ export const layoutWaterfall = (
       symbol: row.symbol,
       status: row.status,
       totalMs: row.totalMs,
-      segments,
+      segments
     }
   })
 }
@@ -185,7 +181,7 @@ export const layoutRebalanceBars = (
     plotWidth: number
     maxRows: number
     now: Date
-  },
+  }
 ): RebalanceBarRow[] => {
   const rows = operations.slice(0, options.maxRows).map((operation) => {
     const durations = operation.stages
@@ -193,7 +189,7 @@ export const layoutRebalanceBars = (
       .map((stage) => ({
         stage: stage.stage,
         ms: stage.durationMs ?? 0,
-        failed: stage.outcome === 'failed',
+        failed: stage.outcome === 'failed'
       }))
 
     // For in-progress operations the backend sets totalMs only on completion,
@@ -213,7 +209,7 @@ export const layoutRebalanceBars = (
       amount: operation.amount,
       status: operation.status,
       totalMs,
-      durations,
+      durations
     }
   })
 
@@ -226,7 +222,7 @@ export const layoutRebalanceBars = (
       const positioned = {
         ...segment,
         x: cursor,
-        width,
+        width
       }
       cursor += width
       return positioned
@@ -238,7 +234,7 @@ export const layoutRebalanceBars = (
       amount: row.amount,
       status: row.status,
       totalMs: row.totalMs,
-      segments,
+      segments
     }
   })
 }
@@ -255,24 +251,19 @@ export const layoutAttestationTrend = (
   options: {
     plotWidth: number
     plotHeight: number
-  },
+  }
 ): TrendLayout => {
   const maxMs = Math.max(1, ...samples.map((sample) => sample.durationMs))
   const xDenominator = Math.max(1, samples.length - 1)
   const points = samples.map((sample, index) => ({
-    x:
-      samples.length <= 1
-        ? options.plotWidth / 2
-        : (index / xDenominator) * options.plotWidth,
-    y: options.plotHeight - (sample.durationMs / maxMs) * options.plotHeight,
+    x: samples.length <= 1 ? options.plotWidth / 2 : (index / xDenominator) * options.plotWidth,
+    y: options.plotHeight - (sample.durationMs / maxMs) * options.plotHeight
   }))
 
   return {
     points,
-    path: points
-      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-      .join(' '),
-    maxMs,
+    path: points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '),
+    maxMs
   }
 }
 
@@ -288,7 +279,7 @@ export const layoutBlockLagTrend = (
   options: {
     plotWidth: number
     plotHeight: number
-  },
+  }
 ): BlockLagLayout => {
   const maxLagBlocks = Math.max(0, ...buckets.map((bucket) => bucket.maxLagBlocks))
   // The y-scale denominator is floored at 1 so an all-zero series divides
@@ -297,19 +288,14 @@ export const layoutBlockLagTrend = (
   const scaleMax = Math.max(1, maxLagBlocks)
   const xDenominator = Math.max(1, buckets.length - 1)
   const points = buckets.map((bucket, index) => ({
-    x:
-      buckets.length <= 1
-        ? options.plotWidth / 2
-        : (index / xDenominator) * options.plotWidth,
-    y: options.plotHeight - (bucket.maxLagBlocks / scaleMax) * options.plotHeight,
+    x: buckets.length <= 1 ? options.plotWidth / 2 : (index / xDenominator) * options.plotWidth,
+    y: options.plotHeight - (bucket.maxLagBlocks / scaleMax) * options.plotHeight
   }))
 
   return {
     points,
-    path: points
-      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-      .join(' '),
-    maxLagBlocks,
+    path: points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '),
+    maxLagBlocks
   }
 }
 
@@ -325,13 +311,13 @@ export type DependencySparkBar = {
  */
 export const layoutDependencySparkline = (
   buckets: DependencyBucket[],
-  options: { plotHeight: number },
+  options: { plotHeight: number }
 ): DependencySparkBar[] => {
   const maxP50 = Math.max(1, ...buckets.map((bucket) => bucket.p50Ms ?? 0))
 
   return buckets.map((bucket) => ({
     height: ((bucket.p50Ms ?? 0) / maxP50) * options.plotHeight,
-    hasErrors: bucket.errors > 0,
+    hasErrors: bucket.errors > 0
   }))
 }
 
@@ -349,36 +335,36 @@ export const layoutPercentileSeries = (
     plotWidth: number
     plotHeight: number
     maxXLabels: number
-  },
+    horizontalPadding?: number
+  }
 ): SeriesLayout => {
   const sampled = buckets
     .map((bucket) => ({
       start: bucket.start,
-      stats: bucket.stages[stage],
+      stats: bucket.stages[stage]
     }))
     .filter((bucket) => bucket.stats !== null)
 
   const maxMs = Math.max(1, ...sampled.map((bucket) => bucket.stats?.p99Ms ?? 0))
+  const horizontalPadding = Math.min(options.horizontalPadding ?? 0, options.plotWidth / 2)
+  const usableWidth = options.plotWidth - horizontalPadding * 2
   const xDenominator = Math.max(1, sampled.length - 1)
   const xFor = (index: number): number =>
     sampled.length <= 1
       ? options.plotWidth / 2
-      : (index / xDenominator) * options.plotWidth
-  const yFor = (ms: number): number =>
-    options.plotHeight - (ms / maxMs) * options.plotHeight
+      : horizontalPadding + (index / xDenominator) * usableWidth
+  const yFor = (ms: number): number => options.plotHeight - (ms / maxMs) * options.plotHeight
 
   const lines = PERCENTILE_KEYS.map((percentile) => {
     const points = sampled.map((bucket, index) => ({
       x: xFor(index),
-      y: yFor(bucket.stats?.[percentile] ?? 0),
+      y: yFor(bucket.stats?.[percentile] ?? 0)
     }))
 
     return {
       percentile,
       points,
-      path: points
-        .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-        .join(' '),
+      path: points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')
     }
   })
 
@@ -389,19 +375,19 @@ export const layoutPercentileSeries = (
       x: xFor(index),
       label: new Date(bucket.start).toLocaleDateString(undefined, {
         month: 'short',
-        day: 'numeric',
+        day: 'numeric'
       }),
-      index,
+      index
     }))
     .filter(({ index }) => index % labelStep === 0 || index === lastIndex)
     .map(({ x, label }) => ({
       x,
-      label,
+      label
     }))
 
   return {
     lines,
     maxMs,
-    xLabels,
+    xLabels
   }
 }

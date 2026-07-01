@@ -274,9 +274,11 @@ nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-feature
 
 `nix run .#simulate` launches a full local simulation of the market making
 system using [mprocs](https://github.com/pvolok/mprocs) to run the dashboard and
-the bot side-by-side. `nix run .#simulate-failures` starts the same stack, then
-creates failed mint and redemption rebalances whose mock Alpaca provider later
-completes and prints the `transfer recheck` commands that recover them.
+the bot side-by-side. `nix run .#simulate-14d` starts the same stack with 14
+days of seeded hedge-latency activity so Performance tab trends are visible
+immediately. `nix run .#simulate-failures` starts the same stack, then creates
+failed mint and redemption rebalances whose mock Alpaca provider later completes
+and prints the `transfer recheck` commands that recover them.
 
 What it does:
 
@@ -288,6 +290,11 @@ What it does:
 5. Starts the dashboard dev server
 6. Continuously takes orders at 10-second intervals, simulating users buying and
    selling tokenized equities
+
+The `simulate-14d` variant also preloads the hedge-latency read model with 14
+daily buckets of completed hedge cycles before live trades begin. Use it when
+checking Performance tab percentile charts without waiting for historical data
+to accumulate.
 
 The bot counter-trades each fill on the mock broker, mints/redeems to rebalance
 equity supply between venues, and bridges USDC via mock CCTP to keep cash
