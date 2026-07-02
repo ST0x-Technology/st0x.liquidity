@@ -123,6 +123,12 @@ pub(crate) fn get_test_order() -> OrderV4 {
 }
 
 /// Preloads ERC20 symbols for the fixed token addresses in [`get_test_order`].
+///
+/// Seeding by ADDRESS (rather than mocking `symbol()`/`decimals()` RPC calls in
+/// call order) makes direction assertions sensitive to an inverted IO-index
+/// mapping -- a positional mock would return USDC-then-wtAAPL regardless of
+/// which token was actually queried, so a swapped input/output index would go
+/// undetected.
 pub(crate) fn seed_get_test_order_token_symbols(cache: &st0x_registry::SymbolCache) {
     cache.preload_symbol(
         address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
