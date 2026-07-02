@@ -51,8 +51,9 @@ use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
     TransferUsdcToMarketMakingJobQueue,
 };
+use crate::tokenization::IssuerRequestId;
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+    TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
 };
 use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
 use crate::unwrapped_equity_recovery::{
@@ -198,7 +199,7 @@ impl std::fmt::Display for MintTrackingStage {
 struct MintTracking {
     symbol: Symbol,
     quantity: FractionalShares,
-    tokenization_request_id: Option<crate::tokenized_equity_mint::TokenizationRequestId>,
+    tokenization_request_id: Option<crate::tokenization::TokenizationRequestId>,
     stage: MintTrackingStage,
     last_progress_at: DateTime<Utc>,
 }
@@ -298,7 +299,7 @@ impl std::fmt::Display for RedemptionTrackingStage {
 struct RedemptionTracking {
     symbol: Symbol,
     quantity: FractionalShares,
-    tokenization_request_id: Option<crate::tokenized_equity_mint::TokenizationRequestId>,
+    tokenization_request_id: Option<crate::tokenization::TokenizationRequestId>,
     redemption_tx: Option<TxHash>,
     stage: RedemptionTrackingStage,
     last_progress_at: DateTime<Utc>,
@@ -420,7 +421,7 @@ impl RedemptionTracking {
 
 fn mint_event_tokenization_request_id(
     event: &TokenizedEquityMintEvent,
-) -> Option<&crate::tokenized_equity_mint::TokenizationRequestId> {
+) -> Option<&crate::tokenization::TokenizationRequestId> {
     match event {
         TokenizedEquityMintEvent::MintAccepted {
             tokenization_request_id,
@@ -4216,7 +4217,7 @@ impl RebalancingService {
         &self,
         id: &IssuerRequestId,
         entity: &TokenizedEquityMint,
-        tokenization_request_id: crate::tokenized_equity_mint::TokenizationRequestId,
+        tokenization_request_id: crate::tokenization::TokenizationRequestId,
     ) -> Result<RecoveryClaim, RebalancingServiceError> {
         let TokenizedEquityMint::Failed {
             symbol, quantity, ..
@@ -4986,9 +4987,8 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::{
-        TokenizationRequestId, TokenizedEquityMintCommand, issuer_request_id,
-    };
+    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
+    use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
         ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };

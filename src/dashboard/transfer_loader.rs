@@ -359,9 +359,8 @@ mod tests {
     use crate::equity_redemption::{
         EquityRedemptionEvent, RedemptionAggregateId, redemption_aggregate_id,
     };
-    use crate::tokenized_equity_mint::{
-        IssuerRequestId, TokenizedEquityMintEvent, issuer_request_id,
-    };
+    use crate::tokenization::{IssuerRequestId, issuer_request_id};
+    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 
     fn mint_transfer(status: EquityMintStatus) -> TransferOperation {

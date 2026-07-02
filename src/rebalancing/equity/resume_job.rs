@@ -23,7 +23,7 @@ use thiserror::Error;
 use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenization::IssuerRequestId;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
 pub(crate) type ResumeTokenizationJobQueue = JobQueue<ResumeTokenizationAggregate>;
@@ -107,9 +107,8 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
-    use crate::tokenized_equity_mint::{
-        TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
-    };
+    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
+    use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
 
     /// Builds a [`ResumeTokenizationCtx`] backed by in-memory stores, plus

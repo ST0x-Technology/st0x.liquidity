@@ -1061,9 +1061,8 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
     use chrono::Utc;
     use st0x_event_sorcery::DomainEvent;
 
-    use crate::tokenized_equity_mint::{
-        IssuerRequestId, TokenizationRequestId, TokenizedEquityMintEvent,
-    };
+    use crate::tokenization::{IssuerRequestId, TokenizationRequestId};
+    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 
     let symbol = Symbol::new(symbol_str.to_string())?;
     let mint_id: IssuerRequestId = mint_id_str.parse()?;

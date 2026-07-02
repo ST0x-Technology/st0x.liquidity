@@ -30,7 +30,8 @@ use crate::performance::reliability::{
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
+use crate::tokenization::IssuerRequestId;
+use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1686,7 +1687,7 @@ mod tests {
     use crate::inventory::{self, BroadcastingInventory};
     use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
     use crate::performance::reliability::LifecycleFailureProjection;
-    use crate::tokenized_equity_mint::issuer_request_id;
+    use crate::tokenization::issuer_request_id;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -3353,7 +3354,7 @@ mod tests {
     #[test]
     fn recheck_error_response_distinguishes_recoverability() {
         use crate::tokenization::{MintVerificationError, TokenizerError};
-        use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
+        use crate::tokenization::{TokenizationRequestId, issuer_request_id};
 
         // Not-recoverable: the persisted aggregate state forbids recovery, so
         // retrying will not help -> 422 carrying the typed reason.

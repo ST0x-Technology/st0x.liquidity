@@ -19,7 +19,7 @@ use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenization::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 
 /// Error type for inventory view operations.
