@@ -13,6 +13,12 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
+    IRaindexInventory, env!("ST0X_RAINDEX_INVENTORY_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
     IERC4626, env!("ST0X_IERC4626_ABI")
 );
 
