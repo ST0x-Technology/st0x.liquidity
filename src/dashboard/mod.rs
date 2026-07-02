@@ -193,6 +193,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
                 symbol: symbol.clone(),
                 trading: config.trading == OperationMode::Enabled,
                 rebalancing: config.rebalancing == OperationMode::Enabled,
+                extended_hours: config.extended_hours_counter_trading == OperationMode::Enabled,
                 operational_limit: limit,
             }
         })
@@ -297,11 +298,11 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
 
+    use st0x_config::{EquityAssetConfig, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
 
     use super::*;
     use crate::inventory::{self, BroadcastingInventory};
-    use st0x_config::create_test_ctx_with_order_owner;
 
     fn dummy_fill(symbol: &str) -> Statement {
         Statement::TradeFill(Trade {
@@ -345,6 +346,39 @@ mod tests {
             recent_transfers: Vec::new(),
             warnings: Vec::new(),
         })
+    }
+
+    #[test]
+    fn settings_from_ctx_includes_asset_operation_flags() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let settings = settings_from_ctx(&ctx);
+        let asset = settings
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .expect("RKLB settings should be present");
+
+        assert!(asset.trading);
+        assert!(!asset.rebalancing);
+        assert!(asset.extended_hours);
     }
 
     async fn create_test_state() -> AppState {
