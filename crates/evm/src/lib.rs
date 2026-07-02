@@ -843,6 +843,15 @@ const DROPPED_TX_GRACE: std::time::Duration = std::time::Duration::from_secs(30)
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const DROPPED_TX_CONSECUTIVE_MISSES: u32 = 3;
 
+/// Consecutive transport errors (with no successful poll in between) tolerated
+/// while polling before giving up. A transient blip on a load-balanced RPC
+/// recovers within a poll or two and a successful poll resets the count; this
+/// many failures in a row with no success means the endpoint is unreachable, so
+/// fail fast with the transport error instead of spinning the full
+/// inclusion/confirmation timeout against a dead RPC.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const MAX_CONSECUTIVE_TRANSPORT_ERRORS: u32 = 5;
+
 /// Tuning parameters for [`wait_for_receipt_with_config`]. Bundled into a struct
 /// so the wait function keeps a small argument list as knobs are added.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -919,32 +928,51 @@ pub(crate) async fn wait_for_receipt_with_config(
         // so we require several in a row — and only after a grace period —
         // before concluding the tx was dropped.
         let mut consecutive_misses = 0u32;
+        let mut consecutive_transport_errors = 0u32;
 
         loop {
             poll.tick().await;
 
-            let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
-                // Not yet mined. Only suspect a drop once the grace period has
-                // elapsed; before that a missing tx is almost certainly still
-                // propagating or awaiting its first block.
-                if start.elapsed() >= config.dropped_grace {
-                    if provider.get_transaction_by_hash(tx_hash).await?.is_none() {
-                        consecutive_misses += 1;
-
-                        if consecutive_misses >= config.dropped_consecutive_misses {
-                            return Err(EvmError::TransactionDropped {
-                                tx_hash,
-                                elapsed_secs: start.elapsed().as_secs(),
-                            });
-                        }
-                    } else {
-                        // Tx is still in the mempool; it was not dropped.
-                        consecutive_misses = 0;
-                    }
+            // A transient transport error on a load-balanced RPC must not abort
+            // the wait: count it as an inconclusive poll and retry within the
+            // inclusion timeout, mirroring `wait_for_node_sync`. Aborting on the
+            // first error surfaces a live, broadcast tx as failed. But a
+            // sustained run of errors means the RPC is down, not blipping, so
+            // give up at the cap rather than spinning the whole timeout.
+            // The error run resets only when a full poll cycle completes with no
+            // transport error -- a receipt comes back, or (post-grace) a clean
+            // receipt+mempool pair. Resetting on the receipt poll alone would let
+            // a mempool-only failure never accumulate to the cap.
+            let maybe_receipt = match provider.get_transaction_receipt(tx_hash).await {
+                Ok(maybe_receipt) => maybe_receipt,
+                Err(transport_error) => {
+                    note_receipt_poll_transport_error(
+                        &mut consecutive_transport_errors,
+                        transport_error,
+                        "polling for receipt",
+                    )?;
+                    continue;
                 }
+            };
 
+            let Some(receipt) = maybe_receipt else {
+                // Not yet mined: decide whether to keep waiting or conclude the tx
+                // was dropped, advancing the miss / transport-error runs. A
+                // terminal outcome (dropped, or RPC down past the cap) propagates.
+                classify_pending_receipt(
+                    provider,
+                    tx_hash,
+                    &config,
+                    start,
+                    &mut consecutive_misses,
+                    &mut consecutive_transport_errors,
+                )
+                .await?;
                 continue;
             };
+
+            // A receipt came back -- the RPC responded, so the error run is clean.
+            consecutive_transport_errors = 0;
 
             let Some(block) = receipt.block_number else {
                 continue;
@@ -961,8 +989,28 @@ pub(crate) async fn wait_for_receipt_with_config(
 
     // Phase 2: wait for confirmation depth (generous timeout).
     timeout(config.confirmation_timeout, async {
+        let mut consecutive_transport_errors = 0u32;
+
         loop {
-            let current_block = provider.get_block_number().await?;
+            // Same load-balanced-RPC tolerance as the inclusion phase: a
+            // transient transport error must not abort confirmation polling of
+            // an already-mined tx, but a sustained run (the RPC is down) gives
+            // up at the cap instead of spinning the whole confirmation timeout.
+            let current_block = match provider.get_block_number().await {
+                Ok(current_block) => {
+                    consecutive_transport_errors = 0;
+                    current_block
+                }
+                Err(transport_error) => {
+                    note_receipt_poll_transport_error(
+                        &mut consecutive_transport_errors,
+                        transport_error,
+                        "polling block number for confirmation",
+                    )?;
+                    poll.tick().await;
+                    continue;
+                }
+            };
             let confirmations = current_block.saturating_sub(receipt_block) + 1;
 
             if confirmations >= required_confirmations {
@@ -977,6 +1025,97 @@ pub(crate) async fn wait_for_receipt_with_config(
         tx_hash,
         timeout_secs: config.confirmation_timeout.as_secs(),
     })?
+}
+
+/// Classify an inclusion poll whose receipt is absent. Returns `Ok(())` to keep
+/// waiting; returns a terminal `Err` when the tx is confirmed dropped (missing
+/// from the receipt lookup and the mempool past the grace period for
+/// `dropped_consecutive_misses` polls) or the RPC is down past the transport cap.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+async fn classify_pending_receipt(
+    provider: &impl Provider,
+    tx_hash: alloy::primitives::TxHash,
+    config: &ReceiptWaitConfig,
+    start: std::time::Instant,
+    consecutive_misses: &mut u32,
+    consecutive_transport_errors: &mut u32,
+) -> Result<(), EvmError> {
+    // Before the grace period a missing tx is almost certainly still propagating
+    // or awaiting its first block. The receipt poll itself succeeded, so the
+    // transport-error run is clean.
+    if start.elapsed() < config.dropped_grace {
+        *consecutive_transport_errors = 0;
+        return Ok(());
+    }
+
+    // A transport error here is not a confirmed absence; retry rather than
+    // counting it toward the drop threshold.
+    let mempool_tx = match provider.get_transaction_by_hash(tx_hash).await {
+        Ok(mempool_tx) => {
+            *consecutive_transport_errors = 0;
+            mempool_tx
+        }
+        Err(transport_error) => {
+            // A transport error is not a confirmed absence, so it breaks the run
+            // of consecutive confirmed absences the drop threshold relies on.
+            // Reset the miss count: otherwise an interleaved blip
+            // (absent, transport error, absent, absent) could accumulate to the
+            // threshold and falsely declare a live-but-lagging tx dropped,
+            // prompting a resubmit of a transaction that is still in flight.
+            *consecutive_misses = 0;
+            note_receipt_poll_transport_error(
+                consecutive_transport_errors,
+                transport_error,
+                "checking mempool",
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Still in the mempool: not dropped, so reset the miss run.
+    if mempool_tx.is_some() {
+        *consecutive_misses = 0;
+        return Ok(());
+    }
+
+    // Absent from both the receipt lookup and the mempool past the grace period.
+    *consecutive_misses += 1;
+
+    if *consecutive_misses >= config.dropped_consecutive_misses {
+        return Err(EvmError::TransactionDropped {
+            tx_hash,
+            elapsed_secs: start.elapsed().as_secs(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Record a transport error during a receipt-wait poll and enforce the
+/// consecutive-error cap. Returns `Err(Transport)` once
+/// `MAX_CONSECUTIVE_TRANSPORT_ERRORS` polls in a row have failed (the RPC is down,
+/// not blipping); otherwise logs and returns `Ok(())` so the caller retries.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+fn note_receipt_poll_transport_error(
+    consecutive_transport_errors: &mut u32,
+    transport_error: alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+    context: &str,
+) -> Result<(), EvmError> {
+    *consecutive_transport_errors += 1;
+
+    if *consecutive_transport_errors >= MAX_CONSECUTIVE_TRANSPORT_ERRORS {
+        return Err(EvmError::Transport(transport_error));
+    }
+
+    warn!(
+        target: "evm",
+        ?transport_error,
+        consecutive_transport_errors = *consecutive_transport_errors,
+        context,
+        "Transient transport error during receipt wait; retrying"
+    );
+
+    Ok(())
 }
 
 /// Read-only EVM access wrapping a bare [`Provider`].
@@ -1008,11 +1147,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, Bloom, U256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::rpc::types::TransactionReceipt;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
     use std::sync::Arc;
@@ -1428,6 +1569,323 @@ mod tests {
 
         assert_eq!(receipt.transaction_hash, tx_hash);
         assert!(receipt.status());
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_gives_up_after_consecutive_transport_errors() {
+        // A transient transport error must not abort the wait on the first
+        // hiccup (a live, broadcast tx would be reported failed), so errors are
+        // retried -- but only up to a cap. A sustained run with no successful
+        // poll means the RPC is unreachable, so the wait must fail fast with the
+        // transport error at the cap instead of spinning the full inclusion
+        // timeout against a dead endpoint.
+        let asserter = Asserter::new();
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS + 2) {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("connection refused {iteration}").into(),
+                data: None,
+            });
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            alloy::primitives::B256::random(),
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                // Generous, so the consecutive-error cap is what trips, not the
+                // inclusion timeout.
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                dropped_grace: std::time::Duration::from_secs(60),
+                dropped_consecutive_misses: 3,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::Transport(_))),
+            "a dead RPC must fail fast with Transport at the consecutive-error cap, \
+             not spin the inclusion timeout, got: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_gives_up_when_only_mempool_polls_fail() {
+        // Receipt polls succeed (tx not yet mined -> Ok(None)) while every mempool
+        // poll fails -- plausible on a load-balanced provider routing the two
+        // methods to different backends. The transport-error run must still reach
+        // the cap: the receipt success must NOT reset it before the mempool poll
+        // fails, or this case would spin the full inclusion timeout instead of
+        // failing fast.
+        let asserter = Asserter::new();
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS + 2) {
+            // get_transaction_receipt -> Ok(None): tx not yet mined.
+            asserter.push_success(&serde_json::Value::Null);
+            // get_transaction_by_hash -> transport error.
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("mempool backend down {iteration}").into(),
+                data: None,
+            });
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            alloy::primitives::B256::random(),
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                // Check the mempool from the first poll so the interleave runs.
+                dropped_grace: std::time::Duration::ZERO,
+                // High, so the drop check never fires before the transport cap.
+                dropped_consecutive_misses: 100,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::Transport(_))),
+            "mempool-only transport failures must still reach the fail-fast cap, got: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn mined_receipt(tx_hash: alloy::primitives::B256) -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: true.into(),
+                    cumulative_gas_used: 0,
+                    logs: vec![],
+                },
+                logs_bloom: Bloom::default(),
+            }),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: Some(alloy::primitives::B256::random()),
+            block_number: Some(0),
+            gas_used: 21000,
+            effective_gas_price: 1,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_gives_up_in_confirmation_phase_after_consecutive_errors() {
+        // Phase 1 succeeds (the tx is mined), then every confirmation-depth poll
+        // (get_block_number) fails. The Phase 2 cap must fire so a dead RPC during
+        // confirmation polling fails fast instead of spinning the confirmation
+        // timeout. Phase 2 has its own counter, untested before this.
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Phase 1: get_transaction_receipt -> Some(mined receipt at block 0).
+        asserter.push_success(&mined_receipt(tx_hash));
+        // Phase 2: every get_block_number poll errors.
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS + 2) {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("node down {iteration}").into(),
+                data: None,
+            });
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            // Require depth > 1 so Phase 2 must poll the tip past the receipt block.
+            2,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_secs(1),
+                // Generous, so the cap trips, not the confirmation timeout.
+                confirmation_timeout: std::time::Duration::from_secs(30),
+                dropped_grace: std::time::Duration::from_secs(60),
+                dropped_consecutive_misses: 3,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::Transport(_))),
+            "a dead RPC during confirmation polling must fail fast at the cap, got: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_tolerates_transient_errors_separated_by_a_success() {
+        // (MAX-1) receipt-poll errors, then ONE successful poll, then (MAX-1) more
+        // errors, then the receipt. The total error count exceeds the cap, but it
+        // never reaches MAX *in a row* -- the success resets the run. The wait must
+        // therefore succeed, proving the counter is consecutive, not cumulative.
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS - 1) {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("blip a {iteration}").into(),
+                data: None,
+            });
+        }
+        // Receipt poll Ok(None): tx not yet mined. Before the grace window, this is
+        // a clean poll that resets the transport-error run.
+        asserter.push_success(&serde_json::Value::Null);
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS - 1) {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("blip b {iteration}").into(),
+                data: None,
+            });
+        }
+        // The receipt finally arrives, ending Phase 1.
+        asserter.push_success(&mined_receipt(tx_hash));
+        // Phase 2 with required_confirmations = 1: the first block-number poll
+        // satisfies the depth immediately.
+        asserter.push_success(&serde_json::Value::from(0u64));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                // Generous, so the wait does not time out before the receipt lands.
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                // Large, so the Ok(None) poll stays in the before-grace reset path.
+                dropped_grace: std::time::Duration::from_secs(60),
+                dropped_consecutive_misses: 3,
+            },
+        )
+        .await;
+
+        let receipt = result.unwrap();
+        assert_eq!(receipt.transaction_hash, tx_hash);
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_confirmation_tolerates_transient_errors_separated_by_a_success() {
+        // Phase 2 twin of the Phase 1 reset test above: (MAX-1) block-number
+        // errors, one successful block-number poll that does not yet satisfy the
+        // depth, then (MAX-1) more errors, then a block number that meets the
+        // depth. The total error count exceeds the cap but never reaches MAX in a
+        // row -- the mid-sequence success resets Phase 2's own counter -- so the
+        // wait must succeed, proving the confirmation-phase counter is
+        // consecutive, not cumulative.
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Phase 1: the tx is mined at block 0.
+        asserter.push_success(&mined_receipt(tx_hash));
+        // Phase 2 first run of transient block-number errors.
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS - 1) {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("blip a {iteration}").into(),
+                data: None,
+            });
+        }
+        // A successful block-number poll at the receipt block: confirmations = 1,
+        // below the required depth of 2, so polling continues -- but the success
+        // resets the transport-error run.
+        asserter.push_success(&serde_json::Value::from(0u64));
+        // Phase 2 second run of transient block-number errors.
+        for iteration in 0..(MAX_CONSECUTIVE_TRANSPORT_ERRORS - 1) {
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: format!("blip b {iteration}").into(),
+                data: None,
+            });
+        }
+        // The tip advances one block: confirmations = 2, satisfying the depth.
+        asserter.push_success(&serde_json::Value::from(1u64));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            // Depth > 1 so Phase 2 must poll the tip past the receipt block.
+            2,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_secs(1),
+                // Generous, so the cap logic is exercised, not the timeout.
+                confirmation_timeout: std::time::Duration::from_secs(30),
+                dropped_grace: std::time::Duration::from_secs(60),
+                dropped_consecutive_misses: 3,
+            },
+        )
+        .await;
+
+        let receipt = result.unwrap();
+        assert_eq!(receipt.transaction_hash, tx_hash);
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_mempool_transport_error_does_not_trigger_false_drop() {
+        // With dropped_consecutive_misses = 3: two confirmed absences straddle a
+        // single mempool transport error, then two more absences, then the tx is
+        // mined. The transport error must reset the miss run, so the drop
+        // threshold is never reached and the wait returns the receipt. Without the
+        // reset the run would be [1, (blip), 2, 3] and falsely declare the tx
+        // dropped on the fourth poll -- before it is seen mined.
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Poll 1: receipt None, mempool absent -> miss 1.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        // Poll 2: receipt None, mempool transport error -> reset the miss run.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "mempool backend blip".into(),
+            data: None,
+        });
+        // Poll 3: receipt None, mempool absent -> miss 1 (not 2).
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        // Poll 4: receipt None, mempool absent -> miss 2 (not 3 -> no false drop).
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        // Poll 5: the tx is finally mined at block 0, ending Phase 1.
+        asserter.push_success(&mined_receipt(tx_hash));
+        // Phase 2 with required_confirmations = 1: satisfied immediately.
+        asserter.push_success(&serde_json::Value::from(0u64));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                // Check the mempool from the first poll so the interleave runs.
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 3,
+            },
+        )
+        .await;
+
+        let receipt = result.unwrap();
+        assert_eq!(receipt.transaction_hash, tx_hash);
     }
 
     #[cfg(feature = "local-signer")]
