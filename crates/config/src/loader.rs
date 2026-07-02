@@ -1065,11 +1065,31 @@ impl Ctx {
         std::time::Duration::from_secs(self.order_polling_interval)
     }
 
-    /// Returns the wallet address that owns orders on the orderbook.
+    /// Returns the bot's signing wallet address (the `[wallet]` EOA).
     ///
-    /// Always derived from the configured `[wallet]` address.
+    /// This is the transaction signer / gas payer, the `spender`-granting
+    /// account for ERC20 approvals, and the `operator` that appears in
+    /// `RaindexInventory.Operator{Deposit,Withdraw}` events (and the `sender`
+    /// in pre-migration `WithdrawV2` events). It is NOT necessarily the address
+    /// that owns the Raindex vaults — see [`Self::vault_owner`].
+    ///
+    /// Named `order_owner` for historical reasons: before the shared-inventory
+    /// migration the signing wallet also owned the orders/vaults, so the two
+    /// concepts coincided.
     pub fn order_owner(&self) -> Address {
         self.order_owner
+    }
+
+    /// Returns the address that owns the Raindex orders and vaults on-chain.
+    ///
+    /// Every `vaultBalance2` read, vault-registry entry, and ClearV3/TakeOrderV3
+    /// order-owner fill match is scoped by this address. Post the shared-inventory
+    /// migration (RAI-1198) the inventory contract is `msg.sender` to Raindex, so
+    /// it owns the vaults; `[raindex].vault_owner` is set to the inventory address
+    /// at that cutover. Until then it falls back to the signing wallet, matching
+    /// the bot-EOA-owned vaults that exist pre-migration.
+    pub fn vault_owner(&self) -> Address {
+        self.evm.vault_owner.unwrap_or(self.order_owner)
     }
 
     /// Returns the configured Pyth feed IDs keyed by base equity symbol.
@@ -1192,6 +1212,7 @@ impl Ctx {
                 rpc_url,
                 orderbook,
                 inventory: orderbook,
+                vault_owner: None,
                 deployment_block,
                 required_confirmations,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -1442,6 +1463,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
             inventory: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
+            vault_owner: None,
             deployment_block: 1,
             required_confirmations: 1,
             ingestion_cutoff: IngestionCutoff::Safe,

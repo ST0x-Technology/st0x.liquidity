@@ -37,13 +37,13 @@ use st0x_event_sorcery::{
     AggregateError, LifecycleError, Projection, SendError, Store, StoreBuilder, compact_events,
     incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::{USDC_BASE, Wallet};
+use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
     MarketOrder, Symbol, TryIntoExecutor,
 };
-use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
@@ -1257,6 +1257,94 @@ fn build_usdc_notifier(
     Ok(Arc::new(notifier))
 }
 
+/// Builds the rebalancing [`RaindexService`]: writes settle through the shared
+/// inventory, `market_maker_wallet` signs and appears as the operator.
+fn build_rebalancing_raindex_service<Chain: Wallet + Clone>(
+    base_wallet: &Chain,
+    ctx: &Ctx,
+    market_maker_wallet: Address,
+) -> Arc<RaindexService<Chain>> {
+    Arc::new(RaindexService::new(
+        base_wallet.clone(),
+        RaindexContracts {
+            inventory: ctx.evm.inventory,
+            orderbook: ctx.evm.orderbook,
+        },
+        market_maker_wallet,
+    ))
+}
+
+/// Startup preflight for the shared-inventory rebalancing path: the bot must
+/// hold `OPERATOR_ROLE` on the configured inventory or every rebalance
+/// deposit/withdraw reverts. Fails fast with a clear error rather than burning
+/// gas reverting on the first rebalance (the role is granted as part of the
+/// RAI-1198 cutover).
+///
+/// Skipped when `inventory == orderbook`: that collapse means no distinct
+/// inventory contract is in play (integration tests and any not-yet-migrated
+/// setup), so there is no `OPERATOR_ROLE` to check and the orderbook allowance
+/// is the live one, not a stale artifact to revoke.
+async fn preflight_inventory_access<Chain: Wallet + Clone>(
+    raindex_service: &RaindexService<Chain>,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    if ctx.evm.inventory == ctx.evm.orderbook {
+        debug!(
+            target: "inventory",
+            "inventory == orderbook; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
+        );
+        return Ok(());
+    }
+
+    raindex_service
+        .verify_operator_role::<OpenChainErrorRegistry>()
+        .await
+        .context(
+            "OPERATOR_ROLE preflight failed: the signing wallet cannot operate the \
+             configured RaindexInventory",
+        )?;
+    info!(
+        target: "inventory",
+        inventory = %ctx.evm.inventory,
+        "OPERATOR_ROLE preflight passed",
+    );
+    revoke_stale_orderbook_allowances(raindex_service, ctx).await;
+    Ok(())
+}
+
+/// Best-effort: revoke any stale pre-migration allowance the bot granted the
+/// orderbook directly. Deposits now approve the inventory instead, so a
+/// leftover orderbook allowance is dead capital-exposure surface. Idempotent
+/// (a no-op once zero) and non-fatal — a failure here must not block startup.
+async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
+    raindex_service: &RaindexService<Chain>,
+    ctx: &Ctx,
+) {
+    let mut revoke_tokens: Vec<Address> = vec![st0x_evm::USDC_BASE];
+    revoke_tokens.extend(
+        ctx.assets
+            .equities
+            .symbols
+            .values()
+            .map(|equity| equity.tokenized_equity_derivative),
+    );
+    for token in revoke_tokens {
+        match raindex_service
+            .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
+            .await
+        {
+            Ok(true) => info!(target: "inventory", %token, "Revoked stale orderbook allowance"),
+            Ok(false) => {}
+            Err(error) => warn!(
+                target: "inventory",
+                %token,
+                ?error,
+                "Failed to revoke stale orderbook allowance (non-fatal)",
+            ),
+        }
+    }
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -1278,15 +1366,13 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
             deps.vault_registry_projection,
             deps.ctx.evm.orderbook,
-            market_maker_wallet,
+            deps.ctx.vault_owner(),
         ));
 
-        let raindex_service = Arc::new(RaindexService::new(
-            base_wallet.clone(),
-            deps.ctx.evm.inventory,
-            deps.ctx.evm.orderbook,
-            market_maker_wallet,
-        ));
+        let raindex_service =
+            build_rebalancing_raindex_service(&base_wallet, &deps.ctx, market_maker_wallet);
+
+        preflight_inventory_access(&raindex_service, &deps.ctx).await?;
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             alpaca_auth.base_url().to_string(),
@@ -1331,7 +1417,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             },
             deps.vault_registry,
             deps.ctx.evm.orderbook,
-            market_maker_wallet,
+            deps.ctx.vault_owner(),
             deps.inventory.clone(),
             wrapper.clone(),
             deps.schedulers,

@@ -23,8 +23,16 @@ orderbook = "0x1111111111111111111111111111111111111111"
 # Raindex orders/vaults. Rebalance deposits/withdrawals settle through this
 # contract; fills across every venue adapter (Bebop hook, univ4 hook) surface
 # here as OperatorDeposit/OperatorWithdraw events. The bot's EOA must hold
-# OPERATOR_ROLE on this address for rebalancing to succeed.
+# OPERATOR_ROLE on this address for rebalancing to succeed (a startup preflight
+# checks this and refuses to start otherwise).
 inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
+# Optional. Owner of the Raindex orders/vaults on-chain — scopes every
+# vaultBalance2 read, vault-registry entry, and ClearV3/TakeOrderV3 order-owner
+# fill match. Leave unset while the vaults are owned by the bot EOA (the
+# pre-inventory-migration state; it falls back to [wallet].address). Once the
+# vaults are migrated under the inventory contract, set this to the `inventory`
+# address so balance reads and fill matching query the right owner:
+#   vault_owner = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 deployment_block = 1
 # Block-confirmation depth required before a transaction this bot submits is
 # treated as settled (the primary gate for USDC rebalancing withdrawals). This

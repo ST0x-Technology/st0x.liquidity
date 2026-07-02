@@ -1172,7 +1172,7 @@ async fn raindex_orders(
         return unavailable_json("REST API not configured (simulate mode)");
     };
 
-    let owner = state.ctx.order_owner();
+    let owner = state.ctx.vault_owner();
     let url = format!(
         "{}/v1/orders/owner/{:#x}",
         rest_api.url.trim_end_matches('/'),

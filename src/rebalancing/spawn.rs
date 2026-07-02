@@ -171,6 +171,7 @@ mod tests {
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::usdc::UsdcSettlementParams;
     use crate::telemetry::TelemetrySender;
+    use st0x_raindex::RaindexContracts;
 
     #[test]
     fn to_wrapped_equities_maps_underlying_and_derivative() {
@@ -338,8 +339,10 @@ mod tests {
         let owner = base_wallet.address();
         let raindex = Arc::new(RaindexService::new(
             base_wallet,
-            TEST_ORDERBOOK,
-            TEST_ORDERBOOK,
+            RaindexContracts {
+                inventory: TEST_ORDERBOOK,
+                orderbook: TEST_ORDERBOOK,
+            },
             owner,
         ));
 

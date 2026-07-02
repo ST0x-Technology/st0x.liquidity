@@ -17,7 +17,7 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
-use st0x_raindex::RaindexService;
+use st0x_raindex::{RaindexContracts, RaindexService};
 
 use super::Conductor;
 use super::exit::MonitorTaskError;
@@ -188,8 +188,10 @@ where
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
         evm,
-        context.ctx.evm.inventory,
-        context.ctx.evm.orderbook,
+        RaindexContracts {
+            inventory: context.ctx.evm.inventory,
+            orderbook: context.ctx.evm.orderbook,
+        },
         order_owner,
     ));
 
@@ -220,6 +222,7 @@ where
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
         snapshot_id,
+        context.ctx.vault_owner(),
         context.frameworks.snapshot,
         wallet_polling,
         tokenizer,

@@ -29,8 +29,16 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Shared RaindexInventory (rainlanguage/raindex.governance) that owns the
 # Raindex orders/vaults. All venue adapters (Bebop hook, univ4 hook) and
 # this bot's rebalancing settle through it; the bot's EOA must hold
-# OPERATOR_ROLE on this address.
+# OPERATOR_ROLE on this address (enforced by a startup preflight).
+#
+# NOTE: staging currently points at the same (pre-Turnkey-migration) inventory
+# as prod. RAI-1198 should give staging its own inventory redeploy; update this
+# address and `vault_owner` below to the staging inventory at that cutover so a
+# staging bug can't touch prod-owned vaults.
 inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
+# Owner of the Raindex orders/vaults on-chain (vaultBalance2 / registry / fill
+# match key). Unset = the [wallet] address (pre-migration). Set to the
+# `inventory` address once RAI-1198 migrates the vaults under it.
 # Block number to start backfilling order events from.
 deployment_block = 43259507
 # Block confirmations required before a submitted transaction is treated as
