@@ -84,13 +84,17 @@
           nodeName = "st0x-liquidity";
           volumeName = "st0x-liquidity-data";
           hostKey = keys.host-prod;
+          # Still on the rainlang.xyz tailnet; migrates to st0x.io last, after
+          # staging is validated on tail6094d7.ts.net.
           tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
         };
         staging = {
           nodeName = "st0x-liquidity-staging";
           volumeName = "st0x-liquidity-staging-data";
           hostKey = keys.host-staging;
-          tailscaleMagicDnsName = "st0x-liquidity-staging.taile5cf8a.ts.net";
+          # Migrated to the st0x.io tailnet (tail6094d7.ts.net) so telemetry can
+          # reach st0x-management-observability (100.93.167.114).
+          tailscaleMagicDnsName = "st0x-liquidity-staging.tail6094d7.ts.net";
         };
       };
       envNames = builtins.attrNames environments;
