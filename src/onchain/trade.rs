@@ -266,6 +266,12 @@ impl OnchainTrade {
         )?;
 
         if trade_details.equity_amount().is_zero()? {
+            debug!(
+                target: "hedge",
+                %tx_hash,
+                log_index,
+                "Skipping fill with zero equity amount; not a tokenized-equity trade"
+            );
             return Ok(None);
         }
 
@@ -273,8 +279,11 @@ impl OnchainTrade {
         let price_per_share_usdc =
             (trade_details.usdc_amount().value() / trade_details.equity_amount().inner())?;
 
+        // Equity is non-zero (checked above), so a non-positive price is a real
+        // equity movement we cannot price. Reject it rather than silently dropping
+        // it, which would leave the resulting position unhedged.
         if price_per_share_usdc.lt(Float::zero()?)? || price_per_share_usdc.is_zero()? {
-            return Ok(None);
+            return Err(TradeValidationError::NonPositivePrice(price_per_share_usdc).into());
         }
 
         let (equity_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
@@ -498,6 +507,11 @@ pub(crate) enum TradeValidationError {
     NegativeShares(Float),
     #[error("Negative USDC amount: {}", format_float_with_fallback(.0))]
     NegativeUsdc(Float),
+    #[error(
+        "fill has non-zero equity but a non-positive USDC/share price: {}",
+        format_float_with_fallback(.0)
+    )]
+    NonPositivePrice(Float),
     #[error("Float error: {0}")]
     Float(#[from] FloatError),
     #[error(
