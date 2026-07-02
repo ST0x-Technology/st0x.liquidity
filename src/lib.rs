@@ -87,6 +87,8 @@ pub fn check_positions_job_type() -> &'static str {
 #[cfg(any(test, feature = "test-support"))]
 pub use conductor::job::{FailureInjector, JobKind};
 #[cfg(any(test, feature = "test-support"))]
+pub use performance::seed_simulated_hedge_latency_history;
+#[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::TradingMode;

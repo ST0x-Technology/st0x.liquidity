@@ -29,6 +29,8 @@
 //! events and a read side ([`report`]) that loads and assembles the report. The
 //! attribution recompute they share lives here as [`uncovered_fills`].
 
+#[cfg(any(test, feature = "test-support"))]
+use chrono::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
@@ -47,6 +49,86 @@ pub(crate) use projection::HedgeLatencyProjection;
 pub(crate) use report::{
     PerformanceError, ReportRange, hedge_latency_report, load_hedge_performance,
 };
+
+/// Seeds deterministic hedge-latency read-model rows for local dashboard simulation.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_simulated_hedge_latency_history(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    days: u32,
+) -> Result<(), sqlx::Error> {
+    const SAMPLES_PER_DAY: u32 = 12;
+
+    let range_start = now - Duration::days(i64::from(days));
+    let mut transaction = pool.begin().await?;
+
+    for day in 0..days {
+        for sample in 0..SAMPLES_PER_DAY {
+            let symbol = if sample % 2 == 0 { "AAPL" } else { "TSLA" };
+            let sample_start = range_start
+                + Duration::days(i64::from(day))
+                + Duration::hours(12)
+                + Duration::minutes(i64::from(sample) * 4);
+            let latency_ms = i64::from(day) * 75 + i64::from(sample) * 125;
+            let block_timestamp = sample_start;
+            let seen_at = block_timestamp + Duration::milliseconds(1_000 + latency_ms);
+            let placed_at = seen_at + Duration::milliseconds(2_000 + latency_ms);
+            let submitted_at = placed_at + Duration::milliseconds(750 + latency_ms);
+            let filled_at = submitted_at + Duration::milliseconds(3_000 + latency_ms);
+            let fill_uuid = simulated_latency_uuid("fill", day, sample);
+            let order_uuid = simulated_latency_uuid("order", day, sample);
+            let tx_hash = format!("0x{:064x}", fill_uuid.as_u128());
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO hedge_fill \
+                 (symbol, tx_hash, log_index, block_timestamp, seen_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(symbol)
+            .bind(tx_hash)
+            .bind(i64::from(sample))
+            .bind(block_timestamp.to_rfc3339())
+            .bind(seen_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO hedge_cycle \
+                 (offchain_order_id, symbol, placed_at, covered_count, \
+                  covered_earliest_block_timestamp, covered_latest_seen_at, filled_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(order_uuid.to_string())
+            .bind(symbol)
+            .bind(placed_at.to_rfc3339())
+            .bind(1_i64)
+            .bind(block_timestamp.to_rfc3339())
+            .bind(seen_at.to_rfc3339())
+            .bind(filled_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO hedge_submission (offchain_order_id, submitted_at) \
+                 VALUES (?, ?)",
+            )
+            .bind(order_uuid.to_string())
+            .bind(submitted_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+
+    transaction.commit().await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn simulated_latency_uuid(kind: &str, day: u32, sample: u32) -> uuid::Uuid {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("st0x-simulated-hedge-latency:{kind}:{day}:{sample}").as_bytes(),
+    )
+}
 
 // Shared with the sibling `rebalance`/`reliability` submodules via `super::`,
 // matching the visibility these items had before the split. `latency_stats`
@@ -317,5 +399,52 @@ pub(super) mod test_helpers {
         load_hedge_performance(&pool, &ReportRange::all_time())
             .await
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod simulated_history_tests {
+    use chrono::TimeZone;
+
+    use super::report::{ReportRange, hedge_latency_report, load_hedge_performance};
+    use super::*;
+    use crate::test_utils::setup_test_db;
+
+    #[tokio::test]
+    async fn simulated_hedge_latency_history_populates_daily_percentile_buckets() {
+        let pool = setup_test_db().await;
+        let now = Utc.with_ymd_and_hms(2026, 7, 1, 18, 0, 0).unwrap();
+        let days = 14;
+
+        seed_simulated_hedge_latency_history(&pool, now, days)
+            .await
+            .unwrap();
+
+        let range = ReportRange {
+            from: now - Duration::days(i64::from(days)),
+            to: now,
+        };
+        let performances = load_hedge_performance(&pool, &range).await.unwrap();
+        let report = hedge_latency_report(&performances, &range);
+
+        assert_eq!(report.summary.fill_count, 168);
+        assert_eq!(report.total_cycles, 168);
+        assert_eq!(report.cycles.len(), 100);
+        assert_eq!(report.buckets.len(), 14);
+        assert!(report.open_exposures.is_empty());
+        assert!(
+            report
+                .buckets
+                .iter()
+                .all(|bucket| bucket.stages.exposure_window.is_some()),
+            "every seeded day must produce exposure-window percentile samples",
+        );
+
+        let first = report.buckets[0].stages.exposure_window.as_ref().unwrap();
+        let last = report.buckets[13].stages.exposure_window.as_ref().unwrap();
+
+        assert!(first.p50_ms < first.p90_ms);
+        assert!(first.p90_ms < first.p99_ms);
+        assert!(last.p50_ms > first.p50_ms);
     }
 }

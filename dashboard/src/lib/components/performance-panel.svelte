@@ -13,14 +13,14 @@
     fetchHedgeLatencies,
     fetchInfraReport,
     fetchRebalanceTimings,
-    fetchReliabilityReport,
+    fetchReliabilityReport
   } from '$lib/performance/api'
   import {
     blockLagCard,
     detectionCard,
     errorsCard,
     exposureCard,
-    openExposureCard,
+    openExposureCard
   } from '$lib/performance/cards'
   import {
     type WaterfallSegmentName,
@@ -30,7 +30,7 @@
     layoutDependencySparkline,
     layoutPercentileSeries,
     layoutRebalanceBars,
-    layoutWaterfall,
+    layoutWaterfall
   } from '$lib/performance/charts'
   import { type SloStatus, formatDurationMs } from '$lib/performance/slo'
 
@@ -73,7 +73,7 @@
     try {
       const [latencyReport, reliabilityReport] = await Promise.all([
         fetchHedgeLatencies({ from, to }),
-        fetchReliabilityReport({ from, to }),
+        fetchReliabilityReport({ from, to })
       ])
       if (seq !== cardFetchSeq) return
 
@@ -86,9 +86,7 @@
     } catch (fetchError) {
       if (seq !== cardFetchSeq) return
 
-      error.update(() =>
-        fetchError instanceof Error ? fetchError.message : 'Unknown error',
-      )
+      error.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
     }
 
     await infraRefresh
@@ -137,14 +135,14 @@
     const to = new Date()
     const range = {
       from: rangeStart(chartRange.current, to),
-      to,
+      to
     }
 
     // Ingestion-health telemetry is pruned at the retention window, so clamp
     // the infra query to it and flag when the selected range was truncated --
     // a 1Y view must not be mistaken for "the system has only run 14 days".
     const infraFrom = new Date(
-      Math.max(range.from.getTime(), to.getTime() - INGESTION_RETENTION_MS),
+      Math.max(range.from.getTime(), to.getTime() - INGESTION_RETENTION_MS)
     )
     ingestionTruncated.update(() => infraFrom.getTime() > range.from.getTime())
 
@@ -161,7 +159,7 @@
     try {
       const [latencyReport, rebalanceReport] = await Promise.all([
         fetchHedgeLatencies(range),
-        fetchRebalanceTimings(range),
+        fetchRebalanceTimings(range)
       ])
 
       if (seq !== chartFetchSeq) return
@@ -173,9 +171,7 @@
     } catch (fetchError) {
       if (seq !== chartFetchSeq) return
 
-      chartError.update(() =>
-        fetchError instanceof Error ? fetchError.message : 'Unknown error',
-      )
+      chartError.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
     }
 
     await infraRefresh
@@ -204,7 +200,7 @@
     exposureCard(latencies.current),
     errorsCard(reliability.current, CARD_WINDOW_HOURS),
     openExposureCard(latencies.current, lastRefreshed.current),
-    blockLagCard(infra.current, lastRefreshed.current),
+    blockLagCard(infra.current, lastRefreshed.current)
   ])
 
   const statusClasses = (status: SloStatus): string => {
@@ -247,27 +243,25 @@
   const SEGMENT_COLORS: Record<WaterfallSegmentName, string> = {
     unhedged: '#64748b',
     submission: '#38bdf8',
-    execution: '#34d399',
+    execution: '#34d399'
   }
 
   const SEGMENT_LABELS: Record<WaterfallSegmentName, string> = {
     unhedged: 'unhedged (fill -> placed)',
     submission: 'submission (placed -> accepted)',
-    execution: 'execution (accepted -> filled)',
+    execution: 'execution (accepted -> filled)'
   }
 
-  const segmentColor = (
-    name: WaterfallSegmentName,
-    status: string,
-  ): string => (name === 'execution' && status === 'failed' ? '#f87171' : SEGMENT_COLORS[name])
+  const segmentColor = (name: WaterfallSegmentName, status: string): string =>
+    name === 'execution' && status === 'failed' ? '#f87171' : SEGMENT_COLORS[name]
 
   const waterfallRows = $derived(
     layoutWaterfall(chartLatencies.current?.cycles ?? [], {
       plotWidth: WATERFALL_PLOT_WIDTH,
       sort: waterfallSort.current,
       maxRows: WATERFALL_MAX_ROWS,
-      now: chartRefreshedAt.current ?? new Date(),
-    }),
+      now: chartRefreshedAt.current ?? new Date()
+    })
   )
 
   type StageKey = keyof StageLatencies
@@ -277,16 +271,17 @@
     { key: 'detection', label: 'Detection' },
     { key: 'decision', label: 'Decision' },
     { key: 'submission', label: 'Submission' },
-    { key: 'execution', label: 'Execution' },
+    { key: 'execution', label: 'Execution' }
   ]
 
   const SERIES_PLOT_WIDTH = 600
   const SERIES_PLOT_HEIGHT = 160
+  const SERIES_HORIZONTAL_PADDING = 24
 
   const PERCENTILE_COLORS = {
     p50Ms: '#34d399',
     p90Ms: '#fbbf24',
-    p99Ms: '#f87171',
+    p99Ms: '#f87171'
   } as const
 
   const selectedStage = reactive<StageKey>('exposureWindow')
@@ -296,7 +291,8 @@
       plotWidth: SERIES_PLOT_WIDTH,
       plotHeight: SERIES_PLOT_HEIGHT,
       maxXLabels: 8,
-    }),
+      horizontalPadding: SERIES_HORIZONTAL_PADDING
+    })
   )
 
   // Each percentile line has one point per sampled time bucket, so the first
@@ -318,34 +314,34 @@
     burn: '#fb923c',
     attestation: '#fbbf24',
     mint: '#34d399',
-    deposit: '#818cf8',
+    deposit: '#818cf8'
   }
 
   const rebalanceRows = $derived(
     layoutRebalanceBars(chartRebalances.current?.operations ?? [], {
       plotWidth: REBALANCE_PLOT_WIDTH,
       maxRows: REBALANCE_MAX_ROWS,
-      now: chartRefreshedAt.current ?? new Date(),
-    }),
+      now: chartRefreshedAt.current ?? new Date()
+    })
   )
 
   const attestationTrend = $derived(
     layoutAttestationTrend(chartRebalances.current?.attestationTrend ?? [], {
       plotWidth: TREND_PLOT_WIDTH,
-      plotHeight: TREND_PLOT_HEIGHT,
-    }),
+      plotHeight: TREND_PLOT_HEIGHT
+    })
   )
 
   const blockLagTrend = $derived(
     layoutBlockLagTrend(chartInfra.current?.monitor.blockLag ?? [], {
       plotWidth: TREND_PLOT_WIDTH,
-      plotHeight: TREND_PLOT_HEIGHT,
-    }),
+      plotHeight: TREND_PLOT_HEIGHT
+    })
   )
 
   const DIRECTION_LABELS: Record<UsdcBridgeDirection, string> = {
     alpaca_to_base: 'Alpaca → Base',
-    base_to_alpaca: 'Base → Alpaca',
+    base_to_alpaca: 'Base → Alpaca'
   }
 
   const directionLabel = (direction: UsdcBridgeDirection | null): string =>
@@ -483,8 +479,8 @@
         </div>
         {#if (chartLatencies.current?.totalCycles ?? 0) > waterfallRows.length}
           <p class="mt-2 text-xs text-muted-foreground">
-            Showing {waterfallRows.length} of {chartLatencies.current?.totalCycles} cycles
-            in range{waterfallSort.current === 'slowest'
+            Showing {waterfallRows.length} of {chartLatencies.current?.totalCycles} cycles in range{waterfallSort.current ===
+            'slowest'
               ? ' — slowest among the most recent cycles shown, not full-range'
               : ''}.
           </p>
@@ -526,8 +522,8 @@
         </p>
       {:else if seriesBucketCount === 1}
         <p class="py-6 text-center text-sm text-muted-foreground">
-          Only one time bucket has samples in this range, so there's no trend to
-          plot yet. Widen the range or wait for more data to accumulate.
+          Only one time bucket has samples in this range, so there's no trend to plot yet. Widen the
+          range or wait for more data to accumulate.
         </p>
       {:else}
         <div class="flex items-start gap-2">
@@ -554,12 +550,7 @@
                 stroke-width="1.5"
               />
               {#each line.points as point, pointIndex (pointIndex)}
-                <circle
-                  cx={point.x}
-                  cy={point.y}
-                  r="2"
-                  fill={PERCENTILE_COLORS[line.percentile]}
-                />
+                <circle cx={point.x} cy={point.y} r="2" fill={PERCENTILE_COLORS[line.percentile]} />
               {/each}
             {/each}
             {#each seriesLayout.xLabels as xLabel (xLabel.x)}
@@ -581,9 +572,7 @@
 
   <Card.Root>
     <Card.Header class="pb-2">
-      <Card.Title class="text-sm font-medium">
-        Errors &amp; warnings by module (24h)
-      </Card.Title>
+      <Card.Title class="text-sm font-medium">Errors &amp; warnings by module (24h)</Card.Title>
     </Card.Header>
     <Card.Content>
       {#if reliability.current !== null && reliability.current.logTargets.length === 0}
@@ -633,9 +622,7 @@
 
       {#if reliability.current !== null && reliability.current.failureEvents.length > 0}
         <div class="mt-4 border-t pt-2">
-          <p class="mb-1 text-xs font-medium text-red-400">
-            Lifecycle failures (money-at-risk)
-          </p>
+          <p class="mb-1 text-xs font-medium text-red-400">Lifecycle failures (money-at-risk)</p>
           {#each reliability.current.failureEvents as failure (failure.eventType)}
             <div class="flex items-center gap-2 text-xs">
               <span class="w-72 shrink-0 truncate font-mono">{failure.eventType}</span>
@@ -656,8 +643,7 @@
       <div class="flex flex-wrap gap-3 text-xs text-muted-foreground">
         {#each Object.entries(STAGE_COLORS) as [stage, color] (stage)}
           <span class="flex items-center gap-1">
-            <span class="inline-block h-2 w-2 rounded-sm" style:background={color}
-            ></span>
+            <span class="inline-block h-2 w-2 rounded-sm" style:background={color}></span>
             {stage}
           </span>
         {/each}
@@ -732,8 +718,7 @@
       <Card.Title class="text-sm font-medium">Ingestion health</Card.Title>
       {#if ingestionTruncated.current}
         <p class="text-xs text-muted-foreground">
-          Showing the last 14 days · older samples are pruned by the telemetry
-          retention window.
+          Showing the last 14 days · older samples are pruned by the telemetry retention window.
         </p>
       {/if}
     </Card.Header>
@@ -751,12 +736,7 @@
           class="h-20 w-full"
           preserveAspectRatio="none"
         >
-          <polyline
-            points={blockLagTrend.path}
-            fill="none"
-            stroke="#38bdf8"
-            stroke-width="1.5"
-          />
+          <polyline points={blockLagTrend.path} fill="none" stroke="#38bdf8" stroke-width="1.5" />
           {#each blockLagTrend.points as point, pointIndex (pointIndex)}
             <circle cx={point.x} cy={point.y} r="2" fill="#38bdf8" />
           {/each}
@@ -765,7 +745,9 @@
 
       {#if chartInfra.current}
         {@const poll = chartInfra.current.monitor.poll}
-        <div class="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-2 text-xs text-muted-foreground">
+        <div
+          class="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-2 text-xs text-muted-foreground"
+        >
           <span>{poll.cycles} poll cycles</span>
           <span class={poll.errors > 0 ? 'text-red-400' : ''}>
             {poll.errors} errors
@@ -789,8 +771,8 @@
     <Card.Header class="pb-2">
       <Card.Title class="text-sm font-medium">Dependency health</Card.Title>
       <p class="text-xs text-muted-foreground">
-        Per-operation latency and errors for the RPC provider and broker API.
-        Sparkline bars are per-bucket median latency; red bars contain errors.
+        Per-operation latency and errors for the RPC provider and broker API. Sparkline bars are
+        per-bucket median latency; red bars contain errors.
       </p>
     </Card.Header>
     <Card.Content>
