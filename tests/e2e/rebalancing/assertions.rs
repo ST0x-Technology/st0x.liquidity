@@ -279,7 +279,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         }),
     };
 
-    let mut ctx = Ctx::for_test()
+    let ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
@@ -289,9 +289,9 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .assets(assets)
+        .issuance(st0x_config::test_issuance_status_ctx(issuance_base_url))
         .redemption_wallet(redemption_wallet)
         .call()?;
-    ctx.issuance.base_url = issuance_base_url;
     Ok(ctx)
 }
 

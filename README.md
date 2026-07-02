@@ -272,13 +272,25 @@ nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-feature
 
 ## Local Simulation
 
-`nix run .#simulate` launches a full local simulation of the market making
-system using [mprocs](https://github.com/pvolok/mprocs) to run the dashboard and
-the bot side-by-side. `nix run .#simulate-failures` starts the same stack, then
+`nix run .#simulate` launches the full-system chaos eventual-consistency e2e
+test (`full_system_concurrent`) with [mprocs](https://github.com/pvolok/mprocs)
+running the dashboard and bot side-by-side. Trades fire in randomized order with
+delayed broker fills; between rounds the test injects chaos (bot restarts, NAV
+bumps, asset add/remove, broker latency) and then asserts hedging, mint, and
+USDC rebalancing still converge. Open `http://localhost:5173` to watch the
+dashboard while it runs. Set `SIMULATE_EXIT_AFTER_CHAOS=1` to exit once
+assertions pass instead of idling for dashboard inspection.
+
+`nix run .#simulate-market` runs the infinite market simulation instead —
+continuous user trades at ~10-second intervals. Use this when you want to
+observe long-running liquidity cycling rather than a single bounded chaos
+scenario.
+
+`nix run .#simulate-failures` starts the same stack as `simulate-market`, then
 creates failed mint and redemption rebalances whose mock Alpaca provider later
 completes and prints the `transfer recheck` commands that recover them.
 
-What it does:
+What `simulate-market` does:
 
 1. Starts a local Anvil blockchain with deployed Raindex orderbook contracts
 2. Deploys mock services: Alpaca broker, tokenization API, CCTP attestation
@@ -294,7 +306,7 @@ equity supply between venues, and bridges USDC via mock CCTP to keep cash
 balanced. If the system works correctly, the vaults never permanently drain —
 the bot cycles liquidity back through hedging and rebalancing.
 
-Open `http://localhost:5173` to watch the dashboard. Press `Ctrl-C` to stop.
+Press `Ctrl-C` to stop.
 
 ## Project Structure
 

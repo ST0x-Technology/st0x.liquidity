@@ -270,7 +270,9 @@ async fn start_broker_mock(
 async fn start_issuance_mock() -> httpmock::MockServer {
     let server = httpmock::MockServer::start_async().await;
     server.mock(|when, then| {
-        when.method(httpmock::Method::GET);
+        when.method(httpmock::Method::GET)
+            .path_prefix("/tokenized-assets/")
+            .path_suffix("/status");
         then.status(200).json_body(serde_json::json!({
             "underlying": "TEST",
             "status": "enabled",

@@ -21,6 +21,7 @@ mod chaos_load;
 mod chaos_rpc;
 mod chaos_time;
 mod full_system;
+mod full_system_chaos;
 mod hedging;
 mod poll;
 mod rebalancing;

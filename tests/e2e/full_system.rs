@@ -5,12 +5,17 @@
 //!   Validates correctness of the complete hedging -> mint -> USDC bridge
 //!   pipeline. Finishes when all assertions pass.
 //!
+//! - [`full_system_concurrent`]: Chaos eventual-consistency simulation — trades
+//!   fire in randomized order while the harness randomly restarts the bot, bumps
+//!   broker NAV, adds MSFT to config, or removes TSLA from config. Run via
+//!   `nix run .#simulate`.
+//!
 //! - [`simulate`]: Long-running market simulation. Sets up Raindex liquidity
 //!   orders once (buy + sell per symbol, shared vaults) and continuously
 //!   takes them to simulate users buying and selling tokenized equities.
 //!   The bot counter-trades, mints/redeems, and bridges USDC to maintain
 //!   liquidity — if it works correctly, the vaults never drain permanently.
-//!   Run via `nix run .#simulate` (mprocs with dashboard). Ctrl-C to stop.
+//!   Run via `nix run .#simulate-market` (mprocs with dashboard). Ctrl-C to stop.
 //!
 //! - [`simulate_failures`]: Same live simulation, but first creates stuck
 //!   mint and redemption rebalances where the local aggregate failed while
@@ -56,7 +61,7 @@ use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
-    connect_db, count_events, count_events_of_type, free_port, poll_for_broker_fills,
+    connect_db, count_events, count_events_of_type, free_port_pair, poll_for_broker_fills,
     poll_for_events, poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
@@ -65,7 +70,7 @@ use crate::test_infra::TestInfra;
 /// Builds a `Ctx` with ALL features enabled: hedging, equity rebalancing,
 /// and USDC rebalancing. This is the superset context for the mega test.
 #[bon::builder]
-fn build_full_system_ctx<P: Provider + Clone>(
+pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
     chain: &base_chain::BaseChain<P>,
     ethereum_endpoint: &str,
     broker: &AlpacaBrokerMock,
@@ -163,12 +168,9 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .maybe_rest_api(
             rest_api_url.map(|url| st0x_config::RestApiCtx::unauthenticated(url.to_string())),
         )
+        .issuance(st0x_config::test_issuance_status_ctx(issuance_base_url))
         .redemption_wallet(REDEMPTION_WALLET)
         .call()
-        .map(|mut ctx| {
-            ctx.issuance.base_url = issuance_base_url;
-            ctx
-        })
         .map_err(Into::into)
 }
 
@@ -589,7 +591,7 @@ async fn full_system() -> anyhow::Result<()> {
 
     let (event_sender, _) = broadcast::channel::<Statement>(256);
 
-    let server_port = free_port();
+    let (server_port, board_port) = free_port_pair();
     let ctx = build_full_system_ctx()
         .chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
@@ -601,7 +603,7 @@ async fn full_system() -> anyhow::Result<()> {
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
         .server_port(server_port)
-        .board_port(server_port + 1)
+        .board_port(board_port)
         .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
 
@@ -787,6 +789,13 @@ async fn full_system() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Chaos eventual-consistency simulation for `nix run .#simulate`.
+#[tokio::test]
+#[ignore = "long-running system test -- run via nix run .#simulate"]
+async fn full_system_concurrent() -> anyhow::Result<()> {
+    Box::pin(crate::full_system_chaos::run_concurrent_chaos_simulation()).await
+}
+
 /// Long-running simulation: sets up mock infrastructure and Raindex
 /// liquidity orders once, starts the bot, then simulates users buying and
 /// selling indefinitely. Each symbol has a SellEquity order (user buys
@@ -798,14 +807,14 @@ async fn full_system() -> anyhow::Result<()> {
 /// supply, and bridges USDC to keep cash balanced. The Rain vaults stay
 /// funded because the bot continuously cycles liquidity back into them.
 ///
-/// Run via `nix run .#simulate` which pairs this with the dashboard dev
+/// Run via `nix run .#simulate-market` which pairs this with the dashboard dev
 /// server in mprocs so you can observe the system in real time.
 #[tokio::test]
-#[ignore = "infinite simulation -- run via nix run .#simulate"]
+#[ignore = "infinite simulation -- run via nix run .#simulate-market"]
 #[allow(clippy::too_many_lines)]
 async fn simulate() -> anyhow::Result<()> {
     let server_port: u16 = std::env::var("SIMULATE_BOT_PORT")
-        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate`)")
+        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate-market`)")
         .parse()
         .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
 
