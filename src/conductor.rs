@@ -46,6 +46,8 @@ use st0x_execution::{
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_registry::SymbolCache;
+use st0x_tokenization::AlpacaTokenizationService;
+use st0x_tokenization::Tokenizer;
 use st0x_wrapper::WrapperService;
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
@@ -97,8 +99,6 @@ use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
-use crate::tokenization::Tokenizer;
-use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
@@ -3380,6 +3380,8 @@ mod tests {
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
 
     use super::*;
@@ -3402,8 +3404,6 @@ mod tests {
         OnchainTradeBuilder, get_test_log, get_test_order, rebalancing_enabled_equities,
         setup_test_db, setup_test_pools,
     };
-    use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenization::{TokenizationRequestId, issuer_request_id};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::AccountForDexTrade;
@@ -3511,9 +3511,9 @@ mod tests {
         pool: sqlx::SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
         services: crate::rebalancing::equity::EquityTransferServices,
-        mint_id: crate::tokenization::IssuerRequestId,
+        mint_id: st0x_tokenization::IssuerRequestId,
         redemption_id: crate::equity_redemption::RedemptionAggregateId,
-        tokenizer: Arc<crate::tokenization::mock::MockTokenizer>,
+        tokenizer: Arc<st0x_tokenization::mock::MockTokenizer>,
         rebalancing_service: RebalancingService,
         inventory: Arc<BroadcastingInventory>,
         resume_queue: crate::rebalancing::equity::ResumeTokenizationJobQueue,
@@ -10045,7 +10045,7 @@ mod tests {
             quantity: float!(5),
             wallet: Address::ZERO,
             issuer_request_id: issuer_request_id("exc-tokens-received"),
-            tokenization_request_id: TokenizationRequestId("TOK-TR".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK-TR"),
             tx_hash: TxHash::ZERO,
             shares_minted: U256::from(5u64),
             fees: None,
@@ -10058,7 +10058,7 @@ mod tests {
             quantity: float!(5),
             wallet: Address::ZERO,
             issuer_request_id: issuer_request_id("exc-wrap-submitted"),
-            tokenization_request_id: TokenizationRequestId("TOK-WS".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK-WS"),
             tx_hash: TxHash::ZERO,
             shares_minted: U256::from(5u64),
             fees: None,
@@ -10072,7 +10072,7 @@ mod tests {
             quantity: float!(5),
             wallet: Address::ZERO,
             issuer_request_id: issuer_request_id("exc-tokens-wrapped"),
-            tokenization_request_id: TokenizationRequestId("TOK-TW".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK-TW"),
             tx_hash: TxHash::ZERO,
             shares_minted: U256::from(5u64),
             requested_at: now,

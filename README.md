@@ -311,6 +311,8 @@ Workspace crates:
   testing utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Alpaca Broker API and mock implementations
+- **`st0x-tokenization`** (`crates/tokenization/`) - Standalone `Tokenizer`
+  trait abstraction with Alpaca tokenization API and mock implementations
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support

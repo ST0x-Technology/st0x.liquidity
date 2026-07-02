@@ -21,13 +21,13 @@ use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ET
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
 use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
+use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
+use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
-use crate::tokenization::{IssuerRequestId, TokenizationRequestId};
-use crate::tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Pending mints and redemptions aggregated by symbol.
@@ -710,7 +710,7 @@ where
     }
 
     fn aggregate_pending_requests(
-        requests: impl Iterator<Item = crate::tokenization::TokenizationRequest>,
+        requests: impl Iterator<Item = st0x_tokenization::TokenizationRequest>,
     ) -> Result<PendingRequests, FloatError> {
         let mut mints: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
         let mut redemptions: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
@@ -765,7 +765,7 @@ where
 
     fn is_own_request(
         &self,
-        request: &crate::tokenization::TokenizationRequest,
+        request: &st0x_tokenization::TokenizationRequest,
         ownership: &PendingRequestOwnershipSnapshot,
     ) -> bool {
         let is_owned = match request.r#type {
@@ -973,11 +973,11 @@ mod tests {
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_tokenization::issuer_request_id;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::tokenization::issuer_request_id;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     #[derive(Clone, Default)]
@@ -1004,11 +1004,17 @@ mod tests {
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
-                    .map(|id| TokenizationRequestId(id.to_string()))
+                    .map(|id| {
+                        TokenizationRequestId::try_new(id)
+                            .expect("test tokenization request id must be non-empty")
+                    })
                     .collect(),
                 redemption_tokenizations: redemption_tokenization_request_ids
                     .into_iter()
-                    .map(|id| TokenizationRequestId(id.to_string()))
+                    .map(|id| {
+                        TokenizationRequestId::try_new(id)
+                            .expect("test tokenization request id must be non-empty")
+                    })
                     .collect(),
                 redemption_txs: redemption_txs.into_iter().collect(),
             },
@@ -2420,7 +2426,7 @@ mod tests {
         };
 
         let tokenizer =
-            Arc::new(crate::tokenization::mock::MockTokenizer::new().with_list_pending_failure());
+            Arc::new(st0x_tokenization::mock::MockTokenizer::new().with_list_pending_failure());
 
         let service = InventoryPollingService::new(
             raindex_service,
@@ -3354,21 +3360,22 @@ mod tests {
     }
 
     fn mock_pending_request(
-        request_type: crate::tokenization::TokenizationRequestType,
+        request_type: st0x_tokenization::TokenizationRequestType,
         symbol: &str,
         quantity: i64,
-    ) -> crate::tokenization::TokenizationRequest {
+    ) -> st0x_tokenization::TokenizationRequest {
         mock_pending_request_with_wallet(request_type, symbol, quantity, None)
     }
 
     fn mock_pending_request_no_type(
         symbol: &str,
         quantity: i64,
-    ) -> crate::tokenization::TokenizationRequest {
-        crate::tokenization::TokenizationRequest {
-            id: TokenizationRequestId(format!("REQ_{symbol}_{quantity}_notype")),
+    ) -> st0x_tokenization::TokenizationRequest {
+        st0x_tokenization::TokenizationRequest {
+            id: TokenizationRequestId::try_new(format!("REQ_{symbol}_{quantity}_notype"))
+                .expect("test tokenization request id must be non-empty"),
             r#type: None,
-            status: crate::tokenization::TokenizationRequestStatus::Pending,
+            status: st0x_tokenization::TokenizationRequestStatus::Pending,
             underlying_symbol: test_symbol(symbol),
             quantity: test_shares(quantity),
             wallet: None,
@@ -3381,15 +3388,16 @@ mod tests {
     }
 
     fn mock_pending_request_with_wallet(
-        request_type: crate::tokenization::TokenizationRequestType,
+        request_type: st0x_tokenization::TokenizationRequestType,
         symbol: &str,
         quantity: i64,
         wallet: Option<Address>,
-    ) -> crate::tokenization::TokenizationRequest {
-        crate::tokenization::TokenizationRequest {
-            id: TokenizationRequestId(format!("REQ_{symbol}_{quantity}")),
+    ) -> st0x_tokenization::TokenizationRequest {
+        st0x_tokenization::TokenizationRequest {
+            id: TokenizationRequestId::try_new(format!("REQ_{symbol}_{quantity}"))
+                .expect("test tokenization request id must be non-empty"),
             r#type: Some(request_type),
-            status: crate::tokenization::TokenizationRequestStatus::Pending,
+            status: st0x_tokenization::TokenizationRequestStatus::Pending,
             underlying_symbol: test_symbol(symbol),
             quantity: test_shares(quantity),
             wallet,
@@ -3402,26 +3410,26 @@ mod tests {
     }
 
     fn mock_pending_request_with_issuer_id(
-        request_type: crate::tokenization::TokenizationRequestType,
+        request_type: st0x_tokenization::TokenizationRequestType,
         symbol: &str,
         quantity: i64,
         issuer_id_label: &str,
         wallet: Option<Address>,
-    ) -> crate::tokenization::TokenizationRequest {
-        crate::tokenization::TokenizationRequest {
+    ) -> st0x_tokenization::TokenizationRequest {
+        st0x_tokenization::TokenizationRequest {
             issuer_request_id: Some(issuer_request_id(issuer_id_label)),
             ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
         }
     }
 
     fn mock_pending_request_with_tx_hash(
-        request_type: crate::tokenization::TokenizationRequestType,
+        request_type: st0x_tokenization::TokenizationRequestType,
         symbol: &str,
         quantity: i64,
         tx_hash: TxHash,
         wallet: Option<Address>,
-    ) -> crate::tokenization::TokenizationRequest {
-        crate::tokenization::TokenizationRequest {
+    ) -> st0x_tokenization::TokenizationRequest {
+        st0x_tokenization::TokenizationRequest {
             tx_hash: Some(tx_hash),
             ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
         }
@@ -3435,14 +3443,10 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
-            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
                 mock_pending_request(
-                    crate::tokenization::TokenizationRequestType::Mint,
-                    "AAPL",
-                    10,
-                ),
-                mock_pending_request(
-                    crate::tokenization::TokenizationRequestType::Redeem,
+                    st0x_tokenization::TokenizationRequestType::Redeem,
                     "MSFT",
                     5,
                 ),
@@ -3495,17 +3499,9 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
-            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
-                mock_pending_request(
-                    crate::tokenization::TokenizationRequestType::Mint,
-                    "AAPL",
-                    10,
-                ),
-                mock_pending_request(
-                    crate::tokenization::TokenizationRequestType::Mint,
-                    "AAPL",
-                    25,
-                ),
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
+                mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 25),
             ]),
         );
 
@@ -3593,7 +3589,7 @@ mod tests {
         let executor = MockExecutor::new();
 
         let tokenizer =
-            Arc::new(crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![]));
+            Arc::new(st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![]));
 
         let service = InventoryPollingService::new(
             raindex_service,
@@ -3636,15 +3632,15 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
-            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
                 mock_pending_request_with_wallet(
-                    crate::tokenization::TokenizationRequestType::Mint,
+                    st0x_tokenization::TokenizationRequestType::Mint,
                     "AAPL",
                     10,
                     Some(order_owner),
                 ),
                 mock_pending_request_with_wallet(
-                    crate::tokenization::TokenizationRequestType::Redeem,
+                    st0x_tokenization::TokenizationRequestType::Redeem,
                     "TSLA",
                     5,
                     Some(order_owner),
@@ -3696,21 +3692,21 @@ mod tests {
         let other_wallet = address!("0x9999999999999999999999999999999999999999");
 
         let tokenizer = Arc::new(
-            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
                 mock_pending_request_with_wallet(
-                    crate::tokenization::TokenizationRequestType::Mint,
+                    st0x_tokenization::TokenizationRequestType::Mint,
                     "AAPL",
                     10,
                     Some(order_owner),
                 ),
                 mock_pending_request_with_wallet(
-                    crate::tokenization::TokenizationRequestType::Mint,
+                    st0x_tokenization::TokenizationRequestType::Mint,
                     "MSFT",
                     20,
                     Some(other_wallet),
                 ),
                 mock_pending_request_with_wallet(
-                    crate::tokenization::TokenizationRequestType::Redeem,
+                    st0x_tokenization::TokenizationRequestType::Redeem,
                     "TSLA",
                     5,
                     None,
@@ -3768,16 +3764,16 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
-            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
                 mock_pending_request_with_issuer_id(
-                    crate::tokenization::TokenizationRequestType::Mint,
+                    st0x_tokenization::TokenizationRequestType::Mint,
                     "AAPL",
                     10,
                     "owned-issuer-request",
                     Some(order_owner),
                 ),
                 mock_pending_request_with_wallet(
-                    crate::tokenization::TokenizationRequestType::Mint,
+                    st0x_tokenization::TokenizationRequestType::Mint,
                     "AAPL",
                     20,
                     Some(order_owner),
@@ -3828,9 +3824,9 @@ mod tests {
         let external_tx = TxHash::random();
 
         let tokenizer = Arc::new(
-            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
                 mock_pending_request_with_tx_hash(
-                    crate::tokenization::TokenizationRequestType::Redeem,
+                    st0x_tokenization::TokenizationRequestType::Redeem,
                     "AAPL",
                     5,
                     redemption_tx,
@@ -3840,7 +3836,7 @@ mod tests {
                 // id (REQ_AAPL_7); otherwise dedup-by-id would mask a leaked
                 // external request and the assertion could pass even on regression.
                 mock_pending_request_with_tx_hash(
-                    crate::tokenization::TokenizationRequestType::Redeem,
+                    st0x_tokenization::TokenizationRequestType::Redeem,
                     "AAPL",
                     7,
                     external_tx,
@@ -3887,21 +3883,13 @@ mod tests {
     fn aggregate_pending_requests_skips_none_type_but_keeps_valid_rows() {
         let requests = vec![
             mock_pending_request_no_type("AAPL", 5),
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
             mock_pending_request(
-                crate::tokenization::TokenizationRequestType::Mint,
-                "AAPL",
-                10,
-            ),
-            mock_pending_request(
-                crate::tokenization::TokenizationRequestType::Redeem,
+                st0x_tokenization::TokenizationRequestType::Redeem,
                 "TSLA",
                 20,
             ),
-            mock_pending_request(
-                crate::tokenization::TokenizationRequestType::Mint,
-                "AAPL",
-                3,
-            ),
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 3),
         ];
 
         let PendingRequests { mints, redemptions } = InventoryPollingService::<
@@ -3931,16 +3919,8 @@ mod tests {
     #[test]
     fn aggregate_pending_requests_deduplicates_provider_request_ids() {
         let requests = vec![
-            mock_pending_request(
-                crate::tokenization::TokenizationRequestType::Mint,
-                "AAPL",
-                10,
-            ),
-            mock_pending_request(
-                crate::tokenization::TokenizationRequestType::Mint,
-                "AAPL",
-                10,
-            ),
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
         ];
 
         let PendingRequests { mints, redemptions } = InventoryPollingService::<

@@ -74,18 +74,18 @@ use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_evm::{EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
+use st0x_tokenization::TokenizationRequestId;
+use st0x_tokenization::Tokenizer;
 use st0x_wrapper::WrapperError;
 
 use crate::rebalancing::equity::EquityTransferServices;
-use crate::tokenization::TokenizationRequestId;
-use crate::tokenization::Tokenizer;
 
 /// Our tokenized equity tokens use 18 decimals.
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
 ///
-/// Mirrors [`crate::tokenization::IssuerRequestId`]: a UUID chosen at
+/// Mirrors [`st0x_tokenization::IssuerRequestId`]: a UUID chosen at
 /// enqueue time so apalis retries and bot restarts always target the same
 /// aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2585,11 +2585,12 @@ mod tests {
     use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
     use st0x_float_macro::float;
     use st0x_raindex::RaindexVaultId;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_tokenization::tokenization_request_id;
     use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::onchain::mock::{ConfirmTxBehavior, MockRaindex};
-    use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
 
     fn mock_vault_lookup() -> MockVaultLookup {
@@ -2716,7 +2717,7 @@ mod tests {
 
     fn detected_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::Detected {
-            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ789"),
             detected_at: Utc::now(),
         }
     }
@@ -2746,7 +2747,7 @@ mod tests {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::Detect {
-                tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                tokenization_request_id: tokenization_request_id("REQ789"),
             })
             .await
             .events();
@@ -2828,7 +2829,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Detect {
-                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                    tokenization_request_id: tokenization_request_id("REQ789"),
                 },
             )
             .await
@@ -3171,7 +3172,7 @@ mod tests {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Detect {
-                tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                tokenization_request_id: tokenization_request_id("REQ789"),
             })
             .await
             .then_expect_error();
@@ -3373,7 +3374,7 @@ mod tests {
                 sent_at: Utc::now(),
             },
             EquityRedemptionEvent::Detected {
-                tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                tokenization_request_id: tokenization_request_id("REQ789"),
                 detected_at: Utc::now(),
             },
             EquityRedemptionEvent::RedemptionRejected {
@@ -3400,7 +3401,7 @@ mod tests {
         assert_eq!(failed_redemption_tx, Some(redemption_tx));
         assert_eq!(
             tokenization_request_id,
-            Some(TokenizationRequestId("REQ789".to_string()))
+            Some(st0x_tokenization::tokenization_request_id("REQ789"))
         );
     }
 
@@ -3443,13 +3444,13 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
-            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ789"),
             started_at: now,
             completed_at: now,
         };
 
         let event = EquityRedemptionEvent::Detected {
-            tokenization_request_id: TokenizationRequestId("REQ999".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ999"),
             detected_at: Utc::now(),
         };
 
@@ -3484,7 +3485,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
-            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ789"),
             sent_at: Utc::now(),
             detected_at: Utc::now(),
         };
@@ -3546,7 +3547,7 @@ mod tests {
     #[test]
     fn test_originate_rejects_non_init_events() {
         let event = EquityRedemptionEvent::Detected {
-            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            tokenization_request_id: tokenization_request_id("REQ789"),
             detected_at: Utc::now(),
         };
 
@@ -3837,7 +3838,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Detect {
-                    tokenization_request_id: TokenizationRequestId("REQ123".to_string()),
+                    tokenization_request_id: tokenization_request_id("REQ123"),
                 },
             )
             .await
@@ -4378,7 +4379,7 @@ mod tests {
             symbol,
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             sent_at: now,
             detected_at: later,
         };
@@ -4554,7 +4555,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             started_at: now,
             completed_at: later,
         };
@@ -4573,7 +4574,7 @@ mod tests {
             quantity: float!(50.25),
             raindex_withdraw_tx: Some(TxHash::random()),
             redemption_tx: Some(TxHash::random()),
-            tokenization_request_id: Some(TokenizationRequestId("TOK001".to_string())),
+            tokenization_request_id: Some(tokenization_request_id("TOK001")),
             reason: None,
             started_at: now,
             failed_at: later,
@@ -4607,7 +4608,7 @@ mod tests {
         };
 
         let recovered = EquityRedemptionEvent::ProviderCompletionRecovered {
-            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tokenization_request_id: tokenization_request_id("TOK001"),
             recovered_at,
         };
 
@@ -4624,7 +4625,7 @@ mod tests {
                     redemption_tx: recovered_tx,
                     ..
                 } if *recovered_symbol == symbol
-                    && *tokenization_request_id == TokenizationRequestId("TOK001".to_string())
+                    && *tokenization_request_id == st0x_tokenization::tokenization_request_id("TOK001")
                     && recovered_tx == redemption_tx
             ),
             "expected recovered redemption to complete, got {result:?}"
@@ -4636,7 +4637,7 @@ mod tests {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![withdrawn_from_raindex_event()])
             .when(EquityRedemptionCommand::RecoverProviderCompletion {
-                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK001"),
             })
             .await
             .then_expect_error();
@@ -4662,7 +4663,7 @@ mod tests {
                 },
             ])
             .when(EquityRedemptionCommand::RecoverProviderCompletion {
-                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK001"),
             })
             .await
             .then_expect_error();
@@ -4687,7 +4688,7 @@ mod tests {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given(history)
             .when(EquityRedemptionCommand::RecoverProviderCompletion {
-                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tokenization_request_id: tokenization_request_id("TOK001"),
             })
             .await
             .then_expect_error();
@@ -5233,7 +5234,7 @@ mod tests {
         // exhaustive match) AND a test failure (unexpected true/false here).
         let now = Utc::now();
         let sym = Symbol::new("tAAPL").unwrap();
-        let tok = TokenizationRequestId("TOK001".to_string());
+        let tok = tokenization_request_id("TOK001");
 
         assert!(
             !EquityRedemption::VaultWithdrawPending {

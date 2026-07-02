@@ -10,7 +10,6 @@ use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
-use httpmock::Mock;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -34,9 +33,17 @@ use st0x_execution::{
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexVaultId};
+use st0x_tokenization::mock::MockTokenizer;
+use st0x_tokenization::{Tokenizer, issuer_request_id};
 use st0x_wrapper::{MockWrapper, Wrapper};
 
-use super::{ExpectedEvent, assert_events, fetch_events};
+use super::{
+    ExpectedEvent, anvil, assert_events, fetch_events,
+    tokenization::{
+        create_test_service_from_mock, sample_completed_response, sample_pending_response,
+        setup_redemption_mocks, tokenization_mint_path, tokenization_requests_path,
+    },
+};
 use crate::bindings::TestERC20;
 use crate::conductor::job::Job;
 use crate::equity_redemption::{
@@ -58,13 +65,6 @@ use crate::rebalancing::{
     RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
 };
 use crate::test_utils::setup_test_pools;
-use crate::tokenization::Tokenizer;
-use crate::tokenization::alpaca::tests::{
-    TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
-    tokenization_requests_path,
-};
-use crate::tokenization::mock::MockTokenizer;
-use crate::tokenization::{IssuerRequestId, issuer_request_id};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 use crate::unwrapped_equity_recovery::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
@@ -81,8 +81,11 @@ use crate::wrapped_equity_recovery::{
     WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue,
 };
 
+const TEST_REDEMPTION_WALLET: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
+
 /// Seeds the VaultRegistry with the given token address and a deterministic
 /// vault ID derived from the symbol.
 async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address) {
@@ -302,90 +305,6 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         inventory,
         position_cqrs,
     }
-}
-
-/// Creates httpmock responses for the Alpaca tokenization API detection and
-/// completion polling endpoints, matching the given tx_hash.
-fn setup_redemption_mocks(server: &MockServer, expected_tx_hash: TxHash) -> (Mock<'_>, Mock<'_>) {
-    let detection_mock = server.mock(|when, then| {
-        when.method(GET)
-            .path(tokenization_requests_path())
-            .query_param("type", "redeem");
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([{
-                "tokenization_request_id": "redeem_int_test",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "30.0",
-                "issuer": "st0x",
-                "network": "base",
-                "tx_hash": expected_tx_hash,
-                "created_at": "2024-01-15T10:30:00Z"
-            }]));
-    });
-
-    let completion_mock = server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([{
-                "tokenization_request_id": "redeem_int_test",
-                "type": "redeem",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "30.0",
-                "issuer": "st0x",
-                "network": "base",
-                "tx_hash": expected_tx_hash,
-                "created_at": "2024-01-15T10:30:00Z"
-            }]));
-    });
-
-    (detection_mock, completion_mock)
-}
-
-fn sample_pending_response(
-    tokenization_request_id: &str,
-    issuer_request_id: &IssuerRequestId,
-) -> serde_json::Value {
-    json!({
-        "tokenization_request_id": tokenization_request_id,
-        "type": "mint",
-        "status": "pending",
-        "underlying_symbol": "AAPL",
-        "token_symbol": "tAAPL",
-        "qty": "30.0",
-        "issuer": "st0x",
-        "network": "base",
-        "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": issuer_request_id.to_string(),
-        "created_at": "2024-01-15T10:30:00Z"
-    })
-}
-
-fn sample_completed_response(
-    tokenization_request_id: &str,
-    issuer_request_id: &IssuerRequestId,
-    tx_hash: TxHash,
-) -> serde_json::Value {
-    json!({
-        "tokenization_request_id": tokenization_request_id,
-        "type": "mint",
-        "status": "completed",
-        "underlying_symbol": "AAPL",
-        "token_symbol": "tAAPL",
-        "qty": "30.0",
-        "issuer": "st0x",
-        "network": "base",
-        "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": issuer_request_id.to_string(),
-        "tx_hash": tx_hash,
-        "created_at": "2024-01-15T10:30:00Z"
-    })
 }
 
 enum Imbalance<'a> {
@@ -639,7 +558,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     .await;
 
     let server = MockServer::start();
-    let (_anvil, endpoint, key) = setup_anvil();
+    let (_anvil, endpoint, key) = anvil::setup_anvil();
 
     // Deploy a real ERC20 on Anvil so that verify_mint_tx can find the
     // transaction receipt and confirm the token balance.
@@ -906,7 +825,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         position_cqrs,
     } = setup_equity_trigger().await;
     let server = MockServer::start();
-    let (_anvil, endpoint, key) = setup_anvil();
+    let (_anvil, endpoint, key) = anvil::setup_anvil();
 
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
     let wallet = EthereumWallet::from(signer.clone());
@@ -1657,7 +1576,7 @@ async fn mint_api_failure_produces_rejected_event() {
     seed_vault_registry(&pool, &symbol, token).await;
 
     let server = MockServer::start();
-    let (_anvil, endpoint, key) = setup_anvil();
+    let (_anvil, endpoint, key) = anvil::setup_anvil();
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
@@ -2184,7 +2103,7 @@ async fn mint_accepted_sets_offchain_inflight() {
     );
 
     let server = MockServer::start();
-    let (_anvil, endpoint, key) = setup_anvil();
+    let (_anvil, endpoint, key) = anvil::setup_anvil();
 
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
     let wallet = EthereumWallet::from(signer.clone());
@@ -2375,7 +2294,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     .await;
 
     let server = MockServer::start();
-    let (_anvil, endpoint, key) = setup_anvil();
+    let (_anvil, endpoint, key) = anvil::setup_anvil();
 
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
     let wallet = EthereumWallet::from(signer.clone());

@@ -57,10 +57,9 @@ mod position;
 mod position_check;
 mod rebalancing;
 mod telemetry;
-mod tokenization;
 mod trading;
 #[cfg(feature = "mock")]
-pub use tokenization::mock_api;
+pub use st0x_tokenization::mock_api;
 mod tokenized_equity_mint;
 mod unwrapped_equity_recovery;
 mod usdc_rebalance;

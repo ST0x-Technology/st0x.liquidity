@@ -30,12 +30,12 @@ use tracing::warn;
 use st0x_config::EquitiesConfig;
 use st0x_event_sorcery::Store;
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_tokenization::IssuerRequestId;
 
 use super::{CrossVenueEquityTransfer, MintTransferError, RedemptionError};
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::trigger::GuardState;
-use crate::tokenization::IssuerRequestId;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 
 /// Apalis queue type for [`TransferEquityToMarketMaking`].
@@ -439,14 +439,14 @@ mod tests {
     use st0x_event_sorcery::test_store;
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
+    use st0x_tokenization::issuer_request_id;
+    use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
-    use crate::tokenization::issuer_request_id;
-    use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::vault_lookup::MockVaultLookup;
 

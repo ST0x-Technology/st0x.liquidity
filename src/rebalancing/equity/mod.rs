@@ -37,6 +37,11 @@ use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_tokenization::{
+    AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
+    TokenizationRequestId, TokenizationRequestIdError, TokenizationRequestStatus, Tokenizer,
+    TokenizerError,
+};
 use st0x_wrapper::{
     UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
 };
@@ -45,10 +50,6 @@ use super::RebalancingService;
 use super::trigger::RecoveryClaim;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
-};
-use crate::tokenization::{
-    AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
-    TokenizationRequestId, TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
 use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
@@ -111,6 +112,12 @@ pub(crate) enum RecheckError {
         #[source]
         source: FromHexError,
     },
+    #[error("mint {id} has an empty tokenization request id in its event history")]
+    MalformedTokenizationRequestId {
+        id: IssuerRequestId,
+        #[source]
+        source: TokenizationRequestIdError,
+    },
 }
 
 /// Context for re-checking a failed mint: the wallet and provider request
@@ -167,7 +174,11 @@ async fn load_mint_recheck_context(
                 id: id.clone(),
                 source,
             })?,
-        tokenization_request_id: TokenizationRequestId(raw_tokenization_request_id),
+        tokenization_request_id: TokenizationRequestId::try_new(&raw_tokenization_request_id)
+            .map_err(|source| RecheckError::MalformedTokenizationRequestId {
+                id: id.clone(),
+                source,
+            })?,
         received_tokens,
     })
 }
@@ -1691,6 +1702,11 @@ mod tests {
     use st0x_float_macro::float;
 
     use st0x_config::{AssetsConfig, EquitiesConfig};
+    use st0x_tokenization::issuer_request_id;
+    use st0x_tokenization::mock::{
+        MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
+    };
+    use st0x_tokenization::tokenization_request_id;
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -1700,10 +1716,6 @@ mod tests {
     };
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
-    use crate::tokenization::issuer_request_id;
-    use crate::tokenization::mock::{
-        MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
-    };
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
     use crate::vault_lookup::MockVaultLookup;
@@ -1898,7 +1910,7 @@ mod tests {
         // Completed request (with a tx_hash) under the aggregate's
         // tokenization_request_id ("tok-1").
         let mut completed_request = TokenizationRequest::mock_completed();
-        completed_request.id = TokenizationRequestId("tok-1".to_string());
+        completed_request.id = tokenization_request_id("tok-1");
         let tokenizer =
             Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
 
@@ -2039,7 +2051,7 @@ mod tests {
             .await;
 
         let mut completed_request = TokenizationRequest::mock_completed();
-        completed_request.id = TokenizationRequestId("tok-1".to_string());
+        completed_request.id = tokenization_request_id("tok-1");
         let tokenizer =
             Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
 

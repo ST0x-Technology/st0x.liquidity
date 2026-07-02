@@ -14,12 +14,12 @@ use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
+use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::tokenization::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 
 /// Error type for inventory view operations.
