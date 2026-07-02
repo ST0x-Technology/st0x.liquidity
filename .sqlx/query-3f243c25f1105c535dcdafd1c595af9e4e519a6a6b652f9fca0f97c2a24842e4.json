@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT tx_hash, log_index, event_type, reason, detail FROM skipped_fills ORDER BY log_index",
+  "describe": {
+    "columns": [
+      {
+        "name": "tx_hash",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skipped_fills",
+            "name": "tx_hash"
+          }
+        }
+      },
+      {
+        "name": "log_index",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "skipped_fills",
+            "name": "log_index"
+          }
+        }
+      },
+      {
+        "name": "event_type",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skipped_fills",
+            "name": "event_type"
+          }
+        }
+      },
+      {
+        "name": "reason",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skipped_fills",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "name": "detail",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skipped_fills",
+            "name": "detail"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3f243c25f1105c535dcdafd1c595af9e4e519a6a6b652f9fca0f97c2a24842e4"
+}

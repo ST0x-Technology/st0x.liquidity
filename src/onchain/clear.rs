@@ -143,10 +143,26 @@ async fn fetch_after_clear_event(
 
     let after_clear_logs = evm.provider().get_logs(&filter).await?;
 
-    if let Some(after_clear_log) = after_clear_logs.iter().find(|after_clear_log| {
-        after_clear_log.transaction_hash == log.transaction_hash
-            && after_clear_log.log_index > log.log_index
-    }) {
+    // Pair this ClearV3 with its IMMEDIATELY following AfterClearV2: the smallest
+    // log_index strictly greater than the clear's. A single transaction can carry
+    // multiple ClearV3/AfterClearV2 pairs, and get_logs ordering is not guaranteed,
+    // so taking the first match by iteration order could adopt a later pair's
+    // AfterClearV2 and account this fill with the wrong state change.
+    //
+    // "Immediately following" pairs correctly because the orderbook's clear call
+    // emits the ClearV3 and then its AfterClearV2 consecutively (Solidity emits
+    // events in statement order within a call), and a multicall runs each clear to
+    // completion before the next begins. Pairs therefore never interleave -- a
+    // ClearV3 at index i is always followed by ITS AfterClearV2 before any other
+    // pair's events -- so the nearest higher-index AfterClearV2 is this clear's.
+    if let Some(after_clear_log) = after_clear_logs
+        .iter()
+        .filter(|after_clear_log| {
+            after_clear_log.transaction_hash == log.transaction_hash
+                && after_clear_log.log_index > log.log_index
+        })
+        .min_by_key(|after_clear_log| after_clear_log.log_index)
+    {
         return Ok(after_clear_log.log_decode::<AfterClearV2>()?.data().clone());
     }
 
@@ -163,32 +179,33 @@ async fn fetch_after_clear_event(
         .into());
     };
 
-    // Find the AfterClearV2 log in the receipt with log_index > clear_log_index
-    for receipt_log in tx_receipt.inner.logs() {
-        if receipt_log.address() != evm_ctx.orderbook {
-            continue;
-        }
+    // Pair with the IMMEDIATELY following AfterClearV2 in the receipt -- the
+    // smallest log_index strictly greater than the clear's -- exactly as the
+    // get_logs path above. Canonical receipts return logs in ascending log_index
+    // order, but this fallback exists precisely for nodes that do not behave
+    // canonically, so a multi-pair transaction must not rely on receipt log
+    // ordering to pair each clear with ITS state change.
+    let immediate_after_clear = tx_receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|receipt_log| {
+            receipt_log.address() == evm_ctx.orderbook
+                && receipt_log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
+                && receipt_log
+                    .log_index
+                    .is_some_and(|receipt_log_index| receipt_log_index > clear_log_index)
+        })
+        .min_by_key(|receipt_log| receipt_log.log_index);
 
-        if receipt_log.topics().first() != Some(&AfterClearV2::SIGNATURE_HASH) {
-            continue;
-        }
-
-        let Some(receipt_log_index) = receipt_log.log_index else {
-            continue;
-        };
-
-        if receipt_log_index <= clear_log_index {
-            continue;
-        }
-
-        // Found it - decode and return
+    if let Some(receipt_log) = immediate_after_clear {
         let decoded = receipt_log.log_decode::<AfterClearV2>()?;
         debug!(
             target: "hedge",
             block_number,
             %tx_hash,
             clear_log_index,
-            receipt_log_index,
+            receipt_log_index = ?receipt_log.log_index,
             "Extracted AfterClearV2 from tx receipt (get_logs returned incomplete data)"
         );
         return Ok(decoded.data().clone());
@@ -497,6 +514,184 @@ mod tests {
         // Bob's order takes wtAAPL in / USDC out -> bought tokenized equity
         // onchain, the opposite of alice; the hedge direction must flip.
         assert_eq!(trade.direction, Direction::Buy);
+    }
+
+    fn after_clear_with(alice_input_usdc: u64, alice_output_equity: u64) -> AfterClearV2 {
+        AfterClearV2 {
+            sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            clearStateChange: ClearStateChangeV2 {
+                aliceOutput: Float::from_fixed_decimal(U256::from(alice_output_equity), 0)
+                    .unwrap()
+                    .get_inner(),
+                bobOutput: Float::from_fixed_decimal(uint!(100_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+                aliceInput: Float::from_fixed_decimal(U256::from(alice_input_usdc), 0)
+                    .unwrap()
+                    .get_inner(),
+                bobInput: Float::from_fixed_decimal(uint!(9_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+            },
+        }
+    }
+
+    fn after_clear_log_at(
+        orderbook: Address,
+        tx_hash: TxHash,
+        log_index: u64,
+        event: AfterClearV2,
+    ) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: event.into_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_from_clear_v3_pairs_immediate_after_clear_not_first_in_iteration() {
+        let ctx = create_test_ctx();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: clear_event.to_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(1),
+            removed: false,
+        };
+
+        // The AfterClearV2 immediately after the clear (index 2) credits alice 9
+        // shares; a later pair's AfterClearV2 (index 4) credits 50. get_logs is
+        // returned newest-first to prove pairing does not rely on iteration order.
+        let immediate_log = after_clear_log_at(orderbook, tx_hash, 2, after_clear_with(100, 9));
+        let later_log = after_clear_log_at(orderbook, tx_hash, 4, after_clear_with(100, 50));
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([later_log, immediate_log]));
+        asserter.push_success(&mocked_receipt_hex(tx_hash));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"USDC".to_string(),
+        ));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"wtAAPL".to_string(),
+        ));
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+        let pyth_feed_ids = PythFeedIds::default();
+
+        let trade = OnchainTrade::try_from_clear_v3(
+            &ctx,
+            &cache,
+            &evm,
+            clear_event,
+            clear_log,
+            &pyth_feed_ids,
+            get_test_order().owner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Must use the immediate AfterClearV2 (9 shares), not the later pair's 50.
+        assert_eq!(trade.amount, FractionalShares::new(float!(9)));
+    }
+
+    #[tokio::test]
+    async fn try_from_clear_v3_errors_on_non_positive_price() {
+        let ctx = create_test_ctx();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: clear_event.to_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(1),
+            removed: false,
+        };
+
+        // Alice receives 9 wtAAPL but pays 0 USDC -> price computes to zero. A real
+        // equity movement that cannot be priced must error, not be silently dropped.
+        let after_clear_log = after_clear_log_at(orderbook, tx_hash, 2, after_clear_with(0, 9));
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([after_clear_log]));
+        asserter.push_success(&mocked_receipt_hex(tx_hash));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"USDC".to_string(),
+        ));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"wtAAPL".to_string(),
+        ));
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+        let pyth_feed_ids = PythFeedIds::default();
+
+        let error = OnchainTrade::try_from_clear_v3(
+            &ctx,
+            &cache,
+            &evm,
+            clear_event,
+            clear_log,
+            &pyth_feed_ids,
+            get_test_order().owner,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OnChainError::Validation(TradeValidationError::NonPositivePrice(_))
+        ));
     }
 
     #[tokio::test]
@@ -938,7 +1133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_after_clear_multiple_logs_picks_first_match() {
+    async fn test_fetch_after_clear_multiple_logs_picks_min_log_index() {
         let ctx = create_test_ctx();
         let cache = SymbolCache::default();
 
@@ -957,16 +1152,20 @@ mod tests {
 
         let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 5);
 
-        let after_clear_event_1 = create_parameterized_after_clear_event(0xaa, 9, 100);
-        let after_clear_event_2 = create_parameterized_after_clear_event(0xbb, 5, 50);
+        // The immediate AfterClearV2 (index 6) credits 9 shares; a later pair's
+        // (index 7) credits 5. get_logs returns them newest-first so first-match
+        // by iteration order would wrongly pick index 7 -- only min-by-log-index
+        // selects the immediate pair.
+        let immediate_after_clear = create_parameterized_after_clear_event(0xaa, 9, 100);
+        let later_after_clear = create_parameterized_after_clear_event(0xbb, 5, 50);
 
-        let after_clear_log_1 =
-            create_test_log(orderbook, tx_hash, after_clear_event_1.to_log_data(), 6);
-        let after_clear_log_2 =
-            create_test_log(orderbook, tx_hash, after_clear_event_2.to_log_data(), 7);
+        let immediate_after_clear_log =
+            create_test_log(orderbook, tx_hash, immediate_after_clear.to_log_data(), 6);
+        let later_after_clear_log =
+            create_test_log(orderbook, tx_hash, later_after_clear.to_log_data(), 7);
 
         let asserter = Asserter::new();
-        asserter.push_success(&json!([after_clear_log_1, after_clear_log_2])); // get_logs returns multiple AfterClearV2
+        asserter.push_success(&json!([later_after_clear_log, immediate_after_clear_log]));
         let receipt_json = create_receipt_json_with_logs(tx_hash, &[]);
         asserter.push_success(&receipt_json); // receipt for gas info
         // Mock decimals() then symbol() calls for input token (USDC)
@@ -1297,6 +1496,88 @@ mod tests {
             trade.symbol,
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
+        assert_eq!(trade.amount, FractionalShares::new(float!(9)));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_receipt_picks_min_log_index_when_out_of_order() {
+        let ctx = create_test_ctx();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 1);
+
+        // Two AfterClearV2 pairs in the receipt, both with log_index > the clear's:
+        // the immediate pair (index 2) credits 9 shares, a later pair (index 4)
+        // credits 5. The receipt lists them newest-first, so a first-match-by-
+        // iteration fallback would wrongly pick the later pair's 5 shares -- only
+        // min-by-log-index selects the immediate pair.
+        let immediate_after_clear =
+            create_parameterized_after_clear_event(0xaa, 9, 100).to_log_data();
+        let later_after_clear = create_parameterized_after_clear_event(0xbb, 5, 50).to_log_data();
+
+        let immediate_receipt_log = create_receipt_log_json(
+            orderbook,
+            tx_hash,
+            2,
+            immediate_after_clear.topics(),
+            immediate_after_clear.data.clone(),
+        );
+        let later_receipt_log = create_receipt_log_json(
+            orderbook,
+            tx_hash,
+            4,
+            later_after_clear.topics(),
+            later_after_clear.data.clone(),
+        );
+        let receipt =
+            create_receipt_json_with_logs(tx_hash, &[later_receipt_log, immediate_receipt_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty -> receipt fallback
+        asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
+        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"USDC".to_string(),
+        ));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"wtAAPL".to_string(),
+        ));
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+        let pyth_feed_ids = PythFeedIds::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &ctx,
+            &cache,
+            &evm,
+            clear_event,
+            clear_log,
+            &pyth_feed_ids,
+            get_test_order().owner,
+        )
+        .await
+        .unwrap();
+
+        let trade = result.unwrap();
+        assert_eq!(
+            trade.symbol,
+            tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
+        );
+        // Must use the immediate AfterClearV2 (9 shares), not the later pair's 5.
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
     }
 
