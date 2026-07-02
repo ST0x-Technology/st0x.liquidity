@@ -44,6 +44,17 @@ pub struct EvmConfig {
     /// address instead of on the orderbook. Fill events on the pooled vaults
     /// are also surfaced here as `OperatorDeposit`/`OperatorWithdraw`.
     pub inventory: Address,
+    /// Address that owns the Raindex orders and vaults on-chain — the key every
+    /// `vaultBalance2` read, vault-registry entry, and order-owner fill match is
+    /// scoped by. Once the shared-inventory migration (RAI-1198) moves the
+    /// orders/vaults under the inventory contract, `msg.sender` to Raindex is the
+    /// inventory, so it becomes the vault owner and this must be set to the
+    /// `inventory` address. Left unset (the pre-migration default) it falls back
+    /// to the `[wallet]` address, matching the bot-EOA-owned vaults that exist
+    /// today. This is the ops cutover lever: flip it to the inventory address in
+    /// the same change that grants the bot `OPERATOR_ROLE` and migrates vaults.
+    #[serde(default)]
+    pub vault_owner: Option<Address>,
     pub deployment_block: u64,
     pub required_confirmations: u64,
     pub ingestion_cutoff: IngestionCutoff,
@@ -72,6 +83,7 @@ pub struct EvmCtx {
     pub rpc_url: Url,
     pub orderbook: Address,
     pub inventory: Address,
+    pub vault_owner: Option<Address>,
     pub deployment_block: u64,
     pub required_confirmations: u64,
     pub ingestion_cutoff: IngestionCutoff,
@@ -83,6 +95,7 @@ impl std::fmt::Debug for EvmCtx {
             .field("rpc_url", &"[REDACTED]")
             .field("orderbook", &self.orderbook)
             .field("inventory", &self.inventory)
+            .field("vault_owner", &self.vault_owner)
             .field("deployment_block", &self.deployment_block)
             .field("required_confirmations", &self.required_confirmations)
             .field("ingestion_cutoff", &self.ingestion_cutoff)
@@ -96,6 +109,7 @@ impl EvmCtx {
             rpc_url: secrets.rpc,
             orderbook: config.orderbook,
             inventory: config.inventory,
+            vault_owner: config.vault_owner,
             deployment_block: config.deployment_block,
             required_confirmations: config.required_confirmations,
             ingestion_cutoff: config.ingestion_cutoff,
@@ -119,6 +133,43 @@ mod tests {
         let wrapper: CutoffWrapper = toml::from_str("ingestion_cutoff = \"safe\"").unwrap();
 
         assert_eq!(wrapper.ingestion_cutoff, IngestionCutoff::Safe);
+    }
+
+    #[test]
+    fn vault_owner_defaults_to_none_when_absent() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.vault_owner, None,
+            "vault_owner must default to None (pre-migration: falls back to the wallet EOA)"
+        );
+    }
+
+    #[test]
+    fn vault_owner_parses_when_present() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x6b7B523fADd1677413AD92c9404C8F0796bACF6F\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.vault_owner,
+            Some(alloy::primitives::address!(
+                "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
+            )),
+        );
     }
 
     #[test]

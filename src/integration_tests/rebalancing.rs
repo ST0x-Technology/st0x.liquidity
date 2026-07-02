@@ -1255,7 +1255,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Inventory as ExecutorInventory, MockExecutor};
     use st0x_finance::Usd;
-    use st0x_raindex::RaindexService;
+    use st0x_raindex::{RaindexContracts, RaindexService};
 
     use crate::inventory::InventoryPollingService;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
@@ -1330,8 +1330,10 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let provider = ProviderBuilder::new().connect_mocked_client(asserter);
     let raindex_service = Arc::new(RaindexService::new(
         ReadOnlyEvm::new(provider),
-        TEST_ORDERBOOK,
-        TEST_ORDERBOOK,
+        RaindexContracts {
+            inventory: TEST_ORDERBOOK,
+            orderbook: TEST_ORDERBOOK,
+        },
         TEST_ORDER_OWNER,
     ));
 
@@ -1342,6 +1344,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         executor,
         vault_registry,
         snapshot_id,
+        TEST_ORDER_OWNER,
         snapshot_store.clone(),
         None,
         None,

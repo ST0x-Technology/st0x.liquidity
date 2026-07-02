@@ -18,16 +18,16 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolError, SolEvent};
 use async_trait::async_trait;
 use rain_math_float::Float;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use st0x_evm::{Evm, IntoErrorRegistry, OpenChainErrorRegistry, USDC_BASE, Wallet};
+use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
-use crate::{Raindex, RaindexError, RaindexVaultId};
+use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -67,8 +67,12 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// identical to `IRaindexV6` -- calldata is the same shape, only the target
 /// contract differs.
 ///
-/// Reads (`vaultBalance2`, historical `WithdrawV2` scans) still go to the
-/// orderbook directly since the inventory is just a wrapper on top of it.
+/// Reads (`vaultBalance2`, historical `WithdrawV2` scans) target the orderbook
+/// directly because the vault balances live in the orderbook's storage; the
+/// inventory is a proxy that owns orders/vaults on the orderbook, not a store of
+/// its own. Post-migration the balances are keyed under the inventory address —
+/// that owner key is supplied by the caller (see `Ctx::vault_owner`), so the
+/// read still hits the orderbook but under the correct owner.
 ///
 /// Parameterized by [`Evm`] for read operations (balance queries, withdrawal
 /// scans) and additionally requires [`Wallet`] for write operations
@@ -77,7 +81,11 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// # Example
 ///
 /// ```ignore
-/// let service = RaindexService::new(wallet, inventory_address, orderbook_address, owner);
+/// let service = RaindexService::new(
+///     wallet,
+///     RaindexContracts { inventory: inventory_address, orderbook: orderbook_address },
+///     owner,
+/// );
 ///
 /// // Submit a USDC deposit to the vault, then confirm it (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
@@ -98,10 +106,10 @@ pub struct RaindexService<E: Evm> {
 }
 
 impl<E: Evm> RaindexService<E> {
-    pub fn new(evm: E, inventory: Address, orderbook: Address, owner: Address) -> Self {
+    pub fn new(evm: E, contracts: RaindexContracts, owner: Address) -> Self {
         Self {
-            inventory_address: inventory,
-            orderbook_address: orderbook,
+            inventory_address: contracts.inventory,
+            orderbook_address: contracts.orderbook,
             evm,
             owner,
         }
@@ -179,6 +187,48 @@ impl<W: Wallet> RaindexService<W> {
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, "Approve confirmed");
         Ok(())
+    }
+
+    /// Idempotently revokes any stale ERC20 allowance the signing wallet granted
+    /// the **orderbook** for `token`. Before the shared-inventory migration the
+    /// bot approved the orderbook as the deposit spender; that spender is now the
+    /// inventory, so the orderbook allowance is dead capital-exposure surface
+    /// that would otherwise sit until the next (never-again) orderbook deposit
+    /// consumed it. A no-op when the allowance is already zero, so it is safe to
+    /// run on every startup. Returns `true` if a revoke tx was submitted.
+    pub async fn revoke_orderbook_allowance<Registry: IntoErrorRegistry>(
+        &self,
+        token: Address,
+    ) -> Result<bool, RaindexError> {
+        let current_allowance: U256 = self
+            .evm
+            .call::<Registry, _>(
+                token,
+                IERC20::allowanceCall {
+                    owner: self.owner,
+                    spender: self.orderbook_address,
+                },
+            )
+            .await?;
+
+        if current_allowance.is_zero() {
+            return Ok(false);
+        }
+
+        let receipt = self
+            .evm
+            .submit::<Registry, _>(
+                token,
+                IERC20::approveCall {
+                    spender: self.orderbook_address,
+                    amount: U256::ZERO,
+                },
+                "revoke stale orderbook allowance",
+            )
+            .await?;
+
+        info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, spender = %self.orderbook_address, "Revoked stale orderbook allowance");
+        Ok(true)
     }
 
     async fn deposit4_to_vault<Registry: IntoErrorRegistry>(
@@ -309,9 +359,13 @@ impl<E: Evm> RaindexService<E> {
     ///
     /// * **Current path (inventory):** `RaindexInventory.OperatorWithdraw`
     ///   filtered by `operator == self.owner`. Emitted for every rebalance
-    ///   withdrawal that routes through the shared inventory. The event's
-    ///   `amount` is the actual balance delta forwarded to the operator, so
-    ///   partial fills reconcile correctly.
+    ///   withdrawal that routes through the shared inventory. The inventory
+    ///   settles atomically — it reverts `InsufficientVaultLiquidity` rather
+    ///   than forward a short fill — so on this path `event.amount` always
+    ///   equals the requested amount; there is no partial-fill case to
+    ///   reconcile (an under-funded withdraw reverts and emits no event, which
+    ///   this scan correctly reports as absent). Only the backwards-compat
+    ///   `WithdrawV2` branch below can surface a partial fill.
     /// * **Backwards-compat path (orderbook):** `IRaindexV6.WithdrawV2`
     ///   filtered by `sender == self.owner`. Matches only pre-migration
     ///   withdrawals the bot submitted directly against the orderbook -- once
@@ -366,9 +420,20 @@ impl<E: Evm> RaindexService<E> {
                     continue;
                 };
 
+                // A log that matches the filter's topic0/address set but fails
+                // to decode is skipped, not propagated: one malformed or
+                // unexpected log must not abort crash-recovery for the whole
+                // scan (which would turn a skippable log into a hard
+                // `ScanInconclusive` and block the resume). Under the current
+                // contracts this can't happen; the guard is defense against
+                // future ABI drift or an imposter log at the same address.
                 if let Some(topic) = log.topics().first() {
                     if *topic == IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH {
-                        let decoded = log.log_decode::<IRaindexInventory::OperatorWithdraw>()?;
+                        let Ok(decoded) = log.log_decode::<IRaindexInventory::OperatorWithdraw>()
+                        else {
+                            warn!(target: "inventory", %tx_hash, "Skipping undecodable OperatorWithdraw log during resume scan");
+                            continue;
+                        };
                         let event = decoded.data();
                         if event.operator == self.owner
                             && event.token == token
@@ -378,7 +443,10 @@ impl<E: Evm> RaindexService<E> {
                             return Ok(Some((tx_hash, event.amount)));
                         }
                     } else if *topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH {
-                        let decoded = log.log_decode::<IRaindexV6::WithdrawV2>()?;
+                        let Ok(decoded) = log.log_decode::<IRaindexV6::WithdrawV2>() else {
+                            warn!(target: "orderbook", %tx_hash, "Skipping undecodable WithdrawV2 log during resume scan");
+                            continue;
+                        };
                         let event = decoded.data();
                         if event.sender == self.owner
                             && event.token == token
@@ -419,6 +487,44 @@ impl<E: Evm> RaindexService<E> {
         Ok(self.evm.provider().get_block_number().await?)
     }
 
+    /// Startup preflight: verifies the signing wallet (`self.owner`) holds
+    /// `OPERATOR_ROLE` on the configured inventory, which every `deposit4` /
+    /// `withdraw4` requires. Returns [`RaindexError::MissingOperatorRole`] if
+    /// not, so the caller can fail fast rather than let the bot revert on the
+    /// first rebalance. `OPERATOR_ROLE` is read from the contract rather than
+    /// hardcoded, so a future role-scheme change stays in sync.
+    pub async fn verify_operator_role<Registry: IntoErrorRegistry>(
+        &self,
+    ) -> Result<(), RaindexError> {
+        let operator_role: alloy::primitives::FixedBytes<32> = self
+            .evm
+            .call::<Registry, _>(
+                self.inventory_address,
+                IRaindexInventory::OPERATOR_ROLECall {},
+            )
+            .await?;
+
+        let has_role: bool = self
+            .evm
+            .call::<Registry, _>(
+                self.inventory_address,
+                IRaindexInventory::hasRoleCall {
+                    role: operator_role,
+                    account: self.owner,
+                },
+            )
+            .await?;
+
+        if has_role {
+            Ok(())
+        } else {
+            Err(RaindexError::MissingOperatorRole {
+                inventory: self.inventory_address,
+                wallet: self.owner,
+            })
+        }
+    }
+
     async fn get_vault_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
@@ -439,6 +545,32 @@ impl<E: Evm> RaindexService<E> {
 
         Ok(Float::from_raw(balance_float))
     }
+}
+
+/// Re-maps a raw `withdraw4` revert into [`RaindexError::InsufficientVaultLiquidity`]
+/// when the inventory reverted because the vault could not cover the request.
+///
+/// The inventory's `InsufficientVaultLiquidity` custom error is not in the
+/// OpenChain selector registry, so `submit` surfaces it as an opaque
+/// `EvmError::Contract` carrying the raw revert bytes. We decode those bytes
+/// against the compiled `IRaindexInventory` binding here so callers can branch
+/// on the under-funded case (reconcile / retry after refund) instead of seeing
+/// a generic contract error. Any other error is returned unchanged.
+fn map_withdraw_revert(err: EvmError) -> RaindexError {
+    let EvmError::Contract(ref contract_err) = err else {
+        return err.into();
+    };
+    let Some(revert_data) = contract_err.as_revert_data() else {
+        return err.into();
+    };
+    IRaindexInventory::InsufficientVaultLiquidity::abi_decode(revert_data.as_ref()).map_or_else(
+        |_| err.into(),
+        |decoded| RaindexError::InsufficientVaultLiquidity {
+            token: decoded.token,
+            requested: decoded.requested,
+            received: decoded.received,
+        },
+    )
 }
 
 #[async_trait]
@@ -468,7 +600,8 @@ impl<W: Wallet> Raindex for RaindexService<W> {
                 },
                 "withdraw4 from vault",
             )
-            .await?;
+            .await
+            .map_err(map_withdraw_revert)?;
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, %target_amount, "withdraw4 confirmed");
         Ok(receipt.transaction_hash)
@@ -517,7 +650,8 @@ impl<W: Wallet> Raindex for RaindexService<W> {
                 },
                 "withdraw4 from vault",
             )
-            .await?;
+            .await
+            .map_err(map_withdraw_revert)?;
 
         info!(target: "inventory", %tx_hash, %token, %target_amount, "withdraw4 submitted");
         Ok(tx_hash)
@@ -745,8 +879,10 @@ mod tests {
         // dual-scan finds this via the backwards-compat branch.
         RaindexService::new(
             wallet,
-            local_evm.orderbook_address,
-            local_evm.orderbook_address,
+            RaindexContracts {
+                inventory: local_evm.orderbook_address,
+                orderbook: local_evm.orderbook_address,
+            },
             owner,
         )
     }
@@ -767,8 +903,10 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let service = RaindexService::new(
             ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            Address::ZERO,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
             Address::ZERO,
         );
 
@@ -797,8 +935,10 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let service = RaindexService::new(
             ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            Address::ZERO,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
             Address::ZERO,
         );
 
@@ -813,10 +953,26 @@ mod tests {
     /// A `WithdrawV2` from this owner's vault, mined at `block_number`, that
     /// `find_recent_withdrawal` will see for `(USDC_BASE, TEST_VAULT_ID)`.
     fn withdraw_log(block_number: u64, withdraw_amount: U256) -> Log {
+        withdraw_log_with(
+            Address::ZERO,
+            USDC_BASE,
+            TEST_VAULT_ID.0,
+            block_number,
+            withdraw_amount,
+        )
+    }
+
+    fn withdraw_log_with(
+        sender: Address,
+        token: Address,
+        vault_id: B256,
+        block_number: u64,
+        withdraw_amount: U256,
+    ) -> Log {
         let event = IRaindexV6::WithdrawV2 {
-            sender: Address::ZERO,
-            token: USDC_BASE,
-            vaultId: TEST_VAULT_ID.0,
+            sender,
+            token,
+            vaultId: vault_id,
             targetAmount: B256::ZERO,
             withdrawAmount: B256::ZERO,
             withdrawAmountUint256: withdraw_amount,
@@ -843,10 +999,26 @@ mod tests {
     /// `block_number`, that `find_recent_withdrawal` will see for
     /// `(USDC_BASE, TEST_VAULT_ID)`.
     fn operator_withdraw_log(block_number: u64, amount: U256) -> Log {
+        operator_withdraw_log_with(
+            Address::ZERO,
+            USDC_BASE,
+            TEST_VAULT_ID.0,
+            block_number,
+            amount,
+        )
+    }
+
+    fn operator_withdraw_log_with(
+        operator: Address,
+        token: Address,
+        vault_id: B256,
+        block_number: u64,
+        amount: U256,
+    ) -> Log {
         let event = IRaindexInventory::OperatorWithdraw {
-            operator: Address::ZERO,
-            token: USDC_BASE,
-            vaultId: TEST_VAULT_ID.0,
+            operator,
+            token,
+            vaultId: vault_id,
             amount,
         };
 
@@ -882,8 +1054,10 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let service = RaindexService::new(
             ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            Address::ZERO,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
             Address::ZERO,
         );
 
@@ -893,6 +1067,137 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, Some((expected_tx, amount)));
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_ignores_other_operators_withdraw() {
+        // The Bebop and univ4 hooks share this inventory. Their OperatorWithdraw
+        // events carry a different `operator`, and must NEVER be adopted as this
+        // bot's in-flight rebalance withdraw — otherwise the resume would skip a
+        // withdraw it still owes (or reconcile against someone else's amount).
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        let bebop_hook = Address::repeat_byte(0x8b);
+        let log = operator_withdraw_log_with(
+            bebop_hook,
+            USDC_BASE,
+            TEST_VAULT_ID.0,
+            from_block + 1,
+            U256::from(9u64),
+        );
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&json!([log.clone()]));
+            asserter.push_success(&json!("0x200")); // head well past from_block
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        // Service owner is Address::ZERO; the log's operator is the Bebop hook.
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "another operator's OperatorWithdraw must not be adopted as ours",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_prefers_operator_withdraw_over_stale_withdrawv2() {
+        // Cutover window: the scan window contains BOTH a pre-migration
+        // WithdrawV2 for a different vault (sender == our EOA) and this
+        // transfer's inventory OperatorWithdraw. Newest-first iteration plus the
+        // per-branch (token, vaultId) filter must land on the OperatorWithdraw
+        // and return ITS amount, not the WithdrawV2's.
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        let op_amount = U256::from(11u64);
+        let other_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000009");
+        // Ascending block order (as get_logs returns): stale WithdrawV2 first,
+        // matching OperatorWithdraw last (newer).
+        let stale = withdraw_log_with(
+            Address::ZERO,
+            USDC_BASE,
+            other_vault,
+            from_block + 1,
+            U256::from(5u64),
+        );
+        let ours = operator_withdraw_log(from_block + 2, op_amount);
+        let expected_tx = ours.transaction_hash.unwrap();
+        asserter.push_success(&json!([stale, ours]));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some((expected_tx, op_amount)));
+    }
+
+    #[test]
+    fn map_withdraw_revert_decodes_insufficient_vault_liquidity() {
+        use alloy::hex;
+        use alloy::rpc::json_rpc::ErrorPayload;
+        use alloy::transports::TransportError;
+
+        let requested = U256::from(1000u64);
+        let received = U256::from(400u64);
+        let revert_bytes = alloy::primitives::Bytes::from(
+            IRaindexInventory::InsufficientVaultLiquidity {
+                token: USDC_BASE,
+                requested,
+                received,
+            }
+            .abi_encode(),
+        );
+
+        // Mirror how a real reverted `withdraw4` surfaces: an RPC error-response
+        // carrying the hex-encoded revert data (see crates/evm error_decoding).
+        let hex_data = hex::encode_prefixed(&revert_bytes);
+        let raw = serde_json::value::to_raw_value(&hex_data).expect("valid json");
+        let payload = ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: Some(raw),
+        };
+        let contract_err =
+            alloy::contract::Error::TransportError(TransportError::ErrorResp(payload));
+
+        let mapped = map_withdraw_revert(EvmError::Contract(contract_err));
+
+        match mapped {
+            RaindexError::InsufficientVaultLiquidity {
+                token,
+                requested: r,
+                received: rc,
+            } => {
+                assert_eq!(token, USDC_BASE);
+                assert_eq!(r, requested);
+                assert_eq!(rc, received);
+            }
+            other => panic!("expected InsufficientVaultLiquidity, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -912,8 +1217,10 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let service = RaindexService::new(
             ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            Address::ZERO,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
             Address::ZERO,
         );
 
@@ -941,8 +1248,10 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let service = RaindexService::new(
             ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            Address::ZERO,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
             Address::ZERO,
         );
 

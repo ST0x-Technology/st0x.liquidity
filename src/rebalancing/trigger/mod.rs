@@ -473,6 +473,9 @@ pub(crate) struct RebalancingService {
     config: RebalancingServiceConfig,
     vault_registry: Arc<Store<VaultRegistry>>,
     orderbook: Address,
+    /// On-chain owner of the Raindex vaults, used to key vault-registry lookups.
+    /// The inventory contract post-migration, the bot EOA before it; production
+    /// sources this from `Ctx::vault_owner`.
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
     /// Reads issuance's per-asset dividend freeze status so the equity trigger

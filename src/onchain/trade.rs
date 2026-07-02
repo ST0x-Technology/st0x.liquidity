@@ -874,6 +874,7 @@ mod tests {
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             inventory: Address::ZERO,
+            vault_owner: None,
             deployment_block: 0,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,

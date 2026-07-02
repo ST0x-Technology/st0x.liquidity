@@ -216,6 +216,7 @@ mod tests {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: Address::random(),
                 inventory: Address::random(),
+                vault_owner: None,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

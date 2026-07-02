@@ -10,7 +10,7 @@ use st0x_config::Ctx;
 use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
-use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexContracts, RaindexService, RaindexVaultId};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
@@ -78,8 +78,10 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        ctx.evm.inventory,
-        ctx.evm.orderbook,
+        RaindexContracts {
+            inventory: ctx.evm.inventory,
+            orderbook: ctx.evm.orderbook,
+        },
         sender_address,
     );
 
@@ -133,8 +135,10 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        ctx.evm.inventory,
-        ctx.evm.orderbook,
+        RaindexContracts {
+            inventory: ctx.evm.inventory,
+            orderbook: ctx.evm.orderbook,
+        },
         sender_address,
     );
 
@@ -222,6 +226,7 @@ mod tests {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: address!("0x2345678901234567890123456789012345678901"),
+                vault_owner: None,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -262,6 +267,7 @@ mod tests {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: address!("0x2345678901234567890123456789012345678901"),
+                vault_owner: None,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

@@ -36,8 +36,20 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Shared RaindexInventory (rainlanguage/raindex.governance) that owns the
 # Raindex orders/vaults. All venue adapters (Bebop hook, univ4 hook) and
 # this bot's rebalancing settle through it; the bot's EOA must hold
-# OPERATOR_ROLE on this address.
+# OPERATOR_ROLE on this address (enforced by a startup preflight).
+#
+# NOTE: this is the CURRENT (pre-Turnkey-migration) inventory, admin
+# 0x679dF30b…. RAI-1198 redeploys the inventory owned by the Turnkey wallet
+# and migrates the vaults; at that cutover, update this address AND set
+# `vault_owner` below to the same address in the same change that grants the
+# bot OPERATOR_ROLE.
 inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
+# Owner of the Raindex orders/vaults on-chain — the key every vaultBalance2
+# read, vault-registry entry, and order-owner fill match is scoped by. Unset
+# = the [wallet] address (pre-migration: vaults owned by the bot EOA). Once
+# RAI-1198 moves the vaults under the inventory contract, set this to the
+# `inventory` address above:
+#   vault_owner = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
 # Block confirmations required before a submitted transaction is treated as
