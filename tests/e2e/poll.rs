@@ -29,6 +29,35 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// Returns two distinct ephemeral ports for the HTTP server and apalis board.
+pub fn free_port_pair() -> (u16, u16) {
+    let server_port = free_port();
+    let mut board_port = free_port();
+    while board_port == server_port {
+        board_port = free_port();
+    }
+    (server_port, board_port)
+}
+
+/// HTTP server and apalis board ports for e2e tests launched via `nix run`.
+///
+/// When `SIMULATE_BOT_PORT` is set (by `nix run .#simulate` / `.#simulate-market`),
+/// uses that port for the server and the next port for the board so the dashboard
+/// can connect. Otherwise picks two free ephemeral ports for plain `cargo nextest`.
+pub fn simulation_ports() -> (u16, u16) {
+    let Ok(port_str) = std::env::var("SIMULATE_BOT_PORT") else {
+        return free_port_pair();
+    };
+
+    let server_port: u16 = port_str
+        .parse()
+        .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
+    let board_port = server_port
+        .checked_add(1)
+        .expect("SIMULATE_BOT_PORT must be < u16::MAX to allocate board port");
+    (server_port, board_port)
+}
+
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_bot_session(ctx))

@@ -339,13 +339,20 @@
                 '';
               };
 
-              # Continuous user-trade driver — the default simulation.
+              # Eventual-consistency chaos test with live dashboard — the default
+              # local simulation entry point.
               simulate = mkSimulation {
                 name = "simulate";
+                testFilter = "full_system_concurrent";
+              };
+
+              # Continuous user-trade driver — infinite market simulation.
+              "simulate-market" = mkSimulation {
+                name = "simulate-market";
                 testFilter = "simulate";
               };
 
-              # Same live dashboard stack as `simulate`, but first creates
+              # Same live dashboard stack as `simulate-market`, but first creates
               # stuck mint and redemption rebalances whose Alpaca mock
               # provider later completes. The backend logs the
               # `transfer recheck` commands needed to recover them.

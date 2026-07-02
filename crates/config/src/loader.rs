@@ -1200,6 +1200,7 @@ impl Ctx {
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
         rest_api: Option<RestApiCtx>,
+        #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
@@ -1245,7 +1246,7 @@ impl Ctx {
             assets,
             travel_rule,
             rest_api,
-            issuance: create_test_issuance_ctx(),
+            issuance,
             redemption_wallet,
         })
     }
@@ -1454,6 +1455,16 @@ pub fn create_test_issuance_ctx() -> IssuanceStatusCtx {
         #[allow(clippy::unwrap_used)]
         base_url: Url::parse("http://localhost:8000").unwrap(),
         api_key: IssuanceApiKey(B256::repeat_byte(0xab)),
+    }
+}
+
+/// Issuance status context pointing at an e2e mock server URL.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn test_issuance_status_ctx(base_url: Url) -> IssuanceStatusCtx {
+    IssuanceStatusCtx {
+        base_url,
+        api_key: create_test_issuance_ctx().api_key,
     }
 }
 
@@ -3333,6 +3344,13 @@ mod tests {
             !rendered.contains(raw_key),
             "the raw api_key leaked into the error output: {rendered}"
         );
+    }
+
+    #[test]
+    fn test_issuance_status_ctx_uses_supplied_base_url() {
+        let base_url = Url::parse("http://127.0.0.1:4242").unwrap();
+        let ctx = test_issuance_status_ctx(base_url.clone());
+        assert_eq!(ctx.base_url, base_url);
     }
 
     #[test]
