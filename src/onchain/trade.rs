@@ -17,6 +17,7 @@ use st0x_config::EvmCtx;
 use st0x_evm::Evm;
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
+use st0x_registry::SymbolCache;
 
 use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
 use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
@@ -24,7 +25,6 @@ use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain_trade::PythPrice;
-use crate::symbol::cache::SymbolCache;
 
 /// Onchain trade event emitted by the Raindex orderbook, wrapping either
 /// a `ClearV3` or `TakeOrderV3` payload for downstream processing.
@@ -249,10 +249,13 @@ impl OnchainTrade {
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
         let onchain_input_amount = Float::from_raw(fill.input_amount);
-        let onchain_input_symbol = cache.get_io_symbol(evm, input).await?;
 
         let onchain_output_amount = Float::from_raw(fill.output_amount);
-        let onchain_output_symbol = cache.get_io_symbol(evm, output).await?;
+
+        let (onchain_input_symbol, onchain_output_symbol) = tokio::try_join!(
+            cache.resolve_symbol(evm, input.token),
+            cache.resolve_symbol(evm, output.token),
+        )?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
@@ -514,15 +517,15 @@ mod tests {
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
 
+    use st0x_config::{EvmCtx, IngestionCutoff};
     use st0x_evm::IPyth::getPriceUnsafeCall;
     use st0x_evm::PythStructs::Price;
     use st0x_evm::ReadOnlyEvm;
+    use st0x_float_macro::float;
+    use st0x_registry::SymbolCache;
 
     use super::*;
     use crate::bindings::IRaindexV6;
-    use crate::symbol::cache::SymbolCache;
-    use st0x_config::{EvmCtx, IngestionCutoff};
-    use st0x_float_macro::float;
 
     #[tokio::test]
     async fn resolve_block_timestamp_fetches_header_when_log_timestamp_missing() {

@@ -6726,6 +6726,7 @@ dependencies = [
  "st0x-issuance-client",
  "st0x-issuance-dto",
  "st0x-raindex",
+ "st0x-registry",
  "st0x-wrapper",
  "task-supervisor",
  "temp-env",
@@ -6787,6 +6788,17 @@ dependencies = [
  "tracing",
  "tracing-test",
  "url",
+]
+
+[[package]]
+name = "st0x-registry"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "backon",
+ "st0x-evm",
+ "st0x-execution",
+ "tokio",
 ]
 
 [[package]]

@@ -34,7 +34,7 @@ use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 use crate::position::{Position, PositionCommand};
-use crate::symbol::cache::SymbolCache;
+use st0x_registry::SymbolCache;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
 /// constructed from config.

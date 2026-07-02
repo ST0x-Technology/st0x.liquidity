@@ -122,6 +122,18 @@ pub(crate) fn get_test_order() -> OrderV4 {
     }
 }
 
+/// Preloads ERC20 symbols for the fixed token addresses in [`get_test_order`].
+pub(crate) fn seed_get_test_order_token_symbols(cache: &st0x_registry::SymbolCache) {
+    cache.preload_symbol(
+        address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "USDC",
+    );
+    cache.preload_symbol(
+        address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        "wtAAPL",
+    );
+}
+
 /// Creates a generic `Log` stub with the supplied log index. This helper is
 /// useful when the concrete value of most fields is irrelevant for the
 /// assertion being performed.

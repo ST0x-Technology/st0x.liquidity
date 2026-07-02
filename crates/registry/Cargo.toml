@@ -1,0 +1,17 @@
+[package]
+name = "st0x-registry"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy.workspace = true
+backon.workspace = true
+st0x-evm.workspace = true
+st0x-execution.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+st0x-evm = { workspace = true, features = ["mock", "test-support"] }
+
+[lints]
+workspace = true

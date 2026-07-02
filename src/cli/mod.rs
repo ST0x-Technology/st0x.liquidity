@@ -26,12 +26,12 @@ use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
+use st0x_registry::SymbolCache;
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::Position;
-use crate::symbol::cache::SymbolCache;
 use crate::vault_registry::VaultRegistry;
 
 /// Direction for transferring assets between trading venues.

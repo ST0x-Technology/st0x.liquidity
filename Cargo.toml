@@ -10,6 +10,7 @@ members = [
   "crates/float-macro",
   "crates/float-serde",
   "crates/raindex",
+  "crates/registry",
   "crates/wrapper",
 ]
 resolver = "2"
@@ -106,6 +107,7 @@ st0x-float-macro = { path = "crates/float-macro" }
 st0x-float-serde = { path = "crates/float-serde" }
 st0x-hedge = { path = "." }
 st0x-raindex = { path = "crates/raindex" }
+st0x-registry = { path = "crates/registry" }
 st0x-wrapper = { path = "crates/wrapper" }
 temp-env = "0.3.6"
 tempfile = "3.24.0"
@@ -219,6 +221,7 @@ st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
 st0x-raindex = { workspace = true, features = ["rain"] }
+st0x-registry.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true

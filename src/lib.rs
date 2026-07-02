@@ -56,7 +56,6 @@ mod performance;
 mod position;
 mod position_check;
 mod rebalancing;
-mod symbol;
 mod telemetry;
 mod tokenization;
 mod trading;
