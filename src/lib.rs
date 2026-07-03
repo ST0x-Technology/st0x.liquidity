@@ -49,6 +49,7 @@ pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
 pub(crate) mod metrics;
+pub mod migration_verification;
 mod offchain;
 mod onchain;
 mod onchain_trade;

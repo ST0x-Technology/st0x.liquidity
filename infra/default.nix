@@ -222,6 +222,47 @@ let
         '';
       };
 
+      # Downloads a *consistent* copy of the live database: `scp`-ing
+      # /mnt/data/st0x-hedge.db directly (as ${env}-status does for its
+      # bundled DB) can race the bot's live writes and produce a torn,
+      # corrupt file -- SQLite's file format has no atomicity guarantee
+      # against a plain file copy of a database still being written to.
+      # `VACUUM INTO` runs a normal read transaction against the live DB and
+      # writes a guaranteed-consistent copy server-side first; only that
+      # copy gets shipped over the wire, then deleted from the remote host.
+      "${env}DbSnapshot" = pkgs.writeShellApplication {
+        name = "${env}-db-snapshot";
+        runtimeInputs = sshInputs ++ [ pkgs.coreutils ];
+        text = ''
+          ${resolveHost}
+          trap _cleanup_identity EXIT
+
+          ssh_remote() {
+            # shellcheck disable=SC2029
+            ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
+          }
+
+          db_path="/mnt/data/st0x-hedge.db"
+          remote_snapshot="/tmp/st0x-hedge-snapshot-$(date -u +%Y%m%d%H%M%S).db"
+          out_dir="''${1:-./.tmp/$(date -u +%Y-%m-%d_%H-%M-%S)-${env}-db-snapshot}"
+          mkdir -p "$out_dir"
+          local_snapshot="$out_dir/st0x-hedge.db"
+
+          echo "Taking a consistent snapshot of ${env}'s live database..." >&2
+          ssh_remote "sqlite3 $db_path \"VACUUM INTO '$remote_snapshot'\""
+
+          cleanup_remote_snapshot() {
+            ssh_remote "rm -f $remote_snapshot" || true
+          }
+          trap 'cleanup_remote_snapshot; _cleanup_identity' EXIT
+
+          echo "Downloading snapshot to $local_snapshot..." >&2
+          scp ''${identity:+-i "$identity"} "root@$host_ip:$remote_snapshot" "$local_snapshot"
+
+          echo "$local_snapshot"
+        '';
+      };
+
       "${env}BotStart" = pkgs.writeShellApplication {
         name = "${env}-bot-start";
         runtimeInputs = sshInputs;

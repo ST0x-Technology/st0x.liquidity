@@ -431,8 +431,28 @@
                 '';
               };
             };
+
+            # Per-environment `<env>-verify-migrations`: pulls a consistent
+            # snapshot via `<env>-db-snapshot` (infra/default.nix), then runs
+            # this build's `verify-migrations` binary against it. Lives here
+            # rather than in infra/default.nix because it needs `rust.st0x-liquidity`
+            # (the compiled binary), which that module doesn't have access to.
+            verifyMigrationsPkgs = builtins.listToAttrs (
+              map (env: {
+                name = "${env}VerifyMigrations";
+                value = pkgs.writeShellApplication {
+                  name = "${env}-verify-migrations";
+                  runtimeInputs = [ rust.st0x-liquidity ];
+                  text = ''
+                    local_snapshot="$(${infraPkgs.packages.${env + "DbSnapshot"}}/bin/${env}-db-snapshot "$@")"
+                    echo "Verifying migrations against $local_snapshot..." >&2
+                    exec verify-migrations --db "$local_snapshot"
+                  '';
+                };
+              }) envNames
+            );
           in
-          rainixPkgs // infraPkgs.packages // deployScripts // abis // others;
+          rainixPkgs // infraPkgs.packages // deployScripts // abis // others // verifyMigrationsPkgs;
 
         formatter = pkgs.nixfmt-rfc-style;
 
