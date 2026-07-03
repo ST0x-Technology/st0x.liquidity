@@ -52,6 +52,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     CurrentState::export_all_to(out_dir)?;
     Settings::export_all_to(out_dir)?;
     AssetSettings::export_all_to(out_dir)?;
+    CounterTrading::export_all_to(out_dir)?;
     WalletSettings::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;

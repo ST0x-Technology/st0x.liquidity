@@ -98,6 +98,11 @@
   const formatRatio = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`
 
   type PositionInfo = { net: string; priceUsdc: string | null }
+  type AssetFlags = {
+    counterTrading: boolean
+    rebalancing: boolean
+    extendedHours: boolean
+  }
 
   const positionMap = $derived(
     new Map(
@@ -108,6 +113,28 @@
           priceUsdc: position.last_price_usdc
         } satisfies PositionInfo
       ])
+    )
+  )
+
+  const assetFlagsMap = $derived(
+    new Map(
+      settings?.assets.map((asset) => {
+        const counterTrading = asset.counterTrading
+        const flags: AssetFlags =
+          counterTrading.status === 'enabled'
+            ? {
+                counterTrading: true,
+                rebalancing: asset.rebalancing,
+                extendedHours: counterTrading.extendedHours
+              }
+            : {
+                counterTrading: false,
+                rebalancing: asset.rebalancing,
+                extendedHours: false
+              }
+
+        return [asset.symbol, flags] as const
+      }) ?? []
     )
   )
 
@@ -123,12 +150,10 @@
     exposure: number
     netShares: string
     priceUsdc: string | null
-    trading: boolean
+    // null when the symbol has no settings entry (unconfigured): the status
+    // lights render as unknown rather than falsely showing all-disabled.
+    flags: AssetFlags | null
   }
-
-  const tradingSet = $derived(
-    new Set(settings?.assets.filter((asset) => asset.trading).map((asset) => asset.symbol) ?? [])
-  )
 
   const equityRows = $derived<EquityRow[]>(
     symbols.map((item) => {
@@ -139,6 +164,7 @@
       )
       const stripped = stripPrefix(item.symbol)
       const pos = positionMap.get(stripped)
+      const flags = assetFlagsMap.get(stripped) ?? null
 
       return {
         asset: stripped,
@@ -152,7 +178,7 @@
         exposure: pos?.priceUsdc ? parseFloat(pos.net) * parseFloat(pos.priceUsdc) : 0,
         netShares: pos?.net ?? '0',
         priceUsdc: pos?.priceUsdc ?? null,
-        trading: tradingSet.has(stripped)
+        flags
       }
     })
   )
@@ -208,8 +234,10 @@
     const rows = [...equityRows]
 
     rows.sort((lhs, rhs) => {
-      // Trading-enabled assets always come first
-      if (lhs.trading !== rhs.trading) return lhs.trading ? -1 : 1
+      // Counter-trading assets always come first
+      const lhsActive = lhs.flags?.counterTrading ?? false
+      const rhsActive = rhs.flags?.counterTrading ?? false
+      if (lhsActive !== rhsActive) return lhsActive ? -1 : 1
 
       if (sort.current) {
         const { column, dir } = sort.current
@@ -234,7 +262,35 @@
       ? approxClass(val)
       : 'cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4'
 
-  const dimClass = (base: string, trading = true): string => (trading ? base : `${base} opacity-40`)
+  const dimClass = (base: string, active = true): string => (active ? base : `${base} opacity-40`)
+
+  type LightState = 'enabled' | 'disabled' | 'unknown'
+
+  // A light reflects only its own flag. When the asset has no settings entry
+  // (unconfigured) the state is unknown -- rendered distinctly, never as a false
+  // "disabled". Counter-trading state does not dim sibling lights: each of CT /
+  // Rebal / Ext stands on its own so an enabled mode never reads as off.
+  const lightState = (flags: AssetFlags | null, key: keyof AssetFlags): LightState =>
+    flags === null ? 'unknown' : flags[key] ? 'enabled' : 'disabled'
+
+  const statusLightClass = (state: LightState): string => {
+    const color =
+      state === 'enabled'
+        ? 'border-green-500/70 bg-green-500 shadow-[0_0_0_3px_rgba(34,197,94,0.12)]'
+        : state === 'disabled'
+          ? 'border-red-500/70 bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.10)]'
+          : 'border-muted-foreground/40 bg-muted-foreground/30'
+
+    return `mx-auto block h-2.5 w-2.5 rounded-full border ${color}`
+  }
+
+  const statusGroupHeadClass = 'px-4 text-center font-normal normal-case tracking-normal'
+  const statusGroupClass =
+    'mx-auto grid w-max grid-cols-[1.25rem_2.5rem_1.25rem] items-center justify-items-center gap-1'
+  const statusCellClass = 'px-4 text-center'
+
+  const statusLabel = (label: string, state: LightState): string =>
+    `${label} ${state === 'unknown' ? 'unconfigured' : state}`
 
   type DeviationStyle = 'normal' | 'high' | 'low'
 
@@ -507,6 +563,22 @@
           </button>
         </Table.Head>
 
+        <Table.Head class={statusGroupHeadClass}>
+          <div class={statusGroupClass}>
+            <span title="Counter-trading / hedging for this asset: green enabled, red disabled, grey not configured."
+              >CT</span
+            >
+
+            <span title="Automatic equity rebalancing for this asset: green enabled, red disabled, grey not configured."
+              >Rebal</span
+            >
+
+            <span title="Extended-hours counter-trading (only active while counter-trading is enabled): green enabled, red disabled, grey not configured."
+              >Ext</span
+            >
+          </div>
+        </Table.Head>
+
         <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'raindex')}>
           <button
             class="{sortBtnClass} text-left"
@@ -593,16 +665,45 @@
     <Table.Body>
       {#each sortedEquities as row, idx (row.asset)}
         {@const dev = ratioDeviation(row.ratio, false)}
+        {@const ctActive = row.flags?.counterTrading ?? false}
+        {@const ctState = lightState(row.flags, 'counterTrading')}
+        {@const rebalState = lightState(row.flags, 'rebalancing')}
+        {@const extState = lightState(row.flags, 'extendedHours')}
         <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
-          <Table.Cell class="font-mono font-medium {row.trading ? '' : 'opacity-40'}"
+          <Table.Cell class="font-mono font-medium {ctActive ? '' : 'opacity-40'}"
             >{row.asset}</Table.Cell
           >
+
+          <Table.Cell class={statusCellClass}>
+            <div class={statusGroupClass}>
+              <span
+                class={statusLightClass(ctState)}
+                role="img"
+                title={statusLabel('Counter-trading', ctState)}
+                aria-label={statusLabel('Counter-trading', ctState)}
+              ></span>
+
+              <span
+                class={statusLightClass(rebalState)}
+                role="img"
+                title={statusLabel('Rebalancing', rebalState)}
+                aria-label={statusLabel('Rebalancing', rebalState)}
+              ></span>
+
+              <span
+                class={statusLightClass(extState)}
+                role="img"
+                title={statusLabel('Extended hours', extState)}
+                aria-label={statusLabel('Extended hours', extState)}
+              ></span>
+            </div>
+          </Table.Cell>
 
           <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={row.raindex.display}
               tooltip={equityUsdTooltip(row.raindex.full, row.priceUsdc)}
-              class={dimClass(valueClass(row.raindex), row.trading)}
+              class={dimClass(valueClass(row.raindex), ctActive)}
             />
           </Table.Cell>
 
@@ -610,7 +711,7 @@
             <InventoryHoverValue
               display={row.inflight.display}
               tooltip={equityUsdTooltip(row.inflight.full, row.priceUsdc)}
-              class={dimClass(`${valueClass(row.inflight)} opacity-50`, row.trading)}
+              class={dimClass(`${valueClass(row.inflight)} opacity-50`, ctActive)}
             />
           </Table.Cell>
 
@@ -618,7 +719,7 @@
             <InventoryHoverValue
               display={row.alpaca.display}
               tooltip={equityUsdTooltip(row.alpaca.full, row.priceUsdc)}
-              class={dimClass(valueClass(row.alpaca), row.trading)}
+              class={dimClass(valueClass(row.alpaca), ctActive)}
             />
           </Table.Cell>
 
@@ -626,7 +727,7 @@
             <InventoryHoverValue
               display={row.total.display}
               tooltip={equityUsdTooltip(row.total.full, row.priceUsdc)}
-              class={dimClass(valueClass(row.total), row.trading)}
+              class={dimClass(valueClass(row.total), ctActive)}
             />
           </Table.Cell>
 
@@ -642,7 +743,7 @@
                   style="width: {String(Math.min(row.ratio * 100, 100))}%"
                 ></div>
               </div>
-              <span class="font-mono text-[11px] {row.trading ? '' : 'opacity-40'}"
+              <span class="font-mono text-[11px] {ctActive ? '' : 'opacity-40'}"
                 >{formatRatio(row.ratio)}</span
               >
             </div>
@@ -662,7 +763,7 @@
                 tooltip={positionSharesTooltip(row.netShares)}
                 class={dimClass(
                   `cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4 ${row.exposure === 0 || isNegligible(row.exposure) ? 'text-muted-foreground' : row.exposure > 0 ? 'text-green-500' : 'text-red-500'}`,
-                  row.trading
+                  ctActive
                 )}
               />
             </div>
@@ -674,7 +775,7 @@
             <InventoryHoverValue
               display={row.unwrapped.display}
               tooltip={equityUsdTooltip(row.unwrapped.full, row.priceUsdc)}
-              class={dimClass(`${valueClass(row.unwrapped)} opacity-50`, row.trading)}
+              class={dimClass(`${valueClass(row.unwrapped)} opacity-50`, ctActive)}
             />
           </Table.Cell>
 
@@ -682,7 +783,7 @@
             <InventoryHoverValue
               display={row.wrapped.display}
               tooltip={equityUsdTooltip(row.wrapped.full, row.priceUsdc)}
-              class={dimClass(`${valueClass(row.wrapped)} opacity-50`, row.trading)}
+              class={dimClass(`${valueClass(row.wrapped)} opacity-50`, ctActive)}
             />
           </Table.Cell>
         </Table.Row>
