@@ -88,7 +88,7 @@ where
         use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
         let trade_event = &self.trade;
-        // The Raindex order/vault owner — the inventory contract post-migration,
+        // The Raindex order/vault owner -- the inventory contract post-migration,
         // the bot EOA before it. Used to match ClearV3/TakeOrderV3 fills to our
         // orders and to scope vault discovery.
         let order_owner = ctx.ctx.vault_owner();

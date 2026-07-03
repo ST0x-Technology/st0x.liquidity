@@ -600,6 +600,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::{ConnectOptions, SqlitePool};
 
+    use st0x_config::InventoryMode;
+
     use super::*;
     use crate::test_utils::setup_test_pools;
 
@@ -695,8 +697,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block,
             required_confirmations: 0,
             ingestion_cutoff,
@@ -1257,8 +1261,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,

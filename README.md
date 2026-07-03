@@ -67,9 +67,10 @@ cargo check       # verify setup
 ```
 
 Solidity ABIs are produced as per-feature Nix derivations under `nix/`
-(`forge-std.nix`, `pyth.nix`, `rain-math-float.nix`, `rain-orderbook.nix`) and
-exposed to `cargo` through environment variables set by the dev shell -- no
-submodule checkout, no manual `forge build` required.
+(`forge-std.nix`, `pyth.nix`, `rain-math-float.nix`, `rain-orderbook.nix`,
+`raindex-governance.nix` -- the shared `RaindexInventory` ABI) and exposed to
+`cargo` through environment variables set by the dev shell -- no submodule
+checkout, no manual `forge build` required.
 
 To reset the database: `sqlx db reset -y`
 
@@ -84,6 +85,13 @@ encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
 available options. Operational intervals such as
 `apalis_finished_job_cleanup_interval_secs` must be explicitly configured and
 non-zero.
+
+The `[raindex]` section requires an explicit `inventory_mode` (`"legacy"` or
+`"managed"`) and a `vault_owner` address (the on-chain owner the vaults are
+keyed by; no fallback). `"managed"` additionally requires an `inventory` address
+(the shared `RaindexInventory` the bot operates via `OPERATOR_ROLE`) and is
+forbidden from being set under `"legacy"`. See the `[raindex]` block in
+`example.config.toml` for the full field documentation.
 
 Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 

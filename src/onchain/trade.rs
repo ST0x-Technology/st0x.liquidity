@@ -531,7 +531,7 @@ mod tests {
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
 
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_evm::IPyth::getPriceUnsafeCall;
     use st0x_evm::PythStructs::Price;
     use st0x_evm::ReadOnlyEvm;
@@ -873,8 +873,10 @@ mod tests {
         let ctx = EvmCtx {
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
-            inventory: Address::ZERO,
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: Address::ZERO,
+            },
+            vault_owner: Address::ZERO,
             deployment_block: 0,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,

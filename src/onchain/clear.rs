@@ -250,7 +250,7 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use st0x_config::IngestionCutoff;
+    use st0x_config::{IngestionCutoff, InventoryMode};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Direction, FractionalShares};
     use st0x_float_macro::float;
@@ -270,8 +270,10 @@ mod tests {
         EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,

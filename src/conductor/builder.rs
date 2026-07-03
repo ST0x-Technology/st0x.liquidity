@@ -17,7 +17,7 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
-use st0x_raindex::{RaindexContracts, RaindexService};
+use st0x_raindex::RaindexService;
 use st0x_registry::SymbolCache;
 use st0x_tokenization::Tokenizer;
 
@@ -193,10 +193,7 @@ where
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
         evm,
-        RaindexContracts {
-            inventory: context.ctx.evm.inventory,
-            orderbook: context.ctx.evm.orderbook,
-        },
+        crate::onchain::raindex_contracts(&context.ctx.evm),
         order_owner,
     ));
 

@@ -209,8 +209,10 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            Address::ZERO,
-            Address::ZERO,
+            VaultRegistryId {
+                orderbook: Address::ZERO,
+                owner: Address::ZERO,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -270,8 +272,10 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            Address::ZERO,
-            Address::ZERO,
+            VaultRegistryId {
+                orderbook: Address::ZERO,
+                owner: Address::ZERO,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -389,8 +393,7 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            orderbook,
-            owner,
+            VaultRegistryId { orderbook, owner },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),

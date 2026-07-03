@@ -1719,7 +1719,7 @@ mod tests {
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
     use crate::vault_lookup::MockVaultLookup;
-    use crate::vault_registry::VaultRegistry;
+    use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new()
@@ -1878,8 +1878,10 @@ mod tests {
                 },
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            address!("0x0000000000000000000000000000000000000001"),
-            address!("0x0000000000000000000000000000000000000002"),
+            VaultRegistryId {
+                orderbook: address!("0x0000000000000000000000000000000000000001"),
+                owner: address!("0x0000000000000000000000000000000000000002"),
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -2024,8 +2026,10 @@ mod tests {
                 },
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            address!("0x0000000000000000000000000000000000000001"),
-            address!("0x0000000000000000000000000000000000000002"),
+            VaultRegistryId {
+                orderbook: address!("0x0000000000000000000000000000000000000001"),
+                owner: address!("0x0000000000000000000000000000000000000002"),
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -2348,8 +2352,10 @@ mod tests {
                 },
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            address!("0x0000000000000000000000000000000000000001"),
-            address!("0x0000000000000000000000000000000000000002"),
+            VaultRegistryId {
+                orderbook: address!("0x0000000000000000000000000000000000000001"),
+                owner: address!("0x0000000000000000000000000000000000000002"),
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),

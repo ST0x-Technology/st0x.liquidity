@@ -101,6 +101,34 @@ and the system proves market fit.
 
 Automated rebalancing is Alpaca Broker API based.
 
+##### Shared-Inventory Settlement
+
+Rebalancing deposits and withdrawals do not necessarily settle on the Rain
+OrderBook directly. The system supports two settlement modes, selected
+explicitly per deployment via `inventory_mode` under `[raindex]`:
+
+- **Legacy** (`inventory_mode = "legacy"`): the bot's own EOA owns the Raindex
+  vaults and `deposit4`/`withdraw4` settle against the OrderBook itself. No
+  distinct inventory contract is in play. This is the pre-migration state.
+- **Managed** (`inventory_mode = "managed"`, requires `inventory`): a shared
+  `RaindexInventory` (rainlanguage/raindex.governance) owns the vaults. Every
+  venue adapter (Bebop hook, univ4 hook) and this bot's own rebalancing path
+  settle through it; fills on the pooled vaults surface as
+  `OperatorDeposit`/`OperatorWithdraw`. The bot's EOA must hold `OPERATOR_ROLE`
+  on the inventory to operate the vaults. A startup preflight verifies the role
+  (retrying to absorb RPC lag right after a cutover grant) and fails fast with a
+  clear error rather than reverting on the first rebalance; it also revokes any
+  stale pre-migration allowance the bot granted the OrderBook directly.
+
+Distinct from the settlement target is `vault_owner`: the on-chain owner every
+`vaultBalance2` read, vault-registry entry, and ClearV3/TakeOrderV3 order-owner
+fill match is scoped by. It is required and explicit (no fallback). While the
+vaults are bot-EOA-owned it is the `[wallet]` address; once the shared-inventory
+migration moves the orders/vaults under the inventory contract, `msg.sender` to
+Raindex becomes the inventory, so `vault_owner` must be flipped to the
+`inventory` address in the same change that switches `inventory_mode` to
+`"managed"` and grants the bot `OPERATOR_ROLE`.
+
 #### Dividend Freeze
 
 A dividend (or other corporate action) bumps a tokenized equity's wrapper NAV.

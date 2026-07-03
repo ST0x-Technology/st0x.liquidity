@@ -11,7 +11,7 @@
 # by the operator address so the bot can watch every venue-driven vault delta
 # from a single contract.
 #
-# Same Soldeer vendoring pattern as rain-orderbook.nix — deterministic fetch of
+# Same Soldeer vendoring pattern as rain-orderbook.nix -- deterministic fetch of
 # the pinned closure so `forge build` runs offline against the sandbox.
 
 let
@@ -57,7 +57,7 @@ let
   };
 
 in
-rec {
+{
   inherit abi soldeerDeps;
 
   abiEnv = {

@@ -22,7 +22,7 @@ use st0x_execution::{
     CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::Usdc;
-use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -140,6 +140,26 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     ) -> Result<Option<TxHash>, CctpError> {
         self.find_recent_usdc_transfer(from, to, amount, from_block)
             .await
+    }
+}
+
+/// Classifies a failed vault `withdraw_usdc`. An atomic
+/// [`RaindexError::InsufficientVaultLiquidity`] revert means the vault could not
+/// cover the request; it withdrew nothing (atomic revert), so retrying only
+/// reverts again until the vault is refunded. It is surfaced as a distinct,
+/// contextful error the job latches for operator reconciliation (no auto-retry)
+/// rather than the opaque `Vault` wrap, which the job redrives. Any other error
+/// keeps the opaque wrap and the normal redrive path.
+fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
+    match error {
+        RaindexError::InsufficientVaultLiquidity { .. } => {
+            warn!(target: "rebalance", %error, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
+            UsdcTransferError::InsufficientVaultLiquidity { source: error }
+        }
+        other => {
+            warn!(target: "rebalance", "Vault withdrawal failed: {other}");
+            UsdcTransferError::Vault(other)
+        }
     }
 }
 
@@ -2603,10 +2623,7 @@ impl<
 
         let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
             Ok(tx) => tx,
-            Err(error) => {
-                warn!(target: "rebalance", "Vault withdrawal failed: {error}");
-                return Err(UsdcTransferError::Vault(error));
-            }
+            Err(error) => return Err(classify_vault_withdrawal_error(error)),
         };
 
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
@@ -2674,10 +2691,7 @@ impl<
 
         let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
             Ok(tx) => tx,
-            Err(error) => {
-                warn!(target: "rebalance", "Vault withdrawal failed: {error}");
-                return Err(UsdcTransferError::Vault(error));
-            }
+            Err(error) => return Err(classify_vault_withdrawal_error(error)),
         };
 
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
@@ -13397,6 +13411,36 @@ mod tests {
         );
 
         (manager, cqrs)
+    }
+
+    #[test]
+    fn under_funded_vault_withdraw_surfaces_distinct_terminal_error() {
+        // An atomic InsufficientVaultLiquidity revert withdrew nothing, so it
+        // must surface the distinct terminal variant (which the job latches for
+        // operator reconciliation, no auto-retry) rather than the opaque Vault
+        // wrap the job redrives.
+        let error = classify_vault_withdrawal_error(RaindexError::InsufficientVaultLiquidity {
+            token: USDC_BASE,
+            requested: U256::from(1_000_000u64),
+            received: U256::from(400_000u64),
+        });
+
+        assert!(
+            matches!(error, UsdcTransferError::InsufficientVaultLiquidity { .. }),
+            "under-funded revert must surface the distinct terminal error, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn non_under_funded_vault_withdraw_wraps_opaquely_for_redrive() {
+        // Any other RaindexError keeps the opaque Vault wrap so the caller's
+        // normal redrive path still runs.
+        let error = classify_vault_withdrawal_error(RaindexError::ZeroAmount);
+
+        assert!(
+            matches!(error, UsdcTransferError::Vault(RaindexError::ZeroAmount)),
+            "non-under-funded errors must wrap opaquely as Vault, got: {error:?}"
+        );
     }
 
     /// Hypothesis: in `continue_alpaca_to_base_from_withdrawal_complete` (durable

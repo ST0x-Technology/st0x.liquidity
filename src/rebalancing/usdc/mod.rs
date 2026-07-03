@@ -58,6 +58,19 @@ pub(crate) enum UsdcTransferError {
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
+    /// The shared inventory reverted a `withdraw4` because the vault could not
+    /// cover the requested amount (a concurrent clear drained it). Distinct from
+    /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
+    /// withdraw reverts again until the vault is refunded, so the withdrawal
+    /// aggregate is failed for operator reconciliation before this surfaces.
+    #[error(
+        "inventory vault under-funded on withdraw: {source}; \
+         failed for operator reconciliation"
+    )]
+    InsufficientVaultLiquidity {
+        #[source]
+        source: RaindexError,
+    },
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<UsdcRebalance>>),
     #[error("Withdrawal failed with terminal status: {status}")]

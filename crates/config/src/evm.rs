@@ -2,6 +2,7 @@
 
 use alloy::primitives::Address;
 use serde::Deserialize;
+use thiserror::Error;
 use url::Url;
 
 /// Which block tag to use as the fill-ingestion cutoff.
@@ -34,30 +35,107 @@ impl std::fmt::Display for IngestionCutoff {
     }
 }
 
+/// Whether rebalancing settles through a distinct shared `RaindexInventory` or
+/// directly against the orderbook.
+///
+/// Pre-migration the bot's EOA owns the Raindex vaults and deposits/withdraws
+/// settle on the orderbook itself: there is no separate inventory contract and
+/// no `OPERATOR_ROLE` to hold. The shared-inventory migration introduces a
+/// distinct `RaindexInventory` that owns the vaults, which the bot operates via
+/// `OPERATOR_ROLE`. Modelling the two as an explicit enum keeps a production
+/// misconfig -- e.g. copying the orderbook address into `inventory` -- from
+/// silently bypassing the startup `OPERATOR_ROLE` preflight, which an
+/// `inventory == orderbook` equality check could not distinguish from a genuine
+/// legacy deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryMode {
+    /// No distinct inventory contract: vaults are bot-EOA-owned and settle
+    /// directly against the orderbook. The startup `OPERATOR_ROLE` preflight is
+    /// skipped and rebalancing `deposit4`/`withdraw4` target the orderbook.
+    Legacy,
+    /// A distinct shared `RaindexInventory` owns the vaults. The bot must hold
+    /// `OPERATOR_ROLE` on it; rebalancing deposits/withdraws settle here.
+    Managed { inventory: Address },
+}
+
+/// Config-level discriminant for [`InventoryMode`], deserialized from
+/// `[raindex].inventory_mode`.
+///
+/// Kept separate from the resolved enum so the `inventory` address requirement
+/// can be validated (required for `managed`, forbidden for `legacy`) at startup
+/// rather than trusted from the file.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryModeTag {
+    Legacy,
+    Managed,
+}
+
+/// Errors resolving an [`EvmConfig`] into a runtime [`EvmCtx`].
+#[derive(Debug, Error)]
+pub enum EvmConfigError {
+    #[error(
+        "[raindex] inventory_mode = \"managed\" requires an `inventory` address, \
+         but none was configured"
+    )]
+    ManagedWithoutInventory,
+    #[error(
+        "[raindex] inventory_mode = \"legacy\" forbids an `inventory` address, \
+         but {inventory} was configured; set inventory_mode = \"managed\" to \
+         enable a shared inventory"
+    )]
+    LegacyWithInventory { inventory: Address },
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvmConfig {
     pub orderbook: Address,
+    /// Rebalancing settlement mode. `legacy` settles directly against the
+    /// orderbook with bot-EOA-owned vaults (no inventory contract); `managed`
+    /// settles through the shared `RaindexInventory` named by `inventory`, which
+    /// the bot must operate via `OPERATOR_ROLE`. See [`InventoryMode`].
+    pub inventory_mode: InventoryModeTag,
     /// Shared `RaindexInventory` (raindex.governance) that owns the Raindex
-    /// vaults. All venue adapters (Bebop hook, univ4 hook) and this bot's own
-    /// rebalancing path settle through it — `deposit4`/`withdraw4` on this
-    /// address instead of on the orderbook. Fill events on the pooled vaults
-    /// are also surfaced here as `OperatorDeposit`/`OperatorWithdraw`.
-    pub inventory: Address,
-    /// Address that owns the Raindex orders and vaults on-chain — the key every
+    /// vaults. Required when `inventory_mode = "managed"` and forbidden for
+    /// `legacy` (both validated at startup). All venue adapters (Bebop hook,
+    /// univ4 hook) and this bot's own rebalancing path settle through it --
+    /// `deposit4`/`withdraw4` on this address instead of on the orderbook. Fill
+    /// events on the pooled vaults are also surfaced here as
+    /// `OperatorDeposit`/`OperatorWithdraw`.
+    pub inventory: Option<Address>,
+    /// Address that owns the Raindex orders and vaults on-chain -- the key every
     /// `vaultBalance2` read, vault-registry entry, and order-owner fill match is
-    /// scoped by. Once the shared-inventory migration (RAI-1198) moves the
-    /// orders/vaults under the inventory contract, `msg.sender` to Raindex is the
-    /// inventory, so it becomes the vault owner and this must be set to the
-    /// `inventory` address. Left unset (the pre-migration default) it falls back
-    /// to the `[wallet]` address, matching the bot-EOA-owned vaults that exist
-    /// today. This is the ops cutover lever: flip it to the inventory address in
-    /// the same change that grants the bot `OPERATOR_ROLE` and migrates vaults.
-    #[serde(default)]
-    pub vault_owner: Option<Address>,
+    /// scoped by. Required and explicit (no fallback): this parameter determines
+    /// fund-routing correctness, so a missing value must fail at startup rather
+    /// than silently assume an owner. Pre-migration (vaults owned by the bot
+    /// EOA) set it to the `[wallet]` address. Once the shared-inventory
+    /// migration moves the orders/vaults under the inventory contract,
+    /// `msg.sender` to Raindex is the inventory, so it becomes the vault owner
+    /// and this must be flipped to the `inventory` address in the same change
+    /// that grants the bot `OPERATOR_ROLE` and migrates vaults.
+    pub vault_owner: Address,
     pub deployment_block: u64,
     pub required_confirmations: u64,
     pub ingestion_cutoff: IngestionCutoff,
+}
+
+impl EvmConfig {
+    /// Resolves the configured mode + optional `inventory` into an
+    /// [`InventoryMode`], failing fast on the two contradictory combinations:
+    /// `managed` without an inventory, or `legacy` with one.
+    fn resolve_inventory_mode(&self) -> Result<InventoryMode, EvmConfigError> {
+        match (self.inventory_mode, self.inventory) {
+            (InventoryModeTag::Legacy, None) => Ok(InventoryMode::Legacy),
+            (InventoryModeTag::Legacy, Some(inventory)) => {
+                Err(EvmConfigError::LegacyWithInventory { inventory })
+            }
+            (InventoryModeTag::Managed, Some(inventory)) => {
+                Ok(InventoryMode::Managed { inventory })
+            }
+            (InventoryModeTag::Managed, None) => Err(EvmConfigError::ManagedWithoutInventory),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -82,8 +160,8 @@ pub struct EvmSecrets {
 pub struct EvmCtx {
     pub rpc_url: Url,
     pub orderbook: Address,
-    pub inventory: Address,
-    pub vault_owner: Option<Address>,
+    pub inventory: InventoryMode,
+    pub vault_owner: Address,
     pub deployment_block: u64,
     pub required_confirmations: u64,
     pub ingestion_cutoff: IngestionCutoff,
@@ -104,15 +182,25 @@ impl std::fmt::Debug for EvmCtx {
 }
 
 impl EvmCtx {
-    pub fn new(config: &EvmConfig, secrets: EvmSecrets) -> Self {
-        Self {
+    pub fn new(config: &EvmConfig, secrets: EvmSecrets) -> Result<Self, EvmConfigError> {
+        Ok(Self {
             rpc_url: secrets.rpc,
             orderbook: config.orderbook,
-            inventory: config.inventory,
+            inventory: config.resolve_inventory_mode()?,
             vault_owner: config.vault_owner,
             deployment_block: config.deployment_block,
             required_confirmations: config.required_confirmations,
             ingestion_cutoff: config.ingestion_cutoff,
+        })
+    }
+
+    /// The address rebalancing `deposit4`/`withdraw4` settle against: the shared
+    /// inventory in `Managed` mode, or the orderbook itself in `Legacy` mode
+    /// (where the bot-owned vaults live on the orderbook).
+    pub fn inventory_address(&self) -> Address {
+        match self.inventory {
+            InventoryMode::Legacy => self.orderbook,
+            InventoryMode::Managed { inventory } => inventory,
         }
     }
 }
@@ -128,6 +216,14 @@ mod tests {
         ingestion_cutoff: IngestionCutoff,
     }
 
+    fn dummy_secrets() -> EvmSecrets {
+        EvmSecrets {
+            rpc: Url::parse("http://localhost:8545").unwrap(),
+            base: None,
+            ethereum: None,
+        }
+    }
+
     #[test]
     fn ingestion_cutoff_deserializes_safe() {
         let wrapper: CutoffWrapper = toml::from_str("ingestion_cutoff = \"safe\"").unwrap();
@@ -136,39 +232,127 @@ mod tests {
     }
 
     #[test]
-    fn vault_owner_defaults_to_none_when_absent() {
-        let config: EvmConfig = toml::from_str(
+    fn vault_owner_missing_fails_to_parse() {
+        // vault_owner determines fund-routing correctness (every vaultBalance2
+        // read and fill match is scoped by it), so a config without it must
+        // fail at startup rather than silently assume an owner.
+        let result: Result<EvmConfig, _> = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              deployment_block = 1\n\
              required_confirmations = 3\n\
              ingestion_cutoff = \"safe\"",
-        )
-        .unwrap();
+        );
 
-        assert_eq!(
-            config.vault_owner, None,
-            "vault_owner must default to None (pre-migration: falls back to the wallet EOA)"
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("vault_owner"),
+            "expected missing-field error for vault_owner, got: {error}"
         );
     }
 
     #[test]
-    fn vault_owner_parses_when_present() {
+    fn evm_ctx_new_maps_config_fields_to_their_own_slots() {
+        // Three same-typed Address fields flow through EvmCtx::new. A swap in the
+        // mapping would compile silently, so assert each distinct address lands
+        // in its own slot (and that a managed inventory resolves to itself).
         let config: EvmConfig = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
-             vault_owner = \"0x6b7B523fADd1677413AD92c9404C8F0796bACF6F\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
              required_confirmations = 3\n\
              ingestion_cutoff = \"safe\"",
         )
         .unwrap();
 
+        let ctx = EvmCtx::new(&config, dummy_secrets()).unwrap();
+
         assert_eq!(
-            config.vault_owner,
-            Some(alloy::primitives::address!(
-                "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
-            )),
+            ctx.orderbook,
+            alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
+        );
+        assert_eq!(
+            ctx.inventory,
+            InventoryMode::Managed {
+                inventory: alloy::primitives::address!(
+                    "0x2222222222222222222222222222222222222222"
+                ),
+            },
+        );
+        assert_eq!(
+            ctx.inventory_address(),
+            alloy::primitives::address!("0x2222222222222222222222222222222222222222"),
+        );
+        assert_eq!(
+            ctx.vault_owner,
+            alloy::primitives::address!("0x3333333333333333333333333333333333333333"),
+        );
+    }
+
+    #[test]
+    fn managed_mode_without_inventory_fails() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        let error = EvmCtx::new(&config, dummy_secrets()).unwrap_err();
+
+        assert!(
+            matches!(error, EvmConfigError::ManagedWithoutInventory),
+            "expected ManagedWithoutInventory, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_mode_with_inventory_fails() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"legacy\"\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        let error = EvmCtx::new(&config, dummy_secrets()).unwrap_err();
+
+        assert!(
+            matches!(error, EvmConfigError::LegacyWithInventory { .. }),
+            "expected LegacyWithInventory, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_mode_resolves_inventory_address_to_orderbook() {
+        // Legacy: no inventory contract, so rebalancing settles on the orderbook
+        // and inventory_address() must return the orderbook address.
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"legacy\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        let ctx = EvmCtx::new(&config, dummy_secrets()).unwrap();
+
+        assert_eq!(ctx.inventory, InventoryMode::Legacy);
+        assert_eq!(
+            ctx.inventory_address(),
+            alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
         );
     }
 
@@ -198,7 +382,9 @@ mod tests {
         // The field is required; a config without it must fail to deserialize.
         let result: Result<EvmConfig, _> = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
              required_confirmations = 3",
         );

@@ -195,7 +195,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_execution::Symbol;
     use st0x_wrapper::MockWrapper;
 
@@ -215,8 +215,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: Address::random(),
-                inventory: Address::random(),
-                vault_owner: None,
+                inventory: InventoryMode::Managed {
+                    inventory: Address::random(),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

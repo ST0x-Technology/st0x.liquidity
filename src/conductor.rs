@@ -31,8 +31,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use st0x_config::{
-    AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, IssuanceStatusCtx,
-    OperationMode, RebalancingCtx,
+    AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, InventoryMode,
+    IssuanceStatusCtx, OperationMode, RebalancingCtx,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -46,7 +46,7 @@ use st0x_execution::{
     MarketOrder, MarketSession, Symbol, TryIntoExecutor,
 };
 use st0x_issuance_client::IssuanceClient;
-use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
+use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
@@ -1328,10 +1328,7 @@ fn build_rebalancing_raindex_service<Chain: Wallet + Clone>(
 ) -> Arc<RaindexService<Chain>> {
     Arc::new(RaindexService::new(
         base_wallet.clone(),
-        RaindexContracts {
-            inventory: ctx.evm.inventory,
-            orderbook: ctx.evm.orderbook,
-        },
+        crate::onchain::raindex_contracts(&ctx.evm),
         market_maker_wallet,
     ))
 }
@@ -1339,24 +1336,24 @@ fn build_rebalancing_raindex_service<Chain: Wallet + Clone>(
 /// Startup preflight for the shared-inventory rebalancing path: the bot must
 /// hold `OPERATOR_ROLE` on the configured inventory or every rebalance
 /// deposit/withdraw reverts. Fails fast with a clear error rather than burning
-/// gas reverting on the first rebalance (the role is granted as part of the
-/// RAI-1198 cutover).
+/// gas reverting on the first rebalance (the shared-inventory cutover grants
+/// the role before rebalancing runs).
 ///
-/// Skipped when `inventory == orderbook`: that collapse means no distinct
-/// inventory contract is in play (integration tests and any not-yet-migrated
-/// setup), so there is no `OPERATOR_ROLE` to check and the orderbook allowance
-/// is the live one, not a stale artifact to revoke.
+/// Skipped in [`InventoryMode::Legacy`]: no distinct inventory contract is in
+/// play (integration tests and any not-yet-migrated setup), so there is no
+/// `OPERATOR_ROLE` to check and the orderbook allowance is the live one, not a
+/// stale artifact to revoke.
 async fn preflight_inventory_access<Chain: Wallet + Clone>(
     raindex_service: &RaindexService<Chain>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    if ctx.evm.inventory == ctx.evm.orderbook {
+    let InventoryMode::Managed { inventory } = ctx.evm.inventory else {
         debug!(
             target: "inventory",
-            "inventory == orderbook; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
+            "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
         );
         return Ok(());
-    }
+    };
 
     raindex_service
         .verify_operator_role::<OpenChainErrorRegistry>()
@@ -1367,7 +1364,7 @@ async fn preflight_inventory_access<Chain: Wallet + Clone>(
         )?;
     info!(
         target: "inventory",
-        inventory = %ctx.evm.inventory,
+        %inventory,
         "OPERATOR_ROLE preflight passed",
     );
     revoke_stale_orderbook_allowances(raindex_service, ctx).await;
@@ -1377,13 +1374,12 @@ async fn preflight_inventory_access<Chain: Wallet + Clone>(
 /// Best-effort: revoke any stale pre-migration allowance the bot granted the
 /// orderbook directly. Deposits now approve the inventory instead, so a
 /// leftover orderbook allowance is dead capital-exposure surface. Idempotent
-/// (a no-op once zero) and non-fatal — a failure here must not block startup.
+/// (a no-op once zero) and non-fatal -- a failure here must not block startup.
 async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
     raindex_service: &RaindexService<Chain>,
     ctx: &Ctx,
 ) {
-    let mut revoke_tokens: Vec<Address> = vec![st0x_evm::USDC_BASE];
-    revoke_tokens.extend(
+    let revoke_tokens = std::iter::once(st0x_evm::USDC_BASE).chain(
         ctx.assets
             .equities
             .symbols
@@ -1395,8 +1391,7 @@ async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
             .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
             .await
         {
-            Ok(true) => info!(target: "inventory", %token, "Revoked stale orderbook allowance"),
-            Ok(false) => {}
+            Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyZero) => {}
             Err(error) => warn!(
                 target: "inventory",
                 %token,
@@ -1427,10 +1422,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let market_maker_wallet = base_wallet.address();
 
+        // The (orderbook, vault-owner) pair keys both the vault-registry lookup
+        // and the rebalancing service's registry reads.
+        let vault_registry_id = VaultRegistryId {
+            orderbook: deps.ctx.evm.orderbook,
+            owner: deps.ctx.vault_owner(),
+        };
+
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
             deps.vault_registry_projection,
-            deps.ctx.evm.orderbook,
-            deps.ctx.vault_owner(),
+            vault_registry_id.clone(),
         ));
 
         let raindex_service =
@@ -1475,8 +1476,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 assets: deps.ctx.assets.clone(),
             },
             deps.vault_registry,
-            deps.ctx.evm.orderbook,
-            deps.ctx.vault_owner(),
+            vault_registry_id,
             deps.inventory.clone(),
             wrapper.clone(),
             deps.schedulers,
@@ -3494,6 +3494,8 @@ where
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
@@ -3510,13 +3512,14 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, StoreBuilder, test_store};
+    use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
         Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
         MockExecutor, Positive, Symbol,
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
-    use st0x_raindex::Raindex;
+    use st0x_raindex::{Raindex, RaindexContracts};
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
@@ -3552,6 +3555,65 @@ mod tests {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
+    /// A wallet-backed `RaindexService` whose provider is an [`Asserter`] mock, so
+    /// `preflight_inventory_access` (which needs `Chain: Wallet`) can run without
+    /// a live chain. Any eth_call it makes pops a response from `asserter`; an
+    /// empty asserter therefore proves the code made no call.
+    fn mock_wallet_raindex_service(
+        asserter: Asserter,
+    ) -> RaindexService<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone>> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = B256::repeat_byte(0x11);
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let owner = wallet.address();
+
+        RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: Address::repeat_byte(0xAA),
+                orderbook: Address::repeat_byte(0xBB),
+            },
+            owner,
+        )
+    }
+
+    #[tokio::test]
+    async fn preflight_skips_role_check_in_legacy_mode() {
+        // Legacy mode has no distinct inventory, so the preflight must return Ok
+        // WITHOUT issuing any eth_call. The service's asserter is empty: if the
+        // preflight tried to read OPERATOR_ROLE / hasRole, the mock would error.
+        let service = mock_wallet_raindex_service(Asserter::new());
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.evm.inventory = InventoryMode::Legacy;
+
+        preflight_inventory_access(&service, &ctx)
+            .await
+            .expect("legacy mode must skip the preflight and succeed");
+    }
+
+    #[tokio::test]
+    async fn preflight_attempts_role_check_in_managed_mode() {
+        // Managed mode must actually query the role: with an empty asserter the
+        // first eth_call fails, so the preflight surfaces an error (wrapped in its
+        // context). This is the mirror of the legacy test -- proving the branch on
+        // InventoryMode, not the skip. The exact MissingOperatorRole outcome is
+        // covered by the RaindexService::verify_operator_role unit tests.
+        let service = mock_wallet_raindex_service(Asserter::new());
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.evm.inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+
+        let error = preflight_inventory_access(&service, &ctx)
+            .await
+            .expect_err("managed mode must attempt the role check and surface the failure");
+
+        assert!(
+            error.to_string().contains("OPERATOR_ROLE preflight failed"),
+            "managed-mode failure must carry the preflight context, got: {error}"
+        );
+    }
+
     async fn freeze_guard_test_service() -> Arc<RebalancingService> {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -3575,8 +3637,10 @@ mod tests {
                 },
             },
             vault_registry,
-            Address::ZERO,
-            Address::ZERO,
+            VaultRegistryId {
+                orderbook: Address::ZERO,
+                owner: Address::ZERO,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -3799,8 +3863,10 @@ mod tests {
                 },
             },
             vault_registry,
-            alloy::primitives::Address::ZERO,
-            alloy::primitives::Address::ZERO,
+            VaultRegistryId {
+                orderbook: alloy::primitives::Address::ZERO,
+                owner: alloy::primitives::Address::ZERO,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -4167,8 +4233,10 @@ mod tests {
                 },
             },
             vault_registry,
-            alloy::primitives::Address::ZERO,
-            alloy::primitives::Address::ZERO,
+            VaultRegistryId {
+                orderbook: alloy::primitives::Address::ZERO,
+                owner: alloy::primitives::Address::ZERO,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -4259,8 +4327,10 @@ mod tests {
                 },
             },
             vault_registry2,
-            alloy::primitives::Address::ZERO,
-            alloy::primitives::Address::ZERO,
+            VaultRegistryId {
+                orderbook: alloy::primitives::Address::ZERO,
+                owner: alloy::primitives::Address::ZERO,
+            },
             inventory2.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool2),
@@ -7416,8 +7486,10 @@ mod tests {
                 },
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -7525,8 +7597,10 @@ mod tests {
                 },
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::clone(&inventory),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -7644,8 +7718,10 @@ mod tests {
                 },
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -7781,8 +7857,10 @@ mod tests {
                 },
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),

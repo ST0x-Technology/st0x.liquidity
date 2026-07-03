@@ -27,7 +27,7 @@ use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, USDC_BA
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
-use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId};
+use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -70,7 +70,7 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// Reads (`vaultBalance2`, historical `WithdrawV2` scans) target the orderbook
 /// directly because the vault balances live in the orderbook's storage; the
 /// inventory is a proxy that owns orders/vaults on the orderbook, not a store of
-/// its own. Post-migration the balances are keyed under the inventory address —
+/// its own. Post-migration the balances are keyed under the inventory address --
 /// that owner key is supplied by the caller (see `Ctx::vault_owner`), so the
 /// read still hits the orderbook but under the correct owner.
 ///
@@ -93,11 +93,11 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// service.confirm_tx(deposit_tx).await?;
 /// ```
 pub struct RaindexService<E: Evm> {
-    /// Shared `RaindexInventory` — target of every deposit4/withdraw4 write
+    /// Shared `RaindexInventory` -- target of every deposit4/withdraw4 write
     /// and the source of `OperatorWithdraw`/`OperatorDeposit` events surfaced
     /// during withdrawal recovery.
     inventory_address: Address,
-    /// Underlying Rain OrderBook — target of `vaultBalance2` reads and the
+    /// Underlying Rain OrderBook -- target of `vaultBalance2` reads and the
     /// backwards-compat `WithdrawV2` scan for pre-inventory withdrawals still
     /// in flight during the cutover window.
     orderbook_address: Address,
@@ -195,11 +195,11 @@ impl<W: Wallet> RaindexService<W> {
     /// inventory, so the orderbook allowance is dead capital-exposure surface
     /// that would otherwise sit until the next (never-again) orderbook deposit
     /// consumed it. A no-op when the allowance is already zero, so it is safe to
-    /// run on every startup. Returns `true` if a revoke tx was submitted.
+    /// run on every startup. Returns whether a revoke tx was actually submitted.
     pub async fn revoke_orderbook_allowance<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
-    ) -> Result<bool, RaindexError> {
+    ) -> Result<RevokeOutcome, RaindexError> {
         let current_allowance: U256 = self
             .evm
             .call::<Registry, _>(
@@ -212,7 +212,7 @@ impl<W: Wallet> RaindexService<W> {
             .await?;
 
         if current_allowance.is_zero() {
-            return Ok(false);
+            return Ok(RevokeOutcome::AlreadyZero);
         }
 
         let receipt = self
@@ -228,7 +228,7 @@ impl<W: Wallet> RaindexService<W> {
             .await?;
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, spender = %self.orderbook_address, "Revoked stale orderbook allowance");
-        Ok(true)
+        Ok(RevokeOutcome::Revoked)
     }
 
     async fn deposit4_to_vault<Registry: IntoErrorRegistry>(
@@ -360,8 +360,8 @@ impl<E: Evm> RaindexService<E> {
     /// * **Current path (inventory):** `RaindexInventory.OperatorWithdraw`
     ///   filtered by `operator == self.owner`. Emitted for every rebalance
     ///   withdrawal that routes through the shared inventory. The inventory
-    ///   settles atomically — it reverts `InsufficientVaultLiquidity` rather
-    ///   than forward a short fill — so on this path `event.amount` always
+    ///   settles atomically -- it reverts `InsufficientVaultLiquidity` rather
+    ///   than forward a short fill -- so on this path `event.amount` always
     ///   equals the requested amount; there is no partial-fill case to
     ///   reconcile (an under-funded withdraw reverts and emits no event, which
     ///   this scan correctly reports as absent). Only the backwards-compat
@@ -411,51 +411,72 @@ impl<E: Evm> RaindexService<E> {
             // get_logs returns ascending block order; iterate newest-first so
             // the most recent matching withdrawal wins -- under single-in-flight
             // that is this transfer's withdrawal.
+            // A log matches the filter's address + topic0 set but is anomalous
+            // (no tx hash, no topics, unrecognized topic0, or undecodable) only
+            // under ABI drift or an imposter at a trusted address -- impossible
+            // with the current contracts. Because the log could be our own
+            // in-flight withdrawal, we fail closed (`ScanAnomalousLog`) rather
+            // than skip it: skipping would make the scan report a false absence
+            // and let the caller re-issue an irreversible, already-submitted
+            // withdraw. `?` on each decode propagates that closure out of both
+            // loops.
             for log in logs.iter().rev() {
                 let block_after_from = log.block_number.is_some_and(|b| b > from_block);
                 if !block_after_from {
                     continue;
                 }
                 let Some(tx_hash) = log.transaction_hash else {
-                    continue;
+                    warn!(target: "inventory", ?log, "Withdrawal-scan log without a transaction hash; failing closed");
+                    return Err(RaindexError::ScanAnomalousLog {
+                        reason: "log without transaction hash",
+                    });
+                };
+                let Some(topic) = log.topics().first().copied() else {
+                    warn!(target: "inventory", %tx_hash, "Withdrawal-scan log without topics; failing closed");
+                    return Err(RaindexError::ScanAnomalousLog {
+                        reason: "log without topics",
+                    });
                 };
 
-                // A log that matches the filter's topic0/address set but fails
-                // to decode is skipped, not propagated: one malformed or
-                // unexpected log must not abort crash-recovery for the whole
-                // scan (which would turn a skippable log into a hard
-                // `ScanInconclusive` and block the resume). Under the current
-                // contracts this can't happen; the guard is defense against
-                // future ABI drift or an imposter log at the same address.
-                if let Some(topic) = log.topics().first() {
-                    if *topic == IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH {
-                        let Ok(decoded) = log.log_decode::<IRaindexInventory::OperatorWithdraw>()
-                        else {
-                            warn!(target: "inventory", %tx_hash, "Skipping undecodable OperatorWithdraw log during resume scan");
-                            continue;
-                        };
-                        let event = decoded.data();
-                        if event.operator == self.owner
-                            && event.token == token
-                            && event.vaultId == vault_id
-                        {
-                            debug!(target: "inventory", %tx_hash, from_block, "Found existing OperatorWithdraw during resume");
-                            return Ok(Some((tx_hash, event.amount)));
-                        }
-                    } else if *topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH {
-                        let Ok(decoded) = log.log_decode::<IRaindexV6::WithdrawV2>() else {
-                            warn!(target: "orderbook", %tx_hash, "Skipping undecodable WithdrawV2 log during resume scan");
-                            continue;
-                        };
-                        let event = decoded.data();
-                        if event.sender == self.owner
-                            && event.token == token
-                            && event.vaultId == vault_id
-                        {
-                            debug!(target: "orderbook", %tx_hash, from_block, "Found existing pre-migration WithdrawV2 during resume");
-                            return Ok(Some((tx_hash, event.withdrawAmountUint256)));
-                        }
+                if topic == IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH {
+                    let decoded = log
+                        .log_decode::<IRaindexInventory::OperatorWithdraw>()
+                        .inspect_err(|error| {
+                            warn!(target: "inventory", %tx_hash, ?error, "Undecodable OperatorWithdraw log during resume scan; failing closed");
+                        })
+                        .map_err(|_| RaindexError::ScanAnomalousLog {
+                            reason: "undecodable OperatorWithdraw log",
+                        })?;
+                    let event = decoded.data();
+                    if event.operator == self.owner
+                        && event.token == token
+                        && event.vaultId == vault_id
+                    {
+                        debug!(target: "inventory", %tx_hash, from_block, "Found existing OperatorWithdraw during resume");
+                        return Ok(Some((tx_hash, event.amount)));
                     }
+                } else if topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH {
+                    let decoded = log
+                        .log_decode::<IRaindexV6::WithdrawV2>()
+                        .inspect_err(|error| {
+                            warn!(target: "orderbook", %tx_hash, ?error, "Undecodable WithdrawV2 log during resume scan; failing closed");
+                        })
+                        .map_err(|_| RaindexError::ScanAnomalousLog {
+                            reason: "undecodable WithdrawV2 log",
+                        })?;
+                    let event = decoded.data();
+                    if event.sender == self.owner
+                        && event.token == token
+                        && event.vaultId == vault_id
+                    {
+                        debug!(target: "orderbook", %tx_hash, from_block, "Found existing pre-migration WithdrawV2 during resume");
+                        return Ok(Some((tx_hash, event.withdrawAmountUint256)));
+                    }
+                } else {
+                    warn!(target: "inventory", %tx_hash, %topic, "Withdrawal-scan log with unrecognized topic0; failing closed");
+                    return Err(RaindexError::ScanAnomalousLog {
+                        reason: "unrecognized topic0",
+                    });
                 }
             }
 
@@ -493,6 +514,13 @@ impl<E: Evm> RaindexService<E> {
     /// not, so the caller can fail fast rather than let the bot revert on the
     /// first rebalance. `OPERATOR_ROLE` is read from the contract rather than
     /// hardcoded, so a future role-scheme change stays in sync.
+    ///
+    /// The role value is an immutable constant, so a single read is node-agnostic.
+    /// `hasRole` is state-dependent, so right after the cutover grant a
+    /// load-balanced RPC can route to a node that has not yet seen the grant tx
+    /// and answer a stale `false`. That is retried a bounded number of times
+    /// (different nodes may answer each) before a `false` is trusted as a genuine
+    /// missing role -- the same lag defense the withdrawal scan uses.
     pub async fn verify_operator_role<Registry: IntoErrorRegistry>(
         &self,
     ) -> Result<(), RaindexError> {
@@ -504,25 +532,38 @@ impl<E: Evm> RaindexService<E> {
             )
             .await?;
 
-        let has_role: bool = self
-            .evm
-            .call::<Registry, _>(
-                self.inventory_address,
-                IRaindexInventory::hasRoleCall {
-                    role: operator_role,
-                    account: self.owner,
-                },
-            )
-            .await?;
+        for attempt in 1..=SCAN_ATTEMPTS {
+            let has_role: bool = self
+                .evm
+                .call::<Registry, _>(
+                    self.inventory_address,
+                    IRaindexInventory::hasRoleCall {
+                        role: operator_role,
+                        account: self.owner,
+                    },
+                )
+                .await?;
 
-        if has_role {
-            Ok(())
-        } else {
-            Err(RaindexError::MissingOperatorRole {
-                inventory: self.inventory_address,
-                wallet: self.owner,
-            })
+            if has_role {
+                return Ok(());
+            }
+
+            if attempt < SCAN_ATTEMPTS {
+                warn!(
+                    target: "inventory",
+                    inventory = %self.inventory_address,
+                    wallet = %self.owner,
+                    attempt,
+                    "OPERATOR_ROLE not yet visible; retrying (RPC node may lag a recent grant)",
+                );
+                tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
+            }
         }
+
+        Err(RaindexError::MissingOperatorRole {
+            inventory: self.inventory_address,
+            wallet: self.owner,
+        })
     }
 
     async fn get_vault_balance<Registry: IntoErrorRegistry>(
@@ -551,16 +592,17 @@ impl<E: Evm> RaindexService<E> {
 /// when the inventory reverted because the vault could not cover the request.
 ///
 /// The inventory's `InsufficientVaultLiquidity` custom error is not in the
-/// OpenChain selector registry, so `submit` surfaces it as an opaque
-/// `EvmError::Contract` carrying the raw revert bytes. We decode those bytes
-/// against the compiled `IRaindexInventory` binding here so callers can branch
-/// on the under-funded case (reconcile / retry after refund) instead of seeing
-/// a generic contract error. Any other error is returned unchanged.
+/// OpenChain selector registry, so its revert bytes reach us undecoded. They can
+/// arrive in more than one shape depending on where the revert surfaces: an
+/// `EvmError::Contract` (call error), an `EvmError::Transport` JSON-RPC error
+/// (a revert caught during gas estimation, before the tx is sent), or an
+/// `EvmError::DecodedRevert(Unknown(..))` (a mined revert the registry could not
+/// match). [`EvmError::revert_data`] normalizes all three; we decode the bytes
+/// against the compiled `IRaindexInventory` binding so callers can branch on the
+/// under-funded case (reconcile / retry after refund) instead of seeing a
+/// generic error. Any error without matching revert bytes is returned unchanged.
 fn map_withdraw_revert(err: EvmError) -> RaindexError {
-    let EvmError::Contract(ref contract_err) = err else {
-        return err.into();
-    };
-    let Some(revert_data) = contract_err.as_revert_data() else {
+    let Some(revert_data) = err.revert_data() else {
         return err.into();
     };
     IRaindexInventory::InsufficientVaultLiquidity::abi_decode(revert_data.as_ref()).map_or_else(
@@ -661,7 +703,16 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         &self,
         tx_hash: TxHash,
     ) -> Result<TransactionReceipt, RaindexError> {
-        let receipt = self.evm.confirm::<OpenChainErrorRegistry>(tx_hash).await?;
+        // Map a revert surfaced at confirm time too: a `withdraw4` submitted via
+        // `submit_withdraw` can revert on-chain if a concurrent trade drains the
+        // vault before inclusion, and the revert then arrives here rather than at
+        // submit. `map_withdraw_revert` passes non-matching errors through
+        // unchanged, so it is safe for deposit confirmations as well.
+        let receipt = self
+            .evm
+            .confirm::<OpenChainErrorRegistry>(tx_hash)
+            .await
+            .map_err(map_withdraw_revert)?;
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, "Transaction confirmed");
         Ok(receipt)
@@ -670,6 +721,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::hex;
     use alloy::network::{Ethereum, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::Log as PrimitiveLog;
@@ -680,9 +732,11 @@ mod tests {
     };
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
+    use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::{Log, TransactionRequest};
     use alloy::sol;
-    use alloy::transports::{RpcError, TransportErrorKind};
+    use alloy::sol_types::SolCall;
+    use alloy::transports::{RpcError, TransportError, TransportErrorKind};
     use proptest::prelude::*;
     use serde_json::json;
     use tracing_test::traced_test;
@@ -1073,7 +1127,7 @@ mod tests {
     async fn find_recent_withdrawal_ignores_other_operators_withdraw() {
         // The Bebop and univ4 hooks share this inventory. Their OperatorWithdraw
         // events carry a different `operator`, and must NEVER be adopted as this
-        // bot's in-flight rebalance withdraw — otherwise the resume would skip a
+        // bot's in-flight rebalance withdraw -- otherwise the resume would skip a
         // withdraw it still owes (or reconcile against someone else's amount).
         let asserter = Asserter::new();
         let from_block = 100u64;
@@ -1113,25 +1167,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_recent_withdrawal_prefers_operator_withdraw_over_stale_withdrawv2() {
-        // Cutover window: the scan window contains BOTH a pre-migration
-        // WithdrawV2 for a different vault (sender == our EOA) and this
-        // transfer's inventory OperatorWithdraw. Newest-first iteration plus the
-        // per-branch (token, vaultId) filter must land on the OperatorWithdraw
-        // and return ITS amount, not the WithdrawV2's.
+    async fn find_recent_withdrawal_prefers_newer_operator_withdraw_over_older_withdrawv2_same_vault()
+     {
+        // Cutover window: a pre-migration WithdrawV2 AND this transfer's inventory
+        // OperatorWithdraw both match the SAME (token, vaultId, owner) -- only
+        // their block ordering differs. With the WithdrawV2 older, newest-first
+        // iteration must adopt the OperatorWithdraw's amount. Using the same vault
+        // (not a different one) means the per-branch filter cannot mask a
+        // regression: if iteration flipped to oldest-first, this would wrongly
+        // return the WithdrawV2's amount instead.
         let asserter = Asserter::new();
         let from_block = 100u64;
         let op_amount = U256::from(11u64);
-        let other_vault =
-            b256!("0x0000000000000000000000000000000000000000000000000000000000000009");
-        // Ascending block order (as get_logs returns): stale WithdrawV2 first,
-        // matching OperatorWithdraw last (newer).
+        let stale_amount = U256::from(5u64);
+        // Ascending block order (as get_logs returns): older WithdrawV2 first,
+        // newer OperatorWithdraw last. Both target TEST_VAULT_ID with sender /
+        // operator == owner (Address::ZERO here).
         let stale = withdraw_log_with(
             Address::ZERO,
             USDC_BASE,
-            other_vault,
+            TEST_VAULT_ID.0,
             from_block + 1,
-            U256::from(5u64),
+            stale_amount,
         );
         let ours = operator_withdraw_log(from_block + 2, op_amount);
         let expected_tx = ours.transaction_hash.unwrap();
@@ -1155,37 +1212,126 @@ mod tests {
         assert_eq!(result, Some((expected_tx, op_amount)));
     }
 
-    #[test]
-    fn map_withdraw_revert_decodes_insufficient_vault_liquidity() {
-        use alloy::hex;
-        use alloy::rpc::json_rpc::ErrorPayload;
-        use alloy::transports::TransportError;
+    #[tokio::test]
+    async fn find_recent_withdrawal_prefers_newer_withdrawv2_over_older_operator_withdraw_same_vault()
+     {
+        // The mirror cutover case: both events match the same (token, vaultId,
+        // owner), but here the pre-migration WithdrawV2 is the NEWER one. Newest-
+        // first must adopt the WithdrawV2's amount, proving the ordering (not the
+        // event type) decides which withdrawal wins.
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        let op_amount = U256::from(11u64);
+        let withdraw_amount = U256::from(7u64);
+        // Older OperatorWithdraw first, newer WithdrawV2 last.
+        let older_op = operator_withdraw_log(from_block + 1, op_amount);
+        let newer_withdraw = withdraw_log(from_block + 2, withdraw_amount);
+        let expected_tx = newer_withdraw.transaction_hash.unwrap();
+        asserter.push_success(&json!([older_op, newer_withdraw]));
 
-        let requested = U256::from(1000u64);
-        let received = U256::from(400u64);
-        let revert_bytes = alloy::primitives::Bytes::from(
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some((expected_tx, withdraw_amount)));
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_fails_closed_on_undecodable_log() {
+        // A log matching the filter's address + topic0 that cannot be decoded
+        // means ABI drift or an imposter; it could be our own in-flight
+        // withdrawal. The scan must fail closed (ScanAnomalousLog) rather than
+        // skip it and report a false absence that triggers a double withdraw.
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        // Correct OperatorWithdraw topic0 but truncated/garbage body -> decode
+        // fails.
+        let corrupt = Log {
+            inner: PrimitiveLog::new(
+                Address::ZERO,
+                vec![IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH],
+                alloy::primitives::Bytes::from_static(&[0x00]),
+            )
+            .expect("log with topic"),
+            block_hash: None,
+            block_number: Some(from_block + 1),
+            block_timestamp: None,
+            transaction_hash: Some(b256!(
+                "0x00000000000000000000000000000000000000000000000000000000000000cc"
+            )),
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        };
+        asserter.push_success(&json!([corrupt]));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
+            Address::ZERO,
+        );
+
+        let error = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RaindexError::ScanAnomalousLog { .. }),
+            "undecodable log must fail closed, got: {error:?}",
+        );
+    }
+
+    /// ABI-encodes an `InsufficientVaultLiquidity(token, requested, received)`
+    /// revert as raw bytes, as the inventory contract would emit on an
+    /// under-funded `withdraw4`.
+    fn insufficient_liquidity_revert_bytes(
+        requested: U256,
+        received: U256,
+    ) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(
             IRaindexInventory::InsufficientVaultLiquidity {
                 token: USDC_BASE,
                 requested,
                 received,
             }
             .abi_encode(),
-        );
+        )
+    }
 
-        // Mirror how a real reverted `withdraw4` surfaces: an RPC error-response
-        // carrying the hex-encoded revert data (see crates/evm error_decoding).
-        let hex_data = hex::encode_prefixed(&revert_bytes);
+    /// Builds a JSON-RPC `ErrorPayload` carrying the hex-encoded revert data, the
+    /// shape a reverted call surfaces as over the wire (see crates/evm
+    /// error_decoding).
+    fn revert_error_payload(revert_bytes: &alloy::primitives::Bytes) -> ErrorPayload {
+        let hex_data = hex::encode_prefixed(revert_bytes);
         let raw = serde_json::value::to_raw_value(&hex_data).expect("valid json");
-        let payload = ErrorPayload {
+        ErrorPayload {
             code: 3,
             message: "execution reverted".into(),
             data: Some(raw),
-        };
-        let contract_err =
-            alloy::contract::Error::TransportError(TransportError::ErrorResp(payload));
+        }
+    }
 
-        let mapped = map_withdraw_revert(EvmError::Contract(contract_err));
-
+    fn assert_maps_to_insufficient_liquidity(
+        mapped: RaindexError,
+        requested: U256,
+        received: U256,
+    ) {
         match mapped {
             RaindexError::InsufficientVaultLiquidity {
                 token,
@@ -1198,6 +1344,186 @@ mod tests {
             }
             other => panic!("expected InsufficientVaultLiquidity, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_withdraw_revert_decodes_insufficient_vault_liquidity_from_contract_error() {
+        let requested = U256::from(1000u64);
+        let received = U256::from(400u64);
+        let payload =
+            revert_error_payload(&insufficient_liquidity_revert_bytes(requested, received));
+        let contract_err =
+            alloy::contract::Error::TransportError(TransportError::ErrorResp(payload));
+
+        let mapped = map_withdraw_revert(EvmError::Contract(contract_err));
+
+        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+    }
+
+    #[test]
+    fn map_withdraw_revert_decodes_insufficient_vault_liquidity_from_transport_error() {
+        // A revert caught during gas estimation (before the tx is sent) surfaces
+        // as EvmError::Transport carrying the raw JSON-RPC error response, not an
+        // alloy contract error.
+        let requested = U256::from(2000u64);
+        let received = U256::from(750u64);
+        let payload =
+            revert_error_payload(&insufficient_liquidity_revert_bytes(requested, received));
+
+        let mapped = map_withdraw_revert(EvmError::Transport(TransportError::ErrorResp(payload)));
+
+        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+    }
+
+    #[test]
+    fn map_withdraw_revert_decodes_insufficient_vault_liquidity_from_decoded_unknown_revert() {
+        // A mined revert whose selector the shared registry does not know reaches
+        // us as EvmError::DecodedRevert(Unknown(raw_bytes)).
+        let requested = U256::from(3000u64);
+        let received = U256::from(120u64);
+        let revert_bytes = insufficient_liquidity_revert_bytes(requested, received);
+        let decoded = st0x_evm::AbiDecodedErrorType::Unknown(revert_bytes.to_vec());
+
+        let mapped = map_withdraw_revert(EvmError::DecodedRevert(decoded));
+
+        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+    }
+
+    #[test]
+    fn map_withdraw_revert_passes_through_unrelated_error() {
+        // An error with no revert bytes (or bytes that are not
+        // InsufficientVaultLiquidity) must be returned unchanged.
+        let mapped = map_withdraw_revert(EvmError::Reverted {
+            tx_hash: TxHash::ZERO,
+        });
+
+        assert!(
+            matches!(mapped, RaindexError::Evm(EvmError::Reverted { .. })),
+            "expected the original error to pass through, got: {mapped:?}"
+        );
+    }
+
+    /// Pushes mocked `OPERATOR_ROLE()` + `hasRole(role, owner)` eth_call
+    /// responses so `verify_operator_role` can run against an [`Asserter`]. When
+    /// `has_role` is false the check retries `hasRole` up to `SCAN_ATTEMPTS`
+    /// times (RPC-lag defense), so push that many `false` responses; a `true`
+    /// short-circuits on the first, so one suffices.
+    fn push_operator_role_responses(asserter: &Asserter, has_role: bool) {
+        let role = B256::repeat_byte(0x42);
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            IRaindexInventory::OPERATOR_ROLECall::abi_encode_returns(&role),
+        ));
+        let has_role_responses = if has_role { 1 } else { SCAN_ATTEMPTS };
+        for _ in 0..has_role_responses {
+            asserter.push_success(&alloy::primitives::Bytes::from(
+                IRaindexInventory::hasRoleCall::abi_encode_returns(&has_role),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_operator_role_passes_when_role_granted() {
+        let asserter = Asserter::new();
+        push_operator_role_responses(&asserter, true);
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory: Address::repeat_byte(0xAA),
+                orderbook: Address::ZERO,
+            },
+            Address::repeat_byte(0xBB),
+        );
+
+        service
+            .verify_operator_role::<NoOpErrorRegistry>()
+            .await
+            .expect("preflight must pass when the wallet holds OPERATOR_ROLE");
+    }
+
+    #[tokio::test]
+    async fn verify_operator_role_fails_with_named_error_when_role_missing() {
+        let asserter = Asserter::new();
+        push_operator_role_responses(&asserter, false);
+
+        let inventory = Address::repeat_byte(0xAA);
+        let wallet = Address::repeat_byte(0xBB);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory,
+                orderbook: Address::ZERO,
+            },
+            wallet,
+        );
+
+        let error = service
+            .verify_operator_role::<NoOpErrorRegistry>()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RaindexError::MissingOperatorRole { inventory: i, wallet: w }
+                    if i == inventory && w == wallet
+            ),
+            "expected MissingOperatorRole, got: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_orderbook_allowance_is_noop_when_allowance_zero() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = create_test_raindex_service(&local_evm);
+
+        let outcome = service
+            .revoke_orderbook_allowance::<NoOpErrorRegistry>(local_evm.token_address)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RevokeOutcome::AlreadyZero,
+            "zero allowance must be a no-op (no revoke tx)"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_orderbook_allowance_zeroes_stale_allowance() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = create_test_raindex_service(&local_evm);
+
+        // Simulate the pre-migration state: a standing approval toward the
+        // orderbook address.
+        let stale = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        local_evm
+            .approve_tokens(local_evm.token_address, local_evm.orderbook_address, stale)
+            .await
+            .unwrap();
+
+        let outcome = service
+            .revoke_orderbook_allowance::<NoOpErrorRegistry>(local_evm.token_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RevokeOutcome::Revoked,
+            "non-zero allowance must trigger a revoke tx"
+        );
+
+        // Idempotent: a second call sees zero and does nothing.
+        let second = service
+            .revoke_orderbook_allowance::<NoOpErrorRegistry>(local_evm.token_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            RevokeOutcome::AlreadyZero,
+            "allowance must be zero after the revoke"
+        );
     }
 
     #[tokio::test]

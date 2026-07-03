@@ -445,7 +445,7 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use url::Url;
 
     use super::*;
@@ -482,8 +482,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -500,8 +502,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -520,8 +524,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -564,8 +570,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -596,8 +604,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -635,8 +645,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -672,8 +684,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -794,8 +808,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -863,8 +879,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -933,8 +951,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1035,8 +1055,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1078,8 +1100,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1168,8 +1192,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1266,8 +1292,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1321,8 +1349,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1000,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1365,8 +1395,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 500,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1410,8 +1442,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1456,8 +1490,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1496,8 +1532,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1590,8 +1628,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1639,8 +1679,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1678,8 +1720,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1721,8 +1765,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1772,8 +1818,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1832,8 +1880,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1882,8 +1932,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 42,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1918,8 +1970,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1973,8 +2027,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2022,8 +2078,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2057,8 +2115,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2119,8 +2179,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2176,8 +2238,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2221,8 +2285,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 100,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2257,8 +2323,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -2348,8 +2416,10 @@ mod tests {
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: address!("0x1111111111111111111111111111111111111111"),
-            vault_owner: None,
+            inventory: InventoryMode::Managed {
+                inventory: address!("0x1111111111111111111111111111111111111111"),
+            },
+            vault_owner: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,

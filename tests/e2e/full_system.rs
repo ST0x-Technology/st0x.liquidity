@@ -526,6 +526,8 @@ beneficiary_entity_name = "Simulate Failures"
 
 [raindex]
 orderbook = "{orderbook}"
+inventory_mode = "legacy"
+vault_owner = "{owner}"
 deployment_block = {current_block}
 required_confirmations = 0
 ingestion_cutoff = "safe"

@@ -981,13 +981,13 @@ mod tests {
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_raindex::RaindexContracts;
     use st0x_tokenization::issuer_request_id;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
-    use st0x_raindex::RaindexContracts;
 
     #[derive(Clone, Default)]
     struct TestPendingRequestOwnership(PendingRequestOwnershipSnapshot);
@@ -2094,6 +2094,68 @@ mod tests {
         assert!(
             logs_contain("No USDC vaults discovered, skipping onchain cash polling"),
             "Should log debug message explaining why cash polling was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_onchain_keys_vault_registry_on_vault_owner_not_snapshot_owner() {
+        // The vault-registry lookup key is the vault OWNER (the inventory
+        // contract post-migration), distinct from snapshot_id.owner (the signing
+        // wallet). Seed the equity vault ONLY under vault_owner; if the lookup
+        // keyed on snapshot_id.owner instead, it would find no registry and skip
+        // on-chain polling. Emitting OnchainEquity proves it used vault_owner.
+        let pool = setup_test_db().await;
+        let (orderbook, snapshot_owner) = test_addresses();
+        let vault_owner = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_ne!(
+            vault_owner, snapshot_owner,
+            "test is meaningless unless the two owners differ"
+        );
+
+        // Registry seeded under the VAULT OWNER key only.
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            vault_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&vault_balance_hex(float!(7))); // vaultBalance2 for the equity vault
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: snapshot_owner,
+            },
+            vault_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        // Snapshot events are keyed by snapshot_id.owner (the signing wallet),
+        // NOT vault_owner: the two aggregates use different owners by design.
+        let events = load_snapshot_events(&pool, orderbook, snapshot_owner).await;
+        let has_onchain_equity = events
+            .iter()
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }));
+
+        assert!(
+            has_onchain_equity,
+            "OnchainEquity must be emitted, proving the vault registry was found \
+             via vault_owner rather than snapshot_id.owner",
         );
     }
 

@@ -53,33 +53,25 @@ pub(crate) enum VaultLookupError {
 /// orderbook/owner pair.
 pub(crate) struct VaultRegistryLookup {
     projection: Arc<VaultRegistryProjection>,
-    orderbook: Address,
-    owner: Address,
+    registry_id: VaultRegistryId,
 }
 
 impl VaultRegistryLookup {
     pub(crate) fn new(
         projection: Arc<VaultRegistryProjection>,
-        orderbook: Address,
-        owner: Address,
+        registry_id: VaultRegistryId,
     ) -> Self {
         Self {
             projection,
-            orderbook,
-            owner,
+            registry_id,
         }
     }
 
     async fn load_registry(&self) -> Result<VaultRegistry, VaultLookupError> {
-        let id = VaultRegistryId {
-            orderbook: self.orderbook,
-            owner: self.owner,
-        };
-
         self.projection
-            .load(&id)
+            .load(&self.registry_id)
             .await?
-            .ok_or(VaultLookupError::RegistryNotFound(id))
+            .ok_or_else(|| VaultLookupError::RegistryNotFound(self.registry_id.clone()))
     }
 }
 
@@ -214,7 +206,13 @@ mod tests {
             .await
             .unwrap();
 
-        VaultRegistryLookup::new(projection, TEST_ORDERBOOK, TEST_OWNER)
+        VaultRegistryLookup::new(
+            projection,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_OWNER,
+            },
+        )
     }
 
     #[tokio::test]
@@ -251,7 +249,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let lookup = VaultRegistryLookup::new(projection, TEST_ORDERBOOK, TEST_OWNER);
+        let lookup = VaultRegistryLookup::new(
+            projection,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_OWNER,
+            },
+        );
 
         assert_eq!(
             lookup.vault_id_for_token(TEST_TOKEN).await.unwrap(),
@@ -299,7 +303,13 @@ mod tests {
                 .unwrap();
         }
 
-        let lookup = VaultRegistryLookup::new(projection, TEST_ORDERBOOK, TEST_OWNER);
+        let lookup = VaultRegistryLookup::new(
+            projection,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_OWNER,
+            },
+        );
         let error = lookup
             .vault_token_for_symbol(&test_symbol())
             .await
@@ -349,7 +359,13 @@ mod tests {
             .build(())
             .await
             .unwrap();
-        let lookup = VaultRegistryLookup::new(projection, TEST_ORDERBOOK, TEST_OWNER);
+        let lookup = VaultRegistryLookup::new(
+            projection,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_OWNER,
+            },
+        );
 
         let error = lookup.vault_id_for_token(TEST_TOKEN).await.unwrap_err();
 
