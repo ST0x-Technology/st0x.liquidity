@@ -527,11 +527,22 @@ pub(crate) fn hedge_latency_report(
     let total_cycles = cycles.len();
     cycles.truncate(MAX_CYCLE_REPORTS);
 
-    let buckets = bucket_samples
-        .into_iter()
-        .map(|(index, samples)| LatencyBucket {
+    // Dense across the FULL requested range, not just the indices that
+    // happen to have samples: a sparse (samples-only) bucket list loses all
+    // positional information about how far apart populated buckets really
+    // are, so the dashboard chart can't tell a burst of data 2 buckets wide
+    // from one 200 buckets wide -- both would render identically, stretched
+    // to fill the whole plot. Filling gaps with empty (all-None) stats lets
+    // the frontend position every sampled point at its true index in the
+    // requested range.
+    let last_index = bucket_index(range.to);
+    let buckets = (0..=last_index)
+        .map(|index| LatencyBucket {
             start: range.from + Duration::seconds(width.num_seconds() * index),
-            stages: samples.into_stage_latencies(),
+            stages: bucket_samples
+                .remove(&index)
+                .unwrap_or_default()
+                .into_stage_latencies(),
         })
         .collect();
 
@@ -1205,6 +1216,11 @@ mod tests {
         );
     }
 
+    /// Buckets are dense across the FULL requested range, not just the
+    /// indices with samples: a range's empty buckets carry positional
+    /// information the dashboard chart needs (a burst of activity should
+    /// render at its true position within the range, not stretch to fill
+    /// the whole plot -- see `layoutPercentileSeries` on the frontend).
     #[tokio::test]
     async fn report_buckets_fills_by_day() {
         let day = 86_400;
@@ -1216,17 +1232,23 @@ mod tests {
 
         let report = hedge_latency_report(&performances, &report_range(0, 10 * day));
 
-        assert_eq!(report.buckets.len(), 2);
+        // 10-day range at daily granularity -> 11 buckets (indices 0..=10).
+        assert_eq!(report.buckets.len(), 11);
         assert_eq!(report.buckets[0].start, timestamp(0));
-        assert_eq!(report.buckets[1].start, timestamp(3 * day));
+        assert_eq!(report.buckets[3].start, timestamp(3 * day));
         assert_eq!(
             report.buckets[0].stages.detection.as_ref().unwrap().p50_ms,
             2_000
         );
         assert_eq!(
-            report.buckets[1].stages.detection.as_ref().unwrap().p50_ms,
+            report.buckets[3].stages.detection.as_ref().unwrap().p50_ms,
             4_000
         );
+        // The gap between the two fills is real empty buckets, not skipped
+        // indices -- proving the dense range, not just the populated ends.
+        assert!(report.buckets[1].stages.detection.is_none());
+        assert!(report.buckets[2].stages.detection.is_none());
+        assert!(report.buckets[10].stages.detection.is_none());
     }
 
     #[tokio::test]
@@ -1240,9 +1262,11 @@ mod tests {
 
         let report = hedge_latency_report(&performances, &report_range(0, 60 * day));
 
-        assert_eq!(report.buckets.len(), 2);
+        // 60-day range at weekly granularity -> 9 buckets (indices 0..=8).
+        assert_eq!(report.buckets.len(), 9);
         assert_eq!(report.buckets[0].start, timestamp(0));
         assert_eq!(report.buckets[1].start, timestamp(7 * day));
+        assert!(report.buckets[8].stages.detection.is_none());
     }
 
     #[tokio::test]
@@ -1256,9 +1280,12 @@ mod tests {
 
         let report = hedge_latency_report(&performances, &report_range(0, 300 * day));
 
-        assert_eq!(report.buckets.len(), 2);
+        // 300-day range at monthly (30-day) granularity -> 11 buckets
+        // (indices 0..=10).
+        assert_eq!(report.buckets.len(), 11);
         assert_eq!(report.buckets[0].start, timestamp(0));
         assert_eq!(report.buckets[1].start, timestamp(30 * day));
+        assert!(report.buckets[10].stages.detection.is_none());
     }
 
     /// A range whose endpoints are EXACTLY 31 days apart spans 32 inclusive
@@ -1363,7 +1390,12 @@ mod tests {
         assert_eq!(report.summary.fill_count, 0);
         assert_eq!(report.total_cycles, 0);
         assert_eq!(report.summary.stages.detection, None);
-        assert_eq!(report.buckets.len(), 0);
+        // The range still produces its one (hourly, for a 1000s span) dense
+        // bucket -- empty of samples, not absent -- so the dashboard chart
+        // has positional context for the requested window even with zero
+        // activity in it.
+        assert_eq!(report.buckets.len(), 1);
+        assert_eq!(report.buckets[0].stages.detection, None);
         assert_eq!(report.cycles.len(), 0);
         assert_eq!(report.open_exposures.len(), 0);
     }
