@@ -236,15 +236,23 @@
               pkgs.openssl
               pkgs.sqlite
               pkgs.pkg-config
+              pkgs.datasette
               rustToolchain
             ];
 
             # Mock infra + bot + dashboard + e2e driver. Picks the lowest port
-            # offset whose bot/vite/mock-api ports are all free so multiple
-            # instances can run side-by-side without collisions. The dashboard
-            # auto-opens in the browser on start. Press `q` to exit.
+            # offset whose bot/board/vite/mock-api ports are all free so
+            # multiple instances can run side-by-side without collisions. The
+            # dashboard auto-opens in the browser on start. Press `q` to exit.
             mkSimulation =
-              { name, testFilter }:
+              {
+                name,
+                testFilter,
+                backendEnv ? "",
+              }:
+              let
+                backendEnvPrefix = if backendEnv == "" then "" else "${backendEnv} ";
+              in
               pkgs.writeShellApplication {
                 inherit name;
                 runtimeInputs = simulationRuntimeInputs;
@@ -263,11 +271,15 @@
                   max_offset=9
                   while (( offset <= max_offset )); do
                     bot_port=$((8001 + offset))
+                    board_port=$((8002 + offset))
                     vite_port=$((5173 + offset))
                     mock_api_port=$((8099 + offset))
+                    datasette_port=$((8200 + offset))
                     if port_free "$bot_port" \
+                      && port_free "$board_port" \
                       && port_free "$vite_port" \
-                      && port_free "$mock_api_port"; then
+                      && port_free "$mock_api_port" \
+                      && port_free "$datasette_port"; then
                       break
                     fi
                     offset=$((offset + 1))
@@ -279,9 +291,29 @@
                   fi
 
                   echo "${name}: offset=$offset (bot=$bot_port \
-                    vite=$vite_port mock_api=$mock_api_port)"
+                    board=$board_port vite=$vite_port mock_api=$mock_api_port \
+                    datasette=$datasette_port)"
 
-                  backend="SIMULATE_BOT_PORT=$bot_port \
+                  # Mirrors the DB path `simulate()` hardcodes in
+                  # tests/e2e/full_system.rs. Datasette serves it under a
+                  # route named after the file's basename (extension
+                  # stripped); the trailing .json forces a JSON response --
+                  # without it, Datasette content-negotiates to an HTML page
+                  # for a plain fetch() and sql-source.ts's response.json()
+                  # parse fails.
+                  db_path="/tmp/st0x-liquidity-simulate-$bot_port.sqlite"
+                  pnl_sql_api_url="http://127.0.0.1:$datasette_port/st0x-liquidity-simulate-$bot_port.json"
+
+                  # A stale $db_path from a previous run at this same port
+                  # offset would let datasette's `-f` check below pass
+                  # immediately, opening the old file before `simulate()`
+                  # removes and recreates it -- leaving datasette serving a
+                  # frozen, unlinked database forever. Clear it up front so
+                  # datasette only ever opens the file the bot creates now.
+                  rm -f "$db_path" "$db_path-shm" "$db_path-wal"
+
+                  backend="${backendEnvPrefix}SIMULATE_BOT_PORT=$bot_port \
+                    SIMULATE_BOARD_PORT=$board_port \
                     cargo nextest run --test e2e \
                     -E 'test(=full_system::${testFilter})' \
                     --run-ignored ignored-only --no-capture"
@@ -289,6 +321,7 @@
                   dashboard="cd dashboard && \
                     BACKEND_PORT=$bot_port \
                     PUBLIC_BACKEND_PORT=$bot_port \
+                    PUBLIC_PNL_SQL_API_URL=$pnl_sql_api_url \
                     PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
                     PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
                     bun run dev --port=$vite_port --strictPort --open"
@@ -296,7 +329,14 @@
                   mockApi="MOCK_REST_API_PORT=$mock_api_port \
                     bun run e2e/mock-rest-api.ts"
 
-                  exec mprocs "$backend" "$dashboard" "$mockApi"
+                  # The bot creates $db_path on startup (after this script
+                  # launches all panes concurrently), so wait for it to exist
+                  # before datasette tries to open it -- otherwise it exits
+                  # immediately with no file to serve.
+                  datasette="while [ ! -f $db_path ]; do sleep 1; done; \
+                    exec datasette serve $db_path -p $datasette_port -h 127.0.0.1"
+
+                  exec mprocs "$backend" "$dashboard" "$mockApi" "$datasette"
                 '';
               };
 
@@ -354,6 +394,15 @@
               "simulate-market" = mkSimulation {
                 name = "simulate-market";
                 testFilter = "simulate";
+              };
+
+              # Same live dashboard stack as `simulate-market`, but preloads the
+              # hedge-latency read model with 14 days of completed cycles so
+              # Performance tab trends can be inspected immediately.
+              "simulate-14d" = mkSimulation {
+                name = "simulate-14d";
+                testFilter = "simulate";
+                backendEnv = "SIMULATE_LATENCY_FIXTURE_DAYS=14";
               };
 
               # Same live dashboard stack as `simulate-market`, but first creates
