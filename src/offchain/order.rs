@@ -364,6 +364,7 @@ fn placed_event(
     executor: SupportedExecutor,
     client_order_id: &ClientOrderId,
     kind: &CounterTradeOrderKind,
+    placed_at: DateTime<Utc>,
 ) -> OffchainOrderEvent {
     let requested_market_session = kind.market_session();
     let limit_price = match kind {
@@ -376,7 +377,7 @@ fn placed_event(
         shares,
         direction,
         executor,
-        placed_at: Utc::now(),
+        placed_at,
         is_extended_hours: requested_market_session == MarketSession::Extended,
         limit_price,
         client_order_id: Some(client_order_id.clone()),
@@ -784,6 +785,26 @@ impl EventSourced for OffchainOrder {
                 executor,
                 &client_order_id,
                 &kind,
+                Utc::now(),
+            )]),
+
+            #[cfg(any(test, feature = "test-support"))]
+            PlaceAt {
+                symbol,
+                shares,
+                direction,
+                executor,
+                client_order_id,
+                kind,
+                placed_at,
+            } => Ok(vec![placed_event(
+                symbol,
+                shares,
+                direction,
+                executor,
+                &client_order_id,
+                &kind,
+                placed_at,
             )]),
 
             _ => Err(OffchainOrderError::NotPlaced),
@@ -810,6 +831,17 @@ impl EventSourced for OffchainOrder {
                 shares: _,
                 client_order_id: _,
                 kind: _,
+            } => validate_place_replay(self, &symbol, direction, executor),
+
+            #[cfg(any(test, feature = "test-support"))]
+            OffchainOrderCommand::PlaceAt {
+                symbol,
+                direction,
+                executor,
+                shares: _,
+                client_order_id: _,
+                kind: _,
+                placed_at: _,
             } => validate_place_replay(self, &symbol, direction, executor),
 
             OffchainOrderCommand::CancelOrder { reason } => {
@@ -2230,6 +2262,19 @@ pub enum OffchainOrderCommand {
         client_order_id: ClientOrderId,
         kind: CounterTradeOrderKind,
     },
+    /// Test/fixture-only: identical to `Place` but takes `placed_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    PlaceAt {
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        client_order_id: ClientOrderId,
+        kind: CounterTradeOrderKind,
+        placed_at: DateTime<Utc>,
+    },
     /// Request broker cancellation for a submitted order and persist the
     /// in-flight cancellation state. The order becomes terminal only after the
     /// broker later reports `Cancelled`.
@@ -2401,6 +2446,13 @@ impl FromStr for OffchainOrderId {
 impl OffchainOrderId {
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Wraps a caller-supplied UUID, for deterministic identifiers (e.g.
+    /// fixture seeding) where [`Self::new`]'s randomness isn't wanted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn from_uuid(id: Uuid) -> Self {
+        Self(id)
     }
 
     /// Exposes the wrapped UUID so callers can derive other identifiers
@@ -3306,6 +3358,42 @@ mod tests {
             store.load(&id).await.unwrap().unwrap(),
             "re-placing a terminal order stays a no-op"
         );
+    }
+
+    /// Covers the fixture-only `PlaceAt` sibling of `Place`: it must thread
+    /// the caller-supplied `placed_at` through to the emitted event's field
+    /// rather than silently falling back to `Utc::now()`.
+    #[tokio::test]
+    async fn place_at_uses_supplied_timestamp() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        let placed_at = Utc::now() - chrono::Duration::hours(2);
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::PlaceAt {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    kind: CounterTradeOrderKind::Market,
+                    placed_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Pending {
+            placed_at: stored_placed_at,
+            ..
+        } = entity
+        else {
+            panic!("Expected Pending state, got: {entity:?}");
+        };
+        assert_eq!(stored_placed_at, placed_at);
     }
 
     #[tokio::test]

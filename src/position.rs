@@ -392,28 +392,37 @@ impl EventSourced for Position {
                 direction,
                 price_usdc,
                 block_timestamp,
-            } => {
-                let now = Utc::now();
-                Ok(vec![
-                    PositionEvent::Initialized {
-                        symbol,
-                        threshold,
-                        initialized_at: now,
-                    },
-                    PositionEvent::OnChainOrderFilled {
-                        trade_id: trade_id.clone(),
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_timestamp,
-                        seen_at: now,
-                    },
-                    PositionEvent::OnChainFillApplied {
-                        trade_id,
-                        applied_at: now,
-                    },
-                ])
-            }
+            } => Ok(Self::acknowledge_on_chain_fill_init_events(
+                symbol,
+                threshold,
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                Utc::now(),
+            )),
+
+            #[cfg(any(test, feature = "test-support"))]
+            AcknowledgeOnChainFillAt {
+                symbol,
+                threshold,
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            } => Ok(Self::acknowledge_on_chain_fill_init_events(
+                symbol,
+                threshold,
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            )),
 
             // Pruning a fill the position never applied is a no-op; never
             // initialize the aggregate just to settle an absent trade.
@@ -478,34 +487,32 @@ impl EventSourced for Position {
                 price_usdc,
                 block_timestamp,
                 ..
-            } => {
-                // Dual guard (ADR 0010): the retained slot bridges a fill
-                // applied under pre-set code and left unmarked at the
-                // deploy restart; the set rejects an out-of-order /
-                // cross-process re-drive the single slot cannot, because a
-                // newer fill displaces the slot but never the set entry.
-                if self.last_acknowledged_trade_id.as_ref() == Some(&trade_id)
-                    || self.pending_acknowledged_trade_ids.contains(&trade_id)
-                {
-                    return Err(PositionError::DuplicateTrade { trade_id });
-                }
+            } => self.acknowledge_on_chain_fill_transition_events(
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                Utc::now(),
+            ),
 
-                let now = Utc::now();
-                Ok(vec![
-                    PositionEvent::OnChainOrderFilled {
-                        trade_id: trade_id.clone(),
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_timestamp,
-                        seen_at: now,
-                    },
-                    PositionEvent::OnChainFillApplied {
-                        trade_id,
-                        applied_at: now,
-                    },
-                ])
-            }
+            #[cfg(any(test, feature = "test-support"))]
+            AcknowledgeOnChainFillAt {
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+                ..
+            } => self.acknowledge_on_chain_fill_transition_events(
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            ),
 
             SettleOnChainFill { trade_id } => {
                 if self.pending_acknowledged_trade_ids.contains(&trade_id) {
@@ -524,36 +531,29 @@ impl EventSourced for Position {
                 direction,
                 executor,
                 ..
-            } => {
-                if let Some(pending) = self.pending_offchain_order_id {
-                    return Err(PositionError::PendingExecution {
-                        offchain_order_id: pending,
-                    });
-                }
+            } => self.place_offchain_order_events(
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+                Utc::now(),
+            ),
 
-                let trigger_reason = self
-                    .create_trigger_reason(&self.threshold)?
-                    .ok_or(PositionError::ThresholdNotMet {
-                        net_position: self.net,
-                        threshold: self.threshold,
-                    })
-                    .inspect_err(|error| {
-                        warn!(
-                            target: "hedge",
-                            %offchain_order_id, symbol = %self.symbol,
-                            "Order placement rejected: {error}",
-                        );
-                    })?;
-
-                Ok(vec![PositionEvent::OffChainOrderPlaced {
-                    offchain_order_id,
-                    shares,
-                    direction,
-                    executor,
-                    trigger_reason,
-                    placed_at: Utc::now(),
-                }])
-            }
+            #[cfg(any(test, feature = "test-support"))]
+            PlaceOffChainOrderAt {
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+                placed_at,
+                ..
+            } => self.place_offchain_order_events(
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+                placed_at,
+            ),
 
             CompleteOffChainOrder {
                 offchain_order_id,
@@ -664,6 +664,111 @@ impl EventSourced for Position {
 }
 
 impl Position {
+    fn acknowledge_on_chain_fill_init_events(
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        price_usdc: Float,
+        block_timestamp: DateTime<Utc>,
+        seen_at: DateTime<Utc>,
+    ) -> Vec<PositionEvent> {
+        vec![
+            PositionEvent::Initialized {
+                symbol,
+                threshold,
+                initialized_at: seen_at,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            },
+            PositionEvent::OnChainFillApplied {
+                trade_id,
+                applied_at: seen_at,
+            },
+        ]
+    }
+
+    fn acknowledge_on_chain_fill_transition_events(
+        &self,
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        price_usdc: Float,
+        block_timestamp: DateTime<Utc>,
+        seen_at: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        // Dual guard (ADR 0010): the retained slot bridges a fill applied
+        // under pre-set code and left unmarked at the deploy restart; the
+        // set rejects an out-of-order / cross-process re-drive the single
+        // slot cannot, because a newer fill displaces the slot but never
+        // the set entry.
+        if self.last_acknowledged_trade_id.as_ref() == Some(&trade_id)
+            || self.pending_acknowledged_trade_ids.contains(&trade_id)
+        {
+            return Err(PositionError::DuplicateTrade { trade_id });
+        }
+
+        Ok(vec![
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            },
+            PositionEvent::OnChainFillApplied {
+                trade_id,
+                applied_at: seen_at,
+            },
+        ])
+    }
+
+    fn place_offchain_order_events(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        placed_at: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if let Some(pending) = self.pending_offchain_order_id {
+            return Err(PositionError::PendingExecution {
+                offchain_order_id: pending,
+            });
+        }
+
+        let trigger_reason = self
+            .create_trigger_reason(&self.threshold)?
+            .ok_or(PositionError::ThresholdNotMet {
+                net_position: self.net,
+                threshold: self.threshold,
+            })
+            .inspect_err(|error| {
+                warn!(
+                    target: "hedge",
+                    %offchain_order_id, symbol = %self.symbol,
+                    "Order placement rejected: {error}",
+                );
+            })?;
+
+        Ok(vec![PositionEvent::OffChainOrderPlaced {
+            offchain_order_id,
+            shares,
+            direction,
+            executor,
+            trigger_reason,
+            placed_at,
+        }])
+    }
+
     fn create_trigger_reason(
         &self,
         threshold: &ExecutionThreshold,
@@ -919,6 +1024,21 @@ pub enum PositionCommand {
         price_usdc: Float,
         block_timestamp: DateTime<Utc>,
     },
+    /// Test/fixture-only: identical to `AcknowledgeOnChainFill` but takes
+    /// `seen_at` explicitly instead of stamping `Utc::now()`, so fixture
+    /// seeding (e.g. `nix run .#simulate-14d`) can backdate synthetic
+    /// history to build a realistic-looking trend.
+    #[cfg(any(test, feature = "test-support"))]
+    AcknowledgeOnChainFillAt {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        price_usdc: Float,
+        block_timestamp: DateTime<Utc>,
+        seen_at: DateTime<Utc>,
+    },
     /// Prunes `trade_id` from the pending-acknowledgement set after its
     /// `OnChainTrade` marker is durable (ADR 0010). A no-op (emits no
     /// events) when the trade is not in the set, so a re-driven prune is
@@ -932,6 +1052,18 @@ pub enum PositionCommand {
         direction: Direction,
         executor: SupportedExecutor,
         threshold: ExecutionThreshold,
+    },
+    /// Test/fixture-only: identical to `PlaceOffChainOrder` but takes
+    /// `placed_at` explicitly instead of stamping `Utc::now()`, so fixture
+    /// seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    PlaceOffChainOrderAt {
+        offchain_order_id: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        threshold: ExecutionThreshold,
+        placed_at: DateTime<Utc>,
     },
     CompleteOffChainOrder {
         offchain_order_id: OffchainOrderId,
@@ -1381,6 +1513,27 @@ impl std::fmt::Debug for PositionCommand {
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
                 .finish(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::AcknowledgeOnChainFillAt {
+                symbol,
+                threshold,
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            } => f
+                .debug_struct("AcknowledgeOnChainFillAt")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("trade_id", trade_id)
+                .field("amount", amount)
+                .field("direction", direction)
+                .field("price_usdc", &DebugFloat(price_usdc))
+                .field("block_timestamp", block_timestamp)
+                .field("seen_at", seen_at)
+                .finish(),
             Self::SettleOnChainFill { trade_id } => f
                 .debug_struct("SettleOnChainFill")
                 .field("trade_id", trade_id)
@@ -1398,6 +1551,23 @@ impl std::fmt::Debug for PositionCommand {
                 .field("direction", direction)
                 .field("executor", executor)
                 .field("threshold", threshold)
+                .finish(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::PlaceOffChainOrderAt {
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+                threshold,
+                placed_at,
+            } => f
+                .debug_struct("PlaceOffChainOrderAt")
+                .field("offchain_order_id", offchain_order_id)
+                .field("shares", shares)
+                .field("direction", direction)
+                .field("executor", executor)
+                .field("threshold", threshold)
+                .field("placed_at", placed_at)
                 .finish(),
             Self::CompleteOffChainOrder {
                 offchain_order_id,
@@ -1701,6 +1871,43 @@ mod tests {
             events[1],
             PositionEvent::OnChainFillApplied { .. }
         ));
+    }
+
+    /// Covers the fixture-only `AcknowledgeOnChainFillAt` sibling of
+    /// `AcknowledgeOnChainFill`: it must thread the caller-supplied `seen_at`
+    /// through to the emitted event's field rather than silently falling
+    /// back to `Utc::now()`.
+    #[tokio::test]
+    async fn acknowledge_on_chain_fill_at_uses_supplied_timestamp() {
+        let seen_at = Utc::now() - chrono::Duration::hours(3);
+
+        let events = TestHarness::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::AcknowledgeOnChainFillAt {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 3);
+        let PositionEvent::OnChainOrderFilled {
+            seen_at: event_seen_at,
+            ..
+        } = &events[1]
+        else {
+            panic!("Expected OnChainOrderFilled, got: {:?}", events[1]);
+        };
+        assert_eq!(*event_seen_at, seen_at);
     }
 
     /// Reproduction for the double-count half of the Witness/Acknowledge
@@ -2056,6 +2263,56 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
+    }
+
+    /// Covers the fixture-only `PlaceOffChainOrderAt` sibling of
+    /// `PlaceOffChainOrder`: it must thread the caller-supplied `placed_at`
+    /// through to the emitted event's field rather than silently falling
+    /// back to `Utc::now()`.
+    #[tokio::test]
+    async fn place_offchain_order_at_uses_supplied_timestamp() {
+        let threshold = one_share_threshold();
+        let placed_at = Utc::now() - chrono::Duration::hours(1);
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::PlaceOffChainOrderAt {
+                offchain_order_id: OffchainOrderId::new(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                threshold,
+                placed_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let PositionEvent::OffChainOrderPlaced {
+            placed_at: event_placed_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected OffChainOrderPlaced, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_placed_at, placed_at);
     }
 
     #[tokio::test]

@@ -178,6 +178,25 @@ impl EventSourced for OnChainTrade {
                 filled_at: Utc::now(),
             }]),
 
+            #[cfg(any(test, feature = "test-support"))]
+            WitnessAt {
+                symbol,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                block_timestamp,
+                filled_at,
+            } => Ok(vec![Filled {
+                symbol,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                block_timestamp,
+                filled_at,
+            }]),
+
             Enrich { .. } | Acknowledge => Err(OnChainTradeError::NotFilled),
         }
     }
@@ -191,6 +210,9 @@ impl EventSourced for OnChainTrade {
         use OnChainTradeEvent::*;
         match command {
             Witness { .. } => Err(OnChainTradeError::AlreadyFilled),
+
+            #[cfg(any(test, feature = "test-support"))]
+            WitnessAt { .. } => Err(OnChainTradeError::AlreadyFilled),
 
             Enrich {
                 gas_used,
@@ -288,6 +310,27 @@ pub(crate) enum OnChainTradeCommand {
         price_usdc: Float,
         block_number: u64,
         block_timestamp: DateTime<Utc>,
+    },
+    /// Test/fixture-only: identical to `Witness` but takes `filled_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    WitnessAt {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        amount: Float,
+        direction: Direction,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        filled_at: DateTime<Utc>,
     },
     Enrich {
         gas_used: u64,
@@ -448,6 +491,40 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], OnChainTradeEvent::Filled { .. }));
+    }
+
+    /// Covers the fixture-only `WitnessAt` sibling of `Witness`: it must
+    /// thread the caller-supplied `filled_at` through to the emitted event's
+    /// field rather than silently falling back to `Utc::now()`.
+    #[tokio::test]
+    async fn witness_at_uses_supplied_timestamp() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let block_timestamp = Utc::now();
+        let filled_at = block_timestamp - chrono::Duration::hours(4);
+
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given_no_previous_events()
+            .when(OnChainTradeCommand::WitnessAt {
+                symbol: symbol.clone(),
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_timestamp,
+                filled_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let OnChainTradeEvent::Filled {
+            filled_at: event_filled_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected Filled, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_filled_at, filled_at);
     }
 
     #[tokio::test]
