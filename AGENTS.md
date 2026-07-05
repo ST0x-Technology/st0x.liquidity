@@ -64,19 +64,12 @@ permission to do the obvious corrective work.
 ## Communication
 
 - **Do not run commands to "show" output to the user.** The CLI truncates
-  output. If you need the user to review something, explicitly ask them to look
-  at it. Do not run `git diff` expecting the user to see output.
+  output. Ask them to look at it instead.
 - **Never say "standing by" or wait for permission once work has been
-  authorized.** When the user has given you a task, do it -- do not ask "want me
-  to proceed?" or pause for a go-ahead between subtasks. If multiple related
-  review threads or requests have been queued, work through them in sequence
-  without asking between each one. Asking for confirmation after the user has
-  already told you what to do wastes their time and signals you weren't
-  listening. Only stop and ask when you are actually blocked on a decision the
-  user must make, not as a polite checkpoint.
-- **When you need user input, use the structured input prompt your tooling
-  exposes -- not prose at the end of a long response.** Wall-of-text questions
-  get missed. Batch all open decisions in one prompt, not a trickle.
+  authorized.** Do it -- do not ask "want me to proceed?" or pause between
+  subtasks. Stop only when actually blocked on a decision the user must make.
+- **When you need user input, use the structured input prompt** -- not prose at
+  end of a long response. Batch open decisions in one prompt.
 
 ## Planning Hierarchy
 
@@ -102,19 +95,18 @@ downstream from the goal.
 
 Decompose epics to maximize independent parallel execution:
 
-1. **Identify coupling boundaries.** Work touching disjoint code areas can
-   proceed in parallel.
-2. **Sequence only where necessary.** A branch depends on another only when it
-   needs types/traits/behavior introduced by that branch.
-3. **Every branch must be independently valid.** Each PR must pass CI and make
-   sense on its own -- never leave a broken intermediate state.
-4. **Defer integration.** Push integration PRs to the end, stacked on both
-   parallel branches.
-5. **Shared dependencies go first.** Extract shared types/traits/schemas into a
-   base PR to unblock all downstream branches.
-6. **Conflict-prone work goes last.** Schedule after parallel branches merge.
-7. **Converge to a single terminal node.** One final PR depends on all parallel
-   streams for integration.
+1. **Identify coupling boundaries** — disjoint code areas can parallelize.
+2. **Sequence only where necessary** — branch on another only when it needs
+   types/traits introduced by that branch.
+3. **Every branch independently valid** — each PR passes CI and makes sense
+   alone.
+4. **Defer integration** — push integration PRs to the end, stacked on parallel
+   branches.
+5. **Shared dependencies go first** — extract shared types into a base PR to
+   unblock downstream.
+6. **Conflict-prone work goes last** — schedule after parallel branches merge.
+7. **Converge to a single terminal node** — one final PR depends on all parallel
+   streams.
 
 ### Managing Epics in Linear
 
@@ -156,12 +148,9 @@ resulting diff as small and reviewable as possible.
 
 ### Handling questions and approach changes
 
-Answer the question first. Don't silently change approach - ask confirmation. If
-new approach fails, state what went wrong and ask before reverting. Explicit
-confirmation required before changing direction.
-
-When the user has already clearly told you what to do, start doing it
-immediately. Do not paraphrase the request back as a confirmation step.
+Answer the question first. Don't silently change approach — ask confirmation
+before reverting. When the user has told you what to do, start immediately;
+don't paraphrase back as a confirmation step.
 
 ### When issues are pointed out
 
@@ -177,17 +166,12 @@ for similar issues, (3) proactively fix all instances without being asked.
 
 ### When user action is required
 
-**CRITICAL**: The user is not reading every word of your output - they are
-monitoring your actions. When you need the user to do something (run a command,
-check output, provide input), you must ensure they see the request:
+**CRITICAL**: When you need the user to do something, make it visible:
 
-- If you are **blocked** and cannot proceed without user action, STOP after
-  stating what you need. Do not continue working on other tasks.
-- If you are **not blocked**, you can continue working, but when you're ready to
-  stop, clearly state what you need from the user at the end of your response.
+- **Blocked**: STOP after stating what you need. Don't continue other tasks.
+- **Not blocked**: continue, but state the request clearly at the end.
 
-The user checks your output when they see you've stopped. If you give them a
-command mid-response and keep working, they will miss it.
+Mid-response requests get missed — surface them when you stop.
 
 Significant architectural decisions are a special case. When existing docs do
 not already answer an architectural choice and the decision is important enough
@@ -214,10 +198,9 @@ readability of code being modified, enforces stricter domain boundaries.
 change area, LLM-initiated "while I'm here" improvements, changing terminology
 without request, adding comments to unchanged code.
 
-This step exists because LLMs are not naturally aware of diff size while
-generating, but can effectively review diffs after the fact. When context is
-ambiguous (after compaction), if you cannot point to an explicit user request in
-visible conversation, treat the change as unjustified and revert it.
+When context is ambiguous (after compaction), if you cannot point to an explicit
+user request in visible conversation, treat the change as unjustified and revert
+it.
 
 ## Project Overview
 
@@ -233,8 +216,25 @@ minimize delta exposure through automated hedging.
 
 This project uses a Cargo workspace with:
 
-- **Root crate (`st0x-hedge`)**: Main arbitrage bot application
-- **Execution crate (`st0x-execution`)**: Trade execution abstraction library
+- **`st0x-hedge`** (root): Main arbitrage bot application
+- **`st0x-config`** (`crates/config/`): TOML/secrets loading; restricted to
+  binary crates
+- **`st0x-dto`** (`crates/dto/`): Dashboard DTOs and TypeScript bindings
+- **`st0x-execution`** (`crates/execution/`): `Executor` trait, Alpaca Broker
+  API, and mock implementations
+- **`st0x-tokenization`** (`crates/tokenization/`): `Tokenizer` trait and Alpaca
+  tokenization API
+- **`st0x-bridge`** (`crates/bridge/`): Cross-chain bridge abstractions and CCTP
+  implementation
+- **`st0x-raindex`** (`crates/raindex/`): `Raindex` trait for Rain OrderBook
+  vault operations
+- **`st0x-registry`** (`crates/registry/`): `SymbolCache` and symbol lock
+- **`st0x-wrapper`** (`crates/wrapper/`): `Wrapper` trait for ERC-4626
+  wrap/unwrap
+- **`st0x-evm`** (`crates/evm/`): EVM wallet, provider, test-chain support
+- **`st0x-finance`** (`crates/finance/`): Shared financial primitives
+- **`st0x-float-serde`** (`crates/float-serde/`): Rain Float serde helpers
+- **`st0x-float-macro`** (`crates/float-macro/`): Compile-time `Float` literals
 
 ### Building & Running
 
@@ -493,11 +493,8 @@ is the source of truth for terminology and naming conventions.
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
   `OffchainOrder`/`OrderPlacer`
 - **Log in command handlers, not callers**: All logging for command execution
-  belongs in the aggregate's `handle()` method, not at the call site. The
-  handler has full aggregate state (symbol, net position, thresholds, etc.)
-  making log messages rich without the caller needing to load or pass extra
-  context. This keeps logging consistent and centralized — one place per
-  command, not scattered across every caller
+  belongs in the aggregate's `handle()` method. The handler has full state,
+  keeps logs rich and centralized.
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code
@@ -529,15 +526,10 @@ is the source of truth for terminology and naming conventions.
   - Groups 2 or 3 may be absent if unused; never add an empty group
   - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
-    **Exceptions** (function-body `use` only when one of these applies):
-    1. Enum variant imports (`use MyEnum::*` or `use MyEnum::{A, B, C}`) to
-       avoid repetitive qualification. Enum variant imports are never allowed at
-       module level.
-    2. Imports used only inside `#[cfg(...)]`-gated code, where pulling them to
-       module scope would produce unused-import warnings under the inverse
-       feature configuration.
-    3. Imports inside macro definitions / generated code, where hygiene requires
-       the import live in the expansion site, not the caller's module.
+    **Exceptions** (function-body `use` only): (1) enum variant imports
+    (`use MyEnum::*`); (2) `#[cfg(...)]`-gated code where module-level import
+    would cause unused warnings under the inverse config; (3) macro definitions
+    where hygiene requires local import.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
@@ -549,13 +541,10 @@ is the source of truth for terminology and naming conventions.
   logic may change, leaving panics). **Exception**: fine in test code
   (`#[cfg(test)]` modules)
 - **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
-  String values.** No `SomeError(String)`, no `.to_string()` or `format!()`
-  conversions, no unpacking newtypes (store `Symbol` not `String`). Prefer
-  `#[from]` + `?` for error conversion; preserve error chains with `#[source]`;
-  discover variants during implementation not preemptively. `.map_err` is
-  permitted when adding call-site context or adapting a source error type that
-  cannot implement `From`/`#[from]` - do not reach for it as the default when
-  `#[from]` + `?` suffices. To log before converting:
+  String values.** No `SomeError(String)`, no `.to_string()`/`format!()`
+  conversions. Prefer `#[from]` + `?`; preserve chains with `#[source]`;
+  discover variants during implementation. `.map_err` only when `From`/`#[from]`
+  can't adapt the source. To log before converting:
   `.inspect_err(|error| error!(?error, "ctx"))` before `?`
 - **Silent Early Returns**: Always log a warning/error before early returns in
   `let-else` or similar patterns. Silent failures hide bugs
@@ -583,11 +572,8 @@ constraints. Silent data corruption leads to massive losses.
 without explicit user permission.**
 
 This project handles financial transactions and sensitive API credentials.
-Unauthorized access to secrets can lead to:
-
-- Account compromise
-- Financial losses
-- Security breaches
+Unauthorized access can lead to account compromise, financial losses, and
+security breaches.
 
 **Protected files** (require explicit permission): `.env*`, `credentials.json`,
 `*.key`, `*.pem`, `*.p12`, `*.pfx`, database files with sensitive data. Ask
@@ -602,10 +588,9 @@ reviewing code that uses configuration instead of reading secrets directly.
 - **Database Isolation**: In-memory SQLite databases for test isolation
 - **Edge Case Coverage**: Comprehensive error scenario testing for trade
   conversion logic
-- **Testing Principle**: Follow the testing pyramid — most coverage in unit
-  tests, fewer integration tests, fewest e2e tests. Integration tests may cover
-  failure scenarios when those failures can only be triggered by wiring multiple
-  components together
+- **Testing Principle**: Testing pyramid — most unit tests, fewer integration,
+  fewest e2e. Integration tests cover failures that require multiple components
+  wired together.
 - **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: If
   code is broken, tests MUST assert correct behavior and FAIL until fixed. NEVER
   assert incorrect behavior with "will fix later" comments. A failing test is
@@ -620,13 +605,9 @@ reviewing code that uses configuration instead of reading secrets directly.
   files
 - **Test Quality**: Tests must verify business logic, not language features or
   struct field assignments
-- **Property-Based Testing**: Use `proptest` for property-based tests whenever
-  there are clear invariants to verify. Property tests are excellent for:
-  - Parsing/serialization roundtrips
-  - Boundary conditions (e.g., message length validation)
-  - Invariants that should hold for all inputs (e.g., extracted data matches
-    input regardless of surrounding bytes)
-  - Numeric operations where edge cases are hard to enumerate manually
+- **Property-Based Testing**: Use `proptest` for clear invariants:
+  parsing/serialization roundtrips, boundary conditions, all-input invariants,
+  numeric edge cases.
 
 ### Workflow Best Practices
 
@@ -766,11 +747,9 @@ Use `assert_eq!` with exact values, not `assert!(result.is_some())`. Never use
 #### Serialization test assertions must use literals
 
 When testing serialized output (JSON, etc.), assert against `json!()` literals,
-never against re-serialized domain types. Comparing
-`serde_json::to_value(field)` against the parent's serialized output tests
-serde's Serialize derive against itself — if the derive is wrong, both sides are
-wrong and the test still passes. Use `assert_eq!(parsed["field"], json!("10"))`
-so the expected value is independent of the code under test.
+never against re-serialized domain types:
+`assert_eq!(parsed["field"], json!("10"))`. Comparing deserialized values
+against each other tests nothing — if the derive is wrong, both sides are wrong.
 
 #### Type modeling
 
