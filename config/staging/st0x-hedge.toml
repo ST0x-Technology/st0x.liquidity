@@ -13,11 +13,12 @@ apalis_finished_job_cleanup_interval_secs = 3600
 [telemetry]
 service_name = "st0x-liquidity"
 environment = "staging"
-# Shared st0x-management-observability box (same as prod); staging traces/logs
-# are distinguished by deployment.environment, not endpoint. Reachable once the
-# bot is migrated onto the st0x tailnet; until then exports drop best-effort.
-traces_endpoint = "http://100.93.167.114:10428"
-logs_endpoint = "http://100.93.167.114:9428"
+# st0x-observability GCP VM (replaces the DO st0x-management-observability
+# droplet, which is being decommissioned); staging traces/logs are
+# distinguished by deployment.environment, not endpoint. MagicDNS FQDN rather
+# than a pinned tailnet IP so the endpoint survives VM rebuilds.
+traces_endpoint = "http://st0x-observability.tail6094d7.ts.net:10428"
+logs_endpoint = "http://st0x-observability.tail6094d7.ts.net:9428"
 
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.

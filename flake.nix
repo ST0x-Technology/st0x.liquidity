@@ -93,7 +93,7 @@
           volumeName = "st0x-liquidity-staging-data";
           hostKey = keys.host-staging;
           # Migrated to the st0x.io tailnet (tail6094d7.ts.net) so telemetry can
-          # reach st0x-management-observability (100.93.167.114).
+          # reach the st0x-observability GCP VM.
           tailscaleMagicDnsName = "st0x-liquidity-staging.tail6094d7.ts.net";
         };
       };
