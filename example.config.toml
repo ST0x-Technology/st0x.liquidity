@@ -93,6 +93,13 @@ attestation_retry_deadline_secs = 86400
 # Suggested value: 5 (covers transient RPC oscillation; halts for permanent
 # contract reverts such as USDC blocklist or paused TokenMessenger).
 max_burn_revert_redrives = 5
+# Dividend freeze guard. When "enabled", the rebalancing trigger queries
+# issuance's per-asset status endpoint each equity cycle and fails closed (skips
+# and alerts) when the status cannot be confirmed. When "disabled", the guard is
+# not wired and equity rebalancing proceeds without consulting issuance -- an
+# operator escape hatch for an issuance outage. Issuance secrets stay required
+# either way, so re-enabling is a pure config change.
+freeze_check = "enabled"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 

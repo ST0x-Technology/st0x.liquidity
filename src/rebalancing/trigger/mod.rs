@@ -688,6 +688,14 @@ impl RebalancingService {
         *self.freeze_status.write().await = Some(reader);
     }
 
+    /// Whether a freeze-status reader has been wired. Lets the conductor's
+    /// `wire_freeze_guard` tests assert the Enabled/Disabled branches without
+    /// reaching into the private `freeze_status` field.
+    #[cfg(test)]
+    pub(crate) async fn has_freeze_status_reader(&self) -> bool {
+        self.freeze_status.read().await.is_some()
+    }
+
     pub(crate) async fn recover_pending_offchain_order_symbols(
         &self,
         position_projection: &Projection<Position>,

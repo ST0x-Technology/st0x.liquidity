@@ -31,7 +31,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use st0x_config::{
-    AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, RebalancingCtx,
+    AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, IssuanceStatusCtx,
+    OperationMode, RebalancingCtx,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -44,6 +45,7 @@ use st0x_execution::{
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
     MarketOrder, MarketSession, Symbol, TryIntoExecutor,
 };
+use st0x_issuance_client::IssuanceClient;
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
@@ -1284,6 +1286,38 @@ fn build_usdc_notifier(
     Ok(Arc::new(notifier))
 }
 
+/// Wires the dividend freeze guard onto the rebalancing service when enabled.
+///
+/// When disabled, the trigger's `freeze_status` stays `None` and the equity gate
+/// fails open -- an operator escape hatch for an issuance outage that would
+/// otherwise fail closed every equity cycle. Issuance secrets remain mandatory
+/// either way, so re-enabling is a pure plaintext-config change.
+async fn wire_freeze_guard(
+    rebalancing_service: &RebalancingService,
+    freeze_check: OperationMode,
+    issuance: &IssuanceStatusCtx,
+) -> anyhow::Result<()> {
+    match freeze_check {
+        OperationMode::Enabled => {
+            let reader = Arc::new(IssuanceClient::new(
+                issuance.base_url.clone(),
+                issuance.api_key.header_value(),
+            )?);
+
+            rebalancing_service.set_freeze_status_reader(reader).await;
+        }
+        OperationMode::Disabled => {
+            warn!(
+                target: "rebalance",
+                "Dividend freeze guard is disabled by config; equity rebalancing will \
+                 proceed without consulting issuance"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -1343,11 +1377,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
 
-        let issuance_freeze_reader = Arc::new(st0x_issuance_client::IssuanceClient::new(
-            deps.ctx.issuance.base_url.clone(),
-            deps.ctx.issuance.api_key.header_value(),
-        )?);
-
         let usdc_notifier = build_usdc_notifier(deps.ctx.alerts.as_ref())?;
 
         let rebalancing_service = Arc::new(RebalancingService::new(
@@ -1366,9 +1395,12 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             usdc_notifier.clone(),
         ));
 
-        rebalancing_service
-            .set_freeze_status_reader(issuance_freeze_reader)
-            .await;
+        wire_freeze_guard(
+            &rebalancing_service,
+            rebalancing_ctx.freeze_check,
+            &deps.ctx.issuance,
+        )
+        .await?;
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
@@ -3366,10 +3398,11 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use task_supervisor::SupervisorBuilder;
     use tokio::sync::broadcast;
+    use url::Url;
 
     use st0x_config::{
         AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
-        create_test_ctx_with_order_owner,
+        create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, StoreBuilder, test_store};
@@ -3413,6 +3446,68 @@ mod tests {
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
+
+    async fn freeze_guard_test_service() -> Arc<RebalancingService> {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool, ()));
+
+        Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(60),
+                assets: AssetsConfig {
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
+                    cash: None,
+                },
+            },
+            vault_registry,
+            Address::ZERO,
+            Address::ZERO,
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(NoopNotifier),
+        ))
+    }
+
+    #[tokio::test]
+    async fn wire_freeze_guard_enabled_wires_the_reader() {
+        let service = freeze_guard_test_service().await;
+        let issuance = test_issuance_status_ctx(Url::parse("http://issuance.test:8000").unwrap());
+
+        wire_freeze_guard(&service, OperationMode::Enabled, &issuance)
+            .await
+            .unwrap();
+
+        assert!(
+            service.has_freeze_status_reader().await,
+            "Enabled must wire the issuance freeze-status reader onto the rebalancing service"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_freeze_guard_disabled_leaves_the_reader_unset() {
+        let service = freeze_guard_test_service().await;
+        let issuance = test_issuance_status_ctx(Url::parse("http://issuance.test:8000").unwrap());
+
+        wire_freeze_guard(&service, OperationMode::Disabled, &issuance)
+            .await
+            .unwrap();
+
+        assert!(
+            !service.has_freeze_status_reader().await,
+            "Disabled must leave the freeze guard unwired so the equity gate fails open"
+        );
     }
 
     fn conductor_with_job_cleanup(job_cleanup: JoinHandle<()>) -> Conductor {

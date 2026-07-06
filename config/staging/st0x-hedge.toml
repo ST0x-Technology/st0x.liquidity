@@ -60,6 +60,10 @@ transfer_timeout_secs = 1800
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
+# Dividend freeze guard: query issuance each equity cycle and fail closed when
+# the status cannot be confirmed. Set to "disabled" to fail open during an
+# issuance outage (issuance secrets stay required, so re-enabling is config-only).
+freeze_check = "disabled"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "disabled" }
 
@@ -89,7 +93,7 @@ realert_interval = 43200
 # USDC vault and rebalancing settings.
 [assets.cash]
 # Raindex vault ID for USDC deposits/withdrawals.
-vault_id = "0xfab2"
+vault_id = "0xfab"
 # Whether automatic USDC rebalancing between venues is active.
 rebalancing = "disabled"
 # operational_limit = 0.01

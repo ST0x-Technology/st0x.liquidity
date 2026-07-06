@@ -10,7 +10,7 @@ use serde::Deserialize;
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
-use crate::ImbalanceThreshold;
+use crate::{ImbalanceThreshold, OperationMode};
 
 /// Minimum USDC amount for Alpaca withdrawals.
 ///
@@ -90,6 +90,17 @@ pub struct RebalancingConfig {
     /// while halting for permanent contract reverts (USDC blocklist, paused
     /// TokenMessenger, etc.).
     pub max_burn_revert_redrives: u32,
+    /// Whether the dividend freeze guard consults issuance before starting an
+    /// equity rebalancing flow.
+    ///
+    /// When `Enabled`, the trigger queries issuance's per-asset status endpoint
+    /// each equity cycle and fails closed (skip + alert) when the status cannot
+    /// be confirmed. When `Disabled`, the guard is not wired and equity
+    /// rebalancing proceeds without consulting issuance (fail-open). Disabling
+    /// is an operator escape hatch for an issuance outage that would otherwise
+    /// fail-closed every equity cycle; issuance secrets stay required either way
+    /// so re-enabling is a pure plaintext-config change.
+    pub freeze_check: OperationMode,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -110,6 +121,9 @@ pub struct RebalancingCtx {
     /// Maximum consecutive burn-revert redrives before the circuit opens.
     /// See [`RebalancingConfig::max_burn_revert_redrives`].
     pub max_burn_revert_redrives: u32,
+    /// Whether the dividend freeze guard is wired for equity rebalancing.
+    /// See [`RebalancingConfig::freeze_check`].
+    pub freeze_check: OperationMode,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -154,6 +168,7 @@ impl RebalancingCtx {
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
             attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
             max_burn_revert_redrives: config.max_burn_revert_redrives,
+            freeze_check: config.freeze_check,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -180,6 +195,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
         #[builder(default = 5)] max_burn_revert_redrives: u32,
+        #[builder(default = OperationMode::Enabled)] freeze_check: OperationMode,
     ) -> Self {
         Self {
             equity,
@@ -188,6 +204,7 @@ impl RebalancingCtx {
             transfer_attempt_timeout,
             attestation_retry_deadline,
             max_burn_revert_redrives,
+            freeze_check,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -212,6 +229,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
         #[builder(default = 5)] max_burn_revert_redrives: u32,
+        #[builder(default = OperationMode::Enabled)] freeze_check: OperationMode,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -227,6 +245,7 @@ impl RebalancingCtx {
             transfer_attempt_timeout,
             attestation_retry_deadline,
             max_burn_revert_redrives,
+            freeze_check,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -260,6 +279,7 @@ impl std::fmt::Debug for RebalancingCtx {
         f.debug_struct("RebalancingCtx")
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
+            .field("freeze_check", &self.freeze_check)
             .finish_non_exhaustive()
     }
 }
@@ -275,6 +295,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -303,6 +324,60 @@ mod tests {
         assert_eq!(config.transfer_attempt_timeout_secs, 3600);
         assert_eq!(config.attestation_retry_deadline_secs, 86400);
         assert_eq!(config.max_burn_revert_redrives, 5);
+        assert_eq!(config.freeze_check, OperationMode::Enabled);
+    }
+
+    #[test]
+    fn deserialize_freeze_check_disabled() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "disabled"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.freeze_check, OperationMode::Disabled);
+        assert_eq!(
+            RebalancingCtx::new(&config).unwrap().freeze_check,
+            OperationMode::Disabled,
+            "RebalancingCtx must carry the configured freeze_check through"
+        );
+    }
+
+    #[test]
+    fn deserialize_missing_freeze_check_fails() {
+        let toml_str = r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("freeze_check"),
+            "Expected missing freeze_check error, got: {error}"
+        );
     }
 
     #[test]
@@ -313,6 +388,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 7200
             max_burn_revert_redrives = 3
+            freeze_check = "enabled"
 
             [equity]
             target = "0.6"
@@ -344,6 +420,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -368,6 +445,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -394,6 +472,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 0
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -421,6 +500,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [usdc]
             mode = "enabled"
@@ -442,6 +522,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -461,6 +542,7 @@ mod tests {
             transfer_timeout_secs = 1800
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -487,6 +569,7 @@ mod tests {
             transfer_attempt_timeout_secs = 0
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -515,6 +598,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 0
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -543,6 +627,7 @@ mod tests {
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 0
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"
@@ -564,6 +649,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            freeze_check = "enabled"
 
             [equity]
             target = "0.5"

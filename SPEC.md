@@ -111,6 +111,13 @@ rebalancing trigger skips frozen assets before starting any rebalancing flow,
 querying issuance's per-asset status endpoint each cycle (fails closed — skip
 and alert — when issuance is unreachable).
 
+The freeze guard is operator-toggleable via `freeze_check` under `[rebalancing]`
+in the plaintext config. `"enabled"` is the fail-closed behavior above.
+`"disabled"` leaves the guard unwired so equity rebalancing proceeds without
+consulting issuance (fail-open) — an escape hatch for an issuance outage that
+would otherwise fail closed every equity cycle. Issuance secrets stay required
+regardless, so re-enabling is a plaintext-config change with no secret update.
+
 The freeze is deliberately narrow: it suspends only **supply** operations.
 
 - **Suspended:** new mints (issuance) and new liquidity-initiated rebalancing
