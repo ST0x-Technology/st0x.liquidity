@@ -3601,6 +3601,41 @@ mod tests {
     }
 
     #[test]
+    fn s01_issuer_config_toml_is_valid() {
+        let config_str = include_str!("../../../config/s01-issuer.toml");
+        let config: Config = toml::from_str(config_str).unwrap();
+
+        // The dividend buy leg runs through Alpaca, which rejects whitelist
+        // requests without a travel rule -- same constraint as the prod bot.
+        let broker = config
+            .broker
+            .expect("s01-issuer config must include [broker] for the dividend buy leg");
+        broker
+            .travel_rule
+            .expect("s01-issuer config must include [broker.travel_rule]")
+            .validated()
+            .unwrap();
+
+        // The NAV bump tokenizes + donates the wrapped equity, so the bumped
+        // symbol must carry both token addresses the wrap/donate path resolves.
+        let sgov = config
+            .assets
+            .equities
+            .symbols
+            .get(&Symbol::new("SGOV").unwrap())
+            .expect("s01-issuer config must configure the SGOV equity for the NAV bump");
+        assert_ne!(sgov.tokenized_equity, Address::ZERO);
+        assert_ne!(sgov.tokenized_equity_derivative, Address::ZERO);
+
+        // The bump is funded + signed by the dividend-ops turnkey wallet.
+        let wallet = config
+            .wallet
+            .expect("s01-issuer config must include the [wallet] section");
+        let wallet_meta = WalletMeta::deserialize(wallet).unwrap();
+        assert_eq!(wallet_meta.kind, "turnkey");
+    }
+
+    #[test]
     fn example_config_toml_is_valid() {
         let config_str = include_str!("../../../example.config.toml");
         let _: Config = toml::from_str(config_str).unwrap();

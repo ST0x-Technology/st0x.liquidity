@@ -1,0 +1,64 @@
+# Issuer / dividend-ops CLI config for the `s01` wrapper (os.nix). Points at the
+# dividend-ops turnkey wallet -- separate from the market-making wallet
+# (st0x-hedge.toml) and the mint/redemption wallet -- so `s01 dividend-bump`
+# (buy -> tokenize -> donate) is funded and signed by the issuer.
+#
+# One environment-agnostic config/secret pair: the dividend-ops wallet is shared
+# across environments (as st0x-hedge's wallet is), so there is no prod/staging
+# split. This is NOT a running service -- the `cli` deploy kind installs the
+# config and decrypts the secret for on-demand CLI use, starting no systemd unit.
+#
+# The encrypted secret (secret/s01-issuer.toml.age) must carry the FULL secret
+# surface the shared validate-config gate checks, or the deploy fails closed:
+#   [evm]       rpc_url, base_rpc_url, ethereum_rpc_url
+#   [broker]    type = "alpaca-broker-api" + api_key/api_secret/account_id
+#   [wallet]    api_private_key (turnkey)
+#   [issuance]  base_url + api_key (required unconditionally by the validator)
+
+# Required by the config schema even though the CLI serves no HTTP. Kept distinct
+# from st0x-hedge (8001/8002) in case both ever run on one host.
+server_port = 8011
+board_port = 8012
+# Separate DB so CLI runs never touch the market-making bot's event store.
+database_url = "sqlite:///mnt/data/s01-issuer.db"
+apalis_finished_job_cleanup_interval_secs = 3600
+
+# On-chain orderbook settings (same Rain Orderbook on Base as the bot).
+[raindex]
+orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
+deployment_block = 43259507
+required_confirmations = 3
+ingestion_cutoff = "safe"
+
+# Dividend-ops turnkey wallet. `address` and `organization_id` are non-secret and
+# live here; the turnkey API key + base RPC URLs are secret and live in
+# secret/s01-issuer.toml.age. Same turnkey organization as the market-making
+# wallet (st0x-hedge.toml), a distinct wallet address.
+[wallet]
+kind = "turnkey"
+address = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"
+organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
+
+# Alpaca broker settings for the issuer buy leg. API credentials are secret.
+[broker]
+counter_trade_slippage_bps = 100
+
+# Travel Rule beneficiary identity for Alpaca whitelist creation. Must be the
+# real entity (validate-config rejects placeholder values).
+[broker.travel_rule]
+beneficiary_entity_name = "T0 TRADE (BVI) LTD"
+
+[tokenization]
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+
+# Equity assets eligible for a dividend bump. SGOV is the yield-bearing wrapper
+# whose NAV bump this MVP targets. Add a block per symbol as they pay dividends
+# (tokenized_equity / tokenized_equity_derivative from config/prod/st0x-hedge.toml).
+[assets.equities.SGOV]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
+tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"

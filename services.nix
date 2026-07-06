@@ -2,6 +2,9 @@
 
 # kind = "st0x"    -- full pipeline: agenix decrypt, install config, validate-config,
 #                    chown data dirs, write git-rev, marker file, restart unit.
+# kind = "cli"     -- agenix decrypt + install config + validate-config for an
+#                    on-demand CLI (e.g. the `s01` issuer wrapper). No systemd
+#                    unit: nothing runs continuously, the files are just installed.
 # kind = "plain"   -- has a systemd unit, no secrets/config. Marker file gates
 #                    ConditionPathExists; deploy step just touches it and restarts.
 # kind = "static"  -- no systemd unit (e.g. nginx-served static assets). Deploy step
@@ -23,8 +26,19 @@ let
     decryptedSecretPath = "/run/agenix/${name}.toml";
   };
 
+  # Two orthogonal per-kind capabilities, each defined here ONCE so adding a kind
+  # forces a decision in this file rather than in each consumer's inline filter
+  # (a missed filter is an eval-time throw -- see upgradeable-services.nix):
+  #   carriesConfig -- has an encrypted secret + plaintext config installed to
+  #                    the st0xFields paths by deploy.nix ("st0x" and "cli").
+  #   hasUnit       -- runs a systemd unit ("st0x" and "plain"). "cli" installs
+  #                    config/secrets for on-demand use but starts no unit.
+  carriesConfig = kind: kind == "st0x" || kind == "cli";
+  hasUnit = kind: kind == "st0x" || kind == "plain";
+
   withPaths =
-    name: attrs: attrs // baseFields name // (if attrs.kind == "st0x" then st0xFields name else { });
+    name: attrs:
+    attrs // baseFields name // (if carriesConfig attrs.kind then st0xFields name else { });
 
   byName = builtins.mapAttrs withPaths {
     # `order` controls deploy-rs activation sequence within `profilesOrder`. The
@@ -36,6 +50,17 @@ let
       kind = "st0x";
       package = "st0x-liquidity";
       bin = "server";
+    };
+
+    # Issuer / dividend-ops CLI config. The `cli` kind installs the
+    # config + decrypts the secret for the on-demand `s01` wrapper (os.nix) and
+    # starts no systemd unit -- the dividend bump is a manual issuer operation,
+    # not a long-running service.
+    s01-issuer = {
+      enabled = true;
+      order = 35;
+      kind = "cli";
+      package = "st0x-liquidity";
     };
 
     dashboard = {
@@ -74,5 +99,10 @@ let
   enabled = lib.filterAttrs (_: v: v.enabled) byName;
 in
 {
-  inherit byName enabled;
+  inherit
+    byName
+    enabled
+    carriesConfig
+    hasUnit
+    ;
 }
