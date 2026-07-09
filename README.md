@@ -286,6 +286,11 @@ continuous user trades at ~10-second intervals. Use this when you want to
 observe long-running liquidity cycling rather than a single bounded chaos
 scenario.
 
+`nix run .#simulate-14d` starts the same stack as `simulate-market`, but
+preloads 14 days of seeded hedge-latency, mint, redemption, and USDC-rebalance
+history so Performance tab trends and the Transfers panel are populated
+immediately.
+
 `nix run .#simulate-failures` starts the same stack as `simulate-market`, then
 creates failed mint and redemption rebalances whose mock Alpaca provider later
 completes and prints the `transfer recheck` commands that recover them.
@@ -300,6 +305,17 @@ What `simulate-market` does:
 5. Starts the dashboard dev server
 6. Continuously takes orders at 10-second intervals, simulating users buying and
    selling tokenized equities
+
+The `simulate-14d` variant also preloads 14 days of history -- hedge-latency
+cycles, equity mints, equity redemptions, and USDC rebalances (alternating
+Alpaca<->Base direction) -- before live trades begin, so the Performance tab's
+percentile charts and rebalance-stage breakdown, and the dashboard's Transfers
+panel, all show a trend immediately instead of waiting for historical data to
+accumulate. The dashboard's default `1W` view renders the most recent week of
+that seed at daily granularity; switch to `2W` to see the full 14-day history,
+still at daily granularity (within ~12h of the bot starting -- the seed is a
+fixed point in time, so a much longer-running session ages its oldest day out of
+the `2W` window).
 
 The bot counter-trades each fill on the mock broker, mints/redeems to rebalance
 equity supply between venues, and bridges USDC via mock CCTP to keep cash

@@ -35,7 +35,7 @@ use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
-use st0x_config::{BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, Ctx, configure_sqlite_pool};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
@@ -54,6 +54,8 @@ use st0x_hedge::mock_api::{
 use st0x_hedge::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
     OperationMode, Position, RebalancingCtx, TradingMode, UsdcRebalancing,
+    seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
+    seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
 };
 
 use crate::assert::ExpectedPosition;
@@ -172,6 +174,166 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         .redemption_wallet(REDEMPTION_WALLET)
         .call()
         .map_err(Into::into)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SimulationPorts {
+    server_port: u16,
+    board_port: u16,
+}
+
+fn simulation_ports(command: &str) -> anyhow::Result<SimulationPorts> {
+    let raw_server_port = std::env::var("SIMULATE_BOT_PORT").map_err(|error| {
+        anyhow::anyhow!("SIMULATE_BOT_PORT must be set (run via `nix run .#{command}`): {error}")
+    })?;
+
+    let raw_board_port = match std::env::var("SIMULATE_BOARD_PORT") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "SIMULATE_BOARD_PORT could not be read for `nix run .#{command}`: {error}"
+            ));
+        }
+    };
+
+    simulation_ports_from_raw(&raw_server_port, raw_board_port.as_deref())
+}
+
+fn simulation_ports_from_raw(
+    raw_server_port: &str,
+    raw_board_port: Option<&str>,
+) -> anyhow::Result<SimulationPorts> {
+    let server_port = parse_simulation_port("SIMULATE_BOT_PORT", raw_server_port)?;
+    let board_port = match raw_board_port {
+        Some(raw) => parse_simulation_port("SIMULATE_BOARD_PORT", raw)?,
+        None => server_port.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("SIMULATE_BOARD_PORT must be set when SIMULATE_BOT_PORT is 65535")
+        })?,
+    };
+
+    Ok(SimulationPorts {
+        server_port,
+        board_port,
+    })
+}
+
+fn parse_simulation_port(env_name: &str, raw: &str) -> anyhow::Result<u16> {
+    let port = raw
+        .parse()
+        .map_err(|error| anyhow::anyhow!("{env_name} must be a valid u16 port number: {error}"))?;
+    anyhow::ensure!(port != 0, "{env_name} must be a non-zero TCP port");
+    Ok(port)
+}
+
+/// Seeds all four simulated-history read models into `pool` for `days` of
+/// history anchored at `seed_now`: hedge-latency, equity mint, USDC-rebalance,
+/// and equity-redemption. Each helper runs its own schema migrations before
+/// touching the CQRS tables. Extracted from the `SIMULATE_LATENCY_FIXTURE_DAYS`
+/// wiring below so the orchestration is testable without spinning up the bot.
+async fn seed_all_simulated_history(
+    pool: &sqlx::SqlitePool,
+    seed_now: chrono::DateTime<chrono::Utc>,
+    days: u32,
+) -> anyhow::Result<()> {
+    seed_simulated_hedge_latency_history(pool, seed_now, days).await?;
+    seed_simulated_mint_history(pool, seed_now, days).await?;
+    seed_simulated_usdc_rebalance_history(pool, seed_now, days).await?;
+    seed_simulated_equity_redemption_history(pool, seed_now, days).await?;
+
+    Ok(())
+}
+
+#[test]
+fn simulation_ports_default_board_port_follows_server_port() {
+    let ports = simulation_ports_from_raw("8101", None).unwrap();
+
+    assert_eq!(
+        ports,
+        SimulationPorts {
+            server_port: 8101,
+            board_port: 8102,
+        }
+    );
+}
+
+#[test]
+fn simulation_ports_accept_independent_board_port() {
+    let ports = simulation_ports_from_raw("8101", Some("8201")).unwrap();
+
+    assert_eq!(
+        ports,
+        SimulationPorts {
+            server_port: 8101,
+            board_port: 8201,
+        }
+    );
+}
+
+#[test]
+fn simulation_ports_from_raw_errors_when_default_board_port_overflows() {
+    let error = simulation_ports_from_raw("65535", None).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "SIMULATE_BOARD_PORT must be set when SIMULATE_BOT_PORT is 65535"
+    );
+}
+
+#[test]
+fn simulation_ports_from_raw_rejects_zero_port() {
+    let error = simulation_ports_from_raw("0", None).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "SIMULATE_BOT_PORT must be a non-zero TCP port"
+    );
+}
+
+/// Guards the `SIMULATE_LATENCY_FIXTURE_DAYS` seeding path: a broken seed helper
+/// that silently writes nothing would otherwise pass CI, since the full-system
+/// e2e (which requires anvil/CCTP) is the only other exercise of this wiring.
+#[tokio::test]
+async fn seed_all_simulated_history_populates_every_read_model() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("simulate-seed.sqlite");
+    let pool = configure_sqlite_pool(&db_path.display().to_string())
+        .await
+        .unwrap();
+
+    seed_all_simulated_history(&pool, chrono::Utc::now(), 2)
+        .await
+        .unwrap();
+
+    // Literal-per-table queries (not a `format!`ed loop) to satisfy the
+    // dynamic-SQL lint; the tuple's label names the read model each guards.
+    let (hedge_cycles,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM hedge_cycle")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (rebalance_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rebalance_stage_timing")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (equity_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM equity_stage_timing")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        hedge_cycles > 0,
+        "expected the hedge-latency read model (hedge_cycle) to hold seeded rows, got {hedge_cycles}"
+    );
+    assert!(
+        rebalance_rows > 0,
+        "expected the rebalance-timing read model (rebalance_stage_timing) to hold seeded rows, got {rebalance_rows}"
+    );
+    assert!(
+        equity_rows > 0,
+        "expected the equity-timing read model (equity_stage_timing) to hold seeded rows, got {equity_rows}"
+    );
+
+    pool.close().await;
 }
 
 struct AcceptedMintIds {
@@ -813,10 +975,10 @@ async fn full_system_concurrent() -> anyhow::Result<()> {
 #[ignore = "infinite simulation -- run via nix run .#simulate-market"]
 #[allow(clippy::too_many_lines)]
 async fn simulate() -> anyhow::Result<()> {
-    let server_port: u16 = std::env::var("SIMULATE_BOT_PORT")
-        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate-market`)")
-        .parse()
-        .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
+    let SimulationPorts {
+        server_port,
+        board_port,
+    } = simulation_ports("simulate")?;
 
     let log_dir = std::path::PathBuf::from(format!("/tmp/st0x-simulate-logs-{server_port}"));
     std::fs::create_dir_all(&log_dir)?;
@@ -926,10 +1088,44 @@ async fn simulate() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
-        .board_port(server_port + 1)
+        .board_port(board_port)
         .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
+
+    // Seeded BEFORE the bot starts: the fixture's temporary
+    // `Store<Position>`/`Store<OffchainOrder>` are wired only with
+    // `HedgeLatencyProjection`, never `RebalancingService`, so they must not
+    // coexist with the bot's own real, RebalancingService-wired stores. The
+    // bot hasn't run its own startup migrations yet, so
+    // `configure_sqlite_pool` (not `connect_db`) is used here -- it sets
+    // `create_if_missing(true)` and matches the bot's own pool
+    // configuration, and `seed_simulated_hedge_latency_history` runs the
+    // schema migrations itself before touching the CQRS tables.
+    match std::env::var("SIMULATE_LATENCY_FIXTURE_DAYS") {
+        Ok(raw_days) => {
+            let days: u32 = raw_days.parse().map_err(|error| {
+                anyhow::anyhow!(
+                    "SIMULATE_LATENCY_FIXTURE_DAYS must be a valid u32 day count: {error}"
+                )
+            })?;
+            let pool = configure_sqlite_pool(&infra.db_path.display().to_string()).await?;
+            let seed_now = chrono::Utc::now();
+            seed_all_simulated_history(&pool, seed_now, days).await?;
+            pool.close().await;
+            info!(
+                days,
+                "Seeded simulated hedge-latency, mint, USDC-rebalance, and equity-redemption \
+                 history for dashboard inspection"
+            );
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "SIMULATE_LATENCY_FIXTURE_DAYS could not be read: {error}"
+            ));
+        }
+    }
 
     debug!("Starting bot");
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
@@ -1007,10 +1203,10 @@ async fn simulate() -> anyhow::Result<()> {
 #[ignore = "failure simulation -- run via nix run .#simulate-failures"]
 #[allow(clippy::too_many_lines)]
 async fn simulate_failures() -> anyhow::Result<()> {
-    let server_port: u16 = std::env::var("SIMULATE_BOT_PORT")
-        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate-failures`)")
-        .parse()
-        .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
+    let SimulationPorts {
+        server_port,
+        board_port,
+    } = simulation_ports("simulate-failures")?;
 
     let log_dir =
         std::path::PathBuf::from(format!("/tmp/st0x-simulate-failures-logs-{server_port}"));
@@ -1126,7 +1322,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
-        .board_port(server_port + 1)
+        .board_port(board_port)
         .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
@@ -1136,7 +1332,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         &infra,
         &cctp,
         server_port,
-        server_port + 1,
+        board_port,
         current_block,
         usdc_vault_id,
         &equity_vault_ids,
