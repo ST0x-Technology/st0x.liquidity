@@ -97,7 +97,7 @@ realert_interval = 43200
 # USDC vault and rebalancing settings.
 [assets.cash]
 # Raindex vault ID for USDC deposits/withdrawals.
-vault_id = "0xfab4"
+vault_id = "0xfab2"
 # Whether automatic USDC rebalancing between venues is active.
 rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
