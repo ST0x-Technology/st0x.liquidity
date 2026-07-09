@@ -22,6 +22,11 @@ permissions:
 jobs:
   deploy:
     environment: production
+    permissions:
+      # id-token lets tailscale/github-action fetch the GitHub OIDC JWT and
+      # redeem it for a keyless tailnet join (no stored TS_AUTHKEY).
+      id-token: write
+      contents: read
     concurrency:
       group: deploy-prod
       cancel-in-progress: false
@@ -59,9 +64,21 @@ jobs:
         continue-on-error: true
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        # Keyless join via GitHub OIDC federation (no stored TS_AUTHKEY): the
+        # runner presents its OIDC token and redeems the liquidity_deploy_production
+        # federated identity for an ephemeral tag:ci node. Mirrors st0x.devops
+        # health-runtime.yml. The prod bot lives on tag:st0x-liquidity; tag:ci ->
+        # tag:st0x-liquidity:22 is granted in st0x.devops policy.hujson so deploy-rs
+        # can SSH.
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          # BLOCKED: fill both from the st0x.devops PR #65 apply output
+          # (`terraform output liquidity_deploy_production_federated_identity`).
+          # These are non-secret identifiers, hardcoded like st0x.devops does.
+          oauth-client-id: FILL_FROM_ST0X_DEVOPS_TF_OUTPUT
+          audience: FILL_FROM_ST0X_DEVOPS_TF_OUTPUT
+          tags: tag:ci
+          hostname: liquidity-deploy-${{ github.run_id }}
 
       - name: Resolve deploy host via Tailscale
         run: |

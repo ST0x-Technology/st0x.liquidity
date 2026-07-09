@@ -84,9 +84,11 @@
           nodeName = "st0x-liquidity";
           volumeName = "st0x-liquidity-data";
           hostKey = keys.host-prod;
-          # Still on the rainlang.xyz tailnet; migrates to st0x.io last, after
-          # staging is validated on tail6094d7.ts.net.
-          tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
+          # Migrated to the st0x.io tailnet (tail6094d7.ts.net) so telemetry can
+          # reach the st0x-observability GCP VM. Joins on its own dedicated tag
+          # tag:st0x-liquidity (see the prod auth key), not the shared
+          # tag:st0x-infra that staging uses.
+          tailscaleMagicDnsName = "st0x-liquidity-nixos.tail6094d7.ts.net";
         };
         staging = {
           nodeName = "st0x-liquidity-staging";
