@@ -72,11 +72,11 @@ jobs:
         # can SSH.
         uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
         with:
-          # BLOCKED: fill both from the st0x.devops PR #65 apply output
-          # (`terraform output liquidity_deploy_production_federated_identity`).
-          # These are non-secret identifiers, hardcoded like st0x.devops does.
-          oauth-client-id: FILL_FROM_ST0X_DEVOPS_TF_OUTPUT
-          audience: FILL_FROM_ST0X_DEVOPS_TF_OUTPUT
+          # From st0x.devops liquidity_deploy_production_federated_identity
+          # (terraform/tailscale/liquidity-wif.tf, applied in #65). Non-secret
+          # identifiers, hardcoded like st0x.devops does.
+          oauth-client-id: TpQCTWg3NM11CNTRL-kuSMK7npcv11CNTRL
+          audience: api.tailscale.com/TpQCTWg3NM11CNTRL-kuSMK7npcv11CNTRL
           tags: tag:ci
           hostname: liquidity-deploy-${{ github.run_id }}
 
