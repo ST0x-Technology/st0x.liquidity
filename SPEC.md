@@ -496,9 +496,16 @@ hedging decisions.
 
 #### Roundtrip and reliability metrics
 
-- **Rebalance stage timing**: per-stage durations of USDC rebalances
+- **USDC rebalance stage timing**: per-stage durations of USDC rebalances
   (withdrawal, CCTP burn -> attestation -> mint, deposit, conversion) derived
-  from `UsdcRebalanceEvent` timestamps, including attestation-time trends.
+  from `UsdcRebalanceEvent` timestamps, including attestation-time trends. Shown
+  on its own dashboard chart, clearly labeled as USDC-specific.
+- **Equity rebalance stage timing**: per-stage durations of equity mints
+  (acceptance, token receipt, wrap, vault deposit) and redemptions (vault
+  withdraw, unwrap, send, detection, completion), derived from
+  `TokenizedEquityMintEvent`/`EquityRedemptionEvent` timestamps and combined
+  into one dashboard chart (mint and redemption rows share the chart, each
+  labeled by kind), separate from the USDC chart above.
 - **Reliability**: error/warning counts by severity, module, and time bucket
   from the structured log store; lifecycle failure events (failed hedges, failed
   rebalance stages, rejections) as an impact-weighted category; job queue health

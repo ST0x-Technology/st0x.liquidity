@@ -87,6 +87,12 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     RebalanceStageName::export_all_to(out_dir)?;
     RebalanceStageStats::export_all_to(out_dir)?;
     AttestationSample::export_all_to(out_dir)?;
+    EquityTimings::export_all_to(out_dir)?;
+    EquityOperationKind::export_all_to(out_dir)?;
+    EquityOperationTiming::export_all_to(out_dir)?;
+    EquityStageTiming::export_all_to(out_dir)?;
+    EquityStageName::export_all_to(out_dir)?;
+    EquityStageStats::export_all_to(out_dir)?;
     ReliabilityReport::export_all_to(out_dir)?;
     LogVolumeBucket::export_all_to(out_dir)?;
     CountedLogLevel::export_all_to(out_dir)?;

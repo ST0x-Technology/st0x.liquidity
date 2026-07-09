@@ -22,6 +22,7 @@ use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
 use crate::performance::HedgeLatencyProjection;
+use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::Position;
@@ -39,6 +40,7 @@ pub(super) struct QueryManifest {
     broadcaster: Arc<Broadcaster>,
     hedge_latency: Arc<HedgeLatencyProjection>,
     rebalance_timing: Arc<RebalanceTimingProjection>,
+    equity_timing: Arc<EquityTimingProjection>,
     lifecycle_failure: Arc<LifecycleFailureProjection>,
 }
 
@@ -62,6 +64,7 @@ impl QueryManifest {
         broadcaster: Arc<Broadcaster>,
         hedge_latency: Arc<HedgeLatencyProjection>,
         rebalance_timing: Arc<RebalanceTimingProjection>,
+        equity_timing: Arc<EquityTimingProjection>,
         lifecycle_failure: Arc<LifecycleFailureProjection>,
     ) -> Self {
         Self {
@@ -69,6 +72,7 @@ impl QueryManifest {
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            equity_timing,
             lifecycle_failure,
         }
     }
@@ -88,6 +92,7 @@ impl QueryManifest {
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            equity_timing,
             lifecycle_failure,
         } = self;
 
@@ -101,6 +106,7 @@ impl QueryManifest {
         let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
+            .with(equity_timing.clone())
             .with(lifecycle_failure.clone())
             .build(services.clone())
             .await?;
@@ -108,6 +114,7 @@ impl QueryManifest {
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
+            .with(equity_timing)
             .with(lifecycle_failure.clone())
             .build(services)
             .await?;
@@ -213,12 +220,14 @@ mod tests {
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
         let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let equity_timing = Arc::new(EquityTimingProjection::new(pool.clone()));
         let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
         let manifest = QueryManifest::new(
             rebalancing_service,
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            equity_timing,
             lifecycle_failure,
         );
 
@@ -271,12 +280,14 @@ mod tests {
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
         let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let equity_timing = Arc::new(EquityTimingProjection::new(pool.clone()));
         let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
         let manifest = QueryManifest::new(
             rebalancing_service,
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            equity_timing,
             lifecycle_failure,
         );
         let services = EquityTransferServices {
@@ -388,12 +399,14 @@ mod tests {
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
         let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let equity_timing = Arc::new(EquityTimingProjection::new(pool.clone()));
         let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            equity_timing,
             lifecycle_failure,
         );
         let services = EquityTransferServices {

@@ -203,11 +203,30 @@ pub(crate) enum TokenizedEquityMintCommand {
         quantity: Float,
         wallet: Address,
     },
+    /// Test/fixture-only: identical to `RequestMint` but takes `requested_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    RequestMintAt {
+        issuer_request_id: IssuerRequestId,
+        symbol: Symbol,
+        quantity: Float,
+        wallet: Address,
+        requested_at: DateTime<Utc>,
+    },
     /// Calls `poll_mint_until_complete()` on the tokenizer service.
     ///
     /// Emits TokensReceived (success)
     ///     or MintAcceptanceFailed (rejection/timeout/error)
     Poll,
+    /// Test/fixture-only: identical to `Poll` but takes `received_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history. Only the success (`TokensReceived`) path
+    /// honours the timestamp; the fixture never drives a rejection.
+    #[cfg(any(test, feature = "test-support"))]
+    PollAt {
+        received_at: DateTime<Utc>,
+    },
     /// Record that a wrap transaction has been submitted (before confirmation).
     SubmitWrap {
         wrap_tx_hash: TxHash,
@@ -224,8 +243,26 @@ pub(crate) enum TokenizedEquityMintCommand {
         /// deposit. The persisted event keeps `Option<u64>` for legacy replay.
         wrap_block: u64,
     },
+    /// Test/fixture-only: identical to `WrapTokens` but takes `wrapped_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    WrapTokensAt {
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        wrap_block: u64,
+        wrapped_at: DateTime<Utc>,
+    },
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
+    },
+    /// Test/fixture-only: identical to `DepositToVault` but takes
+    /// `deposited_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    DepositToVaultAt {
+        vault_deposit_tx_hash: TxHash,
+        deposited_at: DateTime<Utc>,
     },
     /// Operator or timeout-driven failure from `MintAccepted` state, or operator
     /// force-fail from `MintRequested` (requested at the provider but never
@@ -1785,14 +1822,22 @@ impl EventSourced for TokenizedEquityMint {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use TokenizedEquityMintEvent::*;
 
-        let TokenizedEquityMintCommand::RequestMint {
-            issuer_request_id,
-            symbol,
-            quantity,
-            wallet,
-        } = command
-        else {
-            return Err(TokenizedEquityMintError::NotInitialized);
+        let (issuer_request_id, symbol, quantity, wallet, now) = match command {
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id,
+                symbol,
+                quantity,
+                wallet,
+            } => (issuer_request_id, symbol, quantity, wallet, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            TokenizedEquityMintCommand::RequestMintAt {
+                issuer_request_id,
+                symbol,
+                quantity,
+                wallet,
+                requested_at,
+            } => (issuer_request_id, symbol, quantity, wallet, requested_at),
+            _ => return Err(TokenizedEquityMintError::NotInitialized),
         };
 
         if quantity.lt(Float::zero()?)? {
@@ -1807,7 +1852,6 @@ impl EventSourced for TokenizedEquityMint {
             "Initiating mint request"
         );
 
-        let now = Utc::now();
         let mint_requested = MintRequested {
             symbol: symbol.clone(),
             quantity,
@@ -1876,104 +1920,17 @@ impl EventSourced for TokenizedEquityMint {
             TokenizedEquityMintCommand::RequestMint { .. } => {
                 Err(TokenizedEquityMintError::AlreadyInProgress)
             }
+            #[cfg(any(test, feature = "test-support"))]
+            TokenizedEquityMintCommand::RequestMintAt { .. } => {
+                Err(TokenizedEquityMintError::AlreadyInProgress)
+            }
 
-            TokenizedEquityMintCommand::Poll => match self {
-                Self::MintAccepted {
-                    symbol,
-                    quantity,
-                    tokenization_request_id,
-                    ..
-                } => {
-                    let completed = match services
-                        .tokenizer
-                        .poll_mint_until_complete(tokenization_request_id)
-                        .await
-                    {
-                        Ok(req) => req,
-                        Err(error) => {
-                            warn!(target: "tokenization", %error, %symbol, %tokenization_request_id, "Polling failed");
-                            return Ok(vec![MintAcceptanceFailed {
-                                reason: format!("Polling failed: {error}"),
-                                failed_at: Utc::now(),
-                            }]);
-                        }
-                    };
+            TokenizedEquityMintCommand::Poll => self.transition_poll(services, None).await,
 
-                    match completed.status {
-                        TokenizationRequestStatus::Completed => {
-                            let tx_hash = completed
-                                .tx_hash
-                                .ok_or(TokenizedEquityMintError::MissingTxHash)?;
-
-                            // Validate that Alpaca returned the expected
-                            // tokenized symbol (e.g. "tAAPL" for AAPL).
-                            let expected_token_symbol = format!("t{symbol}");
-                            match &completed.token_symbol {
-                                Some(actual) if *actual == expected_token_symbol => {}
-                                Some(actual) => {
-                                    return Err(TokenizedEquityMintError::TokenSymbolMismatch {
-                                        expected_symbol: symbol.clone(),
-                                        actual_token_symbol: actual.clone(),
-                                    });
-                                }
-                                None => {
-                                    return Err(TokenizedEquityMintError::MissingTokenSymbol {
-                                        expected_symbol: symbol.clone(),
-                                    });
-                                }
-                            }
-
-                            let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
-
-                            info!(
-                                target: "tokenization",
-                                %symbol,
-                                %tx_hash,
-                                "Mint polling completed: tokens received"
-                            );
-
-                            Ok(vec![TokensReceived {
-                                tx_hash,
-                                shares_minted,
-                                fees: completed.fees,
-                                received_at: Utc::now(),
-                            }])
-                        }
-                        TokenizationRequestStatus::Rejected => {
-                            warn!(
-                                target: "tokenization",
-                                %symbol,
-                                "Mint rejected by Alpaca after acceptance"
-                            );
-                            Ok(vec![MintAcceptanceFailed {
-                                reason: "Rejected by Alpaca after acceptance".to_string(),
-                                failed_at: Utc::now(),
-                            }])
-                        }
-                        TokenizationRequestStatus::Pending => {
-                            warn!(
-                                target: "tokenization",
-                                %symbol,
-                                "Unexpected pending status after polling"
-                            );
-                            Ok(vec![MintAcceptanceFailed {
-                                reason: "Unexpected Pending status after polling".to_string(),
-                                failed_at: Utc::now(),
-                            }])
-                        }
-                    }
-                }
-                Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
-                Self::TokensReceived { .. }
-                | Self::WrapSubmitted { .. }
-                | Self::TokensWrapped { .. }
-                | Self::VaultDepositSubmitted { .. }
-                | Self::DepositedIntoRaindex { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
-                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
-            },
+            #[cfg(any(test, feature = "test-support"))]
+            TokenizedEquityMintCommand::PollAt { received_at } => {
+                self.transition_poll(services, Some(received_at)).await
+            }
 
             TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash } => match self {
                 Self::TokensReceived { .. } => Ok(vec![WrapSubmitted {
@@ -2015,46 +1972,23 @@ impl EventSourced for TokenizedEquityMint {
                 wrap_tx_hash,
                 wrapped_shares,
                 wrap_block,
-            } => match self {
-                Self::TokensReceived { .. } | Self::WrapSubmitted { .. } => {
-                    Ok(vec![TokensWrapped {
-                        wrap_tx_hash,
-                        wrapped_shares,
-                        wrapped_at: Utc::now(),
-                        wrap_block: Some(wrap_block),
-                    }])
-                }
-                Self::MintRequested { .. } | Self::MintAccepted { .. } => {
-                    Err(TokenizedEquityMintError::TokensNotReceivedForWrap)
-                }
-                Self::TokensWrapped { .. }
-                | Self::VaultDepositSubmitted { .. }
-                | Self::DepositedIntoRaindex { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
-                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
-            },
+            } => self.transition_wrap_tokens(wrap_tx_hash, wrapped_shares, wrap_block, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            TokenizedEquityMintCommand::WrapTokensAt {
+                wrap_tx_hash,
+                wrapped_shares,
+                wrap_block,
+                wrapped_at,
+            } => self.transition_wrap_tokens(wrap_tx_hash, wrapped_shares, wrap_block, wrapped_at),
 
             TokenizedEquityMintCommand::DepositToVault {
                 vault_deposit_tx_hash,
-            } => match self {
-                Self::TokensWrapped { .. } | Self::VaultDepositSubmitted { .. } => {
-                    Ok(vec![DepositedIntoRaindex {
-                        vault_deposit_tx_hash,
-                        deposited_at: Utc::now(),
-                    }])
-                }
-                Self::MintRequested { .. }
-                | Self::MintAccepted { .. }
-                | Self::TokensReceived { .. }
-                | Self::WrapSubmitted { .. } => Err(TokenizedEquityMintError::TokensNotWrapped),
-                Self::DepositedIntoRaindex { .. } => {
-                    Err(TokenizedEquityMintError::AlreadyCompleted)
-                }
-                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
-            },
+            } => self.transition_deposit_to_vault(vault_deposit_tx_hash, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            TokenizedEquityMintCommand::DepositToVaultAt {
+                vault_deposit_tx_hash,
+                deposited_at,
+            } => self.transition_deposit_to_vault(vault_deposit_tx_hash, deposited_at),
 
             TokenizedEquityMintCommand::FailAcceptance { reason } => match self {
                 // `MintRequested` is pre-acceptance: a mint stuck there (requested
@@ -2168,6 +2102,168 @@ impl EventSourced for TokenizedEquityMint {
                 Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 _ => Err(TokenizedEquityMintError::NotFailed),
             },
+        }
+    }
+}
+
+impl TokenizedEquityMint {
+    /// Shared body for `WrapTokens`/`WrapTokensAt`.
+    fn transition_wrap_tokens(
+        &self,
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        wrap_block: u64,
+        wrapped_at: DateTime<Utc>,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        use TokenizedEquityMintEvent::*;
+
+        match self {
+            Self::TokensReceived { .. } | Self::WrapSubmitted { .. } => Ok(vec![TokensWrapped {
+                wrap_tx_hash,
+                wrapped_shares,
+                wrapped_at,
+                wrap_block: Some(wrap_block),
+            }]),
+            Self::MintRequested { .. } | Self::MintAccepted { .. } => {
+                Err(TokenizedEquityMintError::TokensNotReceivedForWrap)
+            }
+            Self::TokensWrapped { .. }
+            | Self::VaultDepositSubmitted { .. }
+            | Self::DepositedIntoRaindex { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+            Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
+        }
+    }
+
+    /// Shared body for `DepositToVault`/`DepositToVaultAt`.
+    fn transition_deposit_to_vault(
+        &self,
+        vault_deposit_tx_hash: TxHash,
+        deposited_at: DateTime<Utc>,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        use TokenizedEquityMintEvent::*;
+
+        match self {
+            Self::TokensWrapped { .. } | Self::VaultDepositSubmitted { .. } => {
+                Ok(vec![DepositedIntoRaindex {
+                    vault_deposit_tx_hash,
+                    deposited_at,
+                }])
+            }
+            Self::MintRequested { .. }
+            | Self::MintAccepted { .. }
+            | Self::TokensReceived { .. }
+            | Self::WrapSubmitted { .. } => Err(TokenizedEquityMintError::TokensNotWrapped),
+            Self::DepositedIntoRaindex { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+            Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
+        }
+    }
+
+    /// Shared body for `Poll`/`PollAt`: only `received_at` (the success
+    /// path's timestamp) is parameterized -- the failure paths keep
+    /// `Utc::now()` since fixture seeding only ever drives the happy path.
+    async fn transition_poll(
+        &self,
+        services: &EquityTransferServices,
+        override_received_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        use TokenizedEquityMintEvent::*;
+
+        match self {
+            Self::MintAccepted {
+                symbol,
+                quantity,
+                tokenization_request_id,
+                ..
+            } => {
+                let completed = match services
+                    .tokenizer
+                    .poll_mint_until_complete(tokenization_request_id)
+                    .await
+                {
+                    Ok(req) => req,
+                    Err(error) => {
+                        warn!(target: "tokenization", %error, %symbol, %tokenization_request_id, "Polling failed");
+                        return Ok(vec![MintAcceptanceFailed {
+                            reason: format!("Polling failed: {error}"),
+                            failed_at: Utc::now(),
+                        }]);
+                    }
+                };
+
+                match completed.status {
+                    TokenizationRequestStatus::Completed => {
+                        let tx_hash = completed
+                            .tx_hash
+                            .ok_or(TokenizedEquityMintError::MissingTxHash)?;
+
+                        // Validate that Alpaca returned the expected
+                        // tokenized symbol (e.g. "tAAPL" for AAPL).
+                        let expected_token_symbol = format!("t{symbol}");
+                        match &completed.token_symbol {
+                            Some(actual) if *actual == expected_token_symbol => {}
+                            Some(actual) => {
+                                return Err(TokenizedEquityMintError::TokenSymbolMismatch {
+                                    expected_symbol: symbol.clone(),
+                                    actual_token_symbol: actual.clone(),
+                                });
+                            }
+                            None => {
+                                return Err(TokenizedEquityMintError::MissingTokenSymbol {
+                                    expected_symbol: symbol.clone(),
+                                });
+                            }
+                        }
+
+                        let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
+
+                        info!(
+                            target: "tokenization",
+                            %symbol,
+                            %tx_hash,
+                            "Mint polling completed: tokens received"
+                        );
+
+                        Ok(vec![TokensReceived {
+                            tx_hash,
+                            shares_minted,
+                            fees: completed.fees,
+                            received_at: override_received_at.unwrap_or_else(Utc::now),
+                        }])
+                    }
+                    TokenizationRequestStatus::Rejected => {
+                        warn!(
+                            target: "tokenization",
+                            %symbol,
+                            "Mint rejected by Alpaca after acceptance"
+                        );
+                        Ok(vec![MintAcceptanceFailed {
+                            reason: "Rejected by Alpaca after acceptance".to_string(),
+                            failed_at: Utc::now(),
+                        }])
+                    }
+                    TokenizationRequestStatus::Pending => {
+                        warn!(
+                            target: "tokenization",
+                            %symbol,
+                            "Unexpected pending status after polling"
+                        );
+                        Ok(vec![MintAcceptanceFailed {
+                            reason: "Unexpected Pending status after polling".to_string(),
+                            failed_at: Utc::now(),
+                        }])
+                    }
+                }
+            }
+            Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            Self::TokensReceived { .. }
+            | Self::WrapSubmitted { .. }
+            | Self::TokensWrapped { .. }
+            | Self::VaultDepositSubmitted { .. }
+            | Self::DepositedIntoRaindex { .. } => Err(TokenizedEquityMintError::AlreadyCompleted),
+            Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
         }
     }
 }
@@ -2847,6 +2943,122 @@ mod tests {
             matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
             "Expected DepositedIntoRaindex, got: {entity:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_at_uses_supplied_timestamp() {
+        let received_at = Utc::now() - chrono::Duration::hours(2);
+
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![mint_requested_event(), mint_accepted_event()])
+            .when(TokenizedEquityMintCommand::PollAt { received_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let TokenizedEquityMintEvent::TokensReceived {
+            received_at: event_received_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected TokensReceived, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_received_at, received_at);
+    }
+
+    #[tokio::test]
+    async fn wrap_tokens_at_uses_supplied_timestamp() {
+        let wrapped_at = Utc::now() - chrono::Duration::hours(3);
+
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+            ])
+            .when(TokenizedEquityMintCommand::WrapTokensAt {
+                wrap_tx_hash: TxHash::random(),
+                wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                wrap_block: 1,
+                wrapped_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let TokenizedEquityMintEvent::TokensWrapped {
+            wrapped_at: event_wrapped_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected TokensWrapped, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_wrapped_at, wrapped_at);
+    }
+
+    #[tokio::test]
+    async fn deposit_to_vault_at_uses_supplied_timestamp() {
+        let deposited_at = Utc::now() - chrono::Duration::hours(4);
+
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+                tokens_wrapped_event(),
+            ])
+            .when(TokenizedEquityMintCommand::DepositToVaultAt {
+                vault_deposit_tx_hash: TxHash::random(),
+                deposited_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let TokenizedEquityMintEvent::DepositedIntoRaindex {
+            deposited_at: event_deposited_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected DepositedIntoRaindex, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_deposited_at, deposited_at);
+    }
+
+    #[tokio::test]
+    async fn request_mint_at_uses_supplied_timestamp() {
+        let requested_at = Utc::now() - chrono::Duration::hours(5);
+
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(TokenizedEquityMintCommand::RequestMintAt {
+                issuer_request_id: issuer_request_id("ISS001"),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(10),
+                wallet: Address::ZERO,
+                requested_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 2);
+        let TokenizedEquityMintEvent::MintRequested {
+            requested_at: event_requested_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected MintRequested, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_requested_at, requested_at);
+
+        let TokenizedEquityMintEvent::MintAccepted {
+            accepted_at: event_accepted_at,
+            ..
+        } = &events[1]
+        else {
+            panic!("Expected MintAccepted, got: {:?}", events[1]);
+        };
+        assert_eq!(*event_accepted_at, requested_at);
     }
 
     #[tokio::test]

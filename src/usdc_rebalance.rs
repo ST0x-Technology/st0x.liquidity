@@ -273,9 +273,27 @@ pub(crate) enum UsdcRebalanceCommand {
         amount: Usdc,
         order_id: ClientOrderId,
     },
+    /// Test/fixture-only: identical to `InitiateConversion` but takes
+    /// `initiated_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    InitiateConversionAt {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: ClientOrderId,
+        initiated_at: DateTime<Utc>,
+    },
     /// Confirm successful conversion. Valid only from `Converting` state.
     /// Contains the source amount sold and the destination amount received.
     ConfirmConversion { conversion: ConversionAmounts },
+    /// Test/fixture-only: identical to `ConfirmConversion` but takes
+    /// `converted_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ConfirmConversionAt {
+        conversion: ConversionAmounts,
+        converted_at: DateTime<Utc>,
+    },
     /// Record conversion failure. Valid only from `Converting` state.
     FailConversion { reason: String },
     /// Start post-deposit conversion for BaseToAlpaca direction.
@@ -285,6 +303,15 @@ pub(crate) enum UsdcRebalanceCommand {
     InitiatePostDepositConversion {
         order_id: ClientOrderId,
         amount: Usdc,
+    },
+    /// Test/fixture-only: identical to `InitiatePostDepositConversion` but
+    /// takes `initiated_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    InitiatePostDepositConversionAt {
+        order_id: ClientOrderId,
+        amount: Usdc,
+        initiated_at: DateTime<Utc>,
     },
     /// Record the intent to withdraw from source BEFORE the on-chain call.
     /// Captures the chain head (`from_block`) so a crash mid-withdrawal can be
@@ -296,6 +323,16 @@ pub(crate) enum UsdcRebalanceCommand {
         amount: Usdc,
         from_block: u64,
     },
+    /// Test/fixture-only: identical to `BeginWithdrawal` but takes
+    /// `submitting_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    BeginWithdrawalAt {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
+    },
     /// Start a new rebalancing operation by recording the submitted withdrawal
     /// transaction. Valid only from `WithdrawalSubmitting` state.
     Initiate {
@@ -303,10 +340,28 @@ pub(crate) enum UsdcRebalanceCommand {
         amount: Usdc,
         withdrawal: TransferRef,
     },
+    /// Test/fixture-only: identical to `Initiate` but takes `initiated_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    InitiateAt {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        withdrawal: TransferRef,
+        initiated_at: DateTime<Utc>,
+    },
     /// Confirm successful withdrawal from source. Valid only from `Withdrawing` state.
     /// `withdrawal_tx` carries the on-chain tx hash when the source provides one
     /// (AlpacaToBase), so the confirmation-depth gate can re-run on apalis redrive.
     ConfirmWithdrawal { withdrawal_tx: Option<TxHash> },
+    /// Test/fixture-only: identical to `ConfirmWithdrawal` but takes
+    /// `confirmed_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ConfirmWithdrawalAt {
+        withdrawal_tx: Option<TxHash>,
+        confirmed_at: DateTime<Utc>,
+    },
     /// Record the intent to burn for CCTP bridging BEFORE the on-chain call.
     /// Captures the chain head (`from_block`) for crash recovery, mirroring
     /// [`BeginWithdrawal`]. Valid only from `WithdrawalComplete` state.
@@ -314,8 +369,25 @@ pub(crate) enum UsdcRebalanceCommand {
         from_block: u64,
         burn_amount: Option<Usdc>,
     },
+    /// Test/fixture-only: identical to `BeginBridging` but takes
+    /// `submitting_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    BeginBridgingAt {
+        from_block: u64,
+        burn_amount: Option<Usdc>,
+        submitting_at: DateTime<Utc>,
+    },
     /// Record the CCTP burn transaction. Valid only from `BridgingSubmitting` state.
     InitiateBridging { burn_tx: TxHash },
+    /// Test/fixture-only: identical to `InitiateBridging` but takes
+    /// `burned_at` explicitly instead of stamping `Utc::now()`, so fixture
+    /// seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    InitiateBridgingAt {
+        burn_tx: TxHash,
+        burned_at: DateTime<Utc>,
+    },
     /// Record the broadcast CCTP burn tx hash while still in `BridgingSubmitting`,
     /// BEFORE awaiting its receipt, so a crash/timeout redrive checks that exact
     /// tx instead of a mempool-blind log scan. Valid only from `BridgingSubmitting`.
@@ -339,6 +411,17 @@ pub(crate) enum UsdcRebalanceCommand {
         message: Vec<u8>,
         mint_scan_from_block: u64,
     },
+    /// Test/fixture-only: identical to `ReceiveAttestation` but takes
+    /// `attested_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ReceiveAttestationAt {
+        attestation: Vec<u8>,
+        cctp_nonce: B256,
+        message: Vec<u8>,
+        mint_scan_from_block: u64,
+        attested_at: DateTime<Utc>,
+    },
     /// Record that Circle attestation polling timed out while the burn remains
     /// recoverable. Valid only from `Bridging` state.
     TimeoutAttestation { retry_deadline_at: DateTime<Utc> },
@@ -351,10 +434,33 @@ pub(crate) enum UsdcRebalanceCommand {
         /// CCTP fee collected (from MintAndWithdraw event)
         fee_collected: Usdc,
     },
+    /// Test/fixture-only: identical to `ConfirmBridging` but takes
+    /// `minted_at` explicitly instead of stamping `Utc::now()`, so fixture
+    /// seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ConfirmBridgingAt {
+        mint_tx: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
+        minted_at: DateTime<Utc>,
+    },
     /// Start deposit to destination. Valid only from `Bridged` state.
     InitiateDeposit { deposit: TransferRef },
+    /// Test/fixture-only: identical to `InitiateDeposit` but takes
+    /// `deposit_initiated_at` explicitly instead of stamping `Utc::now()`,
+    /// so fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    InitiateDepositAt {
+        deposit: TransferRef,
+        deposit_initiated_at: DateTime<Utc>,
+    },
     /// Confirm successful deposit. Valid only from `DepositInitiated` state.
     ConfirmDeposit,
+    /// Test/fixture-only: identical to `ConfirmDeposit` but takes
+    /// `deposit_confirmed_at` explicitly instead of stamping `Utc::now()`,
+    /// so fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ConfirmDepositAt { deposit_confirmed_at: DateTime<Utc> },
     /// Record withdrawal failure. Valid only from `Withdrawing` state.
     FailWithdrawal { reason: String },
     /// Record bridging failure. Valid from `Bridging` or `Attested` states.
@@ -2188,32 +2294,32 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: Utc::now(),
             }]),
 
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateConversionAt {
+                direction,
+                amount,
+                order_id,
+                initiated_at,
+            } => Ok(vec![ConversionInitiated {
+                direction,
+                amount,
+                order_id,
+                initiated_at,
+            }]),
+
             BeginWithdrawal {
                 direction,
                 amount,
                 from_block,
-            } => {
-                // Fresh-start withdrawal intent is BaseToAlpaca-only. An
-                // AlpacaToBase transfer converts USD->USDC first and reaches
-                // `WithdrawalSubmitting` through the post-conversion path
-                // (`transition_begin_withdrawal` from `ConversionComplete`);
-                // recording a fresh AlpacaToBase intent here would materialize a
-                // withdrawal with no conversion history.
-                if direction != RebalanceDirection::BaseToAlpaca {
-                    return Err(UsdcRebalanceError::InvalidCommand {
-                        command: "BeginWithdrawal".to_string(),
-                        state: "Uninitialized (fresh withdrawal is BaseToAlpaca-only; \
-                                AlpacaToBase must convert before withdrawing)"
-                            .to_string(),
-                    });
-                }
-                Ok(vec![WithdrawalSubmitting {
-                    direction,
-                    amount,
-                    from_block,
-                    submitting_at: Utc::now(),
-                }])
-            }
+            } => Self::begin_withdrawal_init_events(direction, amount, from_block, Utc::now()),
+
+            #[cfg(any(test, feature = "test-support"))]
+            BeginWithdrawalAt {
+                direction,
+                amount,
+                from_block,
+                submitting_at,
+            } => Self::begin_withdrawal_init_events(direction, amount, from_block, submitting_at),
 
             Initiate {
                 direction,
@@ -2226,31 +2332,62 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: Utc::now(),
             }]),
 
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateAt {
+                direction,
+                amount,
+                withdrawal,
+                initiated_at,
+            } => Ok(vec![Initiated {
+                direction,
+                amount,
+                withdrawal_ref: withdrawal,
+                initiated_at,
+            }]),
+
             ConfirmConversion { .. } | FailConversion { .. } => {
                 Err(UsdcRebalanceError::ConversionNotInitiated)
             }
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmConversionAt { .. } => Err(UsdcRebalanceError::ConversionNotInitiated),
 
             InitiatePostDepositConversion { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiatePostDepositConversionAt { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
 
             ConfirmWithdrawal { .. } | FailWithdrawal { .. } => {
                 Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmWithdrawalAt { .. } => Err(UsdcRebalanceError::WithdrawalNotInitiated),
 
             BeginBridging { .. }
             | InitiateBridging { .. }
             | RecordPendingBurn { .. }
             | ClearPendingBurn => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            #[cfg(any(test, feature = "test-support"))]
+            BeginBridgingAt { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateBridgingAt { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
 
             ReceiveAttestation { .. }
             | TimeoutAttestation { .. }
             | FailBridging { .. }
             | RecoverBridging { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+            #[cfg(any(test, feature = "test-support"))]
+            ReceiveAttestationAt { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
 
             ConfirmBridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmBridgingAt { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
             InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
             ConfirmDeposit | FailDeposit { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmDepositAt { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
 
             ReconcileStuckRebalance { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "ReconcileStuckRebalance".to_string(),
@@ -2267,32 +2404,87 @@ impl EventSourced for UsdcRebalance {
         use UsdcRebalanceCommand::*;
         match command {
             InitiateConversion { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
-            ConfirmConversion { conversion } => self.transition_confirm_conversion(conversion),
-            FailConversion { reason } => self.transition_fail_conversion(reason),
-            InitiatePostDepositConversion { order_id, amount } => {
-                self.transition_post_deposit_conversion(order_id, amount)
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateConversionAt { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
+
+            ConfirmConversion { conversion } => {
+                self.transition_confirm_conversion(conversion, Utc::now())
             }
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmConversionAt {
+                conversion,
+                converted_at,
+            } => self.transition_confirm_conversion(conversion, converted_at),
+
+            FailConversion { reason } => self.transition_fail_conversion(reason),
+
+            InitiatePostDepositConversion { order_id, amount } => {
+                self.transition_post_deposit_conversion(order_id, amount, Utc::now())
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            InitiatePostDepositConversionAt {
+                order_id,
+                amount,
+                initiated_at,
+            } => self.transition_post_deposit_conversion(order_id, amount, initiated_at),
+
             BeginWithdrawal {
                 direction,
                 amount,
                 from_block,
-            } => self.transition_begin_withdrawal(direction, amount, from_block),
+            } => self.transition_begin_withdrawal(direction, amount, from_block, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            BeginWithdrawalAt {
+                direction,
+                amount,
+                from_block,
+                submitting_at,
+            } => self.transition_begin_withdrawal(direction, amount, from_block, submitting_at),
+
             Initiate {
                 direction,
                 amount,
                 withdrawal,
-            } => self.transition_initiate_withdrawal(direction, amount, withdrawal),
+            } => self.transition_initiate_withdrawal(direction, amount, withdrawal, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateAt {
+                direction,
+                amount,
+                withdrawal,
+                initiated_at,
+            } => self.transition_initiate_withdrawal(direction, amount, withdrawal, initiated_at),
+
             ConfirmWithdrawal { withdrawal_tx } => {
-                self.transition_confirm_withdrawal(withdrawal_tx)
+                self.transition_confirm_withdrawal(withdrawal_tx, Utc::now())
             }
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmWithdrawalAt {
+                withdrawal_tx,
+                confirmed_at,
+            } => self.transition_confirm_withdrawal(withdrawal_tx, confirmed_at),
+
             FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
+
             BeginBridging {
                 from_block,
                 burn_amount,
-            } => self.transition_begin_bridging(from_block, burn_amount),
-            InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
+            } => self.transition_begin_bridging(from_block, burn_amount, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            BeginBridgingAt {
+                from_block,
+                burn_amount,
+                submitting_at,
+            } => self.transition_begin_bridging(from_block, burn_amount, submitting_at),
+
+            InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateBridgingAt { burn_tx, burned_at } => {
+                self.transition_initiate_bridging(burn_tx, burned_at)
+            }
+
             RecordPendingBurn { burn_tx } => self.transition_record_pending_burn(burn_tx),
             ClearPendingBurn => self.transition_clear_pending_burn(),
+
             ReceiveAttestation {
                 attestation,
                 cctp_nonce,
@@ -2303,23 +2495,67 @@ impl EventSourced for UsdcRebalance {
                 cctp_nonce,
                 message,
                 mint_scan_from_block,
+                Utc::now(),
             ),
+            #[cfg(any(test, feature = "test-support"))]
+            ReceiveAttestationAt {
+                attestation,
+                cctp_nonce,
+                message,
+                mint_scan_from_block,
+                attested_at,
+            } => self.transition_receive_attestation(
+                attestation,
+                cctp_nonce,
+                message,
+                mint_scan_from_block,
+                attested_at,
+            ),
+
             TimeoutAttestation { retry_deadline_at } => {
                 self.transition_timeout_attestation(retry_deadline_at)
             }
+
             ConfirmBridging {
                 mint_tx,
                 amount_received,
                 fee_collected,
-            } => self.transition_confirm_bridging(mint_tx, amount_received, fee_collected),
+            } => self.transition_confirm_bridging(
+                mint_tx,
+                amount_received,
+                fee_collected,
+                Utc::now(),
+            ),
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmBridgingAt {
+                mint_tx,
+                amount_received,
+                fee_collected,
+                minted_at,
+            } => {
+                self.transition_confirm_bridging(mint_tx, amount_received, fee_collected, minted_at)
+            }
+
             FailBridging { reason } => self.transition_fail_bridging(reason),
             RecoverBridging {
                 mint_tx,
                 amount_received,
                 fee_collected,
             } => self.transition_recover_bridging(mint_tx, amount_received, fee_collected),
-            InitiateDeposit { deposit } => self.transition_initiate_deposit(deposit),
-            ConfirmDeposit => self.transition_confirm_deposit(),
+
+            InitiateDeposit { deposit } => self.transition_initiate_deposit(deposit, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateDepositAt {
+                deposit,
+                deposit_initiated_at,
+            } => self.transition_initiate_deposit(deposit, deposit_initiated_at),
+
+            ConfirmDeposit => self.transition_confirm_deposit(Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmDepositAt {
+                deposit_confirmed_at,
+            } => self.transition_confirm_deposit(deposit_confirmed_at),
+
             FailDeposit { reason } => self.transition_fail_deposit(reason),
             ReconcileStuckRebalance { reason } => self.transition_reconcile_stuck_rebalance(reason),
         }
@@ -2334,13 +2570,14 @@ impl UsdcRebalance {
     fn transition_confirm_conversion(
         &self,
         conversion: ConversionAmounts,
+        converted_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
             Self::Converting { direction, .. } => Ok(vec![ConversionConfirmed {
                 direction: *direction,
                 conversion,
-                converted_at: Utc::now(),
+                converted_at,
             }]),
             Self::ConversionComplete { .. } | Self::ConversionFailed { .. } => {
                 Err(UsdcRebalanceError::ConversionAlreadyCompleted)
@@ -2370,6 +2607,7 @@ impl UsdcRebalance {
         &self,
         order_id: ClientOrderId,
         command_amount: Usdc,
+        initiated_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         let Self::DepositConfirmed {
@@ -2391,7 +2629,39 @@ impl UsdcRebalance {
             direction: *direction,
             amount: *amount,
             order_id,
-            initiated_at: Utc::now(),
+            initiated_at,
+        }])
+    }
+
+    /// Records the BaseToAlpaca fresh-start withdrawal intent (the chain
+    /// head) before the on-chain withdraw. Shared by `initialize()`'s real
+    /// `BeginWithdrawal` command and its fixture-only `BeginWithdrawalAt`
+    /// sibling, which differ only in the timestamp source.
+    fn begin_withdrawal_init_events(
+        direction: RebalanceDirection,
+        amount: Usdc,
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        // Fresh-start withdrawal intent is BaseToAlpaca-only. An
+        // AlpacaToBase transfer converts USD->USDC first and reaches
+        // `WithdrawalSubmitting` through the post-conversion path
+        // (`transition_begin_withdrawal` from `ConversionComplete`);
+        // recording a fresh AlpacaToBase intent here would materialize a
+        // withdrawal with no conversion history.
+        if direction != RebalanceDirection::BaseToAlpaca {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "BeginWithdrawal".to_string(),
+                state: "Uninitialized (fresh withdrawal is BaseToAlpaca-only; \
+                        AlpacaToBase must convert before withdrawing)"
+                    .to_string(),
+            });
+        }
+        Ok(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+            direction,
+            amount,
+            from_block,
+            submitting_at,
         }])
     }
 
@@ -2403,6 +2673,7 @@ impl UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         from_block: u64,
+        submitting_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         let Self::ConversionComplete {
@@ -2436,7 +2707,7 @@ impl UsdcRebalance {
             direction,
             amount: conversion.received_amount,
             from_block,
-            submitting_at: Utc::now(),
+            submitting_at,
         }])
     }
 
@@ -2448,6 +2719,7 @@ impl UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal: TransferRef,
+        initiated_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         let (expected_direction, expected_amount) = match self {
@@ -2484,18 +2756,19 @@ impl UsdcRebalance {
             direction,
             amount: *expected_amount,
             withdrawal_ref: withdrawal,
-            initiated_at: Utc::now(),
+            initiated_at,
         }])
     }
 
     fn transition_confirm_withdrawal(
         &self,
         withdrawal_tx: Option<TxHash>,
+        confirmed_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
             Self::Withdrawing { .. } => Ok(vec![WithdrawalConfirmed {
-                confirmed_at: Utc::now(),
+                confirmed_at,
                 withdrawal_tx,
             }]),
             Self::WithdrawalComplete { .. }
@@ -2544,6 +2817,7 @@ impl UsdcRebalance {
         &self,
         from_block: u64,
         burn_amount: Option<Usdc>,
+        submitting_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -2591,7 +2865,7 @@ impl UsdcRebalance {
 
                 Ok(vec![BridgingSubmitting {
                     from_block,
-                    submitting_at: Utc::now(),
+                    submitting_at,
                     burn_amount,
                 }])
             }
@@ -2616,6 +2890,7 @@ impl UsdcRebalance {
     fn transition_initiate_bridging(
         &self,
         burn_tx: TxHash,
+        burned_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -2630,7 +2905,7 @@ impl UsdcRebalance {
             Self::WithdrawalComplete { .. } | Self::BridgingSubmitting { .. } => {
                 Ok(vec![BridgingInitiated {
                     burn_tx_hash: burn_tx,
-                    burned_at: Utc::now(),
+                    burned_at,
                 }])
             }
             Self::Bridging { .. }
@@ -2723,6 +2998,7 @@ impl UsdcRebalance {
         cctp_nonce: B256,
         message: Vec<u8>,
         mint_scan_from_block: u64,
+        attested_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -2740,7 +3016,7 @@ impl UsdcRebalance {
                     cctp_nonce,
                     message: Some(message),
                     mint_scan_from_block: Some(mint_scan_from_block),
-                    attested_at: Utc::now(),
+                    attested_at,
                 }])
             }
             Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
@@ -2797,6 +3073,7 @@ impl UsdcRebalance {
         mint_tx: TxHash,
         amount_received: Usdc,
         fee_collected: Usdc,
+        minted_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -2814,7 +3091,7 @@ impl UsdcRebalance {
                 mint_tx_hash: mint_tx,
                 amount_received,
                 fee_collected,
-                minted_at: Utc::now(),
+                minted_at,
             }]),
             Self::Bridged { .. }
             | Self::BridgingFailed { .. }
@@ -2927,6 +3204,7 @@ impl UsdcRebalance {
     fn transition_initiate_deposit(
         &self,
         deposit: TransferRef,
+        deposit_initiated_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -2944,7 +3222,7 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
             Self::Bridged { .. } => Ok(vec![DepositInitiated {
                 deposit_ref: deposit,
-                deposit_initiated_at: Utc::now(),
+                deposit_initiated_at,
             }]),
             Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
@@ -2956,7 +3234,10 @@ impl UsdcRebalance {
         }
     }
 
-    fn transition_confirm_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+    fn transition_confirm_deposit(
+        &self,
+        deposit_confirmed_at: DateTime<Utc>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
             Self::Converting { .. }
@@ -2974,7 +3255,7 @@ impl UsdcRebalance {
             | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
             Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
                 direction: *direction,
-                deposit_confirmed_at: Utc::now(),
+                deposit_confirmed_at,
             }]),
             Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
@@ -7760,6 +8041,508 @@ mod tests {
             ),
             "Expected ConversionAmountMismatch with expected=99.99 and provided=500, got: {error:?}"
         );
+    }
+
+    /// Covers the fixture-only `*At` siblings of the async transitions that
+    /// take an explicit timestamp instead of `Utc::now()`: each must thread
+    /// the caller-supplied timestamp through to the emitted event's field
+    /// rather than silently falling back to the current time.
+    #[tokio::test]
+    async fn initiate_conversion_at_uses_supplied_timestamp() {
+        let initiated_at = Utc::now() - chrono::Duration::hours(3);
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::InitiateConversionAt {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(1000.00)),
+                order_id,
+                initiated_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::ConversionInitiated {
+            initiated_at: event_initiated_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected ConversionInitiated event");
+        };
+        assert_eq!(*event_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn confirm_conversion_at_uses_supplied_timestamp() {
+        let converted_at = Utc::now() - chrono::Duration::hours(2);
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let conversion = par_conversion(Usdc::new(float!(998)));
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(1000.00)),
+                order_id,
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ConfirmConversionAt {
+                conversion,
+                converted_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::ConversionConfirmed {
+            converted_at: event_converted_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected ConversionConfirmed event");
+        };
+        assert_eq!(*event_converted_at, converted_at);
+    }
+
+    #[tokio::test]
+    async fn initiate_post_deposit_conversion_at_uses_supplied_timestamp() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let initiated_at = Utc::now() - chrono::Duration::hours(1);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(1000.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
+                    mint_scan_from_block: Some(100),
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc::new(float!(99.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    deposit_initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    deposit_confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversionAt {
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                amount: Usdc::new(float!(99.99)),
+                initiated_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::ConversionInitiated {
+            initiated_at: event_initiated_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected ConversionInitiated event");
+        };
+        assert_eq!(*event_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn begin_withdrawal_at_uses_supplied_timestamp() {
+        let submitting_at = Utc::now() - chrono::Duration::hours(4);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::BeginWithdrawalAt {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                from_block: 42,
+                submitting_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::WithdrawalSubmitting {
+            submitting_at: event_submitting_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected WithdrawalSubmitting event");
+        };
+        assert_eq!(*event_submitting_at, submitting_at);
+    }
+
+    #[tokio::test]
+    async fn initiate_at_uses_supplied_timestamp() {
+        let initiated_at = Utc::now() - chrono::Duration::hours(5);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                from_block: 42,
+                submitting_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::InitiateAt {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+                initiated_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::Initiated {
+            initiated_at: event_initiated_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected Initiated event");
+        };
+        assert_eq!(*event_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn confirm_withdrawal_at_uses_supplied_timestamp() {
+        let confirmed_at = Utc::now() - chrono::Duration::hours(6);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ConfirmWithdrawalAt {
+                withdrawal_tx: None,
+                confirmed_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: event_confirmed_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected WithdrawalConfirmed event");
+        };
+        assert_eq!(*event_confirmed_at, confirmed_at);
+    }
+
+    #[tokio::test]
+    async fn begin_bridging_at_uses_supplied_timestamp() {
+        let submitting_at = Utc::now() - chrono::Duration::hours(7);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::BeginBridgingAt {
+                from_block: 100,
+                burn_amount: None,
+                submitting_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingSubmitting {
+            submitting_at: event_submitting_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingSubmitting event");
+        };
+        assert_eq!(*event_submitting_at, submitting_at);
+    }
+
+    #[tokio::test]
+    async fn initiate_bridging_at_uses_supplied_timestamp() {
+        let burned_at = Utc::now() - chrono::Duration::hours(8);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridgingAt { burn_tx, burned_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingInitiated {
+            burned_at: event_burned_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingInitiated event");
+        };
+        assert_eq!(*event_burned_at, burned_at);
+    }
+
+    #[tokio::test]
+    async fn receive_attestation_at_uses_supplied_timestamp() {
+        let attested_at = Utc::now() - chrono::Duration::hours(9);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReceiveAttestationAt {
+                attestation: vec![0x01],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![0xDE, 0xAD],
+                mint_scan_from_block: 100,
+                attested_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgeAttestationReceived {
+            attested_at: event_attested_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgeAttestationReceived event");
+        };
+        assert_eq!(*event_attested_at, attested_at);
+    }
+
+    #[tokio::test]
+    async fn confirm_bridging_at_uses_supplied_timestamp() {
+        let minted_at = Utc::now() - chrono::Duration::hours(10);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
+                    mint_scan_from_block: Some(100),
+                    attested_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmBridgingAt {
+                mint_tx,
+                amount_received: Usdc::new(float!(499.50)),
+                fee_collected: Usdc::new(float!(0.50)),
+                minted_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::Bridged {
+            minted_at: event_minted_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected Bridged event");
+        };
+        assert_eq!(*event_minted_at, minted_at);
+    }
+
+    #[tokio::test]
+    async fn initiate_deposit_at_uses_supplied_timestamp() {
+        let deposit_initiated_at = Utc::now() - chrono::Duration::hours(11);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
+                    mint_scan_from_block: Some(100),
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc::new(float!(499.50)),
+                    fee_collected: Usdc::new(float!(0.50)),
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateDepositAt {
+                deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                deposit_initiated_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::DepositInitiated {
+            deposit_initiated_at: event_deposit_initiated_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected DepositInitiated event");
+        };
+        assert_eq!(*event_deposit_initiated_at, deposit_initiated_at);
+    }
+
+    #[tokio::test]
+    async fn confirm_deposit_at_uses_supplied_timestamp() {
+        let deposit_confirmed_at = Utc::now() - chrono::Duration::hours(12);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
+                    mint_scan_from_block: Some(100),
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc::new(float!(499.50)),
+                    fee_collected: Usdc::new(float!(0.50)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ConfirmDepositAt {
+                deposit_confirmed_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::DepositConfirmed {
+            deposit_confirmed_at: event_deposit_confirmed_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected DepositConfirmed event");
+        };
+        assert_eq!(*event_deposit_confirmed_at, deposit_confirmed_at);
     }
 
     #[tokio::test]

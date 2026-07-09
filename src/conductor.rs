@@ -80,6 +80,7 @@ use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
 use crate::performance::HedgeLatencyProjection;
+use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::{Position, PositionCommand, PositionError, PositionEvent, TradeId};
@@ -1405,20 +1406,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
         let rebalance_timing = Arc::new(RebalanceTimingProjection::new(deps.pool.clone()));
+        let equity_timing = Arc::new(EquityTimingProjection::new(deps.pool.clone()));
         let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(deps.pool.clone()));
-        // Catch the rebalance stage-timing read model up to the event log before
-        // the reactor goes live, so a restart replays whatever the forward-only
-        // live path missed in the previous run. Reads only the un-folded tail
-        // past each operation's checkpoint, so this does not re-fold history.
-        let rebalance_timing_replayed = rebalance_timing.catch_up().await?;
-        info!(target: "rebalance", replayed = rebalance_timing_replayed,
-            "Rebalance stage-timing read model caught up to the event log at startup");
+        catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
 
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
             broadcaster,
             hedge_latency,
             rebalance_timing,
+            equity_timing,
             lifecycle_failure,
         );
 
@@ -1584,6 +1581,26 @@ async fn catch_up_lifecycle_failures(pool: &SqlitePool) -> anyhow::Result<()> {
         replayed,
         "Lifecycle-failure read model caught up to the event log at startup"
     );
+
+    Ok(())
+}
+
+/// Catches the USDC rebalance and equity mint/redemption stage-timing read
+/// models up to the event log before their reactors go live, so a restart
+/// replays whatever the forward-only live path missed in the previous run.
+/// Each reads only its un-folded tail past its own operations' checkpoints,
+/// so this does not re-fold history.
+async fn catch_up_stage_timing_projections(
+    rebalance_timing: &RebalanceTimingProjection,
+    equity_timing: &EquityTimingProjection,
+) -> anyhow::Result<()> {
+    let rebalance_timing_replayed = rebalance_timing.catch_up().await?;
+    info!(target: "rebalance", replayed = rebalance_timing_replayed,
+        "Rebalance stage-timing read model caught up to the event log at startup");
+
+    let equity_timing_replayed = equity_timing.catch_up().await?;
+    info!(target: "equity", replayed = equity_timing_replayed,
+        "Equity stage-timing read model caught up to the event log at startup");
 
     Ok(())
 }

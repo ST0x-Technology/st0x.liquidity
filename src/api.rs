@@ -16,13 +16,16 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_dto::{HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue};
+use st0x_dto::{
+    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
+};
 use st0x_execution::FractionalShares;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
 use crate::performance::reliability::{
@@ -1517,17 +1520,26 @@ struct PerformanceRangeQuery {
     to: Option<DateTime<Utc>>,
 }
 
+/// Widest span accepted by `/performance/*` range queries. Generous for any
+/// real dashboard preset (the widest, "ALL", spans a bit over a year today)
+/// while rejecting a pathological `from`/`to` that would otherwise make
+/// `hedge_latency_report`'s dense bucket generation iterate unboundedly.
+const MAX_PERFORMANCE_RANGE_DAYS: i64 = 3650;
+
+fn parse_report_range(query: &PerformanceRangeQuery) -> Result<ReportRange, StatusCode> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
+    if from >= to || to - from > chrono::Duration::days(MAX_PERFORMANCE_RANGE_DAYS) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(ReportRange { from, to })
+}
+
 async fn performance_latencies(
     State(state): State<AppState>,
     Query(query): Query<PerformanceRangeQuery>,
 ) -> Result<Json<HedgeLatencies>, StatusCode> {
-    let to = query.to.unwrap_or_else(Utc::now);
-    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
-    if from >= to {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let report_range = ReportRange { from, to };
+    let report_range = parse_report_range(&query)?;
     let performances = load_hedge_performance(&state.pool, &report_range)
         .await
         .inspect_err(|error| error!(%error, "Failed to load hedge performance"))
@@ -1540,15 +1552,25 @@ async fn performance_rebalances(
     State(state): State<AppState>,
     Query(query): Query<PerformanceRangeQuery>,
 ) -> Result<Json<RebalanceTimings>, StatusCode> {
-    let to = query.to.unwrap_or_else(Utc::now);
-    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
-    if from >= to {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let range = parse_report_range(&query)?;
 
-    let timings = load_rebalance_timings(&state.pool, &ReportRange { from, to })
+    let timings = load_rebalance_timings(&state.pool, &range)
         .await
         .inspect_err(|error| error!(%error, "Failed to load rebalance timings"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(timings))
+}
+
+async fn performance_equity_rebalances(
+    State(state): State<AppState>,
+    Query(query): Query<PerformanceRangeQuery>,
+) -> Result<Json<EquityTimings>, StatusCode> {
+    let range = parse_report_range(&query)?;
+
+    let timings = load_equity_timings(&state.pool, &range)
+        .await
+        .inspect_err(|error| error!(%error, "Failed to load equity timings"))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(timings))
@@ -1558,12 +1580,7 @@ async fn performance_reliability(
     State(state): State<AppState>,
     Query(query): Query<PerformanceRangeQuery>,
 ) -> Result<Json<ReliabilityReport>, StatusCode> {
-    let to = query.to.unwrap_or_else(Utc::now);
-    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
-    if from >= to {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let range = ReportRange { from, to };
+    let range = parse_report_range(&query)?;
 
     let (entries, log_entries_truncated) = if let Some(log_dir) = state.ctx.log_dir.as_deref() {
         let log_dir = log_dir.to_owned();
@@ -1571,8 +1588,8 @@ async fn performance_reliability(
             search_lower: None,
             levels: Some(vec!["ERROR".to_string(), "WARN".to_string()]),
             targets: None,
-            since: Some(from),
-            until: Some(to),
+            since: Some(range.from),
+            until: Some(range.to),
         };
         // Log scanning is synchronous file I/O; keep it off the async
         // workers. The cap bounds memory during error storms, slightly
@@ -1620,13 +1637,7 @@ async fn performance_infra(
     State(state): State<AppState>,
     Query(query): Query<PerformanceRangeQuery>,
 ) -> Result<Json<InfraReport>, StatusCode> {
-    let to = query.to.unwrap_or_else(Utc::now);
-    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
-    if from >= to {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let range = ReportRange { from, to };
+    let range = parse_report_range(&query)?;
     // The two loaders hit independent tables, so run them concurrently rather
     // than paying both round-trips in series.
     let (monitor, dependencies) = tokio::try_join!(
@@ -1655,6 +1666,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
         .route("/performance/rebalances", get(performance_rebalances))
+        .route(
+            "/performance/equity-rebalances",
+            get(performance_equity_rebalances),
+        )
         .route("/performance/reliability", get(performance_reliability))
         .route("/performance/infra", get(performance_infra))
         .route("/logs", get(logs))
@@ -1684,6 +1699,7 @@ mod tests {
 
     use st0x_config::{Ctx, RestApiCtx, create_test_ctx_with_order_owner};
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_float_macro::float;
     use st0x_tokenization::{
         MintVerificationError, TokenizerError, issuer_request_id, tokenization_request_id,
     };
@@ -1692,7 +1708,9 @@ mod tests {
     use crate::dashboard;
     use crate::inventory::{self, BroadcastingInventory};
     use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
+    use crate::performance::equity_timing::EquityTimingProjection;
     use crate::performance::reliability::LifecycleFailureProjection;
+    use crate::tokenized_equity_mint::TokenizedEquityMint;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -2675,6 +2693,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A pathological span (e.g. `to` far in the future) must be rejected
+    /// rather than accepted and handed to `hedge_latency_report`, whose
+    /// dense bucket generation would otherwise iterate once per bucket
+    /// across the entire span.
+    #[tokio::test]
+    async fn performance_latencies_rejects_range_wider_than_max_span() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/latencies\
+                         ?from=2000-01-01T00:00:00Z&to=9000-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// Seeds a fill with a non-zero detection latency (seen_at > block_timestamp)
     /// and verifies the value survives reactor write -> SQL load -> report assembly
     /// -> JSON serialization, ending up in `summary.stages.detection.p50Ms`.
@@ -2818,6 +2861,98 @@ mod tests {
         assert_eq!(
             report["operations"][0]["direction"],
             serde_json::json!("base_to_alpaca")
+        );
+    }
+
+    #[tokio::test]
+    async fn performance_equity_rebalances_returns_empty_report_on_fresh_database() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/equity-rebalances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["totalOperations"], serde_json::json!(0));
+        assert_eq!(report["skippedOperations"], serde_json::json!(0));
+        assert_eq!(report["operations"], serde_json::json!([]));
+        assert_eq!(report["stageSummary"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn performance_equity_rebalances_rejects_inverted_range() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/equity-rebalances\
+                         ?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_equity_rebalances_reports_seeded_operations() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        // Drive the real reactor (not a hand-crafted JSON blob) so this test
+        // stays at the public API surface, mirroring
+        // `performance_rebalances_reports_seeded_operations` above. One
+        // `MintRequested` event leaves an open, in-progress mint operation.
+        let harness = ReactorHarness::new(EquityTimingProjection::new(state.pool.clone()));
+        let operation_id = issuer_request_id("equity-rebalances-seed");
+        harness
+            .receive::<TokenizedEquityMint>(
+                operation_id,
+                TokenizedEquityMintEvent::MintRequested {
+                    symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
+                    quantity: float!(5),
+                    wallet: Address::repeat_byte(0x11),
+                    requested_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/equity-rebalances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["totalOperations"], serde_json::json!(1));
+        assert_eq!(report["operations"][0]["kind"], serde_json::json!("mint"));
+        assert_eq!(
+            report["operations"][0]["status"],
+            serde_json::json!("in_progress")
         );
     }
 

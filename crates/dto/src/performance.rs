@@ -8,7 +8,7 @@ use thiserror::Error;
 use ts_rs::TS;
 use uuid::Uuid;
 
-use st0x_finance::{Symbol, Usdc};
+use st0x_finance::{FractionalShares, Symbol, Usdc};
 
 use crate::UsdcBridgeDirection;
 
@@ -227,6 +227,110 @@ pub enum RebalanceStageName {
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceStageStats {
     pub stage: RebalanceStageName,
+    pub stats: LatencyStats,
+}
+
+/// Response of `GET /performance/equity-rebalances`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EquityTimings {
+    /// Most recent operations (stage breakdown rows), newest first.
+    pub operations: Vec<EquityOperationTiming>,
+    /// Total operations in range before the `operations` cap was applied.
+    #[ts(type = "number")]
+    pub total_operations: usize,
+    /// Operations dropped because their stored timing JSON failed to
+    /// deserialize. They are excluded from every field above; this count
+    /// surfaces the gap so a malformed read-model row is not silently invisible.
+    #[ts(type = "number")]
+    pub skipped_operations: u32,
+    /// Percentiles per stage across all operations in range.
+    ///
+    /// SPARSE: a stage with no completed (`Succeeded`) samples in range is
+    /// omitted entirely rather than emitted with an empty/zero entry. Consumers
+    /// must look stages up by name and tolerate absence, not index positionally.
+    pub stage_summary: Vec<EquityStageStats>,
+}
+
+/// Whether an equity rebalance operation is minting tokenized equity from
+/// real shares or redeeming tokenized equity back to real shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum EquityOperationKind {
+    Mint,
+    Redeem,
+}
+
+/// One equity mint or redemption operation's per-stage timing breakdown.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EquityOperationTiming {
+    #[ts(type = "string")]
+    pub operation_id: Uuid,
+    pub kind: EquityOperationKind,
+    /// `null` only when the read model first observed the operation
+    /// mid-stream (its genesis event, which alone carries the symbol, was
+    /// never seen) -- mirrors `RebalanceOperationTiming::direction`'s
+    /// optionality for the same reason.
+    #[ts(type = "string | null")]
+    pub symbol: Option<Symbol>,
+    #[ts(type = "string | null")]
+    pub quantity: Option<FractionalShares>,
+    /// Genuine operation start (the first observed event). `null` when the
+    /// read model first observed the operation mid-stream (e.g. after a
+    /// deploy), in which case its start time is unknown and `total_ms` is
+    /// unmeasured.
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub status: RebalanceTimingStatus,
+    pub stages: Vec<EquityStageTiming>,
+    /// Genuine start to terminal success, when both endpoints are known.
+    /// `null` when the operation is unfinished, or when `started_at` is
+    /// unknown (mid-stream first observation), or when completion was an
+    /// out-of-band `OperatorReconciled` (whose manual-response window must
+    /// not pollute round-trip latency metrics).
+    #[ts(type = "number | null")]
+    pub total_ms: Option<i64>,
+}
+
+/// Timing of one stage within an equity mint or redemption operation.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EquityStageTiming {
+    pub stage: EquityStageName,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+    pub outcome: StageOutcome,
+}
+
+/// Stages of the equity mint and redemption pipelines, in flow order.
+///
+/// Prefixed by operation kind (`Mint`/`Redemption`) since, unlike USDC's
+/// stages (shared meaning across both bridge directions), mint and
+/// redemption stages are semantically distinct pipelines combined into one
+/// chart -- the prefix keeps the legend unambiguous about which row kind a
+/// stage applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum EquityStageName {
+    MintAcceptance,
+    MintReceipt,
+    MintWrap,
+    MintDeposit,
+    RedemptionWithdraw,
+    RedemptionUnwrap,
+    RedemptionSend,
+    RedemptionDetection,
+    RedemptionCompletion,
+}
+
+/// Percentiles for one equity stage.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EquityStageStats {
+    pub stage: EquityStageName,
     pub stats: LatencyStats,
 }
 

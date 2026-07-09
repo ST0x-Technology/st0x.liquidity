@@ -29,6 +29,7 @@ use st0x_finance::Usdc;
 use st0x_registry::SymbolCache;
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
+use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::Position;
@@ -117,6 +118,10 @@ pub enum AggregateView {
     /// Rebalance stage-timing read model (rebalance_stage_timing). Replays every
     /// `UsdcRebalance` event stream through the reactor fold. Supports `--all` only.
     RebalanceTiming,
+    /// Equity mint/redemption stage-timing read model (equity_stage_timing).
+    /// Replays every `TokenizedEquityMint`/`EquityRedemption` event stream
+    /// through the reactor fold. Supports `--all` only.
+    EquityTiming,
     /// Lifecycle-failure read model (lifecycle_failure_event). Replays every
     /// failure across all four subscribed streams through the reactor fold.
     /// Supports `--all` only.
@@ -1675,6 +1680,25 @@ async fn rebuild_view<W: Write>(
                 "Rebuilt rebalance stage-timing read model ({replayed} events replayed)"
             )?;
         }
+        AggregateView::EquityTiming => {
+            if id.is_some() {
+                anyhow::bail!(
+                    "equity-timing rebuild replays the whole read model; pass --all, not --id"
+                );
+            }
+
+            if !all {
+                anyhow::bail!("equity-timing rebuild replays the whole read model; pass --all");
+            }
+
+            let replayed = EquityTimingProjection::new(pool.clone())
+                .rebuild_all()
+                .await?;
+            writeln!(
+                stdout,
+                "Rebuilt equity stage-timing read model ({replayed} events replayed)"
+            )?;
+        }
         AggregateView::LifecycleFailure => {
             if id.is_some() {
                 anyhow::bail!(
@@ -1846,10 +1870,19 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
     use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_event_sorcery::StoreBuilder;
+    use st0x_float_macro::float;
+    use st0x_tokenization::IssuerRequestId;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::offchain::order::OffchainOrderEvent;
+    use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::{positive_shares, setup_test_db};
+    use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
+    use crate::vault_lookup::MockVaultLookup;
 
     fn create_test_ctx() -> Ctx {
         Ctx {
@@ -2576,6 +2609,111 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "rebalance-timing rebuild replays the whole read model; pass --all, not --id"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_equity_timing_requires_all() {
+        let pool = setup_test_db().await;
+        let mut stdout_buffer = Vec::new();
+
+        let error = rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::EquityTiming,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "equity-timing rebuild replays the whole read model; pass --all"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_equity_timing_rejects_id() {
+        let pool = setup_test_db().await;
+        let mut stdout_buffer = Vec::new();
+
+        let error = rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::EquityTiming,
+            Some("some-id".to_string()),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "equity-timing rebuild replays the whole read model; pass --all, not --id"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_equity_timing_rebuilds_from_event_log() {
+        let pool = setup_test_db().await;
+        let operation_id = Uuid::new_v4();
+
+        // Seed a real TokenizedEquityMint event stream by sending the
+        // fixture-only `RequestMintAt` command through the aggregate's own
+        // store -- never a raw `events` INSERT -- so the replay path folds
+        // the exact event shapes/sequence the live system would produce.
+        // The default `MockTokenizer` accepts the request, so this emits
+        // both `MintRequested` and `MintAccepted`.
+        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(EquityTransferServices {
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(MockVaultLookup::new()),
+                tokenizer: Arc::new(MockTokenizer::new()),
+                wrapper: Arc::new(MockWrapper::new()),
+            })
+            .await
+            .unwrap();
+        store
+            .send(
+                &IssuerRequestId(operation_id),
+                TokenizedEquityMintCommand::RequestMintAt {
+                    issuer_request_id: IssuerRequestId(operation_id),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(5),
+                    wallet: Address::repeat_byte(0x11),
+                    requested_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout_buffer = Vec::new();
+        rebuild_view(
+            &mut stdout_buffer,
+            &pool,
+            AggregateView::EquityTiming,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("Rebuilt equity stage-timing read model (2 events replayed)"),
+            "unexpected output: {output}"
+        );
+
+        let timing_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM equity_stage_timing WHERE operation_id = ?")
+                .bind(operation_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            timing_rows, 1,
+            "the rebuild folded the seeded mint events into a single operation row"
         );
     }
 

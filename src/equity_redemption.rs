@@ -259,24 +259,70 @@ pub(crate) enum EquityRedemptionCommand {
         token: Address,
         amount: U256,
     },
+    /// Test/fixture-only: identical to `Redeem` but takes `pending_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    RedeemAt {
+        symbol: Symbol,
+        quantity: Float,
+        token: Address,
+        amount: U256,
+        pending_at: DateTime<Utc>,
+    },
     /// Waits for a previously submitted withdrawal to confirm.
     /// Emits WithdrawnFromRaindex.
     ConfirmWithdraw,
+    /// Test/fixture-only: identical to `ConfirmWithdraw` but takes
+    /// `withdrawn_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ConfirmWithdrawAt { withdrawn_at: DateTime<Utc> },
     /// Submits ERC-4626 unwrap tx and emits UnwrapSubmitted.
     UnwrapTokens,
+    /// Test/fixture-only: identical to `UnwrapTokens` but takes `pending_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    UnwrapTokensAt { pending_at: DateTime<Utc> },
     /// Waits for a previously submitted unwrap to confirm.
     /// Emits TokensUnwrapped.
     ConfirmUnwrap,
+    /// Test/fixture-only: identical to `ConfirmUnwrap` but takes
+    /// `unwrapped_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    ConfirmUnwrapAt { unwrapped_at: DateTime<Utc> },
     /// Send unwrapped tokens to Alpaca's redemption wallet.
     SendTokens,
+    /// Test/fixture-only: identical to `SendTokens` but takes `sent_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history. Only the success (`TokensSent`) path
+    /// honours the timestamp; the failure (`TransferFailed`) path keeps
+    /// `Utc::now()` since the fixture never drives it.
+    #[cfg(any(test, feature = "test-support"))]
+    SendTokensAt { sent_at: DateTime<Utc> },
     /// Alpaca detected the token transfer.
     Detect {
         tokenization_request_id: TokenizationRequestId,
+    },
+    /// Test/fixture-only: identical to `Detect` but takes `detected_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    DetectAt {
+        tokenization_request_id: TokenizationRequestId,
+        detected_at: DateTime<Utc>,
     },
     /// Detection polling failed or timed out.
     FailDetection { failure: DetectionFailure },
     /// Redemption completed successfully.
     Complete,
+    /// Test/fixture-only: identical to `Complete` but takes `completed_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    CompleteAt { completed_at: DateTime<Utc> },
     /// Alpaca rejected the redemption.
     RejectRedemption { reason: String },
     /// Recover provider completion after the aggregate had failed.
@@ -289,12 +335,27 @@ pub(crate) enum EquityRedemptionCommand {
     /// Performs the actual vault withdrawal (side-effectful).
     /// Valid from `VaultWithdrawPending`.
     SubmitWithdraw,
+    /// Test/fixture-only: identical to `SubmitWithdraw` but takes
+    /// `submitted_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    SubmitWithdrawAt { submitted_at: DateTime<Utc> },
     /// Performs the actual ERC-4626 unwrap (side-effectful).
     /// Valid from `UnwrapPending`.
     SubmitUnwrap,
+    /// Test/fixture-only: identical to `SubmitUnwrap` but takes
+    /// `submitted_at` explicitly instead of stamping `Utc::now()`, so
+    /// fixture seeding can backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    SubmitUnwrapAt { submitted_at: DateTime<Utc> },
     /// Prepares sending tokens (pure, no side effects).
     /// Valid from `TokensUnwrapped`.
     PrepareSend,
+    /// Test/fixture-only: identical to `PrepareSend` but takes `pending_at`
+    /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
+    /// backdate synthetic history.
+    #[cfg(any(test, feature = "test-support"))]
+    PrepareSendAt { pending_at: DateTime<Utc> },
     /// Reconcile a redemption stranded in the terminal `Failed` state to the
     /// terminal `Reconciled` state. The residual equity was handled out-of-band
     /// (e.g. via wrap-equity/vault-deposit), so this is a bookkeeping resolution
@@ -1750,6 +1811,20 @@ impl EventSourced for EquityRedemption {
                 wrapped_amount: amount,
                 pending_at: Utc::now(),
             }]),
+            #[cfg(any(test, feature = "test-support"))]
+            RedeemAt {
+                symbol,
+                quantity,
+                token,
+                amount,
+                pending_at,
+            } => Ok(vec![VaultWithdrawPending {
+                symbol,
+                quantity,
+                token,
+                wrapped_amount: amount,
+                pending_at,
+            }]),
             SubmitWithdraw
             | SubmitUnwrap
             | PrepareSend
@@ -1764,6 +1839,24 @@ impl EventSourced for EquityRedemption {
             | RecoverProviderCompletion { .. }
             | Reconcile { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            SubmitWithdrawAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            SubmitUnwrapAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            PrepareSendAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmWithdrawAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmUnwrapAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            UnwrapTokensAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            SendTokensAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            DetectAt { .. } => Err(EquityRedemptionError::NotStarted),
+            #[cfg(any(test, feature = "test-support"))]
+            CompleteAt { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
 
@@ -1782,311 +1875,62 @@ impl EventSourced for EquityRedemption {
                 Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
-
-            SubmitWithdraw => match self {
-                Self::VaultWithdrawPending {
-                    symbol,
-                    quantity,
-                    token,
-                    wrapped_amount,
-                    ..
-                } => {
-                    let vault_id = match services.vault_lookup.vault_id_for_token(*token).await {
-                        Ok(id) => id,
-                        Err(error) => {
-                            warn!(target: "rebalance", %error, %token, "Vault lookup failed");
-                            return Err(EquityRedemptionError::RaindexVaultNotFound(*token));
-                        }
-                    };
-
-                    info!(target: "rebalance", ?vault_id, %token, %wrapped_amount, "Submitting Raindex vault withdrawal");
-
-                    let tx_hash = match services
-                        .raindex
-                        .submit_withdraw(
-                            *token,
-                            vault_id,
-                            *wrapped_amount,
-                            TOKENIZED_EQUITY_DECIMALS,
-                        )
-                        .await
-                    {
-                        Ok(tx) => tx,
-                        Err(error) => {
-                            warn!(target: "rebalance", %error, %token, %wrapped_amount, "Raindex vault withdrawal submission failed");
-                            return Err(EquityRedemptionError::RaindexWithdrawFailed {
-                                token: *token,
-                                amount: *wrapped_amount,
-                                error_message: error.to_string(),
-                            });
-                        }
-                    };
-
-                    Ok(vec![VaultWithdrawSubmitted {
-                        symbol: symbol.clone(),
-                        quantity: *quantity,
-                        token: *token,
-                        wrapped_amount: *wrapped_amount,
-                        tx_hash,
-                        submitted_at: Utc::now(),
-                    }])
-                }
+            #[cfg(any(test, feature = "test-support"))]
+            RedeemAt { .. } => match self {
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
                 Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
-            ConfirmWithdraw => match self {
-                Self::VaultWithdrawSubmitted {
-                    symbol,
-                    quantity,
-                    token,
-                    wrapped_amount,
-                    tx_hash,
-                    ..
-                } => {
-                    let receipt = services
-                        .raindex
-                        .confirm_tx_receipt(*tx_hash)
-                        .await
-                        .map_err(|error| EquityRedemptionError::RaindexWithdrawFailed {
-                            token: *token,
-                            amount: *wrapped_amount,
-                            error_message: error.to_string(),
-                        })?;
-                    let raindex_withdraw_block = receipt
-                        .block_number
-                        .ok_or(EquityRedemptionError::MissingWithdrawBlock { tx_hash: *tx_hash })?;
-                    let recipient = services.wrapper.owner();
-                    let actual_wrapped_amount =
-                        actual_withdrawn_amount_from_receipt(&receipt, *token, recipient)?;
-                    Ok(vec![WithdrawnFromRaindex {
-                        symbol: symbol.clone(),
-                        quantity: *quantity,
-                        token: *token,
-                        wrapped_amount: *wrapped_amount,
-                        actual_wrapped_amount: Some(actual_wrapped_amount),
-                        raindex_withdraw_tx: *tx_hash,
-                        raindex_withdraw_block: Some(raindex_withdraw_block),
-                        withdrawn_at: Utc::now(),
-                    }])
-                }
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                _ => Err(EquityRedemptionError::AlreadyStarted),
-            },
+            SubmitWithdraw => self.transition_submit_withdraw(services, None).await,
+            #[cfg(any(test, feature = "test-support"))]
+            SubmitWithdrawAt { submitted_at } => {
+                self.transition_submit_withdraw(services, Some(submitted_at))
+                    .await
+            }
 
-            UnwrapTokens => match self {
-                Self::WithdrawnFromRaindex { .. } => Ok(vec![UnwrapPending {
-                    pending_at: Utc::now(),
-                }]),
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
-            },
+            ConfirmWithdraw => self.transition_confirm_withdraw(services, None).await,
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmWithdrawAt { withdrawn_at } => {
+                self.transition_confirm_withdraw(services, Some(withdrawn_at))
+                    .await
+            }
 
-            SubmitUnwrap => match self {
-                Self::UnwrapPending {
-                    token,
-                    wrapped_amount,
-                    raindex_withdraw_block,
-                    ..
-                } => {
-                    // Wait for the RPC node to catch up to the block where the
-                    // Raindex withdrawal tx confirmed before submitting the unwrap.
-                    // Without this, a load-balanced backend that hasn't indexed
-                    // the withdrawal may simulate the unwrap against a stale
-                    // wrapped-token balance. `raindex_withdraw_block` is None for
-                    // pre-fix aggregates; skip the wait for backward-compatibility.
-                    if let Some(block) = raindex_withdraw_block {
-                        services
-                            .wrapper
-                            .wait_for_block(*block)
-                            .await
-                            .map_err(|error| node_sync_failed(*block, &error))?;
-                    }
-                    let owner = services.wrapper.owner();
-                    let unwrap_tx_hash = services
-                        .wrapper
-                        .submit_unwrap(*token, *wrapped_amount, owner, owner)
-                        .await
-                        .inspect_err(|error| {
-                            warn!(target: "rebalance", %error, %token, "Token unwrap submission failed");
-                        })
-                        .map_err(|error| EquityRedemptionError::UnwrapFailed {
-                            token: *token,
-                            wrapped_amount: *wrapped_amount,
-                            error_message: error.to_string(),
-                        })?;
+            UnwrapTokens => self.transition_unwrap_tokens(Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            UnwrapTokensAt { pending_at } => self.transition_unwrap_tokens(pending_at),
 
-                    Ok(vec![UnwrapSubmitted {
-                        unwrap_tx_hash,
-                        submitted_at: Utc::now(),
-                    }])
-                }
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
-            },
+            SubmitUnwrap => self.transition_submit_unwrap(services, None).await,
+            #[cfg(any(test, feature = "test-support"))]
+            SubmitUnwrapAt { submitted_at } => {
+                self.transition_submit_unwrap(services, Some(submitted_at))
+                    .await
+            }
 
-            ConfirmUnwrap => match self {
-                Self::UnwrapSubmitted {
-                    symbol,
-                    token,
-                    wrapped_amount,
-                    unwrap_tx_hash,
-                    ..
-                } => {
-                    let underlying_token = services
-                        .wrapper
-                        .lookup_underlying(symbol)
-                        .inspect_err(|error| {
-                            warn!(target: "rebalance", %error, %symbol, "Underlying token lookup failed");
-                        })
-                        .map_err(|error| EquityRedemptionError::UnderlyingLookupFailed {
-                            symbol: symbol.clone(),
-                            error_message: error.to_string(),
-                        })?;
+            ConfirmUnwrap => self.transition_confirm_unwrap(services, None).await,
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmUnwrapAt { unwrapped_at } => {
+                self.transition_confirm_unwrap(services, Some(unwrapped_at))
+                    .await
+            }
 
-                    let unwrap_confirmation = services
-                        .wrapper
-                        .confirm_unwrap(*token, *unwrap_tx_hash)
-                        .await
-                        .inspect_err(|error| {
-                            warn!(target: "rebalance", %error, %token, "Token unwrap confirmation failed");
-                        })
-                        .map_err(|error| EquityRedemptionError::UnwrapFailed {
-                            token: *token,
-                            wrapped_amount: *wrapped_amount,
-                            error_message: error.to_string(),
-                        })?;
-                    let unwrapped_amount = unwrap_confirmation.assets;
-                    let unwrap_block = unwrap_confirmation.block;
-                    let quantity =
-                        Float::from_fixed_decimal(unwrapped_amount, TOKENIZED_EQUITY_DECIMALS)
-                            .map_err(|error| {
-                                EquityRedemptionError::RaindexWithdrawQuantityConversionFailed {
-                                    tx_hash: *unwrap_tx_hash,
-                                    amount: unwrapped_amount,
-                                    error_message: error.to_string(),
-                                }
-                            })?;
+            PrepareSend => self.transition_prepare_send(Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            PrepareSendAt { pending_at } => self.transition_prepare_send(pending_at),
 
-                    Ok(vec![TokensUnwrapped {
-                        quantity: Some(quantity),
-                        underlying_token,
-                        unwrap_tx_hash: *unwrap_tx_hash,
-                        unwrapped_amount,
-                        unwrap_block: Some(unwrap_block),
-                        unwrapped_at: Utc::now(),
-                    }])
-                }
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
-            },
-
-            PrepareSend => match self {
-                Self::TokensUnwrapped { .. } => Ok(vec![SendPending {
-                    pending_at: Utc::now(),
-                }]),
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                _ => Err(EquityRedemptionError::TokensNotUnwrapped),
-            },
-
-            SendTokens => match self {
-                Self::SendPending {
-                    symbol,
-                    underlying_token,
-                    unwrapped_amount,
-                    unwrap_block,
-                    ..
-                } => {
-                    let token = *underlying_token;
-                    let amount = *unwrapped_amount;
-
-                    let Some(redemption_wallet) =
-                        Tokenizer::redemption_wallet(services.tokenizer.as_ref())
-                    else {
-                        warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
-                        return Ok(vec![TransferFailed {
-                            tx_hash: None,
-                            reason: None,
-                            failed_at: Utc::now(),
-                        }]);
-                    };
-
-                    // Wait for the RPC node to catch up to the block where the
-                    // unwrap tx confirmed before sending the transfer. Without
-                    // this, a load-balanced backend that hasn't indexed the
-                    // unwrap block yet sees the wallet balance as zero and the
-                    // send_for_redemption call reverts with
-                    // ERC20InsufficientBalance. The wait runs on the tokenizer's
-                    // provider -- the same one that performs the transfer -- so
-                    // a caught-up wrapper provider can't mask a lagging
-                    // tokenizer provider. `unwrap_block` is None for aggregates
-                    // persisted before this field was added; in that case the
-                    // wait is skipped for backward-compatibility.
-                    if let Some(block) = unwrap_block {
-                        services
-                            .tokenizer
-                            .wait_for_block(*block)
-                            .await
-                            .map_err(|error| node_sync_failed_from_evm(*block, &error))?;
-                    }
-
-                    info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
-
-                    match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
-                        .await
-                    {
-                        Ok(redemption_tx) => Ok(vec![TokensSent {
-                            redemption_wallet,
-                            redemption_tx,
-                            sent_at: Utc::now(),
-                        }]),
-                        Err(error) => {
-                            warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
-                            Ok(vec![TransferFailed {
-                                tx_hash: None,
-                                reason: None,
-                                failed_at: Utc::now(),
-                            }])
-                        }
-                    }
-                }
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                _ => Err(EquityRedemptionError::TokensNotUnwrapped),
-            },
+            SendTokens => self.transition_send_tokens(services, None).await,
+            #[cfg(any(test, feature = "test-support"))]
+            SendTokensAt { sent_at } => self.transition_send_tokens(services, Some(sent_at)).await,
 
             Detect {
                 tokenization_request_id,
-            } => match self {
-                Self::TokensSent { .. } => Ok(vec![Detected {
-                    tokenization_request_id,
-                    detected_at: Utc::now(),
-                }]),
-                Self::VaultWithdrawPending { .. }
-                | Self::VaultWithdrawSubmitted { .. }
-                | Self::WithdrawnFromRaindex { .. }
-                | Self::UnwrapPending { .. }
-                | Self::UnwrapSubmitted { .. }
-                | Self::TokensUnwrapped { .. }
-                | Self::SendPending { .. } => Err(EquityRedemptionError::TokensNotSent),
-                Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-            },
+            } => self.transition_detect(tokenization_request_id, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            DetectAt {
+                tokenization_request_id,
+                detected_at,
+            } => self.transition_detect(tokenization_request_id, detected_at),
 
             FailDetection { failure } => match self {
                 Self::TokensSent { symbol, .. } => {
@@ -2113,22 +1957,9 @@ impl EventSourced for EquityRedemption {
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
-            Complete => match self {
-                Self::VaultWithdrawPending { .. }
-                | Self::VaultWithdrawSubmitted { .. }
-                | Self::WithdrawnFromRaindex { .. }
-                | Self::UnwrapPending { .. }
-                | Self::UnwrapSubmitted { .. }
-                | Self::TokensUnwrapped { .. }
-                | Self::SendPending { .. }
-                | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPending),
-                Self::Pending { .. } => Ok(vec![Completed {
-                    completed_at: Utc::now(),
-                }]),
-                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
-                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
-                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
-            },
+            Complete => self.transition_complete(Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            CompleteAt { completed_at } => self.transition_complete(completed_at),
 
             RejectRedemption { reason } => match self {
                 Self::VaultWithdrawPending { .. }
@@ -2214,6 +2045,398 @@ impl EventSourced for EquityRedemption {
                 Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::NotFailed),
             },
+        }
+    }
+}
+
+impl EquityRedemption {
+    /// Shared body for `SubmitWithdraw`/`SubmitWithdrawAt`.
+    async fn transition_submit_withdraw(
+        &self,
+        services: &EquityTransferServices,
+        override_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::VaultWithdrawPending {
+                symbol,
+                quantity,
+                token,
+                wrapped_amount,
+                ..
+            } => {
+                let vault_id = match services.vault_lookup.vault_id_for_token(*token).await {
+                    Ok(id) => id,
+                    Err(error) => {
+                        warn!(target: "rebalance", %error, %token, "Vault lookup failed");
+                        return Err(EquityRedemptionError::RaindexVaultNotFound(*token));
+                    }
+                };
+
+                info!(target: "rebalance", ?vault_id, %token, %wrapped_amount, "Submitting Raindex vault withdrawal");
+
+                let tx_hash = match services
+                    .raindex
+                    .submit_withdraw(*token, vault_id, *wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
+                    .await
+                {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        warn!(target: "rebalance", %error, %token, %wrapped_amount, "Raindex vault withdrawal submission failed");
+                        return Err(EquityRedemptionError::RaindexWithdrawFailed {
+                            token: *token,
+                            amount: *wrapped_amount,
+                            error_message: error.to_string(),
+                        });
+                    }
+                };
+
+                Ok(vec![VaultWithdrawSubmitted {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    wrapped_amount: *wrapped_amount,
+                    tx_hash,
+                    submitted_at: override_at.unwrap_or_else(Utc::now),
+                }])
+            }
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::AlreadyStarted),
+        }
+    }
+
+    /// Shared body for `ConfirmWithdraw`/`ConfirmWithdrawAt`.
+    async fn transition_confirm_withdraw(
+        &self,
+        services: &EquityTransferServices,
+        override_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::VaultWithdrawSubmitted {
+                symbol,
+                quantity,
+                token,
+                wrapped_amount,
+                tx_hash,
+                ..
+            } => {
+                let receipt = services
+                    .raindex
+                    .confirm_tx_receipt(*tx_hash)
+                    .await
+                    .map_err(|error| EquityRedemptionError::RaindexWithdrawFailed {
+                        token: *token,
+                        amount: *wrapped_amount,
+                        error_message: error.to_string(),
+                    })?;
+                let raindex_withdraw_block = receipt
+                    .block_number
+                    .ok_or(EquityRedemptionError::MissingWithdrawBlock { tx_hash: *tx_hash })?;
+                let recipient = services.wrapper.owner();
+                let actual_wrapped_amount =
+                    actual_withdrawn_amount_from_receipt(&receipt, *token, recipient)?;
+                Ok(vec![WithdrawnFromRaindex {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    wrapped_amount: *wrapped_amount,
+                    actual_wrapped_amount: Some(actual_wrapped_amount),
+                    raindex_withdraw_tx: *tx_hash,
+                    raindex_withdraw_block: Some(raindex_withdraw_block),
+                    withdrawn_at: override_at.unwrap_or_else(Utc::now),
+                }])
+            }
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::AlreadyStarted),
+        }
+    }
+
+    /// Shared body for `UnwrapTokens`/`UnwrapTokensAt`.
+    fn transition_unwrap_tokens(
+        &self,
+        pending_at: DateTime<Utc>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::WithdrawnFromRaindex { .. } => Ok(vec![UnwrapPending { pending_at }]),
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
+        }
+    }
+
+    /// Shared body for `SubmitUnwrap`/`SubmitUnwrapAt`.
+    async fn transition_submit_unwrap(
+        &self,
+        services: &EquityTransferServices,
+        override_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::UnwrapPending {
+                token,
+                wrapped_amount,
+                raindex_withdraw_block,
+                ..
+            } => {
+                // Wait for the RPC node to catch up to the block where the
+                // Raindex withdrawal tx confirmed before submitting the unwrap.
+                // Without this, a load-balanced backend that hasn't indexed
+                // the withdrawal may simulate the unwrap against a stale
+                // wrapped-token balance. `raindex_withdraw_block` is None for
+                // pre-fix aggregates; skip the wait for backward-compatibility.
+                if let Some(block) = raindex_withdraw_block {
+                    services
+                        .wrapper
+                        .wait_for_block(*block)
+                        .await
+                        .map_err(|error| node_sync_failed(*block, &error))?;
+                }
+                let owner = services.wrapper.owner();
+                let unwrap_tx_hash = services
+                    .wrapper
+                    .submit_unwrap(*token, *wrapped_amount, owner, owner)
+                    .await
+                    .inspect_err(|error| {
+                        warn!(target: "rebalance", %error, %token, "Token unwrap submission failed");
+                    })
+                    .map_err(|error| EquityRedemptionError::UnwrapFailed {
+                        token: *token,
+                        wrapped_amount: *wrapped_amount,
+                        error_message: error.to_string(),
+                    })?;
+
+                Ok(vec![UnwrapSubmitted {
+                    unwrap_tx_hash,
+                    submitted_at: override_at.unwrap_or_else(Utc::now),
+                }])
+            }
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
+        }
+    }
+
+    /// Shared body for `ConfirmUnwrap`/`ConfirmUnwrapAt`.
+    async fn transition_confirm_unwrap(
+        &self,
+        services: &EquityTransferServices,
+        override_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::UnwrapSubmitted {
+                symbol,
+                token,
+                wrapped_amount,
+                unwrap_tx_hash,
+                ..
+            } => {
+                let underlying_token = services
+                    .wrapper
+                    .lookup_underlying(symbol)
+                    .inspect_err(|error| {
+                        warn!(target: "rebalance", %error, %symbol, "Underlying token lookup failed");
+                    })
+                    .map_err(|error| EquityRedemptionError::UnderlyingLookupFailed {
+                        symbol: symbol.clone(),
+                        error_message: error.to_string(),
+                    })?;
+
+                let unwrap_confirmation = services
+                    .wrapper
+                    .confirm_unwrap(*token, *unwrap_tx_hash)
+                    .await
+                    .inspect_err(|error| {
+                        warn!(target: "rebalance", %error, %token, "Token unwrap confirmation failed");
+                    })
+                    .map_err(|error| EquityRedemptionError::UnwrapFailed {
+                        token: *token,
+                        wrapped_amount: *wrapped_amount,
+                        error_message: error.to_string(),
+                    })?;
+                let unwrapped_amount = unwrap_confirmation.assets;
+                let unwrap_block = unwrap_confirmation.block;
+                let quantity =
+                    Float::from_fixed_decimal(unwrapped_amount, TOKENIZED_EQUITY_DECIMALS)
+                        .map_err(|error| {
+                            EquityRedemptionError::RaindexWithdrawQuantityConversionFailed {
+                                tx_hash: *unwrap_tx_hash,
+                                amount: unwrapped_amount,
+                                error_message: error.to_string(),
+                            }
+                        })?;
+
+                Ok(vec![TokensUnwrapped {
+                    quantity: Some(quantity),
+                    underlying_token,
+                    unwrap_tx_hash: *unwrap_tx_hash,
+                    unwrapped_amount,
+                    unwrap_block: Some(unwrap_block),
+                    unwrapped_at: override_at.unwrap_or_else(Utc::now),
+                }])
+            }
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
+        }
+    }
+
+    /// Shared body for `PrepareSend`/`PrepareSendAt`.
+    fn transition_prepare_send(
+        &self,
+        pending_at: DateTime<Utc>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::TokensUnwrapped { .. } => Ok(vec![SendPending { pending_at }]),
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::TokensNotUnwrapped),
+        }
+    }
+
+    /// Shared body for `SendTokens`/`SendTokensAt`: only `sent_at` (the
+    /// success path's timestamp) is parameterized -- the `TransferFailed`
+    /// failure path keeps `Utc::now()` since fixture seeding only ever
+    /// drives the happy path.
+    async fn transition_send_tokens(
+        &self,
+        services: &EquityTransferServices,
+        override_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::SendPending {
+                symbol,
+                underlying_token,
+                unwrapped_amount,
+                unwrap_block,
+                ..
+            } => {
+                let token = *underlying_token;
+                let amount = *unwrapped_amount;
+
+                let Some(redemption_wallet) =
+                    Tokenizer::redemption_wallet(services.tokenizer.as_ref())
+                else {
+                    warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
+                    return Ok(vec![TransferFailed {
+                        tx_hash: None,
+                        reason: None,
+                        failed_at: Utc::now(),
+                    }]);
+                };
+
+                // Wait for the RPC node to catch up to the block where the
+                // unwrap tx confirmed before sending the transfer. Without
+                // this, a load-balanced backend that hasn't indexed the
+                // unwrap block yet sees the wallet balance as zero and the
+                // send_for_redemption call reverts with
+                // ERC20InsufficientBalance. The wait runs on the tokenizer's
+                // provider -- the same one that performs the transfer -- so
+                // a caught-up wrapper provider can't mask a lagging
+                // tokenizer provider. `unwrap_block` is None for aggregates
+                // persisted before this field was added; in that case the
+                // wait is skipped for backward-compatibility.
+                if let Some(block) = unwrap_block {
+                    services
+                        .tokenizer
+                        .wait_for_block(*block)
+                        .await
+                        .map_err(|error| node_sync_failed_from_evm(*block, &error))?;
+                }
+
+                info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
+
+                match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
+                    .await
+                {
+                    Ok(redemption_tx) => Ok(vec![TokensSent {
+                        redemption_wallet,
+                        redemption_tx,
+                        sent_at: override_at.unwrap_or_else(Utc::now),
+                    }]),
+                    Err(error) => {
+                        warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
+                        Ok(vec![TransferFailed {
+                            tx_hash: None,
+                            reason: None,
+                            failed_at: Utc::now(),
+                        }])
+                    }
+                }
+            }
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            _ => Err(EquityRedemptionError::TokensNotUnwrapped),
+        }
+    }
+
+    /// Shared body for `Detect`/`DetectAt`.
+    fn transition_detect(
+        &self,
+        tokenization_request_id: TokenizationRequestId,
+        detected_at: DateTime<Utc>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::TokensSent { .. } => Ok(vec![Detected {
+                tokenization_request_id,
+                detected_at,
+            }]),
+            Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitted { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. } => Err(EquityRedemptionError::TokensNotSent),
+            Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+        }
+    }
+
+    /// Shared body for `Complete`/`CompleteAt`.
+    fn transition_complete(
+        &self,
+        completed_at: DateTime<Utc>,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        use EquityRedemptionEvent::*;
+
+        match self {
+            Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitted { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. }
+            | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPending),
+            Self::Pending { .. } => Ok(vec![Completed { completed_at }]),
+            Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
         }
     }
 }
@@ -2670,6 +2893,16 @@ mod tests {
         }
     }
 
+    fn vault_withdraw_pending_event() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawPending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(50.25),
+            token: Address::random(),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            pending_at: Utc::now(),
+        }
+    }
+
     fn withdrawn_from_raindex_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::WithdrawnFromRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -2842,6 +3075,295 @@ mod tests {
 
         let entity = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(entity, EquityRedemption::Completed { .. }));
+    }
+
+    /// Covers the fixture-only `*At` siblings of the async transitions that
+    /// take an explicit timestamp instead of `Utc::now()`: each must thread
+    /// the caller-supplied timestamp through to the emitted event's field
+    /// rather than silently falling back to the current time.
+    #[tokio::test]
+    async fn submit_withdraw_at_uses_supplied_timestamp() {
+        let submitted_at = Utc::now() - chrono::Duration::hours(3);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_pending_event()])
+            .when(EquityRedemptionCommand::SubmitWithdrawAt { submitted_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::VaultWithdrawSubmitted {
+            submitted_at: event_submitted_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected VaultWithdrawSubmitted, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_submitted_at, submitted_at);
+    }
+
+    #[tokio::test]
+    async fn confirm_withdraw_at_uses_supplied_timestamp() {
+        let withdrawn_at = Utc::now() - chrono::Duration::hours(2);
+
+        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let id = redemption_aggregate_id("confirm-withdraw-at");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::random(),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::ConfirmWithdrawAt { withdrawn_at },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let EquityRedemption::WithdrawnFromRaindex {
+            withdrawn_at: stored_withdrawn_at,
+            ..
+        } = entity
+        else {
+            panic!("Expected WithdrawnFromRaindex state, got: {entity:?}");
+        };
+        assert_eq!(stored_withdrawn_at, withdrawn_at);
+    }
+
+    #[tokio::test]
+    async fn submit_unwrap_at_uses_supplied_timestamp() {
+        let submitted_at = Utc::now() - chrono::Duration::hours(1);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event(), unwrap_pending_event()])
+            .when(EquityRedemptionCommand::SubmitUnwrapAt { submitted_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::UnwrapSubmitted {
+            submitted_at: event_submitted_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected UnwrapSubmitted, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_submitted_at, submitted_at);
+    }
+
+    #[tokio::test]
+    async fn confirm_unwrap_at_uses_supplied_timestamp() {
+        let unwrapped_at = Utc::now() - chrono::Duration::minutes(30);
+
+        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let id = redemption_aggregate_id("confirm-unwrap-at");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::random(),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitUnwrap)
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::ConfirmUnwrapAt { unwrapped_at },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let EquityRedemption::TokensUnwrapped {
+            unwrapped_at: stored_unwrapped_at,
+            ..
+        } = entity
+        else {
+            panic!("Expected TokensUnwrapped state, got: {entity:?}");
+        };
+        assert_eq!(stored_unwrapped_at, unwrapped_at);
+    }
+
+    #[tokio::test]
+    async fn send_tokens_at_uses_supplied_timestamp() {
+        let sent_at = Utc::now() - chrono::Duration::minutes(15);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                tokens_unwrapped_event(),
+                EquityRedemptionEvent::SendPending {
+                    pending_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::SendTokensAt { sent_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::TokensSent {
+            sent_at: event_sent_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected TokensSent, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_sent_at, sent_at);
+    }
+
+    #[tokio::test]
+    async fn redeem_at_uses_supplied_timestamp() {
+        let pending_at = Utc::now() - chrono::Duration::hours(4);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given_no_previous_events()
+            .when(EquityRedemptionCommand::RedeemAt {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(50.25),
+                token: Address::random(),
+                amount: U256::from(50_250_000_000_000_000_000_u128),
+                pending_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::VaultWithdrawPending {
+            pending_at: event_pending_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected VaultWithdrawPending, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_pending_at, pending_at);
+    }
+
+    #[tokio::test]
+    async fn unwrap_tokens_at_uses_supplied_timestamp() {
+        let pending_at = Utc::now() - chrono::Duration::hours(3);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event()])
+            .when(EquityRedemptionCommand::UnwrapTokensAt { pending_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::UnwrapPending {
+            pending_at: event_pending_at,
+        } = &events[0]
+        else {
+            panic!("Expected UnwrapPending, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_pending_at, pending_at);
+    }
+
+    #[tokio::test]
+    async fn prepare_send_at_uses_supplied_timestamp() {
+        let pending_at = Utc::now() - chrono::Duration::hours(2);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                tokens_unwrapped_event(),
+            ])
+            .when(EquityRedemptionCommand::PrepareSendAt { pending_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::SendPending {
+            pending_at: event_pending_at,
+        } = &events[0]
+        else {
+            panic!("Expected SendPending, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_pending_at, pending_at);
+    }
+
+    #[tokio::test]
+    async fn detect_at_uses_supplied_timestamp() {
+        let detected_at = Utc::now() - chrono::Duration::hours(1);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
+            .when(EquityRedemptionCommand::DetectAt {
+                tokenization_request_id: tokenization_request_id("REQ789"),
+                detected_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::Detected {
+            detected_at: event_detected_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected Detected, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_detected_at, detected_at);
+    }
+
+    #[tokio::test]
+    async fn complete_at_uses_supplied_timestamp() {
+        let completed_at = Utc::now() - chrono::Duration::minutes(45);
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                tokens_sent_event(),
+                detected_event(),
+            ])
+            .when(EquityRedemptionCommand::CompleteAt { completed_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::Completed {
+            completed_at: event_completed_at,
+        } = &events[0]
+        else {
+            panic!("Expected Completed, got: {:?}", events[0]);
+        };
+        assert_eq!(*event_completed_at, completed_at);
     }
 
     #[tokio::test]
