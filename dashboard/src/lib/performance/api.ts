@@ -1,3 +1,4 @@
+import type { EquityTimings } from '$lib/api/EquityTimings'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
 import type { RebalanceTimings } from '$lib/api/RebalanceTimings'
@@ -55,6 +56,10 @@ export const fetchHedgeLatencies = async (
 export const fetchRebalanceTimings = async (
   range: PerformanceRange = {},
 ): Promise<RebalanceTimings> => fetchPerformanceJson('/performance/rebalances', range)
+
+export const fetchEquityTimings = async (
+  range: PerformanceRange = {},
+): Promise<EquityTimings> => fetchPerformanceJson('/performance/equity-rebalances', range)
 
 export const fetchReliabilityReport = async (
   range: PerformanceRange = {},

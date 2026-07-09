@@ -178,6 +178,16 @@ const mockApi = () => ({
         return
       }
 
+      if (path === '/performance/equity-rebalances') {
+        mockJson(response, {
+          operations: [],
+          totalOperations: 0,
+          skippedOperations: 0,
+          stageSummary: [],
+        })
+        return
+      }
+
       goNext()
     })
   }

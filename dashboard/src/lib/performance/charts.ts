@@ -1,8 +1,13 @@
-/** Pure SVG layout math for the Performance tab's latency charts. */
+/**
+ * Data-shaping for the Performance tab's charts: the actual layout math
+ * (scales, axes, padding) is handled by LayerChart -- these functions only
+ * reshape backend DTOs into the flat, per-series-field rows the chart
+ * components expect.
+ */
 
-import type { AttestationSample } from '$lib/api/AttestationSample'
-import type { BlockLagPoint } from '$lib/api/BlockLagPoint'
 import type { DependencyBucket } from '$lib/api/DependencyBucket'
+import type { EquityOperationTiming } from '$lib/api/EquityOperationTiming'
+import type { EquityStageName } from '$lib/api/EquityStageName'
 import type { HedgeCycleReport } from '$lib/api/HedgeCycleReport'
 import type { LatencyBucket } from '$lib/api/LatencyBucket'
 import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming'
@@ -11,36 +16,34 @@ import type { StageLatencies } from '$lib/api/StageLatencies'
 
 export type WaterfallSegmentName = 'unhedged' | 'submission' | 'execution'
 
-export type WaterfallSegment = {
-  name: WaterfallSegmentName
-  ms: number
-  x: number
-  width: number
-}
+export type WaterfallSort = 'slowest' | 'newest'
 
-export type WaterfallRow = {
+export type WaterfallBarRow = {
   id: string
   symbol: string
   status: HedgeCycleReport['status']
   totalMs: number
-  segments: WaterfallSegment[]
+  unhedged: number
+  submission: number
+  // Split into two series (rather than one 'execution' series colored per-row)
+  // so a failed cycle's final segment renders red through the chart's normal
+  // per-series coloring -- each row populates only one of the pair, the other
+  // stays 0, so the stack shows exactly one execution segment per row.
+  executionOk: number
+  executionFailed: number
 }
-
-export type WaterfallSort = 'slowest' | 'newest'
 
 const segmentDurations = (
   cycle: HedgeCycleReport,
-  now: Date,
+  now: Date
 ): { name: WaterfallSegmentName; ms: number }[] => {
   const placedAt = new Date(cycle.placedAt).getTime()
   const earliestFill =
     cycle.earliestFillBlockTimestamp !== null
       ? new Date(cycle.earliestFillBlockTimestamp).getTime()
       : placedAt
-  const submittedAt =
-    cycle.submittedAt !== null ? new Date(cycle.submittedAt).getTime() : null
-  const completedAt =
-    cycle.completedAt !== null ? new Date(cycle.completedAt).getTime() : null
+  const submittedAt = cycle.submittedAt !== null ? new Date(cycle.submittedAt).getTime() : null
+  const completedAt = cycle.completedAt !== null ? new Date(cycle.completedAt).getTime() : null
 
   // A cycle that has not reached a terminal state is live exposure: its
   // whole elapsed time still counts as unhedged, so it ranks where it
@@ -49,26 +52,26 @@ const segmentDurations = (
     return [
       {
         name: 'unhedged',
-        ms: Math.max(0, now.getTime() - earliestFill),
-      },
+        ms: Math.max(0, now.getTime() - earliestFill)
+      }
     ]
   }
 
   const segments: { name: WaterfallSegmentName; ms: number }[] = [
     {
       name: 'unhedged',
-      ms: Math.max(0, placedAt - earliestFill),
-    },
+      ms: Math.max(0, placedAt - earliestFill)
+    }
   ]
 
   if (submittedAt !== null) {
     segments.push({
       name: 'submission',
-      ms: Math.max(0, submittedAt - placedAt),
+      ms: Math.max(0, submittedAt - placedAt)
     })
     segments.push({
       name: 'execution',
-      ms: Math.max(0, completedAt - submittedAt),
+      ms: Math.max(0, completedAt - submittedAt)
     })
   }
 
@@ -76,89 +79,44 @@ const segmentDurations = (
 }
 
 /**
- * Lays out hedge cycles as horizontal stacked bars whose segment widths are
- * proportional to wall-clock time, normalized to the slowest visible cycle.
+ * Shapes hedge cycles into rows for a horizontal stacked bar chart, one
+ * numeric field per segment, sorted and capped to the visible window.
  */
-export const layoutWaterfall = (
+export const buildWaterfallRows = (
   cycles: HedgeCycleReport[],
   options: {
-    plotWidth: number
     sort: WaterfallSort
     maxRows: number
     now: Date
-  },
-): WaterfallRow[] => {
+  }
+): WaterfallBarRow[] => {
   const rows = cycles.map((cycle) => {
     const durations = segmentDurations(cycle, options.now)
     const totalMs = durations.reduce((sum, segment) => sum + segment.ms, 0)
+    const byName: Partial<Record<WaterfallSegmentName, number>> = Object.fromEntries(
+      durations.map((segment) => [segment.name, segment.ms])
+    )
+    const executionMs = byName.execution ?? 0
+    const failed = cycle.status === 'failed'
 
     return {
       id: cycle.offchainOrderId,
       symbol: cycle.symbol,
       status: cycle.status,
-      placedAt: new Date(cycle.placedAt).getTime(),
+      placedAtMs: new Date(cycle.placedAt).getTime(),
       totalMs,
-      durations,
+      unhedged: byName.unhedged ?? 0,
+      submission: byName.submission ?? 0,
+      executionOk: failed ? 0 : executionMs,
+      executionFailed: failed ? executionMs : 0
     }
   })
 
   rows.sort((left, right) =>
-    options.sort === 'slowest'
-      ? right.totalMs - left.totalMs
-      : right.placedAt - left.placedAt,
+    options.sort === 'slowest' ? right.totalMs - left.totalMs : right.placedAtMs - left.placedAtMs
   )
-  const visible = rows.slice(0, options.maxRows)
 
-  const maxTotal = Math.max(1, ...visible.map((row) => row.totalMs))
-
-  return visible.map((row) => {
-    let cursor = 0
-    const segments = row.durations.map((segment) => {
-      const width = (segment.ms / maxTotal) * options.plotWidth
-      const positioned = {
-        ...segment,
-        x: cursor,
-        width,
-      }
-      cursor += width
-      return positioned
-    })
-
-    return {
-      id: row.id,
-      symbol: row.symbol,
-      status: row.status,
-      totalMs: row.totalMs,
-      segments,
-    }
-  })
-}
-
-export type PercentileKey = 'p50Ms' | 'p90Ms' | 'p99Ms'
-
-export type SeriesPoint = {
-  x: number
-  y: number
-}
-
-export type SeriesLine = {
-  percentile: PercentileKey
-  points: SeriesPoint[]
-  path: string
-}
-
-export type SeriesLayout = {
-  lines: SeriesLine[]
-  maxMs: number
-  xLabels: { x: number; label: string }[]
-}
-
-export type RebalanceBarSegment = {
-  stage: RebalanceStageName
-  ms: number
-  x: number
-  width: number
-  failed: boolean
+  return rows.slice(0, options.maxRows).map(({ placedAtMs: _placedAtMs, ...row }) => row)
 }
 
 export type RebalanceBarRow = {
@@ -166,46 +124,100 @@ export type RebalanceBarRow = {
   direction: RebalanceOperationTiming['direction']
   amount: string | null
   status: RebalanceOperationTiming['status']
-  totalMs: number
-  segments: RebalanceBarSegment[]
+  totalMs: number | null
+  // Each stage splits into an Ok/Failed pair (rather than one series colored
+  // per-row) so a failed stage renders red through the chart's normal
+  // per-series coloring -- each row populates only one of a pair, the other
+  // stays 0.
+  conversionOk: number
+  conversionFailed: number
+  withdrawalOk: number
+  withdrawalFailed: number
+  burnOk: number
+  burnFailed: number
+  attestationOk: number
+  attestationFailed: number
+  mintOk: number
+  mintFailed: number
+  depositOk: number
+  depositFailed: number
+  // totalMs minus every measured stage above, for any row with a known
+  // totalMs. The stacked bar otherwise only plots completed-stage time, so a
+  // stuck operation (or a completed-but-recovered operation whose stages
+  // don't fully account for its elapsed time) would render as a
+  // shorter-than-real bar despite real elapsed time -- this makes that
+  // elapsed remainder its own visible segment instead of silently vanishing.
+  unmeasuredMs: number
+}
+
+const stageDurations = (
+  stages: RebalanceOperationTiming['stages'],
+  name: RebalanceStageName
+): { ok: number; failed: number } => {
+  const stage = stages.find((entry) => entry.stage === name && entry.durationMs !== null)
+  if (!stage) return { ok: 0, failed: 0 }
+
+  return stage.outcome === 'failed'
+    ? { ok: 0, failed: stage.durationMs ?? 0 }
+    : { ok: stage.durationMs ?? 0, failed: 0 }
 }
 
 /**
- * Lays out rebalance operations as horizontal stacked bars, one segment per
- * completed stage, normalized to the slowest visible operation. Operations
- * arrive newest-first from the backend and stay in that order.
+ * Shapes rebalance operations into rows for a horizontal stacked bar chart,
+ * one numeric field per stage/outcome. Operations arrive newest-first from
+ * the backend and stay in that order.
  *
  * Pass `now` so that in-progress operations (where the backend has not yet
- * set `totalMs`) are rendered with their true elapsed time instead of just
- * the sum of completed stages.
+ * set `totalMs`) are shaped with their true elapsed time instead of just the
+ * sum of completed stages.
  */
-export const layoutRebalanceBars = (
+export const buildRebalanceRows = (
   operations: RebalanceOperationTiming[],
   options: {
-    plotWidth: number
     maxRows: number
     now: Date
-  },
-): RebalanceBarRow[] => {
-  const rows = operations.slice(0, options.maxRows).map((operation) => {
-    const durations = operation.stages
-      .filter((stage) => stage.durationMs !== null)
-      .map((stage) => ({
-        stage: stage.stage,
-        ms: stage.durationMs ?? 0,
-        failed: stage.outcome === 'failed',
-      }))
-
+  }
+): RebalanceBarRow[] =>
+  operations.slice(0, options.maxRows).map((operation) => {
     // For in-progress operations the backend sets totalMs only on completion,
     // so use wall-clock elapsed since startedAt instead of summing completed
     // stages (which would understate a stuck operation on an open stage).
-    // startedAt is null when the read model first observed the operation
-    // mid-stream (no genuine start event), so there is no elapsed basis.
+    // For any other status, totalMs stays whatever the backend reported --
+    // including null, which means the round-trip is genuinely unmeasured
+    // (unknown startedAt, or a terminal OperatorReconciled operation whose
+    // manual-response window must not pollute latency metrics).
     const totalMs =
-      operation.totalMs ??
-      (operation.startedAt !== null
+      operation.status === 'in_progress' && operation.startedAt !== null
         ? Math.max(0, options.now.getTime() - new Date(operation.startedAt).getTime())
-        : 0)
+        : operation.totalMs
+
+    const conversion = stageDurations(operation.stages, 'conversion')
+    const withdrawal = stageDurations(operation.stages, 'withdrawal')
+    const burn = stageDurations(operation.stages, 'burn')
+    const attestation = stageDurations(operation.stages, 'attestation')
+    const mint = stageDurations(operation.stages, 'mint')
+    const deposit = stageDurations(operation.stages, 'deposit')
+
+    // Any operation with a known totalMs can have a remainder: in-progress
+    // operations from the elapsed-time fallback above, but also completed
+    // operations recovered via a provider-completion path, whose stages don't
+    // fully account for the measured round-trip. totalMs === null means the
+    // round-trip is genuinely unmeasured (unknown startedAt, or a terminal
+    // OperatorReconciled operation), so there is no remainder to attribute.
+    const measuredMs =
+      conversion.ok +
+      conversion.failed +
+      withdrawal.ok +
+      withdrawal.failed +
+      burn.ok +
+      burn.failed +
+      attestation.ok +
+      attestation.failed +
+      mint.ok +
+      mint.failed +
+      deposit.ok +
+      deposit.failed
+    const unmeasuredMs = totalMs !== null ? Math.max(0, totalMs - measuredMs) : 0
 
     return {
       id: operation.operationId,
@@ -213,104 +225,191 @@ export const layoutRebalanceBars = (
       amount: operation.amount,
       status: operation.status,
       totalMs,
-      durations,
+      conversionOk: conversion.ok,
+      conversionFailed: conversion.failed,
+      withdrawalOk: withdrawal.ok,
+      withdrawalFailed: withdrawal.failed,
+      burnOk: burn.ok,
+      burnFailed: burn.failed,
+      attestationOk: attestation.ok,
+      attestationFailed: attestation.failed,
+      mintOk: mint.ok,
+      mintFailed: mint.failed,
+      depositOk: deposit.ok,
+      depositFailed: deposit.failed,
+      unmeasuredMs
     }
   })
 
-  const maxTotal = Math.max(1, ...rows.map((row) => row.totalMs))
+export type EquityBarRow = {
+  id: string
+  kind: EquityOperationTiming['kind']
+  symbol: string | null
+  status: EquityOperationTiming['status']
+  totalMs: number | null
+  // Same Ok/Failed-pair-per-stage rationale as RebalanceBarRow. Mint and
+  // redemption stages are distinct series (never both populated for the same
+  // row, since an operation is one kind or the other) so one combined chart
+  // can show both kinds without the legend implying they share a pipeline.
+  mintAcceptanceOk: number
+  mintAcceptanceFailed: number
+  mintReceiptOk: number
+  mintReceiptFailed: number
+  mintWrapOk: number
+  mintWrapFailed: number
+  mintDepositOk: number
+  mintDepositFailed: number
+  redemptionWithdrawOk: number
+  redemptionWithdrawFailed: number
+  redemptionUnwrapOk: number
+  redemptionUnwrapFailed: number
+  redemptionSendOk: number
+  redemptionSendFailed: number
+  redemptionDetectionOk: number
+  redemptionDetectionFailed: number
+  redemptionCompletionOk: number
+  redemptionCompletionFailed: number
+  // Same elapsed-remainder rationale as {@link RebalanceBarRow.unmeasuredMs}.
+  unmeasuredMs: number
+}
 
-  return rows.map((row) => {
-    let cursor = 0
-    const segments = row.durations.map((segment) => {
-      const width = (segment.ms / maxTotal) * options.plotWidth
-      const positioned = {
-        ...segment,
-        x: cursor,
-        width,
-      }
-      cursor += width
-      return positioned
-    })
+const equityStageDurations = (
+  stages: EquityOperationTiming['stages'],
+  name: EquityStageName
+): { ok: number; failed: number } => {
+  const stage = stages.find((entry) => entry.stage === name && entry.durationMs !== null)
+  if (!stage) return { ok: 0, failed: 0 }
+
+  return stage.outcome === 'failed'
+    ? { ok: 0, failed: stage.durationMs ?? 0 }
+    : { ok: stage.durationMs ?? 0, failed: 0 }
+}
+
+/**
+ * Shapes equity mint/redemption operations into rows for a horizontal
+ * stacked bar chart, one numeric field per stage/outcome. Same shape and
+ * `now`-fallback rationale as {@link buildRebalanceRows}.
+ */
+export const buildEquityRows = (
+  operations: EquityOperationTiming[],
+  options: {
+    maxRows: number
+    now: Date
+  }
+): EquityBarRow[] =>
+  operations.slice(0, options.maxRows).map((operation) => {
+    // Same in-progress-only elapsed-time fallback as buildRebalanceRows --
+    // any other status preserves the backend's totalMs verbatim, including
+    // null for a genuinely unmeasured round-trip.
+    const totalMs =
+      operation.status === 'in_progress' && operation.startedAt !== null
+        ? Math.max(0, options.now.getTime() - new Date(operation.startedAt).getTime())
+        : operation.totalMs
+
+    const mintAcceptance = equityStageDurations(operation.stages, 'mint_acceptance')
+    const mintReceipt = equityStageDurations(operation.stages, 'mint_receipt')
+    const mintWrap = equityStageDurations(operation.stages, 'mint_wrap')
+    const mintDeposit = equityStageDurations(operation.stages, 'mint_deposit')
+    const redemptionWithdraw = equityStageDurations(operation.stages, 'redemption_withdraw')
+    const redemptionUnwrap = equityStageDurations(operation.stages, 'redemption_unwrap')
+    const redemptionSend = equityStageDurations(operation.stages, 'redemption_send')
+    const redemptionDetection = equityStageDurations(operation.stages, 'redemption_detection')
+    const redemptionCompletion = equityStageDurations(operation.stages, 'redemption_completion')
+
+    // Same remainder rationale as buildRebalanceRows.
+    const measuredMs =
+      mintAcceptance.ok +
+      mintAcceptance.failed +
+      mintReceipt.ok +
+      mintReceipt.failed +
+      mintWrap.ok +
+      mintWrap.failed +
+      mintDeposit.ok +
+      mintDeposit.failed +
+      redemptionWithdraw.ok +
+      redemptionWithdraw.failed +
+      redemptionUnwrap.ok +
+      redemptionUnwrap.failed +
+      redemptionSend.ok +
+      redemptionSend.failed +
+      redemptionDetection.ok +
+      redemptionDetection.failed +
+      redemptionCompletion.ok +
+      redemptionCompletion.failed
+    const unmeasuredMs = totalMs !== null ? Math.max(0, totalMs - measuredMs) : 0
 
     return {
-      id: row.id,
-      direction: row.direction,
-      amount: row.amount,
-      status: row.status,
-      totalMs: row.totalMs,
-      segments,
+      id: operation.operationId,
+      kind: operation.kind,
+      symbol: operation.symbol,
+      status: operation.status,
+      totalMs,
+      mintAcceptanceOk: mintAcceptance.ok,
+      mintAcceptanceFailed: mintAcceptance.failed,
+      mintReceiptOk: mintReceipt.ok,
+      mintReceiptFailed: mintReceipt.failed,
+      mintWrapOk: mintWrap.ok,
+      mintWrapFailed: mintWrap.failed,
+      mintDepositOk: mintDeposit.ok,
+      mintDepositFailed: mintDeposit.failed,
+      redemptionWithdrawOk: redemptionWithdraw.ok,
+      redemptionWithdrawFailed: redemptionWithdraw.failed,
+      redemptionUnwrapOk: redemptionUnwrap.ok,
+      redemptionUnwrapFailed: redemptionUnwrap.failed,
+      redemptionSendOk: redemptionSend.ok,
+      redemptionSendFailed: redemptionSend.failed,
+      redemptionDetectionOk: redemptionDetection.ok,
+      redemptionDetectionFailed: redemptionDetection.failed,
+      redemptionCompletionOk: redemptionCompletion.ok,
+      redemptionCompletionFailed: redemptionCompletion.failed,
+      unmeasuredMs
     }
   })
+
+export type PercentileSeriesPoint = {
+  start: Date
+  p50Ms: number | null
+  p90Ms: number | null
+  p99Ms: number | null
 }
 
-export type TrendLayout = {
-  points: SeriesPoint[]
-  path: string
-  maxMs: number
-}
+/**
+ * Shapes latency buckets into one row per bucket for the selected stage, null
+ * -coalescing buckets that have no stats for that stage (the stage was never
+ * reached by any sample in that window). One row per bucket in the full
+ * requested range (not just buckets with samples) is intentional: LineChart's
+ * default `defined` accessor skips null y-values, so this renders true gaps
+ * at the bucket's real time position instead of the line stretching to
+ * connect only the populated buckets.
+ */
+export const buildPercentileSeries = (
+  buckets: LatencyBucket[],
+  stage: keyof StageLatencies
+): PercentileSeriesPoint[] =>
+  buckets.map((bucket) => {
+    const stats = bucket.stages[stage]
+    return {
+      start: new Date(bucket.start),
+      p50Ms: stats?.p50Ms ?? null,
+      p90Ms: stats?.p90Ms ?? null,
+      p99Ms: stats?.p99Ms ?? null
+    }
+  })
 
-/** Lays out attestation durations over time as a single polyline. */
-export const layoutAttestationTrend = (
-  samples: AttestationSample[],
-  options: {
-    plotWidth: number
-    plotHeight: number
-  },
-): TrendLayout => {
-  const maxMs = Math.max(1, ...samples.map((sample) => sample.durationMs))
-  const xDenominator = Math.max(1, samples.length - 1)
-  const points = samples.map((sample, index) => ({
-    x:
-      samples.length <= 1
-        ? options.plotWidth / 2
-        : (index / xDenominator) * options.plotWidth,
-    y: options.plotHeight - (sample.durationMs / maxMs) * options.plotHeight,
-  }))
-
-  return {
-    points,
-    path: points
-      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-      .join(' '),
-    maxMs,
-  }
-}
-
-export type BlockLagLayout = {
-  points: SeriesPoint[]
-  path: string
-  maxLagBlocks: number
-}
-
-/** Lays out per-bucket worst block lag over time as a single polyline. */
-export const layoutBlockLagTrend = (
-  buckets: BlockLagPoint[],
-  options: {
-    plotWidth: number
-    plotHeight: number
-  },
-): BlockLagLayout => {
-  const maxLagBlocks = Math.max(0, ...buckets.map((bucket) => bucket.maxLagBlocks))
-  // The y-scale denominator is floored at 1 so an all-zero series divides
-  // safely; the reported maximum stays the true value (0 for a healthy
-  // series), never the scale floor.
-  const scaleMax = Math.max(1, maxLagBlocks)
-  const xDenominator = Math.max(1, buckets.length - 1)
-  const points = buckets.map((bucket, index) => ({
-    x:
-      buckets.length <= 1
-        ? options.plotWidth / 2
-        : (index / xDenominator) * options.plotWidth,
-    y: options.plotHeight - (bucket.maxLagBlocks / scaleMax) * options.plotHeight,
-  }))
-
-  return {
-    points,
-    path: points
-      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-      .join(' '),
-    maxLagBlocks,
-  }
+/**
+ * Thins a sequence of x-axis points down to at most `maxTicks` explicit tick
+ * values, keeping every `step`-th point (step = ceil(n / maxTicks)) plus
+ * always the last point. The default d3 time-scale tick generator picks
+ * ticks by "nice" time boundaries (hour/day/etc), not by point count, so a
+ * range with many daily buckets can otherwise emit more ticks than there are
+ * distinct days -- rendering the same calendar-date label twice in a row
+ * once two ticks land on the same day.
+ */
+export const thinTicks = (points: { start: Date }[], maxTicks: number): Date[] => {
+  const step = Math.max(1, Math.ceil(points.length / maxTicks))
+  return points
+    .filter((_, index) => index % step === 0 || index === points.length - 1)
+    .map((point) => point.start)
 }
 
 export type DependencySparkBar = {
@@ -325,83 +424,12 @@ export type DependencySparkBar = {
  */
 export const layoutDependencySparkline = (
   buckets: DependencyBucket[],
-  options: { plotHeight: number },
+  options: { plotHeight: number }
 ): DependencySparkBar[] => {
   const maxP50 = Math.max(1, ...buckets.map((bucket) => bucket.p50Ms ?? 0))
 
   return buckets.map((bucket) => ({
     height: ((bucket.p50Ms ?? 0) / maxP50) * options.plotHeight,
-    hasErrors: bucket.errors > 0,
+    hasErrors: bucket.errors > 0
   }))
-}
-
-const PERCENTILE_KEYS: PercentileKey[] = ['p50Ms', 'p90Ms', 'p99Ms']
-
-/**
- * Lays out one stage's percentiles across time buckets as polyline charts.
- * Buckets where the stage has no samples are skipped, keeping the lines
- * continuous across gaps.
- */
-export const layoutPercentileSeries = (
-  buckets: LatencyBucket[],
-  stage: keyof StageLatencies,
-  options: {
-    plotWidth: number
-    plotHeight: number
-    maxXLabels: number
-  },
-): SeriesLayout => {
-  const sampled = buckets
-    .map((bucket) => ({
-      start: bucket.start,
-      stats: bucket.stages[stage],
-    }))
-    .filter((bucket) => bucket.stats !== null)
-
-  const maxMs = Math.max(1, ...sampled.map((bucket) => bucket.stats?.p99Ms ?? 0))
-  const xDenominator = Math.max(1, sampled.length - 1)
-  const xFor = (index: number): number =>
-    sampled.length <= 1
-      ? options.plotWidth / 2
-      : (index / xDenominator) * options.plotWidth
-  const yFor = (ms: number): number =>
-    options.plotHeight - (ms / maxMs) * options.plotHeight
-
-  const lines = PERCENTILE_KEYS.map((percentile) => {
-    const points = sampled.map((bucket, index) => ({
-      x: xFor(index),
-      y: yFor(bucket.stats?.[percentile] ?? 0),
-    }))
-
-    return {
-      percentile,
-      points,
-      path: points
-        .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
-        .join(' '),
-    }
-  })
-
-  const labelStep = Math.max(1, Math.ceil(sampled.length / options.maxXLabels))
-  const lastIndex = sampled.length - 1
-  const xLabels = sampled
-    .map((bucket, index) => ({
-      x: xFor(index),
-      label: new Date(bucket.start).toLocaleDateString(undefined, {
-        month: 'short',
-        day: 'numeric',
-      }),
-      index,
-    }))
-    .filter(({ index }) => index % labelStep === 0 || index === lastIndex)
-    .map(({ x, label }) => ({
-      x,
-      label,
-    }))
-
-  return {
-    lines,
-    maxMs,
-    xLabels,
-  }
 }
