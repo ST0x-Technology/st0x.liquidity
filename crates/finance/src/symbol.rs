@@ -26,6 +26,23 @@ impl Symbol {
         }
         Ok(Self(trimmed))
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<&str> for Symbol {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<Symbol> for &str {
+    fn eq(&self, other: &Symbol) -> bool {
+        *self == other.as_str()
+    }
 }
 
 impl<'de> Deserialize<'de> for Symbol {

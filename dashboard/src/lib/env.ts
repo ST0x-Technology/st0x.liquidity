@@ -1,8 +1,7 @@
-import { browser, dev } from '$app/environment'
+import { browser } from '$app/environment'
 import { env } from '$env/dynamic/public'
 
 const DEFAULT_LOCAL_DEV_PORT = '8001'
-const PNL_SQL_DEV_PROXY_PATH = '/__pnl_sql'
 const BACKEND_API_URL_ENV = 'PUBLIC_BACKEND_API_URL'
 
 const localDevPort = (): string => {
@@ -63,15 +62,6 @@ export const getSimulateBackendPort = (): string | null => {
 export const getSimulateSourceId = (): string | null => {
   const val = env['PUBLIC_SIMULATE_SOURCE_ID']?.trim()
   return val !== undefined && val !== '' ? val : null
-}
-
-export const getPnlSqlApiUrl = (): string | null => {
-  const envKey = 'PUBLIC_PNL_SQL_API_URL'
-  const rawEnv = env as Record<string, string | undefined>
-  const val = rawEnv[envKey]?.trim()
-  if (val === undefined || val === '') return null
-  if (dev && isAbsoluteHttpUrl(val)) return PNL_SQL_DEV_PROXY_PATH
-  return val
 }
 
 export const isDashboardMockMode = (): boolean => {

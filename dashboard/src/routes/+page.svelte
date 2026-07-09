@@ -31,7 +31,7 @@
   })
 
   const connectionState = $derived(mockMode ? 'connected' : (ws.current?.state ?? 'disconnected'))
-  const errorContext = $derived(ws.current?.error ?? null)
+  const errorContext = $derived(mockMode ? null : (ws.current?.error ?? null))
 
   let countdown = $state(0)
 

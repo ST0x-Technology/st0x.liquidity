@@ -40,9 +40,11 @@
 
   type Props = {
     connectionStatus: ConnectionState
+    skipHealth?: boolean
+    connectionLabel?: string | null
   }
 
-  const { connectionStatus }: Props = $props()
+  const { connectionStatus, skipHealth = false, connectionLabel = null }: Props = $props()
 
   type HealthInfo = {
     gitCommit: string
@@ -54,6 +56,12 @@
   const now = reactive(new Date())
 
   const fetchHealth = async () => {
+    if (skipHealth) {
+      health.update(() => null)
+      botReachable.update(() => null)
+      return
+    }
+
     if (isDashboardMockMode()) {
       health.update(() => ({ gitCommit: 'mock', uptimeSeconds: 0 }))
       botReachable.update(() => true)
@@ -112,7 +120,9 @@
   )
 
   const statusLabel = $derived(
-    connectionStatus === 'connected'
+    connectionLabel !== null
+      ? connectionLabel
+      : connectionStatus === 'connected'
       ? 'Connected'
       : connectionStatus === 'connecting'
         ? 'Connecting...'

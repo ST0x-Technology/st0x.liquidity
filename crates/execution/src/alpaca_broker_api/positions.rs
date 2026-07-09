@@ -347,7 +347,7 @@ mod tests {
         let aapl = state
             .positions
             .iter()
-            .find(|p| p.symbol.to_string() == "AAPL")
+            .find(|p| p.symbol.as_str() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, shares("10.5"));
         assert!(option_float_eq(
@@ -532,7 +532,7 @@ mod tests {
         let aapl = inventory
             .positions
             .iter()
-            .find(|p| p.symbol.to_string() == "AAPL")
+            .find(|p| p.symbol.as_str() == "AAPL")
             .unwrap();
         assert!(
             option_float_eq(
@@ -614,7 +614,7 @@ mod tests {
         let rklb = inventory
             .positions
             .iter()
-            .find(|position| position.symbol.to_string() == "RKLB")
+            .find(|position| position.symbol.as_str() == "RKLB")
             .unwrap();
         assert!(option_float_eq(
             rklb.market_value,

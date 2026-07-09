@@ -16,6 +16,11 @@ const backendUrl =
   configuredBackendUrl !== undefined && configuredBackendUrl !== ''
     ? configuredBackendUrl
     : `http://localhost:${backendPort}`
+const configuredPnlBackendUrl = process.env['PUBLIC_PNL_BACKEND_API_URL']?.trim()
+const pnlBackendUrl =
+  configuredPnlBackendUrl !== undefined && configuredPnlBackendUrl !== ''
+    ? configuredPnlBackendUrl
+    : backendUrl
 
 type MockRequest = {
   url?: string | null
@@ -34,35 +39,15 @@ const isMockMode = (): boolean => {
   return value === '1' || value === 'true'
 }
 
-const pnlSqlApiUrl = (): string | null => {
-  const value = process.env['PUBLIC_PNL_SQL_API_URL']?.trim()
-  return value !== undefined && value !== '' ? value : null
-}
-
-const pnlSqlProxy = () => {
-  const value = pnlSqlApiUrl()
-  if (value === null || !(value.startsWith('http://') || value.startsWith('https://'))) {
-    return {}
-  }
-
-  const url = new URL(value)
-  return {
-    '/__pnl_sql': {
-      target: url.origin,
-      changeOrigin: true,
-      rewrite: (path: string) => {
-        const queryStart = path.indexOf('?')
-        const query = queryStart === -1 ? '' : path.slice(queryStart)
-        return `${url.pathname}${query}`
-      }
-    }
-  }
-}
-
 const backendProxy = (websocket = false) => ({
   target: backendUrl,
   changeOrigin: true,
   ...(websocket ? { ws: true } : {})
+})
+
+const pnlBackendProxy = () => ({
+  target: pnlBackendUrl,
+  changeOrigin: true
 })
 
 const mockJson = (res: MockResponse, body: unknown): void => {
@@ -200,13 +185,13 @@ export default defineConfig({
       ? {}
       : {
           '/api/ws': backendProxy(true),
+          '/pnl': pnlBackendProxy(),
           '/logs': backendProxy(),
           '/health': backendProxy(),
           '/orders': backendProxy(),
           '/trades': backendProxy(),
           '/transfers': backendProxy(),
-          '/performance': backendProxy(),
-          ...pnlSqlProxy()
+          '/performance': backendProxy()
         }
   }
 })

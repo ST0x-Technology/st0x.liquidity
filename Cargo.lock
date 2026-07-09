@@ -6697,6 +6697,7 @@ dependencies = [
  "lazy_static",
  "metrics",
  "metrics-exporter-prometheus",
+ "num-decimal",
  "num-traits",
  "opentelemetry",
  "opentelemetry-appender-tracing",

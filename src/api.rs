@@ -16,13 +16,18 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use st0x_config::BrokerCtx;
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
 };
 use st0x_execution::FractionalShares;
+use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
+use crate::dashboard::pnl::{
+    PnlError, PnlQuery, PnlResponse, build_pnl_report, validate_pnl_snapshot_rowid,
+};
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
 use crate::performance::equity_timing::load_equity_timings;
@@ -159,6 +164,69 @@ async fn health() -> Json<HealthResponse> {
         git_commit: GIT_COMMIT.to_string(),
         uptime_seconds: uptime.num_seconds(),
     })
+}
+
+async fn pnl(
+    State(state): State<AppState>,
+    Query(query): Query<PnlQuery>,
+) -> Result<Json<PnlResponse>, (StatusCode, String)> {
+    let after = query
+        .activity_after()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let until = query
+        .activity_until()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    query
+        .symbol_filter(&mut Vec::new())
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    validate_pnl_snapshot_rowid(&state.pool, &query)
+        .await
+        .map_err(pnl_error_response)?;
+
+    let activities = if let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker {
+        alpaca_auth
+            .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
+            .await
+            .map_err(|error| {
+                error!(%error, "Failed to fetch Alpaca account activities for PnL");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Failed to fetch Alpaca account activities".to_string(),
+                )
+            })?
+    } else {
+        Vec::new()
+    };
+
+    build_pnl_report(&state.pool, &query, activities)
+        .await
+        .map(Json)
+        .map_err(pnl_error_response)
+}
+
+fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
+    match error {
+        PnlError::InvalidDate { .. }
+        | PnlError::InvalidSnapshotRowid { .. }
+        | PnlError::InvalidSymbolFilter { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
+        PnlError::InvalidPayload { .. }
+        | PnlError::MalformedPayload { .. }
+        | PnlError::InvalidFinancialField { .. }
+        | PnlError::InvalidInternalDecimal { .. } => {
+            error!(%error, "Failed to build PnL report from persisted payload");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build PnL report".to_string(),
+            )
+        }
+        PnlError::Database(error) => {
+            error!(%error, "Failed to build PnL report");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build PnL report".to_string(),
+            )
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1672,6 +1740,7 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route("/performance/reliability", get(performance_reliability))
         .route("/performance/infra", get(performance_infra))
+        .route("/pnl", get(pnl))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
@@ -1694,11 +1763,17 @@ mod tests {
     use alloy::primitives::Address;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use httpmock::Method::GET;
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+    use uuid::uuid;
 
-    use st0x_config::{Ctx, RestApiCtx, create_test_ctx_with_order_owner};
+    use st0x_config::{BrokerCtx, Ctx, RestApiCtx, create_test_ctx_with_order_owner};
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, TimeInForce,
+    };
     use st0x_float_macro::float;
     use st0x_tokenization::{
         MintVerificationError, TokenizerError, issuer_request_id, tokenization_request_id,
@@ -2208,6 +2283,41 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_to_string(response).await;
         serde_json::from_str(&body).expect("valid LogResponse JSON")
+    }
+
+    #[tokio::test]
+    async fn pnl_rejects_invalid_only_symbol_filter_before_loading_report() {
+        let mock_server = httpmock::MockServer::start();
+        let account_activity_mock = mock_server.mock(|when, then| {
+            when.method(GET).path("/v1/accounts/activities");
+            then.status(500)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "message": "should not be called" }));
+        });
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            api_key: "test_key_id".to_owned(),
+            api_secret: "test_secret_key".to_owned(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        });
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pnl?symbol=RKLB%27%29%3B%20DROP%20TABLE%20events%3B%20--")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        account_activity_mock.assert_calls(0);
     }
 
     fn write_test_logs(dir: &std::path::Path, filename: &str, content: &str) {

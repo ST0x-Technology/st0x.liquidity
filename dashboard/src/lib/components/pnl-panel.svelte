@@ -3,13 +3,15 @@
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import MultiSelect from '$lib/components/multi-select.svelte'
-  import { decimalCompare, formatDecimal } from '$lib/decimal'
+  import { decimalAdd, decimalCompare, decimalMul, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
   import { formatUtc } from '$lib/time'
-  import { fetchPnlReport } from '$lib/pnl/api'
+  import { fetchCompletePnlReport } from '$lib/pnl/api'
   import { STREAM_KEYS } from '$lib/pnl/report'
   import type {
+    PnlCostEntry,
     PnlEntry,
+    PnlMarketSessionFilter,
     PnlResponse,
     PnlStreamKey,
     PnlWindow
@@ -17,8 +19,7 @@
 
   type RangePreset = '1w' | '1m' | 'ytd' | '1y' | 'all' | 'custom'
 
-  const PNL_ENTRY_LIMIT = Number.MAX_SAFE_INTEGER
-  const POLL_INTERVAL_MS = 10_000
+  const POLL_INTERVAL_MS = 60_000
   const MS_PER_DAY = 24 * 60 * 60 * 1_000
 
   const dateFromIso = (value: string): Date => new Date(`${value}T00:00:00.000Z`)
@@ -63,22 +64,22 @@
   const entries = reactive<PnlEntry[]>([])
   const loading = reactive(false)
   const error = reactive<string | null>(null)
-  const total = reactive(0)
   const selectedSymbols = reactive<Set<string>>(new Set())
   const selectedAssetChartSymbols = reactive<Set<string>>(new Set())
   const selectedAssetChartStreams = reactive<Set<PnlStreamKey>>(new Set(STREAM_KEYS))
   const selectedMethodChartSymbols = reactive<Set<string>>(new Set())
   const selectedMethodChartStreams = reactive<Set<PnlStreamKey>>(new Set(STREAM_KEYS))
-  const dayFilter = reactive<'all' | 'weekday' | 'weekend'>('all')
+  const selectedAssetSymbol = reactive<string | null>(null)
+  const marketSessionFilter = reactive<PnlMarketSessionFilter>('all')
   const availableStartDate = $derived.by(
     () =>
-      report.current?.sampleStats?.firstAt?.slice(0, 10) ??
+      report.current?.availableRange?.firstDate ??
       report.current?.windows?.[0]?.startAt.slice(0, 10) ??
       initialAvailableStartDate
   )
   const availableEndDate = $derived.by(
     () =>
-      report.current?.sampleStats?.lastAt?.slice(0, 10) ??
+      report.current?.availableRange?.lastDate ??
       report.current?.windows?.at(-1)?.startAt.slice(0, 10) ??
       initialAvailableEndDate
   )
@@ -139,7 +140,12 @@
       label: 'Realized gross PnL',
       formula:
         'counter_trade_pnl + onchain_netting_pnl + baseline_drift_pnl + directional_excess_pnl',
-      note: 'Gross realized replay by close date; costs, financing, and unrealized NAV drift are not included.'
+      note: 'Gross realized replay by close date before tracked costs, financing, and unrealized NAV drift.'
+    },
+    {
+      label: 'Net realized PnL',
+      formula: 'realized_gross_pnl - tracked_costs + tracked_revenue',
+      note: 'Tracked costs currently include explicit tokenization fees, CCTP fees, and live Alpaca account fees and margin interest when available. Tracked revenue includes live Alpaca dividends and account activity credits when available.'
     }
   ]
 
@@ -158,11 +164,19 @@
   const isPnlStreamKey = (value: string): value is PnlStreamKey =>
     (STREAM_KEYS as readonly string[]).includes(value)
 
-  const matchesDayFilter = (isWeekend: boolean): boolean => {
-    if (dayFilter.current === 'weekday') return !isWeekend
-    if (dayFilter.current === 'weekend') return isWeekend
-    return true
+  const matchesMarketSessionFilter = (window: PnlWindow): boolean => {
+    if (marketSessionFilter.current === 'all') return true
+    return window.marketSession === marketSessionFilter.current
   }
+
+  const marketSessionFilterLabel = $derived.by(() => {
+    if (marketSessionFilter.current === 'pre') return 'pre-market'
+    if (marketSessionFilter.current === 'rth') return 'RTH'
+    if (marketSessionFilter.current === 'post') return 'post-market'
+    if (marketSessionFilter.current === 'overnight') return 'overnight'
+    if (marketSessionFilter.current === 'weekend') return 'weekend'
+    return 'all market sessions'
+  })
 
   const dateKey = (timestamp: string): string => timestamp.slice(0, 10)
 
@@ -224,19 +238,19 @@
     lastRequestedDateRangeKey = dateRangeKey(requestFromDate, requestToDate)
 
     try {
-      const data = await fetchPnlReport({
-        limit: PNL_ENTRY_LIMIT,
-        offset: 0,
-        symbols: selectedSymbols.current,
+      const requestSymbols = isCompleteSelection(selectedSymbols.current, allSymbols.current)
+        ? new Set<string>()
+        : selectedSymbols.current
+      const data = await fetchCompletePnlReport({
+        symbols: requestSymbols,
         fromDate: requestFromDate,
         toDate: requestToDate,
-        dayFilter: dayFilter.current
+        marketSessionFilter: marketSessionFilter.current
       })
 
       if (seq !== fetchSeq) return
 
       report.update(() => data)
-      total.update(() => data.total)
       entries.update(() => data.entries)
 
       syncAvailableSymbols(data.symbolUniverse ?? data.symbols.map((summary) => summary.symbol))
@@ -253,6 +267,11 @@
     void fetchPnl()
   }
 
+  const refreshIfIdle = () => {
+    if (loading.current) return
+    void fetchPnl()
+  }
+
   const handleSymbolChange = (selected: Set<string>) => {
     selectedSymbols.update(() => (selected.size === 0 ? new Set(allSymbols.current) : selected))
     void fetchPnl()
@@ -260,6 +279,7 @@
 
   const clearFilters = () => {
     selectedSymbols.update(() => new Set(allSymbols.current))
+    marketSessionFilter.update(() => 'all')
     void fetchPnl()
   }
 
@@ -279,8 +299,8 @@
     selectedMethodChartStreams.update(() => new Set([...selected].filter(isPnlStreamKey)))
   }
 
-  const setDayFilter = (filter: 'all' | 'weekday' | 'weekend') => {
-    dayFilter.update(() => filter)
+  const setMarketSessionFilter = (filter: PnlMarketSessionFilter) => {
+    marketSessionFilter.update(() => filter)
     refresh()
   }
 
@@ -326,8 +346,9 @@
   ]
 
   const hasFilters = $derived(
-    allSymbols.current.length > 0 &&
-      !isCompleteSelection(selectedSymbols.current, allSymbols.current)
+    (allSymbols.current.length > 0 &&
+      !isCompleteSelection(selectedSymbols.current, allSymbols.current)) ||
+      marketSessionFilter.current !== 'all'
   )
 
   $effect(() => {
@@ -351,7 +372,7 @@
   onMount(() => {
     void fetchPnl()
     const interval = setInterval(() => {
-      void fetchPnl()
+      refreshIfIdle()
     }, POLL_INTERVAL_MS)
 
     return () => {
@@ -392,6 +413,20 @@
   }
   const fmtCount = (value: number): string => new Intl.NumberFormat('en-US').format(value)
   const fmtMaybeUtc = (value: string | null): string => (value === null ? 'n/a' : formatUtc(value))
+  const costStatusClass = (status: string): string => {
+    if (status === 'included') return 'text-green-500'
+    if (status === 'zero') return 'text-muted-foreground'
+    return 'text-red-400'
+  }
+  const costStatusLabel = (status: string): string => status.replaceAll('_', ' ')
+  const costCategoryLabel = (entry: PnlCostEntry): string => entry.category.replaceAll('_', ' ')
+  const accountingBucketLabel = (value: string): string => value.replaceAll('_', ' ')
+  const accountingEffectClass = (effect: string): string =>
+    effect === 'revenue'
+      ? 'text-green-500'
+      : effect === 'cost'
+        ? 'text-red-400'
+        : 'text-muted-foreground'
 
   const shortId = (id: string): string => {
     if (id.length <= 18) return id
@@ -433,9 +468,97 @@
   const chartWindowSource = $derived(report.current?.windows ?? [])
   const chartWindows = $derived(
     chartWindowSource.filter(
-      (window) => matchesDayFilter(window.isWeekend) && matchesDateRange(dateKey(window.startAt))
+      (window) => matchesMarketSessionFilter(window) && matchesDateRange(dateKey(window.startAt))
     )
   )
+
+  type AssetVolume = {
+    shares: string
+    notionalUsd: string
+  }
+
+  const emptyAssetVolume: AssetVolume = {
+    shares: '0',
+    notionalUsd: '0'
+  }
+
+  const assetVolumes = $derived.by(() => {
+    const volumes = new Map<string, AssetVolume>()
+
+    for (const entry of entries.current) {
+      const current = volumes.get(entry.symbol) ?? emptyAssetVolume
+      const twoSidedShares = decimalMul(entry.shares, '2')
+      const openingNotional = decimalMul(entry.shares, entry.openingPriceUsd)
+      const closingNotional = decimalMul(entry.shares, entry.closingPriceUsd)
+      volumes.set(entry.symbol, {
+        shares: decimalAdd(current.shares, twoSidedShares),
+        notionalUsd: decimalAdd(current.notionalUsd, decimalAdd(openingNotional, closingNotional))
+      })
+    }
+
+    return volumes
+  })
+
+  const selectedAsset = $derived.by(() => {
+    const symbols = report.current?.symbols.map((row) => row.symbol) ?? []
+    if (selectedAssetSymbol.current && symbols.includes(selectedAssetSymbol.current)) {
+      return selectedAssetSymbol.current
+    }
+    return (
+      symbols.find((symbol) => entries.current.some((entry) => entry.symbol === symbol)) ??
+      symbols[0] ??
+      null
+    )
+  })
+
+  const selectedAssetEntries = $derived(
+    selectedAsset === null ? [] : entries.current.filter((entry) => entry.symbol === selectedAsset)
+  )
+
+  const selectedAssetSummary = $derived(
+    selectedAsset === null
+      ? null
+      : (report.current?.symbols.find((row) => row.symbol === selectedAsset) ?? null)
+  )
+
+  const selectAsset = (symbol: string) => {
+    selectedAssetSymbol.update(() => symbol)
+  }
+
+  const nyPartsFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  })
+
+  const marketSessionForIso = (iso: string): PnlMarketSessionFilter => {
+    const date = new Date(iso)
+    if (Number.isNaN(date.getTime())) return 'overnight'
+
+    const parts = nyPartsFormatter.formatToParts(date)
+    const weekday = parts.find((part) => part.type === 'weekday')?.value
+    if (weekday === 'Sat' || weekday === 'Sun') return 'weekend'
+
+    const hour = Number(parts.find((part) => part.type === 'hour')?.value ?? '0')
+    const minute = Number(parts.find((part) => part.type === 'minute')?.value ?? '0')
+    const minuteOfDay = hour * 60 + minute
+
+    if (minuteOfDay >= 4 * 60 && minuteOfDay < 9 * 60 + 30) return 'pre'
+    if (minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60) return 'rth'
+    if (minuteOfDay >= 16 * 60 && minuteOfDay < 20 * 60) return 'post'
+    return 'overnight'
+  }
+
+  const sessionLabel = (session: PnlMarketSessionFilter): string => {
+    if (session === 'all') return 'All'
+    if (session === 'pre') return 'Pre'
+    if (session === 'rth') return 'RTH'
+    if (session === 'post') return 'Post'
+    if (session === 'overnight') return 'Overnight'
+    return 'Weekend'
+  }
 
   type BucketCadence = 'day' | 'week' | 'month'
 
@@ -908,34 +1031,58 @@
       </label>
       <div class="inline-flex overflow-hidden rounded border text-xs">
         <button
-          class="px-2 py-1 hover:bg-accent {dayFilter.current === 'all'
+          class="px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'all'
             ? 'bg-amber-500/20 text-amber-200'
             : 'bg-background'}"
           onclick={() => {
-            setDayFilter('all')
-          }}>All days</button
+            setMarketSessionFilter('all')
+          }}>All sessions</button
         >
         <button
-          class="border-l px-2 py-1 hover:bg-accent {dayFilter.current === 'weekday'
+          class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'pre'
             ? 'bg-amber-500/20 text-amber-200'
             : 'bg-background'}"
           onclick={() => {
-            setDayFilter('weekday')
-          }}>Weekdays</button
+            setMarketSessionFilter('pre')
+          }}>Pre</button
         >
         <button
-          class="border-l px-2 py-1 hover:bg-accent {dayFilter.current === 'weekend'
+          class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'rth'
             ? 'bg-amber-500/20 text-amber-200'
             : 'bg-background'}"
           onclick={() => {
-            setDayFilter('weekend')
-          }}>Weekends</button
+            setMarketSessionFilter('rth')
+          }}>RTH</button
+        >
+        <button
+          class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'post'
+            ? 'bg-amber-500/20 text-amber-200'
+            : 'bg-background'}"
+          onclick={() => {
+            setMarketSessionFilter('post')
+          }}>Post</button
+        >
+        <button
+          class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'overnight'
+            ? 'bg-amber-500/20 text-amber-200'
+            : 'bg-background'}"
+          onclick={() => {
+            setMarketSessionFilter('overnight')
+          }}>Overnight</button
+        >
+        <button
+          class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'weekend'
+            ? 'bg-amber-500/20 text-amber-200'
+            : 'bg-background'}"
+          onclick={() => {
+            setMarketSessionFilter('weekend')
+          }}>Weekend</button
         >
       </div>
       <span class="text-muted-foreground">
-        Showing realized close dates {fromDate.current} to {toDate.current} as {timeBuckets.length}
-        {cadenceLabel} non-cumulative buckets. Cash values treat USD and USDC 1:1; portfolio percentage
-        return is not shown because historical NAV is not persisted.
+        Showing realized close dates {fromDate.current} to {toDate.current} for {marketSessionFilterLabel}
+        as {timeBuckets.length}
+        {cadenceLabel} non-cumulative buckets.
       </span>
     </div>
   </Card.Header>
@@ -952,6 +1099,61 @@
     {:else if report.current}
       {@const summary = report.current.summary}
 
+      <details class="mb-3 rounded-xl border bg-card/40 p-3 text-sm">
+        <summary class="cursor-pointer select-none font-semibold">Docs</summary>
+        <div class="mt-3 space-y-4 text-xs leading-5 text-muted-foreground">
+          <div class="grid gap-3 lg:grid-cols-4">
+            <div class="rounded-lg border bg-background/50 p-3">
+              <div class="font-semibold text-foreground">Scope</div>
+              <p class="mt-2">
+                The dashboard reports realized closed-lot PnL from persisted fills. USD and USDC are
+                treated as equivalent reporting currency; USD/USDC basis is not modeled as PnL.
+                Percentage return and true NAV PnL require historical portfolio, mark, and cash-flow
+                snapshots that are not currently persisted.
+              </p>
+            </div>
+            <div class="rounded-lg border bg-background/50 p-3">
+              <div class="font-semibold text-foreground">Costs</div>
+              <p class="mt-2">
+                Net realized PnL deducts explicit tracked costs and adds tracked revenues. Costs or
+                revenues without a symbol are included at the account level and are not artificially
+                allocated into individual asset rows.
+              </p>
+            </div>
+            <div class="rounded-lg border bg-background/50 p-3">
+              <div class="font-semibold text-foreground">Current Exposure</div>
+              <p class="mt-2">
+                Open inventory and unmatched offchain-origin exposure are current replay state from
+                all loaded fills. They are not reconstructed as-of snapshots for the selected
+                historical date range.
+              </p>
+            </div>
+            <div class="rounded-lg border bg-background/50 p-3">
+              <div class="font-semibold text-foreground">Sessions</div>
+              <p class="mt-2">
+                Session labels are classified from each fill timestamp in New York time: pre-market,
+                RTH, post-market, overnight, or weekend. Historical rows are classified using this
+                current session model.
+              </p>
+            </div>
+          </div>
+
+          <div class="grid gap-3 lg:grid-cols-2">
+            {#each formulaRows as formula (formula.label)}
+              <div class="rounded-lg border bg-background/50 p-3">
+                <div class="font-semibold text-foreground">{formula.label}</div>
+                <code class="mt-2 block rounded bg-muted/50 px-2 py-1 font-mono">
+                  {formula.formula}
+                </code>
+                <p class="mt-2">
+                  {formula.note}
+                </p>
+              </div>
+            {/each}
+          </div>
+        </div>
+      </details>
+
       {#if report.current.sampleStats}
         {@const sample = report.current.sampleStats}
         <section class="mb-3 rounded-xl border bg-card/50 p-3">
@@ -959,8 +1161,8 @@
             <div>
               <div class="text-sm font-semibold">Database Trade Sample</div>
               <div class="mt-1 text-xs text-muted-foreground">
-                Full unfiltered Position fill history available through the SQL JSON endpoint. Use
-                this range when choosing dashboard dates.
+                Position fill history for the selected assets and market session inside the selected
+                date range.
               </div>
             </div>
             <div class="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
@@ -1010,12 +1212,39 @@
         </section>
       {/if}
 
-      <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+      <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div class="rounded-lg border bg-card/60 p-3">
+          <div class="text-xs text-muted-foreground">Net Realized PnL</div>
+          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.netRealizedPnlUsd)}">
+            {fmtSignedUsd(summary.netRealizedPnlUsd)}
+          </div>
+          <div class="mt-1 text-xs text-muted-foreground">Gross minus costs plus revenues</div>
+        </div>
+
         <div class="rounded-lg border bg-card/60 p-3">
           <div class="text-xs text-muted-foreground">Realized Gross PnL</div>
-          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.totalPnlUsd)}">
-            {fmtSignedUsd(summary.totalPnlUsd)}
+          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.grossRealizedPnlUsd)}">
+            {fmtSignedUsd(summary.grossRealizedPnlUsd)}
           </div>
+          <div class="mt-1 text-xs text-muted-foreground">Closed-lot fill replay before costs</div>
+        </div>
+
+        <div class="rounded-lg border bg-card/60 p-3">
+          <div class="text-xs text-muted-foreground">Tracked Costs</div>
+          <div class="mt-1 font-mono text-xl font-semibold text-red-400">
+            {fmtUsd(summary.trackedCostsUsd)}
+          </div>
+          <div class="mt-1 text-xs text-muted-foreground">
+            {fmtCount(report.current.costs.costEntryCount)} cost/revenue ledger entries
+          </div>
+        </div>
+
+        <div class="rounded-lg border bg-card/60 p-3">
+          <div class="text-xs text-muted-foreground">Tracked Revenue</div>
+          <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.trackedRevenueUsd)}">
+            {fmtSignedUsd(summary.trackedRevenueUsd)}
+          </div>
+          <div class="mt-1 text-xs text-muted-foreground">Dividends and broker ledger credits</div>
         </div>
 
         <div class="rounded-lg border bg-card/60 p-3">
@@ -1091,6 +1320,217 @@
         </div>
       </div>
 
+      <section class="mt-4 overflow-hidden rounded-xl border bg-card/50">
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
+          <div>
+            <div class="text-sm font-semibold">Per Asset PnL</div>
+            <div class="text-xs text-muted-foreground">
+              Click an asset to inspect the realized trades behind the row.
+            </div>
+          </div>
+          <div class="font-mono text-xs text-muted-foreground">
+            {fmtCount(report.current.symbols.length)} assets
+          </div>
+        </div>
+
+        <div class="overflow-x-auto">
+          <Table.Root>
+            <Table.Header>
+              <Table.Row>
+                <Table.Head>Asset</Table.Head>
+                <Table.Head class="text-right">Gross</Table.Head>
+                <Table.Head class="text-right">Direct Costs</Table.Head>
+                <Table.Head class="text-right">Direct Revenue</Table.Head>
+                <Table.Head class="text-right">Net</Table.Head>
+                <Table.Head class="text-right">Volume</Table.Head>
+                <Table.Head class="text-right">Counter</Table.Head>
+                <Table.Head class="text-right">On-chain</Table.Head>
+                <Table.Head class="text-right">Directional</Table.Head>
+                <Table.Head class="text-right">Baseline Drift</Table.Head>
+                <Table.Head class="text-right">Lots</Table.Head>
+              </Table.Row>
+            </Table.Header>
+            <Table.Body>
+              {#each report.current.symbols as row (row.symbol)}
+                {@const volume = assetVolumes.get(row.symbol) ?? emptyAssetVolume}
+                <Table.Row class={selectedAsset === row.symbol ? 'bg-amber-500/10' : ''}>
+                  <Table.Cell>
+                    <button
+                      class="font-mono text-xs font-semibold text-foreground hover:text-amber-200"
+                      onclick={() => {
+                        selectAsset(row.symbol)
+                      }}
+                    >
+                      {row.symbol}
+                    </button>
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(row.grossRealizedPnlUsd)}"
+                  >
+                    {fmtSignedUsd(row.grossRealizedPnlUsd)}
+                  </Table.Cell>
+                  <Table.Cell class="text-right font-mono text-xs text-red-400">
+                    {fmtUsd(row.trackedCostsUsd)}
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(row.trackedRevenueUsd)}"
+                  >
+                    {fmtSignedUsd(row.trackedRevenueUsd)}
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(row.netRealizedPnlUsd)}"
+                  >
+                    {fmtSignedUsd(row.netRealizedPnlUsd)}
+                  </Table.Cell>
+                  <Table.Cell class="text-right font-mono text-xs">
+                    <div>{fmtShares(volume.shares)} sh</div>
+                    <div class="text-[11px] text-muted-foreground">
+                      {fmtUsd(volume.notionalUsd)}
+                    </div>
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(row.counterTradePnlUsd)}"
+                  >
+                    {fmtSignedUsd(row.counterTradePnlUsd)}
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(row.onchainNettingPnlUsd)}"
+                  >
+                    {fmtSignedUsd(row.onchainNettingPnlUsd)}
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(
+                      row.directionalImbalanceExcessPnlUsd
+                    )}"
+                  >
+                    {fmtSignedUsd(row.directionalImbalanceExcessPnlUsd)}
+                  </Table.Cell>
+                  <Table.Cell
+                    class="text-right font-mono text-xs {pnlColor(
+                      row.directionalInventoryBaselinePnlUsd
+                    )}"
+                  >
+                    {fmtSignedUsd(row.directionalInventoryBaselinePnlUsd)}
+                  </Table.Cell>
+                  <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
+                    {row.matchedLotCount}
+                  </Table.Cell>
+                </Table.Row>
+              {/each}
+            </Table.Body>
+          </Table.Root>
+        </div>
+
+        <div class="border-t bg-background/20">
+          <div class="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+            <div>
+              <div class="text-sm font-semibold">
+                {selectedAsset ?? 'Asset'} Trades
+              </div>
+              {#if selectedAssetSummary}
+                <div class="text-xs text-muted-foreground">
+                  Net {fmtSignedUsd(selectedAssetSummary.netRealizedPnlUsd)} from {fmtCount(
+                    selectedAssetEntries.length
+                  )} matched lots
+                </div>
+              {/if}
+            </div>
+            {#if selectedAsset !== null}
+              {@const volume = assetVolumes.get(selectedAsset) ?? emptyAssetVolume}
+              <div class="font-mono text-xs text-muted-foreground">
+                volume {fmtShares(volume.shares)} sh / {fmtUsd(volume.notionalUsd)}
+              </div>
+            {/if}
+          </div>
+
+          <div class="max-h-[30rem] overflow-auto">
+            {#if selectedAssetEntries.length === 0 && !loading.current}
+              <div class="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                No matched PnL lots for the selected asset.
+              </div>
+            {:else}
+              <Table.Root>
+                <Table.Header>
+                  <Table.Row>
+                    <Table.Head class="text-right">Closed</Table.Head>
+                    <Table.Head class="text-right">Open Session</Table.Head>
+                    <Table.Head class="text-right">Close Session</Table.Head>
+                    <Table.Head class="text-right">Open Venue</Table.Head>
+                    <Table.Head class="text-right">Close Venue</Table.Head>
+                    <Table.Head class="text-right">Flow</Table.Head>
+                    <Table.Head class="text-right">Shares</Table.Head>
+                    <Table.Head class="text-right">Open Price</Table.Head>
+                    <Table.Head class="text-right">Close Price</Table.Head>
+                    <Table.Head class="text-right">Lag</Table.Head>
+                    <Table.Head class="text-right">Spread</Table.Head>
+                    <Table.Head class="text-right">PnL</Table.Head>
+                    <Table.Head class="text-right">IDs</Table.Head>
+                  </Table.Row>
+                </Table.Header>
+                <Table.Body>
+                  {#each selectedAssetEntries as entry, idx (`${entry.openingFillId}-${entry.closingFillId}-${String(idx)}`)}
+                    <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
+                      <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
+                        {formatUtc(entry.closedAt)}
+                      </Table.Cell>
+                      <Table.Cell class="text-right text-xs">
+                        {sessionLabel(marketSessionForIso(entry.openedAt))}
+                      </Table.Cell>
+                      <Table.Cell class="text-right text-xs">
+                        {sessionLabel(marketSessionForIso(entry.closedAt))}
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
+                        {entry.openingVenue}
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
+                        {entry.closingVenue}
+                      </Table.Cell>
+                      <Table.Cell class="text-right text-xs">
+                        <span class={directionColor(entry.openingDirection)}
+                          >{entry.openingDirection}</span
+                        >
+                        <span class="text-muted-foreground"> / </span>
+                        <span class={directionColor(entry.closingDirection)}
+                          >{entry.closingDirection}</span
+                        >
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-xs">
+                        {fmtShares(entry.shares)}
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-xs">
+                        {fmtUsd(entry.openingPriceUsd)}
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-xs">
+                        {fmtUsd(entry.closingPriceUsd)}
+                      </Table.Cell>
+                      <Table.Cell
+                        class="text-right font-mono text-[11px] {entry.delayedCounterTrade
+                          ? 'text-amber-300'
+                          : 'text-muted-foreground'}"
+                      >
+                        {fmtDuration(entry.elapsedSeconds)}
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-xs {pnlColor(entry.spreadUsd)}">
+                        {fmtSignedUsd(entry.spreadUsd)}
+                      </Table.Cell>
+                      <Table.Cell
+                        class="text-right font-mono text-xs {pnlColor(entry.realizedPnlUsd)}"
+                      >
+                        {fmtSignedUsd(entry.realizedPnlUsd)}
+                      </Table.Cell>
+                      <Table.Cell class="text-right font-mono text-[11px] text-muted-foreground">
+                        <div>{shortId(entry.openingFillId)}</div>
+                        <div>{shortId(entry.closingFillId)}</div>
+                      </Table.Cell>
+                    </Table.Row>
+                  {/each}
+                </Table.Body>
+              </Table.Root>
+            {/if}
+          </div>
+        </div>
+      </section>
+
       {#if report.current.warnings.length > 0}
         <details
           class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100"
@@ -1106,26 +1546,110 @@
         </details>
       {/if}
 
-      <details class="mt-3 rounded-xl border bg-card/40 p-3 text-sm">
-        <summary class="cursor-pointer select-none font-semibold">
-          Math / formula reference
-        </summary>
-        <div class="mt-3 grid gap-3 lg:grid-cols-2">
-          {#each formulaRows as formula (formula.label)}
-            <div class="rounded-lg border bg-background/50 p-3">
-              <div class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                {formula.label}
-              </div>
-              <code class="mt-2 block rounded bg-muted/50 px-2 py-1 font-mono text-xs">
-                {formula.formula}
-              </code>
-              <p class="mt-2 text-xs leading-5 text-muted-foreground">
-                {formula.note}
-              </p>
+      <section class="mt-3 overflow-hidden rounded-xl border bg-card/40">
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
+          <div>
+            <div class="text-sm font-semibold">Cost / Revenue Coverage</div>
+            <div class="text-xs text-muted-foreground">
+              Net PnL subtracts included costs and adds included revenues. Sources marked not
+              ingested require additional backend persistence before they can be accounting-grade.
             </div>
-          {/each}
+          </div>
+          <div class="font-mono text-xs text-muted-foreground">
+            costs {fmtUsd(report.current.costs.totalTrackedCostsUsd)} / revenue {fmtUsd(
+              report.current.costs.totalTrackedRevenueUsd
+            )}
+          </div>
         </div>
-      </details>
+        <div class="overflow-x-auto">
+          <Table.Root>
+            <Table.Header>
+              <Table.Row>
+                <Table.Head>Source</Table.Head>
+                <Table.Head>Bucket</Table.Head>
+                <Table.Head>Effect</Table.Head>
+                <Table.Head>Status</Table.Head>
+                <Table.Head class="text-right">Amount</Table.Head>
+                <Table.Head>Note</Table.Head>
+              </Table.Row>
+            </Table.Header>
+            <Table.Body>
+              {#each report.current.costs.coverage as source (source.source)}
+                <Table.Row>
+                  <Table.Cell class="text-xs font-medium">{source.source}</Table.Cell>
+                  <Table.Cell class="text-xs text-muted-foreground">
+                    {accountingBucketLabel(source.accountingBucket)}
+                  </Table.Cell>
+                  <Table.Cell class="text-xs {accountingEffectClass(source.effect)}">
+                    {source.effect}
+                  </Table.Cell>
+                  <Table.Cell class="text-xs {costStatusClass(source.status)}">
+                    {costStatusLabel(source.status)}
+                  </Table.Cell>
+                  <Table.Cell class="text-right font-mono text-xs">
+                    {fmtUsd(source.amountUsd)}
+                  </Table.Cell>
+                  <Table.Cell class="text-xs text-muted-foreground">{source.note}</Table.Cell>
+                </Table.Row>
+              {/each}
+            </Table.Body>
+          </Table.Root>
+        </div>
+
+        <details class="border-t px-3 py-2 text-sm">
+          <summary class="cursor-pointer select-none font-semibold">
+            Cost entries ({fmtCount(report.current.costEntries.length)})
+          </summary>
+          <div class="mt-3 max-h-72 overflow-auto">
+            {#if report.current.costEntries.length === 0}
+              <div class="flex h-24 items-center justify-center text-sm text-muted-foreground">
+                No tracked persisted cost entries for the selected window.
+              </div>
+            {:else}
+              <Table.Root>
+                <Table.Header>
+                  <Table.Row>
+                    <Table.Head class="text-right">Time</Table.Head>
+                    <Table.Head>Category</Table.Head>
+                    <Table.Head>Bucket</Table.Head>
+                    <Table.Head>Effect</Table.Head>
+                    <Table.Head class="text-right">Amount</Table.Head>
+                    <Table.Head>Scope</Table.Head>
+                    <Table.Head>Detail</Table.Head>
+                  </Table.Row>
+                </Table.Header>
+                <Table.Body>
+                  {#each report.current.costEntries as entry (`${String(entry.eventRowid)}-${entry.category}`)}
+                    <Table.Row>
+                      <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
+                        {formatUtc(entry.occurredAt)}
+                      </Table.Cell>
+                      <Table.Cell class="text-xs">{costCategoryLabel(entry)}</Table.Cell>
+                      <Table.Cell class="text-xs text-muted-foreground">
+                        {accountingBucketLabel(entry.accountingBucket)}
+                      </Table.Cell>
+                      <Table.Cell class="text-xs {accountingEffectClass(entry.effect)}">
+                        {entry.effect}
+                      </Table.Cell>
+                      <Table.Cell
+                        class="text-right font-mono text-xs {accountingEffectClass(entry.effect)}"
+                      >
+                        {fmtUsd(entry.amountUsd)}
+                      </Table.Cell>
+                      <Table.Cell class="font-mono text-xs text-muted-foreground">
+                        {entry.symbol ?? 'account'}
+                      </Table.Cell>
+                      <Table.Cell class="text-xs text-muted-foreground">
+                        {entry.detail}
+                      </Table.Cell>
+                    </Table.Row>
+                  {/each}
+                </Table.Body>
+              </Table.Root>
+            {/if}
+          </div>
+        </details>
+      </section>
 
       <div class="mt-4 grid gap-4 xl:grid-cols-2">
         <section class="overflow-hidden rounded-xl border bg-card/40">
@@ -1497,140 +2021,6 @@
           No PnL chart buckets for the selected asset/date filters.
         </div>
       {/if}
-
-      <div class="mt-4 grid gap-4 lg:grid-cols-[0.9fr_1.4fr]">
-        <section class="min-h-0 overflow-hidden rounded-lg border">
-          <div class="border-b px-3 py-2 text-sm font-semibold">By Asset</div>
-          <div class="max-h-80 overflow-auto">
-            <Table.Root>
-              <Table.Header>
-                <Table.Row>
-                  <Table.Head>Asset</Table.Head>
-                  <Table.Head class="text-right">Realized</Table.Head>
-                  <Table.Head class="text-right">Counter</Table.Head>
-                  <Table.Head class="text-right">On-chain</Table.Head>
-                  <Table.Head class="text-right">Directional</Table.Head>
-                  <Table.Head class="text-right">Baseline Drift</Table.Head>
-                  <Table.Head class="text-right">Lots</Table.Head>
-                </Table.Row>
-              </Table.Header>
-              <Table.Body>
-                {#each report.current.symbols as row (row.symbol)}
-                  <Table.Row>
-                    <Table.Cell class="font-mono text-xs font-medium">{row.symbol}</Table.Cell>
-                    <Table.Cell class="text-right font-mono text-xs {pnlColor(row.totalPnlUsd)}">
-                      {fmtSignedUsd(row.totalPnlUsd)}
-                    </Table.Cell>
-                    <Table.Cell
-                      class="text-right font-mono text-xs {pnlColor(row.counterTradePnlUsd)}"
-                    >
-                      {fmtSignedUsd(row.counterTradePnlUsd)}
-                    </Table.Cell>
-                    <Table.Cell
-                      class="text-right font-mono text-xs {pnlColor(row.onchainNettingPnlUsd)}"
-                    >
-                      {fmtSignedUsd(row.onchainNettingPnlUsd)}
-                    </Table.Cell>
-                    <Table.Cell
-                      class="text-right font-mono text-xs {pnlColor(
-                        row.directionalImbalanceExcessPnlUsd
-                      )}"
-                    >
-                      {fmtSignedUsd(row.directionalImbalanceExcessPnlUsd)}
-                    </Table.Cell>
-                    <Table.Cell
-                      class="text-right font-mono text-xs {pnlColor(
-                        row.directionalInventoryBaselinePnlUsd
-                      )}"
-                    >
-                      {fmtSignedUsd(row.directionalInventoryBaselinePnlUsd)}
-                    </Table.Cell>
-                    <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
-                      {row.matchedLotCount}
-                    </Table.Cell>
-                  </Table.Row>
-                {/each}
-              </Table.Body>
-            </Table.Root>
-          </div>
-        </section>
-
-        <section class="min-h-0 overflow-hidden rounded-lg border">
-          <div class="flex items-center justify-between gap-2 border-b px-3 py-2">
-            <span class="text-sm font-semibold">Linked Lots</span>
-            <span class="font-mono text-xs text-muted-foreground">
-              {fmtCount(total.current)} matched lots
-            </span>
-          </div>
-          <div class="max-h-80 overflow-auto">
-            {#if entries.current.length === 0 && !loading.current}
-              <div class="flex h-32 items-center justify-center text-sm text-muted-foreground">
-                No matched PnL lots yet
-              </div>
-            {:else}
-              <Table.Root>
-                <Table.Header>
-                  <Table.Row>
-                    <Table.Head class="text-right">Closed</Table.Head>
-                    <Table.Head>Asset</Table.Head>
-                    <Table.Head class="text-right">Bucket</Table.Head>
-                    <Table.Head class="text-right">Flow</Table.Head>
-                    <Table.Head class="text-right">Lag</Table.Head>
-                    <Table.Head class="text-right">Shares</Table.Head>
-                    <Table.Head class="text-right">Spread</Table.Head>
-                    <Table.Head class="text-right">PnL</Table.Head>
-                    <Table.Head class="text-right">IDs</Table.Head>
-                  </Table.Row>
-                </Table.Header>
-                <Table.Body>
-                  {#each entries.current as entry, idx (`${entry.openingFillId}-${entry.closingFillId}-${String(idx)}`)}
-                    <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
-                      <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
-                        {formatUtc(entry.closedAt)}
-                      </Table.Cell>
-                      <Table.Cell class="font-mono text-xs font-medium">{entry.symbol}</Table.Cell>
-                      <Table.Cell class="text-right font-mono text-[11px] text-muted-foreground">
-                        {entry.pnlBucket}
-                      </Table.Cell>
-                      <Table.Cell class="text-right text-xs">
-                        <span class={directionColor(entry.openingDirection)}
-                          >{entry.openingDirection}</span
-                        >
-                        <span class="text-muted-foreground"> / </span>
-                        <span class={directionColor(entry.closingDirection)}
-                          >{entry.closingDirection}</span
-                        >
-                      </Table.Cell>
-                      <Table.Cell
-                        class="text-right font-mono text-[11px] {entry.delayedCounterTrade
-                          ? 'text-amber-300'
-                          : 'text-muted-foreground'}"
-                      >
-                        {fmtDuration(entry.elapsedSeconds)}
-                      </Table.Cell>
-                      <Table.Cell class="text-right font-mono text-xs"
-                        >{fmtShares(entry.shares)}</Table.Cell
-                      >
-                      <Table.Cell class="text-right font-mono text-xs {pnlColor(entry.spreadUsd)}">
-                        {fmtSignedUsd(entry.spreadUsd)}
-                      </Table.Cell>
-                      <Table.Cell
-                        class="text-right font-mono text-xs {pnlColor(entry.realizedPnlUsd)}"
-                      >
-                        {fmtSignedUsd(entry.realizedPnlUsd)}
-                      </Table.Cell>
-                      <Table.Cell class="text-right font-mono text-[11px] text-muted-foreground">
-                        <div>{entry.openingVenue}: {shortId(entry.openingFillId)}</div>
-                        <div>{entry.closingVenue}: {shortId(entry.closingFillId)}</div>
-                      </Table.Cell>
-                    </Table.Row>
-                  {/each}
-                </Table.Body>
-              </Table.Root>
-            {/if}
-          </div>
-        </section>
-      </div>
     {/if}
   </Card.Content>
 </Card.Root>

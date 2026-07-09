@@ -278,7 +278,7 @@ pub(crate) async fn grant_startup_approvals<W: Wallet>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{B256, TxHash, U256};
     use alloy::providers::{Provider, ProviderBuilder};
     use async_trait::async_trait;
@@ -290,6 +290,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
+    use crate::test_utils::{TestAnvilInstance, spawn_anvil};
 
     /// Per-symbol wrapper stub: resolves underlying/derivative addresses from a
     /// configured map and errors on an unconfigured symbol, so the
@@ -507,7 +508,7 @@ mod tests {
             matches!(
                 error,
                 StartupApprovalError::SymbolResolution { ref symbol, .. }
-                    if symbol.to_string() == "TSLA"
+                    if *symbol == "TSLA"
             ),
             "expected SymbolResolution for TSLA, got: {error:?}"
         );
@@ -518,11 +519,11 @@ mod tests {
     async fn setup_anvil(
         count: usize,
     ) -> (
-        AnvilInstance,
+        TestAnvilInstance,
         RawPrivateKeyWallet<impl Provider + Clone + use<>>,
         Vec<Address>,
     ) {
-        let anvil = Anvil::new().spawn();
+        let anvil = spawn_anvil(Anvil::new());
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
         let wallet = RawPrivateKeyWallet::new(&private_key, provider.clone(), 1).unwrap();

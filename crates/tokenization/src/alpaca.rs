@@ -1259,7 +1259,7 @@ pub(crate) mod tests {
 
         let err = client.request_mint(request).await.unwrap_err();
         assert!(
-            matches!(&err, AlpacaTokenizationError::InsufficientPosition { symbol } if symbol.to_string() == "AAPL"),
+            matches!(&err, AlpacaTokenizationError::InsufficientPosition { symbol } if *symbol == "AAPL"),
             "expected InsufficientPosition for AAPL, got: {err:?}"
         );
         assert!(logs_contain(
