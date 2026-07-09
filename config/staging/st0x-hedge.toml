@@ -274,8 +274,6 @@ vault_id = "0xfab"
 tokenized_equity = "0x323804af6f3bb463d688b854667c6870a0fc06ad"
 tokenized_equity_derivative = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
 
-# Registered for parity with prod; staging only trades RKLB, so SPCX stays
-# disabled.
 [assets.equities.SPCX]
 trading = "disabled"
 rebalancing = "disabled"
