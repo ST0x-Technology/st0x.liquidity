@@ -327,8 +327,9 @@ fn determine_trade_details(
 mod tests {
     use alloy::primitives::address;
 
-    use super::*;
     use st0x_float_macro::float;
+
+    use super::*;
 
     const USDC_TOKEN: Address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     const EQUITY_TOKEN: Address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
