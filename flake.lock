@@ -594,6 +594,23 @@
         "url": "https://github.com/rainlanguage/rain.orderbook"
       }
     },
+    "raindex-governance": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782851479,
+        "narHash": "sha256-Anf7aZ1n2quMd92uKf3PobD6SY+/aqL6vPpJ+UghTME=",
+        "ref": "refs/heads/master",
+        "rev": "fb7092e7fb4273c170a1c91133a642bd95a23694",
+        "revCount": 2,
+        "type": "git",
+        "url": "https://github.com/rainlanguage/raindex.governance"
+      },
+      "original": {
+        "rev": "fb7092e7fb4273c170a1c91133a642bd95a23694",
+        "type": "git",
+        "url": "https://github.com/rainlanguage/raindex.governance"
+      }
+    },
     "rainix": {
       "inputs": {
         "flake-utils": "flake-utils_3",
@@ -633,6 +650,7 @@
         "ragenix": "ragenix",
         "rain-math-float": "rain-math-float",
         "rain-orderbook": "rain-orderbook",
+        "raindex-governance": "raindex-governance",
         "rainix": "rainix"
       }
     },

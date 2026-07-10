@@ -193,7 +193,7 @@ where
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
         evm,
-        context.ctx.evm.orderbook,
+        crate::onchain::raindex_contracts(&context.ctx.evm),
         order_owner,
     ));
 
@@ -224,6 +224,7 @@ where
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
         snapshot_id,
+        context.ctx.vault_owner(),
         context.frameworks.snapshot,
         wallet_polling,
         tokenizer,

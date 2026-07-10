@@ -41,7 +41,7 @@ use crate::usdc_rebalance::{
     RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
-use crate::vault_registry::VaultRegistry;
+use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use st0x_config::{BrokerCtx, Ctx};
 
 struct EquityTransferCliServices {
@@ -91,11 +91,17 @@ async fn build_equity_transfer_services(
 
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
-        ctx.evm.orderbook,
-        wallet,
+        VaultRegistryId {
+            orderbook: ctx.evm.orderbook,
+            owner: ctx.vault_owner(),
+        },
     ));
 
-    let raindex = Arc::new(RaindexService::new(base_caller, ctx.evm.orderbook, wallet));
+    let raindex = Arc::new(RaindexService::new(
+        base_caller,
+        crate::onchain::raindex_contracts(&ctx.evm),
+        wallet,
+    ));
 
     let services = EquityTransferServices {
         raindex: raindex.clone(),
@@ -470,7 +476,7 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let vault_service = Arc::new(RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        ctx.evm.orderbook,
+        crate::onchain::raindex_contracts(&ctx.evm),
         owner,
     ));
 
@@ -1635,7 +1641,7 @@ mod tests {
         AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
         TradingMode,
     };
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_event_sorcery::LifecycleError;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTransferId,
@@ -1970,6 +1976,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: InventoryMode::Managed {
+                    inventory: address!("0x1234567890123456789012345678901234567890"),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -2033,6 +2043,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: InventoryMode::Managed {
+                    inventory: address!("0x1234567890123456789012345678901234567890"),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

@@ -19,6 +19,8 @@ tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
+inventory_mode = "legacy"
+vault_owner = "0x3333333333333333333333333333333333333333"
 deployment_block = 1
 required_confirmations = 0
 ingestion_cutoff = "safe"

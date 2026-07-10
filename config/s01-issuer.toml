@@ -26,6 +26,12 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
 [raindex]
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
+# The issuer/dividend-ops bot does not rebalance, so it settles nothing through a
+# shared inventory: "legacy" keeps the OPERATOR_ROLE preflight off.
+inventory_mode = "legacy"
+# Owner of the Raindex orders/vaults this bot reads -- its own dividend-ops
+# wallet (= [wallet].address below).
+vault_owner = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"
 deployment_block = 43259507
 required_confirmations = 3
 ingestion_cutoff = "safe"

@@ -23,6 +23,35 @@ pub use service::RaindexService;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RaindexVaultId(pub B256);
 
+/// The two Raindex contract addresses a [`RaindexService`] talks to.
+///
+/// Named fields make the inventory/orderbook distinction compile-checked at
+/// every construction -- the two are both `Address` and semantically opposite
+/// (writes go to the inventory; the orderbook is only read and
+/// back-compat-scanned), so passing them positionally invited a silent swap
+/// that no test would catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaindexContracts {
+    /// Shared `RaindexInventory` -- target of every `deposit4`/`withdraw4` write
+    /// and source of `Operator{Deposit,Withdraw}` events.
+    pub inventory: Address,
+    /// Underlying Rain OrderBook -- target of `vaultBalance2` reads and the
+    /// backwards-compat `WithdrawV2` scan.
+    pub orderbook: Address,
+}
+
+/// Outcome of an idempotent stale-allowance revoke.
+///
+/// Distinguishes "a revoke tx was submitted" from "the allowance was already
+/// zero" without the boolean-blindness of a bare `bool` at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// The allowance was non-zero; an `approve(spender, 0)` tx was submitted.
+    Revoked,
+    /// The allowance was already zero; no transaction was needed.
+    AlreadyZero,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RaindexError {
     #[error("EVM error: {0}")]
@@ -43,6 +72,65 @@ pub enum RaindexError {
     /// the irreversible withdraw on this.
     #[error("withdrawal scan inconclusive: node not caught up past block {from_block}")]
     ScanInconclusive { from_block: u64 },
+    /// A log the withdrawal scan matched on address + topic0 was anomalous
+    /// (see [`ScanAnomaly`]). Impossible under the current contracts, so it
+    /// means ABI drift or an imposter at a trusted address. The log could be
+    /// our own in-flight withdrawal, so the scan fails closed rather than skip
+    /// it and let the caller re-issue an irreversible, already-submitted
+    /// withdraw. Not auto-retryable -- ABI drift needs a code fix, not another
+    /// scan.
+    #[error(
+        "withdrawal scan hit an anomalous log ({reason}); failing closed to \
+         avoid re-issuing an already-submitted withdraw"
+    )]
+    ScanAnomalousLog {
+        #[source]
+        reason: ScanAnomaly,
+    },
+    /// The shared `RaindexInventory` reverted a `withdraw4` because the vault
+    /// could not cover the requested amount (e.g. a concurrent Raindex clear
+    /// drained it first). Unlike the orderbook's `withdraw4`, which returns
+    /// `min(target, balance)`, the inventory settles atomically -- it reverts
+    /// rather than forward a short fill. Retryable once the vault is refunded,
+    /// and distinguishable so the caller can reconcile instead of blindly
+    /// re-submitting the same reverting withdraw.
+    #[error(
+        "inventory vault under-funded for {token}: requested {requested}, \
+         vault could cover {received}"
+    )]
+    InsufficientVaultLiquidity {
+        token: Address,
+        requested: U256,
+        received: U256,
+    },
+    /// The bot's signing wallet does not hold `OPERATOR_ROLE` on the configured
+    /// `RaindexInventory`, so every `deposit4`/`withdraw4` would revert
+    /// `AccessControlUnauthorizedAccount`. Raised by the startup preflight so the
+    /// misconfiguration surfaces before the bot burns gas reverting on the first
+    /// rebalance -- the shared-inventory cutover grants the role before
+    /// rebalancing runs.
+    #[error(
+        "signing wallet {wallet} lacks OPERATOR_ROLE on inventory {inventory}; \
+         grant it before enabling rebalancing"
+    )]
+    MissingOperatorRole { inventory: Address, wallet: Address },
+}
+
+/// What made a withdrawal-scan log anomalous, for
+/// [`RaindexError::ScanAnomalousLog`]. Decode failures preserve the underlying
+/// ABI error as a source instead of flattening it into a string.
+#[derive(Debug, thiserror::Error)]
+pub enum ScanAnomaly {
+    #[error("log without transaction hash")]
+    MissingTransactionHash,
+    #[error("log without topics")]
+    MissingTopics,
+    #[error("unrecognized topic0 {topic0}")]
+    UnrecognizedTopic0 { topic0: B256 },
+    #[error("undecodable OperatorWithdraw log")]
+    UndecodableOperatorWithdraw(#[source] alloy::sol_types::Error),
+    #[error("undecodable WithdrawV2 log")]
+    UndecodableWithdrawV2(#[source] alloy::sol_types::Error),
 }
 
 impl RaindexError {
@@ -57,7 +145,10 @@ impl RaindexError {
             | Self::ZeroAmount
             | Self::RpcTransport(_)
             | Self::SolType(_)
-            | Self::ScanInconclusive { .. } => false,
+            | Self::ScanInconclusive { .. }
+            | Self::ScanAnomalousLog { .. }
+            | Self::InsufficientVaultLiquidity { .. }
+            | Self::MissingOperatorRole { .. } => false,
         }
     }
 }

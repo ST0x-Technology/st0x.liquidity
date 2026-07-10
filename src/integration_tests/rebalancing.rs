@@ -286,8 +286,10 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
     let service = Arc::new(RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1093,8 +1095,10 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1178,8 +1182,10 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1255,7 +1261,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Inventory as ExecutorInventory, MockExecutor};
     use st0x_finance::Usd;
-    use st0x_raindex::RaindexService;
+    use st0x_raindex::{RaindexContracts, RaindexService};
 
     use crate::inventory::InventoryPollingService;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
@@ -1281,8 +1287,10 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let service = Arc::new(RebalancingService::new(
         trigger_config,
         Arc::clone(&vault_registry),
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1330,7 +1338,10 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let provider = ProviderBuilder::new().connect_mocked_client(asserter);
     let raindex_service = Arc::new(RaindexService::new(
         ReadOnlyEvm::new(provider),
-        TEST_ORDERBOOK,
+        RaindexContracts {
+            inventory: TEST_ORDERBOOK,
+            orderbook: TEST_ORDERBOOK,
+        },
         TEST_ORDER_OWNER,
     ));
 
@@ -1341,6 +1352,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         executor,
         vault_registry,
         snapshot_id,
+        TEST_ORDER_OWNER,
         snapshot_store.clone(),
         None,
         None,
@@ -1425,8 +1437,10 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1482,8 +1496,10 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
     let trigger = RebalancingService::new(
         config,
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1529,8 +1545,10 @@ async fn usdc_none_disables_usdc_rebalancing() {
             ..test_trigger_config()
         },
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1753,8 +1771,10 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let trigger = RebalancingService::new(
         config,
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1881,8 +1901,10 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let trigger = RebalancingService::new(
         config,
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
@@ -1978,8 +2000,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
         let trigger = RebalancingService::new(
             wide_config,
             vault_registry,
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             Arc::clone(&inventory),
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
@@ -2037,8 +2061,10 @@ async fn threshold_config_controls_trigger_sensitivity() {
         let trigger = RebalancingService::new(
             tight_config,
             vault_registry,
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             Arc::clone(&inventory),
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),

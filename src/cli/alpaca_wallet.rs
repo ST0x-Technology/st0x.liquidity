@@ -716,7 +716,7 @@ mod tests {
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_float_macro::float;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -729,6 +729,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: InventoryMode::Managed {
+                    inventory: address!("0x1234567890123456789012345678901234567890"),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -803,6 +807,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: InventoryMode::Managed {
+                    inventory: address!("0x1234567890123456789012345678901234567890"),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

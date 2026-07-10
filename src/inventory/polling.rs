@@ -110,6 +110,12 @@ where
     executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
     snapshot_id: InventorySnapshotId,
+    /// On-chain owner of the Raindex vaults (`vaultBalance2` owner key and vault
+    /// registry key). Distinct from `snapshot_id.owner` (the signing wallet used
+    /// for the snapshot aggregate key and tokenization-request ownership): after
+    /// the shared-inventory migration the vaults are owned by the inventory
+    /// contract, not the bot EOA. Sourced from `Ctx::vault_owner`.
+    vault_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: Option<WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -135,6 +141,7 @@ where
         executor: Exe,
         vault_registry: Arc<Store<VaultRegistry>>,
         snapshot_id: InventorySnapshotId,
+        vault_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
         wallet_polling: Option<WalletPollingCtx>,
         tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -145,6 +152,7 @@ where
             executor,
             vault_registry,
             snapshot_id,
+            vault_owner,
             snapshot,
             wallet_polling,
             tokenizer,
@@ -251,7 +259,7 @@ where
     ) -> Result<Option<VaultRegistry>, InventoryPollingError<Exe::Error>> {
         let vault_registry_id = VaultRegistryId {
             orderbook: self.snapshot_id.orderbook,
-            owner: self.snapshot_id.owner,
+            owner: self.vault_owner,
         };
 
         Ok(self.vault_registry.load(&vault_registry_id).await?)
@@ -283,7 +291,7 @@ where
                 let vault_futures = vaults_for_token.values().map(|vault| {
                     self.raindex_service
                         .get_equity_balance::<OpenChainErrorRegistry>(
-                            self.snapshot_id.owner,
+                            self.vault_owner,
                             vault.token,
                             RaindexVaultId(vault.vault_id),
                         )
@@ -347,7 +355,7 @@ where
         let balance_futures = registry.usdc_vaults.values().map(|vault| {
             self.raindex_service
                 .get_usdc_balance::<OpenChainErrorRegistry>(
-                    self.snapshot_id.owner,
+                    self.vault_owner,
                     RaindexVaultId(vault.vault_id),
                 )
         });
@@ -973,6 +981,7 @@ mod tests {
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_raindex::RaindexContracts;
     use st0x_tokenization::issuer_request_id;
 
     use super::*;
@@ -1197,7 +1206,10 @@ mod tests {
     ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
         Arc::new(RaindexService::new(
             ReadOnlyEvm::new(provider),
-            Address::ZERO,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
             Address::ZERO,
         ))
     }
@@ -1237,6 +1249,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1295,6 +1308,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1360,6 +1374,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1418,6 +1433,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1470,6 +1486,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1530,6 +1547,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1588,6 +1606,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1645,6 +1664,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1683,6 +1703,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1747,6 +1768,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1794,6 +1816,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1843,6 +1866,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1940,6 +1964,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -1993,6 +2018,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2047,6 +2073,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2067,6 +2094,68 @@ mod tests {
         assert!(
             logs_contain("No USDC vaults discovered, skipping onchain cash polling"),
             "Should log debug message explaining why cash polling was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_onchain_keys_vault_registry_on_vault_owner_not_snapshot_owner() {
+        // The vault-registry lookup key is the vault OWNER (the inventory
+        // contract post-migration), distinct from snapshot_id.owner (the signing
+        // wallet). Seed the equity vault ONLY under vault_owner; if the lookup
+        // keyed on snapshot_id.owner instead, it would find no registry and skip
+        // on-chain polling. Emitting OnchainEquity proves it used vault_owner.
+        let pool = setup_test_db().await;
+        let (orderbook, snapshot_owner) = test_addresses();
+        let vault_owner = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_ne!(
+            vault_owner, snapshot_owner,
+            "test is meaningless unless the two owners differ"
+        );
+
+        // Registry seeded under the VAULT OWNER key only.
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            vault_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&vault_balance_hex(float!(7))); // vaultBalance2 for the equity vault
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: snapshot_owner,
+            },
+            vault_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        // Snapshot events are keyed by snapshot_id.owner (the signing wallet),
+        // NOT vault_owner: the two aggregates use different owners by design.
+        let events = load_snapshot_events(&pool, orderbook, snapshot_owner).await;
+        let has_onchain_equity = events
+            .iter()
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }));
+
+        assert!(
+            has_onchain_equity,
+            "OnchainEquity must be emitted, proving the vault registry was found \
+             via vault_owner rather than snapshot_id.owner",
         );
     }
 
@@ -2100,6 +2189,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2140,6 +2230,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2201,6 +2292,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2252,6 +2344,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2300,6 +2393,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2347,6 +2441,7 @@ mod tests {
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             snapshot_id.clone(),
+            snapshot_id.owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2390,6 +2485,7 @@ mod tests {
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             snapshot_id.clone(),
+            snapshot_id.owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2436,6 +2532,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -2515,6 +2612,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -2563,6 +2661,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -2606,6 +2705,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2647,6 +2747,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2692,6 +2793,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -2731,6 +2833,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -2776,6 +2879,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -2832,6 +2936,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -2885,6 +2990,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2940,6 +3046,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -2992,6 +3099,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -3046,6 +3154,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -3118,6 +3227,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -3168,6 +3278,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3223,6 +3334,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -3278,6 +3390,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -3325,6 +3438,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3463,6 +3577,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3515,6 +3630,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3560,6 +3676,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3599,6 +3716,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3658,6 +3776,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3724,6 +3843,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3791,6 +3911,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3855,6 +3976,7 @@ mod tests {
                 orderbook,
                 owner: order_owner,
             },
+            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),

@@ -472,8 +472,10 @@ pub(crate) enum TriggeredOperation {
 pub(crate) struct RebalancingService {
     config: RebalancingServiceConfig,
     vault_registry: Arc<Store<VaultRegistry>>,
-    orderbook: Address,
-    order_owner: Address,
+    /// The (orderbook, vault-owner) pair that keys vault-registry lookups. The
+    /// owner is the inventory contract post-migration, the bot EOA before it;
+    /// production sources it from `Ctx::vault_owner`.
+    registry_id: VaultRegistryId,
     inventory: Arc<BroadcastingInventory>,
     /// Reads issuance's per-asset dividend freeze status so the equity trigger
     /// can skip frozen assets before starting a flow. Set after construction via
@@ -610,8 +612,7 @@ impl RebalancingService {
     pub(crate) fn new(
         config: RebalancingServiceConfig,
         vault_registry: Arc<Store<VaultRegistry>>,
-        orderbook: Address,
-        order_owner: Address,
+        registry_id: VaultRegistryId,
         inventory: Arc<BroadcastingInventory>,
         wrapper: Arc<dyn Wrapper>,
         schedulers: RebalancingSchedulers,
@@ -630,8 +631,7 @@ impl RebalancingService {
         Self {
             config,
             vault_registry,
-            orderbook,
-            order_owner,
+            registry_id,
             inventory,
             freeze_status: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -2689,14 +2689,9 @@ impl RebalancingService {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<Address>, TokenAddressError> {
-        let vault_registry_id = VaultRegistryId {
-            orderbook: self.orderbook,
-            owner: self.order_owner,
-        };
-
         let registry = self
             .vault_registry
-            .load(&vault_registry_id)
+            .load(&self.registry_id)
             .await?
             .ok_or(TokenAddressError::Uninitialized)?;
 
@@ -5097,8 +5092,10 @@ mod tests {
         Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
@@ -5141,8 +5138,10 @@ mod tests {
         let service = RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -5197,8 +5196,10 @@ mod tests {
         let service = RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -5253,8 +5254,10 @@ mod tests {
         let service = RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -5371,8 +5374,10 @@ mod tests {
         Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
@@ -6990,8 +6995,10 @@ mod tests {
                 },
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
@@ -7402,8 +7409,10 @@ mod tests {
         Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -7640,8 +7649,10 @@ mod tests {
         Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
@@ -7711,8 +7722,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -18397,8 +18410,10 @@ mod tests {
                 },
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             {
                 let (event_sender, _) = broadcast::channel::<Statement>(16);
                 Arc::new(BroadcastingInventory::new(
@@ -18794,8 +18809,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            Address::ZERO,
-            Address::ZERO,
+            VaultRegistryId {
+                orderbook: Address::ZERO,
+                owner: Address::ZERO,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -19021,8 +19038,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -19088,8 +19107,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -19165,8 +19186,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -19226,8 +19249,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
@@ -22258,8 +22283,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
@@ -22339,8 +22366,10 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),

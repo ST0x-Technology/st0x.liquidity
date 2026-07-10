@@ -17,7 +17,7 @@ pub(crate) use manager::{CrossVenueCashTransfer, UsdcSettlementParams, u256_to_u
 
 use std::time::Duration;
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash, U256};
 use chrono::{DateTime, Utc};
 use rain_math_float::FloatError;
 use thiserror::Error;
@@ -58,6 +58,21 @@ pub(crate) enum UsdcTransferError {
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
+    /// The shared inventory reverted a `withdraw4` because the vault could not
+    /// cover the requested amount (a concurrent clear drained it). Distinct from
+    /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
+    /// withdraw reverts again until the vault is refunded, so the job latches
+    /// the aggregate at `WithdrawalSubmitting` for operator reconciliation
+    /// (no auto-retry); the operator refunds the vault, then redrives.
+    #[error(
+        "inventory vault under-funded on withdraw of {token}: requested {requested}, vault \
+         could cover only {received}; latched for operator reconciliation"
+    )]
+    InsufficientVaultLiquidity {
+        token: Address,
+        requested: U256,
+        received: U256,
+    },
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<UsdcRebalance>>),
     #[error("Withdrawal failed with terminal status: {status}")]

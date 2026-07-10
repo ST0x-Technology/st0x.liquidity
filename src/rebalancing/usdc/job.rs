@@ -388,6 +388,30 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging inconclusive-burn alert");
                 }
             }
+            // Deterministic vault-liquidity revert: the withdraw is atomic
+            // (nothing left the vault) and re-issuing it just reverts again
+            // until the vault is refunded, burning gas per attempt. Returning
+            // `Ok(())` ends the apalis job with NO retry, so the aggregate
+            // stays latched at `WithdrawalSubmitting` and the alert fires
+            // exactly once. The operator refunds the vault and redrives via
+            // resume-usdc-transfer; the resume's withdrawal scan still guards
+            // against a double-withdraw.
+            Err(error @ UsdcTransferError::InsufficientVaultLiquidity { .. }) => {
+                let id = &self.id;
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %error,
+                    "Base->Alpaca USDC transfer: inventory vault under-funded on withdraw; \
+                     latched at WithdrawalSubmitting for operator reconciliation \
+                     (no auto-retry)"
+                );
+                let message =
+                    format!("USDC transfer {id}: {error}. Refund the vault, then redrive.");
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging vault-liquidity alert");
+                }
+            }
             Err(error) => {
                 // Terminal non-redriven error: fire notifier before surfacing
                 // to apalis so the operator is alerted before the circuit opens.
@@ -1094,7 +1118,7 @@ impl TransferUsdcToMarketMaking {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{Address, TxHash, U256};
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
     use uuid::Uuid;
@@ -1190,6 +1214,9 @@ mod tests {
         BurnRecordFailed,
         BurnRecordTaskFailed,
         BurnTxDropped,
+        /// Deterministic vault-liquidity revert: re-issuing the withdraw just
+        /// reverts again until the vault is refunded, so the job must latch.
+        InsufficientVaultLiquidity,
     }
 
     impl TerminalOutcome {
@@ -1219,6 +1246,11 @@ mod tests {
                 Self::BurnTxDropped => UsdcTransferError::BurnTxDropped {
                     id: id.clone(),
                     burn_tx: TxHash::from([0xAB; 32]),
+                },
+                Self::InsufficientVaultLiquidity => UsdcTransferError::InsufficientVaultLiquidity {
+                    token: Address::from([0xEE; 20]),
+                    requested: U256::from(100),
+                    received: U256::from(40),
                 },
             }
         }
@@ -1881,10 +1913,12 @@ mod tests {
         );
     }
 
-    /// Fail-closed burn-submission terminals MUST end the apalis job cleanly
-    /// (`Ok`, never a retryable `Err`) with NO redrive and exactly one operator
-    /// alert. Auto-redriving any of these could reburn a possibly-in-flight burn
-    /// (double burn), which is the precise hazard this PR closes.
+    /// Fail-closed terminals that must not trigger an apalis retry MUST end the
+    /// job cleanly (`Ok`, never a retryable `Err`) with NO redrive and exactly
+    /// one operator alert. Returning `Err` would trigger an apalis retry, which
+    /// is wrong for burn-submission terminals (a redrive could reburn a
+    /// possibly-in-flight burn) and for vault-liquidity terminals (a redrive
+    /// re-issues a deterministically-reverting withdraw, burning gas).
     async fn assert_hedging_fail_closed(
         outcome: TerminalOutcome,
         label: &str,
@@ -1912,7 +1946,8 @@ mod tests {
         assert_eq!(
             pending_job_count::<TransferUsdcToHedging>(&pool).await,
             0,
-            "{label} must NOT redrive -- an auto-redrive could reburn a possibly-in-flight burn"
+            "{label} must NOT redrive -- a redrive could reburn a possibly-in-flight burn \
+             or re-issue a deterministically-reverting withdraw"
         );
         let messages = notifier.messages();
         assert_eq!(
@@ -2018,6 +2053,21 @@ mod tests {
             TerminalOutcome::BurnTxDropped,
             "BurnTxDropped (hedging)",
             Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
+    }
+
+    /// An `InsufficientVaultLiquidity` withdraw revert is atomic (nothing left
+    /// the vault) and deterministic: re-issuing the withdraw reverts again until
+    /// the vault is refunded. The job must latch the aggregate at
+    /// `WithdrawalSubmitting` (Ok, no redrive, one alert) instead of letting
+    /// apalis retries burn gas re-submitting the same reverting withdraw.
+    #[tokio::test]
+    async fn hedging_job_latches_on_insufficient_vault_liquidity() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::InsufficientVaultLiquidity,
+            "InsufficientVaultLiquidity (hedging)",
+            None,
         )
         .await;
     }

@@ -1869,7 +1869,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
-    use st0x_config::{EvmCtx, IngestionCutoff};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_float_macro::float;
     use st0x_tokenization::IssuerRequestId;
@@ -1894,6 +1894,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: InventoryMode::Managed {
+                    inventory: address!("0x1234567890123456789012345678901234567890"),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -3481,6 +3485,9 @@ mod tests {
 
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"
+                inventory_mode = "managed"
+                inventory = "0x2222222222222222222222222222222222222222"
+                vault_owner = "0x3333333333333333333333333333333333333333"
                 deployment_block = 1
                 required_confirmations = 3
                 ingestion_cutoff = "safe"
@@ -3533,6 +3540,12 @@ mod tests {
         assert!(matches!(command, Commands::Buy { .. }));
         assert_eq!(ctx.database_url, ":memory:");
         assert_eq!(ctx.evm.required_confirmations, 3);
+        assert_eq!(
+            ctx.evm.inventory,
+            InventoryMode::Managed {
+                inventory: address!("0x2222222222222222222222222222222222222222"),
+            },
+        );
         assert_eq!(ctx.evm.ingestion_cutoff, IngestionCutoff::Safe);
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
     }

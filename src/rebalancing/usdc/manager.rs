@@ -22,7 +22,7 @@ use st0x_execution::{
     CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::Usdc;
-use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -140,6 +140,34 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     ) -> Result<Option<TxHash>, CctpError> {
         self.find_recent_usdc_transfer(from, to, amount, from_block)
             .await
+    }
+}
+
+/// Classifies a failed vault `withdraw_usdc`. An atomic
+/// [`RaindexError::InsufficientVaultLiquidity`] revert means the vault could not
+/// cover the request; it withdrew nothing (atomic revert), so retrying only
+/// reverts again until the vault is refunded. It is surfaced as a distinct,
+/// contextful error the job latches for operator reconciliation (no auto-retry)
+/// rather than the opaque `Vault` wrap, which the job redrives. Any other error
+/// keeps the opaque wrap and the normal redrive path.
+fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
+    match error {
+        RaindexError::InsufficientVaultLiquidity {
+            token,
+            requested,
+            received,
+        } => {
+            warn!(target: "rebalance", %token, %requested, %received, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
+            UsdcTransferError::InsufficientVaultLiquidity {
+                token,
+                requested,
+                received,
+            }
+        }
+        other => {
+            warn!(target: "rebalance", "Vault withdrawal failed: {other}");
+            UsdcTransferError::Vault(other)
+        }
     }
 }
 
@@ -2603,10 +2631,7 @@ impl<
 
         let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
             Ok(tx) => tx,
-            Err(error) => {
-                warn!(target: "rebalance", "Vault withdrawal failed: {error}");
-                return Err(UsdcTransferError::Vault(error));
-            }
+            Err(error) => return Err(classify_vault_withdrawal_error(error)),
         };
 
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
@@ -2674,10 +2699,7 @@ impl<
 
         let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
             Ok(tx) => tx,
-            Err(error) => {
-                warn!(target: "rebalance", "Vault withdrawal failed: {error}");
-                return Err(UsdcTransferError::Vault(error));
-            }
+            Err(error) => return Err(classify_vault_withdrawal_error(error)),
         };
 
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
@@ -3564,7 +3586,7 @@ mod tests {
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
     use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
-    use st0x_raindex::RaindexService;
+    use st0x_raindex::{RaindexContracts, RaindexService};
 
     use super::*;
     use crate::telemetry::TelemetrySender;
@@ -4125,7 +4147,14 @@ mod tests {
 
         let owner = wallet.address();
 
-        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, owner);
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            owner,
+        );
 
         (cctp_bridge, vault_service)
     }
@@ -4151,7 +4180,14 @@ mod tests {
         .unwrap();
 
         let owner = wallet.address();
-        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, owner);
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            owner,
+        );
 
         (cctp_bridge, vault_service)
     }
@@ -7463,7 +7499,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -7644,7 +7683,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -11228,7 +11270,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -11398,7 +11443,14 @@ mod tests {
         // burn_recording_pending never calls into RaindexService.
         let (_anvil, endpoint, private_key) = setup_anvil();
         let wallet = create_test_wallet(&endpoint, &private_key);
-        let vault_service = RaindexService::new(wallet, ORDERBOOK_ADDRESS, recipient);
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            recipient,
+        );
 
         let mock_bridge = Arc::new(MockBridge::new());
 
@@ -11535,7 +11587,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -11910,7 +11965,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -12048,7 +12106,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -12273,7 +12334,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -12460,7 +12524,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -12694,7 +12761,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
 
@@ -12861,7 +12931,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -12999,7 +13072,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -13218,7 +13294,10 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-            ORDERBOOK_ADDRESS,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
             chains.bot_address,
         );
         let cqrs = create_test_store_instance().await;
@@ -13340,6 +13419,43 @@ mod tests {
         );
 
         (manager, cqrs)
+    }
+
+    #[test]
+    fn under_funded_vault_withdraw_surfaces_distinct_terminal_error() {
+        // An atomic InsufficientVaultLiquidity revert withdrew nothing, so it
+        // must surface the distinct terminal variant (which the job latches for
+        // operator reconciliation, no auto-retry) rather than the opaque Vault
+        // wrap the job redrives.
+        let error = classify_vault_withdrawal_error(RaindexError::InsufficientVaultLiquidity {
+            token: USDC_BASE,
+            requested: U256::from(1_000_000u64),
+            received: U256::from(400_000u64),
+        });
+
+        let UsdcTransferError::InsufficientVaultLiquidity {
+            token,
+            requested,
+            received,
+        } = error
+        else {
+            panic!("under-funded revert must surface the distinct terminal error, got: {error:?}");
+        };
+        assert_eq!(token, USDC_BASE);
+        assert_eq!(requested, U256::from(1_000_000u64));
+        assert_eq!(received, U256::from(400_000u64));
+    }
+
+    #[test]
+    fn non_under_funded_vault_withdraw_wraps_opaquely_for_redrive() {
+        // Any other RaindexError keeps the opaque Vault wrap so the caller's
+        // normal redrive path still runs.
+        let error = classify_vault_withdrawal_error(RaindexError::ZeroAmount);
+
+        assert!(
+            matches!(error, UsdcTransferError::Vault(RaindexError::ZeroAmount)),
+            "non-under-funded errors must wrap opaquely as Vault, got: {error:?}"
+        );
     }
 
     /// Hypothesis: in `continue_alpaca_to_base_from_withdrawal_complete` (durable

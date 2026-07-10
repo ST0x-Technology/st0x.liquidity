@@ -164,6 +164,7 @@ mod tests {
         AlpacaWalletService, Executor, Symbol, TimeInForce,
     };
     use st0x_float_macro::float;
+    use st0x_raindex::RaindexContracts;
     use st0x_wrapper::WrappedEquity;
 
     use super::*;
@@ -338,7 +339,14 @@ mod tests {
         );
 
         let owner = base_wallet.address();
-        let raindex = Arc::new(RaindexService::new(base_wallet, TEST_ORDERBOOK, owner));
+        let raindex = Arc::new(RaindexService::new(
+            base_wallet,
+            RaindexContracts {
+                inventory: TEST_ORDERBOOK,
+                orderbook: TEST_ORDERBOOK,
+            },
+            owner,
+        ));
 
         let services = RebalancerServices {
             broker,

@@ -430,7 +430,9 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
 ) -> anyhow::Result<()> {
     let evm_ctx = &ctx.evm;
     let pyth_feed_ids = PythFeedIds::new(ctx.pyth_feed_ids());
-    let order_owner = ctx.order_owner();
+    // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
+    // inventory contract post-migration, the bot EOA before it.
+    let order_owner = ctx.vault_owner();
     let read_evm = ReadOnlyEvm::new(provider.clone());
 
     match OnchainTrade::try_from_tx_hash(
@@ -1079,7 +1081,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, EvmCtx, ExecutionThreshold,
-        IngestionCutoff, LogLevel, OperationMode, TradingMode,
+        IngestionCutoff, InventoryMode, LogLevel, OperationMode, TradingMode,
     };
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
@@ -1276,6 +1278,10 @@ mod tests {
             evm: EvmCtx {
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
+                inventory: InventoryMode::Managed {
+                    inventory: address!("0x1234567890123456789012345678901234567890"),
+                },
+                vault_owner: Address::ZERO,
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,

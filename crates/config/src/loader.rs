@@ -780,7 +780,7 @@ fn parse_and_validate(
     let base_rpc_url = secrets.evm.base.take();
     let ethereum_rpc_url = secrets.evm.ethereum.take();
 
-    let evm = EvmCtx::new(&config.raindex, secrets.evm);
+    let evm = EvmCtx::new(&config.raindex, secrets.evm)?;
 
     // Validate wallet config/secrets pairing and required RPC URLs.
     // Actual wallet construction (async, connects to RPC) is deferred.
@@ -1090,11 +1090,31 @@ impl Ctx {
         std::time::Duration::from_secs(self.order_polling_interval)
     }
 
-    /// Returns the wallet address that owns orders on the orderbook.
+    /// Returns the bot's signing wallet address (the `[wallet]` EOA).
     ///
-    /// Always derived from the configured `[wallet]` address.
+    /// This is the transaction signer / gas payer, the `spender`-granting
+    /// account for ERC20 approvals, and the `operator` that appears in
+    /// `RaindexInventory.Operator{Deposit,Withdraw}` events (and the `sender`
+    /// in pre-migration `WithdrawV2` events). It is NOT necessarily the address
+    /// that owns the Raindex vaults -- see [`Self::vault_owner`].
+    ///
+    /// Named `order_owner` for historical reasons: before the shared-inventory
+    /// migration the signing wallet also owned the orders/vaults, so the two
+    /// concepts coincided.
     pub fn order_owner(&self) -> Address {
         self.order_owner
+    }
+
+    /// Returns the address that owns the Raindex orders and vaults on-chain.
+    ///
+    /// Every `vaultBalance2` read, vault-registry entry, and ClearV3/TakeOrderV3
+    /// order-owner fill match is scoped by this address. Sourced from the
+    /// required `[raindex].vault_owner` config field -- the signing wallet while
+    /// the vaults are bot-EOA-owned, flipped to the inventory address when the
+    /// shared-inventory migration makes the inventory contract `msg.sender` to
+    /// Raindex (and therefore the vault owner).
+    pub fn vault_owner(&self) -> Address {
+        self.evm.vault_owner
     }
 
     /// Returns the configured Pyth feed IDs keyed by base equity symbol.
@@ -1188,7 +1208,7 @@ impl AssetsConfig {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-use crate::IngestionCutoff;
+use crate::{IngestionCutoff, InventoryMode};
 
 /// Test-only constructor for `Ctx` that internalizes fields e2e tests
 /// don't need to control (log level, operational limits, EVM wrapping,
@@ -1241,6 +1261,13 @@ impl Ctx {
             evm: EvmCtx {
                 rpc_url,
                 orderbook,
+                // Legacy: tests simulate the pre-migration state where the bot
+                // owns the vaults and settles on the orderbook, so the startup
+                // OPERATOR_ROLE preflight is skipped (there is no distinct
+                // inventory contract). inventory_address() resolves to the
+                // orderbook, unchanged from before the InventoryMode split.
+                inventory: InventoryMode::Legacy,
+                vault_owner: order_owner,
                 deployment_block,
                 required_confirmations,
                 ingestion_cutoff: IngestionCutoff::Safe,
@@ -1320,6 +1347,8 @@ pub enum CtxError {
     CounterTradeSlippageBpsOutOfRange { configured: u16, min: u16, max: u16 },
     #[error(transparent)]
     Alerts(#[from] crate::alerts::AlertsAssemblyError),
+    #[error(transparent)]
+    Evm(#[from] crate::evm::EvmConfigError),
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
     #[error(
@@ -1396,6 +1425,7 @@ impl CtxError {
                 "counter trade slippage bps out of range"
             }
             Self::Alerts(_) => "alerts assembly error",
+            Self::Evm(_) => "evm configuration error",
             Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
                 "cash operational limit below minimum withdrawal"
             }
@@ -1507,6 +1537,11 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
             #[allow(clippy::unwrap_used)]
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
+            // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
+            // preflight is skipped. Tests exercising the managed path override
+            // `evm.inventory` explicitly.
+            inventory: InventoryMode::Legacy,
+            vault_owner: order_owner,
             deployment_block: 1,
             required_confirmations: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
@@ -1546,7 +1581,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::ExecutionThreshold;
+    use crate::{ExecutionThreshold, InventoryModeTag};
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -1595,6 +1630,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -1623,6 +1661,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1653,6 +1694,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1829,6 +1873,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1875,6 +1922,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1918,6 +1968,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -1961,6 +2014,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2040,6 +2096,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2127,6 +2186,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2163,6 +2225,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2199,6 +2264,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2241,6 +2309,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2278,6 +2349,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2318,6 +2392,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2357,6 +2434,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2414,6 +2494,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2477,6 +2560,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2531,6 +2617,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2624,6 +2713,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -2682,6 +2774,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2743,6 +2838,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2808,6 +2906,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2879,6 +2980,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -2930,6 +3034,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3028,6 +3135,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3082,6 +3192,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3135,6 +3248,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3514,6 +3630,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3669,6 +3788,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3732,6 +3854,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -3800,8 +3925,9 @@ mod tests {
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
-    #[test]
-    fn all_repo_config_tomls_are_valid() {
+    /// Every `.toml` config checked into the repo: `config/*/`, plus the
+    /// `example.config.toml` and `e2e/config.toml` templates.
+    fn repo_config_paths() -> Vec<PathBuf> {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -3810,8 +3936,8 @@ mod tests {
         let config_dir = repo_root.join("config");
 
         // Walk config/ subdirectories (config/prod/, config/staging/) to
-        // find all .toml files. The previous flat read_dir missed these
-        // because the direct children are directories, not .toml files.
+        // find all .toml files. A flat read_dir misses these because the
+        // direct children are directories, not .toml files.
         let mut config_paths: Vec<PathBuf> = Vec::new();
         for entry in std::fs::read_dir(&config_dir).unwrap() {
             let entry = entry.unwrap();
@@ -3839,13 +3965,69 @@ mod tests {
             config_paths.len()
         );
 
-        for path in config_paths {
+        config_paths
+    }
+
+    #[test]
+    fn all_repo_config_tomls_are_valid() {
+        for path in repo_config_paths() {
             let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
                 panic!("Failed to read config {path:?}: {error}");
             });
             toml::from_str::<Config>(&contents).unwrap_or_else(|error| {
                 panic!("Invalid config {path:?}: {error}");
             });
+        }
+    }
+
+    /// `vault_owner` is the key every `vaultBalance2` read, vault-registry
+    /// entry and order-owner fill match is scoped by, so pointing it at the
+    /// wrong address silently routes a deployment at another deployment's
+    /// vaults. Both settlement modes pin it exactly: `legacy` vaults are owned
+    /// by the bot's own EOA, `managed` vaults are owned by the inventory
+    /// contract. Neither invariant is checkable from a single field, so guard
+    /// every checked-in config here (staging once shipped prod's wallet
+    /// address).
+    #[test]
+    fn repo_config_vault_owner_matches_settlement_mode() {
+        for path in repo_config_paths() {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let config: Config = toml::from_str(&contents).unwrap();
+
+            // e2e/config.toml supplies its wallet out of band, so there is no
+            // [wallet].address to pin a legacy vault_owner against -- but the
+            // mode/inventory consistency checks below don't need the wallet,
+            // so they run for every checked-in config.
+            let wallet: Option<WalletMeta> = config.wallet.map(|value| value.try_into().unwrap());
+
+            match (config.raindex.inventory_mode, config.raindex.inventory) {
+                (InventoryModeTag::Legacy, None) => {
+                    if let Some(wallet) = wallet {
+                        assert_eq!(
+                            config.raindex.vault_owner, wallet.address,
+                            "{path:?}: inventory_mode = \"legacy\" means the bot's EOA owns \
+                             the vaults, so vault_owner must equal [wallet].address"
+                        );
+                    }
+                }
+                (InventoryModeTag::Legacy, Some(inventory)) => {
+                    // EvmCtx::new rejects this combination at startup
+                    // (LegacyWithInventory); asserting it here fails the
+                    // contradiction in CI instead of at the deploy gate.
+                    panic!(
+                        "{path:?}: inventory_mode = \"legacy\" forbids an inventory address, \
+                         found {inventory}"
+                    )
+                }
+                (InventoryModeTag::Managed, Some(inventory)) => assert_eq!(
+                    config.raindex.vault_owner, inventory,
+                    "{path:?}: inventory_mode = \"managed\" means the inventory contract \
+                     owns the vaults, so vault_owner must equal inventory"
+                ),
+                (InventoryModeTag::Managed, None) => {
+                    panic!("{path:?}: inventory_mode = \"managed\" requires an inventory address")
+                }
+            }
         }
     }
 
@@ -3883,6 +4065,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3916,6 +4101,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3953,6 +4141,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -3985,6 +4176,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -4070,6 +4264,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -4981,6 +5178,8 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5022,6 +5221,8 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5047,6 +5248,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -5096,6 +5300,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5131,6 +5338,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5181,6 +5391,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
@@ -5267,6 +5480,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3
@@ -5309,6 +5525,9 @@ mod tests {
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
 
             deployment_block = 1
             required_confirmations = 3

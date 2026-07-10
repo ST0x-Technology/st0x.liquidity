@@ -309,6 +309,48 @@ impl EvmError {
             Self::NodeBehindRequiredBlock { .. } => false,
         }
     }
+
+    /// The raw ABI-encoded revert bytes this error carries, if any.
+    ///
+    /// A contract revert reaches us in more than one shape: an `alloy`
+    /// contract-call error (`Contract`), a raw JSON-RPC error response
+    /// (`Transport`, e.g. a revert surfaced during gas estimation before the tx
+    /// is sent), or a mined revert the selector registry decoded
+    /// (`DecodedRevert`, whether or not it matched a known signature). Callers
+    /// use this to re-decode a revert against a specific ABI -- e.g. a custom
+    /// error the shared registry does not know -- instead of branching on the
+    /// error variant themselves.
+    pub fn revert_data(&self) -> Option<alloy::primitives::Bytes> {
+        match self {
+            Self::Contract(contract_err) => contract_err.as_revert_data(),
+            Self::Transport(rpc_error) => rpc_error
+                .as_error_resp()
+                .and_then(alloy::rpc::json_rpc::ErrorPayload::as_revert_data),
+            Self::DecodedRevert(AbiDecodedErrorType::Unknown(bytes)) => {
+                Some(alloy::primitives::Bytes::copy_from_slice(bytes))
+            }
+            Self::DecodedRevert(AbiDecodedErrorType::Known { data, .. }) => {
+                Some(alloy::primitives::Bytes::copy_from_slice(data))
+            }
+            Self::Reverted { .. }
+            | Self::Transaction(_)
+            | Self::AbiDecode(_)
+            | Self::WalletConfigParse(_)
+            | Self::NodeBehindRequiredBlock { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReceiptTimeout { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::TransactionDropped { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementUnderpriced { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementFeeOverflow => None,
+            #[cfg(feature = "local-signer")]
+            Self::InvalidPrivateKey(_) => None,
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey(_) => None,
+        }
+    }
 }
 
 impl EvmError {
