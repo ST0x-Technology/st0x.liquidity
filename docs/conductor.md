@@ -270,6 +270,36 @@ the job needs: config, symbol cache, configured Pyth feed IDs (`PythFeedIds`),
 EVM provider, orderbook address, CQRS frameworks, vault registry, executor,
 database pool, and job queue. Wrapped in `Arc` and injected via apalis `Data`.
 
+### CheckPositions
+
+Defined in `src/position_check.rs`. A durable, self-rescheduling apalis job that
+replaced the former supervised position-polling task. A single instance is
+enqueued at startup; each run scans all positions from the `Position`
+projection, skips symbols with active equity transfers or an already-claimed
+pending order, and enqueues an independent `PlaceHedge` job for every symbol
+whose net exposure has crossed the execution threshold. Per-symbol scan errors
+are logged and swallowed so one symbol's failure cannot block the others; only
+failures of the loop itself propagate. After each scan the job re-enqueues
+itself with a delay of the configured `position_check_interval`.
+
+Each tick also re-drives orders stuck `Pending` between broker acceptance and
+the outcome commit (ADR 0014), serialized against live placements via the shared
+counter-trade submission lock.
+
+### PlaceHedge
+
+Defined in `src/trading/offchain/hedge.rs`. Enqueued by `CheckPositions` (one
+job per ready symbol) into the `HedgeJobQueue`. Implements `Job<HedgeCtx>`. The
+`perform()` method places the offsetting broker order via the `OrderPlacer`
+service and rolls the position back if the broker rejects. The
+`offchain_order_id` is generated at enqueue time, not inside `perform()`, so
+retries reuse the same ID -- a crash between claiming the position and placing
+the order cannot strand the position with a pending ID no retry can claim.
+
+During an Extended market session, only symbols with
+`extended_hours_counter_trading = enabled` place (limit) orders, priced with the
+configured `counter_trade_slippage_bps` buffer; disabled symbols skip.
+
 ## Conductor assembly
 
 `builder::spawn()` (`src/conductor/builder.rs`) uses `#[bon::builder]` to
