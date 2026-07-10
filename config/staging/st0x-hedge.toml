@@ -282,3 +282,50 @@ extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xc585AeB8B76c5F5e4215470A7625258e86ED7746"
 tokenized_equity_derivative = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
+
+# Registered for parity with prod; staging only trades RKLB, so these stay
+# disabled.
+[assets.equities.CEG]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x9a5D3cAeC90b0332b18C0B93fEF42F3F8C918289"
+tokenized_equity_derivative = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
+
+[assets.equities.DRAM]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x96DE077262609298CD891E4Ab21bd34837dE33aB"
+tokenized_equity_derivative = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
+
+[assets.equities.TSM]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x7001e2974F775f0Fd73a3D2e5914e591f3EC3fBB"
+tokenized_equity_derivative = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
+
+[assets.equities.ASML]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x722Cb373f1871A176fb5DC3953046f2EAE22F619"
+tokenized_equity_derivative = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
+
+[assets.equities.SKHY]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x4DBA41f0feb390F208a85e96168fF5d8aC2b6F5c"
+tokenized_equity_derivative = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
