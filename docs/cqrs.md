@@ -367,31 +367,6 @@ let entity: Option<Position> = load_aggregate::<Position>(pool, &symbol)
 Gated behind `#[cfg(test)]` / `feature = "test-support"`. Bypasses the CQRS
 framework (no reactors dispatched). Production code reads through `Projection`.
 
-## Event Upcasters
-
-When you MUST change event structure (e.g., adding required fields to existing
-events), use upcasters to transform old events to the new format at load time:
-
-```rust
-use cqrs_es::persist::{EventUpcaster, SemanticVersionEventUpcaster};
-
-fn upcast_v1_to_v2(mut payload: Value) -> Value {
-    payload["new_field"] = json!("default");
-    payload
-}
-
-pub fn create_my_upcaster() -> Box<dyn EventUpcaster> {
-    Box::new(SemanticVersionEventUpcaster::new(
-        "MyAggregate::MyEvent",  // event_type to match
-        "2.0",                    // target version
-        Box::new(upcast_v1_to_v2),
-    ))
-}
-```
-
-Update `event_version()` in your event enum to return the new version for new
-events.
-
 ## Forbidden Patterns
 
 1. **NEVER write directly to the `events` table** -- use `Store::send()`
