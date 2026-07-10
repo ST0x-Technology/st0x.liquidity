@@ -122,16 +122,18 @@ rebalancing), and respects market hours by pausing trading outside open hours.
 A type-safe stock ticker represented as a newtype (`Symbol(String)`). Tokenized
 equities appear onchain in two forms, modeled by `TokenizedSymbol<Form>`:
 
-- `tAAPL` - 1:1 minted tokenized shares (`OneToOneTokenizedShares`)
+- `tAAPL` - 1:1 minted tokenized shares (the unwrapped underlying of the `wt`
+  vault shares; no dedicated Rust type)
 - `wtCOIN` - ERC-4626 vault shares wrapping tokenized equity
   (`WrappedTokenizedShares`)
 - `AAPL` - base equity stock (offchain, at the brokerage)
 - `USDC` - stablecoin used as the quote currency onchain
 
 Both forms resolve to the same base `Symbol` for offchain hedging (e.g. `tAAPL`
-and `wtAAPL` both resolve to `AAPL`). Each context uses the specific form it
-knows: Raindex events use `TokenizedSymbol<WrappedTokenizedShares>`, Alpaca
-tokenization uses `TokenizedSymbol<OneToOneTokenizedShares>`.
+and `wtAAPL` both resolve to `AAPL`). `WrappedTokenizedShares` is the only
+`TokenizationForm` implemented in code: Raindex events parse
+`TokenizedSymbol<WrappedTokenizedShares>` (`wt` prefix), while Alpaca
+tokenization operates on the base `Symbol` directly.
 
 ### Hedge
 
