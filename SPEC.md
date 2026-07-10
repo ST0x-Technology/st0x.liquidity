@@ -395,18 +395,15 @@ resume hedging — once the cancellation confirms.
 
 #### SQLite Trade Database
 
-The bot uses a multi-table SQLite database to track trades and manage state. Key
-tables include: onchain trade records, broker execution tracking, position
-accumulators for batching fractional shares, audit trail linking, and event
-queue for idempotency. The complete database schema is defined in
-`migrations/20250703115746_trades.sql`.
+The bot uses a SQLite database. State and audit history are stored as CQRS event
+streams (see DDD/CQRS/ES Architecture below). The schema is defined across all
+migration files in `migrations/`.
 
 - Store each onchain trade with symbol, amount, direction, and price
-- Track broker executions separately with whole share amounts, status, and
-  broker type
-- Accumulate positions per symbol until execution thresholds are reached
-- Maintain complete audit trail linking onchain trades to broker executions
-- Handle concurrent database writes safely with per-symbol locking
+- Track offchain order lifecycle through CQRS events
+- Accumulate net position per symbol until execution thresholds are reached
+- Maintain complete audit trail in the immutable event store
+- Handle concurrent trade processing safely with per-symbol locking
 
 #### Pyth Price Extraction
 

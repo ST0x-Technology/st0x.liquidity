@@ -332,17 +332,22 @@ Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
   conductor, dashboard backend, and CLI
+- **`st0x-config`** (`crates/config/`) - TOML/secrets loading and runtime
+  context assembly; restricted to `st0x-hedge` binary crates only
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
-- **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
-  helpers, snapshot-backed loading, compactable observational event streams, and
-  testing utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Alpaca Broker API and mock implementations
 - **`st0x-tokenization`** (`crates/tokenization/`) - Standalone `Tokenizer`
   trait abstraction with Alpaca tokenization API and mock implementations
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
+- **`st0x-raindex`** (`crates/raindex/`) - `Raindex` trait and shared domain
+  types for Rain OrderBook vault operations
+- **`st0x-registry`** (`crates/registry/`) - Shared reference-data registry:
+  `SymbolCache` (token address -> symbol) and per-symbol `get_symbol_lock`
+- **`st0x-wrapper`** (`crates/wrapper/`) - `Wrapper` trait and ERC-4626
+  wrap/unwrap domain types
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
 - **`st0x-finance`** (`crates/finance/`) - Shared financial primitives:
   `Symbol`, `FractionalShares`, `Usdc`, `Usd`, and related domain types
@@ -350,6 +355,10 @@ Workspace crates:
   and serde helpers for workspace wire formats
 - **`st0x-float-macro`** (`crates/float-macro/`) - Proc-macro for compile-time
   `Float` literals (`float!(1.5)`)
+
+`st0x-event-sorcery` is an external git dependency (lives in the separate
+[event-sorcery](https://github.com/ST0x-Technology/event-sorcery) repo) and is
+not a workspace crate.
 
 ### Infrastructure
 
