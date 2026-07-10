@@ -16,9 +16,9 @@ from "how to sign and submit" (key management, owned by this crate).
 
 ### `TurnkeyWallet`
 
-Wraps `alloy-signer-turnkey` to sign transactions via Turnkey's AWS Nitro secure
-enclaves. Low-latency signing (50-100ms). Enabled behind the `turnkey` feature
-flag.
+Implements a custom alloy `TxSigner` backed by the Turnkey API
+(`turnkey_client`) to sign transactions via Turnkey's AWS Nitro secure enclaves.
+Low-latency signing (50-100ms). Enabled behind the `turnkey` feature flag.
 
 ### `RawPrivateKeyWallet`
 

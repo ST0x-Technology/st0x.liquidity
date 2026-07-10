@@ -5,7 +5,6 @@ mod cctp;
 mod dividend;
 mod rebalancing;
 mod repair;
-mod submit;
 mod trading;
 mod vault;
 mod wrapper;
@@ -651,25 +650,6 @@ pub enum Commands {
         order_id: String,
     },
 
-    /// Submit raw calldata transactions to the blockchain
-    ///
-    /// Reads transactions from stdin (pipe mode) or from --to/--data flags.
-    /// Stdin format: one `<address>:<hex_calldata>` per line.
-    /// Signs via the configured Turnkey wallet and prompts before submitting.
-    Submit {
-        /// Target contract address (flag mode, mutually exclusive with stdin)
-        #[arg(long = "to", requires = "data")]
-        to: Option<Address>,
-
-        /// Hex-encoded calldata (flag mode, mutually exclusive with stdin)
-        #[arg(long = "data", requires = "to")]
-        data: Option<String>,
-
-        /// Skip confirmation prompt
-        #[arg(long = "yes")]
-        yes: bool,
-    },
-
     /// Recover stuck positions through aggregate commands.
     Position {
         #[command(subcommand)]
@@ -961,11 +941,6 @@ enum SimpleCommand {
     },
     OrderStatus {
         order_id: String,
-    },
-    Submit {
-        to: Option<Address>,
-        data: Option<String>,
-        yes: bool,
     },
     RebuildView {
         aggregate: AggregateView,
@@ -1347,7 +1322,6 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             Err(ProviderCommand::DividendBump { symbol, quantity })
         }
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
-        Commands::Submit { to, data, yes } => Ok(SimpleCommand::Submit { to, data, yes }),
         Commands::Position { command } => Ok(SimpleCommand::Position { command }),
         Commands::FailUsdcTransfer { id, reason } => {
             Ok(SimpleCommand::FailUsdcTransfer { id, reason })
@@ -1563,15 +1537,6 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await
-        }
-        SimpleCommand::Submit { to, data, yes } => {
-            let transactions = if let (Some(to), Some(data)) = (to, data) {
-                vec![submit::parse_flag_transaction(to, &data)?]
-            } else {
-                let stdin = std::io::stdin().lock();
-                submit::parse_stdin_lines(stdin)?
-            };
-            submit::submit_command(stdout, transactions, yes, ctx).await
         }
         SimpleCommand::RebuildView { aggregate, id, all } => {
             rebuild_view(stdout, pool, aggregate, id, all).await
