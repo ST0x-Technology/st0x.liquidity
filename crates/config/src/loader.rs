@@ -3995,18 +3995,30 @@ mod tests {
             let config: Config = toml::from_str(&contents).unwrap();
 
             // e2e/config.toml supplies its wallet out of band, so there is no
-            // [wallet].address to pin a legacy vault_owner against.
-            let Some(wallet_value) = config.wallet else {
-                continue;
-            };
-            let wallet: WalletMeta = wallet_value.try_into().unwrap();
+            // [wallet].address to pin a legacy vault_owner against -- but the
+            // mode/inventory consistency checks below don't need the wallet,
+            // so they run for every checked-in config.
+            let wallet: Option<WalletMeta> = config.wallet.map(|value| value.try_into().unwrap());
 
             match (config.raindex.inventory_mode, config.raindex.inventory) {
-                (InventoryModeTag::Legacy, _) => assert_eq!(
-                    config.raindex.vault_owner, wallet.address,
-                    "{path:?}: inventory_mode = \"legacy\" means the bot's EOA owns the \
-                     vaults, so vault_owner must equal [wallet].address"
-                ),
+                (InventoryModeTag::Legacy, None) => {
+                    if let Some(wallet) = wallet {
+                        assert_eq!(
+                            config.raindex.vault_owner, wallet.address,
+                            "{path:?}: inventory_mode = \"legacy\" means the bot's EOA owns \
+                             the vaults, so vault_owner must equal [wallet].address"
+                        );
+                    }
+                }
+                (InventoryModeTag::Legacy, Some(inventory)) => {
+                    // EvmCtx::new rejects this combination at startup
+                    // (LegacyWithInventory); asserting it here fails the
+                    // contradiction in CI instead of at the deploy gate.
+                    panic!(
+                        "{path:?}: inventory_mode = \"legacy\" forbids an inventory address, \
+                         found {inventory}"
+                    )
+                }
                 (InventoryModeTag::Managed, Some(inventory)) => assert_eq!(
                     config.raindex.vault_owner, inventory,
                     "{path:?}: inventory_mode = \"managed\" means the inventory contract \

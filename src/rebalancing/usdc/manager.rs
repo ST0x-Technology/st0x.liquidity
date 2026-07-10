@@ -152,9 +152,17 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
 /// keeps the opaque wrap and the normal redrive path.
 fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
     match error {
-        RaindexError::InsufficientVaultLiquidity { .. } => {
-            warn!(target: "rebalance", %error, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
-            UsdcTransferError::InsufficientVaultLiquidity { source: error }
+        RaindexError::InsufficientVaultLiquidity {
+            token,
+            requested,
+            received,
+        } => {
+            warn!(target: "rebalance", %token, %requested, %received, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
+            UsdcTransferError::InsufficientVaultLiquidity {
+                token,
+                requested,
+                received,
+            }
         }
         other => {
             warn!(target: "rebalance", "Vault withdrawal failed: {other}");
@@ -13425,10 +13433,17 @@ mod tests {
             received: U256::from(400_000u64),
         });
 
-        assert!(
-            matches!(error, UsdcTransferError::InsufficientVaultLiquidity { .. }),
-            "under-funded revert must surface the distinct terminal error, got: {error:?}"
-        );
+        let UsdcTransferError::InsufficientVaultLiquidity {
+            token,
+            requested,
+            received,
+        } = error
+        else {
+            panic!("under-funded revert must surface the distinct terminal error, got: {error:?}");
+        };
+        assert_eq!(token, USDC_BASE);
+        assert_eq!(requested, U256::from(1_000_000u64));
+        assert_eq!(received, U256::from(400_000u64));
     }
 
     #[test]

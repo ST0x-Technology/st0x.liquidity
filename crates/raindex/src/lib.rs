@@ -72,18 +72,21 @@ pub enum RaindexError {
     /// the irreversible withdraw on this.
     #[error("withdrawal scan inconclusive: node not caught up past block {from_block}")]
     ScanInconclusive { from_block: u64 },
-    /// A log the withdrawal scan matched on address + topic0 was anomalous: it
-    /// carried no transaction hash, had no topics, an unrecognized topic0, or
-    /// failed to ABI-decode. Impossible under the current contracts, so it means
-    /// ABI drift or an imposter at a trusted address. The log could be our own
-    /// in-flight withdrawal, so the scan fails closed rather than skip it and let
-    /// the caller re-issue an irreversible, already-submitted withdraw. Not
-    /// auto-retryable -- ABI drift needs a code fix, not another scan.
+    /// A log the withdrawal scan matched on address + topic0 was anomalous
+    /// (see [`ScanAnomaly`]). Impossible under the current contracts, so it
+    /// means ABI drift or an imposter at a trusted address. The log could be
+    /// our own in-flight withdrawal, so the scan fails closed rather than skip
+    /// it and let the caller re-issue an irreversible, already-submitted
+    /// withdraw. Not auto-retryable -- ABI drift needs a code fix, not another
+    /// scan.
     #[error(
         "withdrawal scan hit an anomalous log ({reason}); failing closed to \
          avoid re-issuing an already-submitted withdraw"
     )]
-    ScanAnomalousLog { reason: &'static str },
+    ScanAnomalousLog {
+        #[source]
+        reason: ScanAnomaly,
+    },
     /// The shared `RaindexInventory` reverted a `withdraw4` because the vault
     /// could not cover the requested amount (e.g. a concurrent Raindex clear
     /// drained it first). Unlike the orderbook's `withdraw4`, which returns
@@ -111,6 +114,23 @@ pub enum RaindexError {
          grant it before enabling rebalancing"
     )]
     MissingOperatorRole { inventory: Address, wallet: Address },
+}
+
+/// What made a withdrawal-scan log anomalous, for
+/// [`RaindexError::ScanAnomalousLog`]. Decode failures preserve the underlying
+/// ABI error as a source instead of flattening it into a string.
+#[derive(Debug, thiserror::Error)]
+pub enum ScanAnomaly {
+    #[error("log without transaction hash")]
+    MissingTransactionHash,
+    #[error("log without topics")]
+    MissingTopics,
+    #[error("unrecognized topic0 {topic0}")]
+    UnrecognizedTopic0 { topic0: B256 },
+    #[error("undecodable OperatorWithdraw log")]
+    UndecodableOperatorWithdraw(#[source] alloy::sol_types::Error),
+    #[error("undecodable WithdrawV2 log")]
+    UndecodableWithdrawV2(#[source] alloy::sol_types::Error),
 }
 
 impl RaindexError {

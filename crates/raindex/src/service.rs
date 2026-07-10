@@ -27,7 +27,7 @@ use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, USDC_BA
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
-use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome};
+use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome, ScanAnomaly};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -428,13 +428,13 @@ impl<E: Evm> RaindexService<E> {
                 let Some(tx_hash) = log.transaction_hash else {
                     warn!(target: "inventory", ?log, "Withdrawal-scan log without a transaction hash; failing closed");
                     return Err(RaindexError::ScanAnomalousLog {
-                        reason: "log without transaction hash",
+                        reason: ScanAnomaly::MissingTransactionHash,
                     });
                 };
                 let Some(topic) = log.topics().first().copied() else {
                     warn!(target: "inventory", %tx_hash, "Withdrawal-scan log without topics; failing closed");
                     return Err(RaindexError::ScanAnomalousLog {
-                        reason: "log without topics",
+                        reason: ScanAnomaly::MissingTopics,
                     });
                 };
 
@@ -444,8 +444,8 @@ impl<E: Evm> RaindexService<E> {
                         .inspect_err(|error| {
                             warn!(target: "inventory", %tx_hash, ?error, "Undecodable OperatorWithdraw log during resume scan; failing closed");
                         })
-                        .map_err(|_| RaindexError::ScanAnomalousLog {
-                            reason: "undecodable OperatorWithdraw log",
+                        .map_err(|error| RaindexError::ScanAnomalousLog {
+                            reason: ScanAnomaly::UndecodableOperatorWithdraw(error),
                         })?;
                     let event = decoded.data();
                     if event.operator == self.owner
@@ -461,8 +461,8 @@ impl<E: Evm> RaindexService<E> {
                         .inspect_err(|error| {
                             warn!(target: "orderbook", %tx_hash, ?error, "Undecodable WithdrawV2 log during resume scan; failing closed");
                         })
-                        .map_err(|_| RaindexError::ScanAnomalousLog {
-                            reason: "undecodable WithdrawV2 log",
+                        .map_err(|error| RaindexError::ScanAnomalousLog {
+                            reason: ScanAnomaly::UndecodableWithdrawV2(error),
                         })?;
                     let event = decoded.data();
                     if event.sender == self.owner
@@ -475,7 +475,7 @@ impl<E: Evm> RaindexService<E> {
                 } else {
                     warn!(target: "inventory", %tx_hash, %topic, "Withdrawal-scan log with unrecognized topic0; failing closed");
                     return Err(RaindexError::ScanAnomalousLog {
-                        reason: "unrecognized topic0",
+                        reason: ScanAnomaly::UnrecognizedTopic0 { topic0: topic },
                     });
                 }
             }
@@ -1292,8 +1292,13 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, RaindexError::ScanAnomalousLog { .. }),
-            "undecodable log must fail closed, got: {error:?}",
+            matches!(
+                error,
+                RaindexError::ScanAnomalousLog {
+                    reason: ScanAnomaly::UndecodableOperatorWithdraw(_),
+                }
+            ),
+            "undecodable log must fail closed with the decode error preserved, got: {error:?}",
         );
     }
 
@@ -1440,6 +1445,44 @@ mod tests {
             .verify_operator_role::<NoOpErrorRegistry>()
             .await
             .expect("preflight must pass when the wallet holds OPERATOR_ROLE");
+    }
+
+    /// The retry loop exists for exactly this scenario: a load-balanced RPC
+    /// routes early `hasRole` reads to nodes lagging a recent grant (stale
+    /// `false`), then a later attempt reaches a caught-up node. A `true` on any
+    /// attempt must pass the preflight instead of trusting the first stale
+    /// `false`. Paused time auto-advances the `SCAN_RETRY_BACKOFF` sleeps so
+    /// the four retries cost no wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn verify_operator_role_passes_when_true_follows_lagging_falses() {
+        let asserter = Asserter::new();
+        let role = B256::repeat_byte(0x42);
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            IRaindexInventory::OPERATOR_ROLECall::abi_encode_returns(&role),
+        ));
+        for _ in 0..SCAN_ATTEMPTS - 1 {
+            asserter.push_success(&alloy::primitives::Bytes::from(
+                IRaindexInventory::hasRoleCall::abi_encode_returns(&false),
+            ));
+        }
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            IRaindexInventory::hasRoleCall::abi_encode_returns(&true),
+        ));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            RaindexContracts {
+                inventory: Address::repeat_byte(0xAA),
+                orderbook: Address::ZERO,
+            },
+            Address::repeat_byte(0xBB),
+        );
+
+        service
+            .verify_operator_role::<NoOpErrorRegistry>()
+            .await
+            .expect("a true after lagging falses must pass the preflight");
     }
 
     #[tokio::test]
