@@ -10,6 +10,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
 
+use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
 use st0x_execution::{Direction, FractionalShares, Symbol};
 
@@ -144,20 +145,60 @@ impl<Form: TokenizationForm> FromStr for TokenizedSymbol<Form> {
     }
 }
 
+/// Distinguishes the input-side token address from the output-side token
+/// address in [`TradeDetails::try_from_io`]. Both sides are plain `Address`,
+/// so without this wrapper a positional swap at the call site would compile
+/// silently and misattribute the equity token to the wrong side of the trade.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InputToken(pub(crate) Address);
+
+/// See [`InputToken`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutputToken(pub(crate) Address);
+
 /// Trade details extracted from symbol pair processing
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TradeDetails {
-    ticker: Symbol,
+    equity_symbol: TokenizedSymbol<WrappedTokenizedShares>,
+    equity_token: Address,
+    usdc_token: Address,
     equity_amount: FractionalShares,
     usdc_amount: Usdc,
     direction: Direction,
 }
 
 impl TradeDetails {
-    /// Gets the ticker symbol
+    /// Gets the base ticker symbol (e.g. `AAPL`), derived from the wrapped
+    /// equity symbol.
     #[cfg(test)]
     pub(crate) fn ticker(&self) -> &Symbol {
-        &self.ticker
+        self.equity_symbol.base()
+    }
+
+    /// Gets the wrapped tokenized-equity symbol (e.g. `wtAAPL`). Used in
+    /// production by the `InventoryTrade` path to look up the configured
+    /// canonical derivative address for the resolved symbol.
+    pub(crate) fn equity_symbol(&self) -> &TokenizedSymbol<WrappedTokenizedShares> {
+        &self.equity_symbol
+    }
+
+    /// Consumes `self` and returns the wrapped tokenized-equity symbol
+    /// without cloning. For callers that already own a `TradeDetails` and
+    /// only need the other fields' `Copy` values (see `equity_token`,
+    /// `equity_amount`, `direction`), this avoids a heap-allocating clone of
+    /// the underlying `Symbol` string on every processed fill.
+    pub(crate) fn into_equity_symbol(self) -> TokenizedSymbol<WrappedTokenizedShares> {
+        self.equity_symbol
+    }
+
+    /// Gets the ERC20 address of the tokenized-equity side of the trade.
+    pub(crate) fn equity_token(&self) -> Address {
+        self.equity_token
+    }
+
+    /// Gets the ERC20 address of the USDC side of the trade.
+    pub(crate) fn usdc_token(&self) -> Address {
+        self.usdc_token
     }
 
     /// Gets the equity amount
@@ -179,21 +220,27 @@ impl TradeDetails {
     /// (wtTICKER), since Raindex orders always involve wrapped tokens.
     pub(crate) fn try_from_io(
         input_symbol: &str,
+        input_token: InputToken,
         input_amount: Float,
         output_symbol: &str,
+        output_token: OutputToken,
         output_amount: Float,
     ) -> Result<Self, OnChainError> {
-        let (ticker, direction) = determine_trade_details(input_symbol, output_symbol)?;
+        let InputToken(input_token) = input_token;
+        let OutputToken(output_token) = output_token;
+
+        let (equity_symbol, direction) = determine_trade_details(input_symbol, output_symbol)?;
 
         let is_wrapped_equity =
             |symbol: &str| TokenizedSymbol::<WrappedTokenizedShares>::parse(symbol).is_ok();
 
-        // Extract equity and USDC amounts based on which side is the tokenized equity
-        let (equity_amount_raw, usdc_amount_raw) =
+        // Extract the equity/USDC amounts and the equity/USDC token addresses
+        // based on which side is the tokenized equity.
+        let (equity_amount_raw, usdc_amount_raw, equity_token, usdc_token) =
             if input_symbol == "USDC" && is_wrapped_equity(output_symbol) {
-                (output_amount, input_amount)
+                (output_amount, input_amount, output_token, input_token)
             } else if output_symbol == "USDC" && is_wrapped_equity(input_symbol) {
-                (input_amount, output_amount)
+                (input_amount, output_amount, input_token, output_token)
             } else {
                 return Err(TradeValidationError::InvalidSymbolConfiguration(
                     input_symbol.to_string(),
@@ -228,7 +275,9 @@ impl TradeDetails {
             Usdc::new(truncate_to_dp(usdc_amount_raw, 6).map_err(TradeValidationError::Float)?)?;
 
         Ok(Self {
-            ticker,
+            equity_symbol,
+            equity_token,
+            usdc_token,
             equity_amount,
             usdc_amount,
             direction,
@@ -245,8 +294,8 @@ fn truncate_to_dp(value: Float, decimal_places: u8) -> Result<Float, FloatError>
     Float::from_fixed_decimal(fixed, decimal_places)
 }
 
-/// Determines onchain trade direction and ticker based on onchain
-/// symbol configuration.
+/// Determines onchain trade direction and the parsed tokenized-equity ticker
+/// based on onchain symbol configuration.
 ///
 /// If the on-chain order has USDC as input and a wrapped tokenized
 /// equity (wt prefix) as output, the order sold tokenized equity
@@ -254,17 +303,17 @@ fn truncate_to_dp(value: Float, decimal_places: u8) -> Result<Float, FloatError>
 fn determine_trade_details(
     onchain_input_symbol: &str,
     onchain_output_symbol: &str,
-) -> Result<(Symbol, Direction), OnChainError> {
+) -> Result<(TokenizedSymbol<WrappedTokenizedShares>, Direction), OnChainError> {
     if onchain_input_symbol == "USDC"
         && let Ok(equity) = TokenizedSymbol::<WrappedTokenizedShares>::parse(onchain_output_symbol)
     {
-        return Ok((equity.base().clone(), Direction::Sell));
+        return Ok((equity, Direction::Sell));
     }
 
     if onchain_output_symbol == "USDC"
         && let Ok(equity) = TokenizedSymbol::<WrappedTokenizedShares>::parse(onchain_input_symbol)
     {
-        return Ok((equity.base().clone(), Direction::Buy));
+        return Ok((equity, Direction::Buy));
     }
 
     Err(TradeValidationError::InvalidSymbolConfiguration(
@@ -276,8 +325,14 @@ fn determine_trade_details(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use alloy::primitives::address;
+
     use st0x_float_macro::float;
+
+    use super::*;
+
+    const USDC_TOKEN: Address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const EQUITY_TOKEN: Address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
     #[test]
     fn test_tokenized_equity_symbol_parse() {
@@ -425,30 +480,30 @@ mod tests {
     #[test]
     fn test_determine_trade_details_usdc_to_wrapped() {
         let result = determine_trade_details("USDC", "wtAAPL").unwrap();
-        assert_eq!(result.0, symbol!("AAPL"));
+        assert_eq!(result.0.base(), &symbol!("AAPL"));
         assert_eq!(result.1, Direction::Sell);
 
         let result = determine_trade_details("USDC", "wtTSLA").unwrap();
-        assert_eq!(result.0, symbol!("TSLA"));
+        assert_eq!(result.0.base(), &symbol!("TSLA"));
         assert_eq!(result.1, Direction::Sell);
 
         let result = determine_trade_details("USDC", "wtGME").unwrap();
-        assert_eq!(result.0, symbol!("GME"));
+        assert_eq!(result.0.base(), &symbol!("GME"));
         assert_eq!(result.1, Direction::Sell);
     }
 
     #[test]
     fn test_determine_trade_details_wrapped_to_usdc() {
         let result = determine_trade_details("wtAAPL", "USDC").unwrap();
-        assert_eq!(result.0, symbol!("AAPL"));
+        assert_eq!(result.0.base(), &symbol!("AAPL"));
         assert_eq!(result.1, Direction::Buy);
 
         let result = determine_trade_details("wtTSLA", "USDC").unwrap();
-        assert_eq!(result.0, symbol!("TSLA"));
+        assert_eq!(result.0.base(), &symbol!("TSLA"));
         assert_eq!(result.1, Direction::Buy);
 
         let result = determine_trade_details("wtGME", "USDC").unwrap();
-        assert_eq!(result.0, symbol!("GME"));
+        assert_eq!(result.0.base(), &symbol!("GME"));
         assert_eq!(result.1, Direction::Buy);
     }
 
@@ -496,10 +551,20 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_usdc_to_wrapped() {
-        let details =
-            TradeDetails::try_from_io("USDC", float!(100), "wtAAPL", float!(0.5)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(100),
+            "wtAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.5),
+        )
+        .unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
+        assert_eq!(details.equity_symbol().to_string(), "wtAAPL");
+        // Equity is the output side here, so the equity token is the output token.
+        assert_eq!(details.equity_token(), EQUITY_TOKEN);
         assert!(details.equity_amount().inner().eq(float!(0.5)).unwrap());
         assert!(details.usdc_amount().value().eq(float!(100)).unwrap());
         assert_eq!(details.direction(), Direction::Sell);
@@ -507,10 +572,20 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_wrapped_to_usdc() {
-        let details =
-            TradeDetails::try_from_io("wtAAPL", float!(0.5), "USDC", float!(100)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "wtAAPL",
+            InputToken(EQUITY_TOKEN),
+            float!(0.5),
+            "USDC",
+            OutputToken(USDC_TOKEN),
+            float!(100),
+        )
+        .unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
+        assert_eq!(details.equity_symbol().to_string(), "wtAAPL");
+        // Equity is the input side here, so the equity token is the input token.
+        assert_eq!(details.equity_token(), EQUITY_TOKEN);
         assert!(details.equity_amount().inner().eq(float!(0.5)).unwrap());
         assert!(details.usdc_amount().value().eq(float!(100)).unwrap());
         assert_eq!(details.direction(), Direction::Buy);
@@ -518,16 +593,30 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_nvda() {
-        let details =
-            TradeDetails::try_from_io("USDC", float!(64.17), "wtNVDA", float!(0.374)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(64.17),
+            "wtNVDA",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.374),
+        )
+        .unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert!(details.equity_amount().inner().eq(float!(0.374)).unwrap());
         assert!(details.usdc_amount().value().eq(float!(64.17)).unwrap());
         assert_eq!(details.direction(), Direction::Sell);
 
-        let details =
-            TradeDetails::try_from_io("wtNVDA", float!(0.374), "USDC", float!(64.17)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "wtNVDA",
+            InputToken(EQUITY_TOKEN),
+            float!(0.374),
+            "USDC",
+            OutputToken(USDC_TOKEN),
+            float!(64.17),
+        )
+        .unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert!(details.equity_amount().inner().eq(float!(0.374)).unwrap());
@@ -537,13 +626,27 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_invalid_configurations() {
-        let result = TradeDetails::try_from_io("USDC", float!(100), "USDC", float!(100));
+        let result = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(100),
+            "USDC",
+            OutputToken(USDC_TOKEN),
+            float!(100),
+        );
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = TradeDetails::try_from_io("BTC", float!(1), "ETH", float!(3000));
+        let result = TradeDetails::try_from_io(
+            "BTC",
+            InputToken(Address::ZERO),
+            float!(1),
+            "ETH",
+            OutputToken(Address::ZERO),
+            float!(3000),
+        );
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
@@ -552,13 +655,27 @@ mod tests {
 
     #[test]
     fn test_trade_details_negative_amount_validation() {
-        let result = TradeDetails::try_from_io("USDC", float!(100), "wtAAPL", float!(-0.5));
+        let result = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(100),
+            "wtAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(-0.5),
+        );
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::NegativeShares(_))
         ));
 
-        let result = TradeDetails::try_from_io("USDC", float!(-100), "wtAAPL", float!(0.5));
+        let result = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(-100),
+            "wtAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.5),
+        );
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::NegativeUsdc(_))
@@ -597,8 +714,15 @@ mod tests {
     fn test_real_transaction_nvda_amount_extraction() {
         // Real transaction: 0.374 wtNVDA sold for 64.169234 USDC
         // Verifies equity vs USDC amounts are not swapped
-        let details =
-            TradeDetails::try_from_io("USDC", float!(64.169234), "wtNVDA", float!(0.374)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(64.169234),
+            "wtNVDA",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.374),
+        )
+        .unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert!(details.equity_amount().inner().eq(float!(0.374)).unwrap());
@@ -615,8 +739,15 @@ mod tests {
         let usdc_with_dust = float!(&"64.169234000001".to_string());
         let shares_with_dust = float!(&"0.374000000000000000001".to_string());
 
-        let details =
-            TradeDetails::try_from_io("USDC", usdc_with_dust, "wtNVDA", shares_with_dust).unwrap();
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            usdc_with_dust,
+            "wtNVDA",
+            OutputToken(EQUITY_TOKEN),
+            shares_with_dust,
+        )
+        .unwrap();
 
         assert!(details.usdc_amount().value().eq(float!(64.169234)).unwrap());
         assert!(details.equity_amount().inner().eq(float!(0.374)).unwrap());
@@ -635,8 +766,10 @@ mod tests {
 
         let details = TradeDetails::try_from_io(
             "USDC",
+            InputToken(USDC_TOKEN),
             float!(&"34.645024000001".to_string()),
             "wtNVDA",
+            OutputToken(EQUITY_TOKEN),
             shares_with_dust,
         )
         .unwrap();
@@ -647,8 +780,15 @@ mod tests {
 
     #[test]
     fn test_edge_case_validation_very_small_amounts() {
-        let details =
-            TradeDetails::try_from_io("USDC", float!(0.01), "wtAAPL", float!(0.0001)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(0.01),
+            "wtAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.0001),
+        )
+        .unwrap();
         assert_eq!(details.ticker(), &symbol!("AAPL"));
         assert!(details.equity_amount().inner().eq(float!(0.0001)).unwrap());
         assert!(details.usdc_amount().value().eq(float!(0.01)).unwrap());
@@ -656,8 +796,15 @@ mod tests {
 
     #[test]
     fn test_edge_case_validation_very_large_amounts() {
-        let details =
-            TradeDetails::try_from_io("USDC", float!(1000000), "wtBRK", float!(100)).unwrap();
+        let details = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(1000000),
+            "wtBRK",
+            OutputToken(EQUITY_TOKEN),
+            float!(100),
+        )
+        .unwrap();
         assert_eq!(details.ticker(), &symbol!("BRK"));
         assert!(details.equity_amount().inner().eq(float!(100)).unwrap());
         assert!(details.usdc_amount().value().eq(float!(1000000)).unwrap());
@@ -690,13 +837,27 @@ mod tests {
 
     #[test]
     fn test_trade_details_rejects_unwrapped_prefix() {
-        let result = TradeDetails::try_from_io("USDC", float!(100), "tAAPL", float!(0.5));
+        let result = TradeDetails::try_from_io(
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(100),
+            "tAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.5),
+        );
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = TradeDetails::try_from_io("tAAPL", float!(0.5), "USDC", float!(100));
+        let result = TradeDetails::try_from_io(
+            "tAAPL",
+            InputToken(EQUITY_TOKEN),
+            float!(0.5),
+            "USDC",
+            OutputToken(USDC_TOKEN),
+            float!(100),
+        );
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))

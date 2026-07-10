@@ -229,6 +229,24 @@ pub(crate) fn seed_get_test_order_token_symbols(cache: &st0x_registry::SymbolCac
     );
 }
 
+/// Builds a JSON-RPC error payload for a genuine on-chain revert
+/// (`Panic(uint256)` with the arithmetic-overflow reason `0x11`).
+/// `decode_panic` resolves this selector synchronously without a registry
+/// lookup, so pushing it never triggers a real HTTP call to the OpenChain
+/// selector registry that token introspection uses in production.
+///
+/// Only a payload carrying revert *data* satisfies `EvmError::is_revert`, so a
+/// bare `push_failure_msg` is not a substitute: it lands as a transport error
+/// and is classified retryable rather than as a genuine revert.
+pub(crate) fn panic_revert_payload() -> alloy::rpc::json_rpc::ErrorPayload {
+    let revert_data = format!("0x4e487b71{:064x}", 0x11u8);
+    alloy::rpc::json_rpc::ErrorPayload {
+        code: 3,
+        message: "execution reverted".into(),
+        data: Some(serde_json::value::to_raw_value(&revert_data).expect("valid json")),
+    }
+}
+
 /// Creates a generic `Log` stub with the supplied log index. This helper is
 /// useful when the concrete value of most fields is irrelevant for the
 /// assertion being performed.

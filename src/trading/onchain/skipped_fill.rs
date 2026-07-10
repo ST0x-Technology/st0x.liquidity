@@ -18,6 +18,16 @@ pub(crate) enum SkipReason {
     UnpriceableFill,
     /// The fill's token pair is not one the bot hedges.
     NonHedgeablePair,
+    /// An `InventoryTrade`-supplied token failed symbol/decimals
+    /// introspection (non-standard ERC20, no code, or a reverting call).
+    UnintrospectableToken,
+    /// An `InventoryTrade`-supplied deposit/withdraw amount could not be
+    /// converted to a `Float` (a malformed or extreme fixed-decimal value).
+    InvalidInventoryAmount,
+    /// An `InventoryTrade` leg's token address did not match the configured
+    /// canonical address for the symbol its `symbol()` claims to be (a
+    /// spoofed or misconfigured token supplied by an `OPERATOR_ROLE` holder).
+    UnrecognizedInventoryToken,
 }
 
 impl SkipReason {
@@ -25,6 +35,9 @@ impl SkipReason {
         match self {
             Self::UnpriceableFill => "unpriceable_fill",
             Self::NonHedgeablePair => "non_hedgeable_pair",
+            Self::UnintrospectableToken => "unintrospectable_token",
+            Self::InvalidInventoryAmount => "invalid_inventory_amount",
+            Self::UnrecognizedInventoryToken => "unrecognized_inventory_token",
         }
     }
 }
