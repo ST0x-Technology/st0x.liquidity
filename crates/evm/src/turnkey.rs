@@ -7,15 +7,18 @@
 //! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
 //! of `PrivateKeySigner` (local key).
 
-use alloy::consensus::SignableTransaction;
+use alloy::consensus::{SignableTransaction, TxEnvelope};
+use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::network::{Ethereum, EthereumWallet, TxSigner};
-use alloy::primitives::{Address, B256, Bytes, ChainId, Signature, TxHash, U256, hex, normalize_v};
+use alloy::primitives::{
+    Address, B256, Bytes, ChainId, Signature, SignatureError, TxHash, hex, keccak256,
+};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionReceipt;
-use alloy::signers::{Error as SignerError, Result as SignerResult, Signer};
+use alloy::signers::{Error as SignerError, Result as SignerResult};
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use reqwest::header::CONTENT_TYPE;
@@ -26,9 +29,9 @@ use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use tracing::{info, trace};
 use turnkey_api_key_stamper::{Stamp, StampHeader, TurnkeyP256ApiKey};
 use turnkey_client::generated::{
-    Activity, ActivityResponse, ActivityStatus, SignRawPayloadIntentV2, SignRawPayloadRequest,
-    immutable::activity::v1::{SignRawPayloadResult, result},
-    immutable::common::v1::{HashFunction, PayloadEncoding},
+    Activity, ActivityResponse, ActivityStatus, SignTransactionIntentV2, SignTransactionRequest,
+    immutable::activity::v1::{SignTransactionResult, result},
+    immutable::common::v1::TransactionType,
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
@@ -73,14 +76,6 @@ pub enum TurnkeyError {
     Signer(#[from] TracingTurnkeySignerError),
 }
 
-/// Component of an ECDSA signature returned by Turnkey.
-#[derive(Debug, Clone, Copy)]
-pub enum SignatureComponent {
-    R,
-    S,
-    V,
-}
-
 /// Errors that can occur when using the traced Turnkey signer.
 #[derive(Debug, thiserror::Error)]
 pub enum TracingTurnkeySignerError {
@@ -88,13 +83,18 @@ pub enum TracingTurnkeySignerError {
     TurnkeyClient(#[from] TurnkeyClientError),
     #[error("invalid hex string: {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("signature component {component:?} has invalid byte length: {len}")]
-    BadComponentLength {
-        component: SignatureComponent,
-        len: usize,
+    #[error("invalid EIP-2718 signed transaction envelope: {0}")]
+    Rlp(#[from] Eip2718Error),
+    #[error("failed to recover signer address from signature: {0}")]
+    SignatureRecovery(#[from] SignatureError),
+    #[error(
+        "Turnkey-returned signature recovers to {recovered}, expected signer {expected} -- \
+         refusing to trust a signature over content we did not request"
+    )]
+    SignerAddressMismatch {
+        expected: Address,
+        recovered: Address,
     },
-    #[error("signature v value {v} is not a valid recovery id")]
-    UnnormalizableV { v: u8 },
     #[error("transaction is missing a chain id")]
     MissingTxChainId,
     #[error("system time is before UNIX epoch: {source}")]
@@ -346,21 +346,21 @@ impl TracingTurnkeyClient {
             .map_err(|source| TracingTurnkeySignerError::SystemTime { source })
     }
 
-    async fn sign_raw_payload(
+    async fn sign_transaction(
         &self,
         organization_id: TurnkeyOrganizationId,
         timestamp_ms: u128,
-        params: SignRawPayloadIntentV2,
-    ) -> Result<SignRawPayloadResult, TurnkeyClientError> {
+        params: SignTransactionIntentV2,
+    ) -> Result<SignTransactionResult, TurnkeyClientError> {
         let TurnkeyOrganizationId(organization_id) = organization_id;
-        let request = SignRawPayloadRequest {
-            r#type: "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2".to_string(),
+        let request = SignTransactionRequest {
+            r#type: "ACTIVITY_TYPE_SIGN_TRANSACTION_V2".to_string(),
             timestamp_ms: timestamp_ms.to_string(),
             parameters: Some(params),
             organization_id,
         };
         let activity = self
-            .process_activity(&request, "/public/v1/submit/sign_raw_payload")
+            .process_activity(&request, "/public/v1/submit/sign_transaction")
             .await?;
         let inner = activity
             .result
@@ -369,7 +369,7 @@ impl TracingTurnkeyClient {
             .ok_or(TurnkeyClientError::MissingInnerResult)?;
 
         match inner {
-            result::Inner::SignRawPayloadResult(result) => Ok(result),
+            result::Inner::SignTransactionResult(result) => Ok(result),
             other => Err(TurnkeyClientError::UnexpectedInnerActivityResult(
                 serde_json::to_string(&other)?,
             )),
@@ -439,29 +439,28 @@ impl TracingTurnkeyClient {
         let content_type = response.headers().get(CONTENT_TYPE).cloned();
         // Read raw bytes and parse the success body with `serde_json::from_slice`
         // so invalid UTF-8 fails fast, matching the fail-fast convention the
-        // Alpaca clients follow. Lossy decoding is used only for the trace line
-        // and the error-body display.
+        // Alpaca clients follow. Lossy decoding is used only for the
+        // error-body display.
         let bytes = response.bytes().await?;
 
-        // The successful `sign_raw_payload` body contains the ECDSA signature
-        // components (r/s/v). These are signature material, not key material:
-        // they do not expose the private key, and for transaction signing they
-        // become public on-chain once the tx is broadcast. This signer is only
-        // used for transaction signing (no off-chain raw-hash signing path), so
-        // logging the body does not leak a secret.
+        // The successful `sign_transaction` body contains a fully-signed,
+        // broadcastable RLP-encoded transaction -- a bearer instrument until
+        // the bot broadcasts it. Only request metadata is logged here, never
+        // the body, so trace-level "wallet" logs cannot be used to
+        // front-run or replay the transaction.
         trace!(
             target: "wallet",
             method = "POST",
             status = %status,
             url = %url,
-            body = %String::from_utf8_lossy(&bytes),
-            "Turnkey API response body received"
+            "Turnkey API response received"
         );
 
         // Error mapping below reproduces upstream `turnkey_client`'s handling
         // (including its String-valued error variants); it is not a new
         // stringly-typed-error introduction. This client is a deliberate fork
-        // of `turnkey_client` to insert the response-body trace above.
+        // of `turnkey_client` to trace request metadata above (and preserve
+        // fail-fast body parsing) without ever logging the response body.
         let content_type = content_type
             .ok_or(TurnkeyClientError::MissingContentTypeHeader)?
             .to_str()
@@ -485,8 +484,20 @@ impl TracingTurnkeyClient {
             ));
         }
 
+        // This path fires on a 2xx response whose JSON fails to deserialize --
+        // for `sign_transaction` that body still contains the fully-signed
+        // transaction (a bearer instrument), so it must not be embedded in
+        // the error. The byte count preserves debuggability without leaking
+        // the payload; `error` (a `serde_json::Error`) still carries the
+        // parse location.
         serde_json::from_slice(&bytes).map_err(|error| {
-            TurnkeyClientError::Decode(String::from_utf8_lossy(&bytes).into_owned(), error)
+            TurnkeyClientError::Decode(
+                format!(
+                    "<{} bytes redacted: response body may contain a signed transaction>",
+                    bytes.len()
+                ),
+                error,
+            )
         })
     }
 }
@@ -534,40 +545,36 @@ impl TracingTurnkeySigner {
         Ok(Self::new(client, organization_id, address, chain_id))
     }
 
+    /// Decodes Turnkey's signed-transaction envelope and extracts its
+    /// signature, verifying that the signature actually recovers to
+    /// `expected_signer` over `expected_hash`.
+    ///
+    /// Turnkey returns a full signed RLP envelope rather than raw r/s/v
+    /// components; alloy's `TxSigner` contract only needs the
+    /// `Signature` (the caller re-encodes the transaction using it), so
+    /// byte-for-byte re-encoding is not required. What matters is that
+    /// the returned signature is genuinely over the exact bytes we
+    /// asked Turnkey to sign, by the address we expect -- a defensive
+    /// check that turns "trust Turnkey's blob" into "cryptographically
+    /// verify the blob signs what we asked, by us."
     fn parse_signature(
-        response: &SignRawPayloadResult,
+        response: &SignTransactionResult,
+        expected_hash: B256,
+        expected_signer: Address,
     ) -> Result<Signature, TracingTurnkeySignerError> {
-        let r_bytes = hex::decode(&response.r)?;
-        let s_bytes = hex::decode(&response.s)?;
-        let v_bytes = hex::decode(&response.v)?;
+        let signed_bytes = hex::decode(&response.signed_transaction)?;
+        let envelope = TxEnvelope::decode_2718_exact(&signed_bytes)?;
+        let signature = *envelope.signature();
+        let recovered = signature.recover_address_from_prehash(&expected_hash)?;
 
-        let r_arr: [u8; 32] = r_bytes.try_into().map_err(|bytes: Vec<u8>| {
-            TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::R,
-                len: bytes.len(),
-            }
-        })?;
-        let r = U256::from_be_bytes(r_arr);
+        if recovered != expected_signer {
+            return Err(TracingTurnkeySignerError::SignerAddressMismatch {
+                expected: expected_signer,
+                recovered,
+            });
+        }
 
-        let s_arr: [u8; 32] = s_bytes.try_into().map_err(|bytes: Vec<u8>| {
-            TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::S,
-                len: bytes.len(),
-            }
-        })?;
-        let s = U256::from_be_bytes(s_arr);
-
-        let [v_byte]: [u8; 1] = v_bytes.try_into().map_err(|bytes: Vec<u8>| {
-            TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::V,
-                len: bytes.len(),
-            }
-        })?;
-
-        let parity = normalize_v(u64::from(v_byte))
-            .ok_or(TracingTurnkeySignerError::UnnormalizableV { v: v_byte })?;
-
-        Ok(Signature::new(r, s, parity))
+        Ok(signature)
     }
 }
 
@@ -577,11 +584,18 @@ impl TxSigner<Signature> for TracingTurnkeySigner {
         self.address
     }
 
+    // Only legacy (EIP-155) and EIP-1559 transactions are exercised in
+    // production (the bot's fill pipeline never constructs EIP-4844 blob
+    // or EIP-7702 set-code transactions). `encoded_for_signing()` handles
+    // every `SignableTransaction` variant regardless, and the
+    // recovered-address check below fails closed on any Turnkey
+    // mishandling of an unexercised variant, so no explicit reject arm
+    // is added here.
     async fn sign_transaction(
         &self,
         tx: &mut dyn SignableTransaction<Signature>,
     ) -> SignerResult<Signature> {
-        if let Some(chain_id) = self.chain_id()
+        if let Some(chain_id) = self.chain_id
             && !tx.set_chain_id_checked(chain_id)
         {
             // `set_chain_id_checked` only returns false when the tx already
@@ -597,41 +611,28 @@ impl TxSigner<Signature> for TracingTurnkeySigner {
             });
         }
 
-        self.sign_hash(&tx.signature_hash()).await
-    }
-}
+        // Hash the exact bytes transmitted to Turnkey (not a separate
+        // `tx.signature_hash()` call) so the recovered-address check below
+        // proves the returned signature signs the payload we actually sent,
+        // even though `signature_hash()` is overridable on the trait object.
+        let unsigned_rlp = tx.encoded_for_signing();
+        let expected_hash = keccak256(&unsigned_rlp);
 
-#[async_trait]
-impl Signer for TracingTurnkeySigner {
-    async fn sign_hash(&self, hash: &B256) -> SignerResult<Signature> {
         let response = self
             .client
-            .sign_raw_payload(
+            .sign_transaction(
                 self.organization_id.clone(),
                 TracingTurnkeyClient::current_timestamp().map_err(SignerError::other)?,
-                SignRawPayloadIntentV2 {
+                SignTransactionIntentV2 {
                     sign_with: self.address.to_string(),
-                    payload: hex::encode(hash),
-                    encoding: PayloadEncoding::Hexadecimal,
-                    hash_function: HashFunction::NoOp,
+                    unsigned_transaction: hex::encode(&unsigned_rlp),
+                    r#type: TransactionType::Ethereum,
                 },
             )
             .await
             .map_err(|error| SignerError::other(TracingTurnkeySignerError::TurnkeyClient(error)))?;
 
-        Self::parse_signature(&response).map_err(SignerError::other)
-    }
-
-    fn address(&self) -> Address {
-        self.address
-    }
-
-    fn chain_id(&self) -> Option<ChainId> {
-        self.chain_id
-    }
-
-    fn set_chain_id(&mut self, chain_id: Option<ChainId>) {
-        self.chain_id = chain_id;
+        Self::parse_signature(&response, expected_hash, self.address).map_err(SignerError::other)
     }
 }
 
@@ -713,9 +714,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::{TxEip1559, TxLegacy};
+    use alloy::eips::eip2718::Encodable2718;
+    use alloy::eips::eip2930::AccessList;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::U256;
+    use alloy::primitives::{TxKind, U256};
     use alloy::providers::ext::AnvilApi;
+    use alloy::signers::local::PrivateKeySigner;
     use httpmock::MockServer;
 
     use super::*;
@@ -747,31 +752,62 @@ mod tests {
         )
     }
 
-    /// 32-byte big-endian hex for the U256 value 1.
-    const VALID_R_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
-    /// 32-byte big-endian hex for the U256 value 2.
-    const VALID_S_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000002";
-
-    fn signature_result(r: &str, s: &str, v: &str) -> SignRawPayloadResult {
-        SignRawPayloadResult {
-            r: r.to_string(),
-            s: s.to_string(),
-            v: v.to_string(),
+    /// Builds a well-formed EIP-1559 transaction (the only shape the bot's
+    /// fill pipeline emits in production) with the given chain id and
+    /// destination address.
+    fn eip1559_tx(chain_id: ChainId, to: Address) -> TxEip1559 {
+        TxEip1559 {
+            chain_id,
+            nonce: 7,
+            gas_limit: 21_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
         }
     }
 
-    /// JSON body for a COMPLETED `sign_raw_payload` activity carrying the
-    /// given signature components, shaped like a real Turnkey response.
-    fn completed_sign_raw_payload_body(r: &str, s: &str, v: &str) -> serde_json::Value {
+    /// Builds a well-formed legacy (EIP-155) transaction with the given
+    /// chain id and destination address.
+    fn legacy_tx(chain_id: Option<ChainId>, to: Address) -> TxLegacy {
+        TxLegacy {
+            chain_id,
+            nonce: 3,
+            gas_price: 1_000_000_000,
+            gas_limit: 21_000,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }
+    }
+
+    /// Signs `tx` locally with `signer` and returns the hex-encoded
+    /// EIP-2718 signed envelope, exactly as Turnkey's `signed_transaction`
+    /// response field would carry it.
+    async fn locally_signed_envelope_hex<Tx>(signer: &PrivateKeySigner, mut tx: Tx) -> String
+    where
+        Tx: SignableTransaction<Signature> + Clone,
+        TxEnvelope: From<alloy::consensus::Signed<Tx>>,
+    {
+        let signature = signer.sign_transaction(&mut tx).await.unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        hex::encode(envelope.encoded_2718())
+    }
+
+    /// JSON body for a COMPLETED `sign_transaction` activity carrying the
+    /// given signed transaction, shaped like a real Turnkey response.
+    fn completed_sign_transaction_body(signed_transaction_hex: &str) -> serde_json::Value {
         serde_json::json!({
             "activity": {
                 "id": "activity-id",
                 "organizationId": "org-test",
                 "status": "ACTIVITY_STATUS_COMPLETED",
-                "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                "type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2",
                 "fingerprint": "fingerprint",
                 "result": {
-                    "signRawPayloadResult": { "r": r, "s": s, "v": v }
+                    "signTransactionResult": { "signedTransaction": signed_transaction_hex }
                 }
             }
         })
@@ -784,80 +820,284 @@ mod tests {
                 "id": "activity-id",
                 "organizationId": "org-test",
                 "status": "ACTIVITY_STATUS_PENDING",
-                "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                "type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2",
                 "fingerprint": "fingerprint"
             }
         })
     }
 
-    #[test]
-    fn parse_signature_decodes_valid_components() {
-        let result = signature_result(VALID_R_HEX, VALID_S_HEX, "00");
+    #[tokio::test]
+    async fn parse_signature_decodes_eip1559_transaction() {
+        let key_signer = PrivateKeySigner::random();
+        let mut tx = eip1559_tx(8453, Address::random());
+        let expected_hash = tx.signature_hash();
 
-        let signature = TracingTurnkeySigner::parse_signature(&result).unwrap();
+        let signature = key_signer.sign_transaction(&mut tx).await.unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        let response = SignTransactionResult {
+            signed_transaction: hex::encode(envelope.encoded_2718()),
+        };
 
-        assert_eq!(signature.r(), U256::from(1));
-        assert_eq!(signature.s(), U256::from(2));
-        assert!(!signature.v());
+        let recovered =
+            TracingTurnkeySigner::parse_signature(&response, expected_hash, key_signer.address())
+                .unwrap();
+
+        assert_eq!(recovered, signature);
+    }
+
+    #[tokio::test]
+    async fn parse_signature_decodes_legacy_transaction() {
+        let key_signer = PrivateKeySigner::random();
+        let mut tx = legacy_tx(Some(8453), Address::random());
+        let expected_hash = tx.signature_hash();
+
+        let signature = key_signer.sign_transaction(&mut tx).await.unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        let response = SignTransactionResult {
+            signed_transaction: hex::encode(envelope.encoded_2718()),
+        };
+
+        let recovered =
+            TracingTurnkeySigner::parse_signature(&response, expected_hash, key_signer.address())
+                .unwrap();
+
+        assert_eq!(recovered, signature);
     }
 
     #[test]
-    fn parse_signature_rejects_short_r_component() {
-        let result = signature_result("0011", VALID_S_HEX, "00");
+    fn parse_signature_rejects_invalid_hex() {
+        let response = SignTransactionResult {
+            signed_transaction: "not-hex".to_string(),
+        };
 
-        let error = TracingTurnkeySigner::parse_signature(&result).unwrap_err();
+        let error = TracingTurnkeySigner::parse_signature(&response, B256::ZERO, Address::random())
+            .unwrap_err();
 
-        assert!(matches!(
-            error,
-            TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::R,
-                len: 2
-            }
-        ));
+        assert!(matches!(error, TracingTurnkeySignerError::Hex(_)));
     }
 
-    #[test]
-    fn parse_signature_rejects_oversized_v_component() {
-        let result = signature_result(VALID_R_HEX, VALID_S_HEX, "0000");
+    #[tokio::test]
+    async fn parse_signature_rejects_truncated_rlp() {
+        let key_signer = PrivateKeySigner::random();
+        let mut tx = eip1559_tx(8453, Address::random());
+        let expected_hash = tx.signature_hash();
 
-        let error = TracingTurnkeySigner::parse_signature(&result).unwrap_err();
+        let signature = key_signer.sign_transaction(&mut tx).await.unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        let mut encoded = envelope.encoded_2718();
+        // Append trailing garbage: `decode_2718_exact` must reject bytes left
+        // over after decoding, not just successfully decode a prefix.
+        encoded.push(0xff);
+        let response = SignTransactionResult {
+            signed_transaction: hex::encode(encoded),
+        };
 
-        assert!(matches!(
-            error,
-            TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::V,
-                len: 2
-            }
-        ));
+        let error =
+            TracingTurnkeySigner::parse_signature(&response, expected_hash, key_signer.address())
+                .unwrap_err();
+
+        assert!(matches!(error, TracingTurnkeySignerError::Rlp(_)));
     }
 
-    #[test]
-    fn parse_signature_rejects_unnormalizable_v() {
-        // v = 2 is not a valid recovery id (not 0/1, 27/28, or >= 35).
-        let result = signature_result(VALID_R_HEX, VALID_S_HEX, "02");
+    #[tokio::test]
+    async fn parse_signature_rejects_unrecoverable_signature() {
+        let tx = eip1559_tx(8453, Address::random());
+        let expected_hash = tx.signature_hash();
 
-        let error = TracingTurnkeySigner::parse_signature(&result).unwrap_err();
+        // `r = 0` is not a valid ECDSA scalar, so `Signature::to_k256` fails
+        // before recovery is even attempted. RLP encoding does not validate
+        // signature values, so the envelope still decodes cleanly -- this is
+        // the smallest construction that reaches the
+        // `recover_address_from_prehash(...)?` error path without going
+        // through truncated/invalid RLP (already covered separately).
+        let unrecoverable_signature = Signature::new(U256::ZERO, U256::from(1), false);
+        let envelope = TxEnvelope::from(tx.into_signed(unrecoverable_signature));
+        let response = SignTransactionResult {
+            signed_transaction: hex::encode(envelope.encoded_2718()),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_signature(&response, expected_hash, Address::random())
+                .unwrap_err();
 
         assert!(matches!(
             error,
-            TracingTurnkeySignerError::UnnormalizableV { v: 2 }
+            TracingTurnkeySignerError::SignatureRecovery(_)
         ));
     }
 
     #[tokio::test]
-    async fn sign_hash_returns_signature_from_completed_activity() {
-        let server = MockServer::start();
+    async fn parse_signature_rejects_signer_mismatch() {
+        let key_signer = PrivateKeySigner::random();
+        let different_signer = PrivateKeySigner::random();
+        let mut tx = eip1559_tx(8453, Address::random());
+        let expected_hash = tx.signature_hash();
 
-        server.mock(|when, then| {
+        let signature = key_signer.sign_transaction(&mut tx).await.unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        let response = SignTransactionResult {
+            signed_transaction: hex::encode(envelope.encoded_2718()),
+        };
+
+        let error = TracingTurnkeySigner::parse_signature(
+            &response,
+            expected_hash,
+            different_signer.address(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::SignerAddressMismatch {
+                expected,
+                recovered,
+            } if expected == different_signer.address() && recovered == key_signer.address()
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_signature_rejects_signature_over_different_content() {
+        let key_signer = PrivateKeySigner::random();
+        let destination_a = Address::random();
+        let destination_b = Address::random();
+        assert_ne!(destination_a, destination_b);
+
+        // Two distinct transactions signed by the SAME key: `tx_for_a` is what
+        // we ask Turnkey to sign, `tx_for_b` stands in for a signature Turnkey
+        // (or a compromised transport) returns over different content -- the
+        // headline defense `parse_signature` provides is rejecting that even
+        // when the recovered key is genuinely ours.
+        let tx_for_a = eip1559_tx(8453, destination_a);
+        let mut tx_for_b = eip1559_tx(8453, destination_b);
+        let expected_hash = keccak256(tx_for_a.encoded_for_signing());
+
+        let signature_over_tx_for_b = key_signer.sign_transaction(&mut tx_for_b).await.unwrap();
+        let envelope_over_tx_for_b =
+            TxEnvelope::from(tx_for_b.into_signed(signature_over_tx_for_b));
+        let response = SignTransactionResult {
+            signed_transaction: hex::encode(envelope_over_tx_for_b.encoded_2718()),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_signature(&response, expected_hash, key_signer.address())
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::SignerAddressMismatch { expected, recovered }
+                if expected == key_signer.address() && recovered != key_signer.address()
+        ));
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_returns_signature_from_completed_activity() {
+        let key_signer = PrivateKeySigner::random();
+        let address = key_signer.address();
+        let chain_id: ChainId = 8453;
+        let to = Address::random();
+
+        // `chain_id` is already `Some(_)` so the signer's guard does not
+        // mutate `tx` under the call -- the expected `unsignedTransaction`
+        // hex below must match the chain-id state actually encoded.
+        let mut tx = eip1559_tx(chain_id, to);
+        let expected_unsigned_rlp = tx.encoded_for_signing();
+
+        let signed_transaction_hex =
+            locally_signed_envelope_hex(&key_signer, eip1559_tx(chain_id, to)).await;
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
             when.method("POST")
-                .path("/public/v1/submit/sign_raw_payload");
+                .path("/public/v1/submit/sign_transaction")
+                .json_body_includes(
+                    serde_json::json!({
+                        "type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2",
+                        "parameters": {
+                            "signWith": address.to_string(),
+                            "unsignedTransaction": hex::encode(&expected_unsigned_rlp),
+                            "type": "TRANSACTION_TYPE_ETHEREUM",
+                        }
+                    })
+                    .to_string(),
+                );
             then.status(200)
                 .header("Content-Type", "application/json")
-                .json_body(completed_sign_raw_payload_body(
-                    VALID_R_HEX,
-                    VALID_S_HEX,
-                    "00",
-                ));
+                .json_body(completed_sign_transaction_body(&signed_transaction_hex));
+        });
+
+        let signer = TracingTurnkeySigner::new(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            Some(chain_id),
+        );
+
+        TxSigner::sign_transaction(&signer, &mut tx).await.unwrap();
+
+        mock.assert();
+        assert_eq!(
+            hex::encode(tx.encoded_for_signing()),
+            hex::encode(&expected_unsigned_rlp)
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_sets_missing_chain_id_before_encoding() {
+        let key_signer = PrivateKeySigner::random();
+        let address = key_signer.address();
+        let chain_id: ChainId = 8453;
+        let to = Address::random();
+
+        // The signer's guard must set the chain id on `tx` before encoding,
+        // so the "expected" unsigned RLP is computed from a tx that already
+        // carries the signer's chain id.
+        let expected_unsigned_rlp = legacy_tx(Some(chain_id), to).encoded_for_signing();
+        let signed_transaction_hex =
+            locally_signed_envelope_hex(&key_signer, legacy_tx(Some(chain_id), to)).await;
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/submit/sign_transaction")
+                .json_body_includes(
+                    serde_json::json!({
+                        "parameters": {
+                            "unsignedTransaction": hex::encode(&expected_unsigned_rlp),
+                        }
+                    })
+                    .to_string(),
+                );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(completed_sign_transaction_body(&signed_transaction_hex));
+        });
+
+        let signer = TracingTurnkeySigner::new(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            Some(chain_id),
+        );
+
+        let mut tx_missing_chain_id = legacy_tx(None, to);
+
+        TxSigner::sign_transaction(&signer, &mut tx_missing_chain_id)
+            .await
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(tx_missing_chain_id.chain_id, Some(chain_id));
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_mismatched_chain_id_without_http_call() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/submit/sign_transaction");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(pending_activity_body());
         });
 
         let signer = TracingTurnkeySigner::new(
@@ -867,20 +1107,26 @@ mod tests {
             Some(1),
         );
 
-        let signature = signer.sign_hash(&B256::ZERO).await.unwrap();
+        let mut tx = legacy_tx(Some(999), Address::random());
 
-        assert_eq!(signature.r(), U256::from(1));
-        assert_eq!(signature.s(), U256::from(2));
-        assert!(!signature.v());
+        let error = TxSigner::sign_transaction(&signer, &mut tx)
+            .await
+            .unwrap_err();
+
+        mock.assert_calls(0);
+        assert!(matches!(
+            error,
+            SignerError::TransactionChainIdMismatch { signer: 1, tx: 999 }
+        ));
     }
 
     #[tokio::test]
-    async fn sign_raw_payload_exhausts_retries_while_activity_stays_pending() {
+    async fn sign_transaction_exhausts_retries_while_activity_stays_pending() {
         let server = MockServer::start();
 
         let mock = server.mock(|when, then| {
             when.method("POST")
-                .path("/public/v1/submit/sign_raw_payload");
+                .path("/public/v1/submit/sign_transaction");
             then.status(200)
                 .header("Content-Type", "application/json")
                 .json_body(pending_activity_body());
@@ -891,14 +1137,13 @@ mod tests {
         let client = mock_client_with_retry(&server, RetryConfig::none());
 
         let error = client
-            .sign_raw_payload(
+            .sign_transaction(
                 TurnkeyOrganizationId::new("org-test".to_string()),
                 0,
-                SignRawPayloadIntentV2 {
+                SignTransactionIntentV2 {
                     sign_with: Address::random().to_string(),
-                    payload: hex::encode(B256::ZERO),
-                    encoding: PayloadEncoding::Hexadecimal,
-                    hash_function: HashFunction::NoOp,
+                    unsigned_transaction: hex::encode(B256::ZERO),
+                    r#type: TransactionType::Ethereum,
                 },
             )
             .await
@@ -915,7 +1160,7 @@ mod tests {
 
         server.mock(|when, then| {
             when.method("POST")
-                .path("/public/v1/submit/sign_raw_payload");
+                .path("/public/v1/submit/sign_transaction");
             then.status(500)
                 .header("Content-Type", "application/json")
                 .json_body(serde_json::json!({
@@ -954,13 +1199,13 @@ mod tests {
             error_str.contains("TurnkeyClient"),
             "expected TurnkeyClient error in chain, got: {error_str}"
         );
-        assert!(logs_contain("Turnkey API response body received"));
+        assert!(logs_contain("Turnkey API response received"));
         assert!(logs_contain("internal server error"));
     }
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn process_request_logs_success_response_body() {
+    async fn process_request_does_not_log_response_body() {
         let server = MockServer::start();
 
         server.mock(|when, then| {
@@ -979,9 +1224,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(response["turnkey_marker"], "success-body");
-        assert!(logs_contain("Turnkey API response body received"));
-        assert!(logs_contain("turnkey_marker"));
-        assert!(logs_contain("success-body"));
+        assert!(logs_contain("Turnkey API response received"));
+        assert!(logs_contain("/public/v1/test"));
+        assert!(!logs_contain("turnkey_marker"));
+        assert!(!logs_contain("success-body"));
     }
 
     #[tokio::test]
@@ -1030,6 +1276,45 @@ mod tests {
             error,
             TurnkeyClientError::UnexpectedMimeType(mime) if mime == "text/html"
         ));
+    }
+
+    #[tokio::test]
+    async fn process_request_redacts_body_on_decode_error() {
+        let server = MockServer::start();
+
+        // Valid JSON that does not deserialize into the requested `String`
+        // response type (an object is not a string), carrying a sentinel that
+        // must never surface in the error -- this is the shape a signed
+        // transaction body would take if it failed to decode.
+        server.mock(|when, then| {
+            when.method("POST").path("/public/v1/test");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({
+                    "signedTransaction": "sensitive-signed-tx-marker"
+                }));
+        });
+
+        let client = mock_client(&server);
+        let error = client
+            .process_request::<_, String>(
+                &serde_json::json!({"request": "body"}),
+                "/public/v1/test",
+            )
+            .await
+            .unwrap_err();
+
+        let TurnkeyClientError::Decode(message, _) = error else {
+            panic!("expected Decode error, got: {error:?}");
+        };
+        assert!(
+            message.contains("redacted"),
+            "expected redaction marker in message, got: {message}"
+        );
+        assert!(
+            !message.contains("sensitive-signed-tx-marker"),
+            "response body leaked into error message: {message}"
+        );
     }
 
     #[tokio::test]

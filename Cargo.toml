@@ -51,7 +51,6 @@ redundant_pub_crate = "allow"
 aes-gcm = "0.10.3"
 alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
 alloy-primitives = "1.4"
-alloy-signer-turnkey = "=1.0.41"
 anyhow = "1.0.102"
 apalis-board = { version = "1.0.0-rc.8", features = ["axum", "ui"] }
 apalis-workflow = "0.1.0-rc.9"
