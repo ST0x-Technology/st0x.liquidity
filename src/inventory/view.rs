@@ -920,6 +920,30 @@ impl InventoryView {
         }
     }
 
+    /// Sets USDC inventory with explicit available *and* inflight balances per
+    /// venue. Unlike [`Self::with_usdc`], this can seed the resume-desync state
+    /// where inflight is reserved but the matching available debit was lost
+    /// (e.g. a snapshot reset `available` to broker/chain reality while
+    /// persisted inflight survived a restart) -- a state no single event
+    /// produces on its own.
+    #[cfg(test)]
+    pub(crate) fn with_usdc_inflight(
+        self,
+        onchain_available: Usdc,
+        onchain_inflight: Usdc,
+        offchain_available: Usdc,
+        offchain_inflight: Usdc,
+    ) -> Self {
+        Self {
+            usdc: Inventory {
+                onchain: Some(VenueBalance::new(onchain_available, onchain_inflight)),
+                offchain: Some(VenueBalance::new(offchain_available, offchain_inflight)),
+                last_rebalancing: None,
+            },
+            ..self
+        }
+    }
+
     /// Sets the gross offchain cash balance recorded by the inventory poller.
     #[cfg(test)]
     pub(crate) fn with_offchain_gross_usd_cents(self, cents: i64) -> Self {

@@ -13,7 +13,8 @@ use st0x_finance::{Usd, Usdc};
 use super::{RebalancingService, RebalancingServiceError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
-    BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
+    BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, InventoryError,
+    InventoryViewError, TransferOp, Venue,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
 
@@ -140,6 +141,28 @@ pub(super) enum UsdcTerminalAction {
     NotTerminal,
     Clear,
     PreservePostBurn,
+}
+
+/// Whether a terminal USDC settlement event reconciled the in-memory
+/// inventory ledger. `DeferredToSnapshot` means the settlement was accepted
+/// as authoritative (the durable event proves funds arrived) but the
+/// in-memory available bookkeeping was skipped -- either because a terminal
+/// *success* arrived with no tracking context to reconcile against (a
+/// post-restart resume where the transfer already settled), or because
+/// reconciliation underflowed (the resume desync that fails to reconstruct
+/// inflight). The no-tracking clause is terminal-success-only: a pre-burn
+/// terminal *failure* with no tracking context reconciles as `Reconciled`
+/// instead, because nothing moved, so an immediate imbalance check reads data
+/// as fresh as a post-snapshot one (see `cancel_tracked_usdc_rebalance`). In
+/// the underflow case, the source venue's residual inflight is zeroed so
+/// `has_inflight()` can clear and future snapshots resume healing; the
+/// available balances on both sides are left for the snapshot poll to
+/// correct. Callers must not act on `self.inventory` as if it reflects this
+/// settlement until the next snapshot poll heals it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum UsdcSettlementOutcome {
+    Reconciled,
+    DeferredToSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,7 +595,8 @@ impl RebalancingService {
         }
 
         let terminal_action = self.usdc_terminal_action(&id, &event).await;
-        self.apply_usdc_rebalance_event(&id, &event, terminal_action)
+        let settlement_outcome = self
+            .apply_usdc_rebalance_event(&id, &event, terminal_action)
             .await?;
 
         let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
@@ -606,7 +630,25 @@ impl RebalancingService {
         if is_clearable_terminal {
             self.equity_scheduler.cancel_pending().await;
             self.usdc_scheduler.cancel_pending().await;
-            self.usdc_scheduler.enqueue_check().await;
+            match settlement_outcome {
+                UsdcSettlementOutcome::Reconciled => {
+                    self.usdc_scheduler.enqueue_check().await;
+                }
+                UsdcSettlementOutcome::DeferredToSnapshot => {
+                    // The in-memory ledger was not reconciled by this terminal
+                    // event (see UsdcSettlementOutcome::DeferredToSnapshot), so
+                    // checking imbalance now would read stale inventory and could
+                    // dispatch a duplicate transfer for funds that already
+                    // arrived. Defer the fresh check to the next periodic
+                    // snapshot poll, which heals the ledger.
+                    debug!(
+                        target: "rebalance",
+                        id = %id,
+                        "Deferring fresh USDC imbalance check to next snapshot poll: \
+                         in-memory inventory was not reconciled by this terminal event"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -691,21 +733,23 @@ impl RebalancingService {
         id: &UsdcRebalanceId,
         event: &UsdcRebalanceEvent,
         terminal_action: UsdcTerminalAction,
-    ) -> Result<(), RebalancingServiceError> {
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         use UsdcRebalanceEvent::*;
 
-        match event {
+        let outcome = match event {
             ConversionInitiated {
                 direction, amount, ..
             } => {
                 self.upsert_conversion_tracking(id, direction, *amount, event)
                     .await;
+                UsdcSettlementOutcome::Reconciled
             }
             Initiated {
                 direction, amount, ..
             } => {
                 self.track_initiated_usdc_rebalance(id, direction, *amount, event)
                     .await?;
+                UsdcSettlementOutcome::Reconciled
             }
             WithdrawalConfirmed { .. }
             | BridgingInitiated { .. }
@@ -720,6 +764,7 @@ impl RebalancingService {
                 ..
             } => {
                 self.track_usdc_stage_progress(id, event).await;
+                UsdcSettlementOutcome::Reconciled
             }
             Bridged {
                 amount_received, ..
@@ -735,6 +780,7 @@ impl RebalancingService {
                 // deposit, exactly like the normal bridge path.
                 self.track_bridged_amount(id, *amount_received).await?;
                 self.track_usdc_stage_progress(id, event).await;
+                UsdcSettlementOutcome::Reconciled
             }
             ConversionConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -746,14 +792,12 @@ impl RebalancingService {
                     UsdcTrackingEvent::ConversionConfirmed,
                     conversion.received_amount,
                 )
-                .await?;
+                .await?
             }
             DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 ..
-            } => {
-                self.complete_alpaca_to_base_deposit(id).await?;
-            }
+            } => self.complete_alpaca_to_base_deposit(id).await?,
             // Transient intent markers persisted before the on-chain withdraw /
             // burn. Detailed stage tracking starts at the subsequent Initiated /
             // BridgingInitiated; the inventory's active-rebalance claim is set by
@@ -766,11 +810,9 @@ impl RebalancingService {
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
             | PendingBurnCleared { .. }
-            | AttestationTimedOut { .. } => {}
+            | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
             // Withdrawal failure is always pre-burn -> reconcile to source.
-            WithdrawalFailed { .. } => {
-                self.cancel_tracked_usdc_rebalance(id).await?;
-            }
+            WithdrawalFailed { .. } => self.cancel_tracked_usdc_rebalance(id).await?,
             // These failures may be pre- or post-burn (BridgingFailed by burn
             // stage; ConversionFailed by direction -- BaseToAlpaca's conversion
             // is post-deposit; DepositFailed is always post-mint). The classifier
@@ -779,10 +821,13 @@ impl RebalancingService {
                 if terminal_action == UsdcTerminalAction::PreservePostBurn {
                     // Preservation is achieved by NOT cancelling: the tracking
                     // entry, guard, and active id are all kept by the caller. This
-                    // call only surfaces a diagnostic if tracking is absent.
+                    // call only surfaces a diagnostic if tracking is absent. The
+                    // guard stays held (not clearable), so the outcome value is
+                    // unused by the caller's enqueue gate.
                     self.warn_if_post_burn_tracking_missing(id).await;
+                    UsdcSettlementOutcome::Reconciled
                 } else {
-                    self.cancel_tracked_usdc_rebalance(id).await?;
+                    self.cancel_tracked_usdc_rebalance(id).await?
                 }
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
@@ -791,14 +836,19 @@ impl RebalancingService {
             // available -- never a `Cancel` (which would wrongly credit
             // available). Derives the source venue from `direction`, so it works
             // with tracking absent (post-restart). The caller's Clear terminal
-            // action removes tracking and clears the guard.
+            // action removes tracking and clears the guard. `reconcile_operator_resolved`
+            // zeroes source inflight WITHOUT crediting destination `available`
+            // (by design, see its doc comment), so the ledger is only half
+            // updated here: defer the immediate imbalance check to the next
+            // snapshot poll rather than reading stale inventory.
             OperatorReconciled { direction, .. } => {
                 self.reconcile_operator_resolved(direction, Utc::now())
                     .await?;
+                UsdcSettlementOutcome::DeferredToSnapshot
             }
-        }
+        };
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Reconciles source-venue USDC inflight for an operator-reconciled,
@@ -990,14 +1040,14 @@ impl RebalancingService {
     async fn complete_alpaca_to_base_deposit(
         &self,
         id: &UsdcRebalanceId,
-    ) -> Result<(), RebalancingServiceError> {
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             // Resumed after a restart with no rebuilt tracking: the transfer
             // already settled, so there is no inventory inflight to reconcile.
             // Return Ok so the caller clears the guard (terminal success) rather
             // than wedging it forever on a MissingUsdcTrackingContext error.
             warn!(target: "rebalance", id = %id, "DepositConfirmed event missing USDC tracking context; clearing guard without reconciliation (resumed after restart)");
-            return Ok(());
+            return Ok(UsdcSettlementOutcome::DeferredToSnapshot);
         };
 
         let Some(amount_received) = tracking.bridged_amount_received else {
@@ -1016,18 +1066,18 @@ impl RebalancingService {
     async fn cancel_tracked_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
-    ) -> Result<(), RebalancingServiceError> {
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
                 target: "rebalance",
                 id = %id,
                 "Terminal failure event had no USDC tracking context to cancel"
             );
-            return Ok(());
+            return Ok(UsdcSettlementOutcome::Reconciled);
         };
 
         if !tracking.source_transfer_started() {
-            return Ok(());
+            return Ok(UsdcSettlementOutcome::Reconciled);
         }
 
         let source_venue = tracking.source_venue();
@@ -1040,10 +1090,44 @@ impl RebalancingService {
         });
 
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory.clone().update_usdc(update, now)?;
+        let outcome = match inventory.clone().update_usdc(update, now) {
+            Ok(updated) => {
+                *inventory = updated;
+                UsdcSettlementOutcome::Reconciled
+            }
+            Err(InventoryViewError::Usdc(InventoryError::InsufficientInflight {
+                requested,
+                inflight,
+            })) => {
+                // Same resume desync as complete_usdc_rebalance's underflow case:
+                // the durable terminal-failure event is authoritative that the
+                // transfer stopped, but the in-memory inflight bookkeeping never
+                // reserved (or under-reserved) the amount being cancelled back.
+                // The cancel's credit-back to source `available` is skipped
+                // along with the inflight release, so zero the residual
+                // inflight here (a no-op when it was already zero) so
+                // `has_inflight()` clears and the next snapshot poll can heal
+                // `available` from a fresh broker/chain read.
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    source_venue = ?source_venue,
+                    ?initiated_amount,
+                    requested_release = ?requested,
+                    actual_inflight = ?inflight,
+                    "USDC source inflight underflow on terminal cancel; treating \
+                     the durable failure event as authoritative, zeroing residual \
+                     source inflight so snapshots can heal, and skipping in-memory \
+                     available reconciliation (heals on next snapshot poll)."
+                );
+                *inventory = inventory.clone().clear_usdc_inflight(source_venue, now)?;
+                UsdcSettlementOutcome::DeferredToSnapshot
+            }
+            Err(error) => return Err(error.into()),
+        };
         drop(inventory);
 
-        Ok(())
+        Ok(outcome)
     }
 
     async fn complete_usdc_rebalance(
@@ -1051,14 +1135,14 @@ impl RebalancingService {
         id: &UsdcRebalanceId,
         event: UsdcTrackingEvent,
         settled_amount: Usdc,
-    ) -> Result<(), RebalancingServiceError> {
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             // Resumed after a restart with no rebuilt tracking: the transfer
             // already settled, so there is no inventory inflight to reconcile.
             // Return Ok so the caller clears the guard (terminal success) rather
             // than wedging it forever on a MissingUsdcTrackingContext error.
             warn!(target: "rebalance", id = %id, ?event, "Terminal success event missing USDC tracking context; clearing guard without reconciliation (resumed after restart)");
-            return Ok(());
+            return Ok(UsdcSettlementOutcome::DeferredToSnapshot);
         };
 
         let source_venue = tracking.source_venue();
@@ -1091,10 +1175,54 @@ impl RebalancingService {
         });
 
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory.clone().update_usdc(update, now)?;
+        let outcome = match inventory.clone().update_usdc(update, now) {
+            Ok(updated) => {
+                *inventory = updated;
+                UsdcSettlementOutcome::Reconciled
+            }
+            Err(InventoryViewError::Usdc(InventoryError::InsufficientInflight {
+                requested,
+                inflight,
+            })) => {
+                // The durable DepositConfirmed/ConversionConfirmed event is the
+                // source of truth that funds arrived on-chain; the in-memory
+                // inflight bookkeeping is a best-effort mirror that can drift
+                // when a job resumes mid-transfer without ever reserving
+                // inflight, or reserving less than what actually settled.
+                // settle_transfer confirms source inflight before
+                // crediting the destination in one atomic closure, so this
+                // underflow skips BOTH the source-inflight release AND the
+                // destination credit. The destination credit and the
+                // source-available correction are deferred to the next
+                // inventory snapshot poll (source available is desynced from
+                // reality here and only a fresh broker/chain snapshot can
+                // correct it). But the residual source inflight left behind by
+                // the failed confirm_inflight would otherwise never clear on
+                // its own -- has_inflight() would stay true forever and
+                // permanently block that healing snapshot -- so zero it here
+                // (a no-op when it was already zero).
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    ?event,
+                    ?initiated_amount,
+                    ?settled_amount,
+                    requested_release = ?requested,
+                    actual_inflight = ?inflight,
+                    "USDC source inflight underflow on terminal settlement; \
+                     treating the durable settlement event as authoritative, \
+                     zeroing residual source inflight so snapshots can heal, \
+                     and skipping in-memory available reconciliation (heals \
+                     on next snapshot poll)."
+                );
+                *inventory = inventory.clone().clear_usdc_inflight(source_venue, now)?;
+                UsdcSettlementOutcome::DeferredToSnapshot
+            }
+            Err(error) => return Err(error.into()),
+        };
         drop(inventory);
 
-        Ok(())
+        Ok(outcome)
     }
 
     async fn track_usdc_stage_progress(&self, id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {

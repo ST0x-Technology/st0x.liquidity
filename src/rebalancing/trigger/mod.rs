@@ -9699,6 +9699,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alpaca_to_base_terminal_deposit_with_reserved_inflight_enqueues_one_check() {
+        // Companion to the DeferredToSnapshot-path tests above: a normal
+        // successful settlement (inflight properly reserved via the Initiated
+        // event, so settle_transfer succeeds and returns Reconciled) must
+        // still enqueue exactly one fresh USDC imbalance check.
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(usdc(499), usdc(1)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            1,
+            "a Reconciled settlement must enqueue exactly one fresh USDC \
+             imbalance check against the post-rebalance inventory"
+        );
+    }
+
+    #[tokio::test]
     async fn alpaca_to_base_usdc_lifecycle_tracks_started_and_cleared_inflight() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
         let trigger = make_trigger_with_inventory(inventory).await;
@@ -10558,6 +10601,11 @@ mod tests {
         // Available unchanged (500), inflight zeroed -- funds left the source.
         assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(100), Usdc::ZERO)
             .await;
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "operator reconcile must defer the imbalance check to the next snapshot poll"
+        );
     }
 
     /// Post-restart the reactor has no in-memory tracking, yet an operator
@@ -10620,6 +10668,11 @@ mod tests {
         // Available unchanged (500), inflight zeroed via the event's direction.
         assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(100), Usdc::ZERO)
             .await;
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "operator reconcile must defer the imbalance check to the next snapshot poll"
+        );
     }
 
     /// Mirror of `operator_reconcile_works_when_tracking_absent` for the other
@@ -10679,6 +10732,11 @@ mod tests {
         // Hedging available are both untouched (post-burn: no credit).
         assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(500), Usdc::ZERO)
             .await;
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "operator reconcile must defer the imbalance check to the next snapshot poll"
+        );
     }
 
     /// A `Reconciled` aggregate is a clearing terminal: startup guard recovery
@@ -18240,6 +18298,14 @@ mod tests {
             "clearing the guard with no tracking must not reconcile offchain USDC inventory"
         );
         drop(inventory);
+
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "a DeferredToSnapshot settlement must skip the immediate \
+             enqueue_check, leaving the fresh imbalance check to the next \
+             periodic snapshot poll rather than a duplicate immediate check"
+        );
     }
 
     #[tokio::test]
@@ -22135,6 +22201,495 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "completing without tracking should not fabricate a context"
+        );
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "a DeferredToSnapshot settlement must skip the immediate \
+             enqueue_check, leaving the fresh imbalance check to the next \
+             periodic snapshot poll rather than a duplicate immediate check"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_confirmed_with_unreserved_inflight_clears_guard() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Zero inflight at both venues reproduces a resumed-from-None
+        // AlpacaToBase withdrawal whose Venue::Hedging inflight reservation
+        // was never rebuilt before the deposit settles.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(5000), usdc(5000))
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        // Tracking IS present (unlike the "no tracking" regression test
+        // above), but initiated_amount has no matching inflight reservation
+        // at the source venue, so settle_transfer's confirm_inflight
+        // underflows.
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(224),
+                bridged_amount_received: Some(usdc(224)),
+                stage: usdc::UsdcRebalanceStage::Bridged,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must clear on a terminal DepositConfirmed even when the \
+             source inflight was never reserved (resume bug)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be removed on terminal cleanup despite the inflight \
+             underflow"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "active USDC rebalance id must clear on terminal cleanup despite \
+             the inflight underflow"
+        );
+        let (mm_available, hedging_available, mm_inflight, hedging_inflight) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.usdc_available(Venue::MarketMaking),
+                inventory.usdc_available(Venue::Hedging),
+                inventory.usdc_inflight(Venue::MarketMaking),
+                inventory.usdc_inflight(Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            mm_available,
+            Some(usdc(5000)),
+            "the inflight underflow must skip the destination credit, leaving \
+             MarketMaking available untouched"
+        );
+        assert_eq!(
+            hedging_available,
+            Some(usdc(5000)),
+            "the inflight underflow must skip the source-inflight release, \
+             leaving Hedging available untouched"
+        );
+        assert_eq!(
+            mm_inflight,
+            Some(Usdc::ZERO),
+            "inflight underflow must not mutate MarketMaking inflight"
+        );
+        assert_eq!(
+            hedging_inflight,
+            Some(Usdc::ZERO),
+            "inflight underflow must not mutate Hedging inflight"
+        );
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "a DeferredToSnapshot settlement must skip the immediate \
+             enqueue_check, leaving the fresh imbalance check to the next \
+             periodic snapshot poll rather than a duplicate immediate check"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversion_confirmed_base_to_alpaca_with_unreserved_inflight_clears_guard() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Zero inflight at both venues reproduces a resumed-from-None
+        // BaseToAlpaca withdrawal whose Venue::MarketMaking inflight
+        // reservation was never rebuilt before the conversion settles.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(5000), usdc(5000))
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(150),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::ConversionInitiated,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(150),
+                    usdc(150),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must clear on a terminal ConversionConfirmed even when the \
+             source inflight was never reserved"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be removed on terminal cleanup despite the inflight \
+             underflow"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "active USDC rebalance id must clear on terminal cleanup despite \
+             the inflight underflow"
+        );
+        let (mm_available, hedging_available, mm_inflight, hedging_inflight) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.usdc_available(Venue::MarketMaking),
+                inventory.usdc_available(Venue::Hedging),
+                inventory.usdc_inflight(Venue::MarketMaking),
+                inventory.usdc_inflight(Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            mm_available,
+            Some(usdc(5000)),
+            "the inflight underflow must skip the source-inflight release, \
+             leaving MarketMaking available untouched"
+        );
+        assert_eq!(
+            hedging_available,
+            Some(usdc(5000)),
+            "the inflight underflow must skip the destination credit, leaving \
+             Hedging available untouched"
+        );
+        assert_eq!(
+            mm_inflight,
+            Some(Usdc::ZERO),
+            "inflight underflow must not mutate MarketMaking inflight"
+        );
+        assert_eq!(
+            hedging_inflight,
+            Some(Usdc::ZERO),
+            "inflight underflow must not mutate Hedging inflight"
+        );
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "a DeferredToSnapshot settlement must skip the immediate \
+             enqueue_check, leaving the fresh imbalance check to the next \
+             periodic snapshot poll rather than a duplicate immediate check"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_confirmed_with_partial_inflight_clears_residual_source_inflight() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Partial reservation: Hedging (the AlpacaToBase source venue) has a
+        // POSITIVE inflight smaller than the tracked initiated_amount -- a job
+        // resumed mid-transfer after only part of the amount was ever
+        // reserved. confirm_inflight underflows on the shortfall, not
+        // because inflight was zero, so this exercises the partial case
+        // distinct from the zero-inflight sibling tests above.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(5000), usdc(5000))
+            .update_usdc(
+                Inventory::set_inflight(Venue::Hedging, usdc(50)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(224),
+                bridged_amount_received: Some(usdc(224)),
+                stage: usdc::UsdcRebalanceStage::Bridged,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must clear on a terminal DepositConfirmed even when the \
+             source inflight was only partially reserved"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be removed on terminal cleanup despite the partial \
+             inflight underflow"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "active USDC rebalance id must clear on terminal cleanup despite \
+             the partial inflight underflow"
+        );
+
+        let hedging_inflight = {
+            let inventory = trigger.inventory.read().await;
+            inventory.usdc_inflight(Venue::Hedging)
+        };
+        assert_eq!(
+            hedging_inflight,
+            Some(Usdc::ZERO),
+            "the residual partial source inflight must be zeroed so \
+             has_inflight() can clear and future snapshots resume healing"
+        );
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "a DeferredToSnapshot settlement must skip the immediate \
+             enqueue_check, leaving the fresh imbalance check to the next \
+             periodic snapshot poll rather than a duplicate immediate check"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_failed_with_unreserved_inflight_clears_guard() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Zero inflight at Hedging (the AlpacaToBase source venue) reproduces
+        // a resumed-from-None withdrawal whose inflight reservation was
+        // never rebuilt before the failure event arrives -- the same resume
+        // desync as the terminal-success InsufficientInflight tests above,
+        // but exercised on the cancel/failure path (cancel_inflight
+        // underflows instead of confirm_inflight).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(5000), usdc(5000))
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        // Tracking IS present with source_transfer_started() true (stage
+        // Initiated, past the pre-withdrawal ConversionInitiated/Confirmed
+        // stages), but initiated_amount has no matching inflight reservation
+        // at the source venue, so the cancel's cancel_inflight underflows.
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must clear on a terminal WithdrawalFailed even when the \
+             source inflight was never reserved (resume bug)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be removed on terminal cleanup despite the inflight \
+             underflow"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "active USDC rebalance id must clear on terminal cleanup despite \
+             the inflight underflow"
+        );
+
+        let hedging_inflight = {
+            let inventory = trigger.inventory.read().await;
+            inventory.usdc_inflight(Venue::Hedging)
+        };
+        assert_eq!(
+            hedging_inflight,
+            Some(Usdc::ZERO),
+            "the residual source inflight must be zeroed so has_inflight() \
+             can clear and future snapshots resume healing"
+        );
+        assert_eq!(
+            usdc::drain_pending_usdc_jobs(&trigger).await,
+            0,
+            "a DeferredToSnapshot cancel must skip the immediate \
+             enqueue_check, leaving the fresh imbalance check to the next \
+             periodic snapshot poll rather than a duplicate immediate check"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_confirmed_with_destination_overflow_hard_fails_and_leaves_guard_latched() {
+        // Forces the generic (non-InsufficientInflight) error arm of
+        // complete_usdc_rebalance: the destination venue's available balance
+        // is already at Float's max representable value, so add_available's
+        // Float addition overflows with a non-InsufficientInflight
+        // InventoryError::Arithmetic. Unlike the underflow path above, this
+        // must hard-fail and leave the guard/tracking/active-rebalance
+        // untouched -- the ledger here is genuinely corrupted, not merely
+        // stale, so there is nothing safe to reconcile away.
+        let max_positive = Usdc::new(Float::max_positive_value().unwrap());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Both the destination (MarketMaking) available balance AND the
+        // transferred amount are the max representable Float, so the
+        // destination credit doubles the already-maximal value -- genuinely
+        // unrepresentable regardless of exponent renormalization, unlike
+        // adding a small amount to a near-max balance (which the library
+        // silently absorbs via precision loss rather than overflowing).
+        let inventory = InventoryView::default().with_usdc(max_positive, max_positive);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, max_positive),
+            )
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(max_positive, Usdc::ZERO),
+            )
+            .await
+            .unwrap();
+
+        let error = harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingServiceError::Inventory(InventoryViewError::Usdc(
+                    InventoryError::Arithmetic(_)
+                ))
+            ),
+            "expected a generic Arithmetic InventoryError from destination overflow, got {error:?}"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a hard failure outside InsufficientInflight must leave the \
+             in-progress guard latched, not silently clear it"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "a hard failure outside InsufficientInflight must leave tracking \
+             context in place for investigation"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "a hard failure outside InsufficientInflight must leave the \
+             active USDC rebalance id in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_failed_with_source_credit_overflow_hard_fails_and_leaves_guard_latched() {
+        // Cancel-path twin of
+        // deposit_confirmed_with_destination_overflow_hard_fails_and_leaves_guard_latched.
+        // cancel_tracked_usdc_rebalance's Cancel op releases source inflight and
+        // then credits the amount back to source available; with source available
+        // already at Float's max, that credit-back overflows with a generic
+        // (non-InsufficientInflight) InventoryError::Arithmetic, forcing the
+        // Err(error) arm of cancel_tracked_usdc_rebalance. Like the settle-path
+        // twin, this must hard-fail and leave the guard/tracking/active-rebalance
+        // untouched -- the ledger is genuinely corrupted, not merely stale.
+        let max_positive = Usdc::new(Float::max_positive_value().unwrap());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Hedging (the AlpacaToBase source venue) has both available AND inflight
+        // at the max representable Float: inflight = amount lets cancel_inflight
+        // succeed (max - max = 0), but the subsequent available credit-back
+        // (max + max) doubles the already-maximal value and genuinely overflows.
+        // Seeding inflight without the matching available debit mirrors a resume
+        // desync where a snapshot reset available to reality while persisted
+        // inflight survived a restart.
+        let inventory = InventoryView::default()
+            .with_usdc_inflight(Usdc::ZERO, Usdc::ZERO, max_positive, max_positive)
+            .set_active_usdc_rebalance(id.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        // Tracking is present with source_transfer_started() true (stage
+        // Initiated, past the pre-withdrawal conversion stages) so the cancel
+        // path runs its inventory update rather than short-circuiting to
+        // Reconciled.
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: max_positive,
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        let error = harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingServiceError::Inventory(InventoryViewError::Usdc(
+                    InventoryError::Arithmetic(_)
+                ))
+            ),
+            "expected a generic Arithmetic InventoryError from the source \
+             credit-back overflow, got {error:?}"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a hard failure outside InsufficientInflight must leave the \
+             in-progress guard latched, not silently clear it"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "a hard failure outside InsufficientInflight must leave tracking \
+             context in place for investigation"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "a hard failure outside InsufficientInflight must leave the \
+             active USDC rebalance id in place"
         );
     }
 
