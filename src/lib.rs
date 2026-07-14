@@ -38,7 +38,7 @@ use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
 /// and apalis drain.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
-mod alerts;
+pub mod alerts;
 pub mod api;
 #[cfg(feature = "wallet-turnkey")]
 pub mod approval_policy;
