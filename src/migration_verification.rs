@@ -41,7 +41,7 @@ pub struct ReplayFailure {
 /// Replay results for every persisted instance of one aggregate type.
 #[derive(Debug)]
 pub struct AggregateReplayReport {
-    pub aggregate_type: &'static str,
+    pub aggregate_type: String,
     pub total: usize,
     pub failures: Vec<ReplayFailure>,
 }
@@ -177,7 +177,7 @@ async fn clear_snapshots(pool: &SqlitePool) -> Result<(), VerificationError> {
 }
 
 async fn run_replay_checks(pool: &SqlitePool) -> Vec<AggregateReplayReport> {
-    vec![
+    let mut reports = vec![
         check_replay::<Position>(pool).await,
         check_replay::<OnChainTrade>(pool).await,
         check_replay::<OffchainOrder>(pool).await,
@@ -188,7 +188,64 @@ async fn run_replay_checks(pool: &SqlitePool) -> Vec<AggregateReplayReport> {
         check_replay::<EquityRedemption>(pool).await,
         check_replay::<WrappedEquityRecovery>(pool).await,
         check_replay::<UnwrappedEquityRecovery>(pool).await,
-    ]
+    ];
+
+    reports.extend(uncovered_aggregate_reports(pool, &reports).await);
+
+    reports
+}
+
+/// The event store itself is the single source of truth for which aggregate
+/// types exist, so any persisted `aggregate_type` the checks above did not
+/// cover fails the gate closed instead of silently shipping unverified
+/// replay. This is the drift guard for the hand-maintained list in
+/// [`run_replay_checks`]: adding a new `EventSourced` aggregate and
+/// forgetting to extend the list surfaces here on the first deploy where
+/// that aggregate has any events — the exact moment its legacy shapes start
+/// needing verification.
+async fn uncovered_aggregate_reports(
+    pool: &SqlitePool,
+    covered_reports: &[AggregateReplayReport],
+) -> Vec<AggregateReplayReport> {
+    let persisted_types: Vec<String> = match sqlx::query_scalar(
+        "SELECT DISTINCT aggregate_type FROM events ORDER BY aggregate_type",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(persisted_types) => persisted_types,
+        Err(error) => {
+            return vec![AggregateReplayReport {
+                aggregate_type: "*".to_string(),
+                total: 0,
+                failures: vec![ReplayFailure {
+                    aggregate_id: "*".to_string(),
+                    error: format!("failed to enumerate persisted aggregate types: {error}"),
+                }],
+            }];
+        }
+    };
+
+    persisted_types
+        .into_iter()
+        .filter(|persisted| {
+            !covered_reports
+                .iter()
+                .any(|report| report.aggregate_type == *persisted)
+        })
+        .map(|uncovered| AggregateReplayReport {
+            aggregate_type: uncovered,
+            total: 0,
+            failures: vec![ReplayFailure {
+                aggregate_id: "*".to_string(),
+                error: "aggregate type is present in the event store but not \
+                        covered by the replay checks; add it to \
+                        run_replay_checks so its legacy events are verified \
+                        before deploy"
+                    .to_string(),
+            }],
+        })
+        .collect()
 }
 
 async fn check_replay<Entity>(pool: &SqlitePool) -> AggregateReplayReport
@@ -200,7 +257,7 @@ where
         Ok(ids) => ids,
         Err(error) => {
             return AggregateReplayReport {
-                aggregate_type: Entity::AGGREGATE_TYPE,
+                aggregate_type: Entity::AGGREGATE_TYPE.to_string(),
                 total: 0,
                 failures: vec![ReplayFailure {
                     aggregate_id: "*".to_string(),
@@ -226,7 +283,7 @@ where
     }
 
     AggregateReplayReport {
-        aggregate_type: Entity::AGGREGATE_TYPE,
+        aggregate_type: Entity::AGGREGATE_TYPE.to_string(),
         total: ids.len(),
         failures,
     }
@@ -327,6 +384,59 @@ mod tests {
             .iter()
             .find(|report| report.aggregate_type == aggregate_type)
             .unwrap()
+    }
+
+    /// The drift guard for the hand-maintained replay list: an aggregate type
+    /// persisted in the event store but absent from `run_replay_checks` must
+    /// fail the deploy gate closed — otherwise a newly added `EventSourced`
+    /// aggregate silently ships with unverified legacy-event replay.
+    #[tokio::test]
+    async fn uncovered_persisted_aggregate_type_fails_the_gate() {
+        let pool = migrated_pool().await;
+        insert_position_initialized(&pool, "AAPL").await;
+        insert_event(
+            &pool,
+            "BrandNewAggregate",
+            "some-id",
+            1,
+            "BrandNewAggregateEvent::Created",
+            "1.0",
+            json!({"Created": {}}),
+        )
+        .await;
+
+        let reports = run_replay_checks(&pool).await;
+
+        let uncovered = find_report(&reports, "BrandNewAggregate");
+        assert_eq!(uncovered.failures.len(), 1);
+        assert_eq!(uncovered.failures[0].aggregate_id, "*");
+        assert!(
+            uncovered.failures[0]
+                .error
+                .contains("not covered by the replay checks"),
+            "the failure must name the drift, got: {}",
+            uncovered.failures[0].error
+        );
+
+        // The covered aggregates keep passing: the guard adds a failure, it
+        // does not poison the rest of the report.
+        let position_report = find_report(&reports, "Position");
+        assert!(position_report.failures.is_empty());
+    }
+
+    /// A store containing only covered aggregate types produces no synthetic
+    /// uncovered-type failures — the guard stays silent on a healthy store.
+    #[tokio::test]
+    async fn covered_only_store_produces_no_uncovered_reports() {
+        let pool = migrated_pool().await;
+        insert_position_initialized(&pool, "AAPL").await;
+
+        let reports = run_replay_checks(&pool).await;
+
+        assert!(
+            reports.iter().all(|report| report.failures.is_empty()),
+            "no synthetic failures expected for a fully covered store: {reports:?}"
+        );
     }
 
     #[tokio::test]
