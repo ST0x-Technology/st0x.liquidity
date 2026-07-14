@@ -124,3 +124,4 @@ decision.
 | [0009](0009-record-overfill-as-acceptance.md)                           | Record a broker over-fill as an acceptance, not a failure                            | Accepted |
 | [0010](0010-bounded-pending-ack-set-for-cross-process-exactly-once.md)  | Bounded pending-acknowledgement set for cross-process exactly-once                   | Accepted |
 | [0014](0014-runtime-stuck-pending-recovery-and-serialized-placement.md) | Recover stuck Pending placements at runtime, and serialize broker-placement attempts | Accepted |
+| [0015](0015-extract-st0x-finance-without-changing-its-contract.md)      | Extract `st0x-finance` without changing its contract                                 | Proposed |
