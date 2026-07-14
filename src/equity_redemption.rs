@@ -1061,6 +1061,49 @@ impl EquityRedemption {
         }
     }
 
+    /// Returns `true` before the durable `SendPending` intent commits the
+    /// redemption to sending tokens to the issuer's wallet. The freeze check
+    /// cannot be atomic with the external send, so `SendPending` is the stable
+    /// event-sourced boundary: retries from that state must complete even if a
+    /// freeze begins after the intent was recorded.
+    ///
+    /// Exhaustive `match` so a new variant forces re-classification.
+    pub(crate) fn is_pre_send(&self) -> bool {
+        match self {
+            Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitted { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. } => true,
+            Self::SendPending { .. }
+            | Self::TokensSent { .. }
+            | Self::Pending { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Reconciled { .. } => false,
+        }
+    }
+
+    /// The symbol this redemption operates on; every lifecycle state carries
+    /// it.
+    pub(crate) fn symbol(&self) -> &Symbol {
+        match self {
+            Self::VaultWithdrawPending { symbol, .. }
+            | Self::VaultWithdrawSubmitted { symbol, .. }
+            | Self::WithdrawnFromRaindex { symbol, .. }
+            | Self::UnwrapPending { symbol, .. }
+            | Self::UnwrapSubmitted { symbol, .. }
+            | Self::TokensUnwrapped { symbol, .. }
+            | Self::SendPending { symbol, .. }
+            | Self::TokensSent { symbol, .. }
+            | Self::Pending { symbol, .. }
+            | Self::Completed { symbol, .. }
+            | Self::Failed { symbol, .. }
+            | Self::Reconciled { symbol, .. } => symbol,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
             Self::VaultWithdrawPending {
