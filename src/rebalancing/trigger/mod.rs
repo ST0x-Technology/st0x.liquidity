@@ -1,7 +1,7 @@
 //! Rebalancing trigger that reacts to inventory imbalances.
 
 mod equity;
-mod freeze;
+pub(crate) mod freeze;
 mod usdc;
 
 #[cfg(test)]
