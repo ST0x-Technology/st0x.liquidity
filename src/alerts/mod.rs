@@ -1,6 +1,9 @@
-//! Operational alerting: out-of-band notifications for conditions an operator
-//! must react to (low native-gas balance, stuck rebalancing transfers,
-//! dead-lettered hedges, supervised-worker terminal failures).
+//! Operational alerting.
+//!
+//! These out-of-band notifications cover conditions and completed lifecycle
+//! operations an operator needs to see: low native-gas balance, stuck
+//! rebalancing transfers, dead-lettered hedges, supervised-worker terminal
+//! failures, and completed dividend NAV bumps.
 //!
 //! The [`Notifier`] trait abstracts the delivery channel; [`LogNotifier`] is
 //! the only production implementation: it emits each alert as a structured
@@ -20,7 +23,8 @@ use tracing::error;
 /// Kept as a trait so monitors depend on the capability, not the concrete
 /// log transport, which keeps them unit-testable with a capturing mock.
 #[async_trait]
-pub(crate) trait Notifier: Send + Sync {
+pub trait Notifier: Send + Sync {
+    /// Delivers one human-readable operational alert.
     async fn notify(&self, message: &str) -> Result<(), NotifierError>;
 }
 
@@ -31,10 +35,11 @@ pub(crate) trait Notifier: Send + Sync {
 /// `Result` stays in the trait so alert-failure handling at the call sites
 /// (retry/backoff paths, bounded-timeout sends) remains exercisable in tests.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum NotifierError {
+#[non_exhaustive]
+pub enum NotifierError {
     /// Simulated delivery failure, constructible only from tests, for
     /// exercising the call sites' alert-failure handling.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[error("simulated notifier delivery failure")]
     Simulated,
 }
@@ -46,7 +51,7 @@ pub(crate) enum NotifierError {
 /// stream. The `alert = true` field is a secondary marker for structured
 /// queries, and the human-readable alert text is the event message (the
 /// `message` field in JSON log output).
-pub(crate) struct LogNotifier;
+pub struct LogNotifier;
 
 #[async_trait]
 impl Notifier for LogNotifier {
@@ -68,9 +73,9 @@ mod test_support {
 
     use super::{Notifier, NotifierError};
 
-    /// A [`Notifier`] that captures every message passed to `notify()`, for tests
-    /// that assert operator alerts fire at the right moments without asserting
-    /// on log output. Shared across the crate's test modules.
+    /// Captures every message passed to [`Notifier::notify`].
+    ///
+    /// Tests use this instead of asserting on log output.
     #[derive(Default)]
     pub(crate) struct CapturingNotifier {
         captured: std::sync::Mutex<Vec<String>>,
