@@ -1273,14 +1273,18 @@ impl PositionAndRebalancing {
     }
 }
 
-/// Wires the dividend freeze guard onto the rebalancing service when enabled.
+/// Wires the dividend freeze guard onto the rebalancing service (the equity
+/// trigger gate) and the cross-venue transfer service (the pre-send resume
+/// gate) when enabled.
 ///
-/// When disabled, the trigger's `freeze_status` stays `None` and the equity gate
-/// fails open -- an operator escape hatch for an issuance outage that would
-/// otherwise fail closed every equity cycle. Issuance secrets remain mandatory
-/// either way, so re-enabling is a pure plaintext-config change.
+/// When disabled, both `freeze_status` readers stay `None` and the gates fail
+/// open -- an operator escape hatch for an issuance outage that would
+/// otherwise fail closed every equity cycle and hold every redemption resume.
+/// Issuance secrets remain mandatory either way, so re-enabling is a pure
+/// plaintext-config change.
 async fn wire_freeze_guard(
     rebalancing_service: &RebalancingService,
+    transfer: &CrossVenueEquityTransfer,
     freeze_check: OperationMode,
     issuance: &IssuanceStatusCtx,
 ) -> anyhow::Result<()> {
@@ -1291,13 +1295,16 @@ async fn wire_freeze_guard(
                 issuance.api_key.header_value(),
             )?);
 
-            rebalancing_service.set_freeze_status_reader(reader).await;
+            rebalancing_service
+                .set_freeze_status_reader(reader.clone())
+                .await;
+            transfer.set_freeze_status_reader(reader).await;
         }
         OperationMode::Disabled => {
             warn!(
                 target: "rebalance",
-                "Dividend freeze guard is disabled by config; equity rebalancing will \
-                 proceed without consulting issuance"
+                "Dividend freeze guard is disabled by config; equity rebalancing and \
+                 redemption resumes will proceed without consulting issuance"
             );
         }
     }
@@ -1469,13 +1476,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             usdc_notifier.clone(),
         ));
 
-        wire_freeze_guard(
-            &rebalancing_service,
-            rebalancing_ctx.freeze_check,
-            &deps.ctx.issuance,
-        )
-        .await?;
-
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
         let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
@@ -1517,6 +1517,14 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             built.mint.clone(),
             built.redemption.clone(),
         ));
+
+        wire_freeze_guard(
+            &rebalancing_service,
+            &recovery_transfer,
+            rebalancing_ctx.freeze_check,
+            &deps.ctx.issuance,
+        )
+        .await?;
 
         // Built outside `QueryManifest`: services depend on mint/redemption stores
         // that the manifest produces.
@@ -3683,12 +3691,41 @@ mod tests {
         ))
     }
 
+    async fn freeze_guard_test_transfer() -> CrossVenueEquityTransfer {
+        let (pool, _apalis_pool) = setup_test_pools().await;
+        let raindex: Arc<dyn Raindex> = Arc::new(crate::onchain::mock::MockRaindex::new());
+        let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(MockWrapper::new());
+        let tokenizer: Arc<dyn st0x_tokenization::Tokenizer> =
+            Arc::new(st0x_tokenization::mock::MockTokenizer::new());
+        let vault_lookup = Arc::new(crate::vault_lookup::MockVaultLookup::new());
+
+        let services = crate::rebalancing::equity::EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+
+        CrossVenueEquityTransfer::new(
+            raindex,
+            vault_lookup,
+            tokenizer,
+            wrapper,
+            Address::ZERO,
+            mint_store,
+            redemption_store,
+        )
+    }
+
     #[tokio::test]
     async fn wire_freeze_guard_enabled_wires_the_reader() {
         let service = freeze_guard_test_service().await;
+        let transfer = freeze_guard_test_transfer().await;
         let issuance = test_issuance_status_ctx(Url::parse("http://issuance.test:8000").unwrap());
 
-        wire_freeze_guard(&service, OperationMode::Enabled, &issuance)
+        wire_freeze_guard(&service, &transfer, OperationMode::Enabled, &issuance)
             .await
             .unwrap();
 
@@ -3696,20 +3733,29 @@ mod tests {
             service.has_freeze_status_reader().await,
             "Enabled must wire the issuance freeze-status reader onto the rebalancing service"
         );
+        assert!(
+            transfer.has_freeze_status_reader().await,
+            "Enabled must wire the issuance freeze-status reader onto the transfer service"
+        );
     }
 
     #[tokio::test]
     async fn wire_freeze_guard_disabled_leaves_the_reader_unset() {
         let service = freeze_guard_test_service().await;
+        let transfer = freeze_guard_test_transfer().await;
         let issuance = test_issuance_status_ctx(Url::parse("http://issuance.test:8000").unwrap());
 
-        wire_freeze_guard(&service, OperationMode::Disabled, &issuance)
+        wire_freeze_guard(&service, &transfer, OperationMode::Disabled, &issuance)
             .await
             .unwrap();
 
         assert!(
             !service.has_freeze_status_reader().await,
             "Disabled must leave the freeze guard unwired so the equity gate fails open"
+        );
+        assert!(
+            !transfer.has_freeze_status_reader().await,
+            "Disabled must leave the transfer's pre-send gate unwired so resumes fail open"
         );
     }
 

@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 
 use st0x_event_sorcery::{SendError, Store};
@@ -50,6 +51,7 @@ use st0x_wrapper::{
 
 use super::RebalancingService;
 use super::trigger::RecoveryClaim;
+use super::trigger::freeze::FreezeStatusReader;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
@@ -578,6 +580,11 @@ pub(crate) struct CrossVenueEquityTransfer {
     wallet: Address,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    /// Dividend freeze gate for redemption resumes, mirroring the trigger's
+    /// reader: `None` until the conductor wires the issuance client (or when
+    /// the guard is disabled by config, the documented fail-open escape
+    /// hatch for an issuance outage).
+    freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
 }
 
 impl CrossVenueEquityTransfer {
@@ -598,7 +605,22 @@ impl CrossVenueEquityTransfer {
             wallet,
             mint_store,
             redemption_store,
+            freeze_status: RwLock::new(None),
         }
+    }
+
+    /// Wires the dividend freeze reader used by [`Self::resume_redemption`]'s
+    /// pre-send guard. Called by the conductor alongside the rebalancing
+    /// trigger's reader when the freeze check is enabled.
+    pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
+        *self.freeze_status.write().await = Some(reader);
+    }
+
+    /// Test-only introspection so conductor wiring tests can assert the guard
+    /// state without reaching into the private `freeze_status` field.
+    #[cfg(test)]
+    pub(crate) async fn has_freeze_status_reader(&self) -> bool {
+        self.freeze_status.read().await.is_some()
     }
 
     /// Loads the aggregate after Poll and extracts fields from the
@@ -1146,13 +1168,75 @@ impl CrossVenueEquityTransfer {
             })
     }
 
+    /// Returns whether the redemption must hold because its asset is frozen
+    /// for a dividend, failing closed when the status cannot be confirmed.
+    /// `None` reader means the guard is disabled by config (or unwired in
+    /// tests) and the resume proceeds.
+    async fn held_by_dividend_freeze(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) -> bool {
+        let reader = self.freeze_status.read().await.clone();
+        let Some(reader) = reader else {
+            return false;
+        };
+
+        match reader.is_frozen(symbol).await {
+            Ok(false) => false,
+            Ok(true) => {
+                warn!(
+                    target: "rebalance",
+                    %aggregate_id,
+                    %symbol,
+                    "Holding pre-send redemption resume: asset is frozen for a \
+                     dividend; it will resume after unfreeze"
+                );
+                true
+            }
+            Err(error) => {
+                // Fail closed: sending tokens for a frozen asset strands them
+                // in issuance's redemption wallet until unfreeze, so when the
+                // freeze status cannot be confirmed the resume holds and the
+                // recovery machinery retries later.
+                error!(
+                    target: "rebalance",
+                    %aggregate_id,
+                    %symbol,
+                    ?error,
+                    "Holding pre-send redemption resume: could not confirm the \
+                     asset is not frozen; failing closed"
+                );
+                true
+            }
+        }
+    }
+
     #[allow(clippy::cognitive_complexity)]
     pub(crate) async fn resume_redemption(
         &self,
         aggregate_id: &RedemptionAggregateId,
     ) -> Result<(), RedemptionError> {
         loop {
-            match self.load_redemption_entity(aggregate_id).await? {
+            let entity = self.load_redemption_entity(aggregate_id).await?;
+
+            // Pre-send states hold during a dividend freeze: the on-chain send
+            // (`SendTokens`) is the stranding point — tokens leave for
+            // issuance's redemption wallet — and nothing before it has moved
+            // funds out of the bot's wallet. From `TokensSent` onward the
+            // redemption MUST complete; blocking a committed send strands
+            // funds worse than finishing it. Holding returns Ok: the aggregate
+            // stays in its event-sourced state and the inventory-poll recovery
+            // reactors re-drive it, re-checking the freeze each attempt.
+            if entity.is_pre_send()
+                && self
+                    .held_by_dividend_freeze(aggregate_id, entity.symbol())
+                    .await
+            {
+                return Ok(());
+            }
+
+            match entity {
                 EquityRedemption::VaultWithdrawPending { .. } => {
                     info!(%aggregate_id, "Resuming pending vault withdrawal");
                     self.redemption_store
@@ -1717,6 +1801,7 @@ mod tests {
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
+    use crate::rebalancing::trigger::freeze::StubFreezeReader;
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
@@ -2606,6 +2691,180 @@ mod tests {
         assert!(
             matches!(entity, EquityRedemption::Completed { .. }),
             "Expected completed redemption after resume, got: {entity:?}"
+        );
+    }
+
+    /// Drives a redemption to `SendPending` (the last pre-send state) via the
+    /// command chain, without touching the tokenizer.
+    async fn seed_send_pending(
+        transfer: &CrossVenueEquityTransfer,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        transfer
+            .redemption_store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    quantity: float!(50),
+                    token: Address::ZERO,
+                    amount: U256::from(50_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            EquityRedemptionCommand::SubmitWithdraw,
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+            EquityRedemptionCommand::PrepareSend,
+        ] {
+            transfer.redemption_store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// A pre-send redemption holds during a dividend freeze: the resume
+    /// returns Ok without dispatching, the aggregate stays where it is, and
+    /// the issuer is never contacted. The inventory-poll recovery reactors
+    /// re-drive it later, re-checking the freeze each attempt.
+    #[tokio::test]
+    async fn resume_redemption_holds_pre_send_when_frozen() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        transfer
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
+            .await;
+
+        let id = redemption_aggregate_id("redeem-frozen-hold");
+        let symbol = Symbol::new("TEST").unwrap();
+        seed_send_pending(&transfer, &id, &symbol).await;
+
+        let calls_before = tokenizer.call_count();
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::SendPending { .. }),
+            "a frozen asset's pre-send redemption must stay parked, got: {entity:?}"
+        );
+        assert_eq!(
+            tokenizer.call_count(),
+            calls_before,
+            "the issuer must not be contacted while the asset is frozen"
+        );
+    }
+
+    /// An unconfirmable freeze status fails closed exactly like a frozen one.
+    #[tokio::test]
+    async fn resume_redemption_holds_pre_send_when_freeze_indeterminate() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        transfer
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Indeterminate))
+            .await;
+
+        let id = redemption_aggregate_id("redeem-indeterminate-hold");
+        let symbol = Symbol::new("TEST").unwrap();
+        seed_send_pending(&transfer, &id, &symbol).await;
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::SendPending { .. }),
+            "an unconfirmable freeze status must fail closed, got: {entity:?}"
+        );
+        assert_eq!(tokenizer.call_count(), 0);
+    }
+
+    /// From `TokensSent` onward the redemption has committed on-chain and
+    /// MUST complete even while the asset is frozen — blocking a committed
+    /// send strands funds worse than finishing it.
+    #[tokio::test]
+    async fn resume_redemption_completes_post_send_despite_freeze() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-frozen-post-send");
+        let symbol = Symbol::new("TEST").unwrap();
+        seed_send_pending(&transfer, &id, &symbol).await;
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+
+        transfer
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
+            .await;
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "a post-send redemption must complete despite the freeze, got: {entity:?}"
+        );
+    }
+
+    /// A held redemption resumes to completion once the asset unfreezes.
+    #[tokio::test]
+    async fn resume_redemption_resumes_after_unfreeze() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        transfer
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
+            .await;
+
+        let id = redemption_aggregate_id("redeem-unfreeze-resume");
+        let symbol = Symbol::new("TEST").unwrap();
+        seed_send_pending(&transfer, &id, &symbol).await;
+
+        transfer.resume_redemption(&id).await.unwrap();
+        let held = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(held, EquityRedemption::SendPending { .. }));
+
+        transfer
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::NotFrozen))
+            .await;
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "the held redemption must complete after unfreeze, got: {entity:?}"
         );
     }
 

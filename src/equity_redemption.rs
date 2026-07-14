@@ -1061,6 +1061,49 @@ impl EquityRedemption {
         }
     }
 
+    /// Returns `true` while the redemption has not yet sent tokens on-chain
+    /// to the issuer's redemption wallet (`SendTokens`). That send is the
+    /// stranding point during a dividend freeze: everything before it only
+    /// moves value within the bot's own wallet, everything from `TokensSent`
+    /// onward has committed on-chain and must complete.
+    ///
+    /// Exhaustive `match` so a new variant forces re-classification.
+    pub(crate) fn is_pre_send(&self) -> bool {
+        match self {
+            Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitted { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. } => true,
+            Self::TokensSent { .. }
+            | Self::Pending { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Reconciled { .. } => false,
+        }
+    }
+
+    /// The symbol this redemption operates on; every lifecycle state carries
+    /// it.
+    pub(crate) fn symbol(&self) -> &Symbol {
+        match self {
+            Self::VaultWithdrawPending { symbol, .. }
+            | Self::VaultWithdrawSubmitted { symbol, .. }
+            | Self::WithdrawnFromRaindex { symbol, .. }
+            | Self::UnwrapPending { symbol, .. }
+            | Self::UnwrapSubmitted { symbol, .. }
+            | Self::TokensUnwrapped { symbol, .. }
+            | Self::SendPending { symbol, .. }
+            | Self::TokensSent { symbol, .. }
+            | Self::Pending { symbol, .. }
+            | Self::Completed { symbol, .. }
+            | Self::Failed { symbol, .. }
+            | Self::Reconciled { symbol, .. } => symbol,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
             Self::VaultWithdrawPending {
