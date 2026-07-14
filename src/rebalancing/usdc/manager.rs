@@ -2792,7 +2792,13 @@ impl<
         pending_burn_tx: Option<TxHash>,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         if let Some(adopted) = self
-            .check_pending_burn(id, BridgeDirection::BaseToEthereum, amount, pending_burn_tx)
+            .check_pending_burn(
+                id,
+                BridgeDirection::BaseToEthereum,
+                amount,
+                pending_burn_tx,
+                from_block,
+            )
             .await?
         {
             return self.record_cctp_burn(id, adopted).await;
@@ -3119,6 +3125,7 @@ impl<
         direction: BridgeDirection,
         amount: U256,
         pending_burn_tx: Option<TxHash>,
+        from_block: u64,
     ) -> Result<Option<BurnReceipt>, UsdcTransferError> {
         let Some(burn_tx) = pending_burn_tx else {
             // No recorded hash: fall through to the scan, which ADOPTS an already-mined
@@ -3128,9 +3135,13 @@ impl<
             return Ok(None);
         };
 
+        // `from_block` is the pre-burn chain head the transfer recorded (the
+        // same anchor the log scan uses): the burn can only have mined after
+        // it, so `burn_status` gates its `Dropped` verdict on the polled node
+        // being provably past it rather than trusting a lagging backend.
         let status = self
             .cctp_bridge
-            .burn_status(direction, burn_tx)
+            .burn_status(direction, burn_tx, from_block)
             .await
             .map_err(|error| UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
@@ -3291,7 +3302,13 @@ impl<
         pending_burn_tx: Option<TxHash>,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         if let Some(adopted) = self
-            .check_pending_burn(id, BridgeDirection::EthereumToBase, amount, pending_burn_tx)
+            .check_pending_burn(
+                id,
+                BridgeDirection::EthereumToBase,
+                amount,
+                pending_burn_tx,
+                from_block,
+            )
             .await?
         {
             return self.record_cctp_burn(id, adopted).await;
@@ -3672,6 +3689,7 @@ mod tests {
             &self,
             _direction: BridgeDirection,
             _tx_hash: TxHash,
+            _submitted_after_block: u64,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
             unimplemented!("MockBridge: burn_status not used in this test")
         }
@@ -7940,7 +7958,12 @@ mod tests {
     #[tokio::test]
     async fn resume_alpaca_to_base_from_deposit_initiated_reverifies_deposit_tx() {
         let server = MockServer::start();
-        let (_anvil, endpoint, private_key) = setup_anvil();
+        // Auto-mining keeps the head advancing so the wallet's drop verdict
+        // (which requires the node to prove liveness via head advance before
+        // trusting an absence) can actually fire for the fabricated tx.
+        let anvil = Anvil::new().block_time(1).spawn();
+        let endpoint = anvil.endpoint();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
 
         let alpaca_broker = InstrumentedAlpacaBroker::new(
             create_test_broker_service(&server).await,
@@ -11884,6 +11907,11 @@ mod tests {
         let from_block = provider.get_block_number().await.unwrap();
         advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
 
+        // Advance the head past the freshness margin so the node's absence
+        // report is trusted as drop evidence (a node still at `from_block`
+        // reads as a lagging backend and classifies Pending instead).
+        provider.anvil_mine(Some(5), None).await.unwrap();
+
         let error = manager
             .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(dropped_tx))
             .await
@@ -12455,6 +12483,11 @@ mod tests {
         let from_block = provider.get_block_number().await.unwrap();
         advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
 
+        // Advance the head past the freshness margin so the node's absence
+        // report is trusted as drop evidence (a node still at `from_block`
+        // reads as a lagging backend and classifies Pending instead).
+        provider.anvil_mine(Some(5), None).await.unwrap();
+
         let error = manager
             .resume_bridging_submitting(&id, amount_u256, from_block, Some(dropped_tx))
             .await
@@ -12712,6 +12745,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 amount_u256,
                 Some(pending_tx),
+                0,
             )
             .await
             .unwrap_err();

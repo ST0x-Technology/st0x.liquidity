@@ -839,6 +839,17 @@ const DROPPED_TX_GRACE: std::time::Duration = std::time::Duration::from_secs(30)
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const DROPPED_TX_CONSECUTIVE_MISSES: u32 = 3;
 
+/// Blocks the answering node's head must advance past the head observed at the
+/// first post-grace absence before a drop verdict is trusted. A lagging
+/// load-balanced backend returns `None` for a tx that actually mined — a
+/// synced node never does — so absences only count as evidence once the node
+/// has provably moved past the region where the tx could have mined. A node
+/// whose head is frozen (fully stalled backend) therefore never concludes
+/// `Dropped`; the wait ends in the retryable inclusion timeout instead.
+/// Mirrors the CCTP bridge's `SCAN_FINALITY_MARGIN` discipline.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_HEAD_ADVANCE: u64 = 2;
+
 /// Consecutive transport errors (with no successful poll in between) tolerated
 /// while polling before giving up. A transient blip on a load-balanced RPC
 /// recovers within a poll or two and a successful poll resets the count; this
@@ -863,6 +874,9 @@ pub(crate) struct ReceiptWaitConfig {
     pub(crate) dropped_grace: std::time::Duration,
     /// Consecutive mempool-absence observations required to conclude a drop.
     pub(crate) dropped_consecutive_misses: u32,
+    /// Head advance (blocks, from the first post-grace absence) the answering
+    /// node must show before its absences are trusted as a drop verdict.
+    pub(crate) dropped_head_advance: u64,
 }
 
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -876,6 +890,7 @@ impl ReceiptWaitConfig {
             confirmation_timeout: CONFIRMATION_TIMEOUT,
             dropped_grace: DROPPED_TX_GRACE,
             dropped_consecutive_misses: DROPPED_TX_CONSECUTIVE_MISSES,
+            dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
         }
     }
 }
@@ -925,6 +940,11 @@ pub(crate) async fn wait_for_receipt_with_config(
         // before concluding the tx was dropped.
         let mut consecutive_misses = 0u32;
         let mut consecutive_transport_errors = 0u32;
+        // Head observed at the first post-grace absence: the drop verdict
+        // additionally requires the node's head to advance past this by
+        // `dropped_head_advance`, proving the absences come from a node that
+        // is live and moving past where the tx could have mined.
+        let mut drop_reference_head: Option<u64> = None;
 
         loop {
             poll.tick().await;
@@ -962,6 +982,7 @@ pub(crate) async fn wait_for_receipt_with_config(
                     start,
                     &mut consecutive_misses,
                     &mut consecutive_transport_errors,
+                    &mut drop_reference_head,
                 )
                 .await?;
                 continue;
@@ -1026,7 +1047,9 @@ pub(crate) async fn wait_for_receipt_with_config(
 /// Classify an inclusion poll whose receipt is absent. Returns `Ok(())` to keep
 /// waiting; returns a terminal `Err` when the tx is confirmed dropped (missing
 /// from the receipt lookup and the mempool past the grace period for
-/// `dropped_consecutive_misses` polls) or the RPC is down past the transport cap.
+/// `dropped_consecutive_misses` polls, observed by a node whose head advanced
+/// `dropped_head_advance` blocks past the first post-grace absence) or the RPC
+/// is down past the transport cap.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 async fn classify_pending_receipt(
     provider: &impl Provider,
@@ -1035,6 +1058,7 @@ async fn classify_pending_receipt(
     start: std::time::Instant,
     consecutive_misses: &mut u32,
     consecutive_transport_errors: &mut u32,
+    drop_reference_head: &mut Option<u64>,
 ) -> Result<(), EvmError> {
     // Before the grace period a missing tx is almost certainly still propagating
     // or awaiting its first block. The receipt poll itself succeeded, so the
@@ -1074,10 +1098,37 @@ async fn classify_pending_receipt(
         return Ok(());
     }
 
-    // Absent from both the receipt lookup and the mempool past the grace period.
-    *consecutive_misses += 1;
+    // Absent from both the receipt lookup and the mempool past the grace
+    // period. The absence only becomes a verdict once the answering node also
+    // proves it is live and past where the tx could have mined: a lagging
+    // load-balanced backend returns `None` for an already-mined tx (a synced
+    // node never does), so without the head-advance proof the miss run keeps
+    // polling and a truly stalled node ends in the retryable inclusion
+    // timeout, never a false `Dropped`.
+    let head = match provider.get_block_number().await {
+        Ok(head) => {
+            *consecutive_transport_errors = 0;
+            head
+        }
+        Err(transport_error) => {
+            // Same rationale as the mempool arm: a transport error is not a
+            // confirmed observation, so it breaks the consecutive-miss run.
+            *consecutive_misses = 0;
+            note_receipt_poll_transport_error(
+                consecutive_transport_errors,
+                transport_error,
+                "polling block number for drop verdict",
+            )?;
+            return Ok(());
+        }
+    };
 
-    if *consecutive_misses >= config.dropped_consecutive_misses {
+    *consecutive_misses += 1;
+    let reference = *drop_reference_head.get_or_insert(head);
+
+    if *consecutive_misses >= config.dropped_consecutive_misses
+        && head >= reference.saturating_add(config.dropped_head_advance)
+    {
         return Err(EvmError::TransactionDropped {
             tx_hash,
             elapsed_secs: start.elapsed().as_secs(),
@@ -1661,6 +1712,7 @@ mod tests {
                 confirmation_timeout: std::time::Duration::from_secs(1),
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -1706,6 +1758,7 @@ mod tests {
                 dropped_grace: std::time::Duration::ZERO,
                 // High, so the drop check never fires before the transport cap.
                 dropped_consecutive_misses: 100,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -1774,6 +1827,7 @@ mod tests {
                 confirmation_timeout: std::time::Duration::from_secs(30),
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -1829,6 +1883,7 @@ mod tests {
                 // Large, so the Ok(None) poll stays in the before-grace reset path.
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -1887,6 +1942,7 @@ mod tests {
                 confirmation_timeout: std::time::Duration::from_secs(30),
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -1906,9 +1962,10 @@ mod tests {
         // dropped on the fourth poll -- before it is seen mined.
         let tx_hash = alloy::primitives::B256::random();
         let asserter = Asserter::new();
-        // Poll 1: receipt None, mempool absent -> miss 1.
+        // Poll 1: receipt None, mempool absent, head 10 -> miss 1.
         asserter.push_success(&serde_json::Value::Null);
         asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::from(10u64));
         // Poll 2: receipt None, mempool transport error -> reset the miss run.
         asserter.push_success(&serde_json::Value::Null);
         asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
@@ -1916,12 +1973,15 @@ mod tests {
             message: "mempool backend blip".into(),
             data: None,
         });
-        // Poll 3: receipt None, mempool absent -> miss 1 (not 2).
+        // Poll 3: receipt None, mempool absent, head 11 -> miss 1 (not 2).
         asserter.push_success(&serde_json::Value::Null);
         asserter.push_success(&serde_json::Value::Null);
-        // Poll 4: receipt None, mempool absent -> miss 2 (not 3 -> no false drop).
+        asserter.push_success(&serde_json::Value::from(11u64));
+        // Poll 4: receipt None, mempool absent, head 12 -> miss 2 (not 3 -> no
+        // false drop).
         asserter.push_success(&serde_json::Value::Null);
         asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::from(12u64));
         // Poll 5: the tx is finally mined at block 0, ending Phase 1.
         asserter.push_success(&mined_receipt(tx_hash));
         // Phase 2 with required_confirmations = 1: satisfied immediately.
@@ -1939,6 +1999,7 @@ mod tests {
                 // Check the mempool from the first poll so the interleave runs.
                 dropped_grace: std::time::Duration::ZERO,
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -1967,6 +2028,9 @@ mod tests {
                 confirmation_timeout: std::time::Duration::from_secs(60),
                 dropped_grace: std::time::Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                // Anvil's head stays frozen in these fixtures; the freshness
+                // gate is exercised by its own dedicated tests below.
+                dropped_head_advance: 0,
             },
         )
         .await;
@@ -2017,6 +2081,9 @@ mod tests {
                 // logic — the tx is in the mempool, so it must not be dropped.
                 dropped_grace: std::time::Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                // Anvil's head stays frozen in these fixtures; the freshness
+                // gate is exercised by its own dedicated tests below.
+                dropped_head_advance: 0,
             },
         )
         .await;
@@ -2051,6 +2118,9 @@ mod tests {
                 confirmation_timeout: std::time::Duration::from_secs(60),
                 dropped_grace: grace,
                 dropped_consecutive_misses: 1,
+                // Anvil's head stays frozen in these fixtures; the freshness
+                // gate is exercised by its own dedicated tests below.
+                dropped_head_advance: 0,
             },
         )
         .await;
@@ -2063,6 +2133,90 @@ mod tests {
         assert!(
             elapsed >= grace,
             "drop must not be declared before the grace period: elapsed {elapsed:?} < {grace:?}"
+        );
+    }
+
+    /// The RAI-1241 incident shape: a lagging load-balanced backend reports the
+    /// tx absent from BOTH the receipt lookup and the mempool while its head is
+    /// frozen. A synced node never returns `None` for a mined tx, so absences
+    /// from a node that is not provably advancing past where the tx could have
+    /// mined must never conclude `Dropped` — the wait ends in the retryable
+    /// inclusion timeout instead.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_does_not_drop_when_node_head_is_frozen() {
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Every poll: receipt None, mempool None, head STUCK at 42. Misses
+        // accumulate far past the threshold, but the head never advances, so
+        // the drop verdict must stay gated. Enough cycles are queued to outlast
+        // the inclusion timeout at the 1ms poll interval.
+        for _ in 0..500 {
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::from(42u64));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                // Short, so the gated wait resolves as ReceiptTimeout quickly.
+                inclusion_timeout: std::time::Duration::from_millis(100),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 3,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { tx_hash: ht, .. }) if ht == tx_hash),
+            "a frozen-head node cannot prove a drop; expected the retryable \
+             ReceiptTimeout, got: {result:?}"
+        );
+    }
+
+    /// Complement of the frozen-head case: once the answering node's head has
+    /// advanced `dropped_head_advance` past the first post-grace absence while
+    /// the tx stays missing from both lookups, the drop verdict fires.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_drops_when_head_advances_past_absent_tx() {
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Three misses with the head advancing 42 -> 43 -> 44 (= reference + 2):
+        // the third miss satisfies both the miss threshold and the head gate.
+        for head in [42u64, 43, 44] {
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::from(head));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 3,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::TransactionDropped { tx_hash: ht, .. }) if ht == tx_hash),
+            "an absent tx observed by an advancing (caught-up) node past the miss \
+             threshold must classify as Dropped, got: {result:?}"
         );
     }
 
