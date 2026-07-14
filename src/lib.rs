@@ -256,11 +256,10 @@ async fn run_bot_session_inner(
     // trading against the database and the bound server port would leak. This
     // guard aborts the conductor and shuts the supervisor down on drop, so a
     // cancelled session actually stops. The graceful path already stops both
-    // before this guard drops, making it a no-op there.
-    let _session_guard = SessionTaskGuard {
-        conductor: bot_task.abort_handle(),
-        server_supervisor: server_supervisor.clone(),
-    };
+    // before this guard drops, so the guard is disarmed after the coordinator
+    // returns.
+    let mut session_guard =
+        SessionTaskGuard::new(bot_task.abort_handle(), server_supervisor.clone());
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
@@ -271,14 +270,16 @@ async fn run_bot_session_inner(
         }
     };
 
-    await_shutdown(
+    let shutdown_result = await_shutdown(
         server_supervisor,
         bot_task,
         shutdown_token,
         shutdown_signal,
         GRACEFUL_SHUTDOWN_TIMEOUT,
     )
-    .await?;
+    .await;
+    session_guard.disarm();
+    shutdown_result?;
 
     info!(target: "startup", "Shutdown complete");
     Ok(())
@@ -298,14 +299,35 @@ async fn run_bot_session_inner(
 /// synchronously, so callers must not assume the conductor has stopped the
 /// instant the session future returns.
 struct SessionTaskGuard {
+    tasks: Option<SessionTasks>,
+}
+
+struct SessionTasks {
     conductor: AbortHandle,
     server_supervisor: SupervisorHandle,
 }
 
+impl SessionTaskGuard {
+    fn new(conductor: AbortHandle, server_supervisor: SupervisorHandle) -> Self {
+        Self {
+            tasks: Some(SessionTasks {
+                conductor,
+                server_supervisor,
+            }),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.tasks = None;
+    }
+}
+
 impl Drop for SessionTaskGuard {
     fn drop(&mut self) {
-        self.conductor.abort();
-        shutdown_supervisor(&self.server_supervisor);
+        if let Some(tasks) = &self.tasks {
+            tasks.conductor.abort();
+            shutdown_supervisor(&tasks.server_supervisor);
+        }
     }
 }
 
@@ -657,6 +679,34 @@ mod tests {
             post_wait.is_ok(),
             "supervisor.wait() should return after await_shutdown shut it down"
         );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn disarmed_session_guard_does_not_repeat_supervisor_shutdown() {
+        let shutdown_token = CancellationToken::new();
+        let bot_task = tokio::spawn(async { Ok(()) });
+        let supervisor = SupervisorBuilder::default().build().run();
+        let mut session_guard = SessionTaskGuard::new(bot_task.abort_handle(), supervisor.clone());
+        let supervisor_for_wait = supervisor.clone();
+
+        await_shutdown(
+            supervisor,
+            bot_task,
+            shutdown_token,
+            std::future::pending::<()>(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor_for_wait.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        session_guard.disarm();
+        drop(session_guard);
+
+        assert!(!logs_contain("Failed to shutdown server supervisor"));
     }
 
     #[tokio::test]
