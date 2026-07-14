@@ -2278,6 +2278,22 @@ others. Units use a `/run/st0x/<name>.ready` marker file gated by
 `ConditionPathExists` so they only start after the per-service profile has
 finished activation, never on a bare `nixos-rebuild switch`.
 
+_Migration and replay verification_:
+
+Migration verification checks that every aggregate type persisted in either the
+event store or snapshots, including framework-maintained aggregate types, has a
+replay check under the candidate code. These types are discovered before
+clearing stale snapshots, so a snapshot-only type cannot disappear from the
+coverage check. An uncovered type fails the deploy gate and is named in the
+report. Covered compacted inventory snapshots remain available for
+reconstruction; retained event streams replay without their cached snapshots.
+Verification never mutates the source database.
+
+Removing an aggregate from runtime code does not retire its durable history. An
+uncovered retired type needs compatibility replay support so that its retained
+events and snapshots remain verifiable; the coverage guard is not permission to
+delete retained events or ignore their type.
+
 _Configuration management_:
 
 - Plaintext config per `st0x`-kind service (`config/*.toml`) baked into Nix
