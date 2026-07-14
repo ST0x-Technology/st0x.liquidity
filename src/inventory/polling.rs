@@ -129,8 +129,6 @@ pub(crate) enum ReserveError {
     CentsConversion(#[from] UsdToCentsError),
     #[error("failed to convert broker cents {cents} to Usd")]
     BrokerCentsConversion { cents: i64 },
-    #[error("failed to convert available broker cents {cents} to Usdc")]
-    AvailableUsdcConversion { cents: i64 },
 }
 
 pub(crate) struct WalletPollingCtx {
@@ -706,28 +704,37 @@ where
 
         let positions = self.normalize_offchain_positions(inventory.positions);
 
-        let (gross_usd_cents, available_usd_cents) =
+        let (gross_usd, available_usd) =
             compute_available_cash(inventory.usd_balance_cents, self.reserved_cash)?;
+
+        let cash_buying_power = inventory
+            .cash_buying_power_cents
+            .map(|cents| {
+                Usdc::from_cents(cents).ok_or(ReserveError::BrokerCentsConversion { cents })
+            })
+            .transpose()?;
+
+        let cash_withdrawable = inventory
+            .cash_withdrawable_cents
+            .map(|cents| {
+                Usdc::from_cents(cents).ok_or(ReserveError::BrokerCentsConversion { cents })
+            })
+            .transpose()?;
 
         self.persist_snapshot_command(InventorySnapshotCommand::RecordOffchainObservation {
             positions,
-            usd_balance_cents: available_usd_cents,
-            gross_usd_cents,
-            cash_buying_power_cents: inventory.cash_buying_power_cents,
-            cash_withdrawable_cents: inventory.cash_withdrawable_cents,
+            usd_balance: available_usd,
+            gross_usd,
+            cash_buying_power,
+            cash_withdrawable,
             alpaca_usdc: inventory.alpaca_usdc,
             observed_at,
         })
         .await?;
 
         if let Some(observer) = &self.fresh_offchain_usd_observer {
-            let available = Usdc::from_cents(available_usd_cents).ok_or(
-                ReserveError::AvailableUsdcConversion {
-                    cents: available_usd_cents,
-                },
-            )?;
             observer
-                .observe_fresh_offchain_usd(available, Utc::now())
+                .observe_fresh_offchain_usd(available_usd, Utc::now())
                 .await
                 .map_err(InventoryPollingError::FreshOffchainUsdObserver)?;
         }
@@ -1056,11 +1063,11 @@ where
     }
 }
 
-/// Computes gross and reserve-adjusted available cash in cents.
+/// Computes gross and reserve-adjusted available cash.
 ///
-/// Returns `(gross_usd_cents, available_usd_cents)`. `gross_usd_cents` is
-/// `None` when `reserved_cash` is zero (no reserve configured), so the
-/// dashboard can hide reserve-specific context for no-reserve deployments.
+/// Returns `(gross_usd, available_usd)`. `gross_usd` is `None` when
+/// `reserved_cash` is zero (no reserve configured), so the dashboard can hide
+/// reserve-specific context for no-reserve deployments.
 ///
 /// When the broker balance is below the configured reserve, available cash is
 /// explicitly zero. This is a valid capacity state: all Alpaca cash is protected
@@ -1068,7 +1075,7 @@ where
 fn compute_available_cash(
     broker_usd_balance_cents: i64,
     reserved_cash: Usd,
-) -> Result<(Option<i64>, i64), ReserveError> {
+) -> Result<(Option<Usdc>, Usdc), ReserveError> {
     let gross =
         Usd::from_cents(broker_usd_balance_cents).ok_or(ReserveError::BrokerCentsConversion {
             cents: broker_usd_balance_cents,
@@ -1086,14 +1093,13 @@ fn compute_available_cash(
         (gross - reserved_cash)?
     };
 
-    let gross_usd_cents = if reserved_cash > Usd::ZERO {
-        Some(gross.to_cents()?)
+    let gross_usd = if reserved_cash > Usd::ZERO {
+        Some(Usdc::new(gross.inner()))
     } else {
         None
     };
-    let available_usd_cents = available.to_cents()?;
 
-    Ok((gross_usd_cents, available_usd_cents))
+    Ok((gross_usd, Usdc::new(available.inner())))
 }
 
 /// Erases the `Chain` and `Exe` parameters of [`InventoryPollingService`]
@@ -1614,14 +1620,12 @@ mod tests {
             .find(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
             .expect("Expected OffchainUsd event to be emitted");
 
-        let InventorySnapshotEvent::OffchainUsd {
-            usd_balance_cents, ..
-        } = offchain_usd_event
-        else {
+        let InventorySnapshotEvent::OffchainUsd { usd_balance, .. } = offchain_usd_event else {
             panic!("Expected OffchainUsd event, got {offchain_usd_event:?}");
         };
         assert_eq!(
-            *usd_balance_cents, 25_000_000,
+            *usd_balance,
+            Usdc::from_cents(25_000_000).unwrap(),
             "Cash balance mismatch: expected $250,000.00"
         );
     }
@@ -1718,8 +1722,8 @@ mod tests {
             .expect("Expected OffchainUsd event");
 
         let InventorySnapshotEvent::OffchainUsd {
-            usd_balance_cents,
-            gross_usd_cents,
+            usd_balance,
+            gross_usd,
             ..
         } = offchain_usd_event
         else {
@@ -1727,13 +1731,14 @@ mod tests {
         };
 
         assert_eq!(
-            *usd_balance_cents, 5_000_000,
-            "Available balance should be $100k - $50k reserved = $50k ($5,000,000 cents)"
+            *usd_balance,
+            Usdc::from_cents(5_000_000).unwrap(),
+            "Available balance should be $100k - $50k reserved = $50k"
         );
         assert_eq!(
-            *gross_usd_cents,
-            Some(10_000_000),
-            "Gross balance should be the full broker balance ($10,000,000 cents)"
+            *gross_usd,
+            Some(Usdc::from_cents(10_000_000).unwrap()),
+            "Gross balance should be the full broker balance ($100,000)"
         );
     }
 
@@ -1779,8 +1784,8 @@ mod tests {
             .expect("Expected OffchainUsd event");
 
         let InventorySnapshotEvent::OffchainUsd {
-            usd_balance_cents,
-            gross_usd_cents,
+            usd_balance,
+            gross_usd,
             ..
         } = offchain_usd_event
         else {
@@ -1788,12 +1793,13 @@ mod tests {
         };
 
         assert_eq!(
-            *usd_balance_cents, 0,
+            *usd_balance,
+            Usdc::ZERO,
             "Reserve-adjusted available cash should be zero when gross is below reserve"
         );
         assert_eq!(
-            *gross_usd_cents,
-            Some(3_000_000),
+            *gross_usd,
+            Some(Usdc::from_cents(3_000_000).unwrap()),
             "Gross balance should still be emitted so the dashboard can show cash below reserve"
         );
     }
@@ -1838,8 +1844,8 @@ mod tests {
             .expect("Expected OffchainUsd event");
 
         let InventorySnapshotEvent::OffchainUsd {
-            usd_balance_cents,
-            gross_usd_cents,
+            usd_balance,
+            gross_usd,
             ..
         } = offchain_usd_event
         else {
@@ -1847,11 +1853,12 @@ mod tests {
         };
 
         assert_eq!(
-            *usd_balance_cents, 10_000_000,
+            *usd_balance,
+            Usdc::from_cents(10_000_000).unwrap(),
             "With zero reserve, full balance should pass through"
         );
-        assert!(
-            gross_usd_cents.is_none(),
+        assert_eq!(
+            *gross_usd, None,
             "With zero reserve, gross should be None (no reserve configured)"
         );
     }
