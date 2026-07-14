@@ -38,9 +38,11 @@ use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
+use crate::issuance::IssuanceClientFailure;
 use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
+use crate::rebalancing::trigger::FreezeStatusReader;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
 use crate::telemetry::TelemetrySender;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -200,16 +202,123 @@ async fn ensure_vault_direct_mint(
     }
 }
 
+/// Operator's stance toward the dividend freeze gate on the manual
+/// redemption-side commands (`transfer-equity --direction to-alpaca`,
+/// `alpaca-redeem`). Converted from the `--force` clap flag at the dispatch
+/// boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FreezeGateMode {
+    /// Fail closed: refuse the send when the asset is frozen or its freeze
+    /// status cannot be confirmed (default).
+    Enforce,
+    /// Deliberate operator bypass (`--force`); logged as an override.
+    Bypass,
+}
+
+impl FreezeGateMode {
+    pub(super) fn from_force_flag(force: bool) -> Self {
+        if force { Self::Bypass } else { Self::Enforce }
+    }
+
+    pub(super) fn for_transfer(direction: TransferDirection, force: bool) -> anyhow::Result<Self> {
+        match (direction, force) {
+            (TransferDirection::ToRaindex, true) => {
+                anyhow::bail!("--force applies only to transfer-equity --direction to-alpaca")
+            }
+            (TransferDirection::ToRaindex | TransferDirection::ToAlpaca, false) => {
+                Ok(Self::Enforce)
+            }
+            (TransferDirection::ToAlpaca, true) => Ok(Self::Bypass),
+        }
+    }
+}
+
+#[cfg(not(test))]
+const FREEZE_STATUS_CONFIRMATION_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const FREEZE_STATUS_CONFIRMATION_DELAY: Duration = Duration::ZERO;
+
+/// Fail-closed dividend freeze gate for the manual redemption-side commands.
+/// V1 automates the dividend lifecycle, so the CLI is incident-response
+/// tooling: a frozen (or unconfirmable) asset refuses the send unless the
+/// operator deliberately bypasses with `--force`, which is logged. Issuance's
+/// status view is asynchronously projected, so enforcement requires two
+/// enabled reads separated by a propagation interval before initiation.
+async fn ensure_not_frozen_for_redemption<Writer: Write>(
+    stdout: &mut Writer,
+    symbol: &Symbol,
+    gate: FreezeGateMode,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    match gate {
+        FreezeGateMode::Bypass => {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Operator --force bypassing the dividend freeze gate without consulting issuance"
+            );
+            writeln!(
+                stdout,
+                "⚠️  --force: bypassing dividend freeze for {symbol}"
+            )?;
+            return Ok(());
+        }
+        FreezeGateMode::Enforce => {}
+    }
+
+    let reader = IssuanceClient::new(
+        ctx.issuance.base_url.clone(),
+        ctx.issuance.api_key.header_value(),
+    )
+    .map_err(IssuanceClientFailure::from)
+    .context("could not initialize issuance status client; failing closed")?;
+
+    for confirmation_index in 0..2 {
+        match reader.is_frozen(symbol).await {
+            Ok(false) => {}
+            Ok(true) => anyhow::bail!(
+                "{symbol} is frozen for a dividend; redemption-side sends are \
+                 held until unfreeze. Re-run with --force to deliberately bypass."
+            ),
+            Err(error) => anyhow::bail!(
+                "could not confirm {symbol} is not frozen ({error}); failing \
+                 closed. Re-run with --force to deliberately bypass."
+            ),
+        }
+
+        if confirmation_index == 0 {
+            tokio::time::sleep(FREEZE_STATUS_CONFIRMATION_DELAY).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Arguments for `transfer-equity`, mirroring the CLI surface.
+pub(super) struct TransferEquityArgs {
+    pub(super) direction: TransferDirection,
+    pub(super) symbol: Symbol,
+    pub(super) quantity: FractionalShares,
+    pub(super) issuer_request_id: Option<Uuid>,
+    pub(super) redemption_wallet: Option<Address>,
+    pub(super) freeze_gate: FreezeGateMode,
+}
+
 pub(super) async fn transfer_equity_command<Writer: Write>(
     stdout: &mut Writer,
-    direction: TransferDirection,
-    symbol: &Symbol,
-    quantity: FractionalShares,
-    issuer_request_id: Option<Uuid>,
-    redemption_wallet_flag: Option<Address>,
+    args: TransferEquityArgs,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
+    let TransferEquityArgs {
+        direction,
+        symbol,
+        quantity,
+        issuer_request_id,
+        redemption_wallet: redemption_wallet_flag,
+        freeze_gate,
+    } = args;
+    let symbol = &symbol;
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -218,6 +327,21 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     writeln!(stdout, "🔄 Transferring equity: {direction_str}")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+
+    match (direction, freeze_gate) {
+        (TransferDirection::ToRaindex, FreezeGateMode::Bypass) => {
+            anyhow::bail!("--force applies only to transfer-equity --direction to-alpaca")
+        }
+        (TransferDirection::ToRaindex, FreezeGateMode::Enforce)
+        | (TransferDirection::ToAlpaca, FreezeGateMode::Enforce | FreezeGateMode::Bypass) => {}
+    }
+
+    match direction {
+        TransferDirection::ToAlpaca => {
+            ensure_not_frozen_for_redemption(stdout, symbol, freeze_gate, ctx).await?;
+        }
+        TransferDirection::ToRaindex => {}
+    }
 
     let cli_services = build_equity_transfer_services(redemption_wallet_flag, ctx, pool).await?;
     let equity_transfer = cli_services.transfer;
@@ -1285,6 +1409,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     redemption_wallet_flag: Option<Address>,
     network: TokenizationNetwork,
     token_override: Option<Address>,
+    freeze_gate: FreezeGateMode,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
@@ -1294,6 +1419,8 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
 
     let token = resolve_tokenization_token(token_override, network, &symbol, ctx)?;
     writeln!(stdout, "   Token: {token}")?;
+
+    ensure_not_frozen_for_redemption(stdout, &symbol, freeze_gate, ctx).await?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
@@ -2373,11 +2500,14 @@ mod tests {
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
             &mut stdout,
-            TransferDirection::ToRaindex,
-            &symbol,
-            quantity,
-            None,
-            None,
+            TransferEquityArgs {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Enforce,
+            },
             &ctx,
             &pool,
         )
@@ -2400,11 +2530,14 @@ mod tests {
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
             &mut stdout,
-            TransferDirection::ToRaindex,
-            &symbol,
-            quantity,
-            None,
-            None,
+            TransferEquityArgs {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Enforce,
+            },
             &ctx,
             &pool,
         )
@@ -3996,6 +4129,365 @@ mod tests {
         );
     }
 
+    fn ctx_for_issuance_server(server: &httpmock::MockServer) -> Ctx {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        ctx.assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: address!("0x626757e6f50675d17fcad312e82f989ae7a23d38"),
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        ctx.issuance =
+            st0x_config::test_issuance_status_ctx(Url::parse(&server.base_url()).unwrap());
+        ctx
+    }
+
+    /// Points the ctx's issuance endpoint at an httpmock server reporting the
+    /// given freeze status for AAPL.
+    fn ctx_with_issuance_status<'server>(
+        server: &'server httpmock::MockServer,
+        status: &str,
+    ) -> (Ctx, httpmock::Mock<'server>) {
+        let status_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/tokenized-assets/AAPL/status");
+            then.status(200).json_body(serde_json::json!({
+                "underlying": "AAPL",
+                "status": status,
+            }));
+        });
+
+        (ctx_for_issuance_server(server), status_mock)
+    }
+
+    fn ctx_with_issuance_error(server: &httpmock::MockServer) -> (Ctx, httpmock::Mock<'_>) {
+        let status_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/tokenized-assets/AAPL/status");
+            then.status(500);
+        });
+
+        (ctx_for_issuance_server(server), status_mock)
+    }
+
+    #[test]
+    fn transfer_equity_rejects_force_for_to_raindex() {
+        let error = FreezeGateMode::for_transfer(TransferDirection::ToRaindex, true).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--force applies only to transfer-equity --direction to-alpaca"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_to_raindex_rejects_force_before_service_setup() {
+        let ctx = create_ctx_without_rebalancing();
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquityArgs {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Bypass,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--force applies only to transfer-equity --direction to-alpaca"
+        );
+    }
+
+    #[tokio::test]
+    async fn freeze_gate_allows_an_enabled_asset() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "enabled");
+        let mut stdout = Vec::new();
+
+        ensure_not_frozen_for_redemption(
+            &mut stdout,
+            &Symbol::new("AAPL").unwrap(),
+            FreezeGateMode::Enforce,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        status_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn freeze_gate_fails_closed_on_issuance_error() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_error(&server);
+        let mut stdout = Vec::new();
+
+        let error = ensure_not_frozen_for_redemption(
+            &mut stdout,
+            &Symbol::new("AAPL").unwrap(),
+            FreezeGateMode::Enforce,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "could not confirm AAPL is not frozen (issuance freeze-status request failed: \
+             unexpected status 500); failing closed. Re-run with --force to deliberately bypass."
+        );
+        assert!(!error.to_string().contains(&server.base_url()));
+        status_mock.assert_calls(1);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn freeze_gate_bypass_skips_issuance() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "frozen");
+        let mut stdout = Vec::new();
+
+        ensure_not_frozen_for_redemption(
+            &mut stdout,
+            &Symbol::new("AAPL").unwrap(),
+            FreezeGateMode::Bypass,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            String::from_utf8(stdout)
+                .unwrap()
+                .contains("bypassing dividend freeze for AAPL")
+        );
+        assert!(logs_contain(
+            "Operator --force bypassing the dividend freeze gate"
+        ));
+        status_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn freeze_gate_client_error_does_not_expose_issuance_url() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        ctx.issuance = st0x_config::test_issuance_status_ctx(
+            Url::parse("mailto:SENSITIVE_INTERNAL_ISSUANCE_HOST").unwrap(),
+        );
+        let mut stdout = Vec::new();
+
+        let error = ensure_not_frozen_for_redemption(
+            &mut stdout,
+            &Symbol::new("AAPL").unwrap(),
+            FreezeGateMode::Enforce,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        let rendered = format!("{error:#}\n{error:?}");
+
+        assert!(rendered.contains("could not confirm AAPL is not frozen"));
+        assert!(!rendered.contains("SENSITIVE_INTERNAL_ISSUANCE_HOST"));
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_to_alpaca_checks_freeze_before_service_setup() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "frozen");
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquityArgs {
+                direction: TransferDirection::ToAlpaca,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Enforce,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("AAPL is frozen for a dividend"));
+        status_mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_to_alpaca_fails_closed_on_issuance_error() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_error(&server);
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquityArgs {
+                direction: TransferDirection::ToAlpaca,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Enforce,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "could not confirm AAPL is not frozen (issuance freeze-status request failed: \
+             unexpected status 500); failing closed. Re-run with --force to deliberately bypass."
+        );
+        status_mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_to_alpaca_accepts_two_enabled_status_reads() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "enabled");
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquityArgs {
+                direction: TransferDirection::ToAlpaca,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Enforce,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "operation requires [tokenization] config section with redemption_wallet"
+        );
+        status_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_to_alpaca_force_bypasses_issuance_status() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "frozen");
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquityArgs {
+                direction: TransferDirection::ToAlpaca,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                freeze_gate: FreezeGateMode::Bypass,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "operation requires [tokenization] config section with redemption_wallet"
+        );
+        status_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn alpaca_redeem_fails_closed_when_asset_frozen() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "frozen");
+        let mut stdout = Vec::new();
+
+        let error = alpaca_redeem_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(10)),
+            None,
+            TokenizationNetwork::Base,
+            None,
+            FreezeGateMode::Enforce,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("frozen for a dividend") && message.contains("--force"),
+            "a frozen asset must fail closed and point at --force, got: {message}"
+        );
+        status_mock.assert_calls(1);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_redeem_force_bypasses_freeze_gate_with_logged_override() {
+        let server = httpmock::MockServer::start_async().await;
+        let (ctx, status_mock) = ctx_with_issuance_status(&server, "frozen");
+        let mut stdout = Vec::new();
+
+        let result = alpaca_redeem_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(10)),
+            None,
+            TokenizationNetwork::Base,
+            None,
+            FreezeGateMode::Bypass,
+            &ctx,
+        )
+        .await;
+
+        let message = result.unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "operation requires [tokenization] config section with redemption_wallet"
+        );
+
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(
+            printed.contains("bypassing dividend freeze for AAPL"),
+            "the bypass must be visible in the command output, got: {printed}"
+        );
+        assert!(logs_contain(
+            "Operator --force bypassing the dividend freeze gate"
+        ));
+        status_mock.assert_calls(0);
+    }
+
     #[tokio::test]
     async fn alpaca_redeem_fails_when_symbol_not_configured() {
         let ctx = create_alpaca_ctx_without_rebalancing();
@@ -4008,6 +4500,7 @@ mod tests {
             None,
             TokenizationNetwork::Base,
             None,
+            FreezeGateMode::Enforce,
             &ctx,
         )
         .await
@@ -4137,6 +4630,7 @@ mod tests {
             None,
             TokenizationNetwork::Ethereum,
             None,
+            FreezeGateMode::Enforce,
             &ctx,
         )
         .await
@@ -4160,6 +4654,7 @@ mod tests {
             None,
             TokenizationNetwork::HyperEvm,
             None,
+            FreezeGateMode::Enforce,
             &ctx,
         )
         .await

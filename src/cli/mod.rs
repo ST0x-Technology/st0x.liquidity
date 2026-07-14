@@ -35,6 +35,7 @@ use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Sym
 use st0x_finance::Usdc;
 use st0x_registry::SymbolCache;
 
+use self::rebalancing::FreezeGateMode;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
@@ -370,6 +371,11 @@ pub enum Commands {
         /// Alpaca redemption wallet (overrides the tokenization config section)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
+        /// Deliberately bypass the dividend freeze gate on to-alpaca (logged).
+        /// Without this, a frozen or unconfirmable asset refuses the
+        /// redemption-side send.
+        #[arg(long = "force")]
+        force: bool,
     },
 
     /// Wrap tokenized equity into wrapped ERC-4626 vault shares
@@ -706,6 +712,10 @@ pub enum Commands {
         /// non-base networks -- `[assets.equities]` holds Base addresses
         #[arg(long = "token")]
         token: Option<Address>,
+        /// Deliberately bypass the dividend freeze gate (logged). Without
+        /// this, a frozen or unconfirmable asset refuses the redemption send.
+        #[arg(long = "force")]
+        force: bool,
     },
 
     /// Convert USDC to/from USD on Alpaca
@@ -997,6 +1007,7 @@ enum SimpleCommand {
         quantity: FractionalShares,
         issuer_request_id: Option<Uuid>,
         redemption_wallet: Option<Address>,
+        freeze_gate: FreezeGateMode,
     },
     WrapEquity {
         symbol: Symbol,
@@ -1256,6 +1267,7 @@ enum ProviderCommand {
         redemption_wallet: Option<Address>,
         network: TokenizationNetwork,
         token: Option<Address>,
+        freeze_gate: FreezeGateMode,
     },
     DividendBump {
         symbol: Symbol,
@@ -1358,12 +1370,14 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             quantity,
             issuer_request_id,
             redemption_wallet,
+            force,
         } => Ok(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
             issuer_request_id,
             redemption_wallet,
+            freeze_gate: FreezeGateMode::from_force_flag(force),
         }),
         Commands::WrapEquity {
             symbol,
@@ -1460,12 +1474,14 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             redemption_wallet,
             network,
             token,
+            force,
         } => Err(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
             redemption_wallet,
             network,
             token,
+            freeze_gate: FreezeGateMode::from_force_flag(force),
         }),
         Commands::DividendBump { symbol, quantity } => {
             Err(ProviderCommand::DividendBump { symbol, quantity })
@@ -1604,14 +1620,24 @@ async fn run_simple_command<W: Write>(
             quantity,
             issuer_request_id,
             redemption_wallet,
+            freeze_gate,
         } => {
+            let force = match freeze_gate {
+                FreezeGateMode::Enforce => false,
+                FreezeGateMode::Bypass => true,
+            };
+            let freeze_gate = FreezeGateMode::for_transfer(direction, force)?;
+
             rebalancing::transfer_equity_command(
                 stdout,
-                direction,
-                &symbol,
-                quantity,
-                issuer_request_id,
-                redemption_wallet,
+                rebalancing::TransferEquityArgs {
+                    direction,
+                    symbol,
+                    quantity,
+                    issuer_request_id,
+                    redemption_wallet,
+                    freeze_gate,
+                },
                 ctx,
                 pool,
             )
@@ -1999,6 +2025,7 @@ async fn run_provider_command<W: Write + Send>(
             redemption_wallet,
             network,
             token,
+            freeze_gate,
         } => {
             rebalancing::alpaca_redeem_command(
                 stdout,
@@ -2007,6 +2034,7 @@ async fn run_provider_command<W: Write + Send>(
                 redemption_wallet,
                 network,
                 token,
+                freeze_gate,
                 ctx,
             )
             .await
@@ -2296,6 +2324,37 @@ mod tests {
         match classify_command(command) {
             Ok(SimpleCommand::Buy { .. }) => {}
             Ok(_) => panic!("expected buy simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification"),
+        }
+    }
+
+    #[test]
+    fn classify_transfer_equity_to_alpaca_force_as_freeze_bypass() {
+        let command = Commands::TransferEquity {
+            direction: TransferDirection::ToAlpaca,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(1)),
+            issuer_request_id: None,
+            redemption_wallet: None,
+            force: true,
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::TransferEquity { freeze_gate, .. }) => {
+                assert_eq!(freeze_gate, FreezeGateMode::Bypass);
+            }
+            Ok(_) => panic!("expected transfer-equity simple command"),
             Err(
                 ProviderCommand::ProcessTx { .. }
                 | ProviderCommand::TransferUsdc { .. }

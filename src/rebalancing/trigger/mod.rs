@@ -7,6 +7,7 @@ mod usdc;
 #[cfg(test)]
 pub(crate) use equity::InProgressGuard;
 pub(crate) use equity::{GuardState, RecoveryGuard, claim_guard_for_recovery_or_orphan};
+pub(crate) use freeze::FreezeStatusReader;
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
@@ -30,7 +31,6 @@ use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 use st0x_wrapper::{Wrapper, WrapperError};
 
-use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;

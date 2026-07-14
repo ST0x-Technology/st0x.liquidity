@@ -156,13 +156,21 @@ regardless, so re-enabling is a plaintext-config change with no secret update.
 The freeze is deliberately narrow: it suspends only **supply** operations.
 
 - **Suspended:** new mints (issuance) and new liquidity-initiated rebalancing
-  (mints / redemptions / transfers).
+  (mints / redemptions / transfers). Manual redemption commands fail closed at
+  initiation when issuance reports the asset frozen or cannot confirm its
+  status. Because issuance serves asynchronously projected freeze state, an
+  enabled result is confirmed by a second read after a one-second propagation
+  interval before initiation. An explicit `--force` bypass is logged and applies
+  only to redemption-side commands; it is independent of the server's
+  `rebalancing.freeze_check` escape hatch.
 - **Not suspended:** in-flight rebalancing flows, redemption detection, on-chain
-  secondary-market trading, and **market-making counter-trade hedging**. Hedging
-  is a reactive delta-neutraliser of fills that already executed on the standing
-  Raindex orders — which the bot does not place or control — so suspending it
-  would only strip the offset and leave naked directional exposure. Hedging
-  therefore continues through a freeze (see ADR 0008).
+  secondary-market trading, and **market-making counter-trade hedging**. Once a
+  manual command passes its initiation gate, its transfer is in flight and is
+  not re-gated during later settlement steps. Hedging is a reactive
+  delta-neutraliser of fills that already executed on the standing Raindex
+  orders — which the bot does not place or control — so suspending it would only
+  strip the offset and leave naked directional exposure. Hedging therefore
+  continues through a freeze (see ADR 0008).
 
 Removing or repricing the standing Raindex orders to avoid stale-NAV arbitrage
 during the freeze window is order-management work external to this bot, and out
