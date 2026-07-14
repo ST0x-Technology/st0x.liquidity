@@ -213,6 +213,32 @@ Clear the absence progress and keep waiting for the receipt; only transient
 transport failures count toward the outage cap. Repeated unavailable canonical
 state must end in a retryable receipt timeout, not a terminal transport error.
 
+CCTP recovery separates submission evidence from nonce ownership: a
+confirmation-time suspected drop can release generic wallet ownership, but the
+endpoint retains one exact-hash submission context for fresh requalification on
+retry. Never retain a sticky drop verdict or synthesize a missing sender, nonce
+or boundary. A recorded burn's recovery scan must target that hash, not another
+identical `DepositForBurn` in an old scan window. Optional positive scans while
+the burn is Pending do not turn RPC rejection into terminal transfer failure;
+strict confirmation validation still applies after finding the exact hash.
+Hashless or confirmed-revert recovery also checks retained transfer history
+before adopting a fingerprint match: an earlier transfer's burn can fall inside
+a stale scan window, even with a single-flight corridor. Missing ownership
+evidence must fail closed, not silently bypass this check. An empty exact-hash
+log scan needs fresh canonical unused-nonce and head-progress qualification
+after the scan; a separate numeric head does not prove the log backend is caught
+up. Generic recovery needs the complete candidate list before excluding foreign
+owners: the newest foreign match must not hide an older eligible burn, and
+filtering a partial positive response cannot establish an authoritative empty
+result that permits retrying a confirmed-reverted burn.
+
+Anvil's transaction automining does not advance an idle chain. In CCTP restart
+tests, cancellation can race past the mint into `Bridged` before a deposit send
+is recorded. That recovery path needs a finality-qualified empty deposit scan;
+without empty blocks it can repeatedly return `ScanInconclusive` and exhaust the
+job's retries. Mine the required two Ethereum blocks after the first bot stops
+and before restarting it, rather than weakening the scan or increasing retries.
+
 ## Common Pitfalls
 
 1. **Don't use `B256` for tx hashes** - use `TxHash`

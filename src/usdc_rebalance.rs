@@ -79,13 +79,16 @@ use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
+use st0x_event_sorcery::{
+    DomainEvent, EventSourced, EventsSinceError, SendError, Store, Table, events_since, head_rowid,
+};
 use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
@@ -2240,6 +2243,72 @@ pub(crate) async fn open_ethereum_credits(
     }
 
     Ok(credits)
+}
+
+/// Why retained transfer history could not establish a burn's ownership.
+#[derive(Debug, thiserror::Error)]
+pub enum BurnTxOwnershipLookupError {
+    #[error("failed to read the USDC rebalance event history head: {0}")]
+    Query(#[from] sqlx::Error),
+    #[error("failed to read retained USDC rebalance events: {0}")]
+    History(#[from] EventsSinceError),
+}
+
+/// Another transfer that recorded this burn, including cleared pending hashes
+/// and terminal transfers whose current state no longer carries the burn.
+pub(crate) async fn burn_tx_recorded_elsewhere(
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
+    burn_tx: TxHash,
+) -> Result<Option<UsdcRebalanceId>, BurnTxOwnershipLookupError> {
+    let head = head_rowid(pool).await?;
+    let page_size = NonZeroU32::MIN.saturating_add(255);
+    let mut cursor = 0;
+
+    loop {
+        let events = events_since::<UsdcRebalance>(pool, cursor, head, page_size).await?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+
+        for recorded in events {
+            cursor = recorded.rowid;
+            if recorded.id != *id && recorded_burn_tx(&recorded.event) == Some(burn_tx) {
+                return Ok(Some(recorded.id));
+            }
+        }
+    }
+}
+
+fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
+    use UsdcRebalanceEvent::*;
+
+    match event {
+        PendingBurnRecorded { burn_tx, .. } => Some(*burn_tx),
+        BridgingInitiated { burn_tx_hash, .. } | AttestationTimedOut { burn_tx_hash, .. } => {
+            Some(*burn_tx_hash)
+        }
+        BridgingFailed { burn_tx_hash, .. } => *burn_tx_hash,
+        ConversionInitiated { .. }
+        | ConversionConfirmed { .. }
+        | ConversionFailed { .. }
+        | WithdrawalSubmitting { .. }
+        | Initiated { .. }
+        | WithdrawalConfirmed { .. }
+        | WithdrawalFailed { .. }
+        | BridgingSubmitting { .. }
+        | PendingBurnCleared { .. }
+        | BridgeAttestationReceived { .. }
+        | Bridged { .. }
+        | DepositSendPrepared { .. }
+        | BridgingCompletionRecovered { .. }
+        | DepositInitiated { .. }
+        | DepositConfirmed { .. }
+        | DepositFailed { .. }
+        | DepositCompletionRecovered { .. }
+        | DepositSendAttached { .. }
+        | OperatorReconciled { .. } => None,
+    }
 }
 
 /// Another `UsdcRebalance` whose `WithdrawalConfirmed` already recorded
@@ -13227,6 +13296,242 @@ mod tests {
             panic!("expected Bridged");
         };
         assert_eq!(deposit_send, DepositSend::NotStarted);
+    }
+
+    const WITHDRAWAL_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+    const DEPOSIT_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+    fn burn_ownership_commands() -> Vec<UsdcRebalanceCommand> {
+        vec![
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(400)),
+                withdrawal: TransferRef::OnchainTx(WITHDRAWAL_TX),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(WITHDRAWAL_TX),
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 42,
+                burn_amount: Some(Usdc::new(float!(400))),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_retains_cleared_pending_ownership() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX });
+        let owner = seed_through(&store, commands).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner.clone()),
+            "a known pending burn belongs to its recorded transfer"
+        );
+        store
+            .send(&owner, UsdcRebalanceCommand::ClearPendingBurn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &owner, BURN_TX)
+                .await
+                .unwrap(),
+            None,
+            "a transfer's own retained burn must not exclude its recovery"
+        );
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner),
+            "clearing the pending hash must not make its burn unclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_retains_reconciled_confirmed_ownership() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX });
+        let owner = seed_through(&store, commands).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner.clone()),
+            "a confirmed burn belongs to its recorded transfer"
+        );
+
+        for command in [
+            UsdcRebalanceCommand::FailBridging {
+                reason: "receipt unavailable".to_string(),
+            },
+            UsdcRebalanceCommand::RecoverBridging {
+                mint_tx: MINT_TX,
+                amount_received: Usdc::new(float!(399.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            },
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "send unresolved".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&owner, command).await.unwrap();
+        }
+        assert!(matches!(
+            store.load(&owner).await.unwrap(),
+            Some(UsdcRebalance::Reconciled { .. })
+        ));
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner),
+            "a reconciled transfer still owns its confirmed burn"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_ignores_unclaimed_and_non_burn_hashes() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.extend([
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "receipt unavailable".to_string(),
+            },
+            UsdcRebalanceCommand::RecoverBridging {
+                mint_tx: MINT_TX,
+                amount_received: Usdc::new(float!(399.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            },
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(DEPOSIT_TX),
+            },
+        ]);
+        seed_through(&store, commands).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+
+        for hash in [TxHash::random(), WITHDRAWAL_TX, MINT_TX, DEPOSIT_TX] {
+            assert_eq!(
+                burn_tx_recorded_elsewhere(&pool, &other, hash)
+                    .await
+                    .unwrap(),
+                None,
+                "non-burn transaction {hash} does not establish burn ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_pages_past_own_matches() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX });
+        let own = seed_through(&store, commands).await;
+        // Fill the first 256-event page with this transfer's history, including
+        // its own matching hash. The foreign owner is strictly on page two.
+        for _ in 4..256 {
+            store
+                .send(
+                    &own,
+                    UsdcRebalanceCommand::RecordPendingBurn {
+                        burn_tx: TxHash::random(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX });
+        let other = seed_through(&store, commands).await;
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &own, BURN_TX)
+                .await
+                .unwrap(),
+            Some(other),
+            "an own-id match must not hide a foreign owner on a later page"
+        );
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &own, TxHash::random())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_database_failure_is_typed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        pool.close().await;
+        let own = UsdcRebalanceId(Uuid::new_v4());
+
+        assert!(matches!(
+            burn_tx_recorded_elsewhere(&pool, &own, BURN_TX).await,
+            Err(BurnTxOwnershipLookupError::Query(sqlx::Error::PoolClosed))
+        ));
+    }
+
+    #[test]
+    fn recorded_burn_tx_matches_every_burn_hash_event() {
+        let now = Utc::now();
+        let events = [
+            UsdcRebalanceEvent::PendingBurnRecorded {
+                burn_tx: BURN_TX,
+                recorded_at: now,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: BURN_TX,
+                burned_at: now,
+            },
+            UsdcRebalanceEvent::AttestationTimedOut {
+                burn_tx_hash: BURN_TX,
+                retry_deadline_at: now,
+                timed_out_at: now,
+            },
+            UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: Some(BURN_TX),
+                cctp_nonce: None,
+                reason: "receipt unavailable".to_string(),
+                failed_at: now,
+            },
+        ];
+
+        for event in events {
+            assert_eq!(
+                recorded_burn_tx(&event),
+                Some(BURN_TX),
+                "{} owns its burn",
+                event.event_type()
+            );
+        }
+        assert_eq!(
+            recorded_burn_tx(&UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                reason: "pre-burn failure".to_string(),
+                failed_at: now
+            }),
+            None
+        );
     }
 
     /// Each event carrying a deposit send hash records that send for its

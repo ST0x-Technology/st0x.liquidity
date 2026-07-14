@@ -1540,27 +1540,60 @@ where
         AttestationResponse::from_parts(Bytes::from(message), Bytes::from(attestation))
     }
 
-    /// Scans the burn source chain for an already-submitted burn matching
-    /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
-    /// crash-safe resume. Delegates to the source endpoint for the given
-    /// direction.
-    async fn find_recent_burn(
+    /// Scans the source endpoint for the recorded hash and transfer fingerprint.
+    async fn find_recorded_burn(
         &self,
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
         from_block: u64,
-    ) -> Result<Option<TxHash>, Self::Error> {
-        let dest_domain = direction.dest_domain();
+        burn_tx: TxHash,
+    ) -> Result<crate::RecordedBurnScan, Self::Error> {
         match direction {
             BridgeDirection::EthereumToBase => {
                 self.ethereum
-                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .find_recorded_burn(
+                        amount,
+                        direction.dest_domain(),
+                        recipient,
+                        from_block,
+                        burn_tx,
+                    )
                     .await
             }
             BridgeDirection::BaseToEthereum => {
                 self.base
-                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .find_recorded_burn(
+                        amount,
+                        direction.dest_domain(),
+                        recipient,
+                        from_block,
+                        burn_tx,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Finds a matching `(amount, destinationDomain, recipient)` burn after
+    /// `from_block` for crash recovery before a hash has been recorded.
+    async fn find_recent_burns(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Vec<TxHash>, Self::Error> {
+        let dest_domain = direction.dest_domain();
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .find_recent_burns(amount, dest_domain, recipient, from_block)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .find_recent_burns(amount, dest_domain, recipient, from_block)
                     .await
             }
         }
@@ -6625,6 +6658,90 @@ mod tests {
             found,
             Some(receipt.tx),
             "scan must return the real burn's tx for the matching amount + recipient",
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_scan_finds_exact_hash_behind_a_newer_identical_burn() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+        let from_block = bridge
+            .source_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+        let recorded = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+        let unrelated = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+        assert_eq!(
+            bridge
+                .find_recent_burns(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block
+                )
+                .await
+                .unwrap(),
+            vec![unrelated.tx, recorded.tx],
+            "complete range must expose the older eligible candidate"
+        );
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block
+                )
+                .await
+                .unwrap(),
+            Some(unrelated.tx)
+        );
+        assert_eq!(
+            bridge
+                .find_recorded_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block,
+                    recorded.tx
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Found
+        );
+        assert_eq!(
+            bridge
+                .find_recorded_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block,
+                    TxHash::random()
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Inconclusive
+        );
+        assert_eq!(
+            bridge
+                .find_recorded_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    Address::random(),
+                    from_block,
+                    recorded.tx
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Inconclusive
         );
     }
 

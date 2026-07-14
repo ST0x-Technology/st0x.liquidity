@@ -4880,11 +4880,27 @@ The job returns `Ok` and re-enqueues itself with a 15 s delay, re-entering the
 `resume_bridging_submitting` scan-or-reburn path on the next pickup.
 
 The double-burn safety guarantee is NOT `is_revert()` classification -- it is
-the `resume_bridging_submitting` scan: `find_recent_burn` scans for an existing
-burn before re-attempting, using the `from_block` lower bound durably recorded
-in the `BridgingSubmitting` aggregate event before the burn call. Even a
-misclassified error cannot cause a double-burn because the scan adopts any
-existing burn.
+the combination of scan recovery and fail-closed handling of uncertain
+submission. `find_recent_burn` scans for an existing unclaimed mined burn before
+re-attempting, using the `from_block` lower bound durably recorded in the
+`BridgingSubmitting` aggregate event before the burn call. The scan cannot find
+a still-pending broadcast whose hash was lost; that case must fail closed rather
+than authorize a reburn. Recovery without a recorded hash, including recovery
+after a confirmed revert, must not adopt a burn already recorded by another
+transfer. The scan window can include earlier transfers when its initial RPC
+head was stale; retained transfer history supplies the ownership check. Recovery
+scans return all matching candidates, newest first, after their bounded
+repeated-scan and finality gate. Candidates claimed by another transfer are
+skipped, not adopted and not allowed to hide an older unclaimed candidate. Only
+after the complete candidate set has been checked does the existing empty-result
+rule apply: a confirmed-reverted burn may be retried; a missing recorded hash
+still fails closed. Unavailable ownership evidence fails closed, retaining the
+transfer guard and never authorizing another burn. An unclaimed scan candidate
+is durably recorded as the pending burn before confirmation, replacing any
+confirmed-reverted hash; a failed or cancelled confirmation must not leave that
+old revert authorizing another burn. The candidate must then pass `confirm_burn`
+at the configured confirmation depth with valid `MessageSent` evidence before
+adoption.
 
 Generic sends observe their submission boundary under the wallet's send lock,
 immediately around each attempted broadcast, including nonce and fee recovery
@@ -4931,27 +4947,71 @@ reburning a possibly-still-pending burn. On re-pickup,
 `confirm_burn`), a still-pending burn yields a delayed redrive (never a reburn),
 and a reverted burn (which moved no funds) falls through to the scan-or-reburn
 path. A burn classified **dropped** does **not** auto-reburn: once a burn tx
-hash is durably recorded, an ambiguous "dropped" classification pages the
-operator (a terminal `BurnTxDropped` error) for manual on-chain verification,
-because a load-balanced RPC could misreport a still-pending burn as dropped and
-a reburn there would double-burn. `burn_status` mirrors the wallet's
-`wait_for_receipt` drop policy (a grace window plus consecutive qualified
-mempool-absence misses). Its head-progress reference starts after grace;
-progress before grace followed by a frozen head does not qualify. Consecutive
-misses count only once the head has advanced by the required margin beyond that
-post-grace reference. A bounded further observation window allows fresh progress
-before a frozen head returns Pending. An inconclusive lagging-head or
-consumed-nonce poll resets absence progress but does not end that observation
-window or restart grace; later polls must qualify against a new reference.
-Absence only qualifies with the submitted transaction's known sender and nonce,
-a head beyond the pre-submission block, and an unused nonce read at that exact
-canonical block hash. A consumed nonce can mean a mined transaction hidden by a
-lagging receipt backend, so it stays pending. Unknown submission evidence,
-unavailable canonical state, or a frozen/lagging head cannot produce a dropped
-verdict; wallet waits time out without releasing nonce ownership and burn
-recovery redrives. Head advancement alone does not prove global mempool absence,
-so the verdict remains suspected drop and never authorizes automatically
-reburning a recorded burn.
+hash is durably recorded, a suspected drop requires the burn-event cross-check
+below before operator reconciliation. A load-balanced RPC could misreport a
+still-pending burn as dropped, and a reburn there would double-burn.
+`burn_status` mirrors the wallet's `wait_for_receipt` drop policy (a grace
+window plus consecutive qualified mempool-absence misses). Its head-progress
+reference starts after grace; progress before grace followed by a frozen head
+does not qualify. Consecutive misses count only once the head has advanced by
+the required margin beyond that post-grace reference. A bounded further
+observation window allows fresh progress before a frozen head returns Pending.
+An inconclusive lagging-head or consumed-nonce poll resets absence progress but
+does not end that observation window or restart grace; later polls must qualify
+against a new reference. Absence only qualifies with the submitted transaction's
+known sender and nonce, a head beyond the pre-submission block, and an unused
+nonce read at that exact canonical block hash. A consumed nonce can mean a mined
+transaction hidden by a lagging receipt backend, so it stays pending. Unknown
+submission evidence, unavailable canonical state, or a frozen/lagging head
+cannot produce a dropped verdict; wallet waits time out without releasing nonce
+ownership and burn recovery redrives. Head advancement alone does not prove
+global mempool absence, so the verdict remains suspected drop and never
+authorizes automatically reburning a recorded burn.
+
+Before turning a suspected drop into terminal `BurnTxDropped`, both transfer
+directions cross-check `DepositForBurn` logs strictly after the recorded
+pre-burn head, matching depositor, amount, destination domain, recipient and the
+durably recorded transaction hash. Another identical burn is not this transfer's
+evidence; without proof of a same-nonce replacement it cannot be adopted. A drop
+during initial, retry, or adoption confirmation uses the same cross-check as a
+drop found on resume; the confirmation path cannot bypass this evidence. A match
+must pass `confirm_burn` (configured confirmation depth and `MessageSent`
+validation) before it is recorded and adopted. After an empty exact-hash scan,
+the burn must freshly qualify as dropped again using canonical unused-nonce and
+post-grace head-progress evidence. A separately returned fresh numeric head does
+not authenticate a load-balanced log backend's coverage. A receipt, visible
+transaction, consumed nonce, incomplete identity or unavailable fresh evidence
+makes the empty result inconclusive. Positive exact-hash logs remain recoverable
+through confirmation. Only this freshly qualified empty result may page for a
+dropped burn; it is point-in-time evidence, not proof against future mining.
+Inconclusive scans and transient scan or confirmation failures yield
+`SettlementCheckTransient` for delayed retry, retaining the recorded hash and
+transfer guard. Deterministic RPC or validation failures surface for operator
+action, but are not proof of a dropped burn. No scan outcome authorizes
+reburning a suspected drop.
+
+A confirmation-time suspected drop may release the wallet's nonce ownership. The
+source endpoint retains that hash's known submission evidence for automatic
+retry without retaining nonce ownership or a sticky Dropped verdict. This is a
+bounded, process-local slot for the most recently suspected burn, not durable
+history. Every later absence still needs fresh canonical unused-nonce and
+post-grace head-progress qualification. Confirmation clears the matching slot;
+restart or eviction loses the evidence conservatively, leaving an unknown hash
+Pending. A subsequently consumed sender nonce also leaves the burn Pending:
+without the original receipt or exact burn log, consumption cannot distinguish
+the original burn from another transaction. There is no unresolved-burn deadline
+alert in this policy; adding one requires a separate alerting policy, not a
+sticky Dropped verdict.
+
+A pending burn uses the same bounded scan for positive recovery evidence. Only
+the recorded hash can be confirmed and adopted. An empty or inconclusive scan,
+or any scanner failure, preserves Pending and delayed retry with its typed
+source logged; an optional recovery scan cannot exhaust a known pending burn's
+retry budget. Unavailable confirmation RPCs after an exact-hash match also
+retry, including deterministic RPC rejection. Actual invalid burn evidence, such
+as a missing `MessageSent` event, still surfaces for operator action. Pending
+scans never page as dropped and never permit reburning. Unknown identity alone
+still cannot justify a drop.
 
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across
