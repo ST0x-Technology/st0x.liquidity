@@ -1775,7 +1775,6 @@ mod tests {
             if self.failing.load(Ordering::SeqCst) {
                 return Err(crate::alerts::NotifierError::ApiError {
                     status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                    body: "injected delivery failure".to_string(),
                 });
             }
 

@@ -5,9 +5,10 @@
 //! monitor can be exercised against a capturing mock in tests.
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::json;
 
-use super::{Notifier, NotifierError};
+use super::{Notifier, NotifierError, NotifierKind, TelegramApiErrorCode};
 
 /// Telegram Bot API client that posts alerts to a fixed chat.
 pub(crate) struct TelegramNotifier {
@@ -69,6 +70,10 @@ impl TelegramNotifier {
 
 #[async_trait]
 impl Notifier for TelegramNotifier {
+    fn kind(&self) -> NotifierKind {
+        NotifierKind::Configured
+    }
+
     async fn notify(&self, message: &str) -> Result<(), NotifierError> {
         let mut body = json!({
             "chat_id": self.chat_id,
@@ -87,16 +92,40 @@ impl Notifier for TelegramNotifier {
             .json(&body)
             .send()
             .await
-            .map_err(NotifierError::Request)?;
+            .map_err(|error| NotifierError::Request(error.without_url()))?;
 
         let status = response.status();
-        if status.is_success() {
+        if !status.is_success() {
+            return Err(NotifierError::ApiError { status });
+        }
+        let envelope = response
+            .json::<TelegramResponse>()
+            .await
+            .map_err(|error| NotifierError::ResponseDecode(error.without_url()))?;
+
+        if envelope.ok {
             return Ok(());
         }
 
-        let body = response.text().await.map_err(NotifierError::Request)?;
-        Err(NotifierError::ApiError { status, body })
+        let Some(error_code) = envelope.error_code else {
+            return Err(NotifierError::MalformedEnvelope);
+        };
+
+        Err(NotifierError::EnvelopeRejected {
+            error_code: TelegramApiErrorCode(error_code),
+        })
     }
+}
+
+/// Response envelope documented by Telegram's Bot API under "Making requests":
+/// <https://core.telegram.org/bots/api#making-requests>.
+///
+/// Telegram guarantees the Boolean `ok` field on every response and includes an
+/// integer `error_code` when `ok` is false.
+#[derive(Deserialize)]
+struct TelegramResponse {
+    ok: bool,
+    error_code: Option<i64>,
 }
 
 #[cfg(test)]
@@ -104,7 +133,7 @@ mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use reqwest::StatusCode;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::*;
 
@@ -183,7 +212,7 @@ mod tests {
                     .json_body(json!({
                         "ok": false,
                         "error_code": 400,
-                        "description": "Bad Request: chat not found",
+                        "description": "SENSITIVE_PROVIDER_BODY",
                     }));
             })
             .await;
@@ -192,15 +221,98 @@ mod tests {
             TelegramNotifier::with_base_url(&server.base_url(), "123:abc", 42, None).unwrap();
 
         let error = notifier.notify("hello").await.unwrap_err();
+        let rendered_error = format!("{error:?}");
 
-        let NotifierError::ApiError { status, body } = error else {
+        let NotifierError::ApiError { status, .. } = error else {
             panic!("expected ApiError, got: {error}");
         };
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["description"], json!("Bad Request: chat not found"));
+        assert!(!rendered_error.contains("SENSITIVE_PROVIDER_BODY"));
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn notify_redacts_token_bearing_url_from_request_errors() {
+        let notifier =
+            TelegramNotifier::with_base_url("http://127.0.0.1:1", "SENSITIVE_BOT_TOKEN", 42, None)
+                .unwrap();
+
+        let error = notifier.notify("hello").await.unwrap_err();
+        let NotifierError::Request(_) = error else {
+            panic!("expected request failure, got: {error:?}");
+        };
+
+        assert!(!format!("{error:?}").contains("SENSITIVE_BOT_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn notify_distinguishes_an_undecodable_success_response() {
+        let server = MockServer::start_async().await;
+
+        let response_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/bot123:abc/sendMessage");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body("not-json");
+            })
+            .await;
+        let notifier =
+            TelegramNotifier::with_base_url(&server.base_url(), "123:abc", 42, None).unwrap();
+
+        let error = notifier.notify("hello").await.unwrap_err();
+
+        assert!(matches!(error, NotifierError::ResponseDecode(_)));
+        response_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn notify_rejects_an_error_envelope_without_an_error_code() {
+        let server = MockServer::start_async().await;
+
+        let response_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/bot123:abc/sendMessage");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({ "ok": false }));
+            })
+            .await;
+        let notifier =
+            TelegramNotifier::with_base_url(&server.base_url(), "123:abc", 42, None).unwrap();
+
+        let error = notifier.notify("hello").await.unwrap_err();
+
+        assert!(matches!(error, NotifierError::MalformedEnvelope));
+        response_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn notify_rejects_unsuccessful_bot_api_envelope() {
+        let server = MockServer::start_async().await;
+
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/bot123:abc/sendMessage");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({
+                        "ok": false,
+                        "error_code": 400,
+                        "description": "chat not found",
+                    }));
+            })
+            .await;
+        let notifier =
+            TelegramNotifier::with_base_url(&server.base_url(), "123:abc", 42, None).unwrap();
+
+        let error = notifier.notify("hello").await.unwrap_err();
+
+        let NotifierError::EnvelopeRejected { error_code } = error else {
+            panic!("expected envelope rejection, got: {error}");
+        };
+        assert_eq!(error_code, TelegramApiErrorCode(400));
     }
 }

@@ -1280,7 +1280,6 @@ mod tests {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(NotifierError::ApiError {
                     status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                    body: "temporary outage".to_owned(),
                 });
             }
             self.delivered.fetch_add(1, Ordering::SeqCst);

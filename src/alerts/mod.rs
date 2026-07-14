@@ -1,5 +1,5 @@
-//! Operational alerting: out-of-band notifications for conditions an operator
-//! must react to (currently, a low native-gas balance on the bot wallet).
+//! Operational alerting: out-of-band notifications for conditions and completed
+//! lifecycle operations an operator needs to see.
 //!
 //! The [`Notifier`] trait abstracts the delivery channel; [`TelegramNotifier`]
 //! is the only implementation today. Monitors that raise alerts (see
@@ -17,6 +17,10 @@ pub(crate) use telegram::TelegramNotifier;
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use st0x_config::AlertsCtx;
 
 /// Sends an operational alert over some channel.
 ///
@@ -24,7 +28,44 @@ use reqwest::StatusCode;
 /// Telegram transport, which keeps them unit-testable with a capturing mock.
 #[async_trait]
 pub(crate) trait Notifier: Send + Sync {
+    fn kind(&self) -> NotifierKind {
+        NotifierKind::Configured
+    }
+
     async fn notify(&self, message: &str) -> Result<(), NotifierError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotifierKind {
+    Configured,
+    Disabled,
+}
+
+/// Builds the configured operational notification channel.
+///
+/// An absent `[alerts]` section is represented explicitly by [`NoopNotifier`].
+/// If the section is present, construction failures propagate so callers never
+/// silently discard notifications an operator configured.
+pub(crate) fn build_notifier(
+    alerts: Option<&AlertsCtx>,
+) -> Result<Arc<dyn Notifier>, NotifierError> {
+    let Some(alerts) = alerts else {
+        warn!("Operational alerting is not configured; using NoopNotifier");
+        return Ok(Arc::new(NoopNotifier));
+    };
+    let notifier =
+        TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
+    info!("Telegram operational notifier configured");
+    Ok(Arc::new(notifier))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TelegramApiErrorCode(pub(crate) i64);
+
+impl std::fmt::Display for TelegramApiErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,8 +74,14 @@ pub(crate) enum NotifierError {
     ClientBuild(#[source] reqwest::Error),
     #[error("Telegram sendMessage request failed")]
     Request(#[source] reqwest::Error),
-    #[error("Telegram API returned error status {status}: {body}")]
-    ApiError { status: StatusCode, body: String },
+    #[error("Telegram sendMessage response could not be decoded")]
+    ResponseDecode(#[source] reqwest::Error),
+    #[error("Telegram API rejected delivery with error code {error_code}")]
+    EnvelopeRejected { error_code: TelegramApiErrorCode },
+    #[error("Telegram API rejection omitted its error code")]
+    MalformedEnvelope,
+    #[error("Telegram API reported failed delivery with HTTP status {status}")]
+    ApiError { status: StatusCode },
 }
 
 /// A [`Notifier`] that discards every message without error.
@@ -47,6 +94,10 @@ pub(crate) struct NoopNotifier;
 
 #[async_trait]
 impl Notifier for NoopNotifier {
+    fn kind(&self) -> NotifierKind {
+        NotifierKind::Disabled
+    }
+
     async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
         Ok(())
     }
@@ -62,7 +113,7 @@ pub(crate) use test_support::CapturingNotifier;
 mod test_support {
     use async_trait::async_trait;
 
-    use super::{Notifier, NotifierError};
+    use super::{Notifier, NotifierError, NotifierKind};
 
     /// A [`Notifier`] that captures every message passed to `notify()`, for tests
     /// that assert operator alerts fire at the right moments without a real
@@ -80,6 +131,10 @@ mod test_support {
 
     #[async_trait]
     impl Notifier for CapturingNotifier {
+        fn kind(&self) -> NotifierKind {
+            NotifierKind::Configured
+        }
+
         async fn notify(&self, message: &str) -> Result<(), NotifierError> {
             self.captured.lock().unwrap().push(message.to_string());
             Ok(())
