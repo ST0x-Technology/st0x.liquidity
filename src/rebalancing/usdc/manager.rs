@@ -22,12 +22,14 @@ use st0x_bridge::cctp::{
     AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::corridor::UsdcCorridor;
-use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
+use st0x_bridge::{
+    Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt, RecordedBurnScan,
+};
 use st0x_config::{
     ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry, RebalancingCtx,
 };
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, EvmError, IERC20, MinedTx, PreparedTransaction, Wallet};
+use st0x_evm::{Chain, EvmError, IERC20, MinedTx, PreparedTransaction, Wallet, is_transient_rpc};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -49,8 +51,9 @@ use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, DepositSend, EthereumWalletCredit, RebalanceDirection, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, deposit_send_recorded_elsewhere,
-    open_ethereum_credits, prepared_deposit_send_ids, withdrawal_tx_recorded_elsewhere,
+    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, burn_tx_recorded_elsewhere,
+    deposit_send_recorded_elsewhere, open_ethereum_credits, prepared_deposit_send_ids,
+    withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -626,6 +629,79 @@ fn mint_can_lie_below_scan_floor(
         MintScanFloorCheck::Unverified {
             from_block_timestamp,
         } => i128::from(from_block_timestamp) >= i128::from(initiated_at.timestamp()),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BurnRecoveryCheck {
+    Required,
+    OptionalPending,
+}
+
+/// An optional pending check cannot exhaust retry budget through RPC unavailability.
+/// Required evidence and actual invalid burn data still use strict classification.
+fn classify_burn_recovery_error(
+    id: &UsdcRebalanceId,
+    error: CctpError,
+    check: BurnRecoveryCheck,
+) -> UsdcTransferError {
+    let pending = match &error {
+        CctpError::ScanInconclusive { .. } => true,
+        CctpError::Evm(error) => {
+            if let EvmError::Transport(_) = error {
+                match check {
+                    BurnRecoveryCheck::OptionalPending => true,
+                    BurnRecoveryCheck::Required => error.is_confirmation_pending(),
+                }
+            } else {
+                error.is_confirmation_pending()
+            }
+        }
+        CctpError::RpcTransport(error) => match check {
+            BurnRecoveryCheck::OptionalPending => true,
+            BurnRecoveryCheck::Required => is_transient_rpc(error),
+        },
+        CctpError::Contract(_)
+        | CctpError::SolType(_)
+        | CctpError::BurnTxPending { .. }
+        | CctpError::Http(_)
+        | CctpError::AttestationNotReady { .. }
+        | CctpError::AttestationTimeout { .. }
+        | CctpError::MalformedAttestation { .. }
+        | CctpError::MessageSentEventNotFound { .. }
+        | CctpError::MintAndWithdrawEventNotFound
+        | CctpError::TxReceiptMissingBlock { .. }
+        | CctpError::TxNotMined { .. }
+        | CctpError::UsdcCreditOverflow { .. }
+        | CctpError::UsdcTransferLogDecode { .. }
+        | CctpError::MessageTooShort { .. }
+        | CctpError::MessageTooShortForRecovery { .. }
+        | CctpError::MessageDestinationDomainMismatch { .. }
+        | CctpError::AlreadyMintedMessageNotFound { .. }
+        | CctpError::MintNotFoundInScanWindow { .. }
+        | CctpError::MintScanFloorBlockMissing { .. }
+        | CctpError::RecoveredMintMessageMismatch { .. }
+        | CctpError::RecoveredMintLogMissingTxHash { .. }
+        | CctpError::RecoveredMintReceiptReverted { .. }
+        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
+        | CctpError::PlaceholderNonce
+        | CctpError::MintRecoveryInconclusive { .. }
+        | CctpError::FeeCalculationOverflow
+        | CctpError::Float(_)
+        | CctpError::AmountConversion(_)
+        | CctpError::FastTransferFeeNotAvailable { .. }
+        | CctpError::AmountBelowFastTransferFee { .. }
+        | CctpError::HexDecode(_)
+        | CctpError::FeeValueParse(_) => false,
+    };
+
+    if pending {
+        UsdcTransferError::SettlementCheckTransient {
+            id: id.clone(),
+            source: Box::new(error),
+        }
+    } else {
+        UsdcTransferError::Cctp(Box::new(error))
     }
 }
 
@@ -5541,6 +5617,7 @@ impl<
                 BridgeDirection::BaseToEthereum,
                 amount,
                 self.market_maker_wallet,
+                from_block,
             )
             .await?;
         self.record_cctp_burn(id, BridgeDirection::BaseToEthereum, burn_receipt)
@@ -5593,32 +5670,29 @@ impl<
         let reburn_on_empty = pending_burn_tx.is_some();
 
         let burn_receipt = match self
-            .cctp_bridge
-            .find_recent_burn(
-                BridgeDirection::BaseToEthereum,
-                amount,
-                self.market_maker_wallet,
-                from_block,
-            )
-            .await
+            .find_recoverable_burn(id, BridgeDirection::BaseToEthereum, amount, from_block)
+            .await?
         {
-            Ok(Some(existing_tx)) => {
-                info!(target: "rebalance", %existing_tx, "Adopting already-submitted CCTP burn on resume");
-                BurnReceipt {
-                    tx: existing_tx,
+            Some(existing_tx) => {
+                self.recover_unrecorded_burn(
+                    id,
+                    BridgeDirection::BaseToEthereum,
                     amount,
-                }
+                    existing_tx,
+                )
+                .await?
             }
-            Ok(None) if reburn_on_empty => {
+            None if reburn_on_empty => {
                 self.burn_recording_pending(
                     id,
                     BridgeDirection::BaseToEthereum,
                     amount,
                     self.market_maker_wallet,
+                    from_block,
                 )
                 .await?
             }
-            Ok(None) => {
+            None => {
                 error!(
                     target: "rebalance",
                     %id,
@@ -5628,29 +5702,81 @@ impl<
                 );
                 return Err(UsdcTransferError::BurnSubmitInconclusive { id: id.clone() });
             }
-            // ScanInconclusive: the chain head hasn't advanced far enough past
-            // `from_block` to trust an empty scan result. The aggregate is at
-            // `BridgingSubmitting` (a durable state), so return
-            // `SettlementCheckTransient` so the job delayed-redrives instead of
-            // consuming the apalis retry budget.
-            Err(error @ CctpError::ScanInconclusive { .. }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    "CCTP burn scan on Base inconclusive; will retry after delay"
-                );
-                return Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-            Err(error) => {
-                warn!(target: "rebalance", "CCTP burn scan on Base failed: {error}");
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
-            }
         };
 
         self.record_cctp_burn(id, BridgeDirection::BaseToEthereum, burn_receipt)
+            .await
+    }
+
+    /// A complete candidate range is needed before excluding foreign claims can
+    /// mean no recoverable burn remains. Never turn a partial scan into absence.
+    async fn find_recoverable_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, UsdcTransferError> {
+        let candidates = self.cctp_bridge
+            .find_recent_burns(direction, amount, self.market_maker_wallet, from_block)
+            .await
+            .map_err(|error| {
+                warn!(target: "rebalance", %id, ?direction, ?error, "CCTP burn candidate scan failed");
+                match error {
+                    error @ CctpError::ScanInconclusive { .. } =>
+                        UsdcTransferError::SettlementCheckTransient {
+                            id: id.clone(), source: Box::new(error),
+                        },
+                    error => UsdcTransferError::Cctp(Box::new(error)),
+                }
+            })?;
+        for candidate in candidates {
+            if self.check_recovered_burn_ownership(id, candidate).await? {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A stale initial RPC head can include an earlier identical burn. Only
+    /// retained transfer history can rule out another transfer's recorded claim.
+    async fn check_recovered_burn_ownership(
+        &self,
+        id: &UsdcRebalanceId,
+        tx: TxHash,
+    ) -> Result<bool, UsdcTransferError> {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            error!(target: "rebalance", %id, %tx, "Burn ownership history is not wired; refusing scan adoption");
+            return Err(UsdcTransferError::BurnTxOwnershipUnchecked { id: id.clone(), tx });
+        };
+        let owner = burn_tx_recorded_elsewhere(pool, id, tx)
+            .await
+            .inspect_err(|source| {
+                error!(target: "rebalance", %id, %tx, ?source, "Burn ownership history unavailable; refusing scan adoption");
+            })
+            .map_err(|source| UsdcTransferError::BurnTxOwnershipLookupFailed {
+                id: id.clone(), tx, source,
+            })?;
+        if let Some(recorded_by) = owner {
+            warn!(target: "rebalance", %id, %tx, %recorded_by, "Skipping scan candidate recorded by another transfer");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn recover_unrecorded_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        // Replace a confirmed-reverted hash before awaiting: an unavailable or
+        // cancelled candidate confirmation must never leave permission to reburn.
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+            .await?;
+        self.confirm_recovered_burn(id, direction, amount, burn_tx, BurnRecoveryCheck::Required)
             .await
     }
 
@@ -5690,6 +5816,7 @@ impl<
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
+        from_block: u64,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         // First attempt.
         let burn_tx = self
@@ -5706,11 +5833,9 @@ impl<
                 warn!(target: "rebalance", %burn_tx, "CCTP burn reverted on confirm; re-submitting once");
             }
             Err(CctpError::Evm(EvmError::TransactionDropped { .. })) => {
-                error!(target: "rebalance", %id, %burn_tx, "CCTP burn suspected dropped during confirmation; NOT reburning -- operator must verify on-chain");
-                return Err(UsdcTransferError::BurnTxDropped {
-                    id: id.clone(),
-                    burn_tx,
-                });
+                return self
+                    .recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                    .await;
             }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP burn confirm failed: {error}");
@@ -5746,11 +5871,8 @@ impl<
                 Err(UsdcTransferError::BurnRevert(Box::new(error)))
             }
             Err(CctpError::Evm(EvmError::TransactionDropped { .. })) => {
-                error!(target: "rebalance", %id, %burn_tx, "CCTP burn suspected dropped during retry confirmation; NOT reburning -- operator must verify on-chain");
-                Err(UsdcTransferError::BurnTxDropped {
-                    id: id.clone(),
-                    burn_tx,
-                })
+                self.recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                    .await
             }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP burn confirm failed: {error}");
@@ -5940,11 +6062,10 @@ impl<
     ///   the resume path must NEVER auto-reburn). See `resume_bridging_submitting`;
     /// - `Err(SettlementCheckTransient)` when the tx is still PENDING (delayed
     ///   redrive -- the caller must NOT reburn); and
-    /// - `Err(BurnTxDropped)` when the tx is classified DROPPED -- TERMINAL. Once a
-    ///   burn tx hash is durably recorded, an ambiguous "dropped" classification
-    ///   (which a load-balanced RPC can produce for a still-pending burn) NEVER
-    ///   auto-issues a second burn; it pages the operator for manual on-chain
-    ///   verification instead.
+    /// - A suspected DROPPED tx is cross-checked against the burn log: a
+    ///   validated match is adopted, unavailable evidence redrives, and only a
+    ///   conclusive empty scan yields terminal `BurnTxDropped`. No outcome
+    ///   auto-issues a second burn from an ambiguous absence.
     async fn check_pending_burn(
         &self,
         id: &UsdcRebalanceId,
@@ -5969,9 +6090,8 @@ impl<
             .cctp_bridge
             .burn_status(direction, burn_tx, from_block)
             .await
-            .map_err(|error| UsdcTransferError::SettlementCheckTransient {
-                id: id.clone(),
-                source: Box::new(error),
+            .map_err(|error| {
+                classify_burn_recovery_error(id, error, BurnRecoveryCheck::Required)
             })?;
 
         match status {
@@ -5983,39 +6103,33 @@ impl<
                     "Adopting durably-recorded CCTP burn on resume (mined successfully)"
                 );
                 // Adopt via confirm_burn (not a bare BurnReceipt) so the adopt path
-                // runs the same MessageSent validation as the normal burn path. The
-                // receipt is already mined-success, so a non-revert confirm error
-                // (e.g. MessageSentEventNotFound) is the actionable failure -> Cctp.
-                let burn_receipt = self
+                // runs the same MessageSent validation as the normal burn path.
+                // Freshness/transport failures still retry; invalid MessageSent
+                // evidence surfaces for operator action without adopting a burn.
+                match self
                     .cctp_bridge
                     .confirm_burn(direction, burn_tx, amount)
                     .await
-                    .map_err(|error| {
+                {
+                    Ok(receipt) => Ok(Some(receipt)),
+                    Err(CctpError::Evm(EvmError::TransactionDropped { .. })) => self
+                        .recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                        .await
+                        .map(Some),
+                    Err(error) => {
                         warn!(target: "rebalance", %id, %burn_tx, "Adopt-path confirm of recorded burn failed: {error}");
-                        match error {
-                            CctpError::Evm(EvmError::TransactionDropped { .. }) => {
-                                UsdcTransferError::BurnTxDropped {
-                                    id: id.clone(),
-                                    burn_tx,
-                                }
-                            }
-                            error => UsdcTransferError::Cctp(Box::new(error)),
-                        }
-                    })?;
-                Ok(Some(burn_receipt))
+                        Err(classify_burn_recovery_error(
+                            id,
+                            error,
+                            BurnRecoveryCheck::Required,
+                        ))
+                    }
+                }
             }
-            BurnTxStatus::Pending => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    %burn_tx,
-                    "Recorded CCTP burn not yet mined; will retry after delay (no reburn)"
-                );
-                Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(CctpError::BurnTxPending { burn_tx }),
-                })
-            }
+            BurnTxStatus::Pending => self
+                .recover_pending_burn(id, direction, amount, burn_tx, from_block)
+                .await
+                .map(Some),
             BurnTxStatus::MinedReverted => {
                 self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(
@@ -6026,17 +6140,53 @@ impl<
                 );
                 Ok(None)
             }
-            BurnTxStatus::Dropped => {
-                // A burn tx hash is durably recorded, so we must NEVER auto-issue a
-                // second burn for an ambiguous "dropped" classification: a
-                // load-balanced RPC can falsely report a still-pending burn as
-                // dropped, and a reburn there would double-burn. Page the operator
-                // for manual on-chain verification instead.
+            BurnTxStatus::Dropped => self
+                .recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                .await
+                .map(Some),
+        }
+    }
+
+    /// Positive burn-log evidence can recover a suspected drop; unavailable
+    /// evidence can only defer it, never authorize a second burn.
+    async fn recover_suspected_dropped_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+        from_block: u64,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let scan = self
+            .cctp_bridge
+            .find_recorded_burn(
+                direction,
+                amount,
+                self.market_maker_wallet,
+                from_block,
+                burn_tx,
+            )
+            .await
+            .map_err(|error| {
+                classify_burn_recovery_error(id, error, BurnRecoveryCheck::Required)
+            })?;
+        match scan {
+            RecordedBurnScan::Found => {
+                self.confirm_recovered_burn(
+                    id,
+                    direction,
+                    amount,
+                    burn_tx,
+                    BurnRecoveryCheck::Required,
+                )
+                .await
+            }
+            RecordedBurnScan::Absent => {
                 error!(
                     target: "rebalance",
                     %id,
                     %burn_tx,
-                    "Recorded CCTP burn not mined and no longer in mempool (dropped); \
+                    "Suspected-dropped CCTP burn absent from the DepositForBurn scan; \
                      NOT reburning -- operator must verify on-chain"
                 );
                 Err(UsdcTransferError::BurnTxDropped {
@@ -6044,7 +6194,84 @@ impl<
                     burn_tx,
                 })
             }
+            RecordedBurnScan::Inconclusive => {
+                warn!(target: "rebalance", %id, %burn_tx, "Recorded burn scan cannot establish exact-hash absence");
+                Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(CctpError::ScanInconclusive { from_block }),
+                })
+            }
         }
+    }
+
+    async fn recover_pending_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+        from_block: u64,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let scan = self
+            .cctp_bridge
+            .find_recorded_burn(direction, amount, self.market_maker_wallet, from_block, burn_tx)
+            .await.map_err(|error| {
+                warn!(target: "rebalance", %id, %burn_tx, %error,
+                    "Optional pending-burn recovery scan unavailable; retaining pending transaction");
+                UsdcTransferError::SettlementCheckTransient { id: id.clone(), source: Box::new(error) }
+            })?;
+        match scan {
+            RecordedBurnScan::Found => {
+                self.confirm_recovered_burn(
+                    id,
+                    direction,
+                    amount,
+                    burn_tx,
+                    BurnRecoveryCheck::OptionalPending,
+                )
+                .await
+            }
+            RecordedBurnScan::Absent | RecordedBurnScan::Inconclusive => {
+                warn!(target: "rebalance", %id, %burn_tx,
+                    "Recorded CCTP burn not proven mined; will retry after delay (no reburn)");
+                Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(CctpError::BurnTxPending { burn_tx }),
+                })
+            }
+        }
+    }
+
+    async fn confirm_recovered_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+        check: BurnRecoveryCheck,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        info!(
+            target: "rebalance",
+            %id,
+            %burn_tx,
+            "CCTP burn candidate found by DepositForBurn scan; validating before adoption"
+        );
+        self.cctp_bridge
+            .confirm_burn(direction, burn_tx, amount)
+            .await
+            .map_err(|error| {
+                warn!(target: "rebalance", %id, %burn_tx, %error, "Scan-recovered burn confirmation failed");
+                if let CctpError::Evm(EvmError::TransactionDropped { .. }) = &error {
+                    // The positive log is not confirmed evidence yet. Redrive
+                    // through fresh drop qualification and the bounded scan.
+                    UsdcTransferError::SettlementCheckTransient {
+                        id: id.clone(),
+                        source: Box::new(error),
+                    }
+                } else {
+                    classify_burn_recovery_error(id, error, check)
+                }
+            })
     }
 
     /// Records the submitted CCTP burn transaction, advancing to `Bridging`.
@@ -6138,6 +6365,7 @@ impl<
                 BridgeDirection::EthereumToBase,
                 amount,
                 self.market_maker_wallet,
+                from_block,
             )
             .await?;
         self.record_cctp_burn(id, BridgeDirection::EthereumToBase, burn_receipt)
@@ -6185,27 +6413,19 @@ impl<
         let reburn_on_empty = pending_burn_tx.is_some();
 
         let burn_receipt = match self
-            .cctp_bridge
-            .find_recent_burn(
-                BridgeDirection::EthereumToBase,
-                amount,
-                self.market_maker_wallet,
-                from_block,
-            )
-            .await
+            .find_recoverable_burn(id, BridgeDirection::EthereumToBase, amount, from_block)
+            .await?
         {
-            Ok(Some(existing_tx)) => {
-                info!(
-                    target: "rebalance",
-                    %existing_tx,
-                    "Adopting already-submitted CCTP burn on Ethereum resume"
-                );
-                BurnReceipt {
-                    tx: existing_tx,
+            Some(existing_tx) => {
+                self.recover_unrecorded_burn(
+                    id,
+                    BridgeDirection::EthereumToBase,
                     amount,
-                }
+                    existing_tx,
+                )
+                .await?
             }
-            Ok(None) if reburn_on_empty => {
+            None if reburn_on_empty => {
                 // The recorded burn reverted, so its credit is still in the
                 // wallet. The reverted hash stays recorded until
                 // `submit_and_record_burn` clears it: it is what lets a restart
@@ -6218,10 +6438,11 @@ impl<
                     BridgeDirection::EthereumToBase,
                     amount,
                     self.market_maker_wallet,
+                    from_block,
                 )
                 .await?
             }
-            Ok(None) => {
+            None => {
                 error!(
                     target: "rebalance",
                     %id,
@@ -6230,26 +6451,6 @@ impl<
                      reconciliation (no auto-reburn)"
                 );
                 return Err(UsdcTransferError::BurnSubmitInconclusive { id: id.clone() });
-            }
-            // ScanInconclusive: the chain head hasn't advanced far enough past
-            // `from_block` to trust an empty scan result. The aggregate is at
-            // `BridgingSubmitting` (a durable state), so return
-            // `SettlementCheckTransient` so the job delayed-redrives instead of
-            // consuming the apalis retry budget.
-            Err(error @ CctpError::ScanInconclusive { .. }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    "CCTP burn scan on Ethereum inconclusive; will retry after delay"
-                );
-                return Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-            Err(error) => {
-                warn!(target: "rebalance", "CCTP burn scan on Ethereum failed: {error}");
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -7207,6 +7408,7 @@ mod tests {
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+    use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
     use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
@@ -7305,13 +7507,19 @@ mod tests {
         ));
     }
 
+    enum BurnScanAnswer {
+        Absent,
+        Found(TxHash),
+        FoundMany(Vec<TxHash>),
+        Failed(fn() -> CctpError),
+    }
+
     /// A minimal bridge double for tests that exercise `burn_recording_pending`.
     ///
     /// By default, `submit_burn` returns a different hash on each call (first:
     /// all-1 bytes, second: all-2 bytes), while `confirm_burn` reverts once and
-    /// then succeeds. Tests can override the number of confirmation reverts or
-    /// supply a `burn_status`; all other Bridge and UsdcBridgeHelper methods
-    /// remain `unimplemented!()`.
+    /// then succeeds. Recovery tests opt into status, scan and confirmation
+    /// outcomes; unrelated Bridge methods remain `unimplemented!()`.
     struct MockBridge {
         submit_call_count: AtomicUsize,
         confirm_call_count: AtomicUsize,
@@ -7319,7 +7527,9 @@ mod tests {
         submit_started: Option<Arc<Notify>>,
         confirm_revert_count: usize,
         confirm_drop: bool,
+        confirm_error: Option<fn() -> CctpError>,
         burn_status: Option<st0x_bridge::BurnTxStatus>,
+        burn_status_error: Option<fn() -> CctpError>,
         // `unimplemented!()` is the default for `prepare_usdc_on_ethereum`, same
         // as every other unused method on this mock -- so a test that
         // unexpectedly walks into the deposit send still panics loudly. The
@@ -7339,7 +7549,8 @@ mod tests {
         // as a scan of mined logs does while a send is still unmined.
         empty_usdc_scan: bool,
         ledger_probe: Option<LedgerBalanceProbe>,
-        empty_burn_scan: bool,
+        burn_scan: Option<BurnScanAnswer>,
+        burn_scan_calls: Mutex<Vec<(BridgeDirection, U256, Address, u64)>>,
         // Opt-in failing Circle re-poll with the nonce read consumed; see
         // `with_failing_repoll_on_consumed_nonce`.
         repoll_error: Option<fn() -> CctpError>,
@@ -7373,7 +7584,9 @@ mod tests {
                 submit_started: None,
                 confirm_revert_count: 1,
                 confirm_drop: false,
+                confirm_error: None,
                 burn_status: None,
+                burn_status_error: None,
                 send_usdc_tx: None,
                 usdc_prepare_calls: AtomicUsize::new(0),
                 first_usdc_prepare_delay: Duration::ZERO,
@@ -7385,7 +7598,8 @@ mod tests {
                 mined_usdc_sends: Mutex::new(Vec::new()),
                 empty_usdc_scan: false,
                 ledger_probe: None,
-                empty_burn_scan: false,
+                burn_scan: None,
+                burn_scan_calls: Mutex::new(Vec::new()),
                 repoll_error: None,
                 mint_error: None,
                 #[cfg(feature = "test-support")]
@@ -7396,7 +7610,17 @@ mod tests {
         }
 
         fn with_empty_burn_scan(mut self) -> Self {
-            self.empty_burn_scan = true;
+            self.burn_scan = Some(BurnScanAnswer::Absent);
+            self
+        }
+
+        fn with_burn_scan(mut self, answer: BurnScanAnswer) -> Self {
+            self.burn_scan = Some(answer);
+            self
+        }
+
+        fn with_confirm_error(mut self, error: fn() -> CctpError) -> Self {
+            self.confirm_error = Some(error);
             self
         }
 
@@ -7567,13 +7791,21 @@ mod tests {
             amount: U256,
         ) -> Result<BurnReceipt, CctpError> {
             let count = self.confirm_call_count.fetch_add(1, Ordering::SeqCst);
+            if !self.confirm_drop
+                && let Some(error) = self.confirm_error
+            {
+                return Err(error());
+            }
+
             if count < self.confirm_revert_count {
                 Err(CctpError::Evm(EvmError::Reverted { tx_hash }))
-            } else if self.confirm_drop {
+            } else if self.confirm_drop && count == self.confirm_revert_count {
                 Err(CctpError::Evm(EvmError::TransactionDropped {
                     tx_hash,
                     elapsed_secs: 120,
                 }))
+            } else if let Some(error) = self.confirm_error {
+                Err(error())
             } else {
                 Ok(BurnReceipt {
                     tx: tx_hash,
@@ -7588,6 +7820,10 @@ mod tests {
             _tx_hash: TxHash,
             _submitted_after_block: u64,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
+            if let Some(error) = self.burn_status_error {
+                return Err(error());
+            }
+
             let Some(status) = self.burn_status else {
                 unimplemented!("MockBridge: burn_status not used in this test")
             };
@@ -7650,18 +7886,45 @@ mod tests {
             unimplemented!("MockBridge: reconstruct_attestation not used in this test")
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
-            _direction: BridgeDirection,
-            _amount: U256,
-            _recipient: Address,
-            _from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
-            if !self.empty_burn_scan {
-                unimplemented!("MockBridge: find_recent_burn not used in this test")
-            }
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+            from_block: u64,
+        ) -> Result<Vec<TxHash>, CctpError> {
+            self.burn_scan_calls
+                .lock()
+                .unwrap()
+                .push((direction, amount, recipient, from_block));
 
-            Ok(None)
+            match self.burn_scan.as_ref() {
+                Some(BurnScanAnswer::Absent) => Ok(Vec::new()),
+                Some(BurnScanAnswer::Found(tx)) => Ok(vec![*tx]),
+                Some(BurnScanAnswer::FoundMany(txs)) => Ok(txs.clone()),
+                Some(BurnScanAnswer::Failed(error)) => Err(error()),
+                None => unimplemented!("MockBridge: find_recent_burn not used in this test"),
+            }
+        }
+
+        async fn find_recorded_burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+            from_block: u64,
+            burn_tx: TxHash,
+        ) -> Result<RecordedBurnScan, CctpError> {
+            let candidates = self
+                .find_recent_burns(direction, amount, recipient, from_block)
+                .await?;
+            Ok(if candidates.contains(&burn_tx) {
+                RecordedBurnScan::Found
+            } else if candidates.is_empty() {
+                RecordedBurnScan::Absent
+            } else {
+                RecordedBurnScan::Inconclusive
+            })
         }
 
         async fn find_attested_mint(
@@ -7920,15 +8183,15 @@ mod tests {
             self.inner.reconstruct_attestation(message, attestation)
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
             direction: BridgeDirection,
             amount: U256,
             recipient: Address,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_burn(direction, amount, recipient, from_block)
+                .find_recent_burns(direction, amount, recipient, from_block)
                 .await
         }
 
@@ -8133,15 +8396,15 @@ mod tests {
             self.inner.reconstruct_attestation(message, attestation)
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
             direction: BridgeDirection,
             amount: U256,
             recipient: Address,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_burn(direction, amount, recipient, from_block)
+                .find_recent_burns(direction, amount, recipient, from_block)
                 .await
         }
 
@@ -8343,15 +8606,15 @@ mod tests {
             self.inner.reconstruct_attestation(message, attestation)
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
             direction: BridgeDirection,
             amount: U256,
             recipient: Address,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_burn(direction, amount, recipient, from_block)
+                .find_recent_burns(direction, amount, recipient, from_block)
                 .await
         }
 
@@ -8503,10 +8766,14 @@ mod tests {
     }
 
     async fn create_test_store_instance() -> Arc<Store<UsdcRebalance>> {
+        create_test_store_with_pool().await.0
+    }
+
+    async fn create_test_store_with_pool() -> (Arc<Store<UsdcRebalance>>, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        Arc::new(test_store(pool, ()))
+        (Arc::new(test_store(pool.clone(), ())), pool)
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal ->
@@ -23143,7 +23410,7 @@ mod tests {
             },
             chains.bot_address,
         );
-        let cqrs = create_test_store_instance().await;
+        let (cqrs, pool) = create_test_store_with_pool().await;
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
@@ -23157,7 +23424,8 @@ mod tests {
             ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
-        );
+        )
+        .with_credit_ledger(pool);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
@@ -23204,6 +23472,1649 @@ mod tests {
             ),
             "Aggregate must reach Bridging with the adopted burn tx; got: {state:?}"
         );
+    }
+
+    async fn dropped_burn_fixture(
+        direction: BridgeDirection,
+        scan: BurnScanAnswer,
+        confirm_error: Option<fn() -> CctpError>,
+    ) -> (
+        CrossVenueCashTransfer<impl Wallet + Clone, MockBridge>,
+        UsdcRebalanceId,
+        MockServer,
+    ) {
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        match direction {
+            BridgeDirection::BaseToEthereum => {
+                advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, 42).await;
+            }
+            BridgeDirection::EthereumToBase => {
+                advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 42).await;
+            }
+        }
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::RecordPendingBurn {
+                burn_tx: TxHash::from([7; 32]),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut bridge = MockBridge::new()
+            .with_burn_status(BurnTxStatus::Dropped)
+            .with_burn_scan(scan)
+            .with_confirm_revert_count(0);
+        if let Some(error) = confirm_error {
+            bridge = bridge.with_confirm_error(error);
+        }
+        let key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let wallet = create_test_wallet("http://127.0.0.1:1", &key);
+        let (manager, _pool, server) = manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        (manager, id, server)
+    }
+
+    async fn resume_dropped_burn<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let amount = usdc_to_u256(usdc("100")).unwrap();
+        let recorded = Some(TxHash::from([7; 32]));
+        match direction {
+            BridgeDirection::BaseToEthereum => {
+                manager
+                    .resume_bridging_submitting(id, amount, 42, recorded)
+                    .await
+            }
+            BridgeDirection::EthereumToBase => {
+                manager
+                    .resume_bridging_submitting_ethereum(id, amount, 42, recorded)
+                    .await
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BurnCandidateClaim {
+        Unclaimed,
+        Own,
+        Other,
+    }
+
+    async fn generic_burn_scan_fixture(
+        direction: BridgeDirection,
+        pending: Option<TxHash>,
+        claim: BurnCandidateClaim,
+    ) -> (
+        CrossVenueCashTransfer<impl Wallet + Clone, MockBridge>,
+        UsdcRebalanceId,
+        SqlitePool,
+        MockServer,
+    ) {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let previous = UsdcRebalanceId(Uuid::new_v4());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let candidate = TxHash::from([8; 32]);
+        for transfer in [&previous, &id] {
+            match direction {
+                BridgeDirection::BaseToEthereum => {
+                    advance_to_bridging_submitting_base_to_alpaca(&cqrs, transfer, usdc("100"), 42)
+                        .await;
+                }
+                BridgeDirection::EthereumToBase => {
+                    advance_to_bridging_submitting_alpaca_to_base(&cqrs, transfer, usdc("100"), 42)
+                        .await;
+                }
+            }
+        }
+        let owner = match claim {
+            BurnCandidateClaim::Unclaimed => None,
+            BurnCandidateClaim::Own => Some(&id),
+            BurnCandidateClaim::Other => Some(&previous),
+        };
+        if let Some(owner) = owner {
+            cqrs.send(
+                owner,
+                UsdcRebalanceCommand::RecordPendingBurn { burn_tx: candidate },
+            )
+            .await
+            .unwrap();
+            cqrs.send(owner, UsdcRebalanceCommand::ClearPendingBurn)
+                .await
+                .unwrap();
+        }
+        if let Some(burn_tx) = pending {
+            cqrs.send(&id, UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+                .await
+                .unwrap();
+        }
+        let bridge = MockBridge::new()
+            .with_burn_status(BurnTxStatus::MinedReverted)
+            .with_burn_scan(BurnScanAnswer::Found(candidate))
+            .with_confirm_revert_count(0)
+            .with_ledger_probe(cqrs.clone(), id.clone(), usdc_to_u256(usdc("100")).unwrap());
+        let key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let wallet = create_test_wallet("http://127.0.0.1:1", &key);
+        let (manager, _queue, server) = manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        (manager.with_credit_ledger(pool.clone()), id, pool, server)
+    }
+
+    async fn resume_generic_burn_scan<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        pending: Option<TxHash>,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let amount = usdc_to_u256(usdc("100")).unwrap();
+        match direction {
+            BridgeDirection::BaseToEthereum => {
+                manager
+                    .resume_bridging_submitting(id, amount, 42, pending)
+                    .await
+            }
+            BridgeDirection::EthereumToBase => {
+                manager
+                    .resume_bridging_submitting_ethereum(id, amount, 42, pending)
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_generic_adapter_never_promotes_empty_candidates_to_absence() {
+        let recorded = TxHash::from([7; 32]);
+        for (answer, expected) in [
+            (BurnScanAnswer::Absent, RecordedBurnScan::Inconclusive),
+            (BurnScanAnswer::Found(recorded), RecordedBurnScan::Found),
+            (
+                BurnScanAnswer::FoundMany(vec![TxHash::from([8; 32]), recorded]),
+                RecordedBurnScan::Found,
+            ),
+            (
+                BurnScanAnswer::Found(TxHash::from([8; 32])),
+                RecordedBurnScan::Inconclusive,
+            ),
+        ] {
+            // This wrapper deliberately uses Bridge's generic adapter rather
+            // than the mock's explicit authoritative-absence override.
+            let bridge = MintErrorBridge {
+                inner: MockBridge::new().with_burn_scan(answer),
+                recovery_error: || CctpError::ScanInconclusive { from_block: 42 },
+            };
+            assert_eq!(
+                bridge
+                    .find_recorded_burn(
+                        BridgeDirection::BaseToEthereum,
+                        U256::from(100),
+                        Address::random(),
+                        42,
+                        recorded
+                    )
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_hashless_foreign_only_fails_closed() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (manager, id, _pool, _server) =
+                generic_burn_scan_fixture(direction, None, BurnCandidateClaim::Other).await;
+            let result = resume_generic_burn_scan(&manager, &id, direction, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(UsdcTransferError::BurnSubmitInconclusive { .. })
+                ),
+                "another transfer's historical burn must not be adopted: {result:?}"
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    state,
+                    UsdcRebalance::BridgingSubmitting {
+                        pending_burn_tx: None,
+                        ..
+                    }
+                ),
+                "foreign candidate must retain guard: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_foreign_only_confirmed_revert_reburns_safely() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let pending = Some(TxHash::from([7; 32]));
+            let (manager, id, _pool, _server) =
+                generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Other).await;
+            let receipt = resume_generic_burn_scan(&manager, &id, direction, pending)
+                .await
+                .unwrap();
+            assert_eq!(receipt.tx, TxHash::from([1; 32]));
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == receipt.tx),
+                "confirmed revert may reburn only after excluding all foreign candidates: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_finds_eligible_older_candidate_behind_foreign_newest() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                let (mut manager, id, _pool, _server) =
+                    generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Other).await;
+                let eligible = TxHash::from([9; 32]);
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_scan =
+                    Some(BurnScanAnswer::FoundMany(vec![
+                        TxHash::from([8; 32]),
+                        eligible,
+                    ]));
+                let receipt = resume_generic_burn_scan(&manager, &id, direction, pending)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    receipt.tx, eligible,
+                    "foreign newest must not hide an eligible older burn"
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == eligible)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_older_candidate_confirmation_failure_retains_its_hash_on_retry() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                let (mut manager, id, _pool, _server) =
+                    generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Other).await;
+                let eligible = TxHash::from([9; 32]);
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_scan = Some(BurnScanAnswer::FoundMany(vec![
+                    TxHash::from([8; 32]),
+                    eligible,
+                ]));
+                bridge.confirm_error = Some(|| {
+                    CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset"))
+                });
+                assert!(matches!(
+                    resume_generic_burn_scan(&manager, &id, direction, pending).await,
+                    Err(UsdcTransferError::SettlementCheckTransient { .. })
+                ));
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. } if hash == eligible)
+                );
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_status = Some(BurnTxStatus::Pending);
+                bridge.burn_scan = Some(BurnScanAnswer::Absent);
+                assert!(matches!(
+                    resume_generic_burn_scan(&manager, &id, direction, Some(eligible)).await,
+                    Err(UsdcTransferError::SettlementCheckTransient { .. })
+                ));
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_adopts_only_unclaimed_or_own_historical_burns() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                for claim in [BurnCandidateClaim::Unclaimed, BurnCandidateClaim::Own] {
+                    let (manager, id, _pool, _server) =
+                        generic_burn_scan_fixture(direction, pending, claim).await;
+                    let receipt = resume_generic_burn_scan(&manager, &id, direction, pending)
+                        .await
+                        .unwrap();
+                    assert_eq!(receipt.tx, TxHash::from([8; 32]));
+                    assert_eq!(
+                        manager
+                            .cctp_bridge
+                            .confirm_call_count
+                            .load(Ordering::SeqCst),
+                        1
+                    );
+                    assert_eq!(
+                        manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                        0
+                    );
+                    let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                    assert!(
+                        matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. }
+                        if burn_tx_hash == receipt.tx),
+                        "eligible candidate should be adopted: {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_unavailable_ownership_history_fails_closed() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                for unwired in [true, false] {
+                    let (mut manager, id, _pool, _server) = generic_burn_scan_fixture(
+                        direction,
+                        pending,
+                        BurnCandidateClaim::Unclaimed,
+                    )
+                    .await;
+                    if unwired {
+                        manager.credit_ledger = CreditLedger::Unwired;
+                    } else {
+                        let unavailable = SqlitePool::connect(":memory:").await.unwrap();
+                        unavailable.close().await;
+                        manager.credit_ledger = CreditLedger::Wired(unavailable);
+                    }
+                    let error = resume_generic_burn_scan(&manager, &id, direction, pending)
+                        .await
+                        .unwrap_err();
+                    if unwired {
+                        assert!(
+                            matches!(error, UsdcTransferError::BurnTxOwnershipUnchecked { tx, .. }
+                            if tx == TxHash::from([8; 32]))
+                        );
+                    } else {
+                        assert!(matches!(
+                            error,
+                            UsdcTransferError::BurnTxOwnershipLookupFailed {
+                                source: crate::usdc_rebalance::BurnTxOwnershipLookupError::Query(
+                                    sqlx::Error::PoolClosed
+                                ),
+                                ..
+                            }
+                        ));
+                    }
+                    assert_eq!(
+                        manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                        0
+                    );
+                    assert_eq!(
+                        manager
+                            .cctp_bridge
+                            .confirm_call_count
+                            .load(Ordering::SeqCst),
+                        0
+                    );
+                    let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                    assert!(
+                        matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx, .. }
+                        if pending_burn_tx == pending),
+                        "unavailable ownership must retain guard: {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_requires_valid_confirmed_burn_evidence() {
+        let errors: [(fn() -> CctpError, bool); 4] = [
+            (
+                || CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([8; 32]),
+                },
+                false,
+            ),
+            (
+                || {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([8; 32]),
+                        timeout_secs: 30,
+                    })
+                },
+                true,
+            ),
+            (
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+                true,
+            ),
+            (
+                || {
+                    CctpError::Evm(EvmError::TransactionDropped {
+                        tx_hash: TxHash::from([8; 32]),
+                        elapsed_secs: 30,
+                    })
+                },
+                true,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                for (error, retryable) in errors {
+                    let (mut manager, id, _pool, _server) = generic_burn_scan_fixture(
+                        direction,
+                        pending,
+                        BurnCandidateClaim::Unclaimed,
+                    )
+                    .await;
+                    Arc::get_mut(&mut manager.cctp_bridge)
+                        .unwrap()
+                        .confirm_error = Some(error);
+                    let result = resume_generic_burn_scan(&manager, &id, direction, pending)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        matches!(result, UsdcTransferError::SettlementCheckTransient { .. }),
+                        retryable
+                    );
+                    let source = match result {
+                        UsdcTransferError::SettlementCheckTransient { source, .. }
+                        | UsdcTransferError::Cctp(source) => source,
+                        other => panic!("confirmation source must be preserved: {other:?}"),
+                    };
+                    assert_eq!(source.to_string(), error().to_string());
+                    assert_eq!(
+                        manager
+                            .cctp_bridge
+                            .confirm_call_count
+                            .load(Ordering::SeqCst),
+                        1
+                    );
+                    assert_eq!(
+                        manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                        0
+                    );
+                    let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                    assert!(
+                        matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx, .. }
+                        if pending_burn_tx == Some(TxHash::from([8; 32]))),
+                        "unconfirmed candidate must retain guard: {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_confirmation_failure_retries_the_candidate_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                let (mut manager, id, _pool, _server) =
+                    generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Unclaimed)
+                        .await;
+                Arc::get_mut(&mut manager.cctp_bridge)
+                    .unwrap()
+                    .confirm_error = Some(|| {
+                    CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset"))
+                });
+                let error = resume_generic_burn_scan(&manager, &id, direction, pending)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    UsdcTransferError::SettlementCheckTransient { .. }
+                ));
+                let candidate = TxHash::from([8; 32]);
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. }
+                    if hash == candidate),
+                    "failed confirmation must durably replace old revert: {state:?}"
+                );
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_status = Some(BurnTxStatus::Pending);
+                bridge.burn_scan = Some(BurnScanAnswer::Absent);
+                let error = resume_generic_burn_scan(&manager, &id, direction, Some(candidate))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { source, .. }
+                    if matches!(*source, CctpError::BurnTxPending { burn_tx } if burn_tx == candidate))
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. }
+                    if hash == candidate),
+                    "pending retry must retain candidate: {state:?}"
+                );
+            }
+        }
+    }
+
+    async fn assert_suspected_drop_stays_latched<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+    ) {
+        let state = manager.cqrs.load(id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(tx), ..
+            } if tx == TxHash::from([7; 32])),
+            "unresolved burn must retain its recorded hash: {state:?}"
+        );
+        assert_eq!(
+            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            0,
+            "a suspected drop must never submit another burn"
+        );
+        assert_eq!(
+            *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+            vec![(
+                direction,
+                usdc_to_u256(usdc("100")).unwrap(),
+                manager.market_maker_wallet,
+                42
+            )],
+            "cross-check must use this transfer's source, amount, recipient and pre-burn boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_bridging_submitting_dropped_verdict_adopts_burn_found_by_scan() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let found = TxHash::from([7; 32]);
+            let (manager, id, _server) =
+                dropped_burn_fixture(direction, BurnScanAnswer::Found(found), None).await;
+            let receipt = resume_dropped_burn(&manager, &id, direction).await.unwrap();
+            assert_eq!(receipt.tx, found, "must adopt the scan-recovered hash");
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == found),
+                "validated scan match must advance to Bridging: {state:?}"
+            );
+            assert_eq!(
+                *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                vec![(direction, receipt.amount, manager.market_maker_wallet, 42)]
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfirmDropOrigin {
+        NewBurn { reverts: usize },
+        RecordedBurn,
+    }
+
+    impl ConfirmDropOrigin {
+        fn tx_hash(self) -> TxHash {
+            match self {
+                Self::NewBurn { reverts: 0 } => TxHash::from([1; 32]),
+                Self::NewBurn { .. } => TxHash::from([2; 32]),
+                Self::RecordedBurn => TxHash::from([7; 32]),
+            }
+        }
+    }
+
+    async fn drive_confirm_drop<Signer: Wallet + Clone>(
+        manager: &mut CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        origin: ConfirmDropOrigin,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+        bridge.confirm_drop = true;
+        bridge.burn_status = Some(BurnTxStatus::MinedSuccess);
+        match origin {
+            ConfirmDropOrigin::NewBurn { reverts } => {
+                bridge.confirm_revert_count = reverts;
+                manager
+                    .burn_recording_pending(
+                        id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        manager.market_maker_wallet,
+                        42,
+                    )
+                    .await
+            }
+            ConfirmDropOrigin::RecordedBurn => manager
+                .check_pending_burn(
+                    id,
+                    direction,
+                    usdc_to_u256(usdc("100")).unwrap(),
+                    Some(TxHash::from([7; 32])),
+                    42,
+                )
+                .await
+                .map(|receipt| receipt.expect("a mined recorded burn must yield a receipt")),
+        }
+    }
+
+    async fn assert_confirm_drop_stays_latched<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        origin: ConfirmDropOrigin,
+    ) {
+        let (expected_tx, submissions) = match origin {
+            ConfirmDropOrigin::NewBurn { reverts } => (
+                TxHash::from([if reverts == 0 { 1 } else { 2 }; 32]),
+                reverts + 1,
+            ),
+            ConfirmDropOrigin::RecordedBurn => (TxHash::from([7; 32]), 0),
+        };
+        let state = manager.cqrs.load(id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(tx), ..
+            } if tx == expected_tx),
+            "unresolved confirmation drop must retain ownership: {state:?}"
+        );
+        assert_eq!(
+            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            submissions
+        );
+        assert_eq!(
+            *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+            vec![(
+                direction,
+                usdc_to_u256(usdc("100")).unwrap(),
+                manager.market_maker_wallet,
+                42
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_adopts_scan_found_burn_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for origin in [
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+                ConfirmDropOrigin::NewBurn { reverts: 1 },
+                ConfirmDropOrigin::RecordedBurn,
+            ] {
+                let found = origin.tx_hash();
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Found(found), None).await;
+                let receipt = drive_confirm_drop(&mut manager, &id, direction, origin)
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.tx, found);
+                assert_confirm_drop_stays_latched(&manager, &id, direction, origin).await;
+                let expected_confirms = match origin {
+                    ConfirmDropOrigin::NewBurn { reverts } => reverts + 2,
+                    ConfirmDropOrigin::RecordedBurn => 2,
+                };
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    expected_confirms
+                );
+                manager
+                    .record_cctp_burn(&id, direction, receipt)
+                    .await
+                    .unwrap();
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == found),
+                    "validated recovery must advance using scanned identity: {state:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_unavailable_scan_retries_without_reburn() {
+        let errors: [fn() -> CctpError; 2] = [
+            || CctpError::ScanInconclusive { from_block: 42 },
+            || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for origin in [
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+                ConfirmDropOrigin::NewBurn { reverts: 1 },
+                ConfirmDropOrigin::RecordedBurn,
+            ] {
+                for error in errors {
+                    let (mut manager, id, _server) =
+                        dropped_burn_fixture(direction, BurnScanAnswer::Failed(error), None).await;
+                    let error = drive_confirm_drop(&mut manager, &id, direction, origin)
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                        "unavailable confirmation-drop scan must retry: {error:?}"
+                    );
+                    assert_confirm_drop_stays_latched(&manager, &id, direction, origin).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_scan_recovered_burn_requires_valid_confirmation() {
+        let errors: [(fn() -> CctpError, bool); 2] = [
+            (
+                || {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([8; 32]),
+                        timeout_secs: 1,
+                    })
+                },
+                true,
+            ),
+            (
+                || CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([8; 32]),
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for origin in [
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+                ConfirmDropOrigin::NewBurn { reverts: 1 },
+                ConfirmDropOrigin::RecordedBurn,
+            ] {
+                for (error, retryable) in errors {
+                    let (mut manager, id, _server) = dropped_burn_fixture(
+                        direction,
+                        BurnScanAnswer::Found(origin.tx_hash()),
+                        Some(error),
+                    )
+                    .await;
+                    let error = drive_confirm_drop(&mut manager, &id, direction, origin)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                        retryable
+                    );
+                    if !retryable {
+                        assert!(matches!(error, UsdcTransferError::Cctp(source)
+                            if matches!(*source, CctpError::MessageSentEventNotFound { .. })));
+                    }
+                    assert_confirm_drop_stays_latched(&manager, &id, direction, origin).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_inconclusive_scan_later_pending_adopts_found_burn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (mut manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Failed(|| CctpError::ScanInconclusive { from_block: 42 }),
+                None,
+            )
+            .await;
+            let error = drive_confirm_drop(
+                &mut manager,
+                &id,
+                direction,
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                UsdcTransferError::SettlementCheckTransient { .. }
+            ));
+            let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+            bridge.burn_status = Some(BurnTxStatus::Pending);
+            bridge.burn_scan = Some(BurnScanAnswer::Found(TxHash::from([1; 32])));
+            let receipt = manager
+                .check_pending_burn(
+                    &id,
+                    direction,
+                    usdc_to_u256(usdc("100")).unwrap(),
+                    Some(TxHash::from([1; 32])),
+                    42,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.tx, TxHash::from([1; 32]));
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                2
+            );
+            assert_eq!(
+                *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                vec![(direction, receipt.amount, manager.market_maker_wallet, 42); 2]
+            );
+            manager
+                .record_cctp_burn(&id, direction, receipt)
+                .await
+                .unwrap();
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. }
+                if burn_tx_hash == TxHash::from([1; 32])),
+                "positive evidence must remain recoverable after wallet identity release: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_unavailable_scan_then_requalified_drop_can_page_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for scan_error in [
+                || CctpError::ScanInconclusive { from_block: 42 },
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+            ] {
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Failed(scan_error), None).await;
+                let error = drive_confirm_drop(
+                    &mut manager,
+                    &id,
+                    direction,
+                    ConfirmDropOrigin::NewBurn { reverts: 0 },
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    UsdcTransferError::SettlementCheckTransient { .. }
+                ));
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_status = Some(BurnTxStatus::Dropped);
+                bridge.burn_scan = Some(BurnScanAnswer::Absent);
+                let recorded = TxHash::from([1; 32]);
+                let error = manager
+                    .check_pending_burn(
+                        &id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        Some(recorded),
+                        42,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::BurnTxDropped { burn_tx, .. }
+                    if burn_tx == recorded)
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    1
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. }
+                    if hash == recorded),
+                    "terminal drop must keep ownership: {state:?}"
+                );
+                assert_eq!(
+                    *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                    vec![
+                        (
+                            direction,
+                            usdc_to_u256(usdc("100")).unwrap(),
+                            manager.market_maker_wallet,
+                            42
+                        );
+                        2
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_empty_scan_stays_pending_without_drop_or_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (mut manager, id, _server) =
+                dropped_burn_fixture(direction, BurnScanAnswer::Absent, None).await;
+            Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                Some(BurnTxStatus::Pending);
+            let error = manager
+                .check_pending_burn(
+                    &id,
+                    direction,
+                    usdc_to_u256(usdc("100")).unwrap(),
+                    Some(TxHash::from([7; 32])),
+                    42,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::SettlementCheckTransient { source, .. }
+                if matches!(*source, CctpError::BurnTxPending { burn_tx } if burn_tx == TxHash::from([7; 32])))
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_scan_errors_preserve_classification_without_reburn() {
+        let errors: [fn() -> CctpError; 6] = [
+            || CctpError::ScanInconclusive { from_block: 42 },
+            || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+            || CctpError::RpcTransport(RpcError::UnsupportedFeature("eth_getLogs")),
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32000,
+                    message: "block range exceeds provider limit".into(),
+                    data: None,
+                }))
+            },
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32000,
+                    message: "header not found".into(),
+                    data: None,
+                }))
+            },
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32005,
+                    message: "rate limit exceeded".into(),
+                    data: None,
+                }))
+            },
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for error in errors {
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Failed(error), None).await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                    Some(BurnTxStatus::Pending);
+                let result = manager
+                    .check_pending_burn(
+                        &id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        Some(TxHash::from([7; 32])),
+                        42,
+                    )
+                    .await
+                    .unwrap_err();
+                let UsdcTransferError::SettlementCheckTransient { source, .. } = result else {
+                    panic!("any unavailable optional scanner must preserve Pending: {result:?}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    error().to_string(),
+                    "preserve the original RPC source"
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_scan_cannot_adopt_an_unrelated_identical_burn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for status in [BurnTxStatus::Pending, BurnTxStatus::Dropped] {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([8; 32])),
+                    None,
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status = Some(status);
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    "an unrelated hash is neither adoption nor authoritative absence: {error:?}"
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_scan_match_requires_valid_confirmation() {
+        let errors: [(fn() -> CctpError, bool); 2] = [
+            (
+                || {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([7; 32]),
+                        timeout_secs: 1,
+                    })
+                },
+                true,
+            ),
+            (
+                || CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([7; 32]),
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for (error, retryable) in errors {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(error),
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                    Some(BurnTxStatus::Pending);
+                let error = manager
+                    .check_pending_burn(
+                        &id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        Some(TxHash::from([7; 32])),
+                        42,
+                    )
+                    .await
+                    .unwrap_err();
+                match error {
+                    UsdcTransferError::SettlementCheckTransient { source, .. } if retryable => {
+                        assert!(matches!(
+                            *source,
+                            CctpError::Evm(EvmError::ReceiptTimeout { .. })
+                        ));
+                    }
+                    UsdcTransferError::Cctp(source) if !retryable => {
+                        assert!(matches!(
+                            *source,
+                            CctpError::MessageSentEventNotFound { .. }
+                        ));
+                    }
+                    error => panic!(
+                        "pending log match requires confirmation-specific classification: {error:?}"
+                    ),
+                }
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_confirmation_rpc_rejections_remain_retryable() {
+        let errors: [fn() -> CctpError; 3] = [
+            || CctpError::RpcTransport(RpcError::UnsupportedFeature("eth_getTransactionReceipt")),
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32000,
+                    message: "header not found".into(),
+                    data: None,
+                }))
+            },
+            || {
+                CctpError::Evm(EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32005,
+                    message: "request exceeds provider limit".into(),
+                    data: None,
+                })))
+            },
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for error in errors {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(error),
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                    Some(BurnTxStatus::Pending);
+                let result = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                let UsdcTransferError::SettlementCheckTransient { source, .. } = result else {
+                    panic!("optional pending confirmation RPC failure must retry: {result:?}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    error().to_string(),
+                    "preserve the typed RPC source"
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_found_recorded_burn_confirmation_drop_redrives_without_recursive_scan_or_reburn()
+    {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for status in [BurnTxStatus::Pending, BurnTxStatus::Dropped] {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(|| {
+                        CctpError::Evm(EvmError::TransactionDropped {
+                            tx_hash: TxHash::from([7; 32]),
+                            elapsed_secs: 30,
+                        })
+                    }),
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status = Some(status);
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { source, .. }
+                    if matches!(*source, CctpError::Evm(EvmError::TransactionDropped { tx_hash, .. })
+                    if tx_hash == TxHash::from([7; 32])))
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_mined_burn_confirmation_timeout_retries_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (mut manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Absent,
+                Some(|| {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([7; 32]),
+                        timeout_secs: 1,
+                    })
+                }),
+            )
+            .await;
+            Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                Some(BurnTxStatus::MinedSuccess);
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                "receipt visibility or depth timeout must retry the recorded burn: {error:?}"
+            );
+            assert!(
+                manager
+                    .cctp_bridge
+                    .burn_scan_calls
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(tx), ..
+            } if tx == TxHash::from([7; 32])),
+                "recorded burn must remain latched: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_status_errors_preserve_retryability_without_reburn() {
+        let errors: [(fn() -> CctpError, bool); 2] = [
+            (
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+                true,
+            ),
+            (
+                || {
+                    CctpError::RpcTransport(RpcError::UnsupportedFeature(
+                        "eth_getTransactionReceipt",
+                    ))
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for (error, retryable) in errors {
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Absent, None).await;
+                Arc::get_mut(&mut manager.cctp_bridge)
+                    .unwrap()
+                    .burn_status_error = Some(error);
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    retryable,
+                    "only transient status errors may retry: {error:?}"
+                );
+                if !retryable {
+                    assert!(matches!(error, UsdcTransferError::Cctp(_)));
+                }
+                assert!(
+                    manager
+                        .cctp_bridge
+                        .burn_scan_calls
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(tx), ..
+                } if tx == TxHash::from([7; 32])),
+                    "recorded burn must remain latched: {state:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_empty_scan_pages_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (manager, id, _server) =
+                dropped_burn_fixture(direction, BurnScanAnswer::Absent, None).await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::BurnTxDropped { burn_tx, .. }
+                    if burn_tx == TxHash::from([7; 32])),
+                "only conclusive empty scan may yield terminal drop: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_inconclusive_scan_retries_without_reburn() {
+        let errors: [fn() -> CctpError; 2] = [
+            || CctpError::ScanInconclusive { from_block: 42 },
+            || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for error in errors {
+                let (manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Failed(error), None).await;
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    "unavailable scan evidence must retry, not page for a drop: {error:?}"
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_deterministic_scan_failure_surfaces_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Failed(|| {
+                    CctpError::RpcTransport(RpcError::UnsupportedFeature("eth_getLogs"))
+                }),
+                None,
+            )
+            .await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::Cctp(ref source)
+                    if matches!(**source, CctpError::RpcTransport(RpcError::UnsupportedFeature(_)))),
+                "deterministic scan failures must surface, not silently retry forever: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_confirmation_timeout_retries_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let found = TxHash::from([7; 32]);
+            let (manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Found(found),
+                Some(|| {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([7; 32]),
+                        timeout_secs: 1,
+                    })
+                }),
+            )
+            .await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                "a confirmation timeout is retryable, never proof of drop: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_confirmation_rpc_failure_is_classified_without_reburn() {
+        let errors: [(fn() -> CctpError, bool); 3] = [
+            (
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+                true,
+            ),
+            (
+                || {
+                    CctpError::Evm(EvmError::Transport(TransportErrorKind::custom_str(
+                        "connection reset",
+                    )))
+                },
+                true,
+            ),
+            (
+                || {
+                    CctpError::RpcTransport(RpcError::UnsupportedFeature(
+                        "eth_getTransactionReceipt",
+                    ))
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for (error, retryable) in errors {
+                let (manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(error),
+                )
+                .await;
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    retryable,
+                    "only transient confirmation failures may retry: {error:?}"
+                );
+                if !retryable {
+                    assert!(matches!(error, UsdcTransferError::Cctp(_)));
+                }
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_invalid_message_is_not_adopted_or_dropped() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let found = TxHash::from([7; 32]);
+            let (manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Found(found),
+                Some(|| CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([7; 32]),
+                }),
+            )
+            .await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::Cctp(ref source)
+                    if matches!(**source, CctpError::MessageSentEventNotFound { .. })),
+                "invalid burn evidence must not be adopted or mislabeled dropped: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
     }
 
     /// `burn_recording_pending` persists `RecordPendingBurn` BEFORE awaiting the
@@ -23311,7 +25222,13 @@ mod tests {
             manager_with_bot_gas_queue(cqrs.clone(), wallet, MockBridge::new()).await;
 
         let receipt = manager
-            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                recipient,
+                0,
+            )
             .await
             .unwrap();
 
@@ -23409,7 +25326,8 @@ mod tests {
                 }
                 let bridge = MockBridge::new()
                     .with_confirm_revert_count(revert_count)
-                    .with_confirm_drop();
+                    .with_confirm_drop()
+                    .with_empty_burn_scan();
                 let wallet = create_test_wallet(&endpoint, &private_key);
                 let (manager, pool, _server) =
                     manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
@@ -23419,6 +25337,7 @@ mod tests {
                         direction,
                         usdc_to_u256(amount).unwrap(),
                         Address::random(),
+                        0,
                     )
                     .await
                     .unwrap_err();
@@ -23434,6 +25353,15 @@ mod tests {
                     "only a proved revert permits a second burn"
                 );
                 assert_eq!(pending_bot_gas_jobs(&pool).await.len(), revert_count);
+                assert_eq!(
+                    *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                    vec![(
+                        direction,
+                        usdc_to_u256(amount).unwrap(),
+                        manager.market_maker_wallet,
+                        0
+                    )]
+                );
                 let state = cqrs.load(&id).await.unwrap().unwrap();
                 assert!(
                     matches!(state, UsdcRebalance::BridgingSubmitting {
@@ -23459,6 +25387,7 @@ mod tests {
             let bridge = MockBridge::new()
                 .with_confirm_revert_count(0)
                 .with_confirm_drop()
+                .with_empty_burn_scan()
                 .with_burn_status(st0x_bridge::BurnTxStatus::MinedSuccess);
             let wallet = create_test_wallet(&endpoint, &private_key);
             let (manager, _pool, _server) = manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
@@ -23480,6 +25409,15 @@ mod tests {
             assert_eq!(
                 manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
                 0
+            );
+            assert_eq!(
+                *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                vec![(
+                    direction,
+                    usdc_to_u256(amount).unwrap(),
+                    manager.market_maker_wallet,
+                    0
+                )]
             );
         }
     }
@@ -23504,7 +25442,13 @@ mod tests {
             manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
 
         let error = manager
-            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                recipient,
+                0,
+            )
             .await
             .unwrap_err();
 
@@ -23583,6 +25527,7 @@ mod tests {
                 BridgeDirection::EthereumToBase,
                 usdc_to_u256(amount).unwrap(),
                 recipient,
+                0,
             )
             .await
             .unwrap_err();
@@ -24960,7 +26905,13 @@ mod tests {
         let manager = manager.with_credit_ledger(pool);
 
         manager
-            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                recipient,
+                0,
+            )
             .await
             .unwrap();
 
@@ -26477,7 +28428,9 @@ mod tests {
         let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
         let nonce_before = provider.get_transaction_count(sender).await.unwrap();
         let cqrs = create_test_store_instance().await;
-        let bridge = MockBridge::new().with_burn_status(st0x_bridge::BurnTxStatus::Dropped);
+        let bridge = MockBridge::new()
+            .with_burn_status(st0x_bridge::BurnTxStatus::Dropped)
+            .with_empty_burn_scan();
         let (manager, _pool, _server) =
             manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -27025,7 +28978,9 @@ mod tests {
         let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
         let nonce_before = provider.get_transaction_count(sender).await.unwrap();
         let cqrs = create_test_store_instance().await;
-        let bridge = MockBridge::new().with_burn_status(st0x_bridge::BurnTxStatus::Dropped);
+        let bridge = MockBridge::new()
+            .with_burn_status(st0x_bridge::BurnTxStatus::Dropped)
+            .with_empty_burn_scan();
         let (manager, _pool, _server) =
             manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -27244,6 +29199,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 amount_u256,
                 market_maker_wallet,
+                0,
             )
             .await
             .unwrap_err();
@@ -27419,6 +29375,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 amount_u256,
                 chains.bot_address,
+                from_block,
             )
             .await
             .unwrap_err();
@@ -27529,7 +29486,7 @@ mod tests {
             },
             chains.bot_address,
         );
-        let cqrs = create_test_store_instance().await;
+        let (cqrs, pool) = create_test_store_with_pool().await;
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
@@ -27543,7 +29500,8 @@ mod tests {
             ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
-        );
+        )
+        .with_credit_ledger(pool);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -27902,7 +29860,7 @@ mod tests {
             },
             chains.bot_address,
         );
-        let cqrs = create_test_store_instance().await;
+        let (cqrs, pool) = create_test_store_with_pool().await;
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
@@ -27916,7 +29874,8 @@ mod tests {
             ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
-        );
+        )
+        .with_credit_ledger(pool);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
