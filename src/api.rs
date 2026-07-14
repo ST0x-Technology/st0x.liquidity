@@ -1378,6 +1378,26 @@ pub struct ResumeResponse {
     pub redemptions_failed: usize,
 }
 
+/// Wire contract used by the in-container CLI to hand a confirmed dividend
+/// NAV bump to the running bot's exported log pipeline.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DividendNavBumpNotice {
+    pub message: String,
+}
+
+async fn report_dividend_nav_bump(Json(notice): Json<DividendNavBumpNotice>) -> StatusCode {
+    error!(
+        target: "operational_alert",
+        alert = true,
+        alert_kind = "completion",
+        notice_kind = "dividend_nav_bump",
+        "{}",
+        notice.message
+    );
+    StatusCode::NO_CONTENT
+}
+
 async fn resume_transfers(
     State(state): State<AppState>,
 ) -> Result<Json<ResumeResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -2738,16 +2758,15 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 
 /// Refuses any request whose TCP peer is not loopback.
 ///
-/// The `/transfers/*` mutation endpoints exist on their bare paths for exactly
-/// one caller: `st0x-cli` running inside the bot's own container (`docker
-/// exec`), whose resume/recheck verbs delegate to the running server so
-/// recovery dispatches through the in-process reactor. That caller connects to
+/// The bare operator mutation endpoints exist for exactly one caller:
+/// `st0x-cli` running inside the bot's own container (`docker exec`). Transfer
+/// verbs delegate recovery to the running server's in-process reactor, while
+/// completion notices enter its exported log stream. That caller connects to
 /// 127.0.0.1 inside the container's network namespace. Anything arriving over
 /// the published port -- the VPC, an IAP tunnel, the load balancer -- reaches
 /// the container through its bridge interface and carries a non-loopback peer,
-/// so it is refused here and must use the IAP-verified `/liquidity-write`
-/// mount instead. A request with no recorded peer address is refused too:
-/// fail closed rather than guess.
+/// so it is refused here. A request with no recorded peer address is refused
+/// too: fail closed rather than guess.
 async fn require_loopback(
     request: Request,
     next: Next,
@@ -2780,9 +2799,10 @@ async fn require_loopback(
 
 pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     // The operator socket: mutation endpoints for the in-container CLI only.
-    // The IAP-gated `/liquidity-write` mount is the network route to the same
-    // handlers.
+    // Transfer handlers also have an IAP-gated `/liquidity-write` mount for
+    // remote operators; completion notices deliberately remain loopback-only.
     let loopback_only = Router::new()
+        .route("/alerts/dividend-nav-bump", post(report_dividend_nav_bump))
         .route("/transfers/fail/{kind}/{id}", post(fail_transfer))
         .route("/transfers/resume", post(resume_transfers))
         .route(
@@ -2833,6 +2853,7 @@ mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+    use tracing_test::traced_test;
     use uuid::uuid;
 
     use st0x_config::{
@@ -5786,25 +5807,59 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = build_app(empty_app_state(ctx).await);
 
-        for (peer, label) in [
-            (
-                Some(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9)))),
-                "bridge peer",
-            ),
-            (None, "no recorded peer"),
-        ] {
-            let mut request = Request::builder().method("POST").uri("/transfers/resume");
-            if let Some(info) = peer {
-                request = request.extension(info);
-            }
+        for path in ["/transfers/resume", "/alerts/dividend-nav-bump"] {
+            for (peer, label) in [
+                (
+                    Some(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9)))),
+                    "bridge peer",
+                ),
+                (None, "no recorded peer"),
+            ] {
+                let mut request = Request::builder().method("POST").uri(path);
+                if let Some(info) = peer {
+                    request = request.extension(info);
+                }
 
-            let response = app
-                .clone()
-                .oneshot(request.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}: {label}");
+            }
         }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn dividend_nav_bump_notice_enters_exported_log_channel() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+        let message = "Dividend NAV bump completed: AAPL on base; transaction 0x1234";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/alerts/dividend-nav-bump")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::from(
+                        serde_json::to_vec(&DividendNavBumpNotice {
+                            message: message.to_string(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(logs_contain("alert=true"));
+        assert!(logs_contain("alert_kind=\"completion\""));
+        assert!(logs_contain("notice_kind=\"dividend_nav_bump\""));
+        assert!(logs_contain(message));
     }
 
     /// Pins the production serve wiring: `serve_with_peer_info` must record

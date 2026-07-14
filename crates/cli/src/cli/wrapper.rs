@@ -2,14 +2,19 @@
 
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::error;
 
 use st0x_config::Ctx;
 use st0x_evm::{Chain, Wallet};
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_hedge::alerts::{Notifier, NotifierError};
+use st0x_hedge::api::DividendNavBumpNotice;
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
 
@@ -145,6 +150,51 @@ pub(super) async fn donate_equity_command<Writer: Write>(
     network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    let notifier = dividend_completion_notifier(ctx)?;
+    donate_equity_command_with_notifier(stdout, symbol, quantity, network, notifier.as_ref(), ctx)
+        .await
+}
+
+pub(super) fn dividend_completion_notifier(ctx: &Ctx) -> anyhow::Result<Arc<dyn Notifier>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let url = format!(
+        "http://127.0.0.1:{}/alerts/dividend-nav-bump",
+        ctx.server_port
+    );
+
+    Ok(Arc::new(BotProcessNotifier { client, url }))
+}
+
+struct BotProcessNotifier {
+    client: reqwest::Client,
+    url: String,
+}
+
+#[async_trait]
+impl Notifier for BotProcessNotifier {
+    async fn notify(&self, message: &str) -> Result<(), NotifierError> {
+        self.client
+            .post(&self.url)
+            .json(&DividendNavBumpNotice {
+                message: message.to_owned(),
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+pub(super) async fn donate_equity_command_with_notifier<Writer: Write>(
+    stdout: &mut Writer,
+    symbol: Symbol,
+    quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
+    notifier: &dyn Notifier,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
     let HedgedChainContext {
         wallet, trading, ..
     } = hedged_chain_context(ctx, network)?;
@@ -153,16 +203,19 @@ pub(super) async fn donate_equity_command<Writer: Write>(
         wallet,
         to_wrapped_equities(&trading.assets.equities.symbols),
     );
+    let chain = Chain::from(network);
 
-    donate_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
+    donate_equity_with_wrapper(stdout, &wrapper, notifier, owner, symbol, quantity, chain).await
 }
 
 async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized>(
     stdout: &mut Writer,
     wrapper: &WrapperImpl,
+    notifier: &dyn Notifier,
     owner: Address,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    chain: Chain,
 ) -> anyhow::Result<()> {
     writeln!(
         stdout,
@@ -190,8 +243,28 @@ async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
 
     let donate_tx_hash = wrapper.donate(wrapped_token, underlying_amount).await?;
 
-    writeln!(stdout, "   Transaction hash: {donate_tx_hash}")?;
-    writeln!(stdout, "Donation completed successfully!")?;
+    let notification =
+        format!("Dividend NAV bump completed: {symbol} on {chain}; transaction {donate_tx_hash}");
+    let _ = writeln!(stdout, "   Transaction hash: {donate_tx_hash}");
+    match notifier.notify(&notification).await {
+        Ok(()) => {
+            let _ = writeln!(stdout, "   Notification: sent");
+        }
+        Err(notification_error) => {
+            error!(
+                target: "operational_alert",
+                alert = true,
+                alert_kind = "fault",
+                error = ?notification_error,
+                %symbol,
+                ?chain,
+                %donate_tx_hash,
+                "Dividend NAV bump notification delivery failed"
+            );
+            let _ = writeln!(stdout, "   Notification: failed ({notification_error})");
+        }
+    }
+    let _ = writeln!(stdout, "Donation completed successfully!");
 
     Ok(())
 }
@@ -252,8 +325,10 @@ pub(super) fn wrap_context(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
     use std::io::Write as _;
+
+    use alloy::primitives::Address;
+    use async_trait::async_trait;
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
@@ -265,6 +340,7 @@ mod tests {
     use st0x_config::{Ctx, LogFormat, LogLevel};
     use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Positive, Symbol};
+    use st0x_hedge::alerts::{CapturingNotifier, Notifier, NotifierError};
     use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
 
@@ -493,6 +569,41 @@ mod tests {
                 && !error.to_string().contains("pass --registry"),
             "failure must be past resolution, got: {error}"
         );
+    }
+
+    struct FailingNotifier;
+
+    #[async_trait]
+    impl Notifier for FailingNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+            Err(NotifierError::Simulated)
+        }
+    }
+
+    #[derive(Default)]
+    struct RejectFinalSuccessWriter {
+        output: Vec<u8>,
+        error_kind: Option<std::io::ErrorKind>,
+    }
+
+    impl std::io::Write for RejectFinalSuccessWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let mut candidate = self.output.clone();
+            candidate.extend_from_slice(buffer);
+            if String::from_utf8_lossy(&candidate).contains("Donation completed successfully!") {
+                self.error_kind = Some(std::io::ErrorKind::BrokenPipe);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "final success output rejected",
+                ));
+            }
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -793,14 +904,17 @@ mod tests {
         let wrapper = MockWrapper::new()
             .with_wrapped_token(wrapped_token)
             .with_tokenized_shares(underlying_token);
+        let notifier = CapturingNotifier::default();
         let mut stdout = Vec::new();
 
         donate_equity_with_wrapper(
             &mut stdout,
             &wrapper,
+            &notifier,
             Address::repeat_byte(0xaa),
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            Chain::Base,
         )
         .await
         .unwrap();
@@ -813,7 +927,69 @@ mod tests {
         assert!(output.contains(&format!("Underlying token: {underlying_token}")));
         assert!(output.contains("no shares minted"));
         assert!(output.contains("Transaction hash:"));
+        assert!(output.contains("Notification: sent"));
         assert!(output.contains("Donation completed successfully"));
+        let transaction_hash = output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Transaction hash: "))
+            .unwrap();
+        let messages = notifier.messages();
+        assert_eq!(
+            messages,
+            vec![format!(
+                "Dividend NAV bump completed: AAPL on base; transaction {transaction_hash}"
+            )]
+        );
+        assert!(!messages[0].contains("10.5"));
+    }
+
+    #[tokio::test]
+    async fn donate_equity_succeeds_when_notification_delivery_fails() {
+        let wrapper = MockWrapper::new()
+            .with_wrapped_token(Address::repeat_byte(0x22))
+            .with_tokenized_shares(Address::repeat_byte(0x11));
+        let mut stdout = Vec::new();
+
+        donate_equity_with_wrapper(
+            &mut stdout,
+            &wrapper,
+            &FailingNotifier,
+            Address::repeat_byte(0xaa),
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10.5"),
+            Chain::Base,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Notification: failed"));
+        assert!(output.contains("simulated notifier delivery failure"));
+        assert!(output.contains("Donation completed successfully"));
+    }
+
+    #[tokio::test]
+    async fn donate_equity_notifies_after_confirmation_even_if_stdout_closes() {
+        let wrapper = MockWrapper::new()
+            .with_wrapped_token(Address::repeat_byte(0x22))
+            .with_tokenized_shares(Address::repeat_byte(0x11));
+        let notifier = CapturingNotifier::default();
+        let mut stdout = RejectFinalSuccessWriter::default();
+
+        donate_equity_with_wrapper(
+            &mut stdout,
+            &wrapper,
+            &notifier,
+            Address::repeat_byte(0xaa),
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10.5"),
+            Chain::Base,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(notifier.messages().len(), 1);
+        assert_eq!(stdout.error_kind, Some(std::io::ErrorKind::BrokenPipe));
     }
 
     #[tokio::test]
@@ -824,9 +1000,11 @@ mod tests {
         let error = donate_equity_with_wrapper(
             &mut stdout,
             &wrapper,
+            &CapturingNotifier::default(),
             Address::repeat_byte(0xaa),
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            Chain::Base,
         )
         .await
         .unwrap_err();
@@ -845,9 +1023,11 @@ mod tests {
         let error = donate_equity_with_wrapper(
             &mut stdout,
             &wrapper,
+            &CapturingNotifier::default(),
             Address::repeat_byte(0xaa),
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            Chain::Base,
         )
         .await
         .unwrap_err();

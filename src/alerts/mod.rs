@@ -1,13 +1,16 @@
-//! Operational alerting: out-of-band notifications for conditions an operator
-//! must react to (low native-gas balance, stuck rebalancing transfers,
-//! dead-lettered hedges, supervised-worker terminal failures).
+//! Operational alerting.
+//!
+//! These out-of-band notifications cover fault conditions an operator needs to
+//! see: low native-gas balance, stuck rebalancing transfers, dead-lettered
+//! hedges, and supervised-worker terminal failures. Completed dividend NAV
+//! bumps enter the same log pipeline through the running bot's operator API.
 //!
 //! The [`Notifier`] trait abstracts the delivery channel; [`LogNotifier`] is
 //! the only production implementation: it emits each alert as a structured
-//! ERROR log with target `operational_alert`. Delivery to humans happens
-//! downstream, in the log pipeline (Cloud Logging -> Grafana alert rules,
-//! matching on the target string in the gcplogs stream), so the bot itself
-//! holds no delivery credentials and delivery cannot fail in-process.
+//! ERROR log with target `operational_alert` and `alert_kind = "fault"`.
+//! Delivery to humans happens downstream, in the log pipeline (Cloud Logging
+//! -> Grafana alert rules, matching on the target and kind in the gcplogs
+//! stream), so the bot itself holds no delivery credentials.
 //!
 //! Monitors that raise alerts (see `crate::conductor::monitor::gas`) depend on
 //! the trait so they stay testable against a capturing mock.
@@ -20,7 +23,8 @@ use tracing::error;
 /// Kept as a trait so monitors depend on the capability, not the concrete
 /// log transport, which keeps them unit-testable with a capturing mock.
 #[async_trait]
-pub(crate) trait Notifier: Send + Sync {
+pub trait Notifier: Send + Sync {
+    /// Delivers one human-readable operational alert.
     async fn notify(&self, message: &str) -> Result<(), NotifierError>;
 }
 
@@ -31,10 +35,14 @@ pub(crate) trait Notifier: Send + Sync {
 /// `Result` stays in the trait so alert-failure handling at the call sites
 /// (retry/backoff paths, bounded-timeout sends) remains exercisable in tests.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum NotifierError {
+#[non_exhaustive]
+pub enum NotifierError {
+    /// Failed to deliver an alert to the running bot process.
+    #[error("failed to deliver alert to the running bot")]
+    Http(#[from] reqwest::Error),
     /// Simulated delivery failure, constructible only from tests, for
     /// exercising the call sites' alert-failure handling.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[error("simulated notifier delivery failure")]
     Simulated,
 }
@@ -46,46 +54,51 @@ pub(crate) enum NotifierError {
 /// stream. The `alert = true` field is a secondary marker for structured
 /// queries, and the human-readable alert text is the event message (the
 /// `message` field in JSON log output).
-pub(crate) struct LogNotifier;
+pub struct LogNotifier;
 
 #[async_trait]
 impl Notifier for LogNotifier {
     async fn notify(&self, message: &str) -> Result<(), NotifierError> {
-        error!(target: "operational_alert", alert = true, "{message}");
+        error!(target: "operational_alert", alert = true, alert_kind = "fault", "{message}");
         Ok(())
     }
 }
 
-#[cfg(test)]
-pub(crate) use test_support::CapturingNotifier;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::CapturingNotifier;
 
-/// Test-only notifier helpers. Lives in a `#[cfg(test)]` module (rather than
-/// bare `#[cfg(test)]` items) so clippy's `allow-unwrap-in-tests` applies to the
-/// `Mutex`-lock unwraps below, matching the crate's `test_utils` pattern.
-#[cfg(test)]
+/// Test-only notifier helpers shared with workspace dependants through their
+/// `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 mod test_support {
     use async_trait::async_trait;
 
     use super::{Notifier, NotifierError};
 
-    /// A [`Notifier`] that captures every message passed to `notify()`, for tests
-    /// that assert operator alerts fire at the right moments without asserting
-    /// on log output. Shared across the crate's test modules.
+    /// Captures every message passed to [`Notifier::notify`].
+    ///
+    /// Tests use this instead of asserting on log output.
     #[derive(Default)]
-    pub(crate) struct CapturingNotifier {
+    pub struct CapturingNotifier {
         captured: std::sync::Mutex<Vec<String>>,
     }
 
     impl CapturingNotifier {
-        pub(crate) fn messages(&self) -> Vec<String> {
-            self.captured.lock().unwrap().clone()
+        pub fn messages(&self) -> Vec<String> {
+            self.captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
     #[async_trait]
     impl Notifier for CapturingNotifier {
         async fn notify(&self, message: &str) -> Result<(), NotifierError> {
-            self.captured.lock().unwrap().push(message.to_string());
+            self.captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.to_string());
             Ok(())
         }
     }
@@ -111,6 +124,10 @@ mod tests {
         assert!(
             logs_contain("alert=true"),
             "the alert marker field must be present for log-based routing"
+        );
+        assert!(
+            logs_contain("alert_kind=\"fault\""),
+            "fault alerts must be distinguishable from completion notices"
         );
         assert!(
             logs_contain("gas balance low on base"),
