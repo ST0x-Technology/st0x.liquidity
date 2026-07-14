@@ -520,7 +520,7 @@
           in
           rainixPkgs // infraPkgs.packages // deployScripts // abis // others // verifyMigrationsPkgs;
 
-        formatter = pkgs.nixfmt-rfc-style;
+        formatter = pkgs.nixfmt;
 
         devShells =
           let
