@@ -52,7 +52,7 @@ use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::WrapperService;
 
-use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
+use crate::alerts::build_notifier;
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::Broadcaster;
@@ -584,7 +584,7 @@ impl Conductor {
             Err(CtxError::NotRebalancing) => None,
             Err(error) => return Err(error.into()),
         };
-        let notifier = build_operational_notifier(ctx.alerts.as_ref())?;
+        let notifier = build_notifier(ctx.alerts.as_ref())?;
 
         let PositionAndRebalancing {
             position,
@@ -1271,29 +1271,6 @@ impl PositionAndRebalancing {
             })
         }
     }
-}
-
-/// Builds the shared operational alerting notifier.
-///
-/// Returns `Ok(Arc<NoopNotifier>)` when `[alerts]` is absent — silence is
-/// the correct behaviour for an unconfigured optional channel.
-///
-/// Returns `Err` when `[alerts]` IS present but `TelegramNotifier` fails to
-/// initialise. The caller must propagate this so the server fails to start:
-/// an operator who configured `[alerts]` believes alerts are active; silently
-/// falling back to Noop would suppress all redrive-limit and terminal-error
-/// pages with no runtime indication.
-fn build_operational_notifier(
-    alerts: Option<&st0x_config::AlertsCtx>,
-) -> Result<Arc<dyn crate::alerts::Notifier>, NotifierError> {
-    let Some(alerts) = alerts else {
-        debug!("Operational alerting: [alerts] section absent, using NoopNotifier");
-        return Ok(Arc::new(NoopNotifier));
-    };
-    let notifier =
-        TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
-    info!("Operational alerting: Telegram notifier configured");
-    Ok(Arc::new(notifier))
 }
 
 /// Wires the dividend freeze guard onto the rebalancing service when enabled.
@@ -3702,7 +3679,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(NoopNotifier),
+            Arc::new(crate::alerts::NoopNotifier),
         ))
     }
 
@@ -8411,7 +8388,7 @@ mod tests {
                 vault_registry_projection,
                 schedulers: RebalancingSchedulers::new(&apalis_pool),
                 telemetry: TelemetrySender::disabled(),
-                notifier: Arc::new(NoopNotifier),
+                notifier: Arc::new(crate::alerts::NoopNotifier),
             },
         )
         .await
@@ -10683,18 +10660,18 @@ mod tests {
         );
     }
 
-    /// When `[alerts]` is absent, `build_operational_notifier` returns a `NoopNotifier`
+    /// When `[alerts]` is absent, `build_notifier` returns a `NoopNotifier`
     /// that silently discards notifications without error.
     #[tokio::test]
-    async fn build_operational_notifier_returns_ok_noop_when_alerts_absent() {
-        let notifier = build_operational_notifier(None).unwrap();
+    async fn build_notifier_returns_ok_noop_when_alerts_absent() {
+        let notifier = build_notifier(None).unwrap();
         notifier
             .notify("test message")
             .await
             .expect("NoopNotifier must not error on notify");
     }
 
-    /// When `[alerts]` IS present, `build_operational_notifier` constructs a real
+    /// When `[alerts]` IS present, `build_notifier` constructs a real
     /// Telegram notifier and returns `Ok` -- it must NOT fail startup for a
     /// well-formed config, and it must NOT silently fall back to `NoopNotifier`
     /// (which would suppress every redrive-limit and terminal-error page).
@@ -10706,7 +10683,7 @@ mod tests {
     /// `notify()` is deliberately not exercised: the present-branch notifier posts
     /// to the live Telegram API, which a unit test must never reach.
     #[tokio::test]
-    async fn build_operational_notifier_returns_ok_telegram_when_alerts_present() {
+    async fn build_notifier_returns_ok_telegram_when_alerts_present() {
         let alerts = st0x_config::AlertsCtx {
             chat_id: 123,
             bot_token: "test-bot-token".to_string(),
@@ -10716,7 +10693,7 @@ mod tests {
             message_thread_id: Some(42),
         };
 
-        build_operational_notifier(Some(&alerts))
+        build_notifier(Some(&alerts))
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 }
