@@ -40,15 +40,16 @@ info!(%symbol, %shares, "Hedging trade");
 
 ### Existing targets
 
-| Target              | Subsystem                                                |
-| ------------------- | -------------------------------------------------------- |
-| `hedge`             | Hedging / position management                            |
-| `operational_alert` | Operator alerts (ERROR events the log pipeline pages on) |
-| `orderbook`         | Onchain orderbook interactions                           |
-| `rebalancing`       | Portfolio rebalancing                                    |
-| `startup`           | Application initialization                               |
-| `tokenization`      | Tokenized equity minting                                 |
-| `wallet`            | Alpaca wallet / onchain wallet                           |
+| Target               | Subsystem                                                           |
+| -------------------- | ------------------------------------------------------------------- |
+| `hedge`              | Hedging / position management                                       |
+| `operational_alert`  | Operator faults: ERROR, `alert = true`; the pipeline pages          |
+| `operational_notice` | Lifecycle notices: INFO, `notice = true`, `notice_kind`; never page |
+| `orderbook`          | Onchain orderbook interactions                                      |
+| `rebalancing`        | Portfolio rebalancing                                               |
+| `startup`            | Application initialization                                          |
+| `tokenization`       | Tokenized equity minting                                            |
+| `wallet`             | Alpaca wallet / onchain wallet                                      |
 
 When adding a new subsystem, pick a short, descriptive target name and add it to
 this table AND to `DOMAIN_TARGETS` in `crates/config/src/telemetry.rs`, so the
@@ -57,7 +58,10 @@ default `EnvFilter` captures it.
 When overriding filtering with `RUST_LOG`, always keep a bare level segment
 (e.g. `RUST_LOG=warn,hedge=trace`): the bare level is what admits targets you
 did not list, so the ERROR-severity `operational_alert` events keep flowing to
-the pipeline that pages operators even while you focus on one subsystem.
+the pipeline that pages operators even while you focus on one subsystem. The
+INFO-severity `operational_notice` events need an explicit segment when the bare
+level is above `info` (e.g.
+`RUST_LOG=warn,operational_notice=info,hedge=trace`).
 
 ## Sensitive data
 

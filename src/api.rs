@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use alloy::primitives::U256;
+use alloy::primitives::{TxHash, U256};
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -30,6 +30,7 @@ use st0x_dto::{
 use st0x_event_sorcery::{
     AggregateError, EventSourced, SendError, StoreBuilder, load_entity, send_command,
 };
+use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
@@ -1376,6 +1377,44 @@ pub struct ResumeResponse {
     pub mints_failed: usize,
     pub redemptions_attempted: usize,
     pub redemptions_failed: usize,
+}
+
+/// Loopback-only path where the in-container CLI reports a confirmed dividend
+/// NAV bump. Shared with the CLI so both sides name the same route.
+pub const DIVIDEND_NAV_BUMP_NOTICE_PATH: &str = "/alerts/dividend-nav-bump";
+
+/// Wire contract used by the in-container CLI to hand a confirmed dividend
+/// NAV bump to the running bot's exported log pipeline.
+///
+/// The fields are typed so the bot rejects a blank symbol, an unknown chain,
+/// or a malformed transaction hash before it acknowledges the notice, and so
+/// the bot, not the caller, owns the canonical log message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DividendNavBumpNotice {
+    pub symbol: Symbol,
+    pub chain: Chain,
+    pub tx_hash: TxHash,
+}
+
+async fn report_dividend_nav_bump(Json(notice): Json<DividendNavBumpNotice>) -> StatusCode {
+    let DividendNavBumpNotice {
+        symbol,
+        chain,
+        tx_hash,
+    } = notice;
+
+    info!(
+        target: "operational_notice",
+        notice = true,
+        notice_kind = "dividend_nav_bump",
+        %symbol,
+        %chain,
+        %tx_hash,
+        "Dividend NAV bump completed: {symbol} on {chain}; transaction {tx_hash}"
+    );
+
+    StatusCode::NO_CONTENT
 }
 
 async fn resume_transfers(
@@ -2738,16 +2777,15 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 
 /// Refuses any request whose TCP peer is not loopback.
 ///
-/// The `/transfers/*` mutation endpoints exist on their bare paths for exactly
-/// one caller: `st0x-cli` running inside the bot's own container (`docker
-/// exec`), whose resume/recheck verbs delegate to the running server so
-/// recovery dispatches through the in-process reactor. That caller connects to
+/// The bare operator mutation endpoints exist for exactly one caller:
+/// `st0x-cli` running inside the bot's own container (`docker exec`). Transfer
+/// verbs delegate recovery to the running server's in-process reactor, while
+/// completion notices enter its exported log stream. That caller connects to
 /// 127.0.0.1 inside the container's network namespace. Anything arriving over
 /// the published port -- the VPC, an IAP tunnel, the load balancer -- reaches
 /// the container through its bridge interface and carries a non-loopback peer,
-/// so it is refused here and must use the IAP-verified `/liquidity-write`
-/// mount instead. A request with no recorded peer address is refused too:
-/// fail closed rather than guess.
+/// so it is refused here. A request with no recorded peer address is refused
+/// too: fail closed rather than guess.
 async fn require_loopback(
     request: Request,
     next: Next,
@@ -2768,8 +2806,8 @@ async fn require_loopback(
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: "operator-only path: use the in-container CLI or the \
-                        /liquidity-write mount"
+                error: "operator-only path: use the in-container CLI (transfer verbs \
+                        also have the /liquidity-write mount)"
                     .to_string(),
             }),
         ));
@@ -2780,9 +2818,13 @@ async fn require_loopback(
 
 pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     // The operator socket: mutation endpoints for the in-container CLI only.
-    // The IAP-gated `/liquidity-write` mount is the network route to the same
-    // handlers.
+    // Transfer handlers also have an IAP-gated `/liquidity-write` mount for
+    // remote operators; completion notices deliberately remain loopback-only.
     let loopback_only = Router::new()
+        .route(
+            DIVIDEND_NAV_BUMP_NOTICE_PATH,
+            post(report_dividend_nav_bump),
+        )
         .route("/transfers/fail/{kind}/{id}", post(fail_transfer))
         .route("/transfers/resume", post(resume_transfers))
         .route(
@@ -2833,6 +2875,7 @@ mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+    use tracing_test::traced_test;
     use uuid::uuid;
 
     use st0x_config::{
@@ -5789,25 +5832,160 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = build_app(empty_app_state(ctx).await);
 
-        for (peer, label) in [
-            (
-                Some(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9)))),
-                "bridge peer",
-            ),
-            (None, "no recorded peer"),
-        ] {
-            let mut request = Request::builder().method("POST").uri("/transfers/resume");
-            if let Some(info) = peer {
-                request = request.extension(info);
+        for path in ["/transfers/resume", "/alerts/dividend-nav-bump"] {
+            for (peer, label) in [
+                (
+                    Some(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9)))),
+                    "bridge peer",
+                ),
+                (None, "no recorded peer"),
+            ] {
+                let mut request = Request::builder().method("POST").uri(path);
+                if let Some(info) = peer {
+                    request = request.extension(info);
+                }
+
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}: {label}");
+            }
+        }
+    }
+
+    async fn post_dividend_nav_bump_notice(app: Router, body: &'static str) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(DIVIDEND_NAV_BUMP_NOTICE_PATH)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// The body literal here is the exact JSON the CLI's notifier test pins
+    /// on its side of the wire, so a change to either end fails a test.
+    #[tokio::test]
+    #[traced_test]
+    async fn dividend_nav_bump_notice_is_logged_as_info_operational_notice() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let status = post_dividend_nav_bump_notice(
+            app,
+            r#"{
+                "symbol": "AAPL",
+                "chain": "base",
+                "txHash": "0x00000000000000000000000000000000000000000000000000000000000012ab"
+            }"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let canonical_message = "Dividend NAV bump completed: AAPL on base; transaction \
+            0x00000000000000000000000000000000000000000000000000000000000012ab";
+        logs_assert(|lines: &[&str]| {
+            let notices: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("notice_kind="))
+                .collect();
+            let [notice] = notices.as_slice() else {
+                return Err(format!("expected exactly one notice line, got {notices:?}"));
+            };
+
+            for expected in [
+                " INFO ",
+                " operational_notice: ",
+                "notice=true",
+                "notice_kind=\"dividend_nav_bump\"",
+                "symbol=AAPL",
+                "chain=base",
+                "tx_hash=0x00000000000000000000000000000000000000000000000000000000000012ab",
+                canonical_message,
+            ] {
+                if !notice.contains(expected) {
+                    return Err(format!("notice line lacks {expected:?}: {notice}"));
+                }
             }
 
-            let response = app
-                .clone()
-                .oneshot(request.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
+            Ok(())
+        });
+        assert!(!logs_contain("operational_alert"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn dividend_nav_bump_notice_rejects_malformed_bodies() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+        for (body, expected_status, label) in [
+            (
+                r#"{"symbol": "  ", "chain": "base", "txHash": "0x00000000000000000000000000000000000000000000000000000000000012ab"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "blank symbol",
+            ),
+            (
+                r#"{"symbol": "AAPL", "chain": "solana", "txHash": "0x00000000000000000000000000000000000000000000000000000000000012ab"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unknown chain",
+            ),
+            (
+                r#"{"symbol": "AAPL", "chain": "base", "txHash": "0x12ab"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "short transaction hash",
+            ),
+            (
+                r#"{"symbol": "AAPL", "chain": "base"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "missing transaction hash",
+            ),
+            (
+                r#"{"symbol": "AAPL", "chain": "base", "txHash": "0x00000000000000000000000000000000000000000000000000000000000012ab", "message": "extra"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unknown extra field",
+            ),
+            (
+                r#"{"message": "Dividend NAV bump completed"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "free-form message",
+            ),
+            ("not json", StatusCode::BAD_REQUEST, "non-JSON body"),
+        ] {
+            let status = post_dividend_nav_bump_notice(app.clone(), body).await;
+            assert_eq!(status, expected_status, "{label}");
         }
+
+        assert!(!logs_contain("notice_kind="));
+    }
+
+    #[tokio::test]
+    async fn dividend_nav_bump_notice_has_no_published_write_route() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let ops_api = st0x_config::OpsApiConfig {
+            read_audience: "/projects/1/global/backendServices/11".to_string(),
+            write_audience: "/projects/1/global/backendServices/22".to_string(),
+        };
+        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/liquidity-write/alerts/dividend-nav-bump")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// Pins the production serve wiring: `serve_with_peer_info` must record

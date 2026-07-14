@@ -2,14 +2,18 @@
 
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::error;
 
-use st0x_config::Ctx;
+use st0x_config::{Ctx, load_operator_api_port};
 use st0x_evm::{Chain, Wallet};
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_hedge::api::{DIVIDEND_NAV_BUMP_NOTICE_PATH, DividendNavBumpNotice};
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
 
@@ -159,10 +163,75 @@ pub(super) async fn donate_equity_command<Writer: Write>(
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
     network: TokenizationNetwork,
+    bot_config: &Path,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     require_equity_mutation_network(network)?;
+    let notifier = bot_notice_client(bot_config)?;
+    donate_equity_command_with_notifier(stdout, symbol, quantity, network, &notifier, ctx).await
+}
 
+/// Hands a confirmed dividend NAV bump to the running bot, which records it
+/// in the exported log pipeline.
+#[async_trait]
+pub(super) trait DividendNavBumpNotifier: Send + Sync {
+    async fn notify(&self, notice: &DividendNavBumpNotice) -> anyhow::Result<()>;
+}
+
+/// Builds the bot notice client without contacting the bot.
+///
+/// The bump is an issuer operation that does not need the bot, so bot
+/// liveness is never a precondition: delivery is attempted only after the
+/// donation is confirmed, and a failure there is reported to the operator.
+/// Only local setup (reading the bot config, building the client) runs here,
+/// so a setup problem still fails before any money moves.
+pub(super) fn bot_notice_client(bot_config: &Path) -> anyhow::Result<BotNoticeClient> {
+    let server_port = load_operator_api_port(bot_config)?;
+    // Direct loopback only: no HTTP_PROXY/ALL_PROXY detour and no redirects, so
+    // only the bot's own 204 proves it recorded the notice.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let url = format!("http://127.0.0.1:{server_port}{DIVIDEND_NAV_BUMP_NOTICE_PATH}");
+
+    Ok(BotNoticeClient { client, url })
+}
+
+pub(super) struct BotNoticeClient {
+    client: reqwest::Client,
+    url: String,
+}
+
+#[async_trait]
+impl DividendNavBumpNotifier for BotNoticeClient {
+    async fn notify(&self, notice: &DividendNavBumpNotice) -> anyhow::Result<()> {
+        let status = self
+            .client
+            .post(&self.url)
+            .json(notice)
+            .send()
+            .await?
+            .error_for_status()?
+            .status();
+
+        if status != reqwest::StatusCode::NO_CONTENT {
+            anyhow::bail!("bot answered {status} instead of 204 No Content");
+        }
+
+        Ok(())
+    }
+}
+
+pub(super) async fn donate_equity_command_with_notifier<Writer: Write>(
+    stdout: &mut Writer,
+    symbol: Symbol,
+    quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
+    notifier: &dyn DividendNavBumpNotifier,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
     let HedgedChainContext {
         wallet, trading, ..
     } = hedged_chain_context(ctx, network)?;
@@ -171,16 +240,19 @@ pub(super) async fn donate_equity_command<Writer: Write>(
         wallet,
         to_wrapped_equities(&trading.assets.equities.symbols),
     );
+    let chain = Chain::from(network);
 
-    donate_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
+    donate_equity_with_wrapper(stdout, &wrapper, notifier, owner, symbol, quantity, chain).await
 }
 
 async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized>(
     stdout: &mut Writer,
     wrapper: &WrapperImpl,
+    notifier: &dyn DividendNavBumpNotifier,
     owner: Address,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    chain: Chain,
 ) -> anyhow::Result<()> {
     writeln!(
         stdout,
@@ -208,10 +280,55 @@ async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
 
     let donate_tx_hash = wrapper.donate(wrapped_token, underlying_amount).await?;
 
-    writeln!(stdout, "   Transaction hash: {donate_tx_hash}")?;
-    writeln!(stdout, "Donation completed successfully!")?;
+    // The donation is confirmed and irreversible from here on, so output and
+    // notice failures are reported but never turn this into a failed command
+    // an operator might rerun.
+    write_after_receipt(
+        stdout,
+        format_args!("   Transaction hash: {donate_tx_hash}"),
+    );
+    let notice = DividendNavBumpNotice {
+        symbol: symbol.clone(),
+        chain,
+        tx_hash: donate_tx_hash,
+    };
+    match notifier.notify(&notice).await {
+        Ok(()) => write_after_receipt(stdout, format_args!("   Notification: recorded by the bot")),
+        Err(notification_error) => {
+            error!(
+                error = ?notification_error,
+                %symbol,
+                %chain,
+                %donate_tx_hash,
+                "Dividend NAV bump notice delivery failed; record completion manually"
+            );
+            write_after_receipt(
+                stdout,
+                format_args!(
+                    "   WARNING: the donation succeeded, but the bot did not record the \
+                     completion ({notification_error:#}). Do not repeat the donation. \
+                     Record it manually: {symbol} on {chain}, transaction {donate_tx_hash}"
+                ),
+            );
+        }
+    }
+    write_after_receipt(stdout, format_args!("Donation completed successfully!"));
 
     Ok(())
+}
+
+/// Writes one line of output after the donation receipt. The donation is
+/// already irreversible, so a failed write is logged rather than returned.
+pub(super) fn write_after_receipt<Writer: Write>(
+    stdout: &mut Writer,
+    line: std::fmt::Arguments<'_>,
+) {
+    if let Err(write_error) = writeln!(stdout, "{line}") {
+        error!(
+            error = ?write_error,
+            "Donation confirmed but status output failed"
+        );
+    }
 }
 
 /// The wallet and symbol to address map a wrap, unwrap or redemption runs
@@ -266,8 +383,12 @@ pub(super) fn wrap_context(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::{Address, TxHash, address};
+    use async_trait::async_trait;
+    use httpmock::prelude::*;
     use std::io::Write as _;
+    use std::path::Path;
+    use tempfile::NamedTempFile;
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
@@ -279,17 +400,38 @@ mod tests {
     use st0x_config::{Ctx, LogFormat, LogLevel};
     use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Positive, Symbol};
+    use st0x_hedge::api::{DIVIDEND_NAV_BUMP_NOTICE_PATH, DividendNavBumpNotice};
     use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
 
     use super::{
-        TokenizationNetwork, WrapContext, donate_equity_command, donate_equity_with_wrapper,
-        unwrap_equity_command, unwrap_equity_with_wrapper, wrap_context, wrap_equity_command,
-        wrap_equity_with_wrapper,
+        DividendNavBumpNotifier, TokenizationNetwork, WrapContext, bot_notice_client,
+        donate_equity_command, donate_equity_with_wrapper, unwrap_equity_command,
+        unwrap_equity_with_wrapper, wrap_context, wrap_equity_command, wrap_equity_with_wrapper,
     };
 
     fn positive_shares(value: &str) -> Positive<FractionalShares> {
         try_positive_shares(value).expect("test shares must be valid and positive")
+    }
+
+    fn bot_config(port: u16) -> NamedTempFile {
+        let mut config = NamedTempFile::new().unwrap();
+        writeln!(config, "server_port = {port}").unwrap();
+        config
+    }
+
+    /// A bot config whose port nothing listens on; these tests fail before the
+    /// donation, so the notice client is built but never used.
+    fn unused_bot_config() -> NamedTempFile {
+        bot_config(9)
+    }
+
+    fn aapl_notice(tx_hash: TxHash) -> DividendNavBumpNotice {
+        DividendNavBumpNotice {
+            symbol: Symbol::new("AAPL").unwrap(),
+            chain: Chain::Base,
+            tx_hash,
+        }
     }
 
     fn create_base_test_ctx() -> Ctx {
@@ -693,6 +835,54 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct CapturingNotifier {
+        notices: std::sync::Mutex<Vec<DividendNavBumpNotice>>,
+    }
+
+    #[async_trait]
+    impl DividendNavBumpNotifier for CapturingNotifier {
+        async fn notify(&self, notice: &DividendNavBumpNotice) -> anyhow::Result<()> {
+            self.notices.lock().unwrap().push(notice.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingNotifier;
+
+    #[async_trait]
+    impl DividendNavBumpNotifier for FailingNotifier {
+        async fn notify(&self, _notice: &DividendNavBumpNotice) -> anyhow::Result<()> {
+            anyhow::bail!("bot unreachable")
+        }
+    }
+
+    #[derive(Default)]
+    struct RejectFinalSuccessWriter {
+        output: Vec<u8>,
+        error_kind: Option<std::io::ErrorKind>,
+    }
+
+    impl std::io::Write for RejectFinalSuccessWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let mut candidate = self.output.clone();
+            candidate.extend_from_slice(buffer);
+            if String::from_utf8_lossy(&candidate).contains("Donation completed successfully!") {
+                self.error_kind = Some(std::io::ErrorKind::BrokenPipe);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "final success output rejected",
+                ));
+            }
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn wrap_equity_requires_wallet_config() {
         let ctx = create_ctx_listing_aapl_without_wallet();
@@ -891,6 +1081,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             positive_shares("1"),
             TokenizationNetwork::Robinhood,
+            Path::new("unused-before-network-validation"),
             &ctx,
         )
         .await
@@ -903,9 +1094,38 @@ mod tests {
         assert!(stdout.is_empty());
     }
 
+    /// An unreadable bot config is a local setup problem, so it must stop the
+    /// command before any wallet or chain work starts.
+    #[tokio::test]
+    async fn donate_equity_refuses_an_unreadable_bot_config_before_donating() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = donate_equity_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Base,
+            Path::new("/nonexistent/st0x-hedge.config"),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error.downcast_ref::<st0x_config::CtxError>(),
+                Some(st0x_config::CtxError::ConfigIo { .. })
+            ),
+            "expected a config read error, got: {error:#}"
+        );
+        assert!(stdout.is_empty());
+    }
+
     #[tokio::test]
     async fn donate_equity_requires_wallet_config() {
         let ctx = create_base_test_ctx();
+        let bot_config = unused_bot_config();
         let mut stdout = Vec::new();
 
         let error = donate_equity_command(
@@ -913,6 +1133,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
             TokenizationNetwork::Base,
+            bot_config.path(),
             &ctx,
         )
         .await
@@ -956,6 +1177,7 @@ mod tests {
                 .call(),
         );
         let ethereum_wallet = ctx.wallet().unwrap().ethereum_wallet().address();
+        let bot_config = unused_bot_config();
         let mut stdout = Vec::new();
 
         donate_equity_command(
@@ -963,6 +1185,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             positive_shares("1"),
             TokenizationNetwork::Ethereum,
+            bot_config.path(),
             &ctx,
         )
         .await
@@ -989,6 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn donate_equity_refuses_a_network_without_a_trading_table() {
         let ctx = create_ctx_with_stub_wallet();
+        let bot_config = unused_bot_config();
         let mut stdout = Vec::new();
 
         let error = donate_equity_command(
@@ -996,6 +1220,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             positive_shares("1"),
             TokenizationNetwork::Ethereum,
+            bot_config.path(),
             &ctx,
         )
         .await
@@ -1014,14 +1239,17 @@ mod tests {
         let wrapper = MockWrapper::new()
             .with_wrapped_token(wrapped_token)
             .with_tokenized_shares(underlying_token);
+        let notifier = CapturingNotifier::default();
         let mut stdout = Vec::new();
 
         donate_equity_with_wrapper(
             &mut stdout,
             &wrapper,
+            &notifier,
             Address::repeat_byte(0xaa),
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            Chain::Base,
         )
         .await
         .unwrap();
@@ -1034,20 +1262,215 @@ mod tests {
         assert!(output.contains(&format!("Underlying token: {underlying_token}")));
         assert!(output.contains("no shares minted"));
         assert!(output.contains("Transaction hash:"));
+        assert!(output.contains("Notification: recorded by the bot"));
         assert!(output.contains("Donation completed successfully"));
+        let transaction_hash: TxHash = output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Transaction hash: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            *notifier.notices.lock().unwrap(),
+            vec![aapl_notice(transaction_hash)]
+        );
+    }
+
+    /// A bot that is down or restarting must not fail a confirmed donation:
+    /// the operator gets a warning with everything needed to record it.
+    #[tokio::test]
+    async fn donate_equity_succeeds_and_warns_when_notice_delivery_fails() {
+        let wrapper = MockWrapper::new()
+            .with_wrapped_token(Address::repeat_byte(0x22))
+            .with_tokenized_shares(Address::repeat_byte(0x11));
+        let mut stdout = Vec::new();
+
+        donate_equity_with_wrapper(
+            &mut stdout,
+            &wrapper,
+            &FailingNotifier,
+            Address::repeat_byte(0xaa),
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10.5"),
+            Chain::Base,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        let transaction_hash = output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Transaction hash: "))
+            .unwrap();
+        assert!(
+            output.contains(&format!(
+                "WARNING: the donation succeeded, but the bot did not record the completion \
+                 (bot unreachable). Do not repeat the donation. Record it manually: AAPL on \
+                 base, transaction {transaction_hash}"
+            )),
+            "missing delivery warning; output: {output}"
+        );
+        assert!(output.contains("Donation completed successfully"));
+    }
+
+    /// The JSON literal is the exact body the bot's endpoint test accepts, so
+    /// the two sides of the wire cannot drift apart silently.
+    #[tokio::test]
+    async fn bot_notice_client_posts_the_wire_contract() {
+        let bot = MockServer::start_async().await;
+        let endpoint = bot
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/alerts/dividend-nav-bump")
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "symbol": "AAPL",
+                        "chain": "base",
+                        "txHash": "0x00000000000000000000000000000000000000000000000000000000000012ab"
+                    }));
+                then.status(204);
+            })
+            .await;
+        let bot_config = bot_config(bot.port());
+
+        bot_notice_client(bot_config.path())
+            .unwrap()
+            .notify(&aapl_notice(
+                "0x00000000000000000000000000000000000000000000000000000000000012ab"
+                    .parse()
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        endpoint.assert_async().await;
+    }
+
+    /// Building the client must not contact the bot: bot liveness is not a
+    /// precondition for starting a bump.
+    #[tokio::test]
+    async fn bot_notice_client_setup_does_not_contact_the_bot() {
+        let bot = MockServer::start_async().await;
+        let any_request = bot
+            .mock_async(|_when, then| {
+                then.status(204);
+            })
+            .await;
+        let bot_config = bot_config(bot.port());
+
+        bot_notice_client(bot_config.path()).unwrap();
+
+        any_request.assert_calls_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn bot_notice_client_rejects_a_non_success_response() {
+        let bot = MockServer::start_async().await;
+        let endpoint = bot
+            .mock_async(|when, then| {
+                when.method(POST).path(DIVIDEND_NAV_BUMP_NOTICE_PATH);
+                then.status(500);
+            })
+            .await;
+        let bot_config = bot_config(bot.port());
+
+        let error = bot_notice_client(bot_config.path())
+            .unwrap()
+            .notify(&aapl_notice(TxHash::with_last_byte(1)))
+            .await
+            .unwrap_err();
+
+        endpoint.assert_async().await;
+        assert_eq!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status),
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+    }
+
+    /// Only the bot handler's own 204 counts as recorded. Any other 2xx, or a
+    /// redirect that is not followed, must reach the post-donation warning.
+    #[tokio::test]
+    async fn bot_notice_client_rejects_a_response_other_than_no_content() {
+        for status in [200, 302] {
+            let bot = MockServer::start_async().await;
+            let endpoint = bot
+                .mock_async(|when, then| {
+                    when.method(POST).path(DIVIDEND_NAV_BUMP_NOTICE_PATH);
+                    then.status(status)
+                        .header("location", "http://127.0.0.1:9/elsewhere");
+                })
+                .await;
+            let bot_config = bot_config(bot.port());
+
+            let error = bot_notice_client(bot_config.path())
+                .unwrap()
+                .notify(&aapl_notice(TxHash::with_last_byte(1)))
+                .await
+                .unwrap_err();
+
+            endpoint.assert_async().await;
+            assert!(
+                error.to_string().contains("instead of 204 No Content"),
+                "status {status}: unexpected error {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_notice_client_requires_a_readable_bot_config() {
+        let error = bot_notice_client(Path::new("/nonexistent/st0x-hedge.config"))
+            .err()
+            .expect("a missing bot config must fail setup");
+
+        assert!(
+            matches!(
+                error.downcast_ref::<st0x_config::CtxError>(),
+                Some(st0x_config::CtxError::ConfigIo { .. })
+            ),
+            "expected a config read error, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn donate_equity_notifies_after_confirmation_even_if_stdout_closes() {
+        let wrapper = MockWrapper::new()
+            .with_wrapped_token(Address::repeat_byte(0x22))
+            .with_tokenized_shares(Address::repeat_byte(0x11));
+        let notifier = CapturingNotifier::default();
+        let mut stdout = RejectFinalSuccessWriter::default();
+
+        donate_equity_with_wrapper(
+            &mut stdout,
+            &wrapper,
+            &notifier,
+            Address::repeat_byte(0xaa),
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10.5"),
+            Chain::Base,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(notifier.notices.lock().unwrap().len(), 1);
+        assert_eq!(stdout.error_kind, Some(std::io::ErrorKind::BrokenPipe));
     }
 
     #[tokio::test]
     async fn donate_equity_propagates_symbol_lookup_failure() {
         let wrapper = MockWrapper::failing_derivative_lookup();
+        let notifier = CapturingNotifier::default();
         let mut stdout = Vec::new();
 
         let error = donate_equity_with_wrapper(
             &mut stdout,
             &wrapper,
+            &notifier,
             Address::repeat_byte(0xaa),
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            Chain::Base,
         )
         .await
         .unwrap_err();
@@ -1056,19 +1479,23 @@ mod tests {
             error.to_string().contains("Symbol not configured: AAPL"),
             "expected symbol lookup error, got: {error}"
         );
+        assert!(notifier.notices.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn donate_equity_propagates_transfer_failure() {
         let wrapper = MockWrapper::failing_donate();
+        let notifier = CapturingNotifier::default();
         let mut stdout = Vec::new();
 
         let error = donate_equity_with_wrapper(
             &mut stdout,
             &wrapper,
+            &notifier,
             Address::repeat_byte(0xaa),
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            Chain::Base,
         )
         .await
         .unwrap_err();
@@ -1079,5 +1506,6 @@ mod tests {
                 .contains("wrapper donation transfer failed"),
             "expected donate transfer error, got: {error}"
         );
+        assert!(notifier.notices.lock().unwrap().is_empty());
     }
 }

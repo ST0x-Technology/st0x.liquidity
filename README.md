@@ -226,8 +226,10 @@ The vault, allowance, transfer, donate and dividend commands (`vault-deposit`,
 `vault-withdraw`, `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`,
 `donate-equity`, `dividend-bump`) take the same `--network` flag and run on that
 chain's `[chains.<name>.trading]` table (no `--registry`: they need the chain's
-orderbook). `transfer-equity` records the chain it ran on and is resumed on that
-same chain:
+orderbook). `donate-equity` and `dividend-bump` also need the running bot's
+plaintext config (`--bot-config` or `ST0X_BOT_CONFIG`) to report the confirmed
+donation to the bot; see [docs/cli-ops.md](docs/cli-ops.md). `transfer-equity`
+records the chain it ran on and is resumed on that same chain:
 
 ```bash
 cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml vault-deposit --amount 10 --token 0x... --vault-id 0x... --network ethereum

@@ -162,6 +162,29 @@ struct DeploymentConfig {
     assets: HedgingAssets,
 }
 
+#[derive(Deserialize)]
+struct OperatorApiConfig {
+    server_port: u16,
+}
+
+/// Reads the operator API port from the bot's plaintext configuration.
+///
+/// Issuer commands use this narrow loader to contact the running bot without
+/// loading its encrypted secrets or constructing a second runtime context.
+pub fn load_operator_api_port(config_path: &Path) -> Result<u16, CtxError> {
+    let config_str = std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    let config: OperatorApiConfig =
+        toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+
+    Ok(config.server_port)
+}
+
 /// Reads only the public asset section needed by the deploy-time symbol gate.
 ///
 /// The full config/secrets validation remains the responsibility of
@@ -8941,6 +8964,28 @@ mod tests {
             error,
             CtxError::ConfiguredSymbolMarkedRetired { .. }
         ));
+    }
+
+    #[test]
+    fn operator_api_port_reads_only_plaintext_bot_config() {
+        let config = toml_file(
+            r#"
+                server_port = 8123
+                unrelated_top_level_key = "ignored by the narrow port loader"
+            "#,
+        );
+
+        assert_eq!(load_operator_api_port(config.path()).unwrap(), 8123);
+    }
+
+    #[test]
+    fn operator_api_port_requires_server_port() {
+        let config = toml_file("board_port = 8124");
+
+        let error = load_operator_api_port(config.path()).unwrap_err();
+
+        assert!(matches!(error, CtxError::ConfigToml { .. }));
+        assert!(error.to_string().contains("failed to parse config"));
     }
 
     #[test]

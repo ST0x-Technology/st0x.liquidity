@@ -499,6 +499,11 @@ the field is absent, non-positive, or inconsistent with the broker-reported
 order quantity. When requested, placed, and filled quantities differ, the CLI
 shows all three so the adjustment is visible to the operator.
 
+After the donation is confirmed, the CLI reports the completion to the running
+bot, which records it as an `operational_notice` (see "Structured log channel").
+The command needs the bot's plaintext config for this report, but the bot does
+not need to be running: a failed report is a warning, not a failed bump.
+
 ## Bot Implementation Specification
 
 The arbitrage bot will be built in Rust to leverage its performance, safety, and
@@ -6428,18 +6433,40 @@ operational alerts.
 
 ### Structured log channel
 
-Alerts are emitted as structured ERROR logs: target `operational_alert`, an
-`alert = true` marker field, and the human-readable alert text in the `message`
-field. Delivery to humans happens downstream in the log pipeline (Cloud Logging
--> Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
-credentials and in-process delivery cannot fail. The non-secret `[alerts]`
-config supplies only the gas-monitor thresholds and intervals; the encrypted
-secrets carry nothing for alerting. (Migration note: the retired Telegram fields
-are accepted and ignored with a deprecation warning for one release, then
-rejected -- `chat_id`/`message_thread_id` in the `[alerts]` config section, and
-a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
-versions still carry the former, deployed secret versions the latter, and the
-previous build required them.)
+Fault alerts are emitted as structured ERROR logs: target `operational_alert`,
+an `alert = true` marker field, and the human-readable alert text in the
+`message` field. Successful lifecycle notices are not faults: they are emitted
+as INFO logs on the separate target `operational_notice`, with a `notice = true`
+marker and a `notice_kind` discriminator, so neither `operational_alert` paging
+rules nor error-rate monitoring treat a routine completion as an incident.
+Delivery to humans happens downstream in the log pipeline (Cloud Logging ->
+Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
+credentials. The non-secret `[alerts]` config supplies only the gas-monitor
+thresholds and intervals; the encrypted secrets carry nothing for alerting.
+(Migration note: the retired Telegram fields are accepted and ignored with a
+deprecation warning for one release, then rejected -- `chat_id`/
+`message_thread_id` in the `[alerts]` config section, and a leftover `[alerts]`
+table (`bot_token`) in the secrets file. Deployed config versions still carry
+the former, deployed secret versions the latter, and the previous build required
+them.)
+
+After a wrapper donation is confirmed, the in-container CLI POSTs the completion
+to the running bot's loopback-only `/alerts/dividend-nav-bump` endpoint as typed
+fields: the equity symbol, the chain, and the donation transaction hash. The bot
+rejects a blank symbol, an unknown chain, or a malformed transaction hash, then
+builds the canonical message and emits it as a
+`notice_kind = "dividend_nav_bump"` `operational_notice` event with the three
+fields attached. The notice omits the literal share quantity to stay concise;
+this is not a confidentiality guarantee because the public transaction reveals
+the amount.
+
+The bump is an issuer operation that does not need the bot, so bot liveness is
+not a precondition: the CLI reads the bot's `server_port` from its config before
+the buy (so local setup problems fail before money moves) but does not contact
+the bot until the donation is confirmed. Delivery or stdout failure after the
+confirmed receipt is best-effort: the CLI prints a warning with the symbol,
+chain and transaction hash to record manually, and still exits successfully so
+an operator is not prompted to repeat an irreversible donation.
 
 ### BaseToAlpaca deposit send
 

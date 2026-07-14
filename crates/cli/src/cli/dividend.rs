@@ -8,18 +8,24 @@
 //! Shares are tokenized to, and donated from, the configured `[wallet]`, so the
 //! issuer config funds and signs the whole bump.
 
-use std::io::Write;
-
 use async_trait::async_trait;
+use std::io::Write;
+use std::path::Path;
 
 use st0x_config::Ctx;
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
+use super::wrapper::DividendNavBumpNotifier;
 use super::{TokenizationNetwork, rebalancing, trading, wrapper};
 
 #[async_trait]
 trait DividendBumpOperations: Sync {
+    fn prepare_notifier(
+        &self,
+        bot_config: &Path,
+    ) -> anyhow::Result<Box<dyn DividendNavBumpNotifier>>;
+
     async fn buy<Writer: Write + Send>(
         &self,
         stdout: &mut Writer,
@@ -43,6 +49,7 @@ trait DividendBumpOperations: Sync {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         network: TokenizationNetwork,
+        notifier: &dyn DividendNavBumpNotifier,
         ctx: &Ctx,
     ) -> anyhow::Result<()>;
 }
@@ -51,6 +58,13 @@ struct LiveDividendBumpOperations;
 
 #[async_trait]
 impl DividendBumpOperations for LiveDividendBumpOperations {
+    fn prepare_notifier(
+        &self,
+        bot_config: &Path,
+    ) -> anyhow::Result<Box<dyn DividendNavBumpNotifier>> {
+        Ok(Box::new(wrapper::bot_notice_client(bot_config)?))
+    }
+
     async fn buy<Writer: Write + Send>(
         &self,
         stdout: &mut Writer,
@@ -87,9 +101,13 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         network: TokenizationNetwork,
+        notifier: &dyn DividendNavBumpNotifier,
         ctx: &Ctx,
     ) -> anyhow::Result<()> {
-        wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await
+        wrapper::donate_equity_command_with_notifier(
+            stdout, symbol, quantity, network, notifier, ctx,
+        )
+        .await
     }
 }
 
@@ -98,6 +116,7 @@ pub(super) async fn dividend_bump_command<Writer: Write + Send>(
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
     network: TokenizationNetwork,
+    bot_config: &Path,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     dividend_bump_with_operations(
@@ -105,6 +124,7 @@ pub(super) async fn dividend_bump_command<Writer: Write + Send>(
         symbol,
         quantity,
         network,
+        bot_config,
         ctx,
         &LiveDividendBumpOperations,
     )
@@ -116,10 +136,12 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
     network: TokenizationNetwork,
+    bot_config: &Path,
     ctx: &Ctx,
     operations: &Operations,
 ) -> anyhow::Result<()> {
     rebalancing::require_equity_mutation_network(network)?;
+    let notifier = operations.prepare_notifier(bot_config)?;
     let chain = Chain::from(network);
     writeln!(stdout, "Dividend NAV bump: {quantity} {symbol} on {chain}")?;
 
@@ -144,20 +166,31 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
         "Step 3/3: donating {filled_quantity} {symbol} into the wrapper"
     )?;
     operations
-        .donate(stdout, symbol, filled_quantity, network, ctx)
+        .donate(
+            stdout,
+            symbol,
+            filled_quantity,
+            network,
+            notifier.as_ref(),
+            ctx,
+        )
         .await?;
 
-    writeln!(stdout, "✅ Dividend NAV bump completed")?;
+    wrapper::write_after_receipt(stdout, format_args!("✅ Dividend NAV bump completed"));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{Address, address};
+    use httpmock::Method::POST;
+    use httpmock::MockServer;
+    use rain_math_float::Float;
+    use std::io::Write as _;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use alloy::primitives::{Address, address};
-    use rain_math_float::Float;
+    use tempfile::NamedTempFile;
 
     use st0x_config::ChainRegistry;
     use st0x_config::HedgingAssets;
@@ -166,6 +199,7 @@ mod tests {
         BrokerCtx, ExecutionThreshold, HedgedChain, InventoryMode, LogFormat, LogLevel,
     };
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
+    use st0x_hedge::api::{DIVIDEND_NAV_BUMP_NOTICE_PATH, DividendNavBumpNotice};
     use st0x_hedge::operator::test_utils::{mock_alpaca_broker_ctx, try_positive_shares};
 
     use super::*;
@@ -174,14 +208,42 @@ mod tests {
         try_positive_shares(value).expect("test shares must be valid and positive")
     }
 
+    fn unused_bot_config() -> &'static Path {
+        Path::new("unused-by-test-operations")
+    }
+
+    /// The recording operations never reach the donation receipt, so they
+    /// never deliver a notice.
+    struct UnreachableNotifier;
+
+    #[async_trait]
+    impl DividendNavBumpNotifier for UnreachableNotifier {
+        async fn notify(&self, _notice: &DividendNavBumpNotice) -> anyhow::Result<()> {
+            anyhow::bail!("test operations never deliver notices")
+        }
+    }
+
     struct RecordingDividendBumpOperations {
         filled_quantity: Positive<FractionalShares>,
+        notifier_setup_fails: bool,
+        buy_calls: AtomicUsize,
         tokenized: Mutex<Vec<(Positive<FractionalShares>, TokenizationNetwork)>>,
         donated: Mutex<Vec<(Positive<FractionalShares>, TokenizationNetwork)>>,
     }
 
     #[async_trait]
     impl DividendBumpOperations for RecordingDividendBumpOperations {
+        fn prepare_notifier(
+            &self,
+            _bot_config: &Path,
+        ) -> anyhow::Result<Box<dyn DividendNavBumpNotifier>> {
+            if self.notifier_setup_fails {
+                anyhow::bail!("notifier setup failed");
+            }
+
+            Ok(Box::new(UnreachableNotifier))
+        }
+
         async fn buy<Writer: Write + Send>(
             &self,
             _stdout: &mut Writer,
@@ -189,6 +251,7 @@ mod tests {
             _quantity: Positive<FractionalShares>,
             _ctx: &Ctx,
         ) -> anyhow::Result<Positive<FractionalShares>> {
+            self.buy_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.filled_quantity)
         }
 
@@ -210,6 +273,7 @@ mod tests {
             _symbol: Symbol,
             quantity: Positive<FractionalShares>,
             network: TokenizationNetwork,
+            _notifier: &dyn DividendNavBumpNotifier,
             _ctx: &Ctx,
         ) -> anyhow::Result<()> {
             self.donated.lock().unwrap().push((quantity, network));
@@ -223,8 +287,49 @@ mod tests {
         donations: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct CloseOnCompletionWriter {
+        output: Vec<u8>,
+        closed: bool,
+    }
+
+    impl Write for CloseOnCompletionWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.closed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer is closed",
+                ));
+            }
+
+            let mut candidate = self.output.clone();
+            candidate.extend_from_slice(buffer);
+            if String::from_utf8_lossy(&candidate).contains("Dividend NAV bump completed") {
+                self.closed = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer closed before final status",
+                ));
+            }
+
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl DividendBumpOperations for CountingDividendBumpOperations {
+        fn prepare_notifier(
+            &self,
+            _bot_config: &Path,
+        ) -> anyhow::Result<Box<dyn DividendNavBumpNotifier>> {
+            Ok(Box::new(UnreachableNotifier))
+        }
+
         async fn buy<Writer: Write + Send>(
             &self,
             _stdout: &mut Writer,
@@ -254,6 +359,7 @@ mod tests {
             _symbol: Symbol,
             _quantity: Positive<FractionalShares>,
             _network: TokenizationNetwork,
+            _notifier: &dyn DividendNavBumpNotifier,
             _ctx: &Ctx,
         ) -> anyhow::Result<()> {
             self.donations.fetch_add(1, Ordering::Relaxed);
@@ -322,6 +428,7 @@ mod tests {
             Symbol::new("DNUT").unwrap(),
             positive_shares("1"),
             TokenizationNetwork::Robinhood,
+            unused_bot_config(),
             &ctx,
             &operations,
         )
@@ -353,6 +460,15 @@ mod tests {
             .call()
             .await;
         let ctx = test_ctx(mock_alpaca_broker_ctx(broker_mock.base_url()));
+        let bot = MockServer::start_async().await;
+        let notice = bot
+            .mock_async(|when, then| {
+                when.method(POST).path(DIVIDEND_NAV_BUMP_NOTICE_PATH);
+                then.status(204);
+            })
+            .await;
+        let mut bot_config = NamedTempFile::new().unwrap();
+        writeln!(bot_config, "server_port = {}", bot.port()).unwrap();
         let mut stdout = Vec::new();
 
         let error = dividend_bump_command(
@@ -360,6 +476,7 @@ mod tests {
             Symbol::new("COIN").unwrap(),
             positive_shares("10"),
             TokenizationNetwork::Base,
+            bot_config.path(),
             &ctx,
         )
         .await
@@ -385,6 +502,36 @@ mod tests {
             !output.contains("Step 3/3"),
             "donate must not run after tokenize fails; output: {output}"
         );
+        notice.assert_calls_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn dividend_bump_refuses_to_buy_when_notifier_setup_fails() {
+        let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
+        let operations = RecordingDividendBumpOperations {
+            filled_quantity: positive_shares("1"),
+            notifier_setup_fails: true,
+            buy_calls: AtomicUsize::new(0),
+            tokenized: Mutex::new(Vec::new()),
+            donated: Mutex::new(Vec::new()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = dividend_bump_with_operations(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Base,
+            unused_bot_config(),
+            &ctx,
+            &operations,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "notifier setup failed");
+        assert_eq!(operations.buy_calls.load(Ordering::SeqCst), 0);
+        assert!(stdout.is_empty());
     }
 
     #[tokio::test]
@@ -394,6 +541,8 @@ mod tests {
         let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("0.0041"),
+            notifier_setup_fails: false,
+            buy_calls: AtomicUsize::new(0),
             tokenized: Mutex::new(Vec::new()),
             donated: Mutex::new(Vec::new()),
         };
@@ -404,6 +553,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             positive_shares("0.004115451077565126"),
             TokenizationNetwork::Base,
+            unused_bot_config(),
             &ctx,
             &operations,
         )
@@ -423,6 +573,30 @@ mod tests {
         assert!(output.contains("Step 3/3: donating 0.0041 AAPL into the wrapper"));
     }
 
+    #[tokio::test]
+    async fn dividend_bump_succeeds_when_stdout_closes_after_donation() {
+        let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
+        let operations = CountingDividendBumpOperations::default();
+        let mut stdout = CloseOnCompletionWriter::default();
+
+        dividend_bump_with_operations(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Base,
+            unused_bot_config(),
+            &ctx,
+            &operations,
+        )
+        .await
+        .unwrap();
+
+        assert!(stdout.closed);
+        assert_eq!(operations.buys.load(Ordering::Relaxed), 1);
+        assert_eq!(operations.tokenizations.load(Ordering::Relaxed), 1);
+        assert_eq!(operations.donations.load(Ordering::Relaxed), 1);
+    }
+
     /// The tokenize and donate steps must land on the same chain the bump
     /// was asked for: tokens minted on one chain cannot be donated on another.
     #[tokio::test]
@@ -430,6 +604,8 @@ mod tests {
         let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("2"),
+            notifier_setup_fails: false,
+            buy_calls: AtomicUsize::new(0),
             tokenized: Mutex::new(Vec::new()),
             donated: Mutex::new(Vec::new()),
         };
@@ -440,6 +616,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             positive_shares("2"),
             TokenizationNetwork::Ethereum,
+            unused_bot_config(),
             &ctx,
             &operations,
         )

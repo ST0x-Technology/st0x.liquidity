@@ -24,6 +24,7 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
@@ -489,6 +490,9 @@ pub enum Commands {
         /// is refused
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
+        /// Bot config whose server_port identifies the completion-notice API
+        #[arg(long = "bot-config", env = "ST0X_BOT_CONFIG")]
+        bot_config: PathBuf,
     },
 
     /// Apply a dividend NAV bump in one step: buy the equity, tokenize it, and
@@ -510,6 +514,9 @@ pub enum Commands {
         /// is refused
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
+        /// Bot config whose server_port identifies the completion-notice API
+        #[arg(long = "bot-config", env = "ST0X_BOT_CONFIG")]
+        bot_config: PathBuf,
     },
 
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
@@ -1118,6 +1125,7 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         network: TokenizationNetwork,
+        bot_config: PathBuf,
     },
     AlpacaDeposit {
         amount: Usdc,
@@ -1269,6 +1277,7 @@ enum ProviderCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         network: TokenizationNetwork,
+        bot_config: PathBuf,
     },
     AlpacaTokenizationRequests,
 }
@@ -1417,10 +1426,12 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             symbol,
             quantity,
             network,
+            bot_config,
         } => CommandRoute::Simple(SimpleCommand::DonateEquity {
             symbol,
             quantity,
             network,
+            bot_config,
         }),
         Commands::AlpacaDeposit { amount } => {
             CommandRoute::Simple(SimpleCommand::AlpacaDeposit { amount })
@@ -1523,10 +1534,12 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             symbol,
             quantity,
             network,
+            bot_config,
         } => CommandRoute::Provider(ProviderCommand::DividendBump {
             symbol,
             quantity,
             network,
+            bot_config,
         }),
         Commands::OrderStatus { order_id } => {
             CommandRoute::Simple(SimpleCommand::OrderStatus { order_id })
@@ -1734,7 +1747,11 @@ async fn run_simple_command<W: Write>(
             symbol,
             quantity,
             network,
-        } => wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await,
+            bot_config,
+        } => {
+            wrapper::donate_equity_command(stdout, symbol, quantity, network, &bot_config, ctx)
+                .await
+        }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
                 .await
@@ -2173,7 +2190,11 @@ async fn run_provider_command<W: Write + Send>(
             symbol,
             quantity,
             network,
-        } => dividend::dividend_bump_command(stdout, symbol, quantity, network, ctx).await,
+            bot_config,
+        } => {
+            dividend::dividend_bump_command(stdout, symbol, quantity, network, &bot_config, ctx)
+                .await
+        }
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
         }
@@ -2564,18 +2585,29 @@ mod tests {
 
     #[test]
     fn dividend_bump_command_parses_symbol_and_quantity() {
-        let cli =
-            Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "10.5"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "dividend-bump",
+            "-s",
+            "COIN",
+            "-q",
+            "10.5",
+            "--bot-config",
+            "/tmp/bot.config",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::DividendBump {
                 symbol,
                 quantity,
                 network,
+                bot_config,
             } => {
                 assert_eq!(symbol, Symbol::new("COIN").unwrap());
                 assert_eq!(quantity, positive_shares("10.5"));
                 assert_eq!(network, TokenizationNetwork::Base);
+                assert_eq!(bot_config, PathBuf::from("/tmp/bot.config"));
             }
             other => panic!("expected dividend-bump command, got: {other:?}"),
         }
@@ -2595,6 +2627,8 @@ mod tests {
             "1",
             "--network",
             "ethereum",
+            "--bot-config",
+            "/tmp/bot.config",
         ])
         .unwrap();
         match cli.command {
@@ -2613,6 +2647,8 @@ mod tests {
             "1",
             "--network",
             "ethereum",
+            "--bot-config",
+            "/tmp/bot.config",
         ])
         .unwrap();
         match cli.command {
@@ -2625,8 +2661,17 @@ mod tests {
 
     #[test]
     fn dividend_bump_command_rejects_zero_quantity() {
-        let error = Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "0"])
-            .unwrap_err();
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "dividend-bump",
+            "-s",
+            "COIN",
+            "-q",
+            "0",
+            "--bot-config",
+            "/tmp/bot.config",
+        ])
+        .unwrap_err();
         let rendered = error.to_string();
         assert!(rendered.contains('0'), "unexpected clap error: {rendered}");
     }

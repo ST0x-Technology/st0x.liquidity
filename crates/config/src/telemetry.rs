@@ -477,7 +477,7 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     /// level. Keep in sync with
     /// `grep -rhoE 'target: "[a-z_]+"' src/ crates/` (plus `cqrs` from the
     /// external st0x-event-sorcery crate).
-    const DOMAIN_TARGETS: [&str; 19] = [
+    const DOMAIN_TARGETS: [&str; 20] = [
         "backfill",
         "bridge",
         "broker",
@@ -490,6 +490,7 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         "inventory",
         "market_data",
         "operational_alert",
+        "operational_notice",
         "orderbook",
         "rebalance",
         "reliability",
@@ -543,6 +544,8 @@ mod tests {
             "hedge",
             "inventory",
             "market_data",
+            "operational_alert",
+            "operational_notice",
             "orderbook",
             "rebalance",
             "reliability",
@@ -556,6 +559,39 @@ mod tests {
                 "domain target {target} is missing from the env filter: {filter}"
             );
         }
+    }
+
+    /// Operator lifecycle notices are routine INFO events, not faults, so the
+    /// default filter at the production `info` level must export them while
+    /// still dropping more verbose events on the same target.
+    #[test]
+    fn crate_filter_exports_info_operational_notices() {
+        let writer = SharedWriter::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(writer.clone())
+            .with_filter(mk_crate_filter(tracing::Level::INFO));
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "operational_notice", notice = true, "exported notice");
+            tracing::debug!(target: "operational_notice", "filtered detail");
+        });
+
+        let bytes = writer.0.lock().clone();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        let entries: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let [entry] = entries.as_slice() else {
+            panic!("expected only the INFO notice, got: {output}");
+        };
+        assert_eq!(entry["level"], "INFO");
+        assert_eq!(entry["target"], "operational_notice");
+        assert_eq!(entry["fields"]["notice"], true);
+        assert_eq!(entry["fields"]["message"], "exported notice");
     }
 
     /// Captures everything written through a subscriber layer so tests can

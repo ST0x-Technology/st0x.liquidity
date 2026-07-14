@@ -173,6 +173,16 @@ more. The standalone `buy`, `alpaca-tokenize`, and `donate-equity` subcommands
 remain for running a single step in isolation; use `wrap-equity` only when you
 want to _receive_ wrapped shares (a deposit), never for a dividend bump.
 
+After the donation is confirmed, the command reports the completion to the
+running bot, which records it in the exported logs as an `operational_notice`
+event. `s01` reads the bot's port from `S01_BOT_CONFIG` (default
+`/run/st0x/st0x-hedge.config`), and `stox` uses the same default. Otherwise pass
+`--bot-config` or set `ST0X_BOT_CONFIG` (inside the GCP bot container:
+`/run/t0-config/st0x-hedge.toml`). The bot does not need to be running for the
+bump itself. If the report fails, the command still succeeds and prints a
+`WARNING` line with the symbol, chain, and transaction hash: record the
+completion manually and do **not** repeat the donation.
+
 ### Selling and Redeeming (Liquidating Tokenized Shares)
 
 Reverse of buying and minting: redeem tokens offchain, then sell the shares.
@@ -397,7 +407,9 @@ race `/transfers/resume` into a double on-chain wrap).
 > an `{"error": ...}` body: that is the guard working, not the bot broken. The
 > network route for operators is the IAP-verified `/liquidity-write/*` mount
 > behind the load balancer, which requires membership in the write-tier
-> Workspace group.
+> Workspace group. The dividend-bump completion notice
+> (`POST /alerts/dividend-nav-bump`) is loopback-only too, and it has no
+> `/liquidity-write` equivalent.
 
 Recoverable cases:
 
