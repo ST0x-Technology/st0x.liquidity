@@ -55,7 +55,7 @@ use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{Wrapper, WrapperService};
 
-use crate::alerts::{NoopNotifier, Notifier, NotifierError, TelegramNotifier};
+use crate::alerts::{NoopNotifier, Notifier, NotifierError, build_notifier};
 use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
     RecordBotGasReceiptCostJobQueue,
@@ -868,7 +868,7 @@ impl Conductor {
         run_startup_maintenance(&ctx, &pool).await?;
 
         let rebalancing = optional_rebalancing_ctx(&ctx)?;
-        let notifier = build_alert_notifier(ctx.alerts.as_ref(), "Operational alerting")?;
+        let notifier = build_notifier(ctx.alerts.as_ref())?;
 
         let PositionAndRebalancing {
             position,
@@ -1864,33 +1864,6 @@ impl PositionAndRebalancing {
             })
         }
     }
-}
-
-/// Builds an alert notifier for one `[alerts]`-gated channel. Shared by every
-/// alerting call site (USDC rebalancing, supervised-worker terminal failure)
-/// -- `channel` only labels the log lines so each call site's startup
-/// behaviour stays distinguishable.
-///
-/// Returns `Ok(Arc<NoopNotifier>)` when `[alerts]` is absent — silence is
-/// the correct behaviour for an unconfigured optional channel.
-///
-/// Returns `Err` when `[alerts]` IS present but `TelegramNotifier` fails to
-/// initialise. The caller must propagate this so the server fails to start:
-/// an operator who configured `[alerts]` believes alerts are active; silently
-/// falling back to Noop would suppress that channel's alerts with no runtime
-/// indication.
-fn build_alert_notifier(
-    alerts: Option<&st0x_config::AlertsCtx>,
-    channel: &'static str,
-) -> Result<Arc<dyn crate::alerts::Notifier>, NotifierError> {
-    let Some(alerts) = alerts else {
-        debug!("{channel}: [alerts] section absent, using NoopNotifier");
-        return Ok(Arc::new(NoopNotifier));
-    };
-    let notifier =
-        TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
-    info!("{channel}: Telegram notifier configured");
-    Ok(Arc::new(notifier))
 }
 
 /// One-time startup maintenance that must precede
@@ -4747,7 +4720,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(NoopNotifier),
+            Arc::new(crate::alerts::NoopNotifier),
         ))
     }
 
@@ -12664,7 +12637,6 @@ mod tests {
         async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
             Err(NotifierError::ApiError {
                 status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                body: "simulated Telegram outage".to_string(),
             })
         }
     }
@@ -13512,26 +13484,21 @@ mod tests {
         );
     }
 
-    /// When `[alerts]` is absent, `build_alert_notifier` returns a
-    /// `NoopNotifier` that silently discards notifications without error --
-    /// exercised here through the USDC alerting call site's exact arguments.
-    /// `channel` only labels log lines (see `build_alert_notifier`'s doc), so
-    /// this also covers the supervised-worker terminal-failure call site,
-    /// which shares this exact code path with a different `channel` string.
+    /// When `[alerts]` is absent, `build_notifier` returns a `NoopNotifier`
+    /// that silently discards notifications without error.
     #[tokio::test]
-    async fn build_usdc_notifier_returns_ok_noop_when_alerts_absent() {
-        let notifier = build_alert_notifier(None, "USDC alerting").unwrap();
+    async fn build_notifier_returns_ok_noop_when_alerts_absent() {
+        let notifier = build_notifier(None).unwrap();
         notifier
             .notify("test message")
             .await
             .expect("NoopNotifier must not error on notify");
     }
 
-    /// When `[alerts]` IS present, `build_alert_notifier` constructs a real
+    /// When `[alerts]` IS present, `build_notifier` constructs a real
     /// Telegram notifier and returns `Ok` -- it must NOT fail startup for a
     /// well-formed config, and it must NOT silently fall back to `NoopNotifier`
     /// (which would suppress every redrive-limit and terminal-error page).
-    /// Exercised here through the USDC alerting call site's exact arguments.
     ///
     /// The error branch (`Err(NotifierError::ClientBuild)`) is only reachable on
     /// a reqwest/TLS backend init failure; it cannot be triggered deterministically
@@ -13539,11 +13506,8 @@ mod tests {
     /// site the `?` propagation fails startup, which is the behaviour that matters.
     /// `notify()` is deliberately not exercised: the present-branch notifier posts
     /// to the live Telegram API, which a unit test must never reach.
-    /// `channel` only labels log lines (see `build_alert_notifier`'s doc), so
-    /// this also covers the supervised-worker terminal-failure call site,
-    /// which shares this exact code path with a different `channel` string.
     #[tokio::test]
-    async fn build_usdc_notifier_returns_ok_telegram_when_alerts_present() {
+    async fn build_notifier_returns_ok_telegram_when_alerts_present() {
         let alerts = st0x_config::AlertsCtx {
             chat_id: 123,
             bot_token: "test-bot-token".to_string(),
@@ -13554,7 +13518,7 @@ mod tests {
             message_thread_id: Some(42),
         };
 
-        build_alert_notifier(Some(&alerts), "USDC alerting")
+        build_notifier(Some(&alerts))
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 

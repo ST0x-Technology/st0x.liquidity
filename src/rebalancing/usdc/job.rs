@@ -4703,7 +4703,6 @@ mod tests {
         async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
             Err(crate::alerts::NotifierError::ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: "injected test failure".to_string(),
             })
         }
     }
