@@ -450,6 +450,18 @@ never see them.
 These details are hidden by st0x-event-sorcery but documented here for debugging
 and migration authoring.
 
+`StoreBuilder` also persists the framework's `SchemaRegistry` aggregate when
+recording handled schema versions. Migration replay coverage must include its
+actual replay check, not ignore or whitelist its type: malformed registry events
+can prevent startup just like malformed application events. Discover persisted
+aggregate types from both `events` and `snapshots` before the verifier clears
+stale snapshots, since an uncovered compacted type may have no retained events.
+
+An uncovered type may also be a retired aggregate whose implementation was
+removed while its durable history remains. Keep or restore compatibility replay
+support for that history and include it in the verifier. Do not delete retained
+events or whitelist the type merely to clear the deploy gate.
+
 ### sqlite-es Table Schemas
 
 All three tables are created in the `event_store` migration.
