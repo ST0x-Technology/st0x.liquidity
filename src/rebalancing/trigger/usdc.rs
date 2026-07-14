@@ -136,11 +136,26 @@ impl UsdcRebalanceTracking {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UsdcTerminalAction {
+/// Single classification of a USDC rebalance event, driving everything the
+/// reactor does with it: whether the in-progress claim clears or must be
+/// preserved, and — only when it clears — whether the in-memory ledger was
+/// reconciled or must wait for the next snapshot poll. The settlement
+/// outcome exists only inside `Clear`, so consuming it for a non-terminal or
+/// preserved event is unrepresentable and non-terminal arms carry no
+/// placeholder value; the clear/preserve decision and the outcome come from
+/// the same classification, so the two can never drift.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum UsdcEventDisposition {
+    /// A progress or transient-marker event: the in-progress claim stays
+    /// held; there is no settlement to report.
     NotTerminal,
-    Clear,
+    /// Terminal post-burn failure: the burned funds left the source venue and
+    /// cannot be reconciled back, so the in-progress guard must outlive the
+    /// event (and restarts).
     PreservePostBurn,
+    /// Terminal event that releases the in-progress claim; the payload says
+    /// whether the ledger reconciled or the next snapshot poll must heal it.
+    Clear(UsdcSettlementOutcome),
 }
 
 /// Whether a terminal USDC settlement event reconciled the in-memory
@@ -594,45 +609,47 @@ impl RebalancingService {
             return Ok(());
         }
 
-        let terminal_action = self.usdc_terminal_action(&id, &event).await;
-        let settlement_outcome = self
-            .apply_usdc_rebalance_event(&id, &event, terminal_action)
-            .await?;
+        let disposition = self.apply_usdc_rebalance_event(&id, &event).await?;
 
-        let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
         {
             let mut inventory = self.inventory.write().await;
-            *inventory = if is_clearable_terminal {
-                inventory.clone().clear_active_usdc_rebalance()
-            } else {
-                inventory.clone().set_active_usdc_rebalance(id.clone())
+            *inventory = match disposition {
+                UsdcEventDisposition::Clear(_) => inventory.clone().clear_active_usdc_rebalance(),
+                UsdcEventDisposition::NotTerminal | UsdcEventDisposition::PreservePostBurn => {
+                    inventory.clone().set_active_usdc_rebalance(id.clone())
+                }
             };
         }
-        if is_clearable_terminal {
-            self.usdc_tracking.write().await.remove(&id);
-            let mut resume_gate = self.alpaca_to_base_resume_gate.write().await;
-            if resume_gate.as_ref().is_some_and(|gate| gate.id() == &id) {
-                *resume_gate = None;
+        match disposition {
+            UsdcEventDisposition::Clear(_) => {
+                self.usdc_tracking.write().await.remove(&id);
+                let mut resume_gate = self.alpaca_to_base_resume_gate.write().await;
+                if resume_gate.as_ref().is_some_and(|gate| gate.id() == &id) {
+                    *resume_gate = None;
+                }
+                drop(resume_gate);
+                self.clear_usdc_in_progress();
+                debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
             }
-            drop(resume_gate);
-            self.clear_usdc_in_progress();
-            debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
-        } else if terminal_action == UsdcTerminalAction::PreservePostBurn {
-            self.usdc_in_progress.store(true, Ordering::SeqCst);
-            warn!(
-                target: "rebalance",
-                id = %id,
-                ?event,
-                "Preserving USDC in-progress guard after post-burn terminal failure"
-            );
+            UsdcEventDisposition::PreservePostBurn => {
+                self.usdc_in_progress.store(true, Ordering::SeqCst);
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    ?event,
+                    "Preserving USDC in-progress guard after post-burn terminal failure"
+                );
+            }
+            UsdcEventDisposition::NotTerminal => {}
         }
 
         drop(event_sync_guard);
 
         // A terminal USDC transfer cleared the in-progress claim, so we
         // cancel any pre-rebalance checks and push a fresh one against
-        // the post-rebalance inventory.
-        if is_clearable_terminal {
+        // the post-rebalance inventory. The settlement outcome only exists
+        // inside `Clear`, so this is the one place it can be consumed.
+        if let UsdcEventDisposition::Clear(settlement_outcome) = disposition {
             self.equity_scheduler.cancel_pending().await;
             self.usdc_scheduler.cancel_pending().await;
             match settlement_outcome {
@@ -657,22 +674,6 @@ impl RebalancingService {
         }
 
         Ok(())
-    }
-
-    async fn usdc_terminal_action(
-        &self,
-        id: &UsdcRebalanceId,
-        event: &UsdcRebalanceEvent,
-    ) -> UsdcTerminalAction {
-        if !Self::is_terminal_usdc_rebalance_event(event) {
-            return UsdcTerminalAction::NotTerminal;
-        }
-
-        if self.post_burn_failure(id, event).await {
-            UsdcTerminalAction::PreservePostBurn
-        } else {
-            UsdcTerminalAction::Clear
-        }
     }
 
     /// Whether a terminal failure event happened after the CCTP burn, so its
@@ -733,28 +734,33 @@ impl RebalancingService {
         }
     }
 
-    async fn apply_usdc_rebalance_event(
+    /// Applies one USDC rebalance event's tracking/ledger side effects and
+    /// classifies it into the single [`UsdcEventDisposition`] the caller acts
+    /// on. Terminality, the post-burn preserve decision, and the settlement
+    /// outcome all come from this one exhaustive match, so a new event
+    /// variant cannot compile without declaring its disposition — and a
+    /// non-terminal arm has no settlement outcome to get wrong.
+    pub(super) async fn apply_usdc_rebalance_event(
         &self,
         id: &UsdcRebalanceId,
         event: &UsdcRebalanceEvent,
-        terminal_action: UsdcTerminalAction,
-    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
+    ) -> Result<UsdcEventDisposition, RebalancingServiceError> {
         use UsdcRebalanceEvent::*;
 
-        let outcome = match event {
+        let disposition = match event {
             ConversionInitiated {
                 direction, amount, ..
             } => {
                 self.upsert_conversion_tracking(id, direction, *amount, event)
                     .await;
-                UsdcSettlementOutcome::Reconciled
+                UsdcEventDisposition::NotTerminal
             }
             Initiated {
                 direction, amount, ..
             } => {
                 self.track_initiated_usdc_rebalance(id, direction, *amount, event)
                     .await?;
-                UsdcSettlementOutcome::Reconciled
+                UsdcEventDisposition::NotTerminal
             }
             WithdrawalConfirmed { .. }
             | BridgingInitiated { .. }
@@ -769,7 +775,7 @@ impl RebalancingService {
                 ..
             } => {
                 self.track_usdc_stage_progress(id, event).await;
-                UsdcSettlementOutcome::Reconciled
+                UsdcEventDisposition::NotTerminal
             }
             Bridged {
                 amount_received, ..
@@ -785,24 +791,24 @@ impl RebalancingService {
                 // deposit, exactly like the normal bridge path.
                 self.track_bridged_amount(id, *amount_received).await?;
                 self.track_usdc_stage_progress(id, event).await;
-                UsdcSettlementOutcome::Reconciled
+                UsdcEventDisposition::NotTerminal
             }
             ConversionConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 conversion,
                 ..
-            } => {
+            } => UsdcEventDisposition::Clear(
                 self.complete_usdc_rebalance(
                     id,
                     UsdcTrackingEvent::ConversionConfirmed,
                     conversion.received_amount,
                 )
-                .await?
-            }
+                .await?,
+            ),
             DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 ..
-            } => self.complete_alpaca_to_base_deposit(id).await?,
+            } => UsdcEventDisposition::Clear(self.complete_alpaca_to_base_deposit(id).await?),
             // Transient intent markers persisted before the on-chain withdraw /
             // burn. Detailed stage tracking starts at the subsequent Initiated /
             // BridgingInitiated; the inventory's active-rebalance claim is set by
@@ -815,24 +821,23 @@ impl RebalancingService {
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
             | PendingBurnCleared { .. }
-            | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
+            | AttestationTimedOut { .. } => UsdcEventDisposition::NotTerminal,
             // Withdrawal failure is always pre-burn -> reconcile to source.
-            WithdrawalFailed { .. } => self.cancel_tracked_usdc_rebalance(id).await?,
+            WithdrawalFailed { .. } => {
+                UsdcEventDisposition::Clear(self.cancel_tracked_usdc_rebalance(id).await?)
+            }
             // These failures may be pre- or post-burn (BridgingFailed by burn
             // stage; ConversionFailed by direction -- BaseToAlpaca's conversion
-            // is post-deposit; DepositFailed is always post-mint). The classifier
-            // decides: preserve post-burn, otherwise reconcile to source.
+            // is post-deposit; DepositFailed is always post-mint). Post-burn,
+            // preservation is achieved by NOT cancelling: the tracking entry,
+            // guard, and active id are all kept by the caller, and there is no
+            // settlement outcome to report. Pre-burn, reconcile to source.
             BridgingFailed { .. } | DepositFailed { .. } | ConversionFailed { .. } => {
-                if terminal_action == UsdcTerminalAction::PreservePostBurn {
-                    // Preservation is achieved by NOT cancelling: the tracking
-                    // entry, guard, and active id are all kept by the caller. This
-                    // call only surfaces a diagnostic if tracking is absent. The
-                    // guard stays held (not clearable), so the outcome value is
-                    // unused by the caller's enqueue gate.
+                if self.post_burn_failure(id, event).await {
                     self.warn_if_post_burn_tracking_missing(id).await;
-                    UsdcSettlementOutcome::Reconciled
+                    UsdcEventDisposition::PreservePostBurn
                 } else {
-                    self.cancel_tracked_usdc_rebalance(id).await?
+                    UsdcEventDisposition::Clear(self.cancel_tracked_usdc_rebalance(id).await?)
                 }
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
@@ -840,8 +845,8 @@ impl RebalancingService {
             // semantics -- zero the source-venue inflight WITHOUT crediting
             // available -- never a `Cancel` (which would wrongly credit
             // available). Derives the source venue from `direction`, so it works
-            // with tracking absent (post-restart). The caller's Clear terminal
-            // action removes tracking and clears the guard. `reconcile_operator_resolved`
+            // with tracking absent (post-restart). The `Clear` disposition
+            // removes tracking and clears the guard. `reconcile_operator_resolved`
             // zeroes source inflight WITHOUT crediting destination `available`
             // (by design, see its doc comment), so the ledger is only half
             // updated here: defer the immediate imbalance check to the next
@@ -849,11 +854,11 @@ impl RebalancingService {
             OperatorReconciled { direction, .. } => {
                 self.reconcile_operator_resolved(direction, Utc::now())
                     .await?;
-                UsdcSettlementOutcome::DeferredToSnapshot
+                UsdcEventDisposition::Clear(UsdcSettlementOutcome::DeferredToSnapshot)
             }
         };
 
-        Ok(outcome)
+        Ok(disposition)
     }
 
     /// Reconciles source-venue USDC inflight for an operator-reconciled,
