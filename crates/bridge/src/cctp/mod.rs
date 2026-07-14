@@ -792,10 +792,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     }
 
     /// Applies the zero-grace, single-miss fast drop policy to both endpoints'
-    /// `burn_status`. Test-only seam: lets downstream consumers' resume tests
-    /// classify an absent recorded burn tx as `Dropped` immediately rather than
-    /// waiting out the production 30 s grace window, without exposing
-    /// `BurnDropConfig` across the crate boundary.
+    /// `burn_status`. Unknown identity or insufficient head progress remains
+    /// `Pending`; the shortened grace never bypasses canonical-state evidence.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_fast_burn_drop_policy(mut self) -> Self {
@@ -1484,10 +1482,17 @@ where
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<crate::BurnTxStatus, Self::Error> {
         match direction {
-            BridgeDirection::EthereumToBase => self.ethereum.burn_status(tx_hash).await,
-            BridgeDirection::BaseToEthereum => self.base.burn_status(tx_hash).await,
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .burn_status(tx_hash, submitted_after_block)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base.burn_status(tx_hash, submitted_after_block).await
+            }
         }
     }
 
@@ -7035,7 +7040,7 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .burn_status(success_receipt.transaction_hash)
+                .burn_status(success_receipt.transaction_hash, 0)
                 .await
                 .unwrap(),
             crate::BurnTxStatus::MinedSuccess
@@ -7043,7 +7048,7 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .burn_status(reverted_receipt.transaction_hash)
+                .burn_status(reverted_receipt.transaction_hash, 0)
                 .await
                 .unwrap(),
             crate::BurnTxStatus::MinedReverted
@@ -7087,7 +7092,7 @@ mod tests {
         // for a truly-absent tx), a mempool-visible tx must be Pending.
         let status = bridge
             .ethereum
-            .burn_status_with_config(pending_tx, super::evm::BurnDropConfig::fast())
+            .burn_status_with_config(pending_tx, 0, super::evm::BurnDropConfig::fast())
             .await
             .unwrap();
 
@@ -7098,30 +7103,33 @@ mod tests {
         );
     }
 
-    /// A tx absent from both the receipt lookup and the mempool, observed past the
-    /// grace window and the consecutive-miss threshold, classifies as `Dropped`
-    /// so the caller can fail closed and require operator verification. Uses a
-    /// zero grace + single miss to keep the test fast.
+    /// An absent unknown hash stays Pending even past grace on a fresh head:
+    /// without its sender/nonce, canonical state cannot qualify the absence.
     #[tokio::test]
-    async fn burn_status_reports_dropped_for_absent_tx_past_grace() {
+    async fn burn_status_reports_pending_for_unknown_absent_tx_past_grace() {
         let (_anvil, endpoint, private_key) = setup_anvil();
         let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
             .await
             .unwrap();
+
+        // A head beyond the submission floor is insufficient without the
+        // transaction's known sender/nonce (submitted_after_block = 0).
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        provider.anvil_mine(Some(5), None).await.unwrap();
 
         let unknown_tx =
             b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let status = bridge
             .ethereum
-            .burn_status_with_config(unknown_tx, super::evm::BurnDropConfig::fast())
+            .burn_status_with_config(unknown_tx, 0, super::evm::BurnDropConfig::fast())
             .await
             .unwrap();
 
         assert_eq!(
             status,
-            crate::BurnTxStatus::Dropped,
-            "an absent tx past the grace + consecutive-miss threshold must classify as Dropped"
+            crate::BurnTxStatus::Pending,
+            "an unknown nonce cannot authorize a drop, even beyond the submission floor"
         );
     }
 

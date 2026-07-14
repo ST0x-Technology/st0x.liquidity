@@ -48,7 +48,7 @@ itertools.workspace = true
 proptest.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
-st0x-evm = { workspace = true, features = ["local-signer"] }
+st0x-evm = { workspace = true, features = ["local-signer", "test-support"] }
 st0x-float-macro.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 

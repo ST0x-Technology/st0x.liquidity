@@ -6,15 +6,15 @@ use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
 use std::num::NonZeroU32;
-use std::time::{Duration, Instant};
-use tokio::time::{MissedTickBehavior, interval};
+use std::time::Duration;
+use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::{debug, info, trace, warn};
 
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
     Chain, EvmError, IntoErrorRegistry, MinedTx, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
-    PreparedTransaction, Wallet, wait_for_node_sync,
+    PreparedTransaction, Wallet, qualified_absence_head, wait_for_node_sync,
 };
 
 use super::{
@@ -251,10 +251,8 @@ impl BurnDropConfig {
         }
     }
 
-    /// Zero-grace, single-miss, fast-poll variant for tests: an absent tx
-    /// concludes `Dropped` immediately rather than waiting out the production
-    /// 30 s grace window. Shared by the bridge's own tests and downstream
-    /// consumers' resume tests (via [`CctpBridge::with_fast_burn_drop_policy`]).
+    /// Zero-grace, single-miss variant for tests. It still requires trusted
+    /// nonce state and head progress; unknown or frozen evidence is Pending.
     #[cfg(any(test, feature = "test-support"))]
     pub(super) const fn fast() -> Self {
         Self {
@@ -604,11 +602,17 @@ impl<W: Wallet> CctpEndpoint<W> {
 
     /// Resolves the on-chain status of a broadcast burn tx for crash-safe resume,
     /// using this endpoint's configured drop policy (`burn_drop_config`).
+    ///
+    /// `submitted_after_block` is the chain head recorded before the burn was
+    /// broadcast (the same pre-burn head `find_recent_burn` scans from): the
+    /// burn can only have mined strictly after it, so it anchors the
+    /// node-freshness gate on the `Dropped` verdict.
     pub(super) async fn burn_status(
         &self,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<crate::BurnTxStatus, CctpError> {
-        self.burn_status_with_config(tx_hash, self.burn_drop_config)
+        self.burn_status_with_config(tx_hash, submitted_after_block, self.burn_drop_config)
             .await
     }
 
@@ -621,22 +625,36 @@ impl<W: Wallet> CctpEndpoint<W> {
     ///   [`BurnTxStatus::MinedReverted`] (returns immediately)
     /// - no receipt, tx still visible via `get_transaction_by_hash` (mempool) ->
     ///   [`BurnTxStatus::Pending`] (returns immediately)
-    /// - no receipt and tx absent from the mempool -> KEEPS POLLING (does NOT
-    ///   return `Pending` early); only once `config.grace` has elapsed AND
-    ///   `config.consecutive_misses` consecutive post-grace absences are observed
-    ///   does it return [`BurnTxStatus::Dropped`].
-    ///
-    /// A still-pending burn (broadcast but unmined) thus never reports `Dropped`,
-    /// so the caller never re-burns a tx that may still land -- the exact
-    /// double-burn hazard a chain-head-margin heuristic alone cannot rule out.
+    /// - no receipt and tx absent from the mempool -> keeps polling with known
+    ///   submission evidence; only once `config.grace` has elapsed AND
+    ///   `config.consecutive_misses` consecutive post-grace absences are
+    ///   qualified against an advancing canonical head beyond the submission
+    ///   boundary and its unused sender nonce does it return suspected
+    ///   [`BurnTxStatus::Dropped`]. Unknown identity, consumed nonce, missing
+    ///   state or frozen/lagging heads remain [`BurnTxStatus::Pending`]. Head
+    ///   progress starts after grace and has a further bounded observation
+    ///   window: the larger of grace or enough polls for progress plus misses.
+    ///   The verdict is not proof of global mempool absence and never permits
+    ///   an automatic reburn.
     pub(super) async fn burn_status_with_config(
         &self,
         tx_hash: TxHash,
+        submitted_after_block: u64,
         config: BurnDropConfig,
     ) -> Result<crate::BurnTxStatus, CctpError> {
         let provider = self.wallet.provider();
         let start = Instant::now();
+        let observation_window = (0..SCAN_FINALITY_MARGIN)
+            .fold(
+                config
+                    .poll_interval
+                    .saturating_mul(config.consecutive_misses),
+                |window, _| window.saturating_add(config.poll_interval),
+            )
+            .max(config.grace);
+        let observation_limit = config.grace.saturating_add(observation_window);
         let mut consecutive_misses = 0u32;
+        let mut reference_head = None;
         let mut poll = interval(config.poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -657,7 +675,13 @@ impl<W: Wallet> CctpEndpoint<W> {
                 // SUCCESS -- reburning before the revert is confirmation-deep would then
                 // double-burn. Re-fetch through the wallet's confirmation-aware path
                 // (mirroring the success path) before trusting the revert.
-                let confirmed = self.wallet.await_receipt(tx_hash).await?;
+                let confirmed = match self.wallet.await_receipt(tx_hash).await {
+                    Ok(confirmed) => confirmed,
+                    Err(error) if error.is_transaction_dropped() => {
+                        return Ok(crate::BurnTxStatus::Dropped);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 return Ok(if confirmed.status() {
                     crate::BurnTxStatus::MinedSuccess
                 } else {
@@ -671,17 +695,61 @@ impl<W: Wallet> CctpEndpoint<W> {
                 return Ok(crate::BurnTxStatus::Pending);
             }
 
-            // Absent from both receipt and mempool. Keep polling within this call
-            // rather than returning early: only after the grace period AND
-            // `consecutive_misses` consecutive absences is the absence trusted as a
-            // true drop. Before that, a transient absence (lagging node, not-yet-
-            // propagated tx) keeps polling so a tx that mines late is still seen and
-            // a still-pending tx is never re-burned.
-            if start.elapsed() >= config.grace {
-                consecutive_misses += 1;
-                if consecutive_misses >= config.consecutive_misses {
-                    return Ok(crate::BurnTxStatus::Dropped);
+            // Qualify independent receipt/mempool misses with sender state at
+            // the exact canonical head hash. A separate latest nonce read can
+            // hit a stale backend and falsely authenticate a hidden mined tx.
+            let Some(mut submission) = self.wallet.transaction_submission(tx_hash) else {
+                warn!(%tx_hash, "No recorded sender nonce for burn; absence remains pending");
+                return Ok(crate::BurnTxStatus::Pending);
+            };
+            let Some(tracked_floor) = submission.submitted_after_block else {
+                warn!(%tx_hash, sender = %submission.sender, nonce = submission.nonce,
+                    "No recorded submission boundary for burn; caller floor cannot qualify absence");
+                return Ok(crate::BurnTxStatus::Pending);
+            };
+            submission.submitted_after_block = Some(tracked_floor.max(submitted_after_block));
+            let head = match qualified_absence_head(provider, submission, SCAN_FINALITY_MARGIN)
+                .await
+            {
+                Ok(Some(head)) => head,
+                Ok(None) => {
+                    consecutive_misses = 0;
+                    reference_head = None;
+                    if start.elapsed() >= observation_limit {
+                        return Ok(crate::BurnTxStatus::Pending);
+                    }
+                    continue;
                 }
+                Err(error) => {
+                    warn!(?error, %tx_hash, "Cannot qualify burn absence against canonical nonce state");
+                    return Ok(crate::BurnTxStatus::Pending);
+                }
+            };
+            if start.elapsed() < config.grace {
+                continue;
+            }
+
+            // Advancement before grace is not freshness evidence for the
+            // absence run being judged now. Give the post-grace reference a
+            // bounded opportunity to advance, including zero-grace test seams.
+            let reference = *reference_head.get_or_insert(head);
+            if head.saturating_sub(reference) < SCAN_FINALITY_MARGIN {
+                consecutive_misses = 0;
+                if start.elapsed() >= observation_limit {
+                    return Ok(crate::BurnTxStatus::Pending);
+                }
+                continue;
+            }
+
+            // Keep polling within this call rather than returning early: only
+            // after grace AND consecutive qualified misses is a drop suspected.
+            // This never authorizes automatically submitting another burn.
+            consecutive_misses += 1;
+            if consecutive_misses >= config.consecutive_misses {
+                return Ok(crate::BurnTxStatus::Dropped);
+            }
+            if start.elapsed() >= observation_limit {
+                return Ok(crate::BurnTxStatus::Pending);
             }
         }
     }
@@ -1662,7 +1730,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     }
 
     /// Overrides the [`burn_status`](Self::burn_status) drop policy. Test-only:
-    /// lets resume tests classify an absent burn tx as `Dropped` immediately
+    /// lets resume tests shorten the grace without bypassing freshness
     /// instead of waiting out the production 30 s grace window.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
@@ -1821,10 +1889,501 @@ fn parse_mint_receipt_for_message(
 #[cfg(test)]
 mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-    use alloy::primitives::{Bloom, Log as PrimitiveLog};
+    use alloy::primitives::{Bloom, Log as PrimitiveLog, Signature};
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{ProviderBuilder, RootProvider};
     use alloy::rpc::types::Log;
+    use async_trait::async_trait;
+    use httpmock::{Mock, MockServer};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    use st0x_evm::TransactionSubmission;
+    use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
+
+    struct BurnProbeWallet {
+        provider: RootProvider,
+        hash: TxHash,
+        submission: TransactionSubmission,
+        confirmation: Mutex<Option<Result<TransactionReceipt, EvmError>>>,
+    }
+
+    #[async_trait]
+    impl Evm for BurnProbeWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for BurnProbeWallet {
+        fn address(&self) -> Address {
+            self.submission.sender
+        }
+
+        fn transaction_submission(&self, hash: TxHash) -> Option<TransactionSubmission> {
+            (hash == self.hash).then_some(self.submission)
+        }
+
+        async fn sign_typed_data(&self, _: String, _: B256) -> Result<Signature, EvmError> {
+            panic!("absence probing must not sign")
+        }
+
+        async fn prepare_pending(
+            &self,
+            _: Address,
+            _: Bytes,
+            _: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!("absence probing must not prepare")
+        }
+
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _: Address,
+            _: Bytes,
+            _: u64,
+            _: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!("absence probing must not prepare")
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _: &PreparedTransaction,
+            _: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!("absence probing must not broadcast")
+        }
+
+        async fn discard_prepared(&self, _: TxHash) {
+            panic!("absence probing must not release nonce ownership")
+        }
+
+        async fn release_superseded(&self, _: TxHash) {
+            panic!("absence probing must not release nonce ownership")
+        }
+
+        async fn restore_prepared(&self, _: &PreparedTransaction) {
+            panic!("absence probing must not restore ownership")
+        }
+
+        async fn restore_transaction(&self, _: TxHash) -> Result<(), EvmError> {
+            panic!("absence probing must not restore ownership")
+        }
+
+        async fn send_pending(&self, _: Address, _: Bytes, _: &str) -> Result<TxHash, EvmError> {
+            panic!("absence probing must not send")
+        }
+
+        async fn await_receipt(&self, hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            assert_eq!(hash, self.hash);
+            self.confirmation
+                .lock()
+                .unwrap()
+                .take()
+                .expect("absent receipt fixture must not confirm")
+        }
+
+        async fn send(
+            &self,
+            _: Address,
+            _: Bytes,
+            _: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            panic!("absence probing must not send")
+        }
+    }
+
+    fn burn_probe_wallet(
+        floor: Option<u64>,
+        next_nonce: u64,
+        heads: impl Iterator<Item = u64>,
+    ) -> BurnProbeWallet {
+        burn_probe_observations(floor, heads.map(|head| (head, next_nonce)))
+    }
+
+    fn burn_probe_observations(
+        floor: Option<u64>,
+        observations: impl Iterator<Item = (u64, u64)>,
+    ) -> BurnProbeWallet {
+        let asserter = Asserter::new();
+        for (head, next_nonce) in observations {
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::Null);
+            let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+            block.header.number = head;
+            block.header.hash = alloy::primitives::BlockHash::random();
+            asserter.push_success(&block);
+            if head >= floor.unwrap_or(40) + SCAN_FINALITY_MARGIN {
+                asserter.push_success(&next_nonce);
+            }
+        }
+        BurnProbeWallet {
+            confirmation: Mutex::new(None),
+            provider: ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(asserter),
+            hash: TxHash::random(),
+            submission: TransactionSubmission {
+                sender: Address::random(),
+                nonce: 0,
+                submitted_after_block: floor,
+            },
+        }
+    }
+
+    /// Known identity and advancing heads must not mask the recorded burn's
+    /// additional submission floor with the wallet's older boundary.
+    #[tokio::test]
+    async fn burn_status_reports_pending_when_node_lags_submission_block() {
+        let server = MockServer::start_async().await;
+        let mut nonce_probes = Vec::new();
+        let mut head_probes = Vec::new();
+        // Match methods independently: caller-floor qualification skips nonce
+        // reads, so a FIFO queue containing them would corrupt the next receipt.
+        // IDs also make the observed heads advance without a stateful matcher.
+        for id in 0u64..16 {
+            for method in [
+                "eth_getTransactionReceipt",
+                "eth_getTransactionByHash",
+                "eth_getBlockByNumber",
+                "eth_getTransactionCount",
+            ] {
+                let result = match method {
+                    "eth_getBlockByNumber" => {
+                        let mut block: alloy::rpc::types::Block =
+                            alloy::rpc::types::Block::default();
+                        block.header.number = 42 + id;
+                        block.header.hash = alloy::primitives::BlockHash::random();
+                        serde_json::to_value(block).unwrap()
+                    }
+                    "eth_getTransactionCount" => json!("0x0"),
+                    _ => serde_json::Value::Null,
+                };
+                let mock = server
+                    .mock_async(|when, then| {
+                        when.json_body_includes(json!({ "method": method, "id": id }).to_string());
+                        then.status(200)
+                            .json_body(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                    })
+                    .await;
+                match method {
+                    "eth_getTransactionCount" => nonce_probes.push(mock),
+                    "eth_getBlockByNumber" => head_probes.push(mock),
+                    _ => {}
+                }
+            }
+        }
+        let mut wallet = burn_probe_wallet(Some(0), 0, std::iter::empty());
+        wallet.provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(server.url("/").parse().unwrap());
+        let hash = wallet.hash;
+        let endpoint = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+
+        let status = endpoint
+            .burn_status_with_config(
+                hash,
+                100,
+                BurnDropConfig {
+                    grace: Duration::ZERO,
+                    consecutive_misses: 1,
+                    poll_interval: Duration::from_millis(500),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::BurnTxStatus::Pending,
+            "known identity and heads beyond wallet floor 0 but behind burn floor 100 \
+             cannot qualify a drop"
+        );
+        assert!(
+            head_probes.iter().map(Mock::calls).sum::<usize>() >= 2,
+            "fixture must expose advancing heads, not an unknown-identity or frozen-head shortcut"
+        );
+        assert_eq!(
+            nonce_probes.iter().map(Mock::calls).sum::<usize>(),
+            0,
+            "heads behind the caller floor must not qualify canonical nonce absence"
+        );
+    }
+
+    async fn probe_burn(wallet: BurnProbeWallet, caller_floor: u64) -> crate::BurnTxStatus {
+        let hash = wallet.hash;
+        let evm = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+        evm.burn_status_with_config(
+            hash,
+            caller_floor,
+            BurnDropConfig {
+                grace: Duration::from_millis(10),
+                consecutive_misses: 3,
+                poll_interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn probe_reverted_burn(
+        confirmation: impl FnOnce(TxHash) -> Result<TransactionReceipt, EvmError>,
+    ) -> Result<crate::BurnTxStatus, CctpError> {
+        let mut wallet = burn_probe_wallet(Some(40), 0, std::iter::empty());
+        let hash = wallet.hash;
+        let asserter = Asserter::new();
+        let mut shallow_revert = receipt_with_logs(Vec::new());
+        shallow_revert.transaction_hash = hash;
+        match &mut shallow_revert.inner {
+            ReceiptEnvelope::Eip1559(receipt) => receipt.receipt.status = false.into(),
+            other => panic!("unexpected fixture receipt envelope {other:?}"),
+        }
+        asserter.push_success(&shallow_revert);
+        wallet.provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(asserter);
+        wallet.confirmation = Mutex::new(Some(confirmation(hash)));
+        let evm = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+        evm.burn_status_with_config(hash, 40, BurnDropConfig::fast())
+            .await
+    }
+
+    #[tokio::test]
+    async fn burn_status_shallow_revert_then_confirmation_drop_reports_dropped() {
+        let status = probe_reverted_burn(|hash| {
+            Err(EvmError::TransactionDropped {
+                tx_hash: hash,
+                elapsed_secs: 30,
+            })
+        })
+        .await;
+        assert!(
+            matches!(status, Ok(crate::BurnTxStatus::Dropped)),
+            "a qualified confirmation drop must reach dropped-burn recovery: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_status_shallow_revert_preserves_confirmation_timeout() {
+        let status = probe_reverted_burn(|hash| {
+            Err(EvmError::ReceiptTimeout {
+                tx_hash: hash,
+                timeout_secs: 120,
+            })
+        })
+        .await;
+        assert!(
+            matches!(
+                status,
+                Err(CctpError::Evm(EvmError::ReceiptTimeout {
+                    timeout_secs: 120,
+                    ..
+                }))
+            ),
+            "a confirmation timeout must remain a typed retryable error: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_status_shallow_revert_uses_confirmed_success_after_reorg() {
+        let status = probe_reverted_burn(|hash| {
+            let mut confirmed = receipt_with_logs(Vec::new());
+            confirmed.transaction_hash = hash;
+            Ok(confirmed)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, crate::BurnTxStatus::MinedSuccess);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_requires_advancing_canonical_unused_nonce_beyond_submission() {
+        for (floor, nonce, advancing, expected) in [
+            (40, 0, true, crate::BurnTxStatus::Dropped),
+            (1000, 0, true, crate::BurnTxStatus::Pending),
+            (40, 1, true, crate::BurnTxStatus::Pending),
+            (40, 0, false, crate::BurnTxStatus::Pending),
+        ] {
+            let wallet = burn_probe_wallet(
+                Some(floor),
+                nonce,
+                (0..200).map(|index| if advancing { 42 + index } else { 42 }),
+            );
+            let status = probe_burn(wallet, floor).await;
+            assert_eq!(
+                status, expected,
+                "floor {floor}, nonce {nonce}, advancing {advancing}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_caller_floor_cannot_replace_unknown_submission_boundary() {
+        let wallet = burn_probe_wallet(None, 0, (0..200).map(|index| 42 + index));
+        assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Pending);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_pre_grace_progress_cannot_qualify_frozen_post_grace_head() {
+        let wallet = burn_probe_wallet(Some(40), 0, (0..200).map(|index| 42 + index.min(9)));
+        let start = Instant::now();
+        assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Pending);
+        assert_eq!(start.elapsed(), Duration::from_millis(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_allows_progress_after_grace_before_suspecting_drop() {
+        let wallet = burn_probe_wallet(
+            Some(40),
+            0,
+            (0u64..200).map(|index| 42 + index.saturating_sub(10)),
+        );
+        assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Dropped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_restored_prepared_without_boundary_remains_pending() {
+        let probe = burn_probe_wallet(None, 0, (0..200).map(|index| 42 + index));
+        let wallet = RawPrivateKeyWallet::new(&B256::random(), probe.provider, 1).unwrap();
+        let hash = probe.hash;
+        wallet
+            .restore_prepared(&PreparedTransaction::for_test(hash, 0))
+            .await;
+        let evm = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+        assert_eq!(
+            evm.burn_status_with_config(
+                hash,
+                40,
+                BurnDropConfig {
+                    grace: Duration::from_millis(10),
+                    consecutive_misses: 3,
+                    poll_interval: Duration::from_millis(1),
+                }
+            )
+            .await
+            .unwrap(),
+            crate::BurnTxStatus::Pending
+        );
+        assert!(
+            evm.wallet.transaction_submission(hash).is_some(),
+            "Pending must retain restored nonce ownership"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_caller_floor_cannot_lower_known_submission_boundary() {
+        let wallet = burn_probe_wallet(Some(1000), 0, (0..200).map(|index| 42 + index));
+        assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Pending);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_inconclusive_post_grace_poll_allows_later_fresh_progress() {
+        for consumed_nonce in [false, true] {
+            let wallet = burn_probe_observations(
+                Some(40),
+                (0..200).map(|index| {
+                    if index == 10 {
+                        if consumed_nonce { (60, 1) } else { (40, 0) }
+                    } else {
+                        (60 + index, 0)
+                    }
+                }),
+            );
+            let start = Instant::now();
+            assert_eq!(
+                probe_burn(wallet, 40).await,
+                crate::BurnTxStatus::Dropped,
+                "a single inconclusive post-grace poll cannot restart grace"
+            );
+            assert_eq!(start.elapsed(), Duration::from_millis(15));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_inconclusive_run_stays_pending_until_existing_bound() {
+        for (head, nonce) in [(40, 0), (42, 1)] {
+            let wallet = burn_probe_observations(Some(40), std::iter::repeat_n((head, nonce), 200));
+            let start = Instant::now();
+            assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Pending);
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_millis(20),
+                "inconclusive canonical state must use the same bounded observation window"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_inconclusive_poll_resets_reference_and_consecutive_misses() {
+        for consumed_nonce in [false, true] {
+            let wallet = burn_probe_observations(
+                Some(40),
+                (0..200).map(|index| match index {
+                    0..=13 => (60 + index, 0),
+                    14 if consumed_nonce => (74, 1),
+                    14 => (40, 0),
+                    15 | 16 => (75, 0),
+                    _ => (77 + index - 17, 0),
+                }),
+            );
+            let start = Instant::now();
+            assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Dropped);
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_millis(19),
+                "inconclusive poll must reset both the old head reference and accumulated misses"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burn_status_zero_grace_still_allows_post_grace_progress() {
+        let wallet = burn_probe_wallet(Some(40), 0, (0..200).map(|index| 42 + index));
+        let hash = wallet.hash;
+        let evm = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+        assert_eq!(
+            evm.burn_status_with_config(hash, 40, BurnDropConfig::fast())
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::Dropped
+        );
+    }
 
     /// Guards the values of the allowance constants against accidental change.
     ///
