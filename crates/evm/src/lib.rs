@@ -1143,12 +1143,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{Address, Bloom, U256};
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    use alloy::primitives::Bloom;
+    use alloy::primitives::{Address, U256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::rpc::types::TransactionReceipt;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
@@ -1539,6 +1543,69 @@ mod tests {
         assert!(
             matches!(error, EvmError::WalletConfigParse(_)),
             "expected WalletConfigParse error from credentials parse, got: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_blank_organization_id_during_parse() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "   "
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key":
+                    "0000000000000000000000000000000000000000000000000000000000000001"
+            }))),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected blank organization ID to fail during parsing");
+        };
+
+        assert!(
+            matches!(error, EvmError::WalletConfigParse(_)),
+            "expected WalletConfigParse error, got: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_invalid_api_key_during_parse() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "org-test-123"
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key": "not-a-p256-private-key"
+            }))),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected malformed API private key to fail during parsing");
+        };
+
+        assert!(
+            matches!(error, EvmError::WalletConfigParse(_)),
+            "expected WalletConfigParse error, got: {error:?}"
         );
     }
 
