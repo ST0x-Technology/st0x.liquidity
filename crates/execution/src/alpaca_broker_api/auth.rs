@@ -4,6 +4,8 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use st0x_alpaca::broker::AccountStatus;
+
 use super::TimeInForce;
 /// Strongly typed Alpaca account identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +14,10 @@ pub struct AlpacaAccountId(Uuid);
 impl AlpacaAccountId {
     pub const fn new(uuid: Uuid) -> Self {
         Self(uuid)
+    }
+
+    pub const fn into_inner(self) -> Uuid {
+        self.0
     }
 }
 
@@ -200,29 +206,6 @@ impl std::fmt::Debug for AlpacaBrokerApiCtx {
             )
             .finish()
     }
-}
-
-/// Account status from Alpaca Broker API
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AccountStatus {
-    Onboarding,
-    SubmissionFailed,
-    Submitted,
-    AccountUpdated,
-    ApprovalPending,
-    Active,
-    Rejected,
-    Disabled,
-    DisableRequested,
-    AccountClosed,
-}
-
-/// Response from the account verification endpoint
-#[derive(Debug, Deserialize)]
-pub(super) struct AccountResponse {
-    pub id: Uuid,
-    pub status: AccountStatus,
 }
 
 #[cfg(test)]

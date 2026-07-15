@@ -98,6 +98,7 @@ st0x-config = { path = "crates/config" }
 st0x-dto = { path = "crates/dto" }
 st0x-evm = { path = "crates/evm" }
 st0x-execution = { path = "crates/execution" }
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "ab153b2abf254aa7e214a90f7ee53b2053bb9e0d", version = "0.1.0" }
 st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0" }
 st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0" }
 st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0" }

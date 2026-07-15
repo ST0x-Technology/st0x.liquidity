@@ -8,7 +8,6 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::alpaca_market_data::AlpacaMarketDataError;
 use crate::{
     ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares, Positive, Symbol, Usd,
 };
@@ -32,7 +31,6 @@ mod activity;
 mod auth;
 mod client;
 mod executor;
-mod journal;
 mod market_hours;
 #[cfg(feature = "mock")]
 mod mock_api;
@@ -45,39 +43,17 @@ pub use mock_api::{
 mod order;
 mod positions;
 
-/// Asset status from Alpaca Broker API (public because it's exposed in error types)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AssetStatus {
-    Active,
-    Inactive,
-}
-
 pub use activity::{AccountActivitiesQuery, AccountActivity};
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 // Exposed as the single source of truth for the broker HTTP request timeout so
 // timing-sensitive integration tests derive their boundaries from it.
 pub use client::HTTP_REQUEST_TIMEOUT;
 pub use executor::AlpacaBrokerApi;
-pub use journal::{JournalResponse, JournalStatus};
-pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError,
+pub use order::{AlpacaLimitOrder, AlpacaLimitPrice, ParseAlpacaLimitPriceError};
+pub use st0x_alpaca::broker::{
+    AssetStatus, ConversionDirection, CryptoOrderFailureReason, CryptoOrderOutcome,
+    CryptoOrderResponse, JournalResponse, JournalStatus,
 };
-
-impl fmt::Display for CryptoOrderFailureReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Canceled => formatter.write_str("Canceled"),
-            Self::Expired => formatter.write_str("Expired"),
-            Self::Rejected => formatter.write_str("Rejected"),
-            Self::DoneForDay => formatter.write_str("DoneForDay"),
-            Self::Replaced => formatter.write_str("Replaced"),
-            Self::Suspended => formatter.write_str("Suspended"),
-            Self::Calculated => formatter.write_str("Calculated"),
-        }
-    }
-}
 
 impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,32 +84,6 @@ impl FromStr for TimeInForce {
     }
 }
 
-impl TimeInForce {
-    /// Returns the API string representation for this time-in-force value.
-    pub(crate) fn as_api_str(self) -> &'static str {
-        match self {
-            Self::Day => "day",
-            Self::MarketOnClose => "cls",
-        }
-    }
-}
-
-/// Terminal failure states for crypto orders.
-///
-/// Every non-fill terminal `BrokerOrderStatus` maps to one of these so the
-/// conversion resume path never treats an unexpected terminal status as
-/// still-pending (which would retry forever).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CryptoOrderFailureReason {
-    Canceled,
-    Expired,
-    Rejected,
-    DoneForDay,
-    Replaced,
-    Suspended,
-    Calculated,
-}
-
 /// A field absent from a broker order response that the reported order
 /// status requires.
 ///
@@ -149,6 +99,15 @@ pub enum MissingOrderField {
 
 #[derive(Debug, Error)]
 pub enum AlpacaBrokerApiError {
+    #[error(transparent)]
+    SharedClient(#[from] st0x_alpaca::AlpacaError),
+
+    #[error(transparent)]
+    SharedBroker(st0x_alpaca::broker::BrokerApiError),
+
+    #[error(transparent)]
+    SharedMarketData(#[from] st0x_alpaca::market_data::AlpacaMarketDataError),
+
     #[error("HTTP client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
@@ -278,10 +237,46 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
-    #[error("latest trade lookup failed: {0}")]
-    LatestTrade(#[from] AlpacaMarketDataError),
     #[error("counter-trade cost estimation failed: {0}")]
     CounterTradeCost(#[from] CounterTradeCostError),
+}
+
+impl From<st0x_alpaca::broker::BrokerApiError> for AlpacaBrokerApiError {
+    fn from(error: st0x_alpaca::broker::BrokerApiError) -> Self {
+        match error {
+            st0x_alpaca::broker::BrokerApiError::CryptoOrderFailed { order_id, reason } => {
+                Self::CryptoOrderFailed { order_id, reason }
+            }
+            st0x_alpaca::broker::BrokerApiError::Alpaca(st0x_alpaca::AlpacaError::Api {
+                status_code,
+                body,
+            }) => map_shared_api_error(status_code, body),
+            error => Self::SharedBroker(error),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AlpacaApiErrorBody {
+    code: Option<u64>,
+    message: Option<String>,
+}
+
+fn map_shared_api_error(status_code: u16, body: String) -> AlpacaBrokerApiError {
+    let Ok(status) = reqwest::StatusCode::from_u16(status_code) else {
+        return AlpacaBrokerApiError::SharedBroker(st0x_alpaca::broker::BrokerApiError::Alpaca(
+            st0x_alpaca::AlpacaError::Api { status_code, body },
+        ));
+    };
+    let parsed = serde_json::from_str::<AlpacaApiErrorBody>(&body).ok();
+    let alpaca_code = parsed.as_ref().and_then(|error| error.code);
+    let message = parsed.and_then(|error| error.message).unwrap_or(body);
+
+    AlpacaBrokerApiError::ApiError {
+        status,
+        alpaca_code,
+        message,
+    }
 }
 
 fn format_api_error(

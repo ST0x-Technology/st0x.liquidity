@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,24 +11,17 @@ use st0x_float_serde::format_float_with_fallback;
 
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
-use super::journal::JournalResponse;
-use super::order::{
-    AlpacaLimitOrder, ConversionDirection, CryptoOrderOutcome, CryptoOrderResponse,
+use super::order::AlpacaLimitOrder;
+use super::{
+    AlpacaBrokerApiError, AssetStatus, ConversionDirection, CryptoOrderOutcome,
+    CryptoOrderResponse, JournalResponse, MissingOrderField, TimeInForce,
 };
-use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
     ExecutorOrderId, FractionalShares, InventoryResult, LimitOrder, MarketOrder, MarketSession,
     OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
     Usd, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
-
-/// Response from the asset endpoint
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct AssetResponse {
-    pub status: AssetStatus,
-    pub tradable: bool,
-}
 
 /// Cached asset information with expiration tracking
 #[derive(Debug, Clone)]
@@ -40,7 +32,7 @@ struct CachedAsset {
 }
 
 impl CachedAsset {
-    fn from_response(response: &AssetResponse) -> Self {
+    fn from_response(response: &st0x_alpaca::broker::Asset) -> Self {
         Self {
             status: response.status,
             tradable: response.tradable,
@@ -97,7 +89,7 @@ impl Executor for AlpacaBrokerApi {
     async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error> {
         let client = AlpacaBrokerApiClient::new(&ctx)?;
 
-        let account = client.verify_account().await?;
+        let account = st0x_alpaca::broker::verify_account(client.broker()).await?;
 
         if account.status != AccountStatus::Active {
             return Err(AlpacaBrokerApiError::AccountNotActive {
@@ -238,16 +230,15 @@ impl Executor for AlpacaBrokerApi {
                 Ok(crate::resolve_sell_preflight(order, available)?)
             }
             Direction::Buy => {
-                let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
-                    self.client.market_data_http_client(),
-                    self.client.market_data_base_url(),
-                    &order.symbol,
-                )
-                .await?;
+                let latest_trade_price = self
+                    .client
+                    .market_data()
+                    .latest_trade_price(&order.symbol)
+                    .await?;
                 let account_funds = super::positions::get_account_funds(&self.client).await?;
                 let estimated_cost_cents = estimate_buffered_cost_cents(
                     order.shares,
-                    latest_trade_price.inner().inner(),
+                    latest_trade_price.inner(),
                     self.counter_trade_slippage_bps,
                 )?;
 
@@ -276,13 +267,8 @@ impl Executor for AlpacaBrokerApi {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<Positive<Usd>>, Self::Error> {
-        let price = crate::alpaca_market_data::fetch_latest_trade_price(
-            self.client.market_data_http_client(),
-            self.client.market_data_base_url(),
-            symbol,
-        )
-        .await?;
-        Ok(Some(price))
+        let price = self.client.market_data().latest_trade_price(symbol).await?;
+        Ok(Some(Positive::new(price)?))
     }
 
     async fn market_session(&self) -> Result<MarketSession, Self::Error> {
@@ -315,7 +301,17 @@ impl Executor for AlpacaBrokerApi {
         order_id: &Self::OrderId,
     ) -> Result<CancellationOutcome, Self::Error> {
         let order_uuid = Uuid::parse_str(order_id)?;
-        self.client.cancel_order(order_uuid).await
+        st0x_alpaca::broker::cancel_order(self.client.broker(), order_uuid)
+            .await
+            .map(|outcome| match outcome {
+                st0x_alpaca::broker::CancellationOutcome::Requested => {
+                    CancellationOutcome::Requested
+                }
+                st0x_alpaca::broker::CancellationOutcome::OrderNotFound => {
+                    CancellationOutcome::OrderNotFound
+                }
+            })
+            .map_err(Into::into)
     }
 }
 
@@ -355,7 +351,9 @@ impl AlpacaBrokerApi {
             "USDC/USD conversion order placed, polling for completion..."
         );
 
-        super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+        st0x_alpaca::broker::poll_crypto_order_until_filled(self.client.broker(), order.id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Looks up a previously-placed conversion order by its `client_order_id`
@@ -365,9 +363,12 @@ impl AlpacaBrokerApi {
         &self,
         client_order_id: &ClientOrderId,
     ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
-        self.client
-            .get_crypto_order_by_client_order_id(client_order_id)
-            .await
+        st0x_alpaca::broker::get_crypto_order_by_client_order_id(
+            self.client.broker(),
+            &st0x_alpaca::broker::ClientOrderId(client_order_id.to_string()),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Polls a previously-placed conversion order until it reaches a terminal
@@ -383,7 +384,8 @@ impl AlpacaBrokerApi {
         order_id: Uuid,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
         loop {
-            let order = self.client.get_crypto_order(order_id).await?;
+            let order =
+                st0x_alpaca::broker::get_crypto_order(self.client.broker(), order_id).await?;
 
             match order.classify() {
                 CryptoOrderOutcome::Filled | CryptoOrderOutcome::Failed(_) => return Ok(order),
@@ -402,9 +404,14 @@ impl AlpacaBrokerApi {
         symbol: &Symbol,
         quantity: Positive<FractionalShares>,
     ) -> Result<JournalResponse, AlpacaBrokerApiError> {
-        self.client
-            .create_journal(destination, symbol, quantity)
-            .await
+        st0x_alpaca::broker::create_journal(
+            self.client.broker(),
+            destination.into_inner(),
+            symbol.clone(),
+            quantity.inner(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Place a manual Alpaca-specific limit order for operator intervention.
@@ -434,7 +441,7 @@ impl AlpacaBrokerApi {
             }
         }
 
-        let response = self.client.get_asset(symbol).await?;
+        let response = st0x_alpaca::broker::get_asset(self.client.broker(), symbol).await?;
         let cached = CachedAsset::from_response(&response);
 
         {
@@ -518,14 +525,14 @@ mod tests {
             "tradable": true
         });
 
-        let response: AssetResponse = serde_json::from_value(json).unwrap();
+        let response: st0x_alpaca::broker::Asset = serde_json::from_value(json).unwrap();
         assert_eq!(response.status, AssetStatus::Active);
         assert!(response.tradable);
     }
 
     #[test]
     fn test_cached_asset_from_response() {
-        let response = AssetResponse {
+        let response = st0x_alpaca::broker::Asset {
             status: AssetStatus::Active,
             tradable: true,
         };

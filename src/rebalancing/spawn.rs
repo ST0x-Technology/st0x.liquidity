@@ -318,12 +318,15 @@ mod tests {
             TelemetrySender::disabled(),
         );
 
-        let wallet = Arc::new(AlpacaWalletService::new(
-            server.base_url(),
-            account_id,
-            "test_key".into(),
-            "test_secret".into(),
-        ));
+        let wallet = Arc::new(
+            AlpacaWalletService::new(
+                server.base_url(),
+                account_id,
+                "test_key".into(),
+                "test_secret".into(),
+            )
+            .unwrap(),
+        );
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {

@@ -39,10 +39,10 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
-    let usdc_symbol = TokenSymbol::new("USDC");
+    let usdc_symbol = TokenSymbol::new("USDC")?;
     let ethereum = Network::new("ethereum");
     let deposit_address = alpaca_wallet
         .get_wallet_address(&usdc_symbol, &ethereum)
@@ -100,7 +100,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
             writeln!(
                 stdout,
                 "   Amount: {} USDC",
-                format_float_with_fallback(&transfer.amount)
+                format_float_with_fallback(&transfer.amount.inner())
             )?;
         }
         TransferStatus::Failed => {
@@ -207,9 +207,9 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
-    let usdc_asset = TokenSymbol::new("USDC");
+    let usdc_asset = TokenSymbol::new("USDC")?;
 
     let Some(to_address) = to_address else {
         writeln!(stdout, "\nNo --to address provided.")?;
@@ -285,7 +285,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
             writeln!(
                 stdout,
                 "   Amount: {} USDC",
-                format_float_with_fallback(&final_transfer.amount)
+                format_float_with_fallback(&final_transfer.amount.inner())
             )?;
 
             if let Some(tx_hash) = final_transfer.tx {
@@ -361,7 +361,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
     let existing = alpaca_wallet.get_whitelisted_addresses().await?;
@@ -379,7 +379,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     let entry = alpaca_wallet
         .create_whitelist_entry(
             &target_address,
-            &TokenSymbol::new("USDC"),
+            &TokenSymbol::new("USDC")?,
             &Network::new("ethereum"),
             &travel_rule_info,
         )
@@ -417,7 +417,7 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
     writeln!(stdout, "Fetching whitelisted addresses...")?;
 
@@ -470,7 +470,7 @@ pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
     let patched = alpaca_wallet
         .patch_all_whitelist_travel_rules(&travel_rule_info)
@@ -509,7 +509,7 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
     let removed = alpaca_wallet.remove_whitelist_entries(&address).await?;
 
@@ -538,7 +538,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    );
+    )?;
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
     writeln!(stdout, "   Account: {}", alpaca_auth.account_id)?;
@@ -571,7 +571,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
         writeln!(
             stdout,
             "   Amount: {} {}",
-            format_float_with_fallback(&transfer.amount),
+            format_float_with_fallback(&transfer.amount.inner()),
             transfer.asset
         )?;
         writeln!(stdout, "   Status: {:?}", transfer.status)?;
@@ -628,29 +628,29 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(
         stdout,
         "   Quantity: {}",
-        format_float_with_fallback(&order.quantity)
+        format_float_with_fallback(&order.quantity.inner())
     )?;
     writeln!(stdout, "   Status: {}", order.status_display())?;
     if let Some(price) = order.filled_average_price {
         writeln!(
             stdout,
             "   Filled Price: ${}",
-            format_float_with_fallback(&price)
+            format_float_with_fallback(&price.inner())
         )?;
     }
     if let Some(filled_quantity) = order.filled_quantity {
         writeln!(
             stdout,
             "   Filled Quantity: {}",
-            format_float_with_fallback(&filled_quantity)
+            format_float_with_fallback(&filled_quantity.inner())
         )?;
     }
     if let (Some(price), Some(quantity)) = (order.filled_average_price, order.filled_quantity) {
-        let usd_amount = (price * quantity)?;
+        let usd_amount = (price * quantity.inner())?;
         writeln!(
             stdout,
             "   USD Amount: ${}",
-            format_float_with_fallback(&usd_amount)
+            format_float_with_fallback(&usd_amount.inner())
         )?;
     }
     writeln!(stdout, "   Created: {}", order.created_at)?;
@@ -687,7 +687,11 @@ pub(super) async fn alpaca_journal_command<W: Write>(
     writeln!(stdout, "   Quantity: {}", response.quantity)?;
 
     if let Some(price) = response.price {
-        writeln!(stdout, "   Price: ${}", format_float_with_fallback(&price))?;
+        writeln!(
+            stdout,
+            "   Price: ${}",
+            format_float_with_fallback(&price.inner())
+        )?;
     }
 
     if let Some(settle_date) = &response.settle_date {

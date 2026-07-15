@@ -548,7 +548,7 @@ async fn run_usdc_transfer<Writer: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-    ));
+    )?);
 
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
         usdc_ethereum: USDC_ETHEREUM,
