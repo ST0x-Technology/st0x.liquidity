@@ -8,13 +8,11 @@ use tracing::warn;
 use std::fmt::{self, Debug, Display};
 use std::str::FromStr;
 
-use st0x_dto::{TransferOperation, TransferWarning};
-use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
-use st0x_finance::Id;
-
 use crate::equity_redemption::EquityRedemption;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
+use st0x_dto::{TransferOperation, TransferWarning};
+use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
 
 /// The three categories of cross-venue transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +88,7 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
             &cutoff,
             TransferWarning::MintCategoryUnavailable,
             |id| TransferWarning::MintReplayFailed {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
             },
             TokenizedEquityMint::to_dto,
         )
@@ -100,7 +98,7 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
             &cutoff,
             TransferWarning::RedemptionCategoryUnavailable,
             |id| TransferWarning::RedemptionReplayFailed {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
             },
             EquityRedemption::to_dto,
         )
@@ -110,7 +108,7 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
             &cutoff,
             TransferWarning::BridgeCategoryUnavailable,
             |id| TransferWarning::BridgeReplayFailed {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
             },
             UsdcRebalance::to_dto,
         )
@@ -157,7 +155,7 @@ pub(crate) async fn load_all_transfer_operations(
         let (ops, warns) = replay_all::<TokenizedEquityMint>(
             pool,
             |id| TransferWarning::MintReplayFailed {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
             },
             TokenizedEquityMint::to_dto,
         )
@@ -171,7 +169,7 @@ pub(crate) async fn load_all_transfer_operations(
         let (ops, warns) = replay_all::<EquityRedemption>(
             pool,
             |id| TransferWarning::RedemptionReplayFailed {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
             },
             EquityRedemption::to_dto,
         )
@@ -185,7 +183,7 @@ pub(crate) async fn load_all_transfer_operations(
         let (ops, warns) = replay_all::<UsdcRebalance>(
             pool,
             |id| TransferWarning::BridgeReplayFailed {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
             },
             UsdcRebalance::to_dto,
         )
@@ -348,8 +346,8 @@ mod tests {
 
     use st0x_dto::{
         EquityMintOperation, EquityMintStatus, EquityMintTag, EquityRedemptionOperation,
-        EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, TransferWarning,
-        UsdcBridgeDirection, UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
+        EquityRedemptionStatus, TransferOperation, TransferWarning, UsdcBridgeDirection,
+        UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
     };
     use st0x_execution::{ClientOrderId, FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
@@ -365,7 +363,7 @@ mod tests {
 
     fn mint_transfer(status: EquityMintStatus) -> TransferOperation {
         TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::<EquityMintTag>::new("mint-1".to_string()),
+            id: Id::<EquityMintTag>::new("mint-1".to_string()).unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             status,
@@ -376,7 +374,7 @@ mod tests {
 
     fn usdc_transfer(status: UsdcBridgeStatus) -> TransferOperation {
         TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::<UsdcBridgeTag>::new("usdc-1".to_string()),
+            id: Id::<UsdcBridgeTag>::new("usdc-1".to_string()).unwrap(),
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             status,
@@ -653,10 +651,7 @@ mod tests {
             .find(|transfer| matches!(transfer, TransferOperation::EquityMint(_)))
             .unwrap();
         if let TransferOperation::EquityMint(op) = active_mint {
-            assert_eq!(
-                op.id,
-                Id::<EquityMintTag>::new(seeded.active_mint.to_string())
-            );
+            assert_eq!(op.id, crate::transfer_id(seeded.active_mint.0));
         }
 
         let has_active_redemption = loaded.active.iter().any(|transfer| {
@@ -679,10 +674,7 @@ mod tests {
             .find(|transfer| matches!(transfer, TransferOperation::EquityRedemption(_)))
             .unwrap();
         if let TransferOperation::EquityRedemption(op) = active_redemption {
-            assert_eq!(
-                op.id,
-                Id::<EquityRedemptionTag>::new(seeded.active_redemption.to_string())
-            );
+            assert_eq!(op.id, crate::transfer_id(seeded.active_redemption.0));
         }
 
         // Recent should contain the recently failed mint and the USDC rebalance,
@@ -747,7 +739,7 @@ mod tests {
         {
             assert_eq!(
                 usdc_op.id,
-                Id::<UsdcBridgeTag>::new(seeded.usdc.to_string()),
+                crate::transfer_id(seeded.usdc),
                 "USDC bridge ID should match the aggregate_id"
             );
         }
@@ -760,7 +752,7 @@ mod tests {
         {
             assert_eq!(
                 mint_op.id,
-                Id::<EquityMintTag>::new(seeded.failed_mint.to_string()),
+                crate::transfer_id(seeded.failed_mint.0),
                 "failed mint ID should match the aggregate_id"
             );
         }
@@ -827,7 +819,7 @@ mod tests {
         assert_eq!(result.warnings.len(), 1, "expected one warning");
         match result.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
+                assert_eq!(id, &crate::transfer_id(bad_mint_id.0));
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }
@@ -883,7 +875,7 @@ mod tests {
         assert_eq!(loaded.warnings.len(), 1, "expected one replay warning");
         match loaded.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
+                assert_eq!(id, &crate::transfer_id(bad_mint_id.0));
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }

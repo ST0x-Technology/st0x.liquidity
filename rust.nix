@@ -40,6 +40,18 @@ let
 
   fullSrc = withRainMathFloat "st0x-src" cleanedSrc;
 
+  # st0x-finance is a git dependency, so crane builds it during buildDepsOnly.
+  # Its Float dependency must therefore expose the real API even in the dummy
+  # workspace; otherwise mkDummySrc replaces the path crate with an empty lib.
+  depsDummySrc = craneLib.mkDummySrc {
+    src = fullSrc;
+    extraDummyScript = ''
+      rm -rf $out/${rainMathFloatPath}
+      mkdir -p $(dirname $out/${rainMathFloatPath})
+      cp -rL --no-preserve=mode ${rainMathFloat} $out/${rainMathFloatPath}
+    '';
+  };
+
   # Vendor cargo deps with git dependency hashes
   baseVendorDir = craneLib.vendorCargoDeps {
     src = fullSrc;
@@ -51,6 +63,8 @@ let
         "sha256-1vsayhfS3kghmwlKvdNYRklk85VKG6DiuS8Qpn75/wE=";
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
+      "git+https://github.com/ST0x-Technology/st0x.finance?rev=819b6f6bd04c9dcd0f9c0cdded0a07038cd06139#819b6f6bd04c9dcd0f9c0cdded0a07038cd06139" =
+        "sha256-QPaJ5jFMHnWnVS5VAx4uhIH7k8cMLvdO2sCaqf/N+OA=";
     };
 
     # st0x.issuance is a Solidity repo with a deep git submodule tree
@@ -160,12 +174,12 @@ let
   # dashboard builds from realizing backend contract ABIs.
   dtoArgs = depsArgs // rainMathFloatAbiEnv // { doCheck = false; };
 
-  # Build only dependencies (cached separately from source changes).
-  # Crane's mkDummySrc internally strips to manifests + dummy crate roots,
-  # so we feed it fullSrc rather than pre-stripping ourselves -- our prior
-  # manifest-only filter dropped src/lib.rs files for crates with implicit
-  # `[lib]` detection, which broke the deps build.
-  cargoArtifacts = craneLib.buildDepsOnly depsArgs;
+  # Build only dependencies (cached separately from source changes). The
+  # custom dummy source retains rain-math-float's implementation because git
+  # dependencies consume its API while this derivation is being built.
+  cargoArtifacts = craneLib.buildDepsOnly (
+    builtins.removeAttrs depsArgs [ "src" ] // { dummySrc = depsDummySrc; }
+  );
 
 in
 {
