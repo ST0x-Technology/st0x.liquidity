@@ -739,6 +739,7 @@ impl TracingTurnkeyClient {
             timestamp_ms: timestamp_ms.to_string(),
             parameters: Some(params),
             organization_id,
+            generate_app_proofs: None,
         };
         let activity = self
             .process_activity(&request, "/public/v1/submit/sign_transaction")
@@ -770,6 +771,7 @@ impl TracingTurnkeyClient {
             timestamp_ms: timestamp_ms.to_string(),
             parameters: Some(params),
             organization_id,
+            generate_app_proofs: None,
         };
         let activity = self
             .process_activity(&request, "/public/v1/submit/sign_raw_payload")
@@ -2155,7 +2157,8 @@ mod tests {
                             "signWith": address.to_string(),
                             "unsignedTransaction": hex::encode(&expected_unsigned_rlp),
                             "type": "TRANSACTION_TYPE_ETHEREUM",
-                        }
+                        },
+                        "generateAppProofs": null
                     })
                     .to_string(),
                 );
