@@ -48,9 +48,57 @@ let
       let
         configFile = ./config/${env}/${name}.toml;
         secretsFile = ./secret/${cfg.encryptedSecret};
+        startupReadyFile = "/run/${name}/startup-ready";
+        startupWaitCommand = ''
+          startup_ready=0
+          startup_failure_state=
+          for _ in $(seq 1 300); do
+            ready_pid=$(cat ${startupReadyFile} 2>/dev/null || true)
+            main_pid=$(systemctl show --property MainPID --value ${name} 2>/dev/null || true)
+            if [ -n "$ready_pid" ] && [ "$ready_pid" = "$main_pid" ] && systemctl is-active --quiet ${name}; then
+              startup_ready=1
+              break
+            fi
+            active_state=$(systemctl show --property ActiveState --value ${name} 2>/dev/null || true)
+            sub_state=$(systemctl show --property SubState --value ${name} 2>/dev/null || true)
+            case "$active_state/$sub_state" in
+              failed/*|inactive/*|*/auto-restart)
+                startup_failure_state="$active_state/$sub_state"
+                break
+                ;;
+            esac
+            sleep 1
+          done
+          if [ "$startup_ready" -ne 1 ]; then
+            if [ -n "$startup_failure_state" ]; then
+              echo "${name} entered $startup_failure_state before reporting startup readiness" >&2
+            else
+              echo "${name} did not report startup readiness within 5 minutes" >&2
+            fi
+            systemctl status --no-pager --full ${name} >&2 || true
+            journalctl --no-pager --unit ${name} --lines 100 >&2 || true
+            rm -f ${cfg.markerFile}
+            exit 1
+          fi
+        '';
       in
+      assert lib.assertMsg (
+        lib.hasInfix "--property ActiveState" startupWaitCommand
+        && lib.hasInfix "--property SubState" startupWaitCommand
+        && lib.hasInfix "*/auto-restart" startupWaitCommand
+      ) "st0x activation must stop waiting when the restarted unit cannot become ready";
       activate.custom pkg (
         builtins.concatStringsSep " && " [
+          # The readiness environment ships in the system profile, while this
+          # activation ships the binary and wait loop. Enforce system-first on
+          # the handshake's first rollout before touching the running service.
+          ''
+            if ! systemctl show --property Environment --value ${name} 2>/dev/null \
+              | grep --fixed-strings --quiet 'ST0X_STARTUP_READY_FILE=${startupReadyFile}'; then
+              echo "${name} systemd unit does not expose ${startupReadyFile}; deploy the system profile before the service profile" >&2
+              exit 1
+            fi
+          ''
           "systemctl stop ${name} || true"
           "rm -f ${cfg.markerFile}"
           "mkdir -p /run/st0x"
@@ -73,7 +121,12 @@ let
           "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
           "echo '${gitRev}' > /run/st0x/${name}.git-rev"
           "touch ${cfg.markerFile}"
-          "systemctl restart ${name}"
+          # Restart returns after process launch; the PID-scoped readiness file
+          # is written only after all essential runtime components reach their
+          # run loops. Waiting here keeps the unit Type=simple, so rollback to a
+          # pre-readiness binary remains possible during the first rollout.
+          "systemctl restart ${name} || { restart_status=$?; systemctl status --no-pager --full ${name} >&2 || true; journalctl --no-pager --unit ${name} --lines 100 >&2 || true; rm -f ${cfg.markerFile}; exit $restart_status; }"
+          startupWaitCommand
         ]
       )
     else if cfg.kind == "cli" then
@@ -125,10 +178,17 @@ let
     else
       throw "services.${name}: unknown kind ${cfg.kind}";
 
-  mkProfile = env: name: {
-    path = mkServiceProfile env name;
-    profilePath = "${profileBase}/${name}";
-  };
+  mkProfile =
+    env: name:
+    {
+      path = mkServiceProfile env name;
+      profilePath = "${profileBase}/${name}";
+    }
+    // lib.optionalAttrs (enabled.${name}.kind == "st0x") {
+      # Five minutes for startup plus enough time for deploy-rs to reactivate
+      # the previous generation and complete rollback diagnostics.
+      activationTimeout = 900;
+    };
 
   # `hostname` here is an eval-time placeholder that keeps the flake pure.
   # The real SSH target is the public IPv4 resolved from terraform state
