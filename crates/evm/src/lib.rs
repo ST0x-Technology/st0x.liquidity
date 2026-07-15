@@ -1640,58 +1640,181 @@ mod tests {
     }
 
     #[cfg(feature = "turnkey")]
+    const VALID_TURNKEY_ORGANIZATION_ID: &str = "a4d3f3c8-7d52-4d8b-91e1-6f79a02d0bce";
+
+    #[cfg(feature = "turnkey")]
+    fn parse_only_provider() -> impl Provider + Clone {
+        let asserter = Asserter::new();
+
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    #[cfg(feature = "turnkey")]
+    fn wallet_config_parse_message(error: EvmError) -> String {
+        let EvmError::WalletConfigParse(source) = error else {
+            panic!("expected WalletConfigParse error, got: {error:?}");
+        };
+
+        source.to_string()
+    }
+
+    #[cfg(feature = "turnkey")]
     #[tokio::test]
     async fn wallet_kind_turnkey_settings_parse_error() {
-        let anvil = Anvil::new().spawn();
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(anvil.endpoint_url());
-
         let ctx = WalletCtx {
             settings: MaybeParser(None),
             credentials: MaybeParser(Some(serde_json::json!({}))),
-            provider,
+            provider: parse_only_provider(),
             required_confirmations: 1,
         };
 
         let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
         let Err(error) = result else {
-            panic!("expected WalletConfigParse error from settings parse, got Ok");
+            panic!("expected Turnkey wallet config parsing to fail");
         };
+        let message = wallet_config_parse_message(error);
 
-        assert!(
-            matches!(error, EvmError::WalletConfigParse(_)),
-            "expected WalletConfigParse error from settings parse, got: {error:?}"
-        );
+        assert_eq!(message, "intentional test parse failure");
     }
 
     #[cfg(feature = "turnkey")]
     #[tokio::test]
     async fn wallet_kind_turnkey_credentials_parse_error() {
-        let anvil = Anvil::new().spawn();
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(anvil.endpoint_url());
-
         let ctx = WalletCtx {
             settings: MaybeParser(Some(serde_json::json!({
                 "address": format!("{}", Address::random()),
-                "organization_id": "org-test-123"
+                "organization_id": VALID_TURNKEY_ORGANIZATION_ID
             }))),
             credentials: MaybeParser(None),
-            provider,
+            provider: parse_only_provider(),
             required_confirmations: 1,
         };
 
         let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
         let Err(error) = result else {
-            panic!("expected WalletConfigParse error from credentials parse, got Ok");
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert_eq!(message, "intentional test parse failure");
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_blank_organization_id_during_parse() {
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "   "
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key":
+                    "0000000000000000000000000000000000000000000000000000000000000001"
+            }))),
+            provider: parse_only_provider(),
+            required_confirmations: 1,
         };
 
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
         assert!(
-            matches!(error, EvmError::WalletConfigParse(_)),
-            "expected WalletConfigParse error from credentials parse, got: {error:?}"
+            message.contains("Turnkey organization ID must not be empty"),
+            "unexpected parse error: {message}"
         );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_non_uuid_organization_id_during_parse() {
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "org-test-123"
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key":
+                    "0000000000000000000000000000000000000000000000000000000000000001"
+            }))),
+            provider: parse_only_provider(),
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert!(
+            message.contains("Turnkey organization ID must be a UUID"),
+            "unexpected parse error: {message}"
+        );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_invalid_api_key_during_parse() {
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": VALID_TURNKEY_ORGANIZATION_ID
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key": "not-a-p256-private-key"
+            }))),
+            provider: parse_only_provider(),
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert!(
+            message.contains("Turnkey API private key must be valid hexadecimal"),
+            "unexpected parse error: {message}"
+        );
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_wrong_length_api_keys_during_parse() {
+        for (api_private_key, expected_length) in [
+            (String::new(), 0),
+            ("deadbeef".to_string(), 4),
+            ("00".repeat(31), 31),
+        ] {
+            let ctx = WalletCtx {
+                settings: MaybeParser(Some(serde_json::json!({
+                    "address": format!("{}", Address::random()),
+                    "organization_id": VALID_TURNKEY_ORGANIZATION_ID
+                }))),
+                credentials: MaybeParser(Some(serde_json::json!({
+                    "api_private_key": api_private_key
+                }))),
+                provider: parse_only_provider(),
+                required_confirmations: 1,
+            };
+
+            let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+            let Err(error) = result else {
+                panic!("expected Turnkey wallet config parsing to fail");
+            };
+            let message = wallet_config_parse_message(error);
+
+            assert!(
+                message.contains(&format!(
+                    "Turnkey API private key must be 32 bytes, got {expected_length}"
+                )),
+                "unexpected parse error: {message}"
+            );
+        }
     }
 
     #[cfg(feature = "local-signer")]

@@ -7103,10 +7103,11 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
             "#,
         );
-        let secrets = toml_file(
+        let api_private_key = format!("{:064x}", 1);
+        let secrets = toml_file(&format!(
             r#"
             [evm]
             rpc_url = "http://localhost:8545"
@@ -7118,7 +7119,7 @@ mod tests {
             type = "dry-run"
 
             [wallet]
-            api_private_key = "secret-p256-key"
+            api_private_key = "{api_private_key}"
 
             [issuance]
             base_url = "http://issuance.test:8000"
@@ -7127,13 +7128,16 @@ mod tests {
             [pricing]
             api_key = "pricing-oracle-test-key"
             "#,
-        );
+        ));
 
         let inputs = Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path())
             .unwrap()
             .unwrap();
 
-        assert_eq!(inputs.organization_id.as_str(), "org-test");
+        assert_eq!(
+            inputs.organization_id.as_str(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
@@ -7149,7 +7153,7 @@ mod tests {
         );
         assert!(inputs.kms_api_key.is_none());
         assert!(inputs.api_private_key.is_some());
-        assert!(!format!("{inputs:?}").contains("secret-p256-key"));
+        assert!(!format!("{inputs:?}").contains(&api_private_key));
     }
 
     #[cfg(feature = "wallet-turnkey")]

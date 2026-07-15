@@ -7343,6 +7343,7 @@ dependencies = [
  "turnkey_api_key_stamper 0.4.0",
  "turnkey_client 0.4.0",
  "url",
+ "uuid",
 ]
 
 [[package]]
