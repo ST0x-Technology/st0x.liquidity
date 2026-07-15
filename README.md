@@ -163,6 +163,14 @@ NixOS host (DigitalOcean droplet)
 Services are deployed as independent nix profiles, allowing per-service updates
 and rollbacks without affecting other services.
 
+Before the bot is stopped, activation validates staged config/secrets and, for
+Turnkey wallets, runs a read-only policy coverage check for every startup MAX
+approval. Coverage requires an allow policy whose consensus the authenticated
+API user can satisfy alone and whose target condition provably applies;
+applicable or unprovable denies take precedence. Missing token or wrapper
+coverage fails the deployment with the symbol and contract details while the
+existing bot and installed files remain untouched.
+
 The bot unit exposes a PID-scoped startup signal in its systemd runtime
 directory. A bot deployment succeeds only after Conductor finishes startup
 initialization and every essential runtime task has entered its run loop; an

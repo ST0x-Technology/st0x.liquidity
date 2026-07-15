@@ -986,10 +986,9 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
 
 /// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
 /// startup: each configured equity's underlying -> wrapper vault and wrapped ->
-/// orderbook, plus USDC -> orderbook. Resolves token addresses through a
-/// [`WrapperService`] built from the equity config, and submits through the
-/// base wallet so confirmations and nonce handling match every other on-chain
-/// write.
+/// orderbook, plus USDC -> orderbook. Resolves token addresses from the
+/// configured equity addresses, and submits through the base wallet so
+/// confirmations and nonce handling match every other on-chain write.
 ///
 /// Skips entirely when no wallet is configured -- a standalone bot without a
 /// wallet never wraps or deposits, so it has no allowances to grant.
@@ -1006,22 +1005,7 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
 
-    let wrapper = WrapperService::new(
-        base_wallet.clone(),
-        to_wrapped_equities(&ctx.assets.equities.symbols),
-    );
-
-    let symbols = ctx
-        .assets
-        .equities
-        .symbols
-        .keys()
-        .filter(|symbol| {
-            ctx.assets.is_trading_enabled(symbol) || ctx.assets.is_rebalancing_enabled(symbol)
-        })
-        .cloned();
-
-    let targets = build_approval_targets(&wrapper, symbols, ctx.evm.orderbook, USDC_BASE)?;
+    let targets = build_approval_targets(&ctx.assets, ctx.evm.orderbook, USDC_BASE);
 
     grant_startup_approvals(&base_wallet, &targets).await?;
 
