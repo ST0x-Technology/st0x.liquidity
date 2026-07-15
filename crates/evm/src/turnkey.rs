@@ -1073,6 +1073,7 @@ mod tests {
                 .json_body_includes(
                     serde_json::json!({
                         "type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2",
+                        "generateAppProofs": null,
                         "parameters": {
                             "signWith": address.to_string(),
                             "unsignedTransaction": hex::encode(&expected_unsigned_rlp),
