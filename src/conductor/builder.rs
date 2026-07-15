@@ -34,6 +34,7 @@ use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use crate::alerts::TelegramNotifier;
+use crate::conductor::SupervisorStartupTokens;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
@@ -64,6 +65,7 @@ use crate::rebalancing::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
 };
+use crate::startup::{StartupTask, StartupToken};
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
@@ -100,6 +102,8 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
     pub(crate) shutdown_token: CancellationToken,
+    pub(crate) startup_token: StartupToken,
+    pub(crate) supervisor_startup: SupervisorStartupTokens,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) failure_injector: FailureInjector,
 }
@@ -343,6 +347,13 @@ where
     let apalis_shutdown_token = CancellationToken::new();
     let apalis_shutdown_token_for_struct = apalis_shutdown_token.clone();
 
+    let SupervisorStartupTokens {
+        order_fill_monitor: order_fill_startup,
+        inventory_monitor: inventory_startup,
+        executor_maintenance: executor_maintenance_startup,
+        gas_monitor: gas_monitor_startup,
+    } = context.supervisor_startup;
+
     let order_fill_monitor = OrderFillMonitor::new(
         context.ctx.evm.clone(),
         backfill_queue.clone(),
@@ -360,22 +371,47 @@ where
         .with_max_backoff_exponent(if is_test { 2 } else { 8 })
         .with_base_restart_delay(std::time::Duration::from_secs(1))
         .with_dead_tasks_threshold(Some(0.0))
-        .with_task("order-fill-monitor", order_fill_monitor)
-        .with_task("inventory-monitor", inventory_monitor);
+        .with_task(
+            "order-fill-monitor",
+            StartupTask {
+                task: order_fill_monitor,
+                token: order_fill_startup,
+            },
+        )
+        .with_task(
+            "inventory-monitor",
+            StartupTask {
+                task: inventory_monitor,
+                token: inventory_startup,
+            },
+        );
 
     log_optional_task_status("executor maintenance", maintenance_interval.is_some());
 
     if let Some(interval) = maintenance_interval {
         supervisor_builder = supervisor_builder.with_task(
             "executor-maintenance",
-            ExecutorMaintenance::new(context.executor, interval),
+            StartupTask {
+                task: ExecutorMaintenance::new(context.executor, interval),
+                token: executor_maintenance_startup,
+            },
         );
+    } else {
+        executor_maintenance_startup.acknowledge();
     }
 
     log_optional_task_status("gas monitor", gas_monitor.is_some());
 
     if let Some(gas_monitor) = gas_monitor {
-        supervisor_builder = supervisor_builder.with_task("gas-monitor", gas_monitor);
+        supervisor_builder = supervisor_builder.with_task(
+            "gas-monitor",
+            StartupTask {
+                task: gas_monitor,
+                token: gas_monitor_startup,
+            },
+        );
+    } else {
+        gas_monitor_startup.acknowledge();
     }
 
     let supervisor = supervisor_builder.build().run();
@@ -414,6 +450,7 @@ where
         resume_tokenization_ctx,
         apalis_shutdown_token,
         seed_vault_registry_queue,
+        startup_token: context.startup_token,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: context.failure_injector,
     }
@@ -426,6 +463,7 @@ where
         telemetry_writer,
         shutdown_token: context.shutdown_token,
         apalis_shutdown_token: apalis_shutdown_token_for_struct,
+        cleanup_armed: true,
     }
 }
 
@@ -473,6 +511,7 @@ where
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
+    startup_token: StartupToken,
     #[cfg(any(test, feature = "test-support"))]
     failure_injector: FailureInjector,
 }
@@ -520,6 +559,7 @@ where
             resume_tokenization_ctx,
             apalis_shutdown_token,
             seed_vault_registry_queue,
+            startup_token,
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
         } = self;
@@ -594,7 +634,7 @@ where
         let fail_stop_for_transfer_equity_to_hedging = fail_stop.clone();
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
-        tokio::spawn(async move {
+        tokio::spawn(startup_token.wrap(async move {
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
@@ -822,7 +862,7 @@ where
                     Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
                 },
             }
-        })
+        }))
     }
 }
 

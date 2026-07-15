@@ -643,7 +643,21 @@ systemd unit:
 
 - `st0x-hedge` (kind = `st0x`) - hedging bot binary. Full pipeline: decrypts
   agenix secret, installs plaintext config, runs `validate-config`, chowns data
-  files, writes git-rev marker, touches readiness marker, restarts unit.
+  files, writes git-rev marker, touches the activation marker, and restarts the
+  unit. The server writes its PID to a systemd-managed runtime-directory file
+  only after Conductor has completed startup initialization and every essential
+  supervised runtime task has reached a pending run state. Activation waits for
+  that PID to match the unit's live main process with a bounded startup timeout.
+  If the process exits, readiness reporting fails, or the timeout expires first,
+  activation prints the unit status and recent journal, exits non-zero, and
+  deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
+  rollback stays compatible with service generations from before the readiness
+  handshake was introduced. The first rollout requires deploying the system
+  profile before the service profile; a service-only deploy verifies the
+  installed unit exposes the expected ready file before stopping the running bot
+  and otherwise fails immediately with the required rollout order. Outside
+  systemd, the server uses a no-op readiness notifier so local runs remain
+  available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.

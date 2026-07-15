@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::num::TryFromIntError;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use task_supervisor::SupervisorHandle;
+use task_supervisor::{SupervisorHandle, SupervisorHandleError};
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
@@ -98,6 +98,7 @@ use crate::rebalancing::{
     RebalancerServices, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
     to_wrapped_equities,
 };
+use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
@@ -128,6 +129,28 @@ use trading_queues::{EquityRecoveryInputs, TradingJobQueues, setup_trading_job_q
 pub(crate) struct DatabasePools {
     pub(crate) cqrs: SqlitePool,
     pub(crate) apalis: apalis_sqlite::SqlitePool,
+}
+
+pub(crate) struct ConductorRuntime {
+    pub(crate) event_sender: broadcast::Sender<Statement>,
+    pub(crate) inventory: Arc<BroadcastingInventory>,
+    pub(crate) shutdown_token: CancellationToken,
+    pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
+    pub(crate) startup_tokens: ConductorStartupTokens,
+}
+
+pub(crate) struct ConductorStartupTokens {
+    pub(crate) initialized: StartupToken,
+    pub(crate) apalis_monitor: StartupToken,
+    pub(crate) job_cleanup: StartupToken,
+    pub(crate) supervisor: SupervisorStartupTokens,
+}
+
+pub(crate) struct SupervisorStartupTokens {
+    pub(crate) order_fill_monitor: StartupToken,
+    pub(crate) inventory_monitor: StartupToken,
+    pub(crate) executor_maintenance: StartupToken,
+    pub(crate) gas_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -244,6 +267,9 @@ pub(crate) struct Conductor {
     /// Independent token for apalis — cancelled explicitly in Phase 2 after
     /// producers are stopped.
     apalis_shutdown_token: CancellationToken,
+    /// Cleared once every owned task has been stopped, preventing `Drop` from
+    /// issuing a second supervisor shutdown against an already-closed channel.
+    cleanup_armed: bool,
 }
 
 /// Resets a transfer queue's orphaned `Running`/`Queued` rows back to `Pending`
@@ -519,10 +545,7 @@ impl Conductor {
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
         pools: DatabasePools,
-        event_sender: broadcast::Sender<Statement>,
-        inventory: Arc<BroadcastingInventory>,
-        shutdown_token: CancellationToken,
-        recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
+        runtime: ConductorRuntime,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: crate::conductor::job::FailureInjector,
     ) -> anyhow::Result<()>
@@ -535,6 +558,19 @@ impl Conductor {
             cqrs: pool,
             apalis: apalis_pool,
         } = pools;
+        let ConductorRuntime {
+            event_sender,
+            inventory,
+            shutdown_token,
+            recovery_cell,
+            startup_tokens,
+        } = runtime;
+        let ConductorStartupTokens {
+            initialized,
+            apalis_monitor: apalis_startup,
+            job_cleanup: cleanup_startup,
+            supervisor: supervisor_startup,
+        } = startup_tokens;
 
         let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, &ctx.evm, pool.clone()).await?;
@@ -681,6 +717,7 @@ impl Conductor {
             pool.clone(),
             apalis_pool.clone(),
             Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
+            cleanup_startup,
         );
 
         let conductor_ctx = builder::ConductorCtx {
@@ -694,6 +731,8 @@ impl Conductor {
             wallet_polling,
             tokenizer,
             shutdown_token: shutdown_token.clone(),
+            startup_token: apalis_startup,
+            supervisor_startup,
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
         };
@@ -721,7 +760,7 @@ impl Conductor {
         let resume_tokenization_queue = resume_tokenization_queue
             .unwrap_or_else(|| ResumeTokenizationJobQueue::new(&apalis_pool));
 
-        let mut conductor = builder::spawn()
+        let conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
             .backfill_queue(backfill_queue)
@@ -765,10 +804,15 @@ impl Conductor {
             });
         }
 
+        conductor.run_until_completion(initialized).await
+    }
+
+    async fn run_until_completion(mut self, initialized: StartupToken) -> anyhow::Result<()> {
+        initialized.acknowledge();
         info!("Conductor is running");
-        let result = conductor.wait_for_completion().await;
+        let result = self.wait_for_completion().await;
         if result.is_err() {
-            conductor.abort_all();
+            self.abort_all();
         }
         result
     }
@@ -796,9 +840,7 @@ impl Conductor {
         // Phase 1: stop supervised tasks (OrderFillMonitor, PositionMonitor)
         // so they stop enqueuing new jobs.
         info!(target: "shutdown", "Phase 1: stopping producers (supervisor)");
-        if let Err(error) = self.supervisor.shutdown() {
-            error!(target: "shutdown", %error, "Failed to shutdown supervisor");
-        }
+        self.shutdown_supervisor();
 
         // Wait for the supervisor to fully exit so producers are actually
         // stopped before Phase 2 begins draining consumers.
@@ -819,22 +861,44 @@ impl Conductor {
         self.apalis_shutdown_token.cancel();
         let monitor_result = check_monitor_drain_result((&mut self.monitor).await);
         self.telemetry_writer.abort();
+        self.cleanup_armed = false;
         monitor_result
     }
 
     /// Abort all conductor tasks (force shutdown fallback).
-    pub(crate) fn abort_all(&self) {
-        info!(target: "shutdown", "Aborting all conductor tasks");
-        if let Err(error) = self.supervisor.shutdown() {
-            error!(%error, "Failed to shutdown supervisor");
+    pub(crate) fn abort_all(&mut self) {
+        if !self.cleanup_armed {
+            return;
         }
+
+        self.cleanup_armed = false;
+        info!(target: "shutdown", "Aborting all conductor tasks");
+        self.shutdown_supervisor();
         self.monitor.abort();
         self.abort_background_tasks();
+    }
+
+    fn shutdown_supervisor(&self) {
+        match self.supervisor.shutdown() {
+            Ok(()) => {}
+            Err(SupervisorHandleError::SendError) => {
+                debug!(target: "shutdown", "Supervisor was already stopped");
+            }
+            Err(error @ SupervisorHandleError::RecvError(_)) => {
+                error!(target: "shutdown", %error, "Failed to shutdown supervisor");
+            }
+        }
     }
 
     fn abort_background_tasks(&self) {
         self.job_cleanup.abort();
         self.telemetry_writer.abort();
+    }
+}
+
+impl Drop for Conductor {
+    fn drop(&mut self) {
+        self.abort_all();
     }
 }
 
@@ -1017,8 +1081,9 @@ fn spawn_finished_job_cleanup(
     pool: SqlitePool,
     apalis_pool: apalis_sqlite::SqlitePool,
     cleanup_interval: Duration,
+    startup_token: StartupToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::spawn(startup_token.wrap(async move {
         let mut interval = tokio::time::interval(cleanup_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -1068,7 +1133,7 @@ fn spawn_finished_job_cleanup(
                 }
             }
         }
-    })
+    }))
 }
 
 async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
@@ -3505,7 +3570,7 @@ mod tests {
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
     use std::future::pending;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
     use task_supervisor::SupervisorBuilder;
     use tokio::sync::broadcast;
@@ -3556,6 +3621,19 @@ mod tests {
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
     use crate::vault_lookup::MockVaultLookup;
+
+    struct TaskDropFlag(Arc<AtomicBool>);
+
+    impl Drop for TaskDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn pending_until_aborted<T>(dropped: Arc<AtomicBool>) -> T {
+        let _drop_flag = TaskDropFlag(dropped);
+        pending::<T>().await
+    }
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
@@ -3695,6 +3773,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
+            cleanup_armed: true,
         }
     }
 
@@ -4494,12 +4573,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_conductor_aborts_owned_background_tasks() {
+        let monitor_dropped = Arc::new(AtomicBool::new(false));
+        let cleanup_dropped = Arc::new(AtomicBool::new(false));
+        let telemetry_dropped = Arc::new(AtomicBool::new(false));
+        let supervisor = SupervisorBuilder::default().build().run();
+        let monitor = tokio::spawn(pending_until_aborted::<Result<(), MonitorTaskError>>(
+            Arc::clone(&monitor_dropped),
+        ));
+        let job_cleanup = tokio::spawn(pending_until_aborted::<()>(Arc::clone(&cleanup_dropped)));
+        let telemetry_writer =
+            tokio::spawn(pending_until_aborted::<()>(Arc::clone(&telemetry_dropped)));
+        tokio::task::yield_now().await;
+
+        drop(Conductor {
+            supervisor,
+            monitor,
+            job_cleanup,
+            telemetry_writer,
+            shutdown_token: CancellationToken::new(),
+            apalis_shutdown_token: CancellationToken::new(),
+            cleanup_armed: true,
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !monitor_dropped.load(Ordering::SeqCst)
+                || !cleanup_dropped.load(Ordering::SeqCst)
+                || !telemetry_dropped.load(Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping Conductor should abort every owned task");
+    }
+
+    #[tokio::test]
     async fn spawn_finished_job_cleanup_runs_until_aborted() {
         let (pool, apalis_pool) = setup_test_pools().await;
         insert_finished_job(&apalis_pool, "done").await;
 
-        let handle =
-            spawn_finished_job_cleanup(pool.clone(), apalis_pool.clone(), Duration::from_secs(60));
+        let handle = spawn_finished_job_cleanup(
+            pool.clone(),
+            apalis_pool.clone(),
+            Duration::from_secs(60),
+            crate::startup::StartupBarrier::new(1).token(),
+        );
 
         wait_for_job_count(&apalis_pool, 0).await;
         handle.abort();
@@ -4542,8 +4661,12 @@ mod tests {
         )
         .await;
 
-        let handle =
-            spawn_finished_job_cleanup(pool.clone(), apalis_pool.clone(), Duration::from_secs(60));
+        let handle = spawn_finished_job_cleanup(
+            pool.clone(),
+            apalis_pool.clone(),
+            Duration::from_secs(60),
+            crate::startup::StartupBarrier::new(1).token(),
+        );
 
         // The two non-transfer finished rows are pruned; the two transfer rows remain.
         wait_for_job_count(&apalis_pool, 2).await;
@@ -9965,10 +10088,15 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
+            cleanup_armed: true,
         };
 
         shutdown_token.cancel();
         conductor.wait_for_completion().await.unwrap();
+        assert!(
+            !conductor.cleanup_armed,
+            "graceful drain should disarm drop cleanup"
+        );
     }
 
     #[tokio::test]
@@ -9993,6 +10121,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
+            cleanup_armed: true,
         };
 
         shutdown_token.cancel();
@@ -10000,6 +10129,10 @@ mod tests {
         assert!(
             result.is_err(),
             "monitor error during drain should propagate"
+        );
+        assert!(
+            !conductor.cleanup_armed,
+            "a completed drain should disarm drop cleanup even when the monitor failed"
         );
     }
 
