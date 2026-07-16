@@ -4,6 +4,10 @@
 
 Accepted
 
+ADR-0020 proposes an amendment for pre-burn Alpaca-to-Base inventory
+reconstruction only. Until that ADR is accepted, this decision remains in force
+unchanged.
+
 ## Context
 
 The USDC rebalancing reactor allows exactly one rebalance at a time, gated by an
