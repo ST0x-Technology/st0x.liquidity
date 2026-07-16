@@ -4,11 +4,13 @@ use std::collections::BTreeSet;
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
 
+use crate::bot_gas::BotGasReceiptCostEvent;
+
 use super::builder::build_pnl_response_from_rows;
 use super::parsing::parse_payload_string;
 use super::query::{PnlError, PnlQuery};
 use super::response::PnlResponse;
-use super::state::{CostEventRow, PositionEventRow, PositionViewRow};
+use super::state::{BotGasCostRow, CostEventRow, PositionEventRow, PositionViewRow};
 use super::{ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING};
 
 pub(crate) async fn build_pnl_report(
@@ -32,12 +34,14 @@ pub(crate) async fn build_pnl_report(
     let event_rows = load_position_events(&mut tx, &symbols, as_of_rowid).await?;
     let position_rows = load_position_view(&mut tx).await?;
     let cost_rows = load_cost_events(&mut tx, as_of_rowid).await?;
+    let bot_gas_rows = load_bot_gas_costs(&mut tx, as_of_rowid).await?;
     tx.commit().await?;
 
     build_pnl_response_from_rows(
         event_rows,
         &position_rows,
         &cost_rows,
+        &bot_gas_rows,
         &alpaca_activities,
         &effective_query,
         &symbols,
@@ -213,4 +217,47 @@ async fn load_cost_events(
     }
 
     Ok(events)
+}
+
+async fn load_bot_gas_costs(
+    tx: &mut Transaction<'_, Sqlite>,
+    as_of_rowid: i64,
+) -> Result<Vec<BotGasCostRow>, PnlError> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT rowid, payload \
+         FROM events \
+         WHERE aggregate_type = 'BotGasReceiptCost' \
+           AND event_type = 'BotGasReceiptCostEvent::Recorded' \
+           AND rowid <= ? \
+         ORDER BY rowid ASC",
+    )
+    .bind(as_of_rowid)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut costs = Vec::with_capacity(rows.len());
+    for (rowid, payload) in rows {
+        let event = parse_payload_string(&payload)
+            .and_then(serde_json::from_value::<BotGasReceiptCostEvent>)
+            .map_err(|source| PnlError::InvalidPayload {
+                rowid,
+                aggregate_type: "BotGasReceiptCost".to_owned(),
+                event_type: "BotGasReceiptCostEvent::Recorded".to_owned(),
+                source,
+            })?;
+        let BotGasReceiptCostEvent::Recorded { cost } = event;
+        cost.validate()
+            .map_err(|source| PnlError::InvalidBotGasReceiptCost { rowid, source })?;
+        costs.push(BotGasCostRow {
+            rowid,
+            chain: cost.chain.to_string(),
+            tx_hash: cost.tx_hash.to_string(),
+            usd_cost: cost.usd_cost.to_string(),
+            operation_category: cost.operation_category.to_string(),
+            symbol: cost.symbol.map(|symbol| symbol.to_string()),
+            occurred_at: cost.occurred_at.to_rfc3339(),
+        });
+    }
+
+    Ok(costs)
 }

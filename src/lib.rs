@@ -43,6 +43,7 @@ pub mod api;
 pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod bindings;
+pub mod bot_gas;
 pub mod cli;
 mod conductor;
 pub(crate) mod dashboard;

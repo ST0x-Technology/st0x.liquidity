@@ -30,6 +30,12 @@ pub(crate) enum PnlError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid bot gas receipt cost at event row {rowid}")]
+    InvalidBotGasReceiptCost {
+        rowid: i64,
+        #[source]
+        source: crate::bot_gas::BotGasReceiptCostError,
+    },
     #[error(
         "malformed persisted PnL payload at row {rowid} ({aggregate_type}/{event_type}): {reason}"
     )]

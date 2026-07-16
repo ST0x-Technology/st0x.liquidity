@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
+use alloy::primitives::{Address, TxHash, U256};
 use chrono::{NaiveDate, TimeZone, Utc};
 use num_decimal::Num;
 use serde_json::Value;
@@ -8,12 +9,19 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
+use st0x_finance::Symbol;
+
+use crate::bot_gas::{
+    BotGasChain, BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostEvent,
+};
 
 use super::builder::build_pnl_response_from_rows;
 use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp};
 use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, PnlQuery};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
-use super::state::{CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow, Venue};
+use super::state::{
+    BotGasCostRow, CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow, Venue,
+};
 use super::{
     ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING, build_pnl_report,
     validate_pnl_snapshot_rowid,
@@ -434,6 +442,34 @@ fn usdc_bridged(rowid: i64, aggregate_id: &str, fee: &str, timestamp: &str) -> C
     )
 }
 
+fn bot_gas_recorded(rowid: i64) -> CostEventRow {
+    let tx_hash = TxHash::repeat_byte(0xab);
+    let cost = BotGasReceiptCost {
+        chain: BotGasChain::Base,
+        tx_hash,
+        receipt_from: Address::repeat_byte(0x11),
+        gas_used: 21_000,
+        effective_gas_price_wei: 1_000_000_000,
+        native_cost_wei: U256::from(21_000_000_000_000u128),
+        eth_usd_price: Num::from_str("2000").unwrap(),
+        eth_usd_price_source: "eth_usd_valuation_feed".to_owned(),
+        eth_usd_price_at: Utc.with_ymd_and_hms(2026, 5, 15, 14, 0, 0).unwrap(),
+        eth_usd_price_block_number: Some(123),
+        usd_cost: Num::from_str("0.042").unwrap(),
+        operation_category: BotGasOperationCategory::VaultDeposit,
+        symbol: Some(Symbol::new("RKLB").unwrap()),
+        occurred_at: Utc.with_ymd_and_hms(2026, 5, 15, 14, 0, 1).unwrap(),
+    };
+
+    cost_event(
+        rowid,
+        "BotGasReceiptCost",
+        &format!("base:{tx_hash}"),
+        "BotGasReceiptCostEvent::Recorded",
+        serde_json::to_value(BotGasReceiptCostEvent::Recorded { cost }).unwrap(),
+    )
+}
+
 fn account_activity(
     id: &str,
     activity_type: &str,
@@ -506,6 +542,7 @@ fn report_with_result(
         events: Vec<PositionEventRow>,
         position_rows: Vec<PositionViewRow>,
         cost_rows: Vec<CostEventRow>,
+        bot_gas_rows: Vec<BotGasCostRow>,
         alpaca_activities: Vec<AccountActivity>,
         query: PnlQuery,
         symbols: BTreeSet<String>,
@@ -515,6 +552,7 @@ fn report_with_result(
         events,
         position_rows,
         cost_rows,
+        bot_gas_rows: Vec::new(),
         alpaca_activities,
         query,
         symbols,
@@ -523,6 +561,7 @@ fn report_with_result(
         events,
         position_rows,
         cost_rows,
+        bot_gas_rows,
         alpaca_activities,
         query,
         symbols,
@@ -532,6 +571,7 @@ fn report_with_result(
         events,
         &position_rows,
         &cost_rows,
+        &bot_gas_rows,
         &alpaca_activities,
         &query,
         &symbols,
@@ -576,7 +616,6 @@ async fn pnl_test_pool_with_costs(
         .execute(&pool)
         .await
         .unwrap();
-
     for row in events {
         sqlx::query(
             "INSERT INTO events (aggregate_type, aggregate_id, event_type, payload) \
@@ -620,6 +659,7 @@ fn report_result(events: Vec<PositionEventRow>) -> Result<PnlResponse, PnlError>
     build_pnl_response_from_rows(
         events,
         &position_rows(),
+        &Vec::new(),
         &Vec::new(),
         &Vec::new(),
         &query(),
@@ -939,6 +979,81 @@ async fn source_loader_includes_persisted_cost_events() {
     assert_eq!(report.costs.tokenization_fees_usd, "0.25");
     assert_eq!(report.cost_entries.len(), 1);
     assert_eq!(report.cost_entries[0].aggregate_type, "TokenizedEquityMint");
+}
+
+#[tokio::test]
+async fn source_loader_includes_persisted_bot_gas_costs() {
+    let pool = pnl_test_pool_with_costs(
+        vec![
+            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+        ],
+        position_rows(),
+        vec![bot_gas_recorded(3)],
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new()).await.unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "2");
+    assert_eq!(report.summary.tracked_costs_usd, "0.042");
+    assert_eq!(report.summary.net_realized_pnl_usd, "1.958");
+    assert_eq!(report.costs.bot_gas_usd, "0.042");
+    assert_eq!(cost_coverage_status(&report, "Bot gas"), "included");
+    assert_eq!(report.cost_entries.len(), 1);
+    assert_eq!(report.cost_entries[0].category, "bot_gas");
+    assert_eq!(
+        report.cost_entries[0].symbol.as_ref().map(Symbol::as_str),
+        Some("RKLB")
+    );
+}
+
+#[tokio::test]
+async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
+    let pool = pnl_test_pool_with_costs(
+        vec![
+            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+        ],
+        position_rows(),
+        vec![bot_gas_recorded(3)],
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            as_of_rowid: Some(2),
+            ..query()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.as_of_rowid, 2);
+    assert_eq!(report.costs.bot_gas_usd, "0");
+    assert_eq!(cost_coverage_status(&report, "Bot gas"), "not_ingested");
+    assert!(report.cost_entries.is_empty());
+}
+
+#[tokio::test]
+async fn source_loader_rejects_non_positive_persisted_bot_gas_cost() {
+    let mut bot_gas = bot_gas_recorded(1);
+    bot_gas.payload["Recorded"]["cost"]["usd_cost"] = serde_json::json!("0");
+    let pool = pnl_test_pool_with_costs(Vec::new(), position_rows(), vec![bot_gas]).await;
+
+    let error = build_pnl_report(&pool, &query(), Vec::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PnlError::InvalidBotGasReceiptCost {
+            source: crate::bot_gas::BotGasReceiptCostError::NonPositiveUsdCost,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

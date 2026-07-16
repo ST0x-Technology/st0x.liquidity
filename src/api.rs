@@ -210,6 +210,7 @@ fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
         | PnlError::InvalidSnapshotRowid { .. }
         | PnlError::InvalidSymbolFilter { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
         PnlError::InvalidPayload { .. }
+        | PnlError::InvalidBotGasReceiptCost { .. }
         | PnlError::MalformedPayload { .. }
         | PnlError::InvalidFinancialField { .. }
         | PnlError::InvalidInternalDecimal { .. } => {
