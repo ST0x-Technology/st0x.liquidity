@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
 
-use crate::MarketSession;
+use crate::{MarketSession, MarketSessionStatus};
 
 /// Response from the Alpaca calendar endpoint
 /// (https://docs.alpaca.markets/reference/getcalendar-1).
@@ -66,7 +66,14 @@ pub(super) async fn is_market_open(
 pub(super) async fn market_session(
     client: &AlpacaBrokerApiClient,
 ) -> Result<MarketSession, AlpacaBrokerApiError> {
-    market_session_at(client, Utc::now()).await
+    Ok(market_session_status_at(client, Utc::now()).await?.session)
+}
+
+/// Returns the current market session with extended-session close metadata.
+pub(super) async fn market_session_status(
+    client: &AlpacaBrokerApiClient,
+) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
+    market_session_status_at(client, Utc::now()).await
 }
 
 /// Returns the market session at the given time.
@@ -74,6 +81,14 @@ pub(super) async fn market_session_at(
     client: &AlpacaBrokerApiClient,
     now: DateTime<Utc>,
 ) -> Result<MarketSession, AlpacaBrokerApiError> {
+    Ok(market_session_status_at(client, now).await?.session)
+}
+
+/// Returns the market session and extended-session close at the given time.
+pub(super) async fn market_session_status_at(
+    client: &AlpacaBrokerApiClient,
+    now: DateTime<Utc>,
+) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
     let now_et = now.with_timezone(&New_York);
     let today = now_et.date_naive();
 
@@ -81,7 +96,9 @@ pub(super) async fn market_session_at(
 
     let Some(today_calendar) = calendar.into_iter().next() else {
         debug!("Today is not a trading day");
-        return Ok(MarketSession::Closed);
+        return Ok(MarketSessionStatus::without_close_metadata(
+            MarketSession::Closed,
+        ));
     };
 
     // The broker may answer a non-trading-day query with the NEAREST trading
@@ -99,7 +116,9 @@ pub(super) async fn market_session_at(
                 returned = %today_calendar.date,
                 "Calendar returned a later trading day; queried day is not a trading day"
             );
-            return Ok(MarketSession::Closed);
+            return Ok(MarketSessionStatus::without_close_metadata(
+                MarketSession::Closed,
+            ));
         }
         Ordering::Less => {
             return Err(AlpacaBrokerApiError::CalendarDateMismatch {
@@ -140,6 +159,7 @@ pub(super) async fn market_session_at(
     }
 
     let now_time = now_et.time();
+    let extended_session_closes_at = local_market_time_to_utc(today, today_calendar.session_close)?;
 
     let session = if now_time >= today_calendar.open && now_time < today_calendar.close {
         MarketSession::Regular
@@ -159,7 +179,21 @@ pub(super) async fn market_session_at(
         "Checked market session"
     );
 
-    Ok(session)
+    Ok(MarketSessionStatus {
+        session,
+        extended_session_closes_at: Some(extended_session_closes_at),
+    })
+}
+
+fn local_market_time_to_utc(
+    date: NaiveDate,
+    time: NaiveTime,
+) -> Result<DateTime<Utc>, AlpacaBrokerApiError> {
+    date.and_time(time)
+        .and_local_timezone(New_York)
+        .single()
+        .map(|date_time| date_time.with_timezone(&Utc))
+        .ok_or(AlpacaBrokerApiError::CalendarLocalTimeAmbiguous { date, time })
 }
 
 /// Returns true if the market is open for regular trading at the given time.
@@ -622,6 +656,46 @@ mod tests {
             market_session_at(&client, after_hours).await.unwrap(),
             MarketSession::Extended,
             "6:00 PM ET is after-hours (between close 16:00 and session_close 20:00)"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_status_exposes_extended_session_close() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let after_hours = et_time_as_utc("2025-01-06", 18, 0);
+
+        let status = market_session_status_at(&client, after_hours)
+            .await
+            .unwrap();
+
+        assert_eq!(status.session, MarketSession::Extended);
+        assert_eq!(
+            status.extended_session_closes_at,
+            Some(et_time_as_utc("2025-01-06", 20, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_status_uses_early_close_session_close() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_calendar_day(&server, "2025-07-03", "09:30", "13:00", "0400", "1700");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let after_regular_close = et_time_as_utc("2025-07-03", 13, 30);
+
+        let status = market_session_status_at(&client, after_regular_close)
+            .await
+            .unwrap();
+
+        assert_eq!(status.session, MarketSession::Extended);
+        assert_eq!(
+            status.extended_session_closes_at,
+            Some(et_time_as_utc("2025-07-03", 17, 0))
         );
     }
 

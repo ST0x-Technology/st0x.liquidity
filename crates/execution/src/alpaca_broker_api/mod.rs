@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use rain_math_float::Float;
 use rain_math_float::FloatError;
 use serde::Deserialize;
@@ -206,6 +206,9 @@ pub enum AlpacaBrokerApiError {
         queried: NaiveDate,
         returned: NaiveDate,
     },
+
+    #[error("Calendar endpoint returned ambiguous local market time {date} {time}")]
+    CalendarLocalTimeAmbiguous { date: NaiveDate, time: NaiveTime },
 
     #[error("Invalid Alpaca account activities URL {url}")]
     InvalidAccountActivitiesUrl {

@@ -126,6 +126,8 @@ where
         ctx.finalize_terminal_pending_positions().await;
 
         if ctx.ctx.assets.any_extended_hours_enabled() {
+            ctx.request_extended_hours_close_flatten_cancellations()
+                .await;
             ctx.request_extended_hours_reprice_timeout_cancellations()
                 .await;
             // Every regular-hours tick: request cancellation of still-live
@@ -553,6 +555,104 @@ where
         }
     }
 
+    /// Near the extended-hours close, cancels any still-live extended-hours
+    /// limit hedge even when it is fresh. The released position gets one final
+    /// scan-driven hedge attempt before the venue closes, avoiding weekend or
+    /// holiday gaps where unhedged onchain exposure would carry until the next
+    /// open.
+    async fn request_extended_hours_close_flatten_cancellations(&self) {
+        let window = match chrono::Duration::from_std(Duration::from_secs(
+            self.ctx.extended_hours_close_flatten_window_secs,
+        )) {
+            Ok(window) => window,
+            Err(error) => {
+                warn!(
+                    %error,
+                    window_secs = self.ctx.extended_hours_close_flatten_window_secs,
+                    "Invalid extended-hours close flatten window; skipping close-flatten sweep"
+                );
+                return;
+            }
+        };
+
+        let status = match self.executor.market_session_status().await {
+            Ok(status) => status,
+            Err(error) => {
+                warn!("Failed to check market session for close flattening: {error}");
+                return;
+            }
+        };
+
+        if status.session != MarketSession::Extended {
+            return;
+        }
+
+        let Some(extended_session_closes_at) = status.extended_session_closes_at else {
+            warn!(
+                "Executor did not provide extended-session close metadata; \
+                 skipping close-flatten sweep"
+            );
+            return;
+        };
+
+        let now = Utc::now();
+        if extended_session_closes_at.signed_duration_since(now) > window {
+            return;
+        }
+        let close_window_started_at = extended_session_closes_at - window;
+
+        let all_positions = match self.position_projection.load_all().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                warn!("Failed to load positions for extended-hours close flattening: {error}");
+                return;
+            }
+        };
+
+        for (symbol, position) in &all_positions {
+            if !self.ctx.assets.is_extended_hours_enabled(symbol) {
+                continue;
+            }
+
+            let Some(offchain_order_id) = position.pending_offchain_order_id else {
+                continue;
+            };
+
+            let order = match self.offchain_order.load(&offchain_order_id).await {
+                Ok(Some(order)) => order,
+                Ok(None) => {
+                    warn!(%symbol, %offchain_order_id, "Pending order aggregate not found during extended-hours close-flatten sweep; orphan recovery will handle it");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(%symbol, %offchain_order_id, %error, "Failed to load offchain order for extended-hours close flattening; will retry next tick");
+                    continue;
+                }
+            };
+
+            if order.executor() != self.executor.to_supported_executor() {
+                continue;
+            }
+
+            if !live_extended_hours_order_needs_close_flatten(&order, close_window_started_at) {
+                continue;
+            }
+
+            if let Err(error) = self
+                .offchain_order
+                .send(
+                    &offchain_order_id,
+                    OffchainOrderCommand::CancelOrder {
+                        reason: CancellationReason::ExtendedHoursCloseFlatten,
+                    },
+                )
+                .await
+            {
+                warn!(%symbol, %offchain_order_id, %error, "Failed to request cancellation of close-to-close extended-hours order; will retry next tick");
+            }
+        }
+    }
+
     /// After a successful cancel (or a recovery scan finding an already-
     /// terminal order), propagate the broker's actual fill quantity to the
     /// position aggregate so net is correctly debited. Otherwise a partial
@@ -634,6 +734,11 @@ fn live_extended_hours_order_is_stale(
     now: DateTime<Utc>,
     timeout: chrono::Duration,
 ) -> bool {
+    live_extended_hours_order_can_be_cancelled(order)
+        && now.signed_duration_since(order.placed_at()) >= timeout
+}
+
+fn live_extended_hours_order_can_be_cancelled(order: &OffchainOrder) -> bool {
     matches!(
         order,
         OffchainOrder::Submitted {
@@ -643,7 +748,14 @@ fn live_extended_hours_order_is_stale(
             market_session: MarketSession::Extended,
             ..
         }
-    ) && now.signed_duration_since(order.placed_at()) >= timeout
+    )
+}
+
+fn live_extended_hours_order_needs_close_flatten(
+    order: &OffchainOrder,
+    close_window_started_at: DateTime<Utc>,
+) -> bool {
+    live_extended_hours_order_can_be_cancelled(order) && order.placed_at() < close_window_started_at
 }
 
 /// Removes any non-terminal [`CheckPositions`] jobs and pushes a fresh one.
@@ -1272,6 +1384,169 @@ mod tests {
                 }
             ),
             "fresh extended-hours order must stay live, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_to_extended_hours_close_cancels_pre_window_order_for_flattening() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let now = chrono::Utc::now();
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(now + chrono::Duration::seconds(60))
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            now - chrono::Duration::seconds(901),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        let OffchainOrder::Cancelling { reason, .. } = order else {
+            panic!("close-to-close extended-hours order must be cancelling, got: {order:?}");
+        };
+        assert_eq!(reason, CancellationReason::ExtendedHoursCloseFlatten);
+    }
+
+    #[tokio::test]
+    async fn close_window_replacement_order_is_not_cancelled_again_for_flattening() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let now = chrono::Utc::now();
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(now + chrono::Duration::seconds(60))
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Submitted {
+                    market_session: MarketSession::Extended,
+                    ..
+                }
+            ),
+            "replacement hedge placed inside the close window must stay live, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_hours_order_outside_close_window_is_not_cancelled_for_flattening() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(
+                    chrono::Utc::now() + chrono::Duration::seconds(901),
+                )
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order(&ctx, &aapl, offchain_order_id).await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Submitted {
+                    market_session: MarketSession::Extended,
+                    ..
+                }
+            ),
+            "extended-hours order outside close window must stay live, got: {order:?}"
         );
     }
 

@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use st0x_float_macro::float;
 use tracing::{debug, info};
@@ -16,7 +17,7 @@ use crate::{
     CancellationOutcome, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor,
     ExecutorOrderId, Inventory, InventoryResult, LimitOrder, MarketOrder, MarketSession,
-    OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor, Usd,
+    MarketSessionStatus, OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor, Usd,
     estimate_buffered_cost_cents,
 };
 
@@ -42,6 +43,7 @@ pub struct MockExecutor {
     order_status_override: Option<OrderState>,
     market_open: bool,
     market_session_override: Option<MarketSession>,
+    extended_session_closes_at_override: Option<DateTime<Utc>>,
     preflight_price: Float,
 }
 
@@ -54,6 +56,7 @@ impl MockExecutor {
             order_status_override: None,
             market_open: true,
             market_session_override: None,
+            extended_session_closes_at_override: None,
             preflight_price: *MOCK_FILL_PRICE,
         }
     }
@@ -95,6 +98,12 @@ impl MockExecutor {
     #[must_use]
     pub fn with_market_session(mut self, session: MarketSession) -> Self {
         self.market_session_override = Some(session);
+        self
+    }
+
+    #[must_use]
+    pub fn with_extended_session_closes_at(mut self, closes_at: DateTime<Utc>) -> Self {
+        self.extended_session_closes_at_override = Some(closes_at);
         self
     }
 
@@ -265,6 +274,13 @@ impl Executor for MockExecutor {
         } else {
             Ok(MarketSession::Closed)
         }
+    }
+
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        Ok(MarketSessionStatus {
+            session: self.market_session().await?,
+            extended_session_closes_at: self.extended_session_closes_at_override,
+        })
     }
 
     async fn place_limit_order(

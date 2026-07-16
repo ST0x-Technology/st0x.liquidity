@@ -641,6 +641,10 @@ pub enum CancellationReason {
     /// Extended-hours limit order stayed live beyond the configured timeout;
     /// cancel it so the next scan can place a fresh marketable limit.
     ExtendedHoursRepriceTimeout,
+    /// Extended-hours limit order is still live near the extended session
+    /// close; cancel it so any remaining exposure gets one final hedge attempt
+    /// before the venue closes.
+    ExtendedHoursCloseFlatten,
     /// The broker reported the order cancelled without a locally persisted
     /// cancel request: either an operator/broker-side cancellation (e.g. a
     /// manual Alpaca-dashboard cancel) or a crash that lost the

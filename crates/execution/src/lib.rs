@@ -2,6 +2,7 @@
 
 use alloy::primitives::U256;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
@@ -89,6 +90,24 @@ pub enum MarketSession {
     Regular,
     Extended,
     Closed,
+}
+
+/// Current market-session classification plus close metadata for the full
+/// extended-hours trading day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketSessionStatus {
+    pub session: MarketSession,
+    pub extended_session_closes_at: Option<DateTime<Utc>>,
+}
+
+impl MarketSessionStatus {
+    #[must_use]
+    pub fn without_close_metadata(session: MarketSession) -> Self {
+        Self {
+            session,
+            extended_session_closes_at: None,
+        }
+    }
 }
 
 #[async_trait]
@@ -180,6 +199,14 @@ pub trait Executor: Send + Sync + 'static {
         } else {
             Ok(MarketSession::Closed)
         }
+    }
+
+    /// Returns current market-session classification with close metadata when
+    /// the executor can provide it.
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        self.market_session()
+            .await
+            .map(MarketSessionStatus::without_close_metadata)
     }
 
     /// Fetches the latest trade price for a symbol from the broker's market

@@ -20,8 +20,9 @@ use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
     ExecutorOrderId, FractionalShares, InventoryResult, LimitOrder, MarketOrder, MarketSession,
-    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
-    Usd, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
+    MarketSessionStatus, OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor,
+    Symbol, TryIntoExecutor, Usd, buying_power_counter_trade_preflight,
+    estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -287,6 +288,10 @@ impl Executor for AlpacaBrokerApi {
 
     async fn market_session(&self) -> Result<MarketSession, Self::Error> {
         super::market_hours::market_session(&self.client).await
+    }
+
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        super::market_hours::market_session_status(&self.client).await
     }
 
     async fn place_limit_order(
