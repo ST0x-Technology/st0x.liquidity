@@ -160,6 +160,14 @@ mod tests {
         ) -> Result<CounterTradePreflight, Self::Error> {
             Ok(CounterTradePreflight::Allowed { reservation: None })
         }
+
+        async fn preflight_counter_trade_at_price(
+            &self,
+            _order: MarketOrder,
+            _reference_price: st0x_execution::Positive<st0x_execution::Usd>,
+        ) -> Result<CounterTradePreflight, Self::Error> {
+            Ok(CounterTradePreflight::Allowed { reservation: None })
+        }
     }
 
     #[tokio::test(start_paused = true)]

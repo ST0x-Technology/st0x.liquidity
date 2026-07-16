@@ -893,7 +893,7 @@ impl Conductor {
             .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
-            .call();
+            .call()?;
 
         publish_recovery_handle(&recovery_cell, recovery_transfer, recovery_service);
 
