@@ -37,8 +37,12 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::inventory::projection::InventoryProjectionError;
-use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
-use crate::inventory::view::InFlightEquityLocation;
+use crate::inventory::snapshot::{
+    InventoryObservationSource, InventorySnapshot, InventorySnapshotEvent,
+};
+use crate::inventory::view::{
+    InFlightEquityLocation, InventoryFreshnessRequirement, InventorySourceFreshnessError,
+};
 use crate::inventory::{
     BroadcastingInventory, FreshOffchainUsdObserver, ImbalanceThreshold, Inventory, InventoryView,
     InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
@@ -170,6 +174,7 @@ pub(crate) enum TokenAddressError {
 pub(crate) struct RebalancingServiceConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: Option<ImbalanceThreshold>,
+    pub(crate) inventory_freshness_window: Duration,
     pub(crate) transfer_timeout: Duration,
     pub(crate) assets: AssetsConfig,
 }
@@ -1686,7 +1691,8 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
+            | BaseWalletWrappedEquity { .. }
+            | SourceObserved { .. } => inventory.clone().apply_snapshot_event(&event, now),
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1697,8 +1703,6 @@ impl RebalancingService {
                     Ok(inventory.clone())
                 }
             }
-
-            SourceObserved { .. } => Ok(inventory.clone()),
         }?;
 
         *inventory = updated;
@@ -1779,7 +1783,8 @@ impl RebalancingService {
             _ => None,
         };
         let mut inventory = self.inventory.write().await;
-        *inventory = InventoryView::default();
+        let current_inventory = std::mem::take(&mut *inventory);
+        *inventory = current_inventory.reset_for_snapshot_recovery();
 
         let updated = match &event {
             OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
@@ -1818,7 +1823,7 @@ impl RebalancingService {
                 }
             }
 
-            SourceObserved { .. } => Ok(inventory.clone()),
+            SourceObserved { .. } => inventory.clone().apply_snapshot_event(&event, now),
         }?;
 
         *inventory = updated;
@@ -2029,8 +2034,40 @@ impl RebalancingService {
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
-            | InflightEquity { .. }
-            | SourceObserved { .. } => {}
+            | InflightEquity { .. } => {}
+            // A successful source observation re-drives checks that may have
+            // failed closed while this source was missing or stale.
+            SourceObserved { source, .. } => match source {
+                InventoryObservationSource::InflightEquity
+                | InventoryObservationSource::OnchainEquity => {
+                    self.enqueue_enabled_equity_checks().await;
+                }
+                InventoryObservationSource::OnchainUsdc => {
+                    self.enqueue_usdc_check_if_enabled().await;
+                }
+                InventoryObservationSource::OffchainInventory => {
+                    self.enqueue_enabled_equity_checks().await;
+                    self.enqueue_usdc_check_if_enabled().await;
+                }
+                InventoryObservationSource::EthereumWalletUsdc
+                | InventoryObservationSource::BaseWalletUsdc
+                | InventoryObservationSource::BaseWalletUnwrappedEquity
+                | InventoryObservationSource::BaseWalletWrappedEquity => {}
+            },
+        }
+    }
+
+    async fn enqueue_enabled_equity_checks(&self) {
+        for symbol in self.config.assets.equities.symbols.keys() {
+            if self.config.is_equity_rebalancing_enabled(symbol) {
+                self.equity_scheduler.enqueue_check(symbol.clone()).await;
+            }
+        }
+    }
+
+    async fn enqueue_usdc_check_if_enabled(&self) {
+        if self.usdc_rebalancing_params().is_some() {
+            self.usdc_scheduler.enqueue_check().await;
         }
     }
 
@@ -2332,7 +2369,16 @@ impl Reactor for RebalancingService {
                     return Ok(());
                 }
 
-                inventory_result?;
+                if let Err(error) = inventory_result {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        ?error,
+                        "Inventory update failed for onchain fill; relying on independent absolute snapshots"
+                    );
+                    return Ok(());
+                }
+
                 self.equity_scheduler.enqueue_check(symbol).await;
                 self.usdc_scheduler.enqueue_check().await;
                 Ok::<(), RebalancingServiceError>(())
@@ -2733,6 +2779,19 @@ impl RebalancingService {
             return Ok(());
         }
 
+        if let Err(freshness_error) = self
+            .require_fresh_inventory_sources(InventoryFreshnessRequirement::Equity)
+            .await
+        {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                ?freshness_error,
+                "Skipped equity trigger: required inventory source is not fresh"
+            );
+            return Ok(());
+        }
+
         // Dividend freeze guard: do not start a rebalancing flow for an asset
         // issuance has frozen. The check goes before claiming the in-progress
         // guard or building the operation so a frozen asset is skipped cheaply.
@@ -2873,6 +2932,18 @@ impl RebalancingService {
             return;
         };
 
+        if let Err(freshness_error) = self
+            .require_fresh_inventory_sources(InventoryFreshnessRequirement::Usdc)
+            .await
+        {
+            warn!(
+                target: "rebalance",
+                ?freshness_error,
+                "Skipped USDC trigger: required inventory source is not fresh"
+            );
+            return;
+        }
+
         let Some(guard) = self.try_claim_usdc_guard() else {
             debug!(target: "rebalance", "Skipped USDC trigger: already in progress");
             return;
@@ -2904,6 +2975,17 @@ impl RebalancingService {
 
         debug!(target: "rebalance", ?operation, "Triggered USDC rebalancing");
         guard.defuse();
+    }
+
+    async fn require_fresh_inventory_sources(
+        &self,
+        requirement: InventoryFreshnessRequirement,
+    ) -> Result<(), InventorySourceFreshnessError> {
+        self.inventory.read().await.require_fresh_sources(
+            requirement,
+            Utc::now(),
+            self.config.inventory_freshness_window,
+        )
     }
 
     /// Returns the oldest non-terminal USDC transfer job in *either* direction
@@ -4986,10 +5068,16 @@ impl RebalancingService {
             self.apply_equity_update(&symbol, update).await?;
         }
 
-        // When a new redemption transfer starts, clear the previous poll
-        // marker so the next inflight poll won't incorrectly zero the new
-        // inflight if Alpaca hasn't reflected the request yet.
-        if matches!(event, EquityRedemptionEvent::VaultWithdrawPending { .. }) {
+        // Clear the previous poll marker whenever the locally tracked balance
+        // must outlive the provider's view. A new transfer may not be visible
+        // yet; a rejected or undetected transfer is no longer visible but its
+        // assets remain stranded in the redemption wallet.
+        if matches!(
+            event,
+            EquityRedemptionEvent::VaultWithdrawPending { .. }
+                | EquityRedemptionEvent::DetectionFailed { .. }
+                | EquityRedemptionEvent::RedemptionRejected { .. }
+        ) {
             let mut inventory = self.inventory.write().await;
             *inventory = inventory
                 .clone()
@@ -5162,7 +5250,7 @@ mod tests {
         DetectionFailure, EquityRedemptionCommand, redemption_aggregate_id,
     };
     use crate::inventory::snapshot::{
-        InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
+        InventoryObservationSource, InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
     };
     use crate::inventory::view::{InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
@@ -5240,6 +5328,7 @@ mod tests {
                 target: float!(0.5),
                 deviation: float!(0.2),
             }),
+            inventory_freshness_window: Duration::from_secs(60),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: rebalancing_enabled_equities(&["AAPL", "TSLA", "GOOG", "RKLB"]),
@@ -7168,6 +7257,7 @@ mod tests {
             RebalancingServiceConfig {
                 equity: test_config().equity,
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: test_config().transfer_timeout,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
@@ -7542,6 +7632,12 @@ mod tests {
     const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
+    #[derive(Debug, Clone, Copy)]
+    enum TestInventoryFreshness {
+        Fresh,
+        Unobserved,
+    }
+
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
@@ -7582,7 +7678,28 @@ mod tests {
         config: RebalancingServiceConfig,
         notifier: Arc<dyn crate::alerts::Notifier>,
     ) -> Arc<RebalancingService> {
+        make_trigger_with_inventory_config_notifier_and_freshness(
+            inventory,
+            config,
+            notifier,
+            TestInventoryFreshness::Fresh,
+        )
+        .await
+    }
+
+    async fn make_trigger_with_inventory_config_notifier_and_freshness(
+        inventory: InventoryView,
+        config: RebalancingServiceConfig,
+        notifier: Arc<dyn crate::alerts::Notifier>,
+        freshness: TestInventoryFreshness,
+    ) -> Arc<RebalancingService> {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = match freshness {
+            TestInventoryFreshness::Fresh => {
+                inventory.with_rebalancing_sources_observed_at(Utc::now())
+            }
+            TestInventoryFreshness::Unobserved => inventory,
+        };
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
@@ -7619,6 +7736,28 @@ mod tests {
         .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
         .await
         .expect("count pending TransferUsdcToHedging jobs")
+    }
+
+    async fn count_pending_equity_check_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<EquityRebalancingCheck>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending EquityRebalancingCheck jobs")
+    }
+
+    async fn count_pending_usdc_check_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<UsdcRebalancingCheck>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.usdc_scheduler.queue().pool())
+        .await
+        .expect("count pending UsdcRebalancingCheck jobs")
     }
 
     async fn count_pending_transfer_usdc_to_market_making_jobs(
@@ -7820,7 +7959,30 @@ mod tests {
         wrapper: Arc<MockWrapper>,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
+        make_trigger_with_inventory_registry_wrapper_and_freshness(
+            inventory,
+            symbol,
+            wrapper,
+            config,
+            TestInventoryFreshness::Fresh,
+        )
+        .await
+    }
+
+    async fn make_trigger_with_inventory_registry_wrapper_and_freshness(
+        inventory: InventoryView,
+        symbol: &Symbol,
+        wrapper: Arc<MockWrapper>,
+        config: RebalancingServiceConfig,
+        freshness: TestInventoryFreshness,
+    ) -> Arc<RebalancingService> {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = match freshness {
+            TestInventoryFreshness::Fresh => {
+                inventory.with_rebalancing_sources_observed_at(Utc::now())
+            }
+            TestInventoryFreshness::Unobserved => inventory,
+        };
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
@@ -7892,7 +8054,9 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
+            InventoryView::default()
+                .with_usdc(usdc(1_000_000), usdc(1_000_000))
+                .with_rebalancing_sources_observed_at(Utc::now()),
             event_sender,
         ));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
@@ -8004,6 +8168,36 @@ mod tests {
             0,
             "Expected no equity redemption job enqueued"
         );
+    }
+
+    #[tokio::test]
+    async fn onchain_fill_already_reflected_by_snapshot_does_not_fail_reactor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(usdc(0), usdc(0));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        let result = harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill(shares(10), Direction::Buy),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a fill already reflected by absolute snapshots must not poison the reactor"
+        );
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(0)),
+            "the two fill legs remain atomic when the cash leg is already reflected"
+        );
+        assert_eq!(inventory.usdc_available(Venue::MarketMaking), Some(usdc(0)));
+        drop(inventory);
     }
 
     #[tokio::test]
@@ -11207,6 +11401,114 @@ mod tests {
             0,
             "64% ratio within 50% +/- 30% threshold"
         );
+    }
+
+    #[tokio::test]
+    async fn source_recovery_markers_are_applied_and_reenqueue_checks() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(500), usdc(500));
+        let reactor = make_trigger_with_inventory_registry_wrapper_and_freshness(
+            inventory,
+            &symbol,
+            Arc::new(MockWrapper::new()),
+            test_config(),
+            TestInventoryFreshness::Unobserved,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id,
+            InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OffchainInventory,
+                observed_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let enabled_equity_count = i64::try_from(
+            trigger
+                .config
+                .assets
+                .equities
+                .symbols
+                .keys()
+                .filter(|symbol| trigger.config.is_equity_rebalancing_enabled(symbol))
+                .count(),
+        )
+        .expect("enabled equity count fits in i64");
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            enabled_equity_count
+        );
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+
+        apply_and_dispatch_snapshot(
+            reactor,
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OnchainUsdc,
+                observed_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        trigger
+            .inventory
+            .read()
+            .await
+            .require_fresh_sources(
+                InventoryFreshnessRequirement::Usdc,
+                Utc::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            enabled_equity_count
+        );
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 2);
+    }
+
+    #[tokio::test]
+    async fn snapshot_recovery_preserves_fresh_source_observations() {
+        let trigger =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(500), usdc(500)))
+                .await;
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::UsdBalanceConversion(-1)),
+                InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: usdc(600),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .inventory
+            .read()
+            .await
+            .require_fresh_sources(
+                InventoryFreshnessRequirement::Usdc,
+                Utc::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -18978,6 +19280,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
@@ -19601,7 +19904,7 @@ mod tests {
         // Empty inventory - simulates startup state before polling completes
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
+            InventoryView::default().with_rebalancing_sources_observed_at(Utc::now()),
             event_sender,
         ));
 
@@ -19674,7 +19977,7 @@ mod tests {
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
+            InventoryView::default().with_rebalancing_sources_observed_at(Utc::now()),
             event_sender,
         ));
         seed_vault_registry(&pool, &symbol).await;
@@ -19753,7 +20056,7 @@ mod tests {
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
+            InventoryView::default().with_rebalancing_sources_observed_at(Utc::now()),
             event_sender,
         ));
         seed_vault_registry(&pool, &symbol).await;
@@ -19816,7 +20119,7 @@ mod tests {
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
+            InventoryView::default().with_rebalancing_sources_observed_at(Utc::now()),
             event_sender,
         ));
         seed_vault_registry(&pool, &symbol).await;
@@ -20195,7 +20498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redemption_rejected_preserves_inflight_via_absent_skip() {
+    async fn redemption_rejected_preserves_inflight_after_provider_stops_reporting_request() {
         let symbol = Symbol::new("AAPL").unwrap();
         // 80 onchain, 20 offchain = imbalanced
         let inventory = InventoryView::default()
@@ -20227,18 +20530,30 @@ mod tests {
             .await
             .unwrap();
 
-        // RedemptionRejected: terminal failure, no inventory update
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // RedemptionRejected: terminal failure, no inventory update.
         harness
             .receive::<EquityRedemption>(id.clone(), make_redemption_rejected())
             .await
             .unwrap();
 
-        // Empty InflightEquity snapshot: symbol absent from maps, so inflight
-        // is preserved (poll never zeros absent symbols).
-        let snapshot_id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
+        // The provider stops reporting the rejected request. Its absence must
+        // not clear assets that remain stranded in the redemption wallet.
         apply_and_dispatch_snapshot(
             reactor.clone(),
             snapshot_id,
@@ -20258,8 +20573,7 @@ mod tests {
                 .await
                 .symbols_with_inflight()
                 .contains(&symbol),
-            "Inflight should be preserved after RedemptionRejected \
-             (symbol absent from poll maps)"
+            "Inflight should be preserved after the provider stops reporting a rejected request"
         );
     }
 
@@ -22098,6 +22412,74 @@ mod tests {
             panic!("Expected exactly one mint job, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn equity_check_fails_closed_when_a_required_source_was_never_observed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_registry_wrapper_and_freshness(
+            inventory,
+            &symbol,
+            Arc::new(MockWrapper::new()),
+            test_config(),
+            TestInventoryFreshness::Unobserved,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+    }
+
+    #[tokio::test]
+    async fn usdc_check_fails_closed_when_a_required_source_was_never_observed() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory_config_notifier_and_freshness(
+            inventory,
+            test_config(),
+            Arc::new(NoopNotifier),
+            TestInventoryFreshness::Unobserved,
+        )
+        .await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn equity_check_fails_closed_when_required_sources_are_stale() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000))
+            .with_rebalancing_sources_observed_at(Utc::now() - ChronoDuration::seconds(61));
+        let trigger = make_trigger_with_inventory_registry_wrapper_and_freshness(
+            inventory,
+            &symbol,
+            Arc::new(MockWrapper::new()),
+            test_config(),
+            TestInventoryFreshness::Unobserved,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
     }
 
     /// A crash between `queue.push` and the first persisted mint event leaves
