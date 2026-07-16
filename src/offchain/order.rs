@@ -638,6 +638,9 @@ pub enum CancellationReason {
     /// transition so the next monitor scan can place a market order
     /// instead.
     MarketOpenReplacement,
+    /// Extended-hours limit order stayed live beyond the configured timeout;
+    /// cancel it so the next scan can place a fresh marketable limit.
+    ExtendedHoursRepriceTimeout,
     /// The broker reported the order cancelled without a locally persisted
     /// cancel request: either an operator/broker-side cancellation (e.g. a
     /// manual Alpaca-dashboard cancel) or a crash that lost the
@@ -1486,6 +1489,19 @@ impl OffchainOrder {
             | Filled { executor, .. }
             | Failed { executor, .. }
             | Cancelled { executor, .. } => *executor,
+        }
+    }
+
+    pub(crate) fn placed_at(&self) -> DateTime<Utc> {
+        use OffchainOrder::*;
+        match self {
+            Pending { placed_at, .. }
+            | Submitted { placed_at, .. }
+            | PartiallyFilled { placed_at, .. }
+            | Cancelling { placed_at, .. }
+            | Filled { placed_at, .. }
+            | Failed { placed_at, .. }
+            | Cancelled { placed_at, .. } => *placed_at,
         }
     }
 

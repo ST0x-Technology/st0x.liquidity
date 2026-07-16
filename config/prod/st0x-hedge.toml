@@ -24,6 +24,7 @@ traces_endpoint = "http://rain-management-observability.taile5cf8a.ts.net:10428"
 # incoming orderbook fills.
 [broker]
 counter_trade_slippage_bps = 100
+extended_hours_reprice_timeout_secs = 300
 
 # Travel Rule beneficiary identity for Alpaca whitelist creation.
 [broker.travel_rule]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apalis::prelude::Status;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -125,6 +126,8 @@ where
         ctx.finalize_terminal_pending_positions().await;
 
         if ctx.ctx.assets.any_extended_hours_enabled() {
+            ctx.request_extended_hours_reprice_timeout_cancellations()
+                .await;
             // Every regular-hours tick: request cancellation of still-live
             // extended-hours limit orders so they're replaced with market
             // orders. Level-triggered so an order that slipped past the
@@ -479,6 +482,77 @@ where
         }
     }
 
+    /// Cancels live extended-hours limit orders that have not filled within
+    /// the configured timeout, so the position can be released and re-hedged
+    /// with a fresh marketable limit on a later scan.
+    async fn request_extended_hours_reprice_timeout_cancellations(&self) {
+        let timeout = match chrono::Duration::from_std(Duration::from_secs(
+            self.ctx.extended_hours_reprice_timeout_secs,
+        )) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                warn!(
+                    %error,
+                    timeout_secs = self.ctx.extended_hours_reprice_timeout_secs,
+                    "Invalid extended-hours reprice timeout; skipping stale limit-order sweep"
+                );
+                return;
+            }
+        };
+        let now = Utc::now();
+
+        let all_positions = match self.position_projection.load_all().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                warn!("Failed to load positions for extended-hours reprice timeout: {error}");
+                return;
+            }
+        };
+
+        for (symbol, position) in &all_positions {
+            if !self.ctx.assets.is_extended_hours_enabled(symbol) {
+                continue;
+            }
+
+            let Some(offchain_order_id) = position.pending_offchain_order_id else {
+                continue;
+            };
+
+            let order = match self.offchain_order.load(&offchain_order_id).await {
+                Ok(Some(order)) => order,
+                Ok(None) => {
+                    warn!(%symbol, %offchain_order_id, "Pending order aggregate not found during extended-hours reprice timeout sweep; orphan recovery will handle it");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(%symbol, %offchain_order_id, %error, "Failed to load offchain order for extended-hours reprice timeout; will retry next tick");
+                    continue;
+                }
+            };
+
+            if order.executor() != self.executor.to_supported_executor() {
+                continue;
+            }
+
+            if !live_extended_hours_order_is_stale(&order, now, timeout) {
+                continue;
+            }
+
+            if let Err(error) = self
+                .offchain_order
+                .send(
+                    &offchain_order_id,
+                    OffchainOrderCommand::CancelOrder {
+                        reason: CancellationReason::ExtendedHoursRepriceTimeout,
+                    },
+                )
+                .await
+            {
+                warn!(%symbol, %offchain_order_id, %error, "Failed to request cancellation of stale extended-hours order; will retry next tick");
+            }
+        }
+    }
+
     /// After a successful cancel (or a recovery scan finding an already-
     /// terminal order), propagate the broker's actual fill quantity to the
     /// position aggregate so net is correctly debited. Otherwise a partial
@@ -553,6 +627,23 @@ where
             }
         }
     }
+}
+
+fn live_extended_hours_order_is_stale(
+    order: &OffchainOrder,
+    now: DateTime<Utc>,
+    timeout: chrono::Duration,
+) -> bool {
+    matches!(
+        order,
+        OffchainOrder::Submitted {
+            market_session: MarketSession::Extended,
+            ..
+        } | OffchainOrder::PartiallyFilled {
+            market_session: MarketSession::Extended,
+            ..
+        }
+    ) && now.signed_duration_since(order.placed_at()) >= timeout
 }
 
 /// Removes any non-terminal [`CheckPositions`] jobs and pushes a fresh one.
@@ -1032,19 +1123,29 @@ mod tests {
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
     ) {
+        record_extended_hours_order_at(ctx, symbol, offchain_order_id, chrono::Utc::now()).await;
+    }
+
+    async fn record_extended_hours_order_at(
+        ctx: &CheckPositionsCtx<MockExecutor>,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+        placed_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
         let limit_price = Positive::new(Usd::new(float!(195.25))).unwrap();
 
         ctx.offchain_order
             .send(
                 &offchain_order_id,
-                OffchainOrderCommand::Place {
+                OffchainOrderCommand::PlaceAt {
                     symbol: symbol.clone(),
                     shares,
                     direction: Direction::Sell,
                     executor: SupportedExecutor::DryRun,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
                     kind: CounterTradeOrderKind::ExtendedHoursLimit { limit_price },
+                    placed_at,
                 },
             )
             .await
@@ -1062,6 +1163,116 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_extended_hours_order_is_cancelled_for_reprice() {
+        // A live extended-hours limit order that sits unfilled past the
+        // configured timeout must be cancelled during the extended session so
+        // the next scan can place a fresh marketable limit instead of carrying
+        // hours of unhedged exposure.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(301),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        let OffchainOrder::Cancelling { reason, .. } = order else {
+            panic!("stale extended-hours order must be cancelling, got: {order:?}");
+        };
+        assert_eq!(reason, CancellationReason::ExtendedHoursRepriceTimeout);
+    }
+
+    #[tokio::test]
+    async fn fresh_extended_hours_order_is_not_cancelled_for_reprice() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(299),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Submitted {
+                    market_session: MarketSession::Extended,
+                    ..
+                }
+            ),
+            "fresh extended-hours order must stay live, got: {order:?}"
+        );
     }
 
     /// MockExecutor reporting a Regular session whose `get_order_status`
