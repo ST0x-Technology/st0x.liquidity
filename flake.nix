@@ -413,6 +413,8 @@
                     cargo fmt -- --check
                   '
 
+                  nix develop .#ci-audit -c ./scripts/audit-rust.sh
+
                   # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
                   nix run .#genBunNix
                   nix fmt -- dashboard/bun.nix
@@ -657,6 +659,7 @@
                     bun
                     sccache
                     sqlx-cli
+                    cargo-audit
                     cargo-nextest
                     ragenixPkg
                     packages.secret
@@ -694,6 +697,16 @@
               }
               // abiEnv
             );
+
+            ci-audit = pkgs.mkShell {
+              buildInputs = [
+                rustToolchain
+                pkgs.cargo-audit
+                pkgs.jq
+              ];
+
+              RAIN_MATH_FLOAT_SOURCE = rain-math-float;
+            };
 
             # CI dashboard: bun install + lint only. `nix build .#st0x-dashboard`
             # and `nix run .#st0x-dto` realize their own closures and don't need
