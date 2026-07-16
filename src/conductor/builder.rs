@@ -31,7 +31,6 @@ use super::job::{
 };
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
-use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::{Conductor, SupervisorStartupTokens};
 use crate::alerts::Notifier;
@@ -44,6 +43,11 @@ use crate::bot_gas::{
 use crate::dashboard::{
     DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue, DashboardTradeHandoffMonitor,
     DeliverDashboardTrade,
+};
+use crate::inventory::job::{
+    InventoryPollingJobCtx, InventoryPollingJobQueues, PollBaseWalletUnwrappedEquity,
+    PollBaseWalletUsdc, PollBaseWalletWrappedEquity, PollEthereumWalletUsdc, PollInflightEquity,
+    PollOffchainInventory, PollOnchainEquity, PollOnchainUsdc,
 };
 use crate::inventory::{
     BroadcastingInventory, InventoryDivergenceRecoveryCtx, InventoryPollingService,
@@ -212,7 +216,7 @@ pub(crate) fn spawn<Prov, Exec>(
     rejection_queue: HandleOrderRejectionJobQueue,
     check_positions_queue: CheckPositionsJobQueue,
     portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
-    notifier: Arc<dyn Notifier>,
+    inventory_polling_queues: InventoryPollingJobQueues,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
@@ -248,6 +252,7 @@ where
 {
     info!("Starting conductor orchestration");
 
+    let notifier = worker_failure_notifier.clone();
     let order_owner = context.ctx.order_owner();
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
@@ -319,12 +324,11 @@ where
             .with_fresh_offchain_usd_observer(rebalancing_service.clone());
     }
 
-    let polling_service = Arc::new(polling_service);
-
-    let inventory_monitor = InventoryMonitor {
-        poller: polling_service,
+    let inventory_polling_ctx = Arc::new(InventoryPollingJobCtx {
+        poller: Arc::new(polling_service),
+        queues: inventory_polling_queues.clone(),
         interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
-    };
+    });
 
     // Build the gas monitors before `context.provider` is consumed by the
     // order-fill monitor / accountant below. `None` when `[alerts]` is
@@ -489,6 +493,11 @@ where
         ethereum_gas_monitor: ethereum_gas_monitor_startup,
     } = context.supervisor_startup;
 
+    // Independent inventory source jobs are bootstrapped before this builder
+    // runs; acknowledge the retired long-running monitor slot once their
+    // durable queues are available.
+    inventory_startup.acknowledge();
+
     let order_fill_monitor = OrderFillMonitor::new(
         context.ctx.evm.clone(),
         backfill_queue.clone(),
@@ -511,13 +520,6 @@ where
             StartupTask {
                 task: order_fill_monitor,
                 token: order_fill_startup,
-            },
-        )
-        .with_task(
-            "inventory-monitor",
-            StartupTask {
-                task: inventory_monitor,
-                token: inventory_startup,
             },
         )
         .with_task(
@@ -575,6 +577,7 @@ where
         rejection_ctx,
         check_positions_ctx,
         portfolio_snapshot_ctx,
+        inventory_polling_ctx,
         rebalancing_check_ctx: rebalancing_service,
         seed_vault_registry_ctx,
         job_queue,
@@ -587,6 +590,7 @@ where
         rejection_queue,
         check_positions_queue,
         portfolio_snapshot_queue,
+        inventory_polling_queues,
         wrapped_equity_recovery_queue,
         wrapped_equity_recovery_ctx,
         unwrapped_equity_recovery_queue,
@@ -645,6 +649,7 @@ where
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
     check_positions_ctx: Arc<CheckPositionsCtx<Exec>>,
     portfolio_snapshot_ctx: Arc<PortfolioSnapshotCtx>,
+    inventory_polling_ctx: Arc<InventoryPollingJobCtx>,
     rebalancing_check_ctx: Option<Arc<RebalancingService>>,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
@@ -657,6 +662,7 @@ where
     rejection_queue: HandleOrderRejectionJobQueue,
     check_positions_queue: CheckPositionsJobQueue,
     portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
+    inventory_polling_queues: InventoryPollingJobQueues,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
@@ -701,6 +707,7 @@ where
             rejection_ctx,
             check_positions_ctx,
             portfolio_snapshot_ctx,
+            inventory_polling_ctx,
             rebalancing_check_ctx,
             seed_vault_registry_ctx,
             job_queue,
@@ -713,6 +720,7 @@ where
             rejection_queue,
             check_positions_queue,
             portfolio_snapshot_queue,
+            inventory_polling_queues,
             wrapped_equity_recovery_queue,
             wrapped_equity_recovery_ctx,
             unwrapped_equity_recovery_queue,
@@ -767,6 +775,8 @@ where
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_portfolio_snapshot = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_inventory_polling = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_transfer_usdc_to_hedging = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_transfer_usdc_to_market_making = failure_injector.clone();
@@ -793,6 +803,7 @@ where
         let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_unwrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_check_positions = failure_notify.clone();
+        let failure_notify_for_inventory_polling = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_hedging = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_market_making = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
@@ -916,6 +927,15 @@ where
                         failure_injector_for_portfolio_snapshot.clone(),
                     )
                 });
+
+            let monitor = register_inventory_polling_workers(
+                monitor,
+                &inventory_polling_ctx,
+                inventory_polling_queues,
+                &failure_notify_for_inventory_polling,
+                #[cfg(any(test, feature = "test-support"))]
+                &failure_injector_for_inventory_polling,
+            );
 
             let apalis_monitor = if let Some(rebalancing_service) = rebalancing_check_ctx {
                 let equity_service = Arc::clone(&rebalancing_service);
@@ -1121,6 +1141,65 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     } else {
         debug!("{task_name} not configured", task_name = task_name);
     }
+}
+
+fn register_inventory_polling_workers(
+    monitor: Monitor,
+    ctx: &Arc<InventoryPollingJobCtx>,
+    queues: InventoryPollingJobQueues,
+    failure_notify: &Arc<TerminalFailureSignal>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: &FailureInjector,
+) -> Monitor {
+    let InventoryPollingJobQueues {
+        inflight_equity,
+        onchain_equity,
+        onchain_usdc,
+        ethereum_wallet_usdc,
+        base_wallet_usdc,
+        base_wallet_unwrapped_equity,
+        base_wallet_wrapped_equity,
+        offchain_inventory,
+    } = queues;
+
+    macro_rules! register {
+        ($monitor:expr, $job:ty, $queue:expr) => {
+            $monitor.register({
+                let ctx = ctx.clone();
+                let failure_notify = failure_notify.clone();
+                #[cfg(any(test, feature = "test-support"))]
+                let failure_injector = failure_injector.clone();
+
+                move |index| {
+                    build_supervised_worker!(
+                        ::<InventoryPollingJobCtx, $job>,
+                        index,
+                        $queue.clone(),
+                        ctx.clone(),
+                        failure_notify.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector.clone(),
+                    )
+                }
+            })
+        };
+    }
+
+    let monitor = register!(monitor, PollInflightEquity, inflight_equity);
+    let monitor = register!(monitor, PollOnchainEquity, onchain_equity);
+    let monitor = register!(monitor, PollOnchainUsdc, onchain_usdc);
+    let monitor = register!(monitor, PollEthereumWalletUsdc, ethereum_wallet_usdc);
+    let monitor = register!(monitor, PollBaseWalletUsdc, base_wallet_usdc);
+    let monitor = register!(
+        monitor,
+        PollBaseWalletUnwrappedEquity,
+        base_wallet_unwrapped_equity
+    );
+    let monitor = register!(
+        monitor,
+        PollBaseWalletWrappedEquity,
+        base_wallet_wrapped_equity
+    );
+    register!(monitor, PollOffchainInventory, offchain_inventory)
 }
 
 /// Conditionally registers the wrapped-equity recovery worker against the
