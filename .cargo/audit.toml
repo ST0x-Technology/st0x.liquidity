@@ -1,0 +1,46 @@
+[advisories]
+# RUSTSEC-2023-0071: rsa 0.9.10 is lock-only through sqlx-mysql 0.8.6;
+# no normal or development dependency selects that package.
+# RUSTSEC-2025-0055: tracing-subscriber 0.2.25 is lock-only through
+# ark-relations 0.5.1; no normal or development dependency selects it.
+# RUSTSEC-2024-0388: derivative 2.2.0 is lock-only through ark-ff 0.3.0 and
+# 0.4.2; neither version is selected by a normal or development dependency.
+# RUSTSEC-2026-0258: h2 0.3.27 is selected only by reqwest 0.11.27 from
+# rain-error-decoding 0.1.0, whose reqwest line has no patched h2 release.
+# RUSTSEC-2024-0436: paste 1.0.15 is selected by alloy-primitives 1.6.0,
+# ark-ff 0.5.0, syn-solidity 1.5.7, and wasm-bindgen-utils 0.1.2.
+# RUSTSEC-2026-0173: proc-macro-error2 2.0.1 is selected by
+# alloy-sol-macro 1.5.7 and alloy-sol-macro-expander 1.5.7.
+# RUSTSEC-2025-0134: rustls-pemfile 1.0.4 is selected only by reqwest 0.11.27
+# from rain-error-decoding 0.1.0.
+# RUSTSEC-2026-0253: lru 0.16.4 is selected only by alloy-provider 1.6.3;
+# alloy currently constrains lru below the patched 0.18 line.
+# RUSTSEC-2026-0205: scc 2.4.0 is selected only by the serial_test 3.4.0
+# development dependency; the affected panic path is not production code.
+# scripts/audit-rust.sh rejects any change to these exact dependency paths.
+ignore = [
+  "RUSTSEC-2023-0071",
+  "RUSTSEC-2024-0388",
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2025-0055",
+  "RUSTSEC-2025-0134",
+  "RUSTSEC-2026-0173",
+  "RUSTSEC-2026-0205",
+  "RUSTSEC-2026-0253",
+  "RUSTSEC-2026-0258",
+]
+
+[database]
+url = "https://github.com/RustSec/advisory-db"
+fetch = true
+stale = false
+
+[yanked]
+enabled = true
+update_index = true
+
+[output]
+deny = ["unmaintained", "unsound"]
+format = "terminal"
+quiet = false
+show_tree = true
