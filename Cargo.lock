@@ -2615,8 +2615,8 @@ dependencies = [
 
 [[package]]
 name = "event-sorcery"
-version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=0.1.1#d0ad3f66bb5a1da23161d898027bff1abb9dabd6"
+version = "0.1.2"
+source = "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=2cf958dd0899becd6f5b3ac34b7b1841bac55219#2cf958dd0899becd6f5b3ac34b7b1841bac55219"
 dependencies = [
  "async-trait",
  "cqrs-es 0.5.0",
@@ -6102,8 +6102,8 @@ dependencies = [
 
 [[package]]
 name = "sqlite-es"
-version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=0.1.1#d0ad3f66bb5a1da23161d898027bff1abb9dabd6"
+version = "0.1.2"
+source = "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=2cf958dd0899becd6f5b3ac34b7b1841bac55219#2cf958dd0899becd6f5b3ac34b7b1841bac55219"
 dependencies = [
  "chrono",
  "cqrs-es 0.5.0",

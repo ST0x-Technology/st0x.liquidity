@@ -512,11 +512,19 @@ migration files in `migrations/`.
 
 The dashboard exposes a Performance tab measuring the _technological_ health of
 the system (latency and reliability), complementing the P&L tab's economic view.
-All phase-1 metrics are maintained by a forward-only reactor that subscribes to
-live CQRS events and writes into bespoke read-model tables (`hedge_fill`,
-`hedge_cycle`, `hedge_attribution_state`). The read model reflects activity
-since deployment only -- there is no historical backfill from pre-existing
-events in the event store. No new write paths touch the trading path.
+The hedge-latency metrics are maintained by a forward-only reactor that
+subscribes to live CQRS events and writes into bespoke read-model tables
+(`hedge_fill`, `hedge_cycle`, `hedge_submission`, and
+`hedge_attribution_reset`). That read model reflects activity since deployment
+only -- there is no historical backfill from pre-existing events in the event
+store. The USDC/equity stage-timing and lifecycle-failure reactors maintain
+their own bespoke tables with startup catch-up from the event store.
+
+All four bespoke reactors are idempotent, database-only units and retry
+transient SQLite busy/locked failures with bounded exponential backoff. A retry
+re-runs the complete event reaction: multi-statement reactions therefore execute
+in one transaction, and every insert is conflict-safe under redelivery. No new
+write paths touch the trading path.
 
 #### Hedge latency pipeline
 

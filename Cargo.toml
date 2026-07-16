@@ -140,14 +140,9 @@ uuid = { version = "1.11", features = ["serde", "v4", "v5"] }
 # newer crates require >=0.2.122).
 wasm-bindgen = "=0.2.122"
 
-[workspace.dependencies.sqlite-es]
-git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "0.1.1"
-package = "sqlite-es"
-
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "0.1.1"
+rev = "2cf958dd0899becd6f5b3ac34b7b1841bac55219"
 package = "event-sorcery"
 
 [package]

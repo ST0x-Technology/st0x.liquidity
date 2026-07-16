@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use st0x_event_sorcery::{Store, StoreBuilder};
+use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
 use st0x_evm::IERC20;
 use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Symbol};
 use st0x_finance::Usdc;
@@ -244,7 +244,9 @@ pub async fn seed_simulated_mint_history(
     services.tokenizer = Arc::new(FixtureTokenizer::new(Address::ZERO, 0));
 
     let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-        .with(Arc::new(EquityTimingProjection::new(pool.clone())))
+        .with(Arc::new(RetryOnBusy {
+            inner: EquityTimingProjection::new(pool.clone()),
+        }))
         .build(services)
         .await?;
 
@@ -336,7 +338,9 @@ pub async fn seed_simulated_usdc_rebalance_history(
     // `Materialized = Table`, which returns a `(Store, Projection)` pair) --
     // the reactor is wired into the store's dispatch either way.
     let rebalance = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .with(Arc::new(RebalanceTimingProjection::new(pool.clone())))
+        .with(Arc::new(RetryOnBusy {
+            inner: RebalanceTimingProjection::new(pool.clone()),
+        }))
         .build(())
         .await?;
 
@@ -1047,7 +1051,9 @@ pub async fn seed_simulated_equity_redemption_history(
         };
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(Arc::new(EquityTimingProjection::new(pool.clone())))
+            .with(Arc::new(RetryOnBusy {
+                inner: EquityTimingProjection::new(pool.clone()),
+            }))
             .build(services)
             .await?;
 

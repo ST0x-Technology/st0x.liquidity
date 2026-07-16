@@ -47,8 +47,8 @@ let
     outputHashes = {
       "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
-      "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=1557172049c8a43add209a86c7d809e89a5fbc82#1557172049c8a43add209a86c7d809e89a5fbc82" =
-        "sha256-GkQaR+cp09NJBarrz8VeJV/6DVFz+EhMsu2y8jP0Uck=";
+      "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=2cf958dd0899becd6f5b3ac34b7b1841bac55219#2cf958dd0899becd6f5b3ac34b7b1841bac55219" =
+        "sha256-6gfvjw1aPmI8u3ViJkY2mqweuGGb4VvX/T1Bc5MTvE0=";
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
     };
@@ -85,12 +85,12 @@ let
 
   # sqlite-es uses sqlx::migrate!("../../migrations") which resolves inside
   # the vendor dir. Fetch migrations from event-sorcery at the same commit
-  # as Cargo.lock specifies for sqlite-es.
+  # as Cargo.lock specifies for event-sorcery.
   cargoLock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
-  sqliteEsPackage = builtins.head (
-    builtins.filter (p: p.name or "" == "sqlite-es") cargoLock.package
+  eventSorceryPackage = builtins.head (
+    builtins.filter (p: p.name or "" == "event-sorcery") cargoLock.package
   );
-  sqliteEsRev = builtins.head (builtins.match ".*#([a-f0-9]+)" sqliteEsPackage.source);
+  eventSorceryRev = builtins.head (builtins.match ".*#([a-f0-9]+)" eventSorceryPackage.source);
 
   # Issuance vendor override (above) reuses the rev Cargo.lock locks for the
   # st0x-issuance-* crates, so the rev can never drift from the Cargo.toml pins.
@@ -103,7 +103,7 @@ let
   sqliteEsMigrations =
     builtins.fetchGit {
       url = "https://github.com/ST0x-Technology/event-sorcery";
-      rev = sqliteEsRev;
+      rev = eventSorceryRev;
     }
     + "/migrations";
 
