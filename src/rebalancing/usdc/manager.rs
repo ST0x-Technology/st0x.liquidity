@@ -274,7 +274,7 @@ impl<
     /// USDC is already burned, so the aggregate is moved to `BridgingFailed`
     /// via `FailBridging` -- surfacing a durable terminal state for operator
     /// reconciliation rather than wedging the rebalance in a non-terminal state
-    /// while the worker exhausts retries and fail-stops.
+    /// while the worker exhausts retries and opens its recovering circuit.
     async fn poll_cctp_attestation(
         &self,
         id: &UsdcRebalanceId,

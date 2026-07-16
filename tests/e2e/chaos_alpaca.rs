@@ -533,20 +533,19 @@ fn alpaca_client_timeout_constants_bracket_placement_delay_boundaries() {
 }
 
 /// Top-level hypothesis: a broker outage while a hedge sits `Submitted`
-/// must end in a loud halt -- never a silently un-polled order -- and a
-/// restart with the broker restored must resume polling to exactly one
-/// filled broker order.
+/// must leave a loud terminal job -- never a silently un-polled order -- while
+/// isolating the failure to its worker. A restart with the broker restored must
+/// resume polling to exactly one filled broker order.
 ///
 /// Scenario: the broker mock holds the order "new" indefinitely, the
 /// proxy is severed while the order awaits its fill, and `PollOrderStatus`
 /// exhausts its retry budget against the refused connections. The
-/// fail-stop circuit breaker then halts the bot (the deliberate
-/// fail-stop posture: a one-sided trade must page an operator, not
-/// accumulate silent exposure). On restart with the broker back,
+/// recovering worker circuit then pauses that worker and pages the operator
+/// without stopping the process. On restart with the broker back,
 /// `recover_submitted_offchain_orders` re-enqueues the poll and the
 /// order completes.
 #[test_log::test(tokio::test)]
-async fn broker_outage_with_submitted_order_halts_bot_and_restart_recovers() -> anyhow::Result<()> {
+async fn broker_outage_with_submitted_order_isolated_and_restart_recovers() -> anyhow::Result<()> {
     let equity_symbol = "AAPL";
     let onchain_price = float!(155.00);
     let broker_fill_price = float!(150.25);
@@ -589,25 +588,43 @@ async fn broker_outage_with_submitted_order_halts_bot_and_restart_recovers() -> 
 
     latency.sever();
 
-    // PollOrderStatus exhausts its retries against refused connections;
-    // the fail-stop breaker must halt the bot loudly.
-    let join_result = tokio::time::timeout(Duration::from_secs(60), &mut bot)
-        .await
-        .expect("Bot must halt within 60s of the broker going dark with an order in flight");
-    let error = join_result
-        .expect("Bot task must fail, not panic")
-        .expect_err("Bot must fail-stop, not keep running with an un-pollable order");
-    let chain = format!("{error:#}");
+    // PollOrderStatus exhausts its retries against refused connections. The
+    // terminal queue row remains visible while the bot and sibling workers stay
+    // alive.
+    let pool = connect_db(&infra.db_path).await?;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let terminal_jobs: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE status IN ('Failed', 'Killed') AND attempts >= max_attempts",
+            )
+            .fetch_one(&pool)
+            .await?;
+            if terminal_jobs > 0 {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the status-poll job must exhaust its retry budget")?;
     assert!(
-        chain.contains("Apalis worker failed after retries"),
-        "Bot error chain should contain the terminal job failure, got: {chain}",
+        !bot.is_finished(),
+        "a terminal status-poll job must not stop the bot",
     );
+    pool.close().await;
 
     // Broker comes back; let the order fill on the next poll.
     infra
         .broker_service
         .set_symbol_fill_delay(Symbol::new(equity_symbol)?, 0);
     latency.restore().await?;
+    bot.abort();
+    let cancellation = bot.await;
+    assert!(
+        cancellation.is_err_and(|error| error.is_cancelled()),
+        "the first bot must finish cancellation before its replacement starts",
+    );
 
     let ctx2 = build_ctx()
         .chain(&infra.base_chain)

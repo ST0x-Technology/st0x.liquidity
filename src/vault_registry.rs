@@ -1748,13 +1748,10 @@ mod tests {
         use apalis::layers::retry::RetryPolicy;
         use apalis::prelude::{Monitor, WorkerBuilder};
         use apalis_core::worker::event::Event;
-        use apalis_core::worker::ext::circuit_breaker::{
-            CircuitBreaker, config::CircuitBreakerConfig,
-        };
         use apalis_core::worker::ext::event_listener::EventListenerExt;
         use std::time::Duration;
 
-        use crate::conductor::job::{FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, JobQueue, work};
+        use crate::conductor::job::{FailureInjector, JobQueue, work};
 
         let (pool, apalis_pool) = setup_test_pools().await;
 
@@ -1775,17 +1772,12 @@ mod tests {
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
-                    let fail_stop = CircuitBreakerConfig::default()
-                        .with_failure_threshold(1)
-                        .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-
                     WorkerBuilder::new(format!("seed-vault-registry-test-{index}"))
                         .backend(queue_for_worker.clone().into_storage())
                         .data(ctx_for_worker.clone())
                         .data(injector_for_worker.clone())
                         .concurrency(1)
                         .retry(RetryPolicy::retries(3))
-                        .break_circuit_with(fail_stop)
                         .on_event(|ctx, event| {
                             if let Event::Error(_) = event {
                                 let _ = ctx.stop();
