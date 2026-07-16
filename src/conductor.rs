@@ -68,6 +68,10 @@ use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
+use crate::inventory::job::{
+    ConfiguredInventorySources, InventoryPollingJobQueues, bootstrap_inventory_polling_jobs,
+};
+use crate::inventory::snapshot::InventoryObservationSource;
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
@@ -844,8 +848,6 @@ impl Conductor {
     {
         let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, &ctx.evm, pool.clone()).await?;
-        let cache = SymbolCache::default();
-
         let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
             setup_apalis_queues(&pool, &apalis_pool, event_sender).await?;
 
@@ -978,16 +980,19 @@ impl Conductor {
         )
         .await?;
 
-        let job_cleanup = spawn_finished_job_cleanup(
-            pool.clone(),
-            apalis_pool.clone(),
+        let (inventory_polling_queues, job_cleanup) = setup_periodic_job_runtime(
+            &pool,
+            &apalis_pool,
+            wallet_polling.as_ref(),
+            tokenizer.as_ref(),
             Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
             startup_tokens.job_cleanup,
-        );
+        )
+        .await?;
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
-            cache,
+            cache: SymbolCache::default(),
             provider,
             executor,
             execution_threshold: ctx.execution_threshold,
@@ -1003,10 +1008,6 @@ impl Conductor {
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
         };
-
-        // Clone before the builder consumes it; the recovery handle needs the
-        // rebalancing service to rebuild tracking during recheck recovery.
-        let recovery_service = rebalancing_service.clone();
 
         let (resume_tokenization_queue, resume_tokenization_ctx) = resolve_resume_tokenization(
             resume_tokenization_queue,
@@ -1027,7 +1028,7 @@ impl Conductor {
             .rejection_queue(rejection_queue)
             .check_positions_queue(check_positions_queue)
             .portfolio_snapshot_queue(portfolio_snapshot_queue)
-            .notifier(notifier.clone())
+            .inventory_polling_queues(inventory_polling_queues)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
@@ -1042,7 +1043,7 @@ impl Conductor {
             .maybe_transfer_equity_to_market_making_ctx(transfer_equity_to_market_making_ctx)
             .transfer_equity_to_hedging_queue(schedulers.transfer_equity_to_hedging)
             .maybe_transfer_equity_to_hedging_ctx(transfer_equity_to_hedging_ctx)
-            .maybe_rebalancing_service(rebalancing_service)
+            .maybe_rebalancing_service(rebalancing_service.clone())
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
             .resume_tokenization_queue(resume_tokenization_queue)
@@ -1053,12 +1054,10 @@ impl Conductor {
             .maybe_record_bot_gas_receipt_cost_ctx(record_bot_gas_receipt_cost_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
-            // Worker-failure pages share the operational `[alerts]` channel
-            // rather than building a second notifier against the same config.
             .worker_failure_notifier(notifier)
             .call()?;
 
-        publish_recovery_handle(&recovery_cell, recovery_transfer, recovery_service);
+        publish_recovery_handle(&recovery_cell, recovery_transfer, rebalancing_service);
 
         conductor
             .run_until_completion(startup_tokens.initialized)
@@ -1240,6 +1239,61 @@ impl Drop for Conductor {
     fn drop(&mut self) {
         self.abort_all();
     }
+}
+
+/// Creates the per-source inventory polling queues and bootstraps their
+/// durable jobs for every source the configuration makes observable.
+async fn setup_inventory_polling_queues(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    wallet_polling: Option<&crate::inventory::WalletPollingCtx>,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) -> anyhow::Result<InventoryPollingJobQueues> {
+    let queues = InventoryPollingJobQueues::new(apalis_pool);
+    let sources = configured_inventory_sources(wallet_polling, tokenizer);
+    bootstrap_inventory_polling_jobs(apalis_pool, &queues, &sources).await?;
+    Ok(queues)
+}
+
+/// Starts the two recurring Apalis runtime concerns after their dependencies
+/// have been built.
+async fn setup_periodic_job_runtime(
+    pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    wallet_polling: Option<&crate::inventory::WalletPollingCtx>,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+    cleanup_interval: Duration,
+    cleanup_startup: StartupToken,
+) -> anyhow::Result<(InventoryPollingJobQueues, JoinHandle<()>)> {
+    let inventory_polling_queues =
+        setup_inventory_polling_queues(apalis_pool, wallet_polling, tokenizer).await?;
+    let job_cleanup = spawn_finished_job_cleanup(
+        pool.clone(),
+        apalis_pool.clone(),
+        cleanup_interval,
+        cleanup_startup,
+    );
+    Ok((inventory_polling_queues, job_cleanup))
+}
+
+fn configured_inventory_sources(
+    wallet_polling: Option<&crate::inventory::WalletPollingCtx>,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) -> ConfiguredInventorySources {
+    let mut sources = ConfiguredInventorySources::always_available();
+    if tokenizer.is_some() {
+        sources.enable(InventoryObservationSource::InflightEquity);
+    }
+    if let Some(wallets) = wallet_polling {
+        sources.enable(InventoryObservationSource::EthereumWalletUsdc);
+        sources.enable(InventoryObservationSource::BaseWalletUsdc);
+        if !wallets.unwrapped_equity_token_addresses.is_empty() {
+            sources.enable(InventoryObservationSource::BaseWalletUnwrappedEquity);
+        }
+        if !wallets.wrapped_equity_token_addresses.is_empty() {
+            sources.enable(InventoryObservationSource::BaseWalletWrappedEquity);
+        }
+    }
+    sources
 }
 
 /// Builds the [`WrappedEquityRecoveryCtx`] when every dependency the recovery
@@ -2215,6 +2269,14 @@ async fn build_rebalancer_services<Chain: Wallet + Clone>(
     .map_err(Into::into)
 }
 
+fn rebalancing_bot_gas_enqueuer(deps: &RebalancingDeps) -> BotGasReceiptCostEnqueuer {
+    if deps.ctx.bot_gas_valuation.is_some() {
+        BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone())
+    } else {
+        BotGasReceiptCostEnqueuer::Disabled
+    }
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -2235,21 +2297,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
 
-        // This function only runs under `TradingMode::Rebalancing`, which
-        // requires `[wallet]` to be configured (see `CtxError::WalletNotConfigured`),
-        // so `[wallet]` presence is guaranteed here -- unlike
-        // `build_record_bot_gas_receipt_cost_ctx`, which also runs in
-        // Standalone mode and must check both. With that precondition met,
-        // gating on `bot_gas_valuation.is_some()` alone matches
-        // `build_record_bot_gas_receipt_cost_ctx`'s outcome exactly, so the
-        // enqueuer and the registered worker can never disagree: an enqueuer
-        // with no worker would pile up `Pending` rows that nothing ever
-        // drains.
-        let bot_gas_enqueuer = if deps.ctx.bot_gas_valuation.is_some() {
-            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone())
-        } else {
-            BotGasReceiptCostEnqueuer::Disabled
-        };
+        // Rebalancing guarantees a wallet, so valuation controls both this
+        // enqueuer and its worker; they must not disagree.
+        let bot_gas_enqueuer = rebalancing_bot_gas_enqueuer(&deps);
 
         // The (orderbook, vault-owner) pair keys both the vault-registry lookup
         // and the rebalancing service's registry reads.
@@ -2301,8 +2351,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.schedulers.transfer_equity_to_market_making.clone();
         let transfer_equity_to_hedging_queue = deps.schedulers.transfer_equity_to_hedging.clone();
 
-        let notifier = deps.notifier.clone();
-
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
@@ -2315,7 +2363,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.inventory.clone(),
             wrapper.clone(),
             deps.schedulers,
-            notifier.clone(),
+            deps.notifier.clone(),
         ));
 
         wire_freeze_guard(
@@ -2414,7 +2462,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {
             deliverer: mint_authorization.issuance_client,
             mint_store: built.mint.clone(),
-            notifier: notifier.clone(),
+            notifier: deps.notifier.clone(),
             job_queue: mint_authorization.queue.clone(),
         });
 
@@ -2424,7 +2472,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             inventory_recovery_redrive_delay: rebalancing_ctx.inventory_recovery_redrive_delay,
             job_queue: transfer_usdc_to_market_making_queue,
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
-            notifier: notifier.clone(),
+            notifier: deps.notifier.clone(),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -2432,7 +2480,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             timeout: rebalancing_ctx.transfer_attempt_timeout,
             job_queue: transfer_usdc_to_hedging_queue,
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
-            notifier,
+            notifier: deps.notifier,
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {

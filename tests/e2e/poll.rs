@@ -412,9 +412,9 @@ pub async fn poll_for_hedge_completion(
 /// conflicts) may still be in-flight after higher-level conditions are met.
 /// Use this instead of an immediate done-count assertion.
 ///
-/// The self-rescheduling `CheckPositions` and `PortfolioSnapshot` jobs are
-/// excluded from both totals, since each always leaves exactly one non-`Done`
-/// row in the queue waiting for the next tick and is not "in-flight work".
+/// Perpetual jobs are excluded from both totals, since they always leave a
+/// `Pending` successor in the queue waiting for the next tick and are not
+/// "in-flight work".
 pub async fn poll_for_all_jobs_done(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
@@ -436,35 +436,35 @@ pub async fn poll_for_all_jobs_done(
             continue;
         };
 
-        let check_positions = st0x_hedge::check_positions_job_type();
-        let portfolio_snapshot = st0x_hedge::portfolio_snapshot_job_type();
-        let total =
-            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE job_type NOT IN (?, ?)")
-                .bind(check_positions)
-                .bind(portfolio_snapshot)
-                .fetch_one(&pool)
-                .await;
-
-        let done = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM Jobs WHERE status = 'Done' AND job_type NOT IN (?, ?)",
-        )
-        .bind(check_positions)
-        .bind(portfolio_snapshot)
-        .fetch_one(&pool)
-        .await;
+        let jobs = sqlx::query_as::<_, (String, String)>("SELECT status, job_type FROM Jobs")
+            .fetch_all(&pool)
+            .await;
 
         pool.close().await;
 
-        match (total, done) {
-            (Ok((total,)), Ok((done,))) if total >= expected_total && done == total => {
-                return;
+        match jobs {
+            Ok(jobs) => {
+                let perpetual_job_types = st0x_hedge::perpetual_job_types();
+                let finite_jobs = jobs
+                    .iter()
+                    .filter(|(_, job_type)| !perpetual_job_types.contains(&job_type.as_str()));
+                let total = i64::try_from(finite_jobs.clone().count())
+                    .expect("SQLite job count must fit in i64");
+                let done =
+                    i64::try_from(finite_jobs.filter(|(status, _)| status == "Done").count())
+                        .expect("SQLite completed-job count must fit in i64");
+
+                if total >= expected_total && done == total {
+                    return;
+                }
+
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "Timed out after {timeout:?} waiting for {context} \
+                     (total={total}, done={done})",
+                );
             }
-            (Ok((total,)), Ok((done,))) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} \
-                 (total={total}, done={done})",
-            ),
-            _ => assert!(
+            Err(_) => assert!(
                 tokio::time::Instant::now() < deadline,
                 "Timed out after {timeout:?} waiting for {context} (query failed)",
             ),

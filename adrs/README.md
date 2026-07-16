@@ -128,6 +128,7 @@ decision.
 | [0016](0016-store-bot-gas-costs-in-the-event-stream.md)                 | Store bot-gas costs in the event stream                                              | Proposed |
 | [0017](0017-eth-usd-valuation-via-pyth-base-block-pinned.md)            | Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned                     | Proposed |
 | [0020](0020-reconstruct-pre-burn-usdc-inventory-on-resume.md)           | Reconstruct pre-burn Alpaca-to-Base USDC inventory before resume                     | Proposed |
+| [0021](0021-independent-durable-inventory-source-jobs.md)               | Run inventory observations as independent durable source jobs                        | Proposed |
 
 ADR-0020 proposes to amend ADR-0003 for pre-burn Alpaca-to-Base inventory
 reconstruction. The amendment is not in force until ADR-0020 is accepted.
