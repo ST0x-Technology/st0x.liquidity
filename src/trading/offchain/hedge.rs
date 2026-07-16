@@ -7,16 +7,18 @@
 use std::sync::Arc;
 
 use alloy::primitives::U256;
+use metrics::counter;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use st0x_config::{AssetsConfig, ExecutionThreshold};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_execution::{
-    Direction, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol, Usd,
+    ClientOrderId, CounterTradePreflight, Direction, FractionalShares, MarketOrder, MarketSession,
+    Positive, PostCloseGap, SupportedExecutor, Symbol, Usd,
 };
 
 use crate::conductor::job::{Job, JobQueue, Label};
@@ -26,6 +28,8 @@ use crate::offchain::order::{
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
 };
 use crate::position::{Position, PositionCommand, PositionError};
+use crate::position_check::preflight_skip_reason_label;
+use crate::trading::offchain::close_flatten::CloseFlattenPolicy;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
 /// Error returned by [`apply_slippage`].
@@ -106,6 +110,11 @@ pub(crate) struct HedgeCtx {
     /// flag, so an extended order for a disabled symbol would be orphaned).
     pub(crate) assets: AssetsConfig,
     pub(crate) counter_trade_slippage_bps: u16,
+    /// Validated once at construction (`conductor/builder.rs`) instead of
+    /// re-parsed from a raw `u64` on every hedge job -- the window is fixed
+    /// for the process lifetime, so re-validating it per job just threads an
+    /// always-succeeds-in-practice `Result` through the hot placement path.
+    pub(crate) close_flatten_policy: CloseFlattenPolicy,
     /// Serialises broker submissions across hedge jobs and the inline
     /// counter-trade path in `conductor.rs`, so a preflight running under
     /// this same lock (the inline path's) observes any prior submission
@@ -146,15 +155,19 @@ fn default_market_session() -> MarketSession {
 async fn select_order_kind_for_current_session(
     ctx: &HedgeCtx,
     symbol: &Symbol,
+    shares: Positive<FractionalShares>,
     direction: Direction,
     enqueued_session: MarketSession,
 ) -> Result<Option<CounterTradeOrderKind>, TradeAccountingError> {
-    let current_session = ctx.order_placer.market_session().await.map_err(|source| {
-        TradeAccountingError::MarketSessionCheck {
+    let status = ctx
+        .order_placer
+        .market_session_status()
+        .await
+        .map_err(|source| TradeAccountingError::MarketSessionCheck {
             symbol: symbol.clone(),
             source,
-        }
-    })?;
+        })?;
+    let current_session = status.session;
 
     if current_session != enqueued_session {
         info!(
@@ -188,17 +201,64 @@ async fn select_order_kind_for_current_session(
                 return Ok(None);
             }
 
-            let latest_price = ctx
-                .order_placer
-                .fetch_latest_trade_price(symbol)
-                .await
-                .map_err(|source| TradeAccountingError::LimitPriceFetch {
-                    symbol: symbol.clone(),
-                    source,
-                })?
-                .ok_or_else(|| TradeAccountingError::LimitPriceUnavailable {
-                    symbol: symbol.clone(),
-                })?;
+            let close_flatten_active = ctx
+                .close_flatten_policy
+                .active_window(status, chrono::Utc::now())
+                .is_some();
+
+            let latest_price = if close_flatten_active {
+                counter!(
+                    "close_flatten_attempts_total",
+                    "symbol" => symbol.to_string(),
+                    "direction" => direction_label(direction),
+                    "reason" => post_close_gap_label(status.post_close_gap)
+                )
+                .increment(1);
+
+                let quote = match ctx.order_placer.fetch_latest_quote(symbol).await {
+                    Ok(Some(quote)) => quote,
+                    Ok(None) => {
+                        record_close_flatten_block(symbol, "quote_unavailable");
+                        error!(
+                            target: "hedge",
+                            %symbol,
+                            "Close flatten blocked: executor does not support latest quotes"
+                        );
+                        return Err(TradeAccountingError::LimitQuoteUnavailable {
+                            symbol: symbol.clone(),
+                        });
+                    }
+                    Err(source) => {
+                        record_close_flatten_block(symbol, "quote_fetch_failed");
+                        error!(
+                            target: "hedge",
+                            %symbol,
+                            %source,
+                            "Close flatten blocked: latest quote fetch failed"
+                        );
+                        return Err(TradeAccountingError::LimitQuoteFetch {
+                            symbol: symbol.clone(),
+                            source,
+                        });
+                    }
+                };
+
+                match direction {
+                    Direction::Buy => quote.ask(),
+                    Direction::Sell => quote.bid(),
+                }
+            } else {
+                ctx.order_placer
+                    .fetch_latest_trade_price(symbol)
+                    .await
+                    .map_err(|source| TradeAccountingError::LimitPriceFetch {
+                        symbol: symbol.clone(),
+                        source,
+                    })?
+                    .ok_or_else(|| TradeAccountingError::LimitPriceUnavailable {
+                        symbol: symbol.clone(),
+                    })?
+            };
 
             let limit_price = apply_slippage(
                 latest_price.inner(),
@@ -206,11 +266,35 @@ async fn select_order_kind_for_current_session(
                 ctx.counter_trade_slippage_bps,
             )?;
 
+            // The scan-time preflight (`preflight_and_clamp_shares` ->
+            // `preflight_close_flatten_buy`) approved this buy against a
+            // quote fetched during CheckPositions -- potentially minutes
+            // stale by the time this job reaches perform(). Re-check cash
+            // sufficiency against the exact price this order is about to
+            // submit at (the same ask this function just derived
+            // `limit_price` from), closing that staleness window instead of
+            // relying solely on broker-side rejection as the backstop. Sells
+            // are unaffected by price, so only buys need this.
+            if close_flatten_active
+                && direction == Direction::Buy
+                && !close_flatten_preflight_at_submitted_price(
+                    ctx,
+                    symbol,
+                    shares,
+                    direction,
+                    limit_price,
+                )
+                .await?
+            {
+                return Ok(None);
+            }
+
             info!(
                 target: "hedge",
                 %symbol,
                 %limit_price,
                 direction = ?direction,
+                close_flatten_active,
                 "Extended hours: placing limit order"
             );
 
@@ -219,6 +303,80 @@ async fn select_order_kind_for_current_session(
             }))
         }
     }
+}
+
+/// Re-checks buying power for a close-flatten buy against the exact ask
+/// price it is about to submit at, closing the staleness window between the
+/// scan-time preflight's quote (fetched during `CheckPositions`, possibly
+/// minutes earlier) and this job's own quote. Returns `true` if the order
+/// should proceed, `false` if it should be skipped -- mirroring
+/// `CheckPositions::preflight_and_clamp_shares`'s "bool: proceed vs skip"
+/// contract, since a rejection here is a routine outcome of a widening
+/// spread, not an error.
+async fn close_flatten_preflight_at_submitted_price(
+    ctx: &HedgeCtx,
+    symbol: &Symbol,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    limit_price: Positive<Usd>,
+) -> Result<bool, TradeAccountingError> {
+    let order = MarketOrder {
+        symbol: symbol.clone(),
+        shares,
+        direction,
+        // Preflight only; this id is never sent to the broker. Use a fresh
+        // value so callers cannot mistake it for a real key.
+        client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+    };
+
+    let preflight = ctx
+        .order_placer
+        .preflight_counter_trade_at_price(order, limit_price)
+        .await
+        .map_err(
+            |source| TradeAccountingError::CloseFlattenPreflightAtPrice {
+                symbol: symbol.clone(),
+                source,
+            },
+        )?;
+
+    match preflight {
+        CounterTradePreflight::Allowed { .. } => Ok(true),
+        CounterTradePreflight::Skipped(reason) => {
+            record_close_flatten_block(symbol, preflight_skip_reason_label(&reason));
+            warn!(
+                target: "hedge",
+                %symbol, %reason, %limit_price,
+                "Close flatten blocked at submission time: ask moved past the \
+                 scan-time preflight's approved price"
+            );
+            Ok(false)
+        }
+    }
+}
+
+fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Buy => "buy",
+        Direction::Sell => "sell",
+    }
+}
+
+fn post_close_gap_label(post_close_gap: PostCloseGap) -> &'static str {
+    match post_close_gap {
+        PostCloseGap::OrdinaryOvernight => "ordinary_overnight",
+        PostCloseGap::MultiDayClosure => "multi_day_closure",
+        PostCloseGap::Unknown => "unknown",
+    }
+}
+
+fn record_close_flatten_block(symbol: &Symbol, reason: &'static str) {
+    counter!(
+        "close_flatten_blocked_total",
+        "symbol" => symbol.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
 }
 
 /// Recovery path for the `PendingExecution` rejection. A previous attempt for
@@ -262,9 +420,14 @@ async fn recover_pending_poll_status(
             market_session,
             ..
         }) => {
-            let Some(order_kind) =
-                select_order_kind_for_current_session(ctx, &symbol, direction, market_session)
-                    .await?
+            let Some(order_kind) = select_order_kind_for_current_session(
+                ctx,
+                &symbol,
+                shares,
+                direction,
+                market_session,
+            )
+            .await?
             else {
                 return Ok(());
             };
@@ -448,6 +611,7 @@ impl Job<HedgeCtx> for PlaceHedge {
         let Some(order_kind) = select_order_kind_for_current_session(
             ctx,
             &self.symbol,
+            self.shares,
             self.direction,
             self.market_session,
         )
@@ -562,6 +726,7 @@ mod tests {
     use proptest::prelude::*;
     use std::any::type_name;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
 
     use st0x_event_sorcery::StoreBuilder;
@@ -725,6 +890,7 @@ mod tests {
             order_placer,
             assets: extended_hours_assets("AAPL", true),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
         };
 
@@ -1161,6 +1327,241 @@ mod tests {
         Arc::new(ExtHoursPlacer(price))
     }
 
+    fn close_flatten_order_placer(bid: Float, ask: Float) -> Arc<dyn OrderPlacer> {
+        close_flatten_order_placer_with_counter(bid, ask, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn close_flatten_order_placer_with_counter(
+        bid: Float,
+        ask: Float,
+        quote_calls: Arc<AtomicUsize>,
+    ) -> Arc<dyn OrderPlacer> {
+        struct CloseFlattenPlacer {
+            quote: st0x_execution::LatestQuote,
+            quote_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for CloseFlattenPlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("close flatten must not place a market order".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("close-flatten-order"),
+                    placed_shares: order.shares,
+                    is_extended_hours: true,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_latest_trade_price(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("close flatten must not fall back to latest trade".into())
+            }
+
+            async fn fetch_latest_quote(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.quote_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(self.quote))
+            }
+
+            async fn market_session_status(
+                &self,
+            ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::MarketSessionStatus {
+                    session: MarketSession::Extended,
+                    extended_session_closes_at: Some(
+                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
+                    ),
+                    post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
+                })
+            }
+        }
+
+        Arc::new(CloseFlattenPlacer {
+            quote: st0x_execution::LatestQuote::new(
+                Positive::new(Usd::new(bid)).unwrap(),
+                Positive::new(Usd::new(ask)).unwrap(),
+            )
+            .unwrap(),
+            quote_calls,
+        })
+    }
+
+    /// A close-flatten placer whose ask is wide enough that the
+    /// perform-time re-preflight must reject the buy -- and whose
+    /// `place_limit_order` panics if reached, proving the order is never
+    /// submitted. Models the scan-time-approved-but-perform-time-stale
+    /// scenario: `preflight_counter_trade_at_price` always rejects,
+    /// regardless of the order it's asked to check, standing in for an ask
+    /// that moved past the scan-time preflight's approved price by the time
+    /// this job reached perform().
+    fn close_flatten_preflight_rejecting_placer(bid: Float, ask: Float) -> Arc<dyn OrderPlacer> {
+        struct RejectingPreflightPlacer {
+            quote: st0x_execution::LatestQuote,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for RejectingPreflightPlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("close flatten must not place a market order");
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a perform-time preflight rejection must abort before the broker is called");
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_latest_quote(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(Some(self.quote))
+            }
+
+            async fn preflight_counter_trade_at_price(
+                &self,
+                _order: st0x_execution::MarketOrder,
+                _reference_price: Positive<Usd>,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(CounterTradePreflight::Skipped(
+                    st0x_execution::CounterTradeSkipReason::InsufficientBuyingPower {
+                        estimated_cost_cents: 200_000,
+                        available_buying_power_cents: 100,
+                    },
+                ))
+            }
+
+            async fn market_session_status(
+                &self,
+            ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::MarketSessionStatus {
+                    session: MarketSession::Extended,
+                    extended_session_closes_at: Some(
+                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
+                    ),
+                    post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
+                })
+            }
+        }
+
+        Arc::new(RejectingPreflightPlacer {
+            quote: st0x_execution::LatestQuote::new(
+                Positive::new(Usd::new(bid)).unwrap(),
+                Positive::new(Usd::new(ask)).unwrap(),
+            )
+            .unwrap(),
+        })
+    }
+
+    /// Regression test for the TOCTOU between the scan-time close-flatten
+    /// preflight (`CheckPositions::preflight_and_clamp_shares`, which checks
+    /// one quote) and the perform-time submission (which fetches its own,
+    /// possibly-later quote). Before this fix, `select_order_kind_for_current_session`
+    /// applied slippage to the fresh quote and handed the resulting limit
+    /// straight to `place_offchain_order_at_broker` with no cash re-check --
+    /// so an ask that widened between the two quote fetches could produce a
+    /// submitted limit needing more buying power than was ever preflighted.
+    /// Here the perform-time preflight always rejects, standing in for that
+    /// widened ask; the placer panics if the broker is reached, proving
+    /// perform() aborts before submission and the position stays unclaimed
+    /// for a later retry.
+    #[tokio::test]
+    async fn close_flatten_buy_perform_time_preflight_blocks_stale_scan_approval() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            position_projection,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(
+            close_flatten_preflight_rejecting_placer(float!(99.00), float!(1_000.00)),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            market_session: MarketSession::Extended,
+            ..hedge_job(&symbol, 2.0, Direction::Buy)
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let all_orders = offchain_order_projection.load_all().await.unwrap();
+        assert_eq!(
+            all_orders.len(),
+            0,
+            "a perform-time preflight rejection must not submit an order"
+        );
+
+        let position_after = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should still exist");
+        assert_eq!(
+            position_after.pending_offchain_order_id, None,
+            "a rejected buy must not claim the position, so a later re-hedge attempt can retry"
+        );
+
+        let rendered = metrics_handle.render();
+        assert!(rendered.contains("close_flatten_blocked_total{"));
+        assert!(rendered.contains("reason=\"insufficient_buying_power\""));
+        assert!(rendered.contains("symbol=\"AAPL\""));
+    }
+
     async fn create_extended_hours_ctx(price: rain_math_float::Float) -> TestInfra {
         let placer = extended_hours_order_placer(price);
 
@@ -1184,6 +1585,7 @@ mod tests {
             order_placer: placer,
             assets: extended_hours_assets("AAPL", true),
             counter_trade_slippage_bps: 100,
+            close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
@@ -1215,6 +1617,214 @@ mod tests {
             result.inner().inner().eq(float!(148.50)).unwrap(),
             "Sell slippage should decrease the price, got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn close_flatten_buy_uses_ask_plus_slippage() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(
+            close_flatten_order_placer(float!(99.00), float!(100.01)),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let selected_kind = select_order_kind_for_current_session(
+            &ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            Direction::Buy,
+            MarketSession::Extended,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let CounterTradeOrderKind::ExtendedHoursLimit { limit_price } = selected_kind else {
+            panic!("close flatten must select an extended-hours limit");
+        };
+        assert!(limit_price.inner().inner().eq(float!(101.02)).unwrap());
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("new exposure inside the window must place an order");
+        let OffchainOrder::Submitted {
+            market_session: MarketSession::Extended,
+            ..
+        } = order
+        else {
+            panic!("new close-window exposure must place an extended-hours limit");
+        };
+        let rendered = metrics_handle.render();
+        assert!(rendered.contains("close_flatten_attempts_total{"));
+        assert!(rendered.contains("symbol=\"AAPL\""));
+        assert!(rendered.contains("reason=\"multi_day_closure\""));
+    }
+
+    #[tokio::test]
+    async fn close_flatten_sell_uses_bid_minus_slippage() {
+        let TestInfra { ctx, .. } = create_hedge_ctx_with(
+            close_flatten_order_placer(float!(100.01), float!(101.00)),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let kind = select_order_kind_for_current_session(
+            &ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            Direction::Sell,
+            MarketSession::Extended,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let CounterTradeOrderKind::ExtendedHoursLimit { limit_price } = kind else {
+            panic!("close flatten must select an extended-hours limit");
+        };
+        assert!(limit_price.inner().inner().eq(float!(99.00)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn each_close_flatten_reprice_attempt_fetches_a_fresh_quote() {
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let TestInfra { ctx, .. } = create_hedge_ctx_with(
+            close_flatten_order_placer_with_counter(
+                float!(99.00),
+                float!(100.00),
+                quote_calls.clone(),
+            ),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        for _ in 0..2 {
+            select_order_kind_for_current_session(
+                &ctx,
+                &symbol,
+                Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+                Direction::Buy,
+                MarketSession::Extended,
+            )
+            .await
+            .unwrap()
+            .expect("close-flatten pricing should produce a limit order");
+        }
+
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn close_flatten_quote_failure_is_retryable_without_trade_price_fallback() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        struct QuoteFailingPlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for QuoteFailingPlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("placement must not run after quote failure".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("placement must not run after quote failure".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_latest_trade_price(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("latest trade fallback is forbidden".into())
+            }
+
+            async fn fetch_latest_quote(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("quote endpoint unavailable".into())
+            }
+
+            async fn market_session_status(
+                &self,
+            ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::MarketSessionStatus {
+                    session: MarketSession::Extended,
+                    extended_session_closes_at: Some(
+                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
+                    ),
+                    post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
+                })
+            }
+        }
+
+        let TestInfra { ctx, .. } = create_hedge_ctx_with(
+            Arc::new(QuoteFailingPlacer),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let result = select_order_kind_for_current_session(
+            &ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            Direction::Buy,
+            MarketSession::Extended,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(TradeAccountingError::LimitQuoteFetch { .. })
+        ));
+        let rendered = metrics_handle.render();
+        assert!(rendered.contains("close_flatten_blocked_total{"));
+        assert!(rendered.contains("symbol=\"AAPL\""));
+        assert!(rendered.contains("reason=\"quote_fetch_failed\""));
     }
 
     #[test]
@@ -1926,6 +2536,7 @@ mod tests {
             order_placer: placer,
             assets,
             counter_trade_slippage_bps: 100,
+            close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 

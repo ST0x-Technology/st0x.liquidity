@@ -2,6 +2,7 @@
 
 use alloy::primitives::U256;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
@@ -91,6 +92,78 @@ pub enum MarketSession {
     Closed,
 }
 
+/// Classifies the closure after the current extended session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostCloseGap {
+    /// The next trading session begins on the following calendar day.
+    OrdinaryOvernight,
+    /// At least one full calendar day separates this close from the next
+    /// trading session, as on weekends and exchange holidays.
+    MultiDayClosure,
+    /// The executor could not identify the next trading session.
+    Unknown,
+}
+
+/// Current market-session classification plus close metadata for the full
+/// extended-hours trading day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketSessionStatus {
+    pub session: MarketSession,
+    pub extended_session_closes_at: Option<DateTime<Utc>>,
+    pub post_close_gap: PostCloseGap,
+}
+
+impl MarketSessionStatus {
+    #[must_use]
+    pub fn without_close_metadata(session: MarketSession) -> Self {
+        Self {
+            session,
+            extended_session_closes_at: None,
+            post_close_gap: PostCloseGap::Unknown,
+        }
+    }
+}
+
+/// Latest national best bid and offer for a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatestQuote {
+    bid: Positive<Usd>,
+    ask: Positive<Usd>,
+}
+
+impl LatestQuote {
+    /// Builds a validated quote whose bid does not exceed its ask.
+    pub fn new(bid: Positive<Usd>, ask: Positive<Usd>) -> Result<Self, LatestQuoteError> {
+        if ask.inner().lt(&bid.inner())? {
+            return Err(LatestQuoteError::Crossed { bid, ask });
+        }
+
+        Ok(Self { bid, ask })
+    }
+
+    #[must_use]
+    pub const fn bid(self) -> Positive<Usd> {
+        self.bid
+    }
+
+    #[must_use]
+    pub const fn ask(self) -> Positive<Usd> {
+        self.ask
+    }
+}
+
+/// Error returned when constructing a latest quote.
+#[derive(Debug, thiserror::Error)]
+pub enum LatestQuoteError {
+    #[error("quote comparison failed: {0}")]
+    Float(#[from] FloatError),
+    #[error("crossed quote: bid {bid} exceeds ask {ask}")]
+    Crossed {
+        bid: Positive<Usd>,
+        ask: Positive<Usd>,
+    },
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -169,6 +242,28 @@ pub trait Executor: Send + Sync + 'static {
         Ok(CounterTradePreflight::Allowed { reservation: None })
     }
 
+    /// Checks whether a buy counter-trade can be submitted without relying
+    /// on margin, using `reference_price` (rather than the latest trade
+    /// price `preflight_counter_trade` fetches internally) as the cash
+    /// estimate's basis.
+    ///
+    /// Close-flatten buys submit a limit priced off the current ask, not the
+    /// latest trade, so the cash preflight for that path must check the same
+    /// reference the order will actually be priced against -- otherwise a
+    /// widening extended-hours spread can pass this check while the
+    /// submitted limit needs more buying power than was checked. Sell orders
+    /// are unaffected by price (inventory availability doesn't depend on
+    /// it), so callers should keep using `preflight_counter_trade` for
+    /// sells. Executors that do not override this default to
+    /// `preflight_counter_trade`, ignoring `reference_price`.
+    async fn preflight_counter_trade_at_price(
+        &self,
+        order: MarketOrder,
+        _reference_price: Positive<Usd>,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        self.preflight_counter_trade(order).await
+    }
+
     /// Returns the current market session (regular, extended, or closed).
     ///
     /// Default implementation delegates to `is_market_open()`, mapping
@@ -182,6 +277,14 @@ pub trait Executor: Send + Sync + 'static {
         }
     }
 
+    /// Returns current market-session classification with close metadata when
+    /// the executor can provide it.
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        self.market_session()
+            .await
+            .map(MarketSessionStatus::without_close_metadata)
+    }
+
     /// Fetches the latest trade price for a symbol from the broker's market
     /// data feed. Used to determine limit prices for extended-hours
     /// counter-trades. Returns `None` when not supported by the executor.
@@ -189,6 +292,15 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         _symbol: &Symbol,
     ) -> Result<Option<Positive<Usd>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Fetches the latest validated bid and ask for a symbol. Returns `None`
+    /// when the executor does not support quote lookups.
+    async fn fetch_latest_quote(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
         Ok(None)
     }
 
@@ -413,6 +525,8 @@ pub enum ExecutionError {
     OrderNotFound { order_id: String },
     #[error("Mock executor failure: {message}")]
     MockFailure { message: String },
+    #[error("configured mock preflight price is not positive: {0}")]
+    NonPositivePreflightPrice(#[from] NotPositive<Usd>),
     #[error("Incomplete order response: {field} missing for {status:?} order")]
     IncompleteOrderResponse { field: String, status: OrderStatus },
     #[error(transparent)]

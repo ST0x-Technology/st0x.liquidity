@@ -743,6 +743,7 @@ mod tests {
             inventory_poll_interval: 60,
             order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: 300,
+            extended_hours_close_flatten_window_secs: 900,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
@@ -822,6 +823,7 @@ mod tests {
             inventory_poll_interval: 60,
             order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: 300,
+            extended_hours_close_flatten_window_secs: 900,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),

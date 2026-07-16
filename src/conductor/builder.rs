@@ -64,6 +64,7 @@ use crate::rebalancing::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
 };
+use crate::trading::offchain::close_flatten::CloseFlattenPolicy;
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
@@ -180,7 +181,7 @@ pub(crate) fn spawn<Prov, Exec>(
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
     job_cleanup: JoinHandle<()>,
     telemetry_writer: JoinHandle<()>,
-) -> Conductor
+) -> Result<Conductor, chrono::OutOfRangeError>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
     Exec: Executor + Clone + Send + Sync + 'static,
@@ -282,6 +283,14 @@ where
     let order_placer: Arc<dyn OrderPlacer> =
         Arc::new(ExecutorOrderPlacer(context.executor.clone()));
 
+    // Validated once here rather than re-parsed from the raw config
+    // `u64` on every hedge job / position-check tick (RAI-1404 follow-up):
+    // the window is fixed for the process lifetime, so a construction-time
+    // failure should fail startup, not thread a per-call `Result` through
+    // the hot placement and scan paths.
+    let close_flatten_policy =
+        CloseFlattenPolicy::from_secs(context.ctx.extended_hours_close_flatten_window_secs)?;
+
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
@@ -293,6 +302,7 @@ where
             BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => alpaca_ctx.counter_trade_slippage_bps,
             BrokerCtx::DryRun => st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         },
+        close_flatten_policy,
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
@@ -309,6 +319,7 @@ where
         ctx: context.ctx.clone(),
         pool: context.pool.clone(),
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
+        close_flatten_policy,
     });
 
     let trade_cqrs = super::TradeProcessingCqrs {
@@ -419,14 +430,14 @@ where
     }
     .spawn_apalis_monitor();
 
-    Conductor {
+    Ok(Conductor {
         supervisor,
         monitor,
         job_cleanup,
         telemetry_writer,
         shutdown_token: context.shutdown_token,
         apalis_shutdown_token: apalis_shutdown_token_for_struct,
-    }
+    })
 }
 
 /// Owns every queue, ctx and toggle the apalis monitor needs. The wiring is

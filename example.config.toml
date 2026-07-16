@@ -24,6 +24,7 @@ logs_endpoint = "http://100.x.x.x:9428"
 [broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
+extended_hours_close_flatten_window_secs = 900
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
