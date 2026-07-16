@@ -4691,6 +4691,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -4960,6 +4961,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -5517,6 +5519,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -5618,6 +5621,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -5732,6 +5736,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -5843,6 +5848,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -7640,6 +7646,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"

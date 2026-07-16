@@ -17,8 +17,8 @@ pub(crate) use freshness::PollFreshness;
 #[cfg(test)]
 pub(crate) use polling::PollerError;
 pub(crate) use polling::{
-    HedgeOrderGateReconciliationCtx, InventoryPollingService, PendingRequestOwnership,
-    PendingRequestOwnershipSnapshot, Poller, WalletPollingCtx,
+    FreshOffchainUsdObserver, HedgeOrderGateReconciliationCtx, InventoryPollingService,
+    PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller, WalletPollingCtx,
 };
 pub(crate) use projection::InventoryProjection;
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};

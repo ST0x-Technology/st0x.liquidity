@@ -71,6 +71,18 @@ pub(crate) trait PendingRequestOwnership: Send + Sync {
     async fn pending_request_ownership(&self) -> PendingRequestOwnershipSnapshot;
 }
 
+/// Consumer for a freshly fetched, reserve-adjusted offchain cash balance.
+/// Unlike snapshot reactors, this callback runs even when the aggregate
+/// deduplicates an unchanged balance.
+#[async_trait]
+pub(crate) trait FreshOffchainUsdObserver: Send + Sync {
+    async fn observe_fresh_offchain_usd(
+        &self,
+        available: Usdc,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InventoryPollingError<ExecutorError> {
@@ -115,6 +127,8 @@ pub(crate) enum ReserveError {
     CentsConversion(#[from] UsdToCentsError),
     #[error("failed to convert broker cents {cents} to Usd")]
     BrokerCentsConversion { cents: i64 },
+    #[error("failed to convert available broker cents {cents} to Usdc")]
+    AvailableUsdcConversion { cents: i64 },
 }
 
 pub(crate) struct WalletPollingCtx {
@@ -289,6 +303,7 @@ where
     wallet_polling: Option<WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
+    fresh_offchain_usd_observer: Option<Arc<dyn FreshOffchainUsdObserver>>,
     external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
     unconfigured_symbol_warnings: Mutex<HashSet<Symbol>>,
     retired_equity_vault_warnings: Mutex<HashSet<(Address, B256)>>,
@@ -349,6 +364,7 @@ where
             wallet_polling,
             tokenizer,
             pending_request_ownership: None,
+            fresh_offchain_usd_observer: None,
             external_pending_warnings: Mutex::new(HashSet::new()),
             unconfigured_symbol_warnings: Mutex::new(HashSet::new()),
             retired_equity_vault_warnings: Mutex::new(HashSet::new()),
@@ -404,6 +420,14 @@ where
         reconciliation: HedgeOrderGateReconciliationCtx,
     ) -> Self {
         self.hedge_order_gate_reconciliation = Some(reconciliation);
+        self
+    }
+
+    pub(crate) fn with_fresh_offchain_usd_observer(
+        mut self,
+        observer: Arc<dyn FreshOffchainUsdObserver>,
+    ) -> Self {
+        self.fresh_offchain_usd_observer = Some(observer);
         self
     }
 
@@ -879,6 +903,24 @@ where
                     InventorySnapshotCommand::AlpacaUsdc { usdc_balance },
                 )
                 .await?;
+        }
+
+        if let Some(observer) = &self.fresh_offchain_usd_observer {
+            let available = Usdc::from_cents(available_usd_cents).ok_or(
+                ReserveError::AvailableUsdcConversion {
+                    cents: available_usd_cents,
+                },
+            )?;
+            if let Err(error) = observer
+                .observe_fresh_offchain_usd(available, Utc::now())
+                .await
+            {
+                error!(
+                    target: "inventory",
+                    ?error,
+                    "Fresh offchain USD observer failed after recording the complete snapshot"
+                );
+            }
         }
 
         // After the OffchainEquity send: reactors run inline within `send`,
@@ -1913,6 +1955,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingFreshOffchainUsdObserver(Mutex<Vec<Usdc>>);
+
+    #[async_trait]
+    impl FreshOffchainUsdObserver for RecordingFreshOffchainUsdObserver {
+        async fn observe_fresh_offchain_usd(
+            &self,
+            available: Usdc,
+            _observed_at: DateTime<Utc>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().push(available);
+            Ok(())
+        }
+    }
+
+    struct FailingFreshOffchainUsdObserver;
+
+    #[async_trait]
+    impl FreshOffchainUsdObserver for FailingFreshOffchainUsdObserver {
+        async fn observe_fresh_offchain_usd(
+            &self,
+            _available: Usdc,
+            _observed_at: DateTime<Utc>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(std::io::Error::other("recovery conflict")))
+        }
+    }
+
     fn ownership(
         mint_issuer_request_ids: impl IntoIterator<Item = &'static str>,
         mint_tokenization_request_ids: impl IntoIterator<Item = &'static str>,
@@ -2395,6 +2465,107 @@ mod tests {
         assert_eq!(
             *usd_balance_cents, 25_000_000,
             "Cash balance mismatch: expected $250,000.00"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_offchain_usd_observer_runs_when_snapshot_deduplicates_balance() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+        let observer = Arc::new(RecordingFreshOffchainUsdObserver::default());
+        let executor = MockExecutor::new().with_inventory(Inventory {
+            positions: vec![],
+            usd_balance_cents: 25_000_000,
+            cash_buying_power_cents: Some(25_000_000),
+            alpaca_usdc: None,
+            cash_withdrawable_cents: None,
+        });
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_fresh_offchain_usd_observer(observer.clone());
+
+        service.poll_and_record().await.unwrap();
+        service.poll_and_record().await.unwrap();
+
+        let observations = observer.0.lock().unwrap().clone();
+        assert_eq!(
+            observations.as_slice(),
+            &[Usdc::new(float!(250000)), Usdc::new(float!(250000))],
+            "each successful broker fetch must cross the recovery freshness barrier",
+        );
+        let snapshot_events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert_eq!(
+            snapshot_events
+                .iter()
+                .filter(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
+                .count(),
+            1,
+            "the recovery callback must not disable persisted snapshot deduplication",
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_offchain_usd_observer_failure_preserves_complete_snapshot() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            raindex_service,
+            MockExecutor::new().with_inventory(Inventory {
+                positions: vec![],
+                usd_balance_cents: 25_000_000,
+                cash_buying_power_cents: Some(24_000_000),
+                alpaca_usdc: Some(Usdc::new(float!(125))),
+                cash_withdrawable_cents: Some(23_000_000),
+            }),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
+            snapshot_id.clone(),
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_fresh_offchain_usd_observer(Arc::new(FailingFreshOffchainUsdObserver));
+
+        service.poll_offchain(&snapshot_id).await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::OffchainCashBuyingPower { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::OffchainCashWithdrawable { .. }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::AlpacaUsdc { .. }))
         );
     }
 

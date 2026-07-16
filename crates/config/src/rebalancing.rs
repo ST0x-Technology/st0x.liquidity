@@ -42,6 +42,8 @@ pub enum RebalancingCtxError {
     ZeroTransferTimeout,
     #[error("rebalancing transfer_attempt_timeout_secs must be non-zero")]
     ZeroTransferAttemptTimeout,
+    #[error("rebalancing inventory_recovery_redrive_delay_secs must be non-zero")]
+    ZeroInventoryRecoveryRedriveDelay,
     #[error("rebalancing attestation_retry_deadline_secs must be non-zero")]
     ZeroAttestationRetryDeadline,
     #[error(
@@ -80,6 +82,9 @@ pub struct RebalancingConfig {
     /// retries rather than wedging forever. Distinct from
     /// `transfer_timeout_secs`, which is the whole-transfer stall reaper.
     pub transfer_attempt_timeout_secs: u64,
+    /// Delay before re-enqueueing a recovered Alpaca-to-Base transfer while
+    /// its source reservation waits for a fresh Hedging observation.
+    pub inventory_recovery_redrive_delay_secs: u64,
     /// How long to keep retrying Circle attestation polling after the first
     /// poll times out before giving up and marking the bridge failed.
     ///
@@ -141,6 +146,7 @@ pub struct RebalancingCtx {
     /// attempt (hung-RPC backstop). See
     /// [`RebalancingConfig::transfer_attempt_timeout_secs`].
     pub transfer_attempt_timeout: Duration,
+    pub inventory_recovery_redrive_delay: Duration,
     pub attestation_retry_deadline: Duration,
     /// Maximum consecutive burn-revert redrives before the circuit opens.
     /// See [`RebalancingConfig::max_burn_revert_redrives`].
@@ -176,6 +182,9 @@ impl RebalancingCtx {
         if config.transfer_attempt_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
         }
+        if config.inventory_recovery_redrive_delay_secs == 0 {
+            return Err(RebalancingCtxError::ZeroInventoryRecoveryRedriveDelay);
+        }
 
         let usdc = match config.usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -194,6 +203,9 @@ impl RebalancingCtx {
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
+            inventory_recovery_redrive_delay: Duration::from_secs(
+                config.inventory_recovery_redrive_delay_secs,
+            ),
             attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
             max_burn_revert_redrives: config.max_burn_revert_redrives,
             freeze_check: config.freeze_check,
@@ -221,6 +233,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
+        #[builder(default = Duration::from_secs(30))] inventory_recovery_redrive_delay: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
         #[builder(default = 5)] max_burn_revert_redrives: u32,
@@ -232,6 +245,7 @@ impl RebalancingCtx {
             transfer_timeout,
             inventory_staleness_bound,
             transfer_attempt_timeout,
+            inventory_recovery_redrive_delay,
             attestation_retry_deadline,
             max_burn_revert_redrives,
             freeze_check,
@@ -257,6 +271,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
+        #[builder(default = Duration::from_secs(30))] inventory_recovery_redrive_delay: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
         #[builder(default = 5)] max_burn_revert_redrives: u32,
@@ -275,6 +290,7 @@ impl RebalancingCtx {
             transfer_timeout,
             inventory_staleness_bound,
             transfer_attempt_timeout,
+            inventory_recovery_redrive_delay,
             attestation_retry_deadline,
             max_burn_revert_redrives,
             freeze_check,
@@ -327,6 +343,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -368,6 +385,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
@@ -396,6 +414,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
 
@@ -423,6 +442,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 7200
             max_burn_revert_redrives = 3
             freeze_check = "enabled"
@@ -455,6 +475,7 @@ mod tests {
     fn deserialize_missing_transfer_timeout_secs_fails() {
         let toml_str = r#"
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -481,6 +502,7 @@ mod tests {
         let toml_str = r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -508,6 +530,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 0
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -534,6 +557,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -561,6 +585,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 0
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -590,6 +615,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -613,6 +639,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -634,6 +661,7 @@ mod tests {
         let toml_str = r#"
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -662,6 +690,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 0
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
@@ -686,12 +715,73 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_missing_inventory_recovery_redrive_delay_secs_fails() {
+        let toml_str = r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("inventory_recovery_redrive_delay_secs"),
+            "Expected missing inventory_recovery_redrive_delay_secs error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_inventory_recovery_redrive_delay_secs_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 0
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroInventoryRecoveryRedriveDelay
+        ));
+    }
+
+    #[test]
     fn zero_max_burn_revert_redrives_fails_validation_when_usdc_enabled() {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 0
             freeze_check = "enabled"
@@ -722,6 +812,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 0
             freeze_check = "enabled"
@@ -746,6 +837,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
+            inventory_recovery_redrive_delay_secs = 30
             attestation_retry_deadline_secs = 86400
             freeze_check = "enabled"
 

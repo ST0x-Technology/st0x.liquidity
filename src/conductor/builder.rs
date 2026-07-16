@@ -344,8 +344,9 @@ where
     });
 
     if let Some(rebalancing_service) = &rebalancing_service {
-        polling_service =
-            polling_service.with_pending_request_ownership(rebalancing_service.clone());
+        polling_service = polling_service
+            .with_pending_request_ownership(rebalancing_service.clone())
+            .with_fresh_offchain_usd_observer(rebalancing_service.clone());
     }
 
     let polling_service = Arc::new(polling_service);
@@ -1512,7 +1513,10 @@ mod tests {
         EquityTransferServices, MintError, MintTransferError, RedemptionError,
         ResumeEquityToHedging, ResumeEquityToMarketMaking,
     };
-    use crate::rebalancing::usdc::{ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcTransferError};
+    use crate::rebalancing::usdc::{
+        AlpacaToBaseResumePreparation, PrepareAlpacaToBaseResume, ResumeAlpacaToBase,
+        ResumeBaseToAlpaca, UsdcTransferError,
+    };
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
@@ -1700,6 +1704,18 @@ mod tests {
     struct PoisonThenHealthyMintResume {
         poison_id: IssuerRequestId,
         healthy_completed: Arc<tokio::sync::Notify>,
+    }
+
+    struct ReadyAlpacaToBaseResume;
+
+    #[async_trait]
+    impl PrepareAlpacaToBaseResume for ReadyAlpacaToBaseResume {
+        async fn prepare_alpaca_to_base_resume(
+            &self,
+            _id: &UsdcRebalanceId,
+        ) -> AlpacaToBaseResumePreparation {
+            AlpacaToBaseResumePreparation::Ready
+        }
     }
 
     struct PoisonThenHealthyUsdcResume {
@@ -1991,6 +2007,8 @@ mod tests {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),
             }),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
+            inventory_recovery_redrive_delay: Duration::from_secs(30),
             job_queue: queue.clone(),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
