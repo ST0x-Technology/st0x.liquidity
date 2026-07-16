@@ -162,6 +162,7 @@ transfer_timeout_secs = 1800
 # (CCTP attestation + Alpaca deposit polling); only trips on a true hang.
 # 3600 = 60 minutes.
 transfer_attempt_timeout_secs = 3600
+inventory_recovery_redrive_delay_secs = 30
 # CCTP attestation polling timeouts stay retryable until this deadline.
 # 86400 = 24 hours.
 attestation_retry_deadline_secs = 86400
