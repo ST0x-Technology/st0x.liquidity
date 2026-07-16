@@ -16,7 +16,7 @@
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+use st0x_event_sorcery::{Projection, RetryOnBusy, Store, StoreBuilder};
 
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
@@ -38,10 +38,10 @@ use crate::usdc_rebalance::UsdcRebalance;
 pub(super) struct QueryManifest {
     rebalancing_service: Arc<RebalancingService>,
     broadcaster: Arc<Broadcaster>,
-    hedge_latency: Arc<HedgeLatencyProjection>,
-    rebalance_timing: Arc<RebalanceTimingProjection>,
-    equity_timing: Arc<EquityTimingProjection>,
-    lifecycle_failure: Arc<LifecycleFailureProjection>,
+    hedge_latency: Arc<RetryOnBusy<HedgeLatencyProjection>>,
+    rebalance_timing: Arc<RetryOnBusy<RebalanceTimingProjection>>,
+    equity_timing: Arc<RetryOnBusy<EquityTimingProjection>>,
+    lifecycle_failure: Arc<RetryOnBusy<LifecycleFailureProjection>>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -62,18 +62,26 @@ impl QueryManifest {
     pub(super) fn new(
         rebalancing_service: Arc<RebalancingService>,
         broadcaster: Arc<Broadcaster>,
-        hedge_latency: Arc<HedgeLatencyProjection>,
-        rebalance_timing: Arc<RebalanceTimingProjection>,
-        equity_timing: Arc<EquityTimingProjection>,
-        lifecycle_failure: Arc<LifecycleFailureProjection>,
+        hedge_latency: HedgeLatencyProjection,
+        rebalance_timing: RebalanceTimingProjection,
+        equity_timing: EquityTimingProjection,
+        lifecycle_failure: LifecycleFailureProjection,
     ) -> Self {
         Self {
             rebalancing_service,
             broadcaster,
-            hedge_latency,
-            rebalance_timing,
-            equity_timing,
-            lifecycle_failure,
+            hedge_latency: Arc::new(RetryOnBusy {
+                inner: hedge_latency,
+            }),
+            rebalance_timing: Arc::new(RetryOnBusy {
+                inner: rebalance_timing,
+            }),
+            equity_timing: Arc::new(RetryOnBusy {
+                inner: equity_timing,
+            }),
+            lifecycle_failure: Arc::new(RetryOnBusy {
+                inner: lifecycle_failure,
+            }),
         }
     }
 
@@ -220,10 +228,10 @@ mod tests {
         ));
 
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
-        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
-        let equity_timing = Arc::new(EquityTimingProjection::new(pool.clone()));
-        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
+        let hedge_latency = HedgeLatencyProjection::new(pool.clone());
+        let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
+        let equity_timing = EquityTimingProjection::new(pool.clone());
+        let lifecycle_failure = LifecycleFailureProjection::new(pool.clone());
         let manifest = QueryManifest::new(
             rebalancing_service,
             broadcaster,
@@ -282,10 +290,10 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
-        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
-        let equity_timing = Arc::new(EquityTimingProjection::new(pool.clone()));
-        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
+        let hedge_latency = HedgeLatencyProjection::new(pool.clone());
+        let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
+        let equity_timing = EquityTimingProjection::new(pool.clone());
+        let lifecycle_failure = LifecycleFailureProjection::new(pool.clone());
         let manifest = QueryManifest::new(
             rebalancing_service,
             broadcaster,
@@ -400,10 +408,10 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
-        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
-        let equity_timing = Arc::new(EquityTimingProjection::new(pool.clone()));
-        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(pool.clone()));
+        let hedge_latency = HedgeLatencyProjection::new(pool.clone());
+        let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
+        let equity_timing = EquityTimingProjection::new(pool.clone());
+        let lifecycle_failure = LifecycleFailureProjection::new(pool.clone());
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
             broadcaster,
