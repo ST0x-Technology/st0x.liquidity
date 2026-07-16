@@ -143,6 +143,9 @@ jobs:
               -E "test(compile_fail_tests)"
           '
 
+      - name: Audit Rust dependencies
+        run: nix develop .#ci-backend -c cargo audit
+
       - name: Upload nextest archive
         uses: actions/upload-artifact@v4
         with:

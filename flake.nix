@@ -540,6 +540,7 @@
             # and they bloat the closure.
             backendInputs = [
               rustToolchain
+              pkgs.cargo-audit
               pkgs.openssl
               pkgs.sqlite
               pkgs.pkg-config
@@ -570,6 +571,7 @@
                     bun
                     sccache
                     sqlx-cli
+                    cargo-audit
                     cargo-nextest
                     ragenixPkg
                     packages.secret

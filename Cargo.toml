@@ -87,7 +87,6 @@ reqwest = { version = "0.12.4", features = [
   "gzip",
   "blocking",
 ] }
-rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.140"
 serial_test = "3.2.0"
@@ -257,7 +256,6 @@ httpmock.workspace = true
 proptest.workspace = true
 rain-math-float.workspace = true
 regex = "1.12.3"
-rsa.workspace = true
 serial_test.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }
 st0x-event-sorcery = { workspace = true, features = ["test-support"] }
