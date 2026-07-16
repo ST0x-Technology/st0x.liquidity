@@ -83,6 +83,16 @@ pub use position::Position;
 pub fn check_positions_job_type() -> &'static str {
     std::any::type_name::<position_check::CheckPositions>()
 }
+/// Returns the apalis job type identifier for the `PollOrderStatus` job.
+#[cfg(any(test, feature = "test-support"))]
+pub fn poll_order_status_job_type() -> &'static str {
+    std::any::type_name::<offchain::order::poll_status::PollOrderStatus>()
+}
+/// Returns the apalis job type identifier for the `AccountForDexTrade` job.
+#[cfg(any(test, feature = "test-support"))]
+pub fn account_for_dex_trade_job_type() -> &'static str {
+    std::any::type_name::<trading::onchain::trade_accountant::AccountForDexTrade>()
+}
 #[cfg(any(test, feature = "test-support"))]
 pub use conductor::job::{FailureInjector, JobKind};
 #[cfg(any(test, feature = "test-support"))]
@@ -160,11 +170,13 @@ pub async fn run_bot_session_with_event_channel(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
 ) -> anyhow::Result<()> {
+    let shutdown_signal = os_shutdown_signal()?;
     run_bot_session_inner(
         ctx,
         event_sender,
         #[cfg(any(test, feature = "test-support"))]
         FailureInjector::new(),
+        shutdown_signal,
     )
     .await
 }
@@ -178,14 +190,36 @@ pub async fn run_bot_session_with_injector(
     event_sender: broadcast::Sender<Statement>,
     failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
-    run_bot_session_inner(ctx, event_sender, failure_injector).await
+    let shutdown_signal = os_shutdown_signal()?;
+    run_bot_session_inner(ctx, event_sender, failure_injector, shutdown_signal).await
 }
 
-async fn run_bot_session_inner(
+/// Runs a full bot session until the caller cancels `shutdown`.
+#[cfg(any(test, feature = "test-support"))]
+#[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
+pub async fn run_bot_session_until_cancelled(
+    ctx: Ctx,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
+    run_bot_session_inner(
+        ctx,
+        event_sender,
+        FailureInjector::new(),
+        shutdown.cancelled_owned(),
+    )
+    .await
+}
+
+async fn run_bot_session_inner<ShutdownSignal>(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
-) -> anyhow::Result<()> {
+    shutdown_signal: ShutdownSignal,
+) -> anyhow::Result<()>
+where
+    ShutdownSignal: Future<Output = ()>,
+{
     let pool = ctx.get_sqlite_pool().await?;
     let apalis_pool = conductor::connect_apalis_pool(&ctx.database_url).await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -247,18 +281,11 @@ async fn run_bot_session_inner(
     // guard aborts the conductor and shuts the supervisor down on drop, so a
     // cancelled session actually stops. The graceful path already stops both
     // before this guard drops, making it a no-op there.
-    let _session_guard = SessionTaskGuard {
-        conductor: bot_task.abort_handle(),
-        server_supervisor: server_supervisor.clone(),
-    };
-
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to register SIGTERM handler")?;
-    let shutdown_signal = async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => info!(target: "shutdown", "Received SIGINT"),
-            _ = sigterm.recv() => info!(target: "shutdown", "Received SIGTERM"),
-        }
+    let mut session_guard = SessionTaskGuard {
+        tasks: Some(SessionTasks {
+            conductor: bot_task.abort_handle(),
+            server_supervisor: server_supervisor.clone(),
+        }),
     };
 
     await_shutdown(
@@ -269,9 +296,21 @@ async fn run_bot_session_inner(
         GRACEFUL_SHUTDOWN_TIMEOUT,
     )
     .await?;
+    session_guard.tasks.take();
 
     info!(target: "startup", "Shutdown complete");
     Ok(())
+}
+
+fn os_shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!(target: "shutdown", "Received SIGINT"),
+            _ = sigterm.recv() => info!(target: "shutdown", "Received SIGTERM"),
+        }
+    })
 }
 
 /// Drop guard that aborts the conductor task and shuts the server supervisor
@@ -288,14 +327,21 @@ async fn run_bot_session_inner(
 /// synchronously, so callers must not assume the conductor has stopped the
 /// instant the session future returns.
 struct SessionTaskGuard {
+    tasks: Option<SessionTasks>,
+}
+
+struct SessionTasks {
     conductor: AbortHandle,
     server_supervisor: SupervisorHandle,
 }
 
 impl Drop for SessionTaskGuard {
     fn drop(&mut self) {
-        self.conductor.abort();
-        shutdown_supervisor(&self.server_supervisor);
+        let Some(tasks) = self.tasks.take() else {
+            return;
+        };
+        tasks.conductor.abort();
+        shutdown_supervisor(&tasks.server_supervisor);
     }
 }
 

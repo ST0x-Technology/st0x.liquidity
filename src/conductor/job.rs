@@ -11,21 +11,244 @@ use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
-use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
+use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError, TaskBuilderExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
-use std::time::Duration;
-use tracing::{debug, error, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
-/// Recovery timeout for the fail-stop circuit breaker. Effectively
-/// infinite for any plausible bot uptime; chosen to be finite so
-/// `last_failure + recovery_timeout` cannot overflow if apalis
-/// changes its check from `elapsed() >=` to addition.
-pub(crate) const FAIL_STOP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+use crate::alerts::Notifier;
+
+/// Production policy for workers whose terminal systemic failures must pause
+/// new work and recover without restarting the process.
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) const WORKER_CIRCUIT_POLICY: WorkerCircuitPolicy = WorkerCircuitPolicy {
+    failure_threshold: NonZeroU32::MIN,
+    recovery_timeout: Duration::from_secs(5 * 60),
+    realert_interval: Duration::from_secs(60 * 60),
+};
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const WORKER_CIRCUIT_POLICY: WorkerCircuitPolicy = WorkerCircuitPolicy {
+    failure_threshold: NonZeroU32::MIN,
+    recovery_timeout: Duration::from_millis(10),
+    realert_interval: Duration::from_secs(60 * 60),
+};
+
+pub(crate) const JOB_RETRIES: usize = 3;
+pub(crate) const JOB_MAX_ATTEMPTS: u32 = 4;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WorkerCircuitPolicy {
+    failure_threshold: NonZeroU32,
+    recovery_timeout: Duration,
+    realert_interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerCircuitState {
+    Closed { consecutive_failures: u32 },
+    Open,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WorkerCircuitTransition {
+    Opened,
+    Recovered,
+    RecoveryFailed,
+}
+
+impl fmt::Display for WorkerCircuitTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Opened => formatter.write_str("opened"),
+            Self::Recovered => formatter.write_str("recovered"),
+            Self::RecoveryFailed => formatter.write_str("recovery_failed"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RecoveringWorkerCircuit {
+    policy: WorkerCircuitPolicy,
+    state: Arc<Mutex<WorkerCircuitState>>,
+    last_alerted: Arc<Mutex<Option<Instant>>>,
+    notifier: Arc<dyn Notifier>,
+}
+
+impl RecoveringWorkerCircuit {
+    pub(crate) fn new(policy: WorkerCircuitPolicy, notifier: Arc<dyn Notifier>) -> Self {
+        Self {
+            policy,
+            state: Arc::new(Mutex::new(WorkerCircuitState::Closed {
+                consecutive_failures: 0,
+            })),
+            last_alerted: Arc::new(Mutex::new(None)),
+            notifier,
+        }
+    }
+
+    fn record_success(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, WorkerCircuitState::Closed { .. }) {
+            *state = WorkerCircuitState::Closed {
+                consecutive_failures: 0,
+            };
+        }
+    }
+
+    fn record_failure(&self) -> Option<u32> {
+        let consecutive_failures = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let WorkerCircuitState::Closed {
+                consecutive_failures,
+            } = *state
+            else {
+                return None;
+            };
+
+            let consecutive_failures = consecutive_failures.saturating_add(1);
+            if consecutive_failures < self.policy.failure_threshold.get() {
+                *state = WorkerCircuitState::Closed {
+                    consecutive_failures,
+                };
+                return None;
+            }
+
+            *state = WorkerCircuitState::Open;
+            consecutive_failures
+        };
+
+        Some(consecutive_failures)
+    }
+
+    fn schedule_recovery(&self, worker: WorkerContext) {
+        let recovery_timeout = self.policy.recovery_timeout;
+        let circuit = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(recovery_timeout).await;
+
+            match worker.resume() {
+                Ok(()) => {
+                    *circuit
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        WorkerCircuitState::Closed {
+                            consecutive_failures: 0,
+                        };
+                    info!(
+                        worker = %worker.name(),
+                        worker_circuit_transition = %WorkerCircuitTransition::Recovered,
+                        "Worker circuit recovered after cooldown"
+                    );
+                }
+                Err(_) if worker.is_running() => {
+                    *circuit
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        WorkerCircuitState::Closed {
+                            consecutive_failures: 0,
+                        };
+                    info!(
+                        worker = %worker.name(),
+                        worker_circuit_transition = %WorkerCircuitTransition::Recovered,
+                        "Worker circuit was already resumed after cooldown"
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        worker = %worker.name(),
+                        worker_circuit_transition = %WorkerCircuitTransition::RecoveryFailed,
+                        ?error,
+                        "Worker circuit cooldown elapsed but the worker could not resume"
+                    );
+                    circuit.alert(worker.name().clone(), "Worker circuit recovery failed");
+                }
+            }
+        });
+    }
+
+    fn should_alert(&self, now: Instant) -> bool {
+        let mut last_alerted = self
+            .last_alerted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_alerted
+            .is_some_and(|last| now.saturating_duration_since(last) < self.policy.realert_interval)
+        {
+            return false;
+        }
+
+        *last_alerted = Some(now);
+        true
+    }
+
+    fn alert(&self, worker_name: String, error_msg: &'static str) {
+        let notifier = self.notifier.clone();
+        let last_alerted = self.last_alerted.clone();
+        tokio::spawn(async move {
+            let message = format!("{error_msg}: worker {worker_name}");
+            if let Err(error) = notifier.notify(&message).await {
+                *last_alerted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                warn!(
+                    worker = %worker_name,
+                    ?error,
+                    "Failed to deliver worker circuit-open alert"
+                );
+            }
+        });
+    }
+}
+
+pub(crate) fn on_recovering_circuit_event(
+    circuit: RecoveringWorkerCircuit,
+    error_msg: &'static str,
+) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
+    move |ctx, event| match event {
+        Event::Success => circuit.record_success(),
+        Event::Error(error) => {
+            let Some(consecutive_failures) = circuit.record_failure() else {
+                return;
+            };
+
+            if let Err(pause_error) = ctx.pause() {
+                error!(
+                    worker = %ctx.name(),
+                    ?pause_error,
+                    "Worker circuit opened but the worker could not pause"
+                );
+            }
+
+            error!(
+                worker = %ctx.name(),
+                worker_circuit_transition = %WorkerCircuitTransition::Opened,
+                consecutive_failures,
+                recovery_timeout_seconds = circuit.policy.recovery_timeout.as_secs(),
+                %error,
+                "{error_msg}"
+            );
+            if circuit.should_alert(Instant::now()) {
+                circuit.alert(ctx.name().clone(), error_msg);
+            }
+            circuit.schedule_recovery(ctx.clone());
+        }
+        _ => {}
+    }
+}
 
 /// Deterministic exponential backoff for the apalis retry layer.
 /// Doubles the delay each attempt up to `max`, with no jitter (unnecessary
@@ -128,7 +351,10 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     }
 
     pub(crate) async fn push(&mut self, task: Task) -> Result<(), QueuePushError> {
-        Ok(TaskSink::push(&mut self.0, task).await?)
+        let task = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .max_attempts(JOB_MAX_ATTEMPTS)
+            .build();
+        Ok(TaskSink::push_task(&mut self.0, task).await?)
     }
 
     /// Schedules a task to run after `delay` from now. Used by self-rescheduling
@@ -142,6 +368,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         delay: Duration,
     ) -> Result<(), QueuePushError> {
         let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .max_attempts(JOB_MAX_ATTEMPTS)
             .run_after(delay)
             .build();
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
@@ -282,22 +509,19 @@ where
 /// modules.
 ///
 /// `$on_event:expr` must be a value of type
-/// `impl Fn(&WorkerContext, &Event) + Send + Sync + 'static`, produced by
-/// [`on_terminal_failure`].
+/// `impl Fn(&WorkerContext, &Event) + Send + Sync + 'static`.
 macro_rules! build_worker_inner {
     (
         ::<$ctx_type:ty, $job:ty>,
         $index:expr,
         $queue:expr,
         $ctx:expr,
-        $circuit:expr,
         $on_event:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
         use ::apalis::layers::WorkerBuilderExt;
         use ::apalis::layers::retry::RetryPolicy;
         use ::apalis::prelude::WorkerBuilder;
-        use ::apalis_core::worker::ext::circuit_breaker::CircuitBreaker;
         use ::apalis_core::worker::ext::event_listener::EventListenerExt;
 
         let builder = WorkerBuilder::new(format!(
@@ -318,10 +542,9 @@ macro_rules! build_worker_inner {
         builder
             .concurrency(1)
             .retry(
-                RetryPolicy::retries(3)
+                RetryPolicy::retries($crate::conductor::job::JOB_RETRIES)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
-            .break_circuit_with($circuit)
             .on_event($on_event)
             .build($crate::conductor::job::work::<$ctx_type, $job>)
     }};
@@ -333,7 +556,7 @@ pub(crate) use build_worker_inner;
 ///
 /// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
 /// types and the macro expands to a fully-wired worker (queue backend,
-/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
+/// retry policy, recovering worker circuit, terminal-failure notifier,
 /// `.build(work::<Ctx, Job>)`).
 ///
 /// A macro because `.build()` returns a deeply-nested
@@ -347,8 +570,8 @@ macro_rules! build_supervised_worker {
         $index:expr,
         $queue:expr,
         $ctx:expr,
-        $fail_stop:expr,
-        $failure_notify:expr
+        $circuit_policy:expr,
+        $notifier:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
         build_worker_inner!(
@@ -356,9 +579,11 @@ macro_rules! build_supervised_worker {
             $index,
             $queue,
             $ctx,
-            $fail_stop,
-            $crate::conductor::job::on_terminal_failure(
-                $failure_notify,
+            $crate::conductor::job::on_recovering_circuit_event(
+                $crate::conductor::job::RecoveringWorkerCircuit::new(
+                    $circuit_policy,
+                    $notifier,
+                ),
                 <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
             )
             $(, $failure_injector)?
@@ -371,7 +596,7 @@ pub(crate) use build_supervised_worker;
 /// Builds a best-effort `Worker` for a `Job<Ctx>` impl.
 ///
 /// A terminal job failure is logged at `error!` level but does NOT trip the
-/// conductor-wide fail-stop, does NOT stop the worker, and does NOT install an
+/// recovering worker circuit, does NOT pause the worker, and does NOT install a
 /// Apalis circuit breaker. The circuit breaker can latch a single-concurrency
 /// worker idle after retries are exhausted because `poll_ready` returns
 /// `Pending` without scheduling a wakeup when the circuit is open.
@@ -411,7 +636,7 @@ macro_rules! build_best_effort_worker {
         builder
             .concurrency(1)
             .retry(
-                RetryPolicy::retries(3)
+                RetryPolicy::retries($crate::conductor::job::JOB_RETRIES)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
             .on_event($crate::conductor::job::on_terminal_failure_log_only(
@@ -671,22 +896,6 @@ where
     })
 }
 
-/// On-event handler shared by every supervised worker: when apalis
-/// reports a terminal job failure (retries exhausted), notify the
-/// monitor task and stop the worker.
-pub(crate) fn on_terminal_failure(
-    failure_notify: Arc<tokio::sync::Notify>,
-    error_msg: &'static str,
-) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
-    move |ctx, event| {
-        if let Event::Error(err) = event {
-            error!(%err, worker = %ctx.name(), "{error_msg}");
-            failure_notify.notify_waiters();
-            let _ = ctx.stop();
-        }
-    }
-}
-
 /// On-event handler for workers where terminal failure must not crash the
 /// conductor. Logs the error at `error!` level but does NOT call
 /// `failure_notify.notify_waiters()` and does NOT call `ctx.stop()`.
@@ -695,9 +904,8 @@ pub(crate) fn on_terminal_failure(
 /// not bring down hedging and fill detection. See [`build_best_effort_worker!`]
 /// for why these workers do not install Apalis' circuit-breaker layer.
 ///
-/// Structural invariant: unlike [`on_terminal_failure`], this function takes
-/// no `Notify` argument and therefore can never call `notify_waiters()` or
-/// `ctx.stop()`, regardless of how it is called.
+/// Structural invariant: this function takes no circuit policy or notifier and
+/// therefore cannot pause the worker or page for a systemic failure.
 pub(crate) fn on_terminal_failure_log_only(
     error_msg: &'static str,
 ) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
@@ -711,7 +919,8 @@ pub(crate) fn on_terminal_failure_log_only(
 #[cfg(test)]
 mod tests {
     use apalis::prelude::{Monitor, Status};
-    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
+    use async_trait::async_trait;
+    use reqwest::StatusCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -904,6 +1113,9 @@ mod tests {
         should_fail: bool,
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct HealthyTestJob;
+
     struct TestCtx {
         success_count: AtomicUsize,
         success_notify: Arc<tokio::sync::Notify>,
@@ -933,37 +1145,266 @@ mod tests {
         }
     }
 
+    impl Job<TestCtx> for HealthyTestJob {
+        type Output = ();
+        type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "healthy-test-worker";
+        const JOB_KIND: JobKind = JobKind::Hedge;
+
+        fn label(&self) -> Label {
+            Label::new("healthy-test-job")
+        }
+
+        async fn perform(&self, ctx: &TestCtx) -> Result<Self::Output, Self::Error> {
+            ctx.success_count.fetch_add(1, Ordering::SeqCst);
+            ctx.success_notify.notify_waiters();
+            Ok(())
+        }
+    }
+
     #[derive(Debug, thiserror::Error)]
     #[error("test job deliberately failed")]
     struct TestJobError;
 
-    /// A job that fails after all retries must halt further processing --
-    /// the worker must not pick up the next job with stale state.
+    fn test_error_event() -> Event {
+        let error: apalis_core::error::BoxDynError = Box::new(TestJobError);
+        Event::Error(Arc::new(error))
+    }
+
+    #[test]
+    fn worker_circuit_suppresses_alerts_until_realert_interval_elapses() {
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy {
+                failure_threshold: NonZeroU32::MIN,
+                recovery_timeout: Duration::from_millis(10),
+                realert_interval: Duration::from_secs(60 * 60),
+            },
+            Arc::new(crate::alerts::CapturingNotifier::default()),
+        );
+        let first_alert = Instant::now();
+
+        assert!(circuit.should_alert(first_alert));
+        assert!(!circuit.should_alert(first_alert + Duration::from_secs(5 * 60)));
+        assert!(circuit.should_alert(first_alert + Duration::from_secs(60 * 60)));
+    }
+
+    struct FailingNotifier;
+
+    #[async_trait]
+    impl Notifier for FailingNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+            Err(crate::alerts::NotifierError::ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: "test delivery failure".to_string(),
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn job_failure_after_retries_halts_processing() {
+    async fn worker_circuit_delivery_failure_allows_immediate_alert_retry() {
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy {
+                failure_threshold: NonZeroU32::MIN,
+                recovery_timeout: Duration::from_millis(10),
+                realert_interval: Duration::from_secs(60 * 60),
+            },
+            Arc::new(FailingNotifier),
+        );
+        let first_alert = Instant::now();
+
+        assert!(circuit.should_alert(first_alert));
+        circuit.alert("test-worker".to_string(), "Test circuit opened");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let is_reset = circuit
+                    .last_alerted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none();
+                if is_reset {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed delivery must reset the alert timestamp");
+
+        assert!(circuit.should_alert(first_alert + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn worker_circuit_alerts_and_recovers_without_process_restart() {
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy {
+                failure_threshold: NonZeroU32::MIN,
+                recovery_timeout: Duration::from_millis(10),
+                realert_interval: Duration::from_secs(60 * 60),
+            },
+            notifier.clone(),
+        );
+        let on_event = on_recovering_circuit_event(circuit, "Test worker circuit opened");
+        let mut worker = WorkerContext::new::<()>("recovering-test-worker");
+        worker.start().unwrap();
+
+        on_event(&worker, &test_error_event());
+
+        assert!(
+            worker.is_paused(),
+            "the first systemic failure must fail fast"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !worker.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker must resume after the finite recovery timeout");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while notifier.messages().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("opening the circuit must emit an operator alert");
+
+        assert!(
+            notifier.messages()[0].contains("recovering-test-worker"),
+            "the alert must identify the affected worker"
+        );
+        assert!(logs_contain("worker_circuit_transition=opened"));
+        assert!(logs_contain("worker_circuit_transition=recovered"));
+    }
+
+    #[tokio::test]
+    async fn worker_circuit_recovers_when_pause_reports_already_paused() {
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy {
+                failure_threshold: NonZeroU32::MIN,
+                recovery_timeout: Duration::from_millis(10),
+                realert_interval: Duration::from_secs(60 * 60),
+            },
+            notifier.clone(),
+        );
+        let on_event = on_recovering_circuit_event(circuit, "Test worker circuit opened");
+        let mut worker = WorkerContext::new::<()>("already-paused-test-worker");
+        worker.start().unwrap();
+        worker.pause().unwrap();
+
+        on_event(&worker, &test_error_event());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !worker.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause failure must not prevent circuit recovery");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while notifier.messages().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause failure must not suppress the circuit alert");
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn worker_circuit_resume_failure_keeps_circuit_open_and_alerts() {
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy {
+                failure_threshold: NonZeroU32::MIN,
+                recovery_timeout: Duration::from_millis(10),
+                realert_interval: Duration::from_secs(60 * 60),
+            },
+            notifier.clone(),
+        );
+        let on_event = on_recovering_circuit_event(circuit.clone(), "Test worker circuit opened");
+        let mut worker = WorkerContext::new::<()>("stopping-test-worker");
+        worker.start().unwrap();
+
+        on_event(&worker, &test_error_event());
+        worker.stop().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while notifier.messages().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed recovery must emit a second operator alert");
+
+        assert!(matches!(
+            &*circuit
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            WorkerCircuitState::Open
+        ));
+        assert!(logs_contain("worker_circuit_transition=recovery_failed"));
+    }
+
+    #[tokio::test]
+    async fn worker_circuit_counts_consecutive_not_lifetime_failures() {
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy {
+                failure_threshold: NonZeroU32::new(2).unwrap(),
+                recovery_timeout: Duration::from_millis(10),
+                realert_interval: Duration::from_secs(60 * 60),
+            },
+            notifier,
+        );
+        let on_event = on_recovering_circuit_event(circuit, "Test worker circuit opened");
+        let mut worker = WorkerContext::new::<()>("consecutive-test-worker");
+        worker.start().unwrap();
+
+        on_event(&worker, &test_error_event());
+        assert!(worker.is_running());
+        on_event(&worker, &Event::Success);
+        on_event(&worker, &test_error_event());
+        assert!(
+            worker.is_running(),
+            "a success must reset failures accumulated while closed"
+        );
+        on_event(&worker, &test_error_event());
+        assert!(
+            worker.is_paused(),
+            "two consecutive failures must open the circuit"
+        );
+    }
+
+    /// A terminal systemic failure pauses the worker, alerts, and then resumes
+    /// sibling processing after the configured cooldown.
+    #[tokio::test]
+    async fn supervised_worker_recovers_after_terminal_failure() {
         let apalis_pool = setup_test_apalis_pool().await;
 
         let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
         queue.push(TestJob { should_fail: true }).await.unwrap();
         let mut push_queue = queue.clone();
 
-        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let failing_job_started = Arc::new(tokio::sync::Notify::new());
+        let success_notify = Arc::new(tokio::sync::Notify::new());
         let ctx = Arc::new(TestCtx {
             success_count: AtomicUsize::new(0),
-            success_notify: Arc::new(tokio::sync::Notify::new()),
+            success_notify: success_notify.clone(),
             failing_job_started: failing_job_started.clone(),
         });
         let ctx_for_assert = ctx.clone();
 
-        let fail_stop = CircuitBreakerConfig::default()
-            .with_failure_threshold(1)
-            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-
-        let failing_job_started_wait = failing_job_started.notified();
+        let success_wait = success_notify.notified();
 
         let monitor_handle = tokio::spawn({
-            let failure_notify = failure_notify.clone();
+            let notifier = notifier.clone();
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
@@ -972,8 +1413,12 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
-                        fail_stop.clone(),
-                        failure_notify.clone(),
+                        WorkerCircuitPolicy {
+                            failure_threshold: NonZeroU32::MIN,
+                            recovery_timeout: Duration::from_millis(10),
+                            realert_interval: Duration::from_secs(60 * 60),
+                        },
+                        notifier.clone(),
                         FailureInjector::new(),
                     )
                 });
@@ -983,86 +1428,109 @@ mod tests {
             }
         });
 
-        if tokio::time::timeout(Duration::from_secs(10), failing_job_started_wait)
-            .await
-            .is_err()
-        {
-            panic!(
-                "failing job should start before sibling is enqueued; job rows: {:?}",
-                job_rows_for_assertion(&apalis_pool).await
-            );
-        }
+        wait_for_terminal_test_job(&apalis_pool).await;
 
         push_queue
             .push(TestJob { should_fail: false })
             .await
             .unwrap();
 
-        wait_for_fail_stop_without_processing_sibling(
-            &apalis_pool,
-            &failure_notify,
-            monitor_handle,
-        )
-        .await;
+        tokio::time::timeout(Duration::from_secs(15), success_wait)
+            .await
+            .expect("the worker must resume and process the healthy sibling");
 
         assert_eq!(
             ctx_for_assert.success_count.load(Ordering::SeqCst),
-            0,
-            "The second job should NOT have been processed after a prior \
-             job failed all retries; job rows: {:?}",
+            1,
+            "the healthy sibling must complete after circuit recovery; job rows: {:?}",
             job_rows_for_assertion(&apalis_pool).await
         );
+        let job_rows = job_rows_for_assertion(&apalis_pool).await;
+        let killed_row = job_rows
+            .iter()
+            .find(|(_, status, _, _, _)| status == &Status::Killed.to_string())
+            .expect("the exhausted job must have a durable Killed row");
+        assert_eq!(killed_row.2, i64::from(JOB_MAX_ATTEMPTS));
+        assert_eq!(killed_row.3, i64::from(JOB_MAX_ATTEMPTS));
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "one exhausted job must page exactly once; job rows: {job_rows:?}"
+        );
+        assert!(!monitor_handle.is_finished(), "the monitor must stay alive");
+        monitor_handle.abort();
     }
 
-    async fn wait_for_fail_stop_without_processing_sibling(
-        apalis_pool: &apalis_sqlite::SqlitePool,
-        failure_notify: &Arc<tokio::sync::Notify>,
-        monitor_handle: tokio::task::JoinHandle<()>,
-    ) {
-        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let rows = job_rows_for_assertion(apalis_pool).await;
-                if rows
-                    .iter()
-                    .any(|(_, status, _, _, _)| status == &Status::Done.to_string())
-                {
-                    panic!(
-                        "pre-queued sibling job must not reach Done while the failing job \
-                         is still retrying or before the worker halts; job rows: {rows:?}"
-                    );
-                }
-
-                if monitor_handle.is_finished() {
-                    return;
-                }
-
-                tokio::select! {
-                    () = failure_notify.notified() => {
-                        // Terminal failure fired stop; give the monitor a moment to exit.
-                        for _ in 0..100 {
-                            if monitor_handle.is_finished() {
-                                return;
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                        return;
-                    }
-                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
-                }
-            }
-        })
-        .await;
-
-        assert!(
-            terminal.is_ok(),
-            "failing job should reach terminal state and halt the worker; job rows at timeout: {:?}",
-            job_rows_for_assertion(apalis_pool).await
-        );
-
-        let join_result = tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+    #[tokio::test]
+    async fn supervised_worker_failure_does_not_pause_a_healthy_sibling_worker() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut failing_queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
+        let healthy_queue: JobQueue<HealthyTestJob> = JobQueue::new(&apalis_pool);
+        failing_queue
+            .push(TestJob { should_fail: true })
             .await
-            .expect("Monitor should exit within 5s after terminal job failure");
-        join_result.expect("Monitor task should not panic");
+            .unwrap();
+        let mut healthy_push_queue = healthy_queue.clone();
+
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let success_notify = Arc::new(tokio::sync::Notify::new());
+        let ctx = Arc::new(TestCtx {
+            success_count: AtomicUsize::new(0),
+            success_notify: success_notify.clone(),
+            failing_job_started: Arc::new(tokio::sync::Notify::new()),
+        });
+        let ctx_for_assert = ctx.clone();
+        let success_wait = success_notify.notified();
+
+        let monitor_handle = tokio::spawn({
+            let failing_notifier = notifier.clone();
+            let healthy_notifier = notifier.clone();
+            let failing_ctx = ctx.clone();
+            let healthy_ctx = ctx;
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<TestCtx, TestJob>,
+                        index,
+                        failing_queue.clone(),
+                        failing_ctx.clone(),
+                        WorkerCircuitPolicy {
+                            failure_threshold: NonZeroU32::MIN,
+                            recovery_timeout: Duration::from_secs(5),
+                            realert_interval: Duration::from_secs(60 * 60),
+                        },
+                        failing_notifier.clone(),
+                        FailureInjector::new(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<TestCtx, HealthyTestJob>,
+                        index,
+                        healthy_queue.clone(),
+                        healthy_ctx.clone(),
+                        WORKER_CIRCUIT_POLICY,
+                        healthy_notifier.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+
+            async move {
+                let _ = monitor.run().await;
+            }
+        });
+
+        wait_for_terminal_test_job(&apalis_pool).await;
+        healthy_push_queue.push(HealthyTestJob).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), success_wait)
+            .await
+            .expect("healthy sibling worker must progress during the failing worker cooldown");
+
+        assert_eq!(ctx_for_assert.success_count.load(Ordering::SeqCst), 1);
+        assert_eq!(notifier.messages().len(), 1);
+        assert!(!monitor_handle.is_finished(), "the monitor must stay alive");
+        monitor_handle.abort();
     }
 
     async fn insert_job(
@@ -1111,8 +1579,7 @@ mod tests {
             loop {
                 let rows = job_rows_for_assertion(apalis_pool).await;
                 if rows.iter().any(|(_, status, attempts, max_attempts, _)| {
-                    (status == &Status::Killed.to_string() || status == &Status::Failed.to_string())
-                        && attempts >= max_attempts
+                    status == &Status::Killed.to_string() && attempts == max_attempts
                 }) {
                     return;
                 }
@@ -1122,12 +1589,13 @@ mod tests {
         })
         .await;
 
-        assert!(
-            terminal.is_ok(),
-            "failing job should reach terminal state before sibling is enqueued; \
-             job rows at timeout: {:?}",
-            job_rows_for_assertion(apalis_pool).await
-        );
+        if let Err(error) = terminal {
+            panic!(
+                "failing job should reach Killed before sibling is enqueued; \
+                 timeout: {error}; job rows at timeout: {:?}",
+                job_rows_for_assertion(apalis_pool).await
+            );
+        }
     }
 
     #[tokio::test]
