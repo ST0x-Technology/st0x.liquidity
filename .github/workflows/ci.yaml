@@ -388,6 +388,9 @@ jobs:
       - name: fork pull request CI invariants
         run: ./scripts/test-fork-pr-ci.sh
 
+      - name: Audit Rust dependencies
+        run: nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'
+
       - name: tailscale certificate renewal invariants
         run: nix develop .#ci-hooks -c nu scripts/validate-tailscale-cert-renewal.nu
 
