@@ -234,6 +234,20 @@ describe('blockLagCard', () => {
     expect(card.secondary).toBe('no checkpointed samples yet')
   })
 
+  it('reports degraded when the latest cutoff is unavailable', () => {
+    const card = blockLagCard(
+      infra({
+        currentLagBlocks: null,
+        currentLagSampledAt: '2026-06-01T00:00:30Z'
+      }),
+      freshNow
+    )
+
+    expect(card.status).toBe('warning')
+    expect(card.primary).toBe('—')
+    expect(card.secondary).toContain('cutoff unavailable')
+  })
+
   it('classifies the current lag against the block-lag thresholds', () => {
     const card = blockLagCard(infra({}), freshNow)
 

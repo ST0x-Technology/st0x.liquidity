@@ -43,7 +43,8 @@ pub(crate) struct BlockLagSample {
     pub(crate) sampled_at: DateTime<Utc>,
     pub(crate) orderbook: Address,
     pub(crate) chain_tip: u64,
-    pub(crate) cutoff_block: u64,
+    /// `None` when the configured ingestion cutoff tag is unavailable.
+    pub(crate) cutoff_block: Option<u64>,
     /// `None` before the first backfill checkpoint exists.
     pub(crate) last_processed_block: Option<u64>,
 }
@@ -57,8 +58,9 @@ impl BlockLagSample {
     /// a load-balanced RPC can briefly report a cutoff block behind the
     /// checkpoint, which is staleness noise, not negative lag.
     fn lag_blocks(&self) -> Option<u64> {
-        self.last_processed_block
-            .map(|checkpoint| self.cutoff_block.saturating_sub(checkpoint))
+        self.cutoff_block
+            .zip(self.last_processed_block)
+            .map(|(cutoff_block, checkpoint)| cutoff_block.saturating_sub(checkpoint))
     }
 }
 
@@ -116,6 +118,7 @@ pub(crate) async fn record_block_lag(
     sample: &BlockLagSample,
 ) -> Result<(), TelemetryError> {
     let lag_blocks = sample.lag_blocks().map(i64::try_from).transpose()?;
+    let cutoff_block = sample.cutoff_block.map(i64::try_from).transpose()?;
     let last_processed_block = sample.last_processed_block.map(i64::try_from).transpose()?;
 
     sqlx::query(
@@ -127,7 +130,7 @@ pub(crate) async fn record_block_lag(
     .bind(sqlite_timestamp(sample.sampled_at))
     .bind(sample.orderbook.to_string())
     .bind(i64::try_from(sample.chain_tip)?)
-    .bind(i64::try_from(sample.cutoff_block)?)
+    .bind(cutoff_block)
     .bind(last_processed_block)
     .bind(lag_blocks)
     .execute(pool)
@@ -496,7 +499,7 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             chain_tip,
             // Cutoff trails the tip by a few blocks in this mock.
-            cutoff_block: chain_tip.saturating_sub(3),
+            cutoff_block: Some(chain_tip.saturating_sub(3)),
             last_processed_block: checkpoint,
         }
     }
