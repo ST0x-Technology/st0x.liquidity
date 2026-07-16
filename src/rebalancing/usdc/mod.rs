@@ -9,6 +9,7 @@ mod job;
 mod manager;
 
 pub(crate) use job::{
+    AlpacaToBaseResumePreparation, AlpacaToBaseResumePreparationError, PrepareAlpacaToBaseResume,
     ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
