@@ -4,6 +4,9 @@
 
 Accepted
 
+Amended by ADR-0015 for pre-burn Alpaca-to-Base inventory reconstruction only.
+The guard-only rule remains in force for every other recovery state.
+
 ## Context
 
 The USDC rebalancing reactor allows exactly one rebalance at a time, gated by an
