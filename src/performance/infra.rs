@@ -47,9 +47,9 @@ async fn current_lag(
     pool: &SqlitePool,
     orderbook: Address,
 ) -> Result<(Option<i64>, Option<DateTime<Utc>>), PerformanceError> {
-    let latest: Option<(String, i64)> = sqlx::query_as(
-        "SELECT sampled_at, lag_blocks FROM block_lag_samples \
-         WHERE lag_blocks IS NOT NULL AND orderbook = $1 \
+    let latest: Option<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT sampled_at, cutoff_block, lag_blocks FROM block_lag_samples \
+         WHERE orderbook = $1 \
          ORDER BY sampled_at DESC, id DESC LIMIT 1",
     )
     .bind(orderbook.to_string())
@@ -57,12 +57,18 @@ async fn current_lag(
     .await?;
 
     Ok(match latest {
-        Some((raw_sampled_at, lag_blocks)) => {
+        Some((raw_sampled_at, cutoff_block, lag_blocks)) => {
             // A corrupt timestamp makes the lag value unanchorable in time.
             // Return both fields as null so the TS client treats it as "no
             // sample" rather than showing lag without a timestamp.
             let ts = parse_timestamp(&raw_sampled_at);
-            (ts.map(|_| lag_blocks), ts)
+            match (cutoff_block, lag_blocks, ts) {
+                (None, _, sampled_at) => (None, sampled_at),
+                (Some(_), Some(lag_blocks), Some(sampled_at)) => {
+                    (Some(lag_blocks), Some(sampled_at))
+                }
+                (Some(_), _, _) => (None, None),
+            }
         }
         None => (None, None),
     })
@@ -331,7 +337,7 @@ mod tests {
                 sampled_at: timestamp(seconds),
                 orderbook,
                 chain_tip,
-                cutoff_block: chain_tip.saturating_sub(3),
+                cutoff_block: Some(chain_tip.saturating_sub(3)),
                 last_processed_block: checkpoint,
             },
         )
@@ -368,6 +374,39 @@ mod tests {
                     max_lag_blocks: 2,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_unknown_cutoff_supersedes_previous_healthy_lag() {
+        let pool = setup_test_db().await;
+        insert_lag(&pool, 10, 110, Some(100)).await;
+        record_block_lag(
+            &pool,
+            &BlockLagSample {
+                sampled_at: timestamp(20),
+                orderbook: ORDERBOOK,
+                chain_tip: 120,
+                cutoff_block: None,
+                last_processed_block: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+            .await
+            .unwrap();
+
+        assert_eq!(telemetry.current_lag_blocks, None);
+        assert_eq!(telemetry.current_lag_sampled_at, Some(timestamp(20)));
+        assert_eq!(
+            telemetry.block_lag,
+            vec![BlockLagPoint {
+                start: timestamp(0),
+                max_lag_blocks: 7,
+            }],
+            "unknown samples must not fabricate a zero-lag chart point"
         );
     }
 

@@ -311,14 +311,14 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
         // Block-lag telemetry is best-effort: a failed sample must never fail
         // the poll. Lag is measured against the cutoff block -- the real
         // ingestion boundary -- so a caught-up system reads zero rather than a
-        // permanent floor. A null cutoff block records as 0, which saturates
-        // lag to 0.
+        // permanent floor. A null cutoff block remains unknown, so it cannot
+        // synthesize a healthy zero-lag sample while ingestion is paused.
         let sampled_checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
         let sample = BlockLagSample {
             sampled_at,
             orderbook: self.evm_ctx.orderbook,
             chain_tip,
-            cutoff_block: cutoff_opt.unwrap_or(0),
+            cutoff_block: cutoff_opt,
             last_processed_block: sampled_checkpoint,
         };
         if let Err(error) = record_block_lag(&self.pool, &sample).await {
@@ -1140,6 +1140,21 @@ mod tests {
                 .unwrap(),
             Some(99),
             "the checkpoint must not move when the cutoff block is momentarily null"
+        );
+        let (cutoff_block, lag_blocks): (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT cutoff_block, lag_blocks FROM block_lag_samples \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cutoff_block, None,
+            "a null RPC cutoff must remain unknown in telemetry"
+        );
+        assert_eq!(
+            lag_blocks, None,
+            "lag cannot be known without an ingestion cutoff"
         );
 
         // Second tick: cutoff is back -> resume from exactly checkpoint+1.

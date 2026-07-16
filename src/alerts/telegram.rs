@@ -175,7 +175,7 @@ mod tests {
     async fn notify_surfaces_api_error_status() {
         let server = MockServer::start_async().await;
 
-        server
+        let mock = server
             .mock_async(|when, then| {
                 when.method(POST).path("/bot123:abc/sendMessage");
                 then.status(400)
@@ -200,5 +200,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["description"], json!("Bad Request: chat not found"));
+
+        mock.assert_async().await;
     }
 }

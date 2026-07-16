@@ -2565,7 +2565,7 @@ mod tests {
                 sampled_at: now,
                 orderbook,
                 chain_tip: 120,
-                cutoff_block: 117,
+                cutoff_block: Some(117),
                 last_processed_block: Some(100),
             },
         )
