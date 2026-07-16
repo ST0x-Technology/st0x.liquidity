@@ -2459,7 +2459,7 @@ for operator review before automatic recovery.
 **Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
 redrives), at the limit, and before any terminal non-redriven error propagates.
 
-##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
+##### Startup re-arm and pre-burn inventory restoration
 
 On startup, `recover_usdc_guard` re-arms transfer jobs for aggregates at
 `BridgingSubmitting` (both directions) or `WithdrawalSubmitting{BaseToAlpaca}`
@@ -2477,12 +2477,22 @@ latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
 alert via `self.notifier` so the operator is paged to run `transfer resume` or
 `transfer reconcile` manually.
 
-These states do NOT receive a tracking seed (unlike `DepositFailed` /
-`ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a
-mid-flight resumable state would wedge the `DepositConfirmed` path which
-requires `bridged_amount_received` that the seed cannot supply. The re-arm path
-(job re-enqueue) handles them; the sweep path is for manually-reconcilable
-terminal states only.
+Re-arm and inventory restoration are separate contracts. Pre-burn Alpaca-to-Base
+`ConversionComplete`, `Withdrawing`, `WithdrawalComplete`, and
+`BridgingSubmitting { pending_burn_tx: None }` do not receive the legacy
+terminal-state tracking seed. After the guard is latched, their transfer job
+waits for a fresh post-startup Hedging observation associated with the current
+recovery attempt. Recovery then installs the exact active owner, tracking
+context, and source inflight reservation before the transfer manager can resume.
+The replacement is idempotent and does not debit freshly observed available cash
+a second time.
+
+Base-to-Alpaca `WithdrawalSubmitting` and `BridgingSubmitting` remain
+guard-only: startup re-arms their jobs but does not reconstruct tracking or
+MarketMaking inflight. Extending replacement-based reconstruction to that
+direction requires a separate MarketMaking freshness contract and state matrix.
+Post-burn and burn-ambiguous states also retain guard-only recovery unless their
+complete inventory effect can be proven.
 
 ###### Known limitations / follow-ups
 
@@ -3298,6 +3308,13 @@ guard at boot and blocks new USDC rebalancing until it settles or an operator
 recovers it. Supported stranded states are re-armed with idempotent transfer
 jobs on startup; unsupported states keep the guard held and page the operator
 for manual recovery.
+
+Before a pre-burn Alpaca-to-Base job enters the transfer manager, startup
+recovery waits for a fresh Hedging observation tied to that recovery attempt and
+restores its exact source reservation. This prevents a refreshed broker balance
+from being debited twice and prevents resumed terminal settlement from being
+deferred because its tracking entry is absent. Other directions and
+burn-ambiguous states retain guard-only recovery.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
