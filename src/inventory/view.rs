@@ -1674,6 +1674,8 @@ impl InventoryView {
             InflightEquity {
                 mints, redemptions, ..
             } => self.apply_inflight_snapshot(mints, redemptions, fetched_at, now),
+
+            SourceObserved { .. } => Ok(self),
         }
     }
 
@@ -1832,6 +1834,8 @@ impl InventoryView {
                 redemptions,
                 fetched_at,
             } => self.apply_inflight_snapshot(mints, redemptions, *fetched_at, now),
+
+            SourceObserved { .. } => Ok(self),
         }
     }
 }

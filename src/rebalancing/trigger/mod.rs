@@ -1697,6 +1697,8 @@ impl RebalancingService {
                     Ok(inventory.clone())
                 }
             }
+
+            SourceObserved { .. } => Ok(inventory.clone()),
         }?;
 
         *inventory = updated;
@@ -1815,6 +1817,8 @@ impl RebalancingService {
                     Ok(inventory.clone())
                 }
             }
+
+            SourceObserved { .. } => Ok(inventory.clone()),
         }?;
 
         *inventory = updated;
@@ -2025,7 +2029,8 @@ impl RebalancingService {
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
-            | InflightEquity { .. } => {}
+            | InflightEquity { .. }
+            | SourceObserved { .. } => {}
         }
     }
 
