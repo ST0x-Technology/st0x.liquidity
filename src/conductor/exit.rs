@@ -10,8 +10,6 @@ use tracing::{error, info};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MonitorTaskError {
-    #[error("Apalis worker failed after retries")]
-    TerminalJobFailure,
     #[error("Apalis monitor exited unexpectedly")]
     UnexpectedExit {
         #[source]
@@ -127,16 +125,6 @@ mod tests {
     #[tokio::test]
     async fn monitor_inner_ok_returns_ok() {
         ConductorExit::Monitor(Ok(Ok(()))).handle().unwrap();
-    }
-
-    #[tokio::test]
-    async fn monitor_inner_terminal_job_failure_returns_monitor_variant() {
-        assert!(matches!(
-            ConductorExit::Monitor(Ok(Err(MonitorTaskError::TerminalJobFailure)))
-                .handle()
-                .unwrap_err(),
-            ConductorExitError::Monitor(MonitorTaskError::TerminalJobFailure)
-        ));
     }
 
     #[tokio::test]

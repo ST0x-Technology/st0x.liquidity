@@ -11,7 +11,7 @@
 //!
 //! Transient errors propagate as `Err` so apalis retries up to three times.
 //! If all retries are exhausted the terminal failure is logged at `error!` but
-//! does NOT trip the conductor-wide fail-stop, so hedging and fill detection
+//! does NOT open a recovering worker circuit, so hedging and fill detection
 //! continue running. Aggregates already in a terminal state return `Ok(())`
 //! (idempotent).
 

@@ -170,7 +170,7 @@ where
                 // An unpriceable fill (non-zero equity moved at a non-positive
                 // USDC/share price) is anomalous and possibly adversarial. Surface
                 // it loudly and skip THIS fill only -- propagating the error would
-                // exhaust the worker retries and trip the conductor-wide fail-stop,
+                // exhaust the worker retries and open its recovering circuit,
                 // letting one crafted on-chain fill take the whole bot down.
                 error!(
                     target: "hedge",
@@ -197,7 +197,7 @@ where
                 // holder on the shared inventory (Bebop hook, univ4 hook, or a
                 // future venue), not the bot's own trusted order config. A
                 // non-standard token there must not be allowed to exhaust
-                // worker retries and trip the conductor-wide fail-stop --
+                // worker retries and open its recovering circuit --
                 // skip THIS fill only, same as an unpriceable fill.
                 error!(
                     target: "hedge",
@@ -226,7 +226,7 @@ where
                 // TokenIntrospectionFailed: any OPERATOR_ROLE holder can
                 // supply this token, so a spoofed/misconfigured one must not
                 // exhaust worker retries and trip the conductor-wide
-                // fail-stop -- skip THIS fill only.
+                // worker circuit -- skip THIS fill only.
                 error!(
                     target: "hedge",
                     event_type = trade_event.event.kind(),
@@ -252,7 +252,7 @@ where
                 // OPERATOR_ROLE holder on the shared inventory, same threat
                 // model as TokenIntrospectionFailed above: a malformed or
                 // extreme amount must not exhaust worker retries and trip
-                // the conductor-wide fail-stop -- skip THIS fill only.
+                // the worker circuit -- skip THIS fill only.
                 error!(
                     target: "hedge",
                     event_type = trade_event.event.kind(),
@@ -325,7 +325,7 @@ where
 /// Best-effort durable record of a skipped fill for manual reconciliation. A
 /// persistence failure is logged but never propagated: the whole point of the
 /// skip is to not fail the job, so a write hiccup must not resurrect the
-/// fail-stop it exists to avoid.
+/// worker circuit it exists to avoid.
 async fn persist_skipped_fill(
     pool: &SqlitePool,
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
@@ -699,7 +699,7 @@ mod tests {
     /// equity) is anomalous and possibly adversarial. `perform` must surface it
     /// and skip THIS fill only -- returning Ok(()) -- rather than propagating the
     /// error, which would exhaust the worker retries and trip the conductor-wide
-    /// fail-stop, letting one crafted fill take the whole bot down.
+    /// worker circuit, letting one crafted fill pause trade accounting.
     #[tokio::test]
     async fn perform_skips_unpriceable_fill() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -840,7 +840,7 @@ mod tests {
     /// An `InventoryTrade` whose two vault deltas are the same non-USDC token
     /// (a non-hedgeable pair) must be routed through `try_from_inventory_trade`
     /// and skipped gracefully -- exercising the InventoryTrade accounting arm
-    /// end to end without tripping the fail-stop.
+    /// end to end without opening the worker circuit.
     #[tokio::test]
     async fn perform_skips_inventory_trade_with_non_hedgeable_pair() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -1000,7 +1000,7 @@ mod tests {
         .await;
 
         // Should succeed (skip) rather than error -- a spoofed token address
-        // must not trip the fail-stop.
+        // must not open the worker circuit.
         job.perform(&accountant_ctx).await.unwrap();
 
         let recorded = sqlx::query!(
@@ -1019,7 +1019,7 @@ mod tests {
     /// introspection (a non-standard or reverting ERC20 -- these addresses
     /// come from any OPERATOR_ROLE holder, not the bot's own trusted order
     /// config) must be classified as `TokenIntrospectionFailed` and skipped
-    /// gracefully through `perform()` rather than tripping the fail-stop.
+    /// gracefully through `perform()` rather than opening the worker circuit.
     #[tokio::test]
     async fn perform_skips_inventory_trade_with_unintrospectable_token() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -1097,7 +1097,7 @@ mod tests {
         .await;
 
         // Should succeed (skip) rather than error, so a misbehaving
-        // third-party token cannot exhaust retries and trip the fail-stop.
+        // third-party token cannot exhaust retries and open the worker circuit.
         job.perform(&accountant_ctx).await.unwrap();
 
         let recorded = sqlx::query!(
@@ -1116,7 +1116,7 @@ mod tests {
     /// represented as a `rain_math_float` value (here `U256::MAX`, which
     /// deterministically overflows `Float::from_fixed_decimal` regardless of
     /// decimals) must be classified as `InvalidInventoryAmount` and skipped
-    /// gracefully through `perform()` rather than tripping the fail-stop.
+    /// gracefully through `perform()` rather than opening the worker circuit.
     #[tokio::test]
     async fn perform_skips_inventory_trade_with_invalid_amount() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -1184,7 +1184,7 @@ mod tests {
         .await;
 
         // Should succeed (skip) rather than error, so a malformed external
-        // amount cannot exhaust retries and trip the fail-stop.
+        // amount cannot exhaust retries and open the worker circuit.
         job.perform(&accountant_ctx).await.unwrap();
 
         let recorded = sqlx::query!(
