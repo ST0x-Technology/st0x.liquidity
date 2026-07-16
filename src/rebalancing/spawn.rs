@@ -154,6 +154,7 @@ mod tests {
     use httpmock::MockServer;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
     use uuid::Uuid;
 
     use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode, RebalancingCtx};
@@ -238,6 +239,7 @@ mod tests {
         let trigger_config = RebalancingServiceConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
+            inventory_freshness_window: Duration::from_secs(60),
             transfer_timeout: ctx.transfer_timeout,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -256,6 +258,7 @@ mod tests {
         let trigger_config = RebalancingServiceConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
+            inventory_freshness_window: Duration::from_secs(60),
             transfer_timeout: ctx.transfer_timeout,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
