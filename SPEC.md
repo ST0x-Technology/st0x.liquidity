@@ -2133,6 +2133,16 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it:
 
+- Startup recovery of a pre-burn Alpaca-to-Base transfer in
+  `ConversionComplete`, `Withdrawing`, `WithdrawalComplete`, or
+  `BridgingSubmitting` restores its exact Hedging source reservation before the
+  worker re-enters the transfer manager. The durable guard is latched
+  immediately, but the worker delayed-redrives until a fresh post-startup,
+  reserve-adjusted offchain cash observation has replaced available inventory.
+  Recovery then replacement-sets inflight to the aggregate amount and restores
+  the aggregate as the active owner. Repeating the observation or resuming the
+  same aggregate is idempotent; multiple reservation owners or an existing
+  different inventory owner fail closed without overwriting financial state.
 - `WithdrawalSubmitting` / `BridgingSubmitting`: scan the source chain for an
   already-submitted withdrawal / burn (`find_recent_withdrawal` /
   `find_recent_burn`) from the captured head and adopt it rather than

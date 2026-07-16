@@ -40,8 +40,9 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
-    Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
+    BroadcastingInventory, FreshOffchainUsdObserver, ImbalanceThreshold, Inventory, InventoryView,
+    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
+    TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
@@ -49,6 +50,7 @@ use crate::rebalancing::equity::{
     TransferEquityToMarketMakingJobQueue,
 };
 use crate::rebalancing::usdc::{
+    AlpacaToBaseResumePreparation, AlpacaToBaseResumePreparationError, PrepareAlpacaToBaseResume,
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
     TransferUsdcToMarketMakingJobQueue,
 };
@@ -60,8 +62,8 @@ use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
-    InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent,
-    UsdcRebalanceId, interrupted_usdc_rebalance_ids,
+    AlpacaToBaseReservationRecovery, InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance,
+    UsdcRebalanceEvent, UsdcRebalanceId, interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -137,6 +139,21 @@ pub(crate) enum RebalancingServiceError {
     ApalisSqlx(#[from] sqlx_apalis::Error),
     #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
     RearmEnqueue(#[from] QueuePushError),
+    #[error("multiple Alpaca-to-Base source reservations require recovery: {ids:?}")]
+    MultipleAlpacaToBaseReservationRecoveries { ids: Vec<UsdcRebalanceId> },
+    #[error("cannot restore Alpaca-to-Base rebalance {recovered}: inventory is owned by {active}")]
+    ConflictingActiveUsdcRebalance {
+        recovered: UsdcRebalanceId,
+        active: UsdcRebalanceId,
+    },
+    #[error(
+        "recovered Alpaca-to-Base reservation for {id} is {reserved}, but Initiated carries {initiated}"
+    )]
+    RecoveredReservationAmountMismatch {
+        id: UsdcRebalanceId,
+        reserved: Usdc,
+        initiated: Usdc,
+    },
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -509,6 +526,9 @@ pub(crate) struct RebalancingService {
     /// Tracks USDC rebalance lifecycle data needed to settle inventory on
     /// terminal events with the actual amount received.
     usdc_tracking: Arc<RwLock<HashMap<UsdcRebalanceId, usdc::UsdcRebalanceTracking>>>,
+    /// Startup-only barrier that prevents a recovered Alpaca-to-Base worker
+    /// from resuming until its exact source reservation is reconstructed.
+    alpaca_to_base_resume_gate: Arc<RwLock<Option<AlpacaToBaseResumeGate>>>,
     suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, DateTime<Utc>>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, DateTime<Utc>>>>,
@@ -536,6 +556,27 @@ pub(crate) struct RebalancingService {
     mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
     redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
     usdc_store: RwLock<Option<Arc<Store<UsdcRebalance>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AlpacaToBaseResumeGate {
+    AwaitingFreshHedgingSnapshot {
+        id: UsdcRebalanceId,
+        recovery: AlpacaToBaseReservationRecovery,
+    },
+    ReservationRestored {
+        id: UsdcRebalanceId,
+        amount: Usdc,
+    },
+}
+
+impl AlpacaToBaseResumeGate {
+    fn id(&self) -> &UsdcRebalanceId {
+        match self {
+            Self::AwaitingFreshHedgingSnapshot { id, .. }
+            | Self::ReservationRestored { id, .. } => id,
+        }
+    }
 }
 
 type EquityInventoryUpdate = Box<
@@ -650,6 +691,7 @@ impl RebalancingService {
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
+            alpaca_to_base_resume_gate: Arc::new(RwLock::new(None)),
             suppressed_inflight_symbols: Arc::new(RwLock::new(HashMap::new())),
             timed_out_mints: Arc::new(RwLock::new(HashMap::new())),
             timed_out_redemptions: Arc::new(RwLock::new(HashMap::new())),
@@ -1678,8 +1720,11 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
-            ApalisSqlx, EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext,
-            Projection, RearmEnqueue, SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
+            ApalisSqlx, ConflictingActiveUsdcRebalance, EquityTrigger, Float,
+            MissingUsdcBridgedAmount, MissingUsdcTrackingContext,
+            MultipleAlpacaToBaseReservationRecoveries, Projection, RearmEnqueue,
+            RecoveredReservationAmountMismatch, SettledUsdcExceedsInitiatedAmount,
+            SharesConversion, Sqlx,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1693,6 +1738,9 @@ impl RebalancingService {
             | MissingUsdcTrackingContext { .. }
             | MissingUsdcBridgedAmount { .. }
             | SettledUsdcExceedsInitiatedAmount { .. }
+            | MultipleAlpacaToBaseReservationRecoveries { .. }
+            | ConflictingActiveUsdcRebalance { .. }
+            | RecoveredReservationAmountMismatch { .. }
             | Sqlx(_)
             | ApalisSqlx(_)
             | RearmEnqueue(_)) => {
@@ -2026,6 +2074,107 @@ impl RebalancingService {
             })
             .await;
         }
+    }
+}
+
+#[async_trait]
+impl PrepareAlpacaToBaseResume for RebalancingService {
+    async fn prepare_alpaca_to_base_resume(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<AlpacaToBaseResumePreparation, AlpacaToBaseResumePreparationError> {
+        match self.alpaca_to_base_resume_gate.read().await.as_ref() {
+            Some(AlpacaToBaseResumeGate::AwaitingFreshHedgingSnapshot {
+                id: recovered_id, ..
+            }) if recovered_id == id => {
+                Ok(AlpacaToBaseResumePreparation::AwaitingFreshHedgingSnapshot)
+            }
+            Some(AlpacaToBaseResumeGate::ReservationRestored {
+                id: recovered_id, ..
+            }) if recovered_id == id => Ok(AlpacaToBaseResumePreparation::Ready),
+            Some(gate) => Err(
+                AlpacaToBaseResumePreparationError::ConflictingRecoveryOwner {
+                    requested: id.clone(),
+                    owner: gate.id().clone(),
+                },
+            ),
+            None => Ok(AlpacaToBaseResumePreparation::Ready),
+        }
+    }
+}
+
+#[async_trait]
+impl FreshOffchainUsdObserver for RebalancingService {
+    async fn observe_fresh_offchain_usd(
+        &self,
+        available: Usdc,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let event_sync_guard = self.usdc_event_sync.lock().await;
+        let awaiting = match self.alpaca_to_base_resume_gate.read().await.as_ref() {
+            Some(AlpacaToBaseResumeGate::AwaitingFreshHedgingSnapshot { id, recovery }) => {
+                Some((id.clone(), *recovery))
+            }
+            Some(AlpacaToBaseResumeGate::ReservationRestored { .. }) | None => None,
+        };
+
+        let Some((id, recovery)) = awaiting else {
+            return Ok(());
+        };
+
+        let mut inventory = self.inventory.write().await;
+        if let Some(active) = inventory.active_usdc_rebalance()
+            && active != &id
+        {
+            return Err(Box::new(
+                RebalancingServiceError::ConflictingActiveUsdcRebalance {
+                    recovered: id,
+                    active: active.clone(),
+                },
+            ));
+        }
+
+        *inventory = inventory
+            .clone()
+            .update_usdc(
+                Inventory::restore_reservation(Venue::Hedging, available, recovery.amount),
+                observed_at,
+            )?
+            .set_active_usdc_rebalance(id.clone());
+        drop(inventory);
+
+        let stage = match recovery.stage {
+            crate::usdc_rebalance::AlpacaToBaseReservationStage::ConversionComplete => {
+                usdc::UsdcRebalanceStage::ConversionConfirmed
+            }
+            crate::usdc_rebalance::AlpacaToBaseReservationStage::Withdrawing => {
+                usdc::UsdcRebalanceStage::Initiated
+            }
+            crate::usdc_rebalance::AlpacaToBaseReservationStage::WithdrawalComplete => {
+                usdc::UsdcRebalanceStage::WithdrawalConfirmed
+            }
+            crate::usdc_rebalance::AlpacaToBaseReservationStage::BridgingSubmitting => {
+                usdc::UsdcRebalanceStage::BridgingInitiated
+            }
+        };
+        self.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: recovery.amount,
+                bridged_amount_received: None,
+                stage,
+                last_progress_at: recovery.last_progress_at,
+            },
+        );
+        *self.alpaca_to_base_resume_gate.write().await =
+            Some(AlpacaToBaseResumeGate::ReservationRestored {
+                id,
+                amount: recovery.amount,
+            });
+        drop(event_sync_guard);
+
+        Ok(())
     }
 }
 
@@ -3631,7 +3780,7 @@ impl RebalancingService {
     /// each post-burn resumable aggregate with no blocking job row, this
     /// re-enqueues a transfer job keyed by the existing id. The live/row-existence
     /// checks make this idempotent with apalis's own re-pick of still-owned rows.
-    /// See ADR 2.
+    /// See ADR 0003 and ADR 0015.
     pub(crate) async fn recover_usdc_guard(
         &self,
         pool: &SqlitePool,
@@ -3644,6 +3793,7 @@ impl RebalancingService {
 
         let mut held_ids = Vec::new();
         let mut held_tracking = Vec::new();
+        let mut reservation_recoveries = Vec::new();
         // Guard-holding aggregates with no tracking seed AND no re-arm path
         // (e.g. WithdrawalSubmitting{AlpacaToBase}): the sweep never selects
         // them, so there is no automated recovery. The operator must be paged
@@ -3654,6 +3804,10 @@ impl RebalancingService {
         for id in candidate_ids {
             match usdc_store.load(&id).await {
                 Ok(Some(entity)) => {
+                    if let Some(recovery) = entity.alpaca_to_base_reservation_recovery() {
+                        reservation_recoveries.push((id.clone(), recovery));
+                    }
+
                     if entity.holds_rebalance_guard() {
                         held_ids.push(id.clone());
 
@@ -3757,11 +3911,11 @@ impl RebalancingService {
                         // is_resumable_mid_flight_data: resume_alpaca_to_base returns
                         // ResumeDirectionMismatch for that state so it must not be re-armed.
                         //
-                        // IMPORTANT: These states must NOT get a tracking seed (only
-                        // DepositFailed, ConversionFailed, and BridgingFailed{burn_tx=Some}
-                        // get tracking seeds). Adding tracking here would wedge the
-                        // DepositConfirmed path which requires bridged_amount_received
-                        // that the seed cannot supply.
+                        // Alpaca-to-Base pre-burn states receive their tracking
+                        // and exact source reservation only after the fresh
+                        // offchain inventory observer runs. Base-to-Alpaca and
+                        // post-burn states remain guard-only here because their
+                        // full inventory effect cannot be reconstructed safely.
                         //
                         // This re-arm runs BEFORE the apalis monitor spawns (see
                         // conductor.rs startup order), so there is no live-worker race.
@@ -3882,6 +4036,27 @@ impl RebalancingService {
                 }
             }
         }
+
+        if reservation_recoveries.len() > 1 {
+            return Err(
+                RebalancingServiceError::MultipleAlpacaToBaseReservationRecoveries {
+                    ids: reservation_recoveries
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect(),
+                },
+            );
+        }
+
+        *self.alpaca_to_base_resume_gate.write().await = reservation_recoveries
+            .into_iter()
+            .next()
+            .map(
+                |(id, recovery)| AlpacaToBaseResumeGate::AwaitingFreshHedgingSnapshot {
+                    id,
+                    recovery,
+                },
+            );
 
         // Re-arm a transfer job for each post-burn resumable aggregate that has
         // no job row at all -- the strand that a failed redrive enqueue (or a
@@ -16434,6 +16609,34 @@ mod tests {
             .unwrap();
     }
 
+    async fn seed_conversion_complete_alpaca_to_base(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        requested: Usdc,
+        received: Usdc,
+    ) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: requested,
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmConversion {
+                    conversion: ConversionAmounts::new(requested, received),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     async fn make_trigger_with_timed_out_alpaca_to_base_tracking(
         pool: &SqlitePool,
         store: Arc<Store<UsdcRebalance>>,
@@ -16503,6 +16706,52 @@ mod tests {
         service.recover_usdc_guard(&pool, &store).await.unwrap();
 
         assert_eq!(
+            service.prepare_alpaca_to_base_resume(&id).await.unwrap(),
+            AlpacaToBaseResumePreparation::AwaitingFreshHedgingSnapshot,
+            "the recovered job must remain gated until a fresh hedging snapshot arrives",
+        );
+
+        service
+            .observe_fresh_offchain_usd(usdc(500), Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service.prepare_alpaca_to_base_resume(&id).await.unwrap(),
+            AlpacaToBaseResumePreparation::Ready,
+            "the fresh snapshot must release the resume gate after restoring inventory",
+        );
+        {
+            let inventory = service.inventory.read().await;
+            assert_eq!(
+                inventory.usdc_available(Venue::Hedging),
+                Some(usdc(500)),
+                "snapshot-reconciled available cash must not be debited a second time",
+            );
+            assert_eq!(
+                inventory.usdc_inflight(Venue::Hedging),
+                Some(amount),
+                "recovery must restore the exact durable source reservation",
+            );
+            assert_eq!(
+                inventory.active_usdc_rebalance(),
+                Some(&id),
+                "recovery must restore active aggregate ownership together with inflight",
+            );
+            drop(inventory);
+        }
+
+        service
+            .observe_fresh_offchain_usd(usdc(500), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.inventory.read().await.usdc_inflight(Venue::Hedging),
+            Some(amount),
+            "observing the same recovery twice must replace, never add, inflight",
+        );
+
+        assert_eq!(
             count_pending_transfer_usdc_to_market_making_jobs(&service).await,
             1,
             "a Withdrawing{{AlpacaToBase}} with no job row must be re-armed as a market-making job",
@@ -16515,6 +16764,241 @@ mod tests {
         assert!(
             service.usdc_in_progress.load(Ordering::SeqCst),
             "usdc_in_progress must be latched after re-arming a Withdrawing{{AlpacaToBase}} job",
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_conversion_complete_initiated_event_does_not_debit_snapshot_twice() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let requested = usdc(400);
+        let received = usdc(390);
+
+        seed_conversion_complete_alpaca_to_base(&store, &id, requested, received).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+        service
+            .observe_fresh_offchain_usd(usdc(500), Utc::now())
+            .await
+            .unwrap();
+
+        service
+            .on_usdc_rebalance(
+                id.clone(),
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: received,
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = service.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(500)),
+            "the fresh broker snapshot already reflects conversion, so Initiated must not debit it again",
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(received),
+            "the restored reservation must remain exact after the durable Initiated event",
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn recovered_reservation_rejects_a_different_initiated_amount() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let reserved = usdc(400);
+        let initiated = usdc(399);
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        *service.alpaca_to_base_resume_gate.write().await =
+            Some(AlpacaToBaseResumeGate::ReservationRestored {
+                id: id.clone(),
+                amount: reserved,
+            });
+
+        let error = service
+            .on_usdc_rebalance(
+                id.clone(),
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: initiated,
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RebalancingServiceError::RecoveredReservationAmountMismatch {
+                id: mismatched_id,
+                reserved: mismatched_reserved,
+                initiated: mismatched_initiated,
+            } if mismatched_id == id
+                && mismatched_reserved == reserved
+                && mismatched_initiated == initiated
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovered_reservation_does_not_overwrite_conflicting_inventory_owner() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let recovered_id = UsdcRebalanceId(Uuid::new_v4());
+        let active_id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawing_alpaca_to_base(&store, &recovered_id, amount).await;
+
+        let inventory = InventoryView::default().set_active_usdc_rebalance(active_id.clone());
+        let service = make_trigger_with_inventory(inventory).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        let error = service
+            .observe_fresh_offchain_usd(usdc(500), Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<RebalancingServiceError>(),
+            Some(RebalancingServiceError::ConflictingActiveUsdcRebalance {
+                recovered,
+                active,
+            }) if recovered == &recovered_id && active == &active_id
+        ));
+        assert_eq!(
+            service
+                .prepare_alpaca_to_base_resume(&recovered_id)
+                .await
+                .unwrap(),
+            AlpacaToBaseResumePreparation::AwaitingFreshHedgingSnapshot,
+            "a conflicting owner must leave the recovered transfer gated",
+        );
+        assert_eq!(
+            service.inventory.read().await.active_usdc_rebalance(),
+            Some(&active_id),
+            "recovery must never overwrite a different aggregate's ownership",
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_reservation_rejects_a_different_job_owner() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let recovered_id = UsdcRebalanceId(Uuid::new_v4());
+        let different_id = UsdcRebalanceId(Uuid::new_v4());
+
+        seed_withdrawing_alpaca_to_base(&store, &recovered_id, usdc(400)).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        let error = service
+            .prepare_alpaca_to_base_resume(&different_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaToBaseResumePreparationError::ConflictingRecoveryOwner {
+                requested,
+                owner,
+            } if requested == different_id && owner == recovered_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_multiple_alpaca_to_base_reservation_owners() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let first = UsdcRebalanceId(Uuid::new_v4());
+        let second = UsdcRebalanceId(Uuid::new_v4());
+
+        seed_withdrawing_alpaca_to_base(&store, &first, usdc(300)).await;
+        seed_withdrawing_alpaca_to_base(&store, &second, usdc(400)).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let error = service.recover_usdc_guard(&pool, &store).await.unwrap_err();
+
+        let RebalancingServiceError::MultipleAlpacaToBaseReservationRecoveries { ids } = error
+        else {
+            panic!("expected multiple-recovery-owner error, got {error:?}");
+        };
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&first));
+        assert!(ids.contains(&second));
+        assert!(service.alpaca_to_base_resume_gate.read().await.is_none());
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            0,
+            "ambiguous ownership must fail before any resume job is enqueued",
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_reservation_settles_terminal_success_without_inflight_underflow() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated = usdc(400);
+        let received = usdc(398);
+
+        seed_withdrawing_alpaca_to_base(&store, &id, initiated).await;
+
+        let service =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(100), usdc(900)))
+                .await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+        service
+            .observe_fresh_offchain_usd(usdc(500), Utc::now())
+            .await
+            .unwrap();
+
+        service
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_bridged_with_amounts(received, usdc(2)),
+            )
+            .await
+            .unwrap();
+        service
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        let inventory = service.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(500)),
+            "terminal settlement must not debit the already-reconciled source snapshot",
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "terminal settlement must release the exact reconstructed inflight",
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(498)),
+            "the destination must receive the actual bridged amount",
+        );
+        assert_eq!(inventory.active_usdc_rebalance(), None);
+        drop(inventory);
+        assert!(!service.usdc_in_progress.load(Ordering::SeqCst));
+        assert!(
+            service.alpaca_to_base_resume_gate.read().await.is_none(),
+            "terminal cleanup must retire the restart-only resume gate",
         );
     }
 
@@ -16955,6 +17439,27 @@ mod tests {
 
         let service = make_trigger_with_inventory(InventoryView::default()).await;
         service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            service.prepare_alpaca_to_base_resume(&id).await.unwrap(),
+            AlpacaToBaseResumePreparation::AwaitingFreshHedgingSnapshot,
+        );
+        service
+            .observe_fresh_offchain_usd(usdc(700), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.inventory.read().await.usdc_inflight(Venue::Hedging),
+            Some(amount),
+            "BridgingSubmitting recovery must restore its source reservation before burn resume",
+        );
+        assert!(matches!(
+            service.usdc_tracking.read().await.get(&id),
+            Some(usdc::UsdcRebalanceTracking {
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                ..
+            })
+        ));
 
         assert_eq!(
             count_pending_transfer_usdc_to_market_making_jobs(&service).await,
