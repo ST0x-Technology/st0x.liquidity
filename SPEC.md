@@ -1562,6 +1562,14 @@ Four transfer jobs exist:
 | TransferUsdcToMarketMaking   | USDC   | Convert USD->USDC, withdraw, bridge via CCTP, deposit to vault |
 | TransferUsdcToHedging        | USDC   | Withdraw from vault, bridge via CCTP, deposit USDC to Alpaca   |
 
+Equity-transfer workers dead-letter a job that exhausts its retries: the Jobs
+row is recorded as terminal and retained as the durable ownership record, while
+the worker and conductor continue processing unrelated jobs. On startup, any
+equity-transfer row owns recovery of its aggregate: a non-terminal row is
+requeued, while a terminal row remains dead-lettered instead of being
+resurrected through generic tokenization recovery. A poison mint or redemption
+row therefore cannot put the bot into a process restart loop.
+
 The trigger enqueues at most one transfer per scope at a time, guarded both by
 an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard
 resets on restart; a non-terminal job row suppresses a duplicate enqueue). The
