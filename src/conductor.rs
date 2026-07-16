@@ -2363,6 +2363,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc,
+                inventory_freshness_window: Duration::from_secs(deps.ctx.inventory_poll_interval),
                 transfer_timeout: rebalancing_ctx.transfer_timeout,
                 assets: deps.ctx.assets.clone(),
             },
@@ -4770,6 +4771,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -5518,6 +5520,7 @@ mod tests {
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -6051,6 +6054,7 @@ mod tests {
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     // wrapped_equity_recovery ENABLED: recover_mint_state will set
@@ -6147,6 +6151,7 @@ mod tests {
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     // wrapped_equity_recovery DISABLED: recover_mint_state keeps
@@ -9739,6 +9744,7 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap()
+            .with_rebalancing_sources_observed_at(chrono::Utc::now())
     }
 
     #[tokio::test]
@@ -9787,6 +9793,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -9899,6 +9906,7 @@ mod tests {
             RebalancingServiceConfig {
                 equity: threshold,
                 usdc: Some(threshold),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -10021,6 +10029,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -10144,7 +10153,8 @@ mod tests {
                 ),
                 chrono::Utc::now(),
             )
-            .unwrap();
+            .unwrap()
+            .with_rebalancing_sources_observed_at(chrono::Utc::now());
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
@@ -10161,6 +10171,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
