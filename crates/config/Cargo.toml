@@ -49,6 +49,7 @@ tracing-appender.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }
 url.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
