@@ -3255,7 +3255,7 @@ always halt for operator review.
 **Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
 redrives), at the limit, and before any terminal non-redriven error propagates.
 
-##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
+##### Startup re-arm and pre-burn inventory restoration
 
 On startup, `recover_usdc_guard` re-arms transfer jobs for aggregates at
 `BridgingSubmitting` (both directions) or `WithdrawalSubmitting{BaseToAlpaca}`
@@ -3273,12 +3273,25 @@ latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
 alert via `self.notifier` so the operator is paged to run `transfer resume` or
 `transfer reconcile` manually.
 
-These states do NOT receive a tracking seed (unlike `DepositFailed` /
-`ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a
-mid-flight resumable state would wedge the `DepositConfirmed` path which
-requires `bridged_amount_received` that the seed cannot supply. The re-arm path
-(job re-enqueue) handles them; the sweep path is for manually-reconcilable
-terminal states only.
+Re-arm and inventory restoration are separate contracts. Pre-burn Alpaca-to-Base
+`ConversionComplete`, `Withdrawing`, `WithdrawalComplete`, and
+`BridgingSubmitting { pending_burn_tx: None }` do not receive the legacy
+terminal-state tracking seed. After the guard is latched, their transfer job
+waits for a fresh post-startup Hedging observation associated with the current
+recovery attempt. Recovery then installs the exact active owner, tracking
+context, and source inflight reservation before the transfer manager can resume.
+The replacement is idempotent and does not debit freshly observed available cash
+a second time.
+
+Base-to-Alpaca `WithdrawalSubmitting` and `BridgingSubmitting` remain
+guard-only: startup re-arms their jobs but does not reconstruct tracking or
+MarketMaking inflight. Extending replacement-based reconstruction to that
+direction requires a separate MarketMaking freshness contract and state matrix.
+Alpaca-to-Base `BridgingSubmitting { pending_burn_tx: None }` remains in the
+conservative source-reconstruction set: `None` does not prove no broadcast, so
+resume must verify or adopt a prior burn before submitting another. States with
+`pending_burn_tx: Some(_)`, later post-burn states, and unsupported directions
+remain guard-only unless their complete inventory effect can be proven.
 
 ###### Known limitations / follow-ups
 
@@ -4238,23 +4251,34 @@ recovers it. Supported stranded states are re-armed with idempotent transfer
 jobs on startup; unsupported states keep the guard held and page the operator
 for manual recovery.
 
-**Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
-become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
-or `BridgingSubmitting` (burn intent recorded) if the bot crashes or the burn
-fails before the `BridgingInitiated` event is persisted.
+Before a pre-burn Alpaca-to-Base job enters the transfer manager, startup
+recovery waits for a fresh Hedging observation tied to that recovery attempt and
+restores its exact source reservation. This prevents a refreshed broker balance
+from being debited twice and prevents resumed terminal settlement from being
+deferred because its tracking entry is absent. Other directions, states with a
+durably recorded pending burn transaction, and later post-burn states retain
+guard-only recovery. An Alpaca-to-Base
+`BridgingSubmitting { pending_burn_tx: None }` restores only its source
+reservation; it still requires burn verification or adoption before reburning.
 
-`WithdrawalComplete` is pre-CCTP-burn: no burn has been broadcast. However, the
-source withdrawal has already completed and the USDC is sitting in the
-market-maker wallet awaiting bridging. After clearing the guard with this
-command, the operator must reconcile or handle those funds separately.
+**Operator recovery of a pre-burn stranded guard latch**: Supported
+Alpaca-to-Base `WithdrawalComplete` and
+`BridgingSubmitting { pending_burn_tx: None }` states must stay on the automatic
+reservation-restoration and resume path. Do not clear their guard first:
+recovery restores the exact source reservation, then the manager verifies or
+adopts any prior burn before it can submit another.
 
-`BridgingSubmitting` records burn intent but does NOT guarantee that no burn was
-broadcast. A crash at this state may have already submitted a CCTP burn whose
-`BridgingInitiated` event never persisted (see "Crash-safe resume" above, which
-describes `find_recent_burn` scanning for exactly this case). The operator MUST
-verify on-chain that no recent CCTP burn left the market-maker wallet before
-using `fail-usdc-transfer` on a `BridgingSubmitting` transfer. Using it when a
-burn was already broadcast will strand the burned funds.
+`WithdrawalComplete` is pre-CCTP-burn: the source withdrawal completed and its
+USDC is in the market-maker wallet awaiting bridging. The restored reservation
+keeps those funds owned while resume advances into burn verification.
+
+`BridgingSubmitting { pending_burn_tx: None }` records burn intent but does NOT
+prove that no burn was broadcast. Resume uses `find_recent_burn` to adopt a
+prior submission before considering another. A durably recorded
+`pending_burn_tx: Some(_)` and later post-burn states remain guard-only; the
+operator must verify and adopt or reconcile that transaction rather than using
+`fail-usdc-transfer` to bypass the reservation/burn-adoption flow. Failing a
+transfer whose burn landed would strand the burned funds.
 
 The `fail-usdc-transfer` CLI command sends `FailBridging { reason }`, which
 emits `BridgingFailed { burn_tx_hash: None, cctp_nonce: None }`. Because this is

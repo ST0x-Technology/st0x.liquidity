@@ -127,3 +127,7 @@ decision.
 | [0015](0015-bot-gas-pnl-requires-explicit-receipt-cost-ledger.md)       | Require an explicit receipt cost ledger for bot gas PnL                              | Proposed |
 | [0016](0016-store-bot-gas-costs-in-the-event-stream.md)                 | Store bot-gas costs in the event stream                                              | Proposed |
 | [0017](0017-eth-usd-valuation-via-pyth-base-block-pinned.md)            | Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned                     | Proposed |
+| [0020](0020-reconstruct-pre-burn-usdc-inventory-on-resume.md)           | Reconstruct pre-burn Alpaca-to-Base USDC inventory before resume                     | Proposed |
+
+ADR-0020 proposes to amend ADR-0003 for pre-burn Alpaca-to-Base inventory
+reconstruction. The amendment is not in force until ADR-0020 is accepted.
