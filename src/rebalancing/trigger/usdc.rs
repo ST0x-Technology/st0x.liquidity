@@ -610,6 +610,15 @@ impl RebalancingService {
         }
         if is_clearable_terminal {
             self.usdc_tracking.write().await.remove(&id);
+            let mut resume_gate = self.alpaca_to_base_resume_gate.write().await;
+            if resume_gate
+                .as_ref()
+                .and_then(super::AlpacaToBaseResumeGate::single_owner)
+                == Some(&id)
+            {
+                *resume_gate = None;
+            }
+            drop(resume_gate);
             self.clear_usdc_in_progress();
             debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
         } else if terminal_action == UsdcTerminalAction::PreservePostBurn {
@@ -697,10 +706,10 @@ impl RebalancingService {
         // while an AlpacaToBase pre-withdrawal `ConversionFailed` clears.
         // Terminal successes fall through to `false` and settle normally.
         //
-        // When in-memory tracking is absent -- e.g. an apalis job that resumes
-        // after a restart, where `recover_usdc_guard` reasserts the guard but
-        // does not rebuild tracking -- we must NOT speculatively clear the guard
-        // on a failure that could be post-burn. So:
+        // When in-memory tracking is absent -- e.g. a post-burn apalis resume,
+        // for which startup recovery deliberately remains guard-only -- we must
+        // NOT speculatively clear the guard on a failure that could be
+        // post-burn. So:
         //   - `DepositFailed` is only reachable from `DepositInitiated`
         //     (post-mint), hence unconditionally post-burn.
         //   - `ConversionFailed` defaults to preserve when tracking is absent
@@ -910,6 +919,31 @@ impl RebalancingService {
                     id: id.clone(),
                     event: UsdcTrackingEvent::Initiated,
                 })?;
+        let restored_amount = self
+            .alpaca_to_base_resume_gate
+            .read()
+            .await
+            .as_ref()
+            .and_then(|gate| match gate {
+                super::AlpacaToBaseResumeGate::ReservationRestored {
+                    id: recovered_id,
+                    amount,
+                } if recovered_id == id => Some(*amount),
+                super::AlpacaToBaseResumeGate::AwaitingFreshHedgingSnapshot { .. }
+                | super::AlpacaToBaseResumeGate::ReservationRestored { .. }
+                | super::AlpacaToBaseResumeGate::ConflictingReservations { .. } => None,
+            });
+        if let Some(reserved) = restored_amount
+            && reserved != amount
+        {
+            return Err(
+                RebalancingServiceError::RecoveredReservationAmountMismatch {
+                    id: id.clone(),
+                    reserved,
+                    initiated: amount,
+                },
+            );
+        }
         let mut tracking = self.usdc_tracking.write().await;
         if let Some(existing) = tracking.get_mut(id) {
             let tracking_entry = UsdcRebalanceTracking {
@@ -920,7 +954,7 @@ impl RebalancingService {
                 last_progress_at,
             };
 
-            if existing.source_transfer_started() {
+            if existing.source_transfer_started() || restored_amount.is_some() {
                 *existing = tracking_entry;
                 return Ok(());
             }
@@ -950,6 +984,14 @@ impl RebalancingService {
             stage,
             last_progress_at,
         };
+
+        if restored_amount.is_some() {
+            self.usdc_tracking
+                .write()
+                .await
+                .insert(id.clone(), tracking_entry);
+            return Ok(());
+        }
 
         let update = Inventory::transfer(tracking_entry.source_venue(), TransferOp::Start, amount);
 
