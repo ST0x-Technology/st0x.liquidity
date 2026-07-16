@@ -10,6 +10,10 @@ log_dir = "/mnt/data/logs"
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
 # How often (seconds) Apalis purges finished background jobs.
 apalis_finished_job_cleanup_interval_secs = 3600
+
+[worker_circuit]
+recovery_timeout_secs = 300
+realert_interval_secs = 3600
 [telemetry]
 service_name = "st0x-liquidity"
 environment = "production"

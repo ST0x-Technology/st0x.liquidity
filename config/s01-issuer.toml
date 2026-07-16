@@ -23,6 +23,10 @@ board_port = 8012
 database_url = "sqlite:///mnt/data/s01-issuer.db"
 apalis_finished_job_cleanup_interval_secs = 3600
 
+[worker_circuit]
+recovery_timeout_secs = 300
+realert_interval_secs = 3600
+
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
 [raindex]
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"

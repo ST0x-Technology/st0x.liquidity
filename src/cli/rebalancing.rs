@@ -1990,6 +1990,10 @@ mod tests {
             inventory_poll_interval: 60,
             order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
+            worker_circuit: st0x_config::WorkerCircuitConfig::new(
+                std::num::NonZeroU64::MIN,
+                std::num::NonZeroU64::MIN,
+            ),
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
@@ -2057,6 +2061,10 @@ mod tests {
             inventory_poll_interval: 60,
             order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
+            worker_circuit: st0x_config::WorkerCircuitConfig::new(
+                std::num::NonZeroU64::MIN,
+                std::num::NonZeroU64::MIN,
+            ),
             broker: BrokerCtx::AlpacaBrokerApi(alpaca_broker_auth),
             telemetry: None,
             alerts: None,

@@ -289,6 +289,10 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .assets(assets)
+        .worker_circuit(st0x_config::WorkerCircuitConfig::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        ))
         .issuance(st0x_config::test_issuance_status_ctx(issuance_base_url))
         .redemption_wallet(redemption_wallet)
         .call()?;
@@ -384,6 +388,10 @@ where
                 reserved,
             }),
         })
+        .worker_circuit(st0x_config::WorkerCircuitConfig::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        ))
         .inventory_poll_interval(15)
         .redemption_wallet(Address::random())
         .call()

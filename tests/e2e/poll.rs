@@ -4,19 +4,21 @@
 //! managing the bot task, and `poll_for_events*` for waiting on CQRS
 //! events to appear in the database.
 
+use apalis_core::task::status::Status;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use st0x_config::Ctx;
 use st0x_dto::Statement;
 use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_hedge::{
-    FailureInjector, run_bot_session, run_bot_session_with_event_channel,
-    run_bot_session_with_injector,
+    FailureInjector, run_bot_session, run_bot_session_until_cancelled,
+    run_bot_session_with_event_channel, run_bot_session_with_injector,
 };
 
 /// Returns an available TCP port by binding to port 0 and reading the assigned
@@ -61,6 +63,13 @@ pub fn simulation_ports() -> (u16, u16) {
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_bot_session(ctx))
+}
+
+/// Spawns the full bot with an explicit graceful-shutdown trigger.
+pub fn spawn_bot_until_cancelled(ctx: Ctx) -> (CancellationToken, JoinHandle<anyhow::Result<()>>) {
+    let shutdown = CancellationToken::new();
+    let bot = tokio::spawn(run_bot_session_until_cancelled(ctx, shutdown.clone()));
+    (shutdown, bot)
 }
 
 /// Spawns the full bot with an externally-provided event channel,
@@ -508,6 +517,53 @@ pub async fn poll_for_running_job(
         pool.close().await;
 
         if matches!(running, Ok((count,)) if count >= 1) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
+/// Polls until a job of the given concrete type reaches an apalis terminal
+/// state, panicking if the bot dies or the timeout passes first.
+pub async fn poll_for_terminal_job(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    job_type: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("terminal {job_type} job");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let terminal: Result<(i64,), _> = sqlx::query_as(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? AND (status = ? \
+             OR (status = ? AND attempts >= max_attempts))",
+        )
+        .bind(job_type)
+        .bind(Status::Killed.to_string())
+        .bind(Status::Failed.to_string())
+        .fetch_one(&pool)
+        .await;
+
+        pool.close().await;
+
+        if matches!(terminal, Ok((count,)) if count >= 1) {
             return;
         }
 

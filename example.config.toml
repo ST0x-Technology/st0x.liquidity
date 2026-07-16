@@ -8,6 +8,10 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
 order_fill_poll_interval = 5
 
+[worker_circuit]
+recovery_timeout_secs = 300
+realert_interval_secs = 3600
+
 [telemetry]
 service_name = "st0x-hedge"
 # Deployment environment exported as the `deployment.environment` resource

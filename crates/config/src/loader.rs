@@ -9,24 +9,26 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
+use tracing::{Level, warn};
+use url::Url;
+
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive,
     SupportedExecutor, Symbol, TimeInForce,
 };
 use st0x_finance::{Usd, Usdc};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use tracing::{Level, warn};
-
-use url::Url;
+use st0x_float_macro::float;
 
 use crate::{
     AlertsConfig, AlertsCtx, AlertsSecrets, EvmConfig, EvmCtx, EvmSecrets, ExecutionThreshold,
     InvalidThresholdError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
     TelemetryCtx,
 };
-use st0x_float_macro::float;
 
 /// Alpaca minimum execution threshold: $2.
 static ALPACA_MIN_DOLLARS: LazyLock<Usdc> = LazyLock::new(|| Usdc::new(float!(2)));
@@ -54,6 +56,35 @@ pub struct Env {
     /// Path to encrypted TOML secrets file
     #[clap(long)]
     pub secrets: PathBuf,
+}
+
+/// Required timeout policy for recovering apalis worker circuits.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct WorkerCircuitConfig {
+    recovery_timeout_secs: NonZeroU64,
+    realert_interval_secs: NonZeroU64,
+}
+
+impl WorkerCircuitConfig {
+    #[must_use]
+    pub const fn new(recovery_timeout_secs: NonZeroU64, realert_interval_secs: NonZeroU64) -> Self {
+        Self {
+            recovery_timeout_secs,
+            realert_interval_secs,
+        }
+    }
+
+    #[must_use]
+    pub const fn recovery_timeout(self) -> Duration {
+        Duration::from_secs(self.recovery_timeout_secs.get())
+    }
+
+    #[must_use]
+    pub const fn realert_interval(self) -> Duration {
+        Duration::from_secs(self.realert_interval_secs.get())
+    }
 }
 
 /// Whether a per-asset operation (trading or rebalancing) is active.
@@ -222,6 +253,7 @@ struct Config {
     inventory_poll_interval: Option<u64>,
     order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
+    worker_circuit: WorkerCircuitConfig,
     telemetry: Option<TelemetryConfig>,
     alerts: Option<AlertsConfig>,
     rebalancing: Option<RebalancingConfig>,
@@ -522,6 +554,7 @@ pub struct Ctx {
     /// (capped at the chain's latest finalized block).
     pub order_fill_poll_interval: u64,
     pub apalis_finished_job_cleanup_interval_secs: u64,
+    pub worker_circuit: WorkerCircuitConfig,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
     /// Optional gas-balance alerting context. `Some` when both `[alerts]`
@@ -623,6 +656,7 @@ impl std::fmt::Debug for Ctx {
                 "apalis_finished_job_cleanup_interval_secs",
                 &self.apalis_finished_job_cleanup_interval_secs,
             )
+            .field("worker_circuit", &self.worker_circuit)
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("alerts", &self.alerts)
@@ -690,6 +724,7 @@ struct ValidatedParts {
     inventory_poll_interval: u64,
     order_fill_poll_interval: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
+    worker_circuit: WorkerCircuitConfig,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
     alerts: Option<AlertsCtx>,
@@ -934,6 +969,7 @@ fn parse_and_validate(
         inventory_poll_interval,
         order_fill_poll_interval,
         apalis_finished_job_cleanup_interval_secs,
+        worker_circuit: config.worker_circuit,
         broker,
         telemetry,
         alerts,
@@ -1028,6 +1064,7 @@ impl Ctx {
             order_fill_poll_interval: parts.order_fill_poll_interval,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
+            worker_circuit: parts.worker_circuit,
             broker: parts.broker,
             telemetry: parts.telemetry,
             alerts: parts.alerts,
@@ -1241,6 +1278,7 @@ impl Ctx {
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
+        worker_circuit: WorkerCircuitConfig,
         #[builder(default = 0)] server_port: u16,
         #[builder(default = 0)] board_port: u16,
         execution_threshold_override: Option<ExecutionThreshold>,
@@ -1295,6 +1333,7 @@ impl Ctx {
             inventory_poll_interval,
             order_fill_poll_interval: 1,
             apalis_finished_job_cleanup_interval_secs,
+            worker_circuit,
             broker,
             telemetry: None,
             alerts: None,
@@ -1569,6 +1608,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         inventory_poll_interval: 60,
         order_fill_poll_interval: 5,
         apalis_finished_job_cleanup_interval_secs: 3600,
+        worker_circuit: WorkerCircuitConfig::new(NonZeroU64::MIN, NonZeroU64::MIN),
         broker: BrokerCtx::DryRun,
         telemetry: None,
         alerts: None,
@@ -1624,6 +1664,7 @@ mod tests {
             .trading_mode(TradingMode::Standalone)
             .order_owner(order_owner)
             .assets(AssetsConfig::default())
+            .worker_circuit(WorkerCircuitConfig::new(NonZeroU64::MIN, NonZeroU64::MIN))
             .call()
             .unwrap();
 
@@ -1645,6 +1686,7 @@ mod tests {
             .trading_mode(TradingMode::Standalone)
             .order_owner(order_owner)
             .assets(AssetsConfig::default())
+            .worker_circuit(WorkerCircuitConfig::new(NonZeroU64::MIN, NonZeroU64::MIN))
             .inventory_mode(InventoryMode::Managed { inventory })
             .call()
             .unwrap();
@@ -1689,6 +1731,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -1710,6 +1753,59 @@ mod tests {
         file
     }
 
+    #[test]
+    fn worker_circuit_config_is_required() {
+        let config = minimal_config_toml();
+        let config_toml = std::fs::read_to_string(config.path()).unwrap();
+        let config_toml = config_toml.replace(
+            "            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }\n",
+            "",
+        );
+
+        let Err(error) = toml::from_str::<Config>(&config_toml) else {
+            panic!("expected missing [worker_circuit] config to fail parsing");
+        };
+
+        assert!(
+            error.to_string().contains("missing field `worker_circuit`"),
+            "expected parse error to identify the missing worker circuit config, got: {error}"
+        );
+    }
+
+    #[test]
+    fn worker_circuit_requires_both_intervals() {
+        for config_toml in [
+            "recovery_timeout_secs = 300",
+            "realert_interval_secs = 3600",
+        ] {
+            let Err(error) = toml::from_str::<WorkerCircuitConfig>(config_toml) else {
+                panic!("expected incomplete worker circuit config to fail parsing");
+            };
+
+            assert!(
+                error.to_string().contains("missing field"),
+                "expected parse error to identify the missing interval, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_circuit_rejects_zero_intervals() {
+        for config_toml in [
+            "recovery_timeout_secs = 0\nrealert_interval_secs = 3600",
+            "recovery_timeout_secs = 300\nrealert_interval_secs = 0",
+        ] {
+            let Err(error) = toml::from_str::<WorkerCircuitConfig>(config_toml) else {
+                panic!("expected zero worker circuit interval to fail parsing");
+            };
+
+            assert!(
+                error.to_string().contains("expected a nonzero u64"),
+                "expected parse error to reject the zero interval, got: {error}"
+            );
+        }
+    }
+
     /// Minimal config with `[broker.travel_rule]` included, for tests
     /// that use Alpaca Broker API secrets (which now require travel rule
     /// at startup).
@@ -1720,6 +1816,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -1753,6 +1850,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -1891,6 +1989,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -1932,6 +2031,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -1981,6 +2081,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2027,6 +2128,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2073,6 +2175,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2155,6 +2258,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2284,6 +2388,7 @@ mod tests {
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2323,6 +2428,7 @@ mod tests {
             database_url = ":memory:"
             server_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2363,6 +2469,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2408,6 +2515,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2450,6 +2558,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
             order_fill_poll_interval = 0
 
             [assets.equities]
@@ -2493,6 +2602,7 @@ mod tests {
             server_port = 8080
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2549,6 +2659,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2613,6 +2724,7 @@ mod tests {
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
             log_level = "warn"
             server_port = 9090
             order_polling_interval = 30
@@ -2676,6 +2788,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2772,6 +2885,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2833,6 +2947,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2897,6 +3012,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -2965,6 +3081,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3039,6 +3156,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3093,6 +3211,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3194,6 +3313,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3251,6 +3371,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3307,6 +3428,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3689,6 +3811,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -3849,6 +3972,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = {{ recovery_timeout_secs = 300, realert_interval_secs = 3600 }}
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -3915,6 +4039,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -4125,6 +4250,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
             bogus_field = "should fail"
 
             [raindex]
@@ -4157,6 +4283,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets]
             bogus_field = "should fail"
@@ -4193,6 +4320,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -4233,6 +4361,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.cash]
             rebalancing = "disabled"
@@ -4324,6 +4453,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
             bogus_field = "should fail"
 
             [raindex]
@@ -5231,6 +5361,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -5274,6 +5405,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -5359,6 +5491,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -5397,6 +5530,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -5450,6 +5584,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -5539,6 +5674,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
 
             [assets.equities]
 
@@ -5583,6 +5719,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            worker_circuit = { recovery_timeout_secs = 300, realert_interval_secs = 3600 }
             position_check_interval = 0
 
             [assets.equities]

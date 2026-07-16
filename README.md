@@ -84,7 +84,9 @@ The application uses TOML configuration files split into plaintext config and
 encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
 available options. Operational intervals such as
 `apalis_finished_job_cleanup_interval_secs` must be explicitly configured and
-non-zero.
+non-zero. The required `[worker_circuit]` section likewise specifies non-zero
+`recovery_timeout_secs` and `realert_interval_secs`; deployed environments use
+300 seconds and 3600 seconds respectively.
 
 The `[raindex]` section requires an explicit `inventory_mode` (`"legacy"` or
 `"managed"`) and a `vault_owner` address (the on-chain owner the vaults are

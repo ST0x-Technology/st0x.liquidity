@@ -76,6 +76,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .trading_mode(TradingMode::Standalone)
         .order_owner(chain.owner)
         .assets(assets)
+        .worker_circuit(st0x_config::WorkerCircuitConfig::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        ))
         .maybe_execution_threshold_override(execution_threshold_override)
         .maybe_inventory_mode(inventory_mode_override)
         .call()

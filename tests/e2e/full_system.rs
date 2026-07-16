@@ -164,6 +164,10 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                 reserved: cash_reserved,
             }),
         })
+        .worker_circuit(st0x_config::WorkerCircuitConfig::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        ))
         .inventory_poll_interval(15)
         .server_port(server_port)
         .board_port(board_port)
@@ -512,6 +516,9 @@ board_port = {board_port}
 log_level = "debug"
 database_url = "{database_url}"
 apalis_finished_job_cleanup_interval_secs = 3600
+[worker_circuit]
+recovery_timeout_secs = 1
+realert_interval_secs = 60
 [telemetry]
 service_name = "st0x-simulate-failures"
 environment = "e2e"

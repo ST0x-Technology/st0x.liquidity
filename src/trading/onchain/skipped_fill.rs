@@ -1,7 +1,7 @@
 //! Durable record of on-chain fills the accountant skipped instead of hedging.
 //!
 //! [`AccountForDexTrade`] swallows unpriceable fills and non-hedgeable pairs so a
-//! single anomalous (or crafted) fill cannot trip the conductor-wide fail-stop.
+//! single anomalous (or crafted) fill cannot open the worker circuit.
 //! Persisting them here means a skipped fill survives log rotation and can be
 //! reconciled by hand, rather than being visible only in an `error!` line.
 //!
