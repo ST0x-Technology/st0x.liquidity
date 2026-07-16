@@ -104,8 +104,9 @@ whether a balance happened to change.
 ### Make rebalancing fail closed on required-source freshness
 
 Rebalancing check jobs, rather than polling order, enforce freshness. At check
-execution time, every required observation must be present and no older than the
-configured inventory poll interval:
+execution time, every required observation must be present and no older than
+twice the configured inventory poll interval. The second interval is an explicit
+grace margin for network latency, worker backpressure, and scheduling jitter:
 
 - equity checks require fresh `PollInflightEquity`, `PollOnchainEquity`, and
   `PollOffchainInventory` observations;
@@ -159,8 +160,9 @@ gate.
 ### Neutral
 
 - Snapshot values and the dashboard's merged inventory model remain unchanged.
-- The existing poll interval remains both the cadence and the maximum accepted
-  observation age; this ADR does not introduce a second timing knob.
+- The existing poll interval remains the only timing knob. The maximum accepted
+  observation age is derived as twice that interval, adding one interval of
+  grace without separate configuration that could drift from the cadence.
 - Wallet observations remain visible and may drive their existing recovery jobs,
   but do not become counterpart requirements for balance-ratio decisions they do
   not feed.

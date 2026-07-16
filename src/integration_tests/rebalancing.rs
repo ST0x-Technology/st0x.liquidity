@@ -208,6 +208,7 @@ fn test_trigger_config() -> RebalancingServiceConfig {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
+        inventory_freshness_window: Duration::from_secs(60),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets: AssetsConfig {
             equities: EquitiesConfig {
@@ -280,7 +281,8 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
                 FractionalShares::ZERO,
                 FractionalShares::ZERO,
             )
-            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000))),
+            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000)))
+            .with_rebalancing_sources_observed_at(Utc::now()),
         event_sender,
     ));
 
@@ -451,7 +453,8 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
             let taken = std::mem::take(&mut *guard);
             *guard = taken
                 .with_usdc(onchain, offchain)
-                .with_withdrawable_cash_cents(withdrawable_cash_cents);
+                .with_withdrawable_cash_cents(withdrawable_cash_cents)
+                .with_rebalancing_sources_observed_at(Utc::now());
         }
     }
 }
@@ -1761,7 +1764,8 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default()
             .with_usdc(Usdc::new(float!(50)), Usdc::new(float!(950)))
-            .with_withdrawable_cash_cents(95_000),
+            .with_withdrawable_cash_cents(95_000)
+            .with_rebalancing_sources_observed_at(Utc::now()),
         event_sender,
     ));
 
@@ -1784,6 +1788,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
+        inventory_freshness_window: Duration::from_secs(60),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets,
     };
@@ -1892,7 +1897,8 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default()
             .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(900)))
-            .with_withdrawable_cash_cents(90_000),
+            .with_withdrawable_cash_cents(90_000)
+            .with_rebalancing_sources_observed_at(Utc::now()),
         event_sender,
     ));
 
@@ -1914,6 +1920,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
+        inventory_freshness_window: Duration::from_secs(60),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets,
     };
@@ -2007,6 +2014,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: float!(0.5),
                 deviation: float!(0.4),
             }),
+            inventory_freshness_window: Duration::from_secs(60),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -2068,6 +2076,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: float!(0.5),
                 deviation: float!(0.1),
             }),
+            inventory_freshness_window: Duration::from_secs(60),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),

@@ -18,7 +18,7 @@ use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
-use super::snapshot::InventorySnapshotEvent;
+use super::snapshot::{InventoryObservationSource, InventorySnapshotEvent};
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::usdc_rebalance::UsdcRebalanceId;
@@ -34,6 +34,55 @@ pub(crate) enum InventoryViewError {
     Float(#[from] FloatError),
     #[error("failed to convert USD balance cents {0} to USDC")]
     UsdBalanceConversion(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InventoryFreshnessRequirement {
+    Equity,
+    Usdc,
+}
+
+impl InventoryFreshnessRequirement {
+    const fn sources(self) -> &'static [InventoryObservationSource] {
+        match self {
+            Self::Equity => &[
+                InventoryObservationSource::InflightEquity,
+                InventoryObservationSource::OnchainEquity,
+                InventoryObservationSource::OffchainInventory,
+            ],
+            Self::Usdc => &[
+                InventoryObservationSource::OnchainUsdc,
+                InventoryObservationSource::OffchainInventory,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum InventorySourceFreshnessError {
+    #[error("inventory source {observation_source:?} has never been observed")]
+    Missing {
+        observation_source: InventoryObservationSource,
+    },
+    #[error(
+        "inventory source {observation_source:?} was last observed at {observed_at}, \
+         older than the {max_age:?} freshness window at {checked_at}"
+    )]
+    Stale {
+        observation_source: InventoryObservationSource,
+        observed_at: DateTime<Utc>,
+        checked_at: DateTime<Utc>,
+        max_age: std::time::Duration,
+    },
+    #[error(
+        "inventory source {observation_source:?} was observed at future time {observed_at}, \
+         after freshness check time {checked_at}"
+    )]
+    Future {
+        observation_source: InventoryObservationSource,
+        observed_at: DateTime<Utc>,
+        checked_at: DateTime<Utc>,
+    },
 }
 
 /// Why an equity imbalance check failed.
@@ -822,9 +871,62 @@ pub(crate) struct InventoryView {
     /// re-bases the cash balance the same way.
     #[serde(default)]
     restart_tainted_offchain_cash: bool,
+    #[serde(default)]
+    source_observed_at: BTreeMap<InventoryObservationSource, DateTime<Utc>>,
 }
 
 impl InventoryView {
+    pub(crate) fn require_fresh_sources(
+        &self,
+        requirement: InventoryFreshnessRequirement,
+        checked_at: DateTime<Utc>,
+        max_age: std::time::Duration,
+    ) -> Result<(), InventorySourceFreshnessError> {
+        for &observation_source in requirement.sources() {
+            let Some(&observed_at) = self.source_observed_at.get(&observation_source) else {
+                return Err(InventorySourceFreshnessError::Missing { observation_source });
+            };
+
+            if observed_at > checked_at {
+                return Err(InventorySourceFreshnessError::Future {
+                    observation_source,
+                    observed_at,
+                    checked_at,
+                });
+            }
+
+            let age = (checked_at - observed_at)
+                .to_std()
+                .unwrap_or(std::time::Duration::MAX);
+            if age > max_age {
+                return Err(InventorySourceFreshnessError::Stale {
+                    observation_source,
+                    observed_at,
+                    checked_at,
+                    max_age,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rebalancing_sources_observed_at(
+        mut self,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        for source in [
+            InventoryObservationSource::InflightEquity,
+            InventoryObservationSource::OnchainEquity,
+            InventoryObservationSource::OnchainUsdc,
+            InventoryObservationSource::OffchainInventory,
+        ] {
+            self = self.record_source_observation(source, observed_at, observed_at);
+        }
+        self
+    }
+
     /// Checks a single equity for imbalance against the threshold.
     ///
     /// The onchain balance is converted from wrapped to unwrapped-equivalent using
@@ -1186,6 +1288,7 @@ impl Default for InventoryView {
             last_offchain_fill_applied_at: HashMap::new(),
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            source_observed_at: BTreeMap::new(),
         }
     }
 }
@@ -1410,6 +1513,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            source_observed_at: self.source_observed_at,
         })
     }
 
@@ -1447,6 +1551,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            source_observed_at: self.source_observed_at,
         })
     }
 
@@ -1710,6 +1815,7 @@ impl InventoryView {
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols.clone(),
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            source_observed_at: self.source_observed_at.clone(),
             ..Self::default()
         }
     }
@@ -2099,6 +2205,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            source_observed_at: self.source_observed_at,
         })
     }
 
@@ -2137,6 +2244,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            source_observed_at: self.source_observed_at,
         })
     }
 
@@ -2739,7 +2847,10 @@ impl InventoryView {
                 mints, redemptions, ..
             } => self.apply_inflight_snapshot(mints, redemptions, fetched_at, now),
 
-            SourceObserved { .. } => Ok(self),
+            SourceObserved {
+                source,
+                observed_at,
+            } => Ok(self.record_source_observation(*source, *observed_at, now)),
         }
     }
 
@@ -2983,8 +3094,28 @@ impl InventoryView {
                 fetched_at,
             } => self.apply_inflight_snapshot(mints, redemptions, *fetched_at, now),
 
-            SourceObserved { .. } => Ok(self),
+            SourceObserved {
+                source,
+                observed_at,
+            } => Ok(self.record_source_observation(*source, *observed_at, now)),
         }
+    }
+
+    fn record_source_observation(
+        mut self,
+        source: InventoryObservationSource,
+        observed_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let should_record = self
+            .source_observed_at
+            .get(&source)
+            .is_none_or(|existing| observed_at > *existing);
+        if should_record {
+            self.source_observed_at.insert(source, observed_at);
+            self.last_updated = now;
+        }
+        self
     }
 }
 
@@ -3119,6 +3250,125 @@ mod tests {
     }
 
     #[test]
+    fn equity_freshness_accepts_all_required_source_observations() {
+        let now = Utc::now();
+        let view = [
+            InventoryObservationSource::InflightEquity,
+            InventoryObservationSource::OnchainEquity,
+            InventoryObservationSource::OffchainInventory,
+        ]
+        .into_iter()
+        .fold(InventoryView::default(), |view, source| {
+            view.apply_snapshot_event(
+                &InventorySnapshotEvent::SourceObserved {
+                    source,
+                    observed_at: now,
+                },
+                now,
+            )
+            .unwrap()
+        });
+
+        view.require_fresh_sources(
+            InventoryFreshnessRequirement::Equity,
+            now,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn usdc_freshness_fails_closed_when_a_source_is_missing() {
+        let now = Utc::now();
+
+        let result = InventoryView::default().require_fresh_sources(
+            InventoryFreshnessRequirement::Usdc,
+            now,
+            std::time::Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            result,
+            Err(InventorySourceFreshnessError::Missing {
+                observation_source: InventoryObservationSource::OnchainUsdc,
+            })
+        );
+    }
+
+    #[test]
+    fn usdc_freshness_rejects_an_observation_older_than_the_window() {
+        let now = Utc::now();
+        let stale_at = now - Duration::seconds(61);
+        let view = [
+            (InventoryObservationSource::OnchainUsdc, stale_at),
+            (InventoryObservationSource::OffchainInventory, now),
+        ]
+        .into_iter()
+        .fold(InventoryView::default(), |view, (source, observed_at)| {
+            view.apply_snapshot_event(
+                &InventorySnapshotEvent::SourceObserved {
+                    source,
+                    observed_at,
+                },
+                now,
+            )
+            .unwrap()
+        });
+
+        let result = view.require_fresh_sources(
+            InventoryFreshnessRequirement::Usdc,
+            now,
+            std::time::Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            result,
+            Err(InventorySourceFreshnessError::Stale {
+                observation_source: InventoryObservationSource::OnchainUsdc,
+                observed_at: stale_at,
+                checked_at: now,
+                max_age: std::time::Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
+    fn usdc_freshness_rejects_an_observation_from_the_future() {
+        let now = Utc::now();
+        let future_at = now + Duration::milliseconds(1);
+        let view = [
+            (InventoryObservationSource::OnchainUsdc, future_at),
+            (InventoryObservationSource::OffchainInventory, now),
+        ]
+        .into_iter()
+        .fold(InventoryView::default(), |view, (source, observed_at)| {
+            view.apply_snapshot_event(
+                &InventorySnapshotEvent::SourceObserved {
+                    source,
+                    observed_at,
+                },
+                now,
+            )
+            .unwrap()
+        });
+
+        let result = view.require_fresh_sources(
+            InventoryFreshnessRequirement::Usdc,
+            now,
+            std::time::Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            result,
+            Err(InventorySourceFreshnessError::Future {
+                observation_source: InventoryObservationSource::OnchainUsdc,
+                observed_at: future_at,
+                checked_at: now,
+            })
+        );
+    }
+
+    #[test]
     fn has_inflight_false_when_no_inflight() {
         let inventory = make_inventory(50, 0, 50, 0);
         assert!(!inventory.has_inflight().unwrap());
@@ -3190,6 +3440,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            source_observed_at: BTreeMap::new(),
         }
     }
 
@@ -3231,6 +3482,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            source_observed_at: BTreeMap::new(),
         }
     }
 
@@ -5224,6 +5476,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            source_observed_at: BTreeMap::new(),
         };
 
         let dto = view.to_dto();
@@ -5287,6 +5540,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            source_observed_at: BTreeMap::new(),
         };
 
         let dto = view.to_dto();
