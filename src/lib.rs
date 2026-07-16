@@ -93,6 +93,28 @@ pub fn poll_order_status_job_type() -> &'static str {
 pub fn account_for_dex_trade_job_type() -> &'static str {
     std::any::type_name::<trading::onchain::trade_accountant::AccountForDexTrade>()
 }
+/// Returns apalis job type identifiers for jobs that always leave a scheduled
+/// successor in the persistent queue.
+#[cfg(any(test, feature = "test-support"))]
+pub fn perpetual_job_types() -> [&'static str; 9] {
+    use inventory::job::{
+        PollBaseWalletUnwrappedEquity, PollBaseWalletUsdc, PollBaseWalletWrappedEquity,
+        PollEthereumWalletUsdc, PollInflightEquity, PollOffchainInventory, PollOnchainEquity,
+        PollOnchainUsdc,
+    };
+
+    [
+        std::any::type_name::<position_check::CheckPositions>(),
+        std::any::type_name::<PollInflightEquity>(),
+        std::any::type_name::<PollOnchainEquity>(),
+        std::any::type_name::<PollOnchainUsdc>(),
+        std::any::type_name::<PollEthereumWalletUsdc>(),
+        std::any::type_name::<PollBaseWalletUsdc>(),
+        std::any::type_name::<PollBaseWalletUnwrappedEquity>(),
+        std::any::type_name::<PollBaseWalletWrappedEquity>(),
+        std::any::type_name::<PollOffchainInventory>(),
+    ]
+}
 #[cfg(any(test, feature = "test-support"))]
 pub use conductor::job::{FailureInjector, JobKind};
 #[cfg(any(test, feature = "test-support"))]

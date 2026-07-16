@@ -59,6 +59,10 @@ use crate::dashboard::Broadcaster;
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
+use crate::inventory::job::{
+    ConfiguredInventorySources, InventoryPollingJobQueues, bootstrap_inventory_polling_jobs,
+};
+use crate::inventory::snapshot::InventoryObservationSource;
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
@@ -684,6 +688,13 @@ impl Conductor {
         )
         .await?;
 
+        let inventory_polling_queues = setup_inventory_polling_queues(
+            &apalis_pool,
+            wallet_polling.as_ref(),
+            tokenizer.as_ref(),
+        )
+        .await?;
+
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
             apalis_pool.clone(),
@@ -738,6 +749,7 @@ impl Conductor {
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
             .check_positions_queue(check_positions_queue)
+            .inventory_polling_queues(inventory_polling_queues)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
@@ -844,6 +856,40 @@ impl Conductor {
         self.job_cleanup.abort();
         self.telemetry_writer.abort();
     }
+}
+
+/// Creates the per-source inventory polling queues and bootstraps their
+/// durable jobs for every source the configuration makes observable.
+async fn setup_inventory_polling_queues(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    wallet_polling: Option<&crate::inventory::WalletPollingCtx>,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) -> anyhow::Result<InventoryPollingJobQueues> {
+    let queues = InventoryPollingJobQueues::new(apalis_pool);
+    let sources = configured_inventory_sources(wallet_polling, tokenizer);
+    bootstrap_inventory_polling_jobs(apalis_pool, &queues, &sources).await?;
+    Ok(queues)
+}
+
+fn configured_inventory_sources(
+    wallet_polling: Option<&crate::inventory::WalletPollingCtx>,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) -> ConfiguredInventorySources {
+    let mut sources = ConfiguredInventorySources::always_available();
+    if tokenizer.is_some() {
+        sources.enable(InventoryObservationSource::InflightEquity);
+    }
+    if let Some(wallets) = wallet_polling {
+        sources.enable(InventoryObservationSource::EthereumWalletUsdc);
+        sources.enable(InventoryObservationSource::BaseWalletUsdc);
+        if !wallets.unwrapped_equity_token_addresses.is_empty() {
+            sources.enable(InventoryObservationSource::BaseWalletUnwrappedEquity);
+        }
+        if !wallets.wrapped_equity_token_addresses.is_empty() {
+            sources.enable(InventoryObservationSource::BaseWalletWrappedEquity);
+        }
+    }
+    sources
 }
 
 /// Builds the [`WrappedEquityRecoveryCtx`] when every dependency the recovery

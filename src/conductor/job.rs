@@ -362,6 +362,24 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
     }
 
+    /// Schedules one delayed successor for an at-least-once job attempt.
+    /// Repeating the enqueue with the same key is a no-op in apalis-sqlite,
+    /// closing the crash window between successor insertion and completion of
+    /// the current job.
+    pub(crate) async fn push_with_delay_idempotent(
+        &mut self,
+        task: Task,
+        delay: Duration,
+        idempotency_key: &str,
+    ) -> Result<(), QueuePushError> {
+        let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .max_attempts(JOB_MAX_ATTEMPTS)
+            .run_after(delay)
+            .with_idempotency_key(idempotency_key)
+            .build();
+        Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
+    }
+
     pub(crate) fn into_storage(self) -> Storage<Task> {
         self.0
     }
@@ -678,6 +696,7 @@ pub enum JobKind {
     TransferEquityToMarketMaking,
     TransferEquityToHedging,
     ResumeTokenizationAggregate,
+    InventoryPolling,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -719,6 +738,7 @@ pub struct FailureInjector {
     transfer_equity_to_market_making: Arc<Mutex<InjectionState>>,
     transfer_equity_to_hedging: Arc<Mutex<InjectionState>>,
     resume_tokenization_aggregate: Arc<Mutex<InjectionState>>,
+    inventory_polling: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -758,6 +778,7 @@ impl FailureInjector {
             transfer_equity_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_equity_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
             resume_tokenization_aggregate: Arc::new(Mutex::new(InjectionState::Idle)),
+            inventory_polling: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -809,6 +830,7 @@ impl FailureInjector {
             JobKind::TransferEquityToMarketMaking => &self.transfer_equity_to_market_making,
             JobKind::TransferEquityToHedging => &self.transfer_equity_to_hedging,
             JobKind::ResumeTokenizationAggregate => &self.resume_tokenization_aggregate,
+            JobKind::InventoryPolling => &self.inventory_polling,
         };
 
         match mutex.lock() {

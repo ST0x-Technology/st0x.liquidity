@@ -14,6 +14,7 @@ use futures_util::future::try_join_all;
 use rain_math_float::FloatError;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
@@ -24,8 +25,9 @@ use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
+use crate::inventory::job::{InventorySourcePollError, InventorySourcePoller};
 use crate::inventory::snapshot::{
-    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
+    InventoryObservationSource, InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
@@ -34,6 +36,27 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 struct PendingRequests {
     mints: BTreeMap<Symbol, FractionalShares>,
     redemptions: BTreeMap<Symbol, FractionalShares>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourcePollOutcome {
+    ObservedAt(DateTime<Utc>),
+    FreshnessRecorded,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OnchainPollSource {
+    Equity,
+    Usdc,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WalletPollSource {
+    EthereumUsdc,
+    BaseUsdc,
+    BaseUnwrappedEquity,
+    BaseWrappedEquity,
 }
 
 /// Active bot-owned tokenization provider request identifiers.
@@ -133,6 +156,7 @@ where
     /// contract, not the bot EOA. Sourced from `Ctx::vault_owner`.
     vault_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
+    snapshot_write_lock: AsyncMutex<()>,
     wallet_polling: Option<WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
@@ -171,6 +195,7 @@ where
             snapshot_id,
             vault_owner,
             snapshot,
+            snapshot_write_lock: AsyncMutex::new(()),
             wallet_polling,
             tokenizer,
             pending_request_ownership: None,
@@ -220,6 +245,152 @@ where
         self
     }
 
+    async fn persist_snapshot_command(
+        &self,
+        command: InventorySnapshotCommand,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let _guard = self.snapshot_write_lock.lock().await;
+        self.snapshot.send(&self.snapshot_id, command).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn poll_source(
+        &self,
+        source: InventoryObservationSource,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let outcome = match source {
+            InventoryObservationSource::InflightEquity => {
+                if self.tokenizer.is_none() {
+                    SourcePollOutcome::Unavailable
+                } else {
+                    SourcePollOutcome::ObservedAt(
+                        self.poll_inflight_equity(&self.snapshot_id).await?,
+                    )
+                }
+            }
+            InventoryObservationSource::OnchainEquity => {
+                self.poll_onchain_source(OnchainPollSource::Equity).await?
+            }
+            InventoryObservationSource::OnchainUsdc => {
+                self.poll_onchain_source(OnchainPollSource::Usdc).await?
+            }
+            InventoryObservationSource::EthereumWalletUsdc => {
+                self.poll_wallet_source(WalletPollSource::EthereumUsdc)
+                    .await?
+            }
+            InventoryObservationSource::BaseWalletUsdc => {
+                self.poll_wallet_source(WalletPollSource::BaseUsdc).await?
+            }
+            InventoryObservationSource::BaseWalletUnwrappedEquity => {
+                self.poll_wallet_source(WalletPollSource::BaseUnwrappedEquity)
+                    .await?
+            }
+            InventoryObservationSource::BaseWalletWrappedEquity => {
+                self.poll_wallet_source(WalletPollSource::BaseWrappedEquity)
+                    .await?
+            }
+            InventoryObservationSource::OffchainInventory => {
+                self.poll_offchain(&self.snapshot_id).await?
+            }
+        };
+
+        if let SourcePollOutcome::ObservedAt(observed_at) = outcome {
+            self.persist_snapshot_command(InventorySnapshotCommand::RecordSourceObservation {
+                source,
+                observed_at,
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn poll_onchain_source(
+        &self,
+        source: OnchainPollSource,
+    ) -> Result<SourcePollOutcome, InventoryPollingError<Exe::Error>> {
+        let Some(registry) = self.load_vault_registry().await? else {
+            debug!(target: "inventory", ?source, "Vault registry not initialized; source unavailable");
+            return Ok(SourcePollOutcome::Unavailable);
+        };
+
+        match source {
+            OnchainPollSource::Equity if registry.equity_vaults.is_empty() => {
+                Ok(SourcePollOutcome::Unavailable)
+            }
+            OnchainPollSource::Equity => {
+                let observed_at = self
+                    .poll_onchain_equity(&self.snapshot_id, &registry)
+                    .await?;
+                Ok(SourcePollOutcome::ObservedAt(observed_at))
+            }
+            OnchainPollSource::Usdc if registry.usdc_vaults.is_empty() => {
+                Ok(SourcePollOutcome::Unavailable)
+            }
+            OnchainPollSource::Usdc => {
+                let observed_at = self.poll_onchain_usdc(&self.snapshot_id, &registry).await?;
+                Ok(SourcePollOutcome::ObservedAt(observed_at))
+            }
+        }
+    }
+
+    async fn poll_wallet_source(
+        &self,
+        source: WalletPollSource,
+    ) -> Result<SourcePollOutcome, InventoryPollingError<Exe::Error>> {
+        let Some(wallets) = &self.wallet_polling else {
+            debug!(target: "inventory", ?source, "Wallet polling not configured; source unavailable");
+            return Ok(SourcePollOutcome::Unavailable);
+        };
+
+        let observed_at = match source {
+            WalletPollSource::EthereumUsdc => {
+                self.poll_ethereum_usdc(&self.snapshot_id, &wallets.ethereum)
+                    .await?
+            }
+            WalletPollSource::BaseUsdc => {
+                self.poll_base_wallet_usdc(&self.snapshot_id, &wallets.base)
+                    .await?
+            }
+            WalletPollSource::BaseUnwrappedEquity => {
+                if wallets.unwrapped_equity_token_addresses.is_empty() {
+                    return Ok(SourcePollOutcome::Unavailable);
+                }
+                let balances = self
+                    .poll_base_wallet_token_balances(
+                        &wallets.base,
+                        &wallets.unwrapped_equity_token_addresses,
+                    )
+                    .await?;
+                let observed_at = Utc::now();
+                self.persist_snapshot_command(
+                    InventorySnapshotCommand::BaseWalletUnwrappedEquity { balances },
+                )
+                .await?;
+                observed_at
+            }
+            WalletPollSource::BaseWrappedEquity => {
+                if wallets.wrapped_equity_token_addresses.is_empty() {
+                    return Ok(SourcePollOutcome::Unavailable);
+                }
+                let balances = self
+                    .poll_base_wallet_token_balances(
+                        &wallets.base,
+                        &wallets.wrapped_equity_token_addresses,
+                    )
+                    .await?;
+                let observed_at = Utc::now();
+                self.persist_snapshot_command(InventorySnapshotCommand::BaseWalletWrappedEquity {
+                    balances,
+                })
+                .await?;
+                observed_at
+            }
+        };
+
+        Ok(SourcePollOutcome::ObservedAt(observed_at))
+    }
+
     /// Polls actual inventory from all venues and emits snapshot commands.
     ///
     /// 1. Queries inflight equity from tokenization provider (must be first)
@@ -236,6 +407,7 @@ where
     /// snapshot is emitted. The remaining three groups (onchain, wallet,
     /// offchain) are independent: each logs and continues on failure so a
     /// single venue outage does not stall the others.
+    #[cfg(test)]
     pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<Exe::Error>> {
         let snapshot_id = &self.snapshot_id;
 
@@ -263,6 +435,7 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     async fn poll_onchain(
         &self,
         snapshot_id: &InventorySnapshotId,
@@ -293,12 +466,12 @@ where
 
     async fn poll_onchain_equity(
         &self,
-        snapshot_id: &InventorySnapshotId,
+        _snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+    ) -> Result<DateTime<Utc>, InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
             debug!(target: "inventory", "No equity vaults discovered, skipping onchain equity polling");
-            return Ok(());
+            return Ok(Utc::now());
         }
 
         let expected_tokens: Vec<_> = registry.equity_vaults.keys().copied().collect();
@@ -343,6 +516,7 @@ where
             });
 
         let results = try_join_all(per_token_futures).await?;
+        let observed_at = Utc::now();
 
         let balances: BTreeMap<_, _> = results
             .iter()
@@ -358,24 +532,20 @@ where
             });
         }
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OnchainEquity { balances },
-            )
+        self.persist_snapshot_command(InventorySnapshotCommand::OnchainEquity { balances })
             .await?;
 
-        Ok(())
+        Ok(observed_at)
     }
 
     async fn poll_onchain_usdc(
         &self,
-        snapshot_id: &InventorySnapshotId,
+        _snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+    ) -> Result<DateTime<Utc>, InventoryPollingError<Exe::Error>> {
         if registry.usdc_vaults.is_empty() {
             debug!(target: "inventory", "No USDC vaults discovered, skipping onchain cash polling");
-            return Ok(());
+            return Ok(Utc::now());
         }
 
         let balance_futures = registry.usdc_vaults.values().map(|vault| {
@@ -387,6 +557,7 @@ where
         });
 
         let vault_balances = try_join_all(balance_futures).await?;
+        let observed_at = Utc::now();
 
         for (vault, balance) in registry.usdc_vaults.values().zip(vault_balances.iter()) {
             self.warn_if_retired_usdc_vault_has_balance(vault.vault_id, *balance)?;
@@ -397,16 +568,13 @@ where
             .copied()
             .try_fold(vault_balances[0], |acc, balance| acc + balance)?;
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OnchainUsdc { usdc_balance },
-            )
+        self.persist_snapshot_command(InventorySnapshotCommand::OnchainUsdc { usdc_balance })
             .await?;
 
-        Ok(())
+        Ok(observed_at)
     }
 
+    #[cfg(test)]
     async fn poll_wallets(
         &self,
         snapshot_id: &InventorySnapshotId,
@@ -430,12 +598,10 @@ where
             .await?;
 
         if !balances.is_empty() {
-            self.snapshot
-                .send(
-                    snapshot_id,
-                    InventorySnapshotCommand::BaseWalletUnwrappedEquity { balances },
-                )
-                .await?;
+            self.persist_snapshot_command(InventorySnapshotCommand::BaseWalletUnwrappedEquity {
+                balances,
+            })
+            .await?;
         }
 
         let balances = self
@@ -443,12 +609,10 @@ where
             .await?;
 
         if !balances.is_empty() {
-            self.snapshot
-                .send(
-                    snapshot_id,
-                    InventorySnapshotCommand::BaseWalletWrappedEquity { balances },
-                )
-                .await?;
+            self.persist_snapshot_command(InventorySnapshotCommand::BaseWalletWrappedEquity {
+                balances,
+            })
+            .await?;
         }
 
         Ok(())
@@ -456,9 +620,9 @@ where
 
     async fn poll_ethereum_usdc(
         &self,
-        snapshot_id: &InventorySnapshotId,
+        _snapshot_id: &InventorySnapshotId,
         wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+    ) -> Result<DateTime<Utc>, InventoryPollingError<Exe::Error>> {
         let raw_balance = wallet
             .call::<OpenChainErrorRegistry, _>(
                 USDC_ETHEREUM,
@@ -467,24 +631,21 @@ where
                 },
             )
             .await?;
+        let observed_at = Utc::now();
 
         let usdc_balance = u256_to_usdc(raw_balance)?;
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::EthereumUsdc { usdc_balance },
-            )
+        self.persist_snapshot_command(InventorySnapshotCommand::EthereumUsdc { usdc_balance })
             .await?;
 
-        Ok(())
+        Ok(observed_at)
     }
 
     async fn poll_base_wallet_usdc(
         &self,
-        snapshot_id: &InventorySnapshotId,
+        _snapshot_id: &InventorySnapshotId,
         wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+    ) -> Result<DateTime<Utc>, InventoryPollingError<Exe::Error>> {
         let raw_balance = wallet
             .call::<OpenChainErrorRegistry, _>(
                 USDC_BASE,
@@ -493,17 +654,14 @@ where
                 },
             )
             .await?;
+        let observed_at = Utc::now();
 
         let usdc_balance = u256_to_usdc(raw_balance)?;
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::BaseWalletUsdc { usdc_balance },
-            )
+        self.persist_snapshot_command(InventorySnapshotCommand::BaseWalletUsdc { usdc_balance })
             .await?;
 
-        Ok(())
+        Ok(observed_at)
     }
 
     async fn poll_base_wallet_token_balances(
@@ -532,40 +690,35 @@ where
 
     async fn poll_offchain(
         &self,
-        snapshot_id: &InventorySnapshotId,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        _snapshot_id: &InventorySnapshotId,
+    ) -> Result<SourcePollOutcome, InventoryPollingError<Exe::Error>> {
         let inventory_result = self
             .executor
             .get_inventory()
             .await
             .map_err(InventoryPollingError::Executor)?;
+        let observed_at = Utc::now();
 
         let InventoryResult::Fetched(inventory) = inventory_result else {
             debug!(target: "inventory", "Executor returned non-fetched inventory result, skipping offchain polling");
-            return Ok(());
+            return Ok(SourcePollOutcome::Unavailable);
         };
 
         let positions = self.normalize_offchain_positions(inventory.positions);
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OffchainEquity { positions },
-            )
-            .await?;
-
         let (gross_usd_cents, available_usd_cents) =
             compute_available_cash(inventory.usd_balance_cents, self.reserved_cash)?;
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OffchainUsd {
-                    usd_balance_cents: available_usd_cents,
-                    gross_usd_cents,
-                },
-            )
-            .await?;
+        self.persist_snapshot_command(InventorySnapshotCommand::RecordOffchainObservation {
+            positions,
+            usd_balance_cents: available_usd_cents,
+            gross_usd_cents,
+            cash_buying_power_cents: inventory.cash_buying_power_cents,
+            cash_withdrawable_cents: inventory.cash_withdrawable_cents,
+            alpaca_usdc: inventory.alpaca_usdc,
+            observed_at,
+        })
+        .await?;
 
         if let Some(observer) = &self.fresh_offchain_usd_observer {
             let available = Usdc::from_cents(available_usd_cents).ok_or(
@@ -579,34 +732,7 @@ where
                 .map_err(InventoryPollingError::FreshOffchainUsdObserver)?;
         }
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OffchainCashBuyingPower {
-                    cash_buying_power_cents: inventory.cash_buying_power_cents,
-                },
-            )
-            .await?;
-
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OffchainCashWithdrawable {
-                    cash_withdrawable_cents: inventory.cash_withdrawable_cents,
-                },
-            )
-            .await?;
-
-        if let Some(usdc_balance) = inventory.alpaca_usdc {
-            self.snapshot
-                .send(
-                    snapshot_id,
-                    InventorySnapshotCommand::AlpacaUsdc { usdc_balance },
-                )
-                .await?;
-        }
-
-        Ok(())
+        Ok(SourcePollOutcome::FreshnessRecorded)
     }
 
     fn normalize_offchain_positions(
@@ -879,15 +1005,15 @@ where
 
     async fn poll_inflight_equity(
         &self,
-        snapshot_id: &InventorySnapshotId,
-    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        _snapshot_id: &InventorySnapshotId,
+    ) -> Result<DateTime<Utc>, InventoryPollingError<Exe::Error>> {
         let Some(tokenizer) = &self.tokenizer else {
             debug!(target: "inventory", "No tokenizer configured, skipping inflight equity polling");
-            return Ok(());
+            return Ok(Utc::now());
         };
 
-        let fetched_at = Utc::now();
         let pending = tokenizer.list_pending_requests().await?;
+        let fetched_at = Utc::now();
         let ownership = if let Some(pending_request_ownership) = &self.pending_request_ownership {
             pending_request_ownership.pending_request_ownership().await
         } else {
@@ -919,18 +1045,14 @@ where
             "Polled inflight equity from tokenization provider"
         );
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::InflightEquity {
-                    mints,
-                    redemptions,
-                    fetched_at,
-                },
-            )
-            .await?;
+        self.persist_snapshot_command(InventorySnapshotCommand::InflightEquity {
+            mints,
+            redemptions,
+            fetched_at,
+        })
+        .await?;
 
-        Ok(())
+        Ok(fetched_at)
     }
 }
 
@@ -977,28 +1099,19 @@ fn compute_available_cash(
 /// Erases the `Chain` and `Exe` parameters of [`InventoryPollingService`]
 /// so the apalis [`Job`] context isn't generic over them.
 #[async_trait]
-pub(crate) trait Poller: Send + Sync {
-    async fn poll(&self) -> Result<(), PollerError>;
-}
-
-/// Boxed source error from a [`Poller`] implementation. Polling errors are
-/// always logged and swallowed by the supervised inventory monitor; this
-/// wrapper only erases the underlying executor-specific error type.
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-pub(crate) struct PollerError(pub(crate) Box<dyn std::error::Error + Send + Sync>);
-
-#[async_trait]
-impl<Chain, Exe> Poller for InventoryPollingService<Chain, Exe>
+impl<Chain, Exe> InventorySourcePoller for InventoryPollingService<Chain, Exe>
 where
     Chain: Evm + Send + Sync + 'static,
     Exe: Executor + Send + Sync + 'static,
     Exe::Error: std::error::Error + Send + Sync + 'static,
 {
-    async fn poll(&self) -> Result<(), PollerError> {
-        Self::poll_and_record(self)
+    async fn poll_source(
+        &self,
+        source: InventoryObservationSource,
+    ) -> Result<(), InventorySourcePollError> {
+        Self::poll_source(self, source)
             .await
-            .map_err(|error| PollerError(Box::new(error)))
+            .map_err(|error| InventorySourcePollError(Box::new(error)))
     }
 }
 
@@ -1790,7 +1903,7 @@ mod tests {
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
+    async fn offchain_source_does_not_record_freshness_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(provider.clone());
@@ -1813,8 +1926,10 @@ mod tests {
             Usd::ZERO,
         );
 
-        // Should succeed without error
-        service.poll_and_record().await.unwrap();
+        service
+            .poll_source(InventoryObservationSource::OffchainInventory)
+            .await
+            .unwrap();
 
         // Verify NO offchain events were emitted
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
@@ -1833,6 +1948,13 @@ mod tests {
             !has_offchain_usd,
             "Should NOT emit OffchainUsd when executor returns Unimplemented"
         );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OffchainInventory,
+                ..
+            }
+        )));
         assert!(
             logs_contain(
                 "Executor returned non-fetched inventory result, skipping offchain polling"
@@ -1888,6 +2010,64 @@ mod tests {
             matches!(error, InventoryPollingError::Reserve(_)),
             "Negative broker balance should produce Reserve error, got: {error:?}"
         );
+        assert!(
+            load_snapshot_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "a failed offchain observation must not persist partial inventory"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_source_persists_one_read_completion_time_for_all_events() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let (orderbook, order_owner) = test_addresses();
+        let inventory = Inventory {
+            positions: vec![EquityPosition {
+                symbol: test_symbol("AAPL"),
+                quantity: test_shares(10),
+                market_value: Some(float!(1500)),
+            }],
+            usd_balance_cents: 50_00,
+            cash_buying_power_cents: Some(10_000),
+            alpaca_usdc: Some(Usdc::from_cents(12_500).unwrap()),
+            cash_withdrawable_cents: Some(38_00),
+        };
+        let service = InventoryPollingService::new(
+            create_test_raindex_service(provider),
+            MockExecutor::new().with_inventory(inventory),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service
+            .poll_source(InventoryObservationSource::OffchainInventory)
+            .await
+            .unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let observed_at = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::SourceObserved {
+                    source: InventoryObservationSource::OffchainInventory,
+                    observed_at,
+                } => Some(*observed_at),
+                _ => None,
+            })
+            .expect("offchain source marker");
+
+        assert_eq!(events.len(), 6);
+        assert!(events.iter().all(|event| event.timestamp() == observed_at));
     }
 
     #[tokio::test]
@@ -2309,6 +2489,97 @@ mod tests {
             matches!(error, InventoryPollingError::Raindex(_)),
             "Expected Vault error when RPC fails, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn onchain_usdc_source_does_not_depend_on_equity_polling() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&vault_balance_hex(float!(250)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = InventoryPollingService::new(
+            create_test_raindex_service(provider),
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service
+            .poll_source(InventoryObservationSource::OnchainUsdc)
+            .await
+            .unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::OnchainUsdc { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OnchainUsdc,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn concurrent_source_writes_do_not_conflict() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let (orderbook, order_owner) = test_addresses();
+        let service = InventoryPollingService::new(
+            create_test_raindex_service(provider),
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool, ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+        let observed_at = Utc::now();
+        let writes = (0..64).map(|offset| {
+            service.persist_snapshot_command(InventorySnapshotCommand::RecordSourceObservation {
+                source: InventoryObservationSource::OnchainUsdc,
+                observed_at: observed_at + chrono::Duration::milliseconds(offset),
+            })
+        });
+
+        let results = futures_util::future::join_all(writes).await;
+
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
     }
 
     #[tokio::test]

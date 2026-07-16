@@ -317,7 +317,7 @@ optional `tokenizer: Option<Arc<dyn Tokenizer>>`, shutdown token).
 Phase 1: connect_http (with RPC probe) | setup_apalis_tables | build CQRS stores
 Phase 2: seed_vault_registry (inline, must complete before downstream wiring)
 Phase 3: setup_rebalancing (optional) | requeue_orphaned jobs | hydrate inventory |
-         recover pending orders
+         recover pending orders | bootstrap configured inventory source jobs
 Phase 4: builder::spawn() starts supervisor + apalis workers
 ```
 
@@ -330,6 +330,16 @@ Vault registry seeding (`SeedVaultRegistry`) runs inline during Phase 2 so that
 registry. The same `SeedVaultRegistry` job is also registered as an apalis
 worker so the queue can retry on failure if seeding is re-triggered later (e.g.
 from a recovery flow).
+
+Inventory polling is eight independent durable job types rather than one
+conductor sleep loop: inflight equity, onchain equity, onchain USDC, Ethereum
+wallet USDC, Base wallet USDC, Base unwrapped equity, Base wrapped equity, and
+offchain inventory. Startup removes abandoned active rows for all eight types,
+then enqueues one immediate job for each configured source. Tokenizer and wallet
+jobs are omitted when the corresponding capability or token set is absent. Each
+job schedules exactly one source-local successor at the configured interval even
+after a read or snapshot failure, so one unavailable integration does not stall
+the other inventory observations.
 
 Seeding is additive for vault discovery history but authoritative for the
 configured primary vault. Each startup registers every configured vault ID and
