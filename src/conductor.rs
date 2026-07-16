@@ -1618,6 +1618,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
             transfer: usdc_handles.resume_alpaca_to_base,
+            resume_preparation: rebalancing_service.clone(),
             job_queue: transfer_usdc_to_market_making_queue,
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: usdc_notifier.clone(),

@@ -70,6 +70,10 @@ const SETTLEMENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 /// (Ethereum block timing) so the two can evolve independently.
 const WITHDRAWAL_POLL_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 
+/// Delay before retrying a recovered Alpaca-to-Base job whose source
+/// reservation is still waiting for a fresh hedging inventory observation.
+const INVENTORY_RECOVERY_REDRIVE_DELAY: Duration = Duration::from_secs(30);
+
 /// Duration after which repeated `WithdrawalPollInconclusive` redrives page
 /// the operator via the notifier. The deadline is durable: it is derived from
 /// `Withdrawing.initiated_at` (stored in the CQRS aggregate, survives restarts)
@@ -151,6 +155,50 @@ pub(crate) trait ResumeAlpacaToBase: Send + Sync + 'static {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<(), UsdcTransferError>;
+}
+
+/// Whether a recovered Alpaca-to-Base transfer can safely enter its durable
+/// aggregate resume path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlpacaToBaseResumePreparation {
+    Ready,
+    AwaitingFreshHedgingSnapshot,
+}
+
+/// Why a recovered Alpaca-to-Base job cannot enter its aggregate resume path.
+#[derive(Debug, Error)]
+pub(crate) enum AlpacaToBaseResumePreparationError {
+    #[error(
+        "Alpaca-to-Base job {requested} cannot resume while recovered reservation owner {owner} is active"
+    )]
+    ConflictingRecoveryOwner {
+        requested: UsdcRebalanceId,
+        owner: UsdcRebalanceId,
+    },
+}
+
+/// Restores restart-only source inventory ownership before the transfer
+/// manager resumes. Fresh transfers return [`AlpacaToBaseResumePreparation::Ready`].
+#[async_trait]
+pub(crate) trait PrepareAlpacaToBaseResume: Send + Sync + 'static {
+    async fn prepare_alpaca_to_base_resume(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<AlpacaToBaseResumePreparation, AlpacaToBaseResumePreparationError>;
+}
+
+#[cfg(test)]
+struct ReadyAlpacaToBaseResume;
+
+#[cfg(test)]
+#[async_trait]
+impl PrepareAlpacaToBaseResume for ReadyAlpacaToBaseResume {
+    async fn prepare_alpaca_to_base_resume(
+        &self,
+        _id: &UsdcRebalanceId,
+    ) -> Result<AlpacaToBaseResumePreparation, AlpacaToBaseResumePreparationError> {
+        Ok(AlpacaToBaseResumePreparation::Ready)
+    }
 }
 
 #[async_trait]
@@ -653,6 +701,7 @@ impl TransferUsdcToHedging {
 /// [`TransferUsdcToHedgingCtx`].
 pub(crate) struct TransferUsdcToMarketMakingCtx {
     pub(crate) transfer: Arc<dyn ResumeAlpacaToBase>,
+    pub(crate) resume_preparation: Arc<dyn PrepareAlpacaToBaseResume>,
     pub(crate) job_queue: TransferUsdcToMarketMakingJobQueue,
     /// Maximum consecutive revert-class burn failures before circuit opens.
     pub(crate) max_burn_revert_redrives: u32,
@@ -667,6 +716,8 @@ pub(crate) struct TransferUsdcToMarketMakingCtx {
 pub(crate) enum TransferUsdcToMarketMakingJobError {
     #[error(transparent)]
     Transfer(#[from] UsdcTransferError),
+    #[error(transparent)]
+    ResumePreparation(#[from] AlpacaToBaseResumePreparationError),
     #[error(
         "Alpaca->Base transfer {id} burn revert redrive limit reached; \
          aggregate stalled at BridgingSubmitting, operator action required"
@@ -708,6 +759,25 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
         &self,
         ctx: &TransferUsdcToMarketMakingCtx,
     ) -> Result<Self::Output, Self::Error> {
+        if ctx
+            .resume_preparation
+            .prepare_alpaca_to_base_resume(&self.id)
+            .await?
+            == AlpacaToBaseResumePreparation::AwaitingFreshHedgingSnapshot
+        {
+            warn!(
+                target: "rebalance",
+                id = %self.id,
+                delay = ?INVENTORY_RECOVERY_REDRIVE_DELAY,
+                "Waiting for fresh hedging inventory before resuming recovered Alpaca->Base transfer"
+            );
+            ctx.job_queue
+                .clone()
+                .push_with_delay(self.clone(), INVENTORY_RECOVERY_REDRIVE_DELAY)
+                .await?;
+            return Ok(());
+        }
+
         // No per-attempt timeout here unlike the hedging direction. The
         // AlpacaToBase resume can pass through a long-running broker Converting
         // leg with no safe re-entry path if interrupted (unlike BaseToAlpaca
@@ -1506,10 +1576,64 @@ mod tests {
     ) -> TransferUsdcToMarketMakingCtx {
         TransferUsdcToMarketMakingCtx {
             transfer,
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(NoopNotifier),
         }
+    }
+
+    struct AwaitingAlpacaToBaseResume;
+
+    #[async_trait]
+    impl PrepareAlpacaToBaseResume for AwaitingAlpacaToBaseResume {
+        async fn prepare_alpaca_to_base_resume(
+            &self,
+            _id: &UsdcRebalanceId,
+        ) -> Result<AlpacaToBaseResumePreparation, AlpacaToBaseResumePreparationError> {
+            Ok(AlpacaToBaseResumePreparation::AwaitingFreshHedgingSnapshot)
+        }
+    }
+
+    #[tokio::test]
+    async fn market_making_job_waits_for_recovered_source_reservation() {
+        let pool = setup_queue_pool().await;
+        let transfer = Arc::new(RecordingResume {
+            fail: false,
+            captured: std::sync::Mutex::new(None),
+        });
+        let mut ctx = market_making_ctx(transfer.clone(), &pool);
+        ctx.resume_preparation = Arc::new(AwaitingAlpacaToBaseResume);
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert!(
+            transfer.captured.lock().unwrap().is_none(),
+            "the transfer manager must not run before recovery restores source inventory"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "the gated job must enqueue one delayed replacement"
+        );
+        let (_, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        assert!(
+            run_at
+                >= before + i64::try_from(INVENTORY_RECOVERY_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at
+                    <= after
+                        + i64::try_from(INVENTORY_RECOVERY_REDRIVE_DELAY.as_secs()).unwrap()
+                        + 5,
+            "recovery redrive must be delayed by ~{INVENTORY_RECOVERY_REDRIVE_DELAY:?}: \
+             run_at={run_at} before={before} after={after}"
+        );
     }
 
     #[tokio::test]
@@ -1562,6 +1686,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(InconclusiveAlpacaToBase::before_deadline()),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -1625,6 +1750,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(InconclusiveAlpacaToBase::future_initiated_at()),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -1675,6 +1801,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(InconclusiveAlpacaToBase::after_deadline()),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -1748,6 +1875,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(InconclusiveAlpacaToBase::at_deadline()),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -1978,6 +2106,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(outcome)),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -3157,6 +3286,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(BurnRevertAlpacaToBase),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: Arc::new(NoopNotifier),
@@ -3192,6 +3322,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(BurnRevertAlpacaToBase),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -3236,6 +3367,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(BurnRevertAlpacaToBase),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
@@ -3280,6 +3412,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(BurnRevertAlpacaToBase),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
@@ -3334,6 +3467,7 @@ mod tests {
 
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(NonRevertAlpacaToBase),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -3402,6 +3536,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::DeadlineElapsed)),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -3521,6 +3656,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(MintPathRevertAlpacaToBase),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -3562,6 +3698,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
+            resume_preparation: Arc::new(ReadyAlpacaToBaseResume),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
