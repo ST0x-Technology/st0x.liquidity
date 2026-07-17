@@ -230,7 +230,7 @@ impl TransferOperation {
     }
 }
 
-/// Warning emitted when transfer data is partially loaded.
+/// Warning emitted when dashboard initial state is partially loaded.
 ///
 /// Variant names encode the category — no separate `TransferCategory`
 /// enum needed. Replay failures carry the dto `Id<Tag>` — the internal
@@ -245,6 +245,7 @@ pub enum TransferWarning {
     MintCategoryUnavailable,
     RedemptionCategoryUnavailable,
     BridgeCategoryUnavailable,
+    TradeHistoryUnavailable,
     MintReplayFailed {
         #[ts(type = "string")]
         id: Id<EquityMintTag>,
@@ -567,6 +568,14 @@ mod tests {
             serialized["status"]["reconcileReason"],
             json!("funds moved manually")
         );
+    }
+
+    #[test]
+    fn transfer_warning_trade_history_unavailable_serializes_with_kind_tag() {
+        let warning = TransferWarning::TradeHistoryUnavailable;
+
+        let serialized = serde_json::to_value(&warning).expect("serialization should succeed");
+        assert_eq!(serialized, json!({"kind": "trade_history_unavailable"}));
     }
 
     #[test]

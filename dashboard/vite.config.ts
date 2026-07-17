@@ -131,13 +131,13 @@ const mockApi = () => ({
               decision: null,
               submission: null,
               execution: null,
-              exposureWindow: null,
-            },
+              exposureWindow: null
+            }
           },
           buckets: [],
           cycles: [],
           totalCycles: 0,
-          openExposures: [],
+          openExposures: []
         })
         return
       }
@@ -148,7 +148,7 @@ const mockApi = () => ({
           totalOperations: 0,
           skippedOperations: 0,
           stageSummary: [],
-          attestationTrend: [],
+          attestationTrend: []
         })
         return
       }
@@ -158,7 +158,7 @@ const mockApi = () => ({
           logBuckets: [],
           logTargets: [],
           failureEvents: [],
-          jobQueues: [],
+          jobQueues: []
         })
         return
       }
@@ -168,7 +168,7 @@ const mockApi = () => ({
           operations: [],
           totalOperations: 0,
           skippedOperations: 0,
-          stageSummary: [],
+          stageSummary: []
         })
         return
       }
@@ -179,6 +179,15 @@ const mockApi = () => ({
 })
 
 export default defineConfig({
+  ...(process.env['VITEST'] === 'true'
+    ? {
+        resolve: {
+          // Vitest otherwise resolves Svelte's server entry even when a test
+          // uses a DOM environment, which makes `mount` unavailable.
+          conditions: ['browser']
+        }
+      }
+    : {}),
   plugins: [mockApi(), tailwindcss(), sveltekit()],
   server: {
     proxy: isMockMode()
