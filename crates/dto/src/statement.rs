@@ -28,7 +28,7 @@ use crate::{CurrentState, Position, Trade};
 #[strum(serialize_all = "snake_case")]
 pub enum Statement {
     CurrentState(Box<CurrentState>),
-    TradeFill(Trade),
+    TradeUpdate(Trade),
     PositionUpdate(Position),
     InventorySnapshot(Box<InventorySnapshot>),
     TransferUpdate(TransferOperation),
@@ -101,7 +101,7 @@ mod tests {
             Statement::VARIANTS,
             &[
                 "current_state",
-                "trade_fill",
+                "trade_update",
                 "position_update",
                 "inventory_snapshot",
                 "transfer_update"
@@ -123,18 +123,19 @@ mod tests {
     }
 
     #[test]
-    fn statement_trade_fill_serializes_with_type_tag() {
+    fn statement_trade_update_serializes_with_type_tag() {
         let trade = Trade {
             id: "0x0000000000000000000000000000000000000000000000000000000000000000:0".to_string(),
-            filled_at: Utc::now(),
+            occurred_at: Utc::now(),
             venue: TradingVenue::Raindex,
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares::new(float!(10)),
+            outcome: crate::TradeOutcome::Filled,
         };
-        let msg = Statement::TradeFill(trade);
+        let msg = Statement::TradeUpdate(trade);
         let json = serde_json::to_value(&msg).expect("serialization should succeed");
-        assert_eq!(json["type"], json!("trade_fill"));
+        assert_eq!(json["type"], json!("trade_update"));
         assert_eq!(json["data"]["venue"], json!("raindex"));
         assert_eq!(json["data"]["direction"], json!("buy"));
         assert_eq!(json["data"]["symbol"], json!("AAPL"));

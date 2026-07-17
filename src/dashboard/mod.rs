@@ -86,7 +86,13 @@ async fn drain_client_messages(stream: &mut futures_util::stream::SplitStream<We
 async fn send_initial_state(sink: &mut SplitSink<WebSocket, Message>, state: &AppState) -> bool {
     let inventory_dto = state.inventory.read().await.to_dto();
     let transfers = transfer_loader::load_transfers(&state.pool).await;
-    let trades = trade_loader::load_trades(&state.pool).await;
+    let trades = match trade_loader::load_trades(&state.pool).await {
+        Ok(trades) => trades,
+        Err(error) => {
+            warn!(target: "dashboard", %error, "Failed to load initial trade history");
+            return false;
+        }
+    };
     let positions = load_positions(&state.pool).await;
 
     let initial = Statement::CurrentState(Box::new(CurrentState {
@@ -312,18 +318,26 @@ mod tests {
 
     use st0x_config::{EquityAssetConfig, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
+    use st0x_event_sorcery::StoreBuilder;
+    use st0x_execution::{ClientOrderId, FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::inventory::{self, BroadcastingInventory};
+    use crate::offchain::order::{
+        CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
+        noop_order_placer,
+    };
 
     fn dummy_fill(symbol: &str) -> Statement {
-        Statement::TradeFill(Trade {
+        Statement::TradeUpdate(Trade {
             id: format!("test-fill-{symbol}"),
-            filled_at: chrono::Utc::now(),
+            occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Raindex,
             direction: Direction::Buy,
             symbol: st0x_finance::Symbol::new(symbol).unwrap(),
             shares: st0x_finance::FractionalShares::new(st0x_float_macro::float!(1)),
+            outcome: st0x_dto::TradeOutcome::Filled,
         })
     }
 
@@ -472,7 +486,10 @@ mod tests {
     }
 
     async fn start_test_server() -> TestServer {
-        let state = create_test_state().await;
+        start_test_server_with_state(create_test_state().await).await
+    }
+
+    async fn start_test_server_with_state(state: AppState) -> TestServer {
         let event_sender = state.event_sender.clone();
         let inventory = Arc::clone(&state.inventory);
 
@@ -549,6 +566,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_initial_state_includes_failed_counter_trades() {
+        let state = create_test_state().await;
+        let (store, _) = StoreBuilder::<OffchainOrder>::new(state.pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let id = OffchainOrderId::new();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "asset is not tradable".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut server = start_test_server_with_state(state).await;
+        let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+        let (mut client, _) = connect_async(&url).await.unwrap();
+        let message = client.next().await.unwrap().unwrap().into_text().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+        let trade = &parsed["data"]["trades"][0];
+
+        assert_eq!(trade["id"], id.to_string());
+        assert!(trade["occurredAt"].as_str().is_some());
+        assert_eq!(trade["outcome"]["status"], "failed");
+        assert_eq!(trade["outcome"]["error"], "asset is not tradable");
+        assert_eq!(trade["outcome"]["filledShares"], "0");
+        assert_eq!(trade["outcome"]["remainingShares"], "1");
+        assert_eq!(trade["outcome"]["excessShares"], "0");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn multiple_concurrent_clients_receive_initial_message() {
         let mut server = start_test_server().await;
         let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
@@ -619,8 +686,8 @@ mod tests {
 
             assert_eq!(
                 parsed["type"],
-                "trade_fill",
-                "client{} should receive trade_fill message",
+                "trade_update",
+                "client{} should receive trade_update message",
                 i + 1
             );
             assert_eq!(parsed["data"]["symbol"], "AAPL");
@@ -661,7 +728,7 @@ mod tests {
         let text = msg.into_text().expect("expected text");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
-        assert_eq!(parsed["type"], "trade_fill");
+        assert_eq!(parsed["type"], "trade_update");
         assert_eq!(parsed["data"]["symbol"], "TSLA");
 
         server.shutdown().await;

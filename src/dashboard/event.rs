@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use st0x_dto::{Statement, Trade, TradingVenue};
+use st0x_dto::{Statement, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{EntityList, Never, Reactor, deps, load_entity};
 
 use crate::equity_redemption::EquityRedemption;
@@ -40,9 +40,9 @@ impl Broadcaster {
         Self { sender, pool }
     }
 
-    fn broadcast_fill(&self, trade: Trade) {
-        if let Err(error) = self.sender.send(Statement::TradeFill(trade)) {
-            debug!(target: "dashboard", %error, "Failed to broadcast trade fill (no receivers)");
+    fn broadcast_trade(&self, trade: Trade) {
+        if let Err(error) = self.sender.send(Statement::TradeUpdate(trade)) {
+            debug!(target: "dashboard", %error, "Failed to broadcast trade update (no receivers)");
         }
     }
 
@@ -73,17 +73,18 @@ impl Reactor for Broadcaster {
                     symbol,
                     amount,
                     direction,
-                    filled_at,
+                    block_timestamp,
                     ..
-                } = &event
+                } = event
                 {
-                    self.broadcast_fill(Trade {
+                    self.broadcast_trade(Trade {
                         id: id.to_string(),
-                        filled_at: *filled_at,
+                        occurred_at: block_timestamp,
                         venue: TradingVenue::Raindex,
-                        direction: *direction,
-                        symbol: symbol.clone(),
-                        shares: st0x_finance::FractionalShares::new(*amount),
+                        direction,
+                        symbol,
+                        shares: st0x_finance::FractionalShares::new(amount),
+                        outcome: TradeOutcome::Filled,
                     });
                 }
             })
@@ -114,14 +115,14 @@ impl Reactor for Broadcaster {
             .on(|id, event| async move {
                 use OffchainOrderEvent::*;
                 match event {
-                    Filled { .. } => {
+                    Filled { .. } | Failed { .. } => {
                         match load_entity::<OffchainOrder>(&self.pool, &id).await {
-                            Ok(Some(order)) => match order.try_to_trade(&id) {
-                                Ok(trade) => self.broadcast_fill(trade),
+                            Ok(Some(order)) => match order.try_into_trade(&id) {
+                                Ok(trade) => self.broadcast_trade(trade),
                                 Err(error) => warn!(
                                     target: "dashboard",
                                     %id, %error,
-                                    "OffchainOrder not in Filled state after Filled event"
+                                    "OffchainOrder not terminal after terminal event"
                                 ),
                             },
                             Ok(None) => warn!(
@@ -132,7 +133,7 @@ impl Reactor for Broadcaster {
                             Err(error) => warn!(
                                 target: "dashboard",
                                 %id, ?error,
-                                "Failed to load OffchainOrder for fill broadcast"
+                                "Failed to load OffchainOrder for terminal broadcast"
                             ),
                         }
                     }
@@ -141,7 +142,6 @@ impl Reactor for Broadcaster {
                     | Accepted { .. }
                     | PartiallyFilled { .. }
                     | CancelRequested { .. }
-                    | Failed { .. }
                     | Cancelled { .. } => {}
                 }
             })
@@ -211,6 +211,7 @@ mod tests {
         let harness = ReactorHarness::new(broadcaster);
 
         let now = chrono::Utc::now();
+        let ingested_at = now + chrono::Duration::seconds(1);
         let id = crate::onchain_trade::OnChainTradeId {
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 0,
@@ -226,7 +227,7 @@ mod tests {
                     price_usdc: st0x_float_macro::float!(150),
                     block_number: 12345,
                     block_timestamp: now,
-                    filled_at: now,
+                    filled_at: ingested_at,
                 },
             )
             .await
@@ -235,12 +236,13 @@ mod tests {
         let msg = receiver.recv().await.expect("should receive fill");
 
         match msg {
-            Statement::TradeFill(trade) => {
+            Statement::TradeUpdate(trade) => {
                 assert!(matches!(trade.venue, TradingVenue::Raindex));
                 assert!(matches!(trade.direction, st0x_dto::Direction::Buy));
                 assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
+                assert_eq!(trade.occurred_at, now);
             }
-            other => panic!("expected TradeFill message, got {other:?}"),
+            other => panic!("expected TradeUpdate message, got {other:?}"),
         }
     }
 
@@ -311,12 +313,121 @@ mod tests {
         let msg = receiver.recv().await.expect("should receive fill");
 
         match msg {
-            Statement::TradeFill(trade) => {
+            Statement::TradeUpdate(trade) => {
                 assert!(matches!(trade.venue, TradingVenue::Alpaca));
                 assert!(matches!(trade.direction, st0x_dto::Direction::Sell));
                 assert_eq!(trade.symbol, Symbol::new("TSLA").unwrap());
             }
-            other => panic!("expected TradeFill message, got {other:?}"),
+            other => panic!("expected TradeUpdate message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn offchain_order_failed_broadcasts_failure() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(crate::offchain::order::noop_order_placer())
+            .await
+            .unwrap();
+        let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
+        let harness = ReactorHarness::new(broadcaster);
+
+        let id = crate::offchain::order::OffchainOrderId::new();
+        let now = chrono::Utc::now();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                        st0x_float_macro::float!(1),
+                    ))
+                    .unwrap(),
+                    direction: st0x_execution::Direction::Buy,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("partial-failure"),
+                    placed_shares: st0x_execution::Positive::new(
+                        st0x_execution::FractionalShares::new(st0x_float_macro::float!(1)),
+                    )
+                    .unwrap(),
+                    submitted_at: now,
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: st0x_execution::FractionalShares::new(st0x_float_macro::float!(
+                        0.25
+                    )),
+                    avg_price: st0x_finance::Usd::new(st0x_float_macro::float!(25)),
+                    partially_filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "asset is not tradable".to_string(),
+                    failed_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed = OffchainOrderEvent::Failed {
+            error: "asset is not tradable".to_string(),
+            failed_at: now,
+        };
+        harness.receive::<OffchainOrder>(id, failed).await.unwrap();
+
+        let message = receiver.recv().await.expect("should receive failure");
+        match message {
+            Statement::TradeUpdate(trade) => match trade.outcome {
+                st0x_dto::TradeOutcome::Failed {
+                    error,
+                    filled_shares,
+                    remaining_shares,
+                    excess_shares,
+                } => {
+                    assert_eq!(error, "asset is not tradable");
+                    assert!(
+                        filled_shares
+                            .inner()
+                            .inner()
+                            .eq(st0x_float_macro::float!(0.25))
+                            .unwrap()
+                    );
+                    assert!(
+                        remaining_shares
+                            .inner()
+                            .inner()
+                            .eq(st0x_float_macro::float!(0.75))
+                            .unwrap()
+                    );
+                    assert!(excess_shares.inner().inner().is_zero().unwrap());
+                }
+                st0x_dto::TradeOutcome::Filled => {
+                    panic!("failed order must broadcast a failure outcome")
+                }
+            },
+            other => panic!("expected TradeUpdate message, got {other:?}"),
         }
     }
 

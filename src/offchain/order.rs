@@ -33,20 +33,21 @@ pub(crate) use reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
+use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use st0x_dto::{Direction, Trade, TradingVenue};
+use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
     AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, ExecutionError, Executor,
     ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, MarketSession, OrderState,
     PersistenceError, Positive, SupportedExecutor, Symbol,
 };
-use st0x_finance::Usd;
+use st0x_finance::{NonNegative, NotNonNegative, Usd};
 
 use crate::conductor::job::QueuePushError;
 use crate::onchain::OnChainError;
@@ -1393,47 +1394,90 @@ fn evolve_cancelled(
 }
 
 impl OffchainOrder {
-    /// Renders this order as a dashboard [`Trade`]. Only the `Filled` state
-    /// has the executed price and fill timestamp needed for a Trade; every
-    /// other state returns [`NotFilled`] so callers must acknowledge the
-    /// conversion can fail. Callers that want a silently-discarded `Option`
-    /// can write `.ok()`.
-    pub(crate) fn try_to_trade(&self, id: &OffchainOrderId) -> Result<Trade, NotFilled> {
-        use OffchainOrder::{Cancelled, Cancelling, Failed, PartiallyFilled, Pending, Submitted};
-        let Self::Filled {
-            symbol,
-            shares,
-            direction,
-            executor,
-            filled_at,
-            ..
-        } = self
-        else {
-            return Err(match self {
-                Pending { .. } => NotFilled { state: "Pending" },
-                Submitted { .. } => NotFilled { state: "Submitted" },
-                PartiallyFilled { .. } => NotFilled {
-                    state: "PartiallyFilled",
-                },
-                Cancelling { .. } => NotFilled {
-                    state: "Cancelling",
-                },
-                Failed { .. } => NotFilled { state: "Failed" },
-                Cancelled { .. } => NotFilled { state: "Cancelled" },
-                Self::Filled { .. } => unreachable!(),
-            });
+    /// Renders a terminal fill or failure as a dashboard [`Trade`].
+    pub(crate) fn try_into_trade(
+        self,
+        id: &OffchainOrderId,
+    ) -> Result<Trade, TradeConversionError> {
+        let (symbol, shares, direction, executor, occurred_at, outcome) = match self {
+            Self::Filled {
+                symbol,
+                shares,
+                direction,
+                executor,
+                filled_at,
+                ..
+            } => (
+                symbol,
+                shares,
+                direction,
+                executor,
+                filled_at,
+                TradeOutcome::Filled,
+            ),
+            Self::Failed {
+                symbol,
+                shares,
+                direction,
+                executor,
+                retained_fill,
+                error,
+                failed_at,
+                ..
+            } => {
+                let filled_shares =
+                    retained_fill.map_or(FractionalShares::ZERO, RetainedFill::shares_filled);
+                let accepted_shares = shares.inner();
+                let (filled_portion, remaining_shares, excess_shares) =
+                    if filled_shares.inner().gt(accepted_shares.inner())? {
+                        (
+                            accepted_shares,
+                            FractionalShares::ZERO,
+                            (filled_shares - accepted_shares)?,
+                        )
+                    } else {
+                        (
+                            filled_shares,
+                            (accepted_shares - filled_shares)?,
+                            FractionalShares::ZERO,
+                        )
+                    };
+                let filled_shares = NonNegative::new(filled_portion)?;
+                let remaining_shares = NonNegative::new(remaining_shares)?;
+                let excess_shares = NonNegative::new(excess_shares)?;
+
+                (
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    failed_at,
+                    TradeOutcome::Failed {
+                        error,
+                        filled_shares,
+                        remaining_shares,
+                        excess_shares,
+                    },
+                )
+            }
+            Self::Pending { .. } => return Err(TradeConversionError::Pending),
+            Self::Submitted { .. } => return Err(TradeConversionError::Submitted),
+            Self::PartiallyFilled { .. } => return Err(TradeConversionError::PartiallyFilled),
+            Self::Cancelling { .. } => return Err(TradeConversionError::Cancelling),
+            Self::Cancelled { .. } => return Err(TradeConversionError::Cancelled),
         };
 
         Ok(Trade {
             id: id.to_string(),
-            filled_at: *filled_at,
+            occurred_at,
             venue: match executor {
                 SupportedExecutor::AlpacaBrokerApi => TradingVenue::Alpaca,
                 SupportedExecutor::DryRun => TradingVenue::DryRun,
             },
-            direction: *direction,
-            symbol: symbol.clone(),
-            shares: FractionalShares::new(shares.inner().inner()),
+            direction,
+            symbol,
+            shares: shares.inner(),
+            outcome,
         })
     }
 
@@ -2463,14 +2507,24 @@ impl OffchainOrderId {
     }
 }
 
-/// Returned by [`OffchainOrder::try_to_trade`] when the order isn't in the
-/// `Filled` state. `state` is the variant name as a `&'static str` so
-/// diagnostics get the specific state without dragging the variant's data
-/// (which would include opaque error strings on `Failed`).
+/// Returned by [`OffchainOrder::try_into_trade`] when the order cannot be
+/// rendered as a dashboard trade.
 #[derive(Debug, thiserror::Error)]
-#[error("OffchainOrder cannot be rendered as a Trade: current state is {state}")]
-pub(crate) struct NotFilled {
-    pub(crate) state: &'static str,
+pub(crate) enum TradeConversionError {
+    #[error("pending OffchainOrder cannot be rendered as a Trade")]
+    Pending,
+    #[error("submitted OffchainOrder cannot be rendered as a Trade")]
+    Submitted,
+    #[error("partially filled OffchainOrder cannot be rendered as a Trade")]
+    PartiallyFilled,
+    #[error("cancelling OffchainOrder cannot be rendered as a Trade")]
+    Cancelling,
+    #[error("cancelled OffchainOrder cannot be rendered as a Trade")]
+    Cancelled,
+    #[error("failed to calculate the remaining counter-trade shares: {0}")]
+    Arithmetic(#[from] FloatError),
+    #[error("failed counter-trade shares cannot be negative: {0}")]
+    NegativeShares(#[from] NotNonNegative<FractionalShares>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
@@ -2758,6 +2812,83 @@ mod tests {
             broker_timestamp, fill_time,
             "finalization must stamp the broker fill time, not the failure time"
         );
+    }
+
+    #[test]
+    fn failed_trade_reports_filled_and_remaining_shares() {
+        let fill_time = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
+        let order = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: Some(RetainedFill::priced(
+                FractionalShares::new(float!(0.5)),
+                Usd::new(float!(195.25)),
+                fill_time,
+            )),
+            executor_order_id: Some(ExecutorOrderId::new("failed-with-fill")),
+            error: "broker rejected remainder".to_string(),
+            placed_at: fill_time,
+            failed_at: failure_time,
+        };
+
+        let trade = order
+            .try_into_trade(&OffchainOrderId::new())
+            .expect("valid terminal failure should convert");
+        assert_eq!(trade.occurred_at, failure_time);
+        assert!(trade.shares.inner().eq(float!(2)).unwrap());
+        match trade.outcome {
+            TradeOutcome::Failed {
+                error,
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } => {
+                assert_eq!(error, "broker rejected remainder");
+                assert!(filled_shares.inner().inner().eq(float!(0.5)).unwrap());
+                assert!(remaining_shares.inner().inner().eq(float!(1.5)).unwrap());
+                assert!(excess_shares.inner().inner().is_zero().unwrap());
+            }
+            TradeOutcome::Filled => panic!("failed order must retain its failure outcome"),
+        }
+    }
+
+    #[test]
+    fn failed_trade_reports_retained_fill_larger_than_order_as_excess() {
+        let failed_at = Utc::now();
+        let order = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: Some(RetainedFill::priced(
+                FractionalShares::new(float!(1.5)),
+                Usd::new(float!(195.25)),
+                failed_at,
+            )),
+            executor_order_id: Some(ExecutorOrderId::new("invalid-retained-fill")),
+            error: "broker reported an impossible fill".to_string(),
+            placed_at: failed_at,
+            failed_at,
+        };
+
+        let trade = order
+            .try_into_trade(&OffchainOrderId::new())
+            .expect("overfilled terminal failures must remain visible");
+        let TradeOutcome::Failed {
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("failed order must retain its failure outcome");
+        };
+        assert!(filled_shares.inner().inner().eq(float!(1)).unwrap());
+        assert!(remaining_shares.inner().inner().is_zero().unwrap());
+        assert!(excess_shares.inner().inner().eq(float!(0.5)).unwrap());
     }
 
     #[test]

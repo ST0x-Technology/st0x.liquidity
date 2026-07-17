@@ -1,11 +1,14 @@
 <script lang="ts">
   import { createQuery } from '@tanstack/svelte-query'
-  import { onMount } from 'svelte'
+  import { onMount, untrack } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import CliCommandBlock from '$lib/components/cli-command-block.svelte'
   import type { Position } from '$lib/api/Position'
+  import type { Trade } from '$lib/api/Trade'
+  import type { TradingVenue } from '$lib/api/TradingVenue'
+  import TradeOutcomeView from '$lib/components/trade-outcome.svelte'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import {
@@ -18,6 +21,7 @@
   import { formatDecimal } from '$lib/decimal'
   import { equityUsdTooltip } from '$lib/inventory-value'
   import { tradeRecoveryCommands } from '$lib/transfer'
+  import { mergeTradeHistory, type TradeHistoryFilter } from '$lib/trade'
 
   type TradeEvent = {
     step: string
@@ -25,14 +29,7 @@
     payload: Record<string, unknown>
   }
 
-  type TradeEntry = {
-    id: string
-    filledAt: string
-    venue: string
-    direction: string
-    symbol: string
-    shares: string
-  }
+  type TradeEntry = Trade
 
   type TradeResponse = {
     entries: TradeEntry[]
@@ -51,7 +48,7 @@
   const offset = reactive(0)
   const total = reactive(0)
   const hasMore = reactive(false)
-  const selectedVenues = reactive<Set<string>>(new Set(ALL_VENUES))
+  const selectedVenues = reactive<Set<TradingVenue>>(new Set(ALL_VENUES))
   const selectedSymbols = reactive<Set<string>>(new Set())
   const allSymbols = reactive<string[]>([])
   const since = reactive('')
@@ -59,9 +56,14 @@
 
   let sinceInput: HTMLInputElement | undefined
   let untilInput: HTMLInputElement | undefined
+  let historyRequestVersion = 0
 
   const positionsQuery = createQuery<Position[]>(() => ({
     queryKey: ['positions'],
+    enabled: false
+  }))
+  const tradesQuery = createQuery<Trade[]>(() => ({
+    queryKey: ['trades'],
     enabled: false
   }))
 
@@ -100,10 +102,10 @@
   const venueOptions = ALL_VENUES.map((venue) => ({ value: venue, label: venueLabel(venue) }))
   const symbolOptions = $derived(allSymbols.current.map((sym) => ({ value: sym, label: sym })))
 
-  const buildParams = (): URLSearchParams => {
+  const buildParams = (limit = PAGE_SIZE, requestOffset = offset.current): URLSearchParams => {
     const params = new URLSearchParams({
-      limit: String(PAGE_SIZE),
-      offset: String(offset.current)
+      limit: String(limit),
+      offset: String(requestOffset)
     })
 
     if (selectedVenues.current.size > 0 && selectedVenues.current.size < ALL_VENUES.length) {
@@ -120,13 +122,54 @@
     return params
   }
 
+  const historyFilter = (): TradeHistoryFilter => ({
+    venues: selectedVenues.current,
+    symbols: selectedSymbols.current,
+    since: since.current ? toRfc3339(since.current) : null,
+    until: until.current ? toRfc3339(until.current) : null
+  })
+
+  const mergeLiveTrades = (current: TradeEntry[]): TradeEntry[] =>
+    mergeTradeHistory(current, tradesQuery.data ?? [], historyFilter())
+
+  const resetHistoryForFilter = () => {
+    entries.update(() => [])
+    total.update(() => 0)
+    hasMore.update(() => false)
+    loadingMore.update(() => false)
+    error.update(() => null)
+  }
+
+  $effect(() => {
+    const live = tradesQuery.data ?? []
+
+    untrack(() => {
+      const filter = historyFilter()
+      entries.update((current) => {
+        const merged = mergeTradeHistory(current, live, filter)
+        const additions = Math.max(0, merged.length - current.length)
+        if (additions > 0) total.update((currentTotal) => currentTotal + additions)
+        return merged
+      })
+      allSymbols.update((current) =>
+        [...new Set([...current, ...live.map((trade) => trade.symbol)])].sort()
+      )
+    })
+  })
+
   const fetchTrades = async (mode: 'replace' | 'append') => {
     if (selectedVenues.current.size === 0) {
+      historyRequestVersion += 1
       entries.update(() => [])
+      total.update(() => 0)
       hasMore.update(() => false)
+      loading.update(() => false)
+      loadingMore.update(() => false)
+      error.update(() => null)
       return
     }
 
+    const requestVersion = ++historyRequestVersion
     const isLoadMore = mode === 'append'
     if (isLoadMore) {
       loadingMore.update(() => true)
@@ -142,19 +185,22 @@
       })
 
       if (!response.ok) {
-        error.update(() => `HTTP ${String(response.status)}`)
+        if (requestVersion === historyRequestVersion) {
+          error.update(() => `HTTP ${String(response.status)}`)
+        }
         return
       }
 
       const data: TradeResponse = (await response.json()) as TradeResponse
-      total.update(() => data.total)
-      hasMore.update(() => data.hasMore)
+      if (requestVersion !== historyRequestVersion) return
 
-      if (isLoadMore) {
-        entries.update((prev) => [...prev, ...data.entries])
-      } else {
-        entries.update(() => data.entries)
-      }
+      const nextEntries = isLoadMore
+        ? mergeLiveTrades([...entries.current, ...data.entries])
+        : mergeLiveTrades(data.entries)
+      const reconciledTotal = Math.max(total.current, data.total)
+      total.update(() => reconciledTotal)
+      hasMore.update(() => data.hasMore || nextEntries.length < reconciledTotal)
+      entries.update(() => nextEntries)
 
       // Accumulate symbols across fetches so the dropdown doesn't shrink
       const newSyms = new Set(data.entries.map((trade) => trade.symbol))
@@ -163,10 +209,14 @@
         return [...merged].sort()
       })
     } catch (fetchError) {
-      error.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
+      if (requestVersion === historyRequestVersion) {
+        error.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
+      }
     } finally {
-      loading.update(() => false)
-      loadingMore.update(() => false)
+      if (requestVersion === historyRequestVersion) {
+        loading.update(() => false)
+        loadingMore.update(() => false)
+      }
     }
   }
 
@@ -187,6 +237,7 @@
     if (sinceInput) sinceInput.value = toDatetimeLocal(sinceDate)
     if (untilInput) untilInput.value = ''
     offset.update(() => 0)
+    resetHistoryForFilter()
     void fetchTrades('replace')
   }
 
@@ -198,6 +249,7 @@
     offset.update(() => 0)
     if (sinceInput) sinceInput.value = ''
     if (untilInput) untilInput.value = ''
+    resetHistoryForFilter()
     void fetchTrades('replace')
   }
 
@@ -207,7 +259,6 @@
       selectedVenues.current.size < ALL_VENUES.length ||
       selectedSymbols.current.size > 0
   )
-
   onMount(() => {
     void fetchTrades('replace')
     const interval = setInterval(() => {
@@ -218,27 +269,31 @@
     }
   })
 
-  const handleVenueChange = (selected: Set<string>) => {
+  const handleVenueChange = (selected: Set<TradingVenue>) => {
     selectedVenues.update(() => selected)
     offset.update(() => 0)
+    resetHistoryForFilter()
     void fetchTrades('replace')
   }
 
   const handleSymbolChange = (selected: Set<string>) => {
     selectedSymbols.update(() => selected)
     offset.update(() => 0)
+    resetHistoryForFilter()
     void fetchTrades('replace')
   }
 
   const handleSinceChange = (event: Event) => {
     since.update(() => (event.target as HTMLInputElement).value)
     offset.update(() => 0)
+    resetHistoryForFilter()
     void fetchTrades('replace')
   }
 
   const handleUntilChange = (event: Event) => {
     until.update(() => (event.target as HTMLInputElement).value)
     offset.update(() => 0)
+    resetHistoryForFilter()
     void fetchTrades('replace')
   }
 
@@ -462,10 +517,11 @@
             <Table.Head class="text-right">Venue</Table.Head>
             <Table.Head class="text-right">Side</Table.Head>
             <Table.Head class="text-center">Size</Table.Head>
+            <Table.Head>Status</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
-          {#each entries.current as trade, idx (trade.id + String(idx))}
+          {#each entries.current as trade, idx (trade.id)}
             <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
               <Table.Cell class="w-8 px-1">
                 <button
@@ -488,7 +544,7 @@
                 </button>
               </Table.Cell>
               <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
-                {formatUtc(trade.filledAt)}
+                {formatUtc(trade.occurredAt)}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs font-medium">{trade.symbol}</Table.Cell>
               <Table.Cell class="text-right text-xs font-medium {venueColor(trade.venue)}"
@@ -504,6 +560,9 @@
                     >{fmtSize(trade.shares)}</span
                   >
                 </HoverTooltip>
+              </Table.Cell>
+              <Table.Cell class="max-w-64 text-xs">
+                <TradeOutcomeView outcome={trade.outcome} />
               </Table.Cell>
             </Table.Row>
           {/each}
@@ -603,8 +662,15 @@
           </div>
 
           <div class="flex items-center gap-2 font-mono">
-            <span class="shrink-0 text-muted-foreground">Filled At</span>
-            <span>{formatUtc(trade.filledAt)}</span>
+            <span class="shrink-0 text-muted-foreground">Occurred At</span>
+            <span>{formatUtc(trade.occurredAt)}</span>
+          </div>
+
+          <div class="flex items-start gap-2 font-mono">
+            <span class="shrink-0 text-muted-foreground">Status</span>
+            <div>
+              <TradeOutcomeView outcome={trade.outcome} compact={false} />
+            </div>
           </div>
         </div>
 

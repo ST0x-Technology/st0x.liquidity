@@ -3998,6 +3998,14 @@ multiple broker-specific contexts.
    reference, spread bps) and per-symbol price charts over time.
 
 4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
+   Onchain entries are completed fills. Offchain counter-trade entries include
+   both successful fills and terminal failures; each entry carries its terminal
+   outcome timestamp. Failed entries expose the broker or placement error plus
+   the filled and unfilled portions of that broker order so operators can see
+   partial execution without inspecting logs. Fills beyond the broker-accepted
+   order quantity expose the excess separately rather than clamping it or making
+   history unavailable. Terminal outcomes appear in both initial history and
+   live dashboard updates.
 
 5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
    event type, timestamp). Starts empty, populates via WebSocket.
