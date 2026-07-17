@@ -13,12 +13,12 @@ apalis_finished_job_cleanup_interval_secs = 3600
 [telemetry]
 service_name = "st0x-liquidity"
 environment = "production"
-# st0x-management-observability on the st0x tailnet (VictoriaTraces :10428,
-# VictoriaLogs :9428). Reachable once the bot is migrated onto the st0x tailnet;
+# rain-management-observability on the rain tailnet (VictoriaTraces :10428,
+# VictoriaLogs :9428). Reachable once the bot is migrated onto the rain tailnet;
 # until then the OTLP exporters fail closed and drop best-effort (no startup
 # impact, file/console logging unaffected).
-traces_endpoint = "http://100.93.167.114:10428"
-logs_endpoint = "http://100.93.167.114:9428"
+logs_endpoint = "http://rain-management-observability.taile5cf8a.ts.net:9428"
+traces_endpoint = "http://rain-management-observability.taile5cf8a.ts.net:10428"
 
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.
