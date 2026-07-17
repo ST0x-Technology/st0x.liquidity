@@ -33,7 +33,7 @@ use turnkey_client::generated::{
     immutable::activity::v1::{SignTransactionResult, result},
     immutable::common::v1::TransactionType,
 };
-use turnkey_client::{RetryConfig, TurnkeyClientError};
+use turnkey_client::{RetryConfig, TurnkeyClient, TurnkeyClientError};
 
 use crate::nonce::ResettableNonceManager;
 use crate::submit::send_with_recovery;
@@ -48,6 +48,10 @@ pub struct TurnkeyOrganizationId(String);
 impl TurnkeyOrganizationId {
     pub fn new(value: String) -> Self {
         Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -120,6 +124,135 @@ impl std::fmt::Debug for TurnkeyCredentials {
             .debug_struct("TurnkeyCredentials")
             .field("api_private_key", &"[REDACTED]")
             .finish()
+    }
+}
+
+/// Turnkey policy effect relevant to deploy-time coverage verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnkeyPolicyEffect {
+    Allow,
+    Deny,
+    Unspecified,
+}
+
+/// Read-only policy data used by the deploy verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnkeyPolicy {
+    pub effect: TurnkeyPolicyEffect,
+    pub consensus: Option<String>,
+    pub condition: Option<String>,
+}
+
+/// Policies plus the authenticated Turnkey API user's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnkeyPolicySnapshot {
+    pub user_id: String,
+    pub policies: Vec<TurnkeyPolicy>,
+}
+
+/// Errors returned while constructing or querying the Turnkey policy client.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnkeyPolicyError {
+    #[error(transparent)]
+    ApiKey(#[from] turnkey_api_key_stamper::StamperError),
+    #[error(transparent)]
+    Client(#[from] TurnkeyClientError),
+}
+
+/// Authenticated read-only client for listing an organization's policies.
+pub struct TurnkeyPolicyClient {
+    organization_id: TurnkeyOrganizationId,
+    client: TurnkeyClient<TurnkeyP256ApiKey>,
+}
+
+impl std::fmt::Debug for TurnkeyPolicyClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnkeyPolicyClient")
+            .field("organization_id", &self.organization_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnkeyPolicyClient {
+    pub fn new(
+        organization_id: TurnkeyOrganizationId,
+        api_private_key: &TurnkeyApiPrivateKey,
+    ) -> Result<Self, TurnkeyPolicyError> {
+        let TurnkeyApiPrivateKey(api_key_hex) = api_private_key;
+        let api_key = TurnkeyP256ApiKey::from_strings(api_key_hex, None)?;
+        Self::from_parts(organization_id, api_key, "https://api.turnkey.com")
+    }
+
+    #[cfg(test)]
+    fn for_base_url(
+        organization_id: TurnkeyOrganizationId,
+        api_key: TurnkeyP256ApiKey,
+        base_url: String,
+    ) -> Result<Self, TurnkeyPolicyError> {
+        Self::from_parts(organization_id, api_key, base_url)
+    }
+
+    fn from_parts(
+        organization_id: TurnkeyOrganizationId,
+        api_key: TurnkeyP256ApiKey,
+        base_url: impl Into<String>,
+    ) -> Result<Self, TurnkeyPolicyError> {
+        let client = TurnkeyClient::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .timeout(Duration::from_secs(20))
+            .build()?;
+
+        Ok(Self {
+            organization_id,
+            client,
+        })
+    }
+
+    pub async fn list_policies(&self) -> Result<TurnkeyPolicySnapshot, TurnkeyPolicyError> {
+        let organization_id = self.organization_id.as_str().to_owned();
+        let whoami = self
+            .client
+            .get_whoami(
+                turnkey_client::generated::services::coordinator::public::v1::GetWhoamiRequest {
+                    organization_id: organization_id.clone(),
+                },
+            )
+            .await?;
+        let response = self
+            .client
+            .get_policies(
+                turnkey_client::generated::services::coordinator::public::v1::GetPoliciesRequest {
+                    organization_id,
+                },
+            )
+            .await?;
+
+        let policies = response
+            .policies
+            .into_iter()
+            .map(|policy| TurnkeyPolicy {
+                effect: match policy.effect {
+                    turnkey_client::generated::immutable::common::v1::Effect::Allow => {
+                        TurnkeyPolicyEffect::Allow
+                    }
+                    turnkey_client::generated::immutable::common::v1::Effect::Deny => {
+                        TurnkeyPolicyEffect::Deny
+                    }
+                    turnkey_client::generated::immutable::common::v1::Effect::Unspecified => {
+                        TurnkeyPolicyEffect::Unspecified
+                    }
+                },
+                consensus: policy.consensus,
+                condition: policy.condition,
+            })
+            .collect();
+
+        Ok(TurnkeyPolicySnapshot {
+            user_id: whoami.user_id,
+            policies,
+        })
     }
 }
 
@@ -750,6 +883,79 @@ mod tests {
             test_api_key(),
             retry_config,
         )
+    }
+
+    #[tokio::test]
+    async fn policy_client_lists_policy_effects_and_conditions() {
+        let server = MockServer::start();
+        let policies_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/list_policies")
+                .body_includes("\"organizationId\":\"org-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "policies": [
+                        {
+                            "policyId": "policy-allow",
+                            "policyName": "allow approvals",
+                            "effect": "EFFECT_ALLOW",
+                            "notes": "",
+                            "consensus": "approvers.any(user, user.id == 'user-test')",
+                            "condition": "eth.tx.to == '0x1111111111111111111111111111111111111111'"
+                        },
+                        {
+                            "policyId": "policy-deny",
+                            "policyName": "deny transfers",
+                            "effect": "EFFECT_DENY",
+                            "notes": "",
+                            "condition": "eth.tx.function_name == 'transfer'"
+                        }
+                    ]
+                }));
+        });
+        let whoami_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/whoami")
+                .body_includes("\"organizationId\":\"org-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "organizationId": "org-test",
+                    "organizationName": "Test",
+                    "userId": "user-test",
+                    "username": "Bot"
+                }));
+        });
+        let client = TurnkeyPolicyClient::for_base_url(
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_api_key(),
+            server.base_url(),
+        )
+        .unwrap();
+
+        let snapshot = client.list_policies().await.unwrap();
+
+        policies_mock.assert();
+        whoami_mock.assert();
+        assert_eq!(snapshot.user_id, "user-test");
+        assert_eq!(
+            snapshot.policies,
+            vec![
+                TurnkeyPolicy {
+                    effect: TurnkeyPolicyEffect::Allow,
+                    consensus: Some("approvers.any(user, user.id == 'user-test')".to_string()),
+                    condition: Some(
+                        "eth.tx.to == '0x1111111111111111111111111111111111111111'".to_string()
+                    ),
+                },
+                TurnkeyPolicy {
+                    effect: TurnkeyPolicyEffect::Deny,
+                    consensus: None,
+                    condition: Some("eth.tx.function_name == 'transfer'".to_string()),
+                },
+            ]
+        );
     }
 
     /// Builds a well-formed EIP-1559 transaction (the only shape the bot's

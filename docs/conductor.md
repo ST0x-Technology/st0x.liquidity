@@ -322,6 +322,17 @@ optional `tokenizer: Option<Arc<dyn Tokenizer>>`, shutdown token).
 
 ## Startup sequencing
 
+Before systemd stops the existing bot, deploy activation validates staged
+config/secrets and uses Turnkey's read-only policy list to verify coverage for
+the exact approval targets startup will grant. Both paths call the same
+deterministic target builder, limited to trading- or rebalancing-enabled symbols
+plus USDC. An allow policy covers a target only when the authenticated API user
+can satisfy its consensus alone and its target condition provably applies.
+Applicable or unprovable deny policies take precedence. Missing or unrecognized
+coverage fails activation without replacing the running process or installed
+config. If stopping the validated service fails, activation also aborts before
+the staged files replace the installed config and secrets.
+
 ```
 Phase 1: connect_http (with RPC probe) | setup_apalis_tables | build CQRS stores
 Phase 2: seed_vault_registry (inline, must complete before downstream wiring)

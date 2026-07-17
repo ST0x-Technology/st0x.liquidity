@@ -19,9 +19,9 @@
 
 use alloy::primitives::{Address, U256};
 
+use st0x_config::AssetsConfig;
 use st0x_evm::{IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
-use st0x_wrapper::{Wrapper, WrapperError};
 
 /// High watermark above which an existing allowance is treated as "already
 /// effectively unlimited", so the startup grant skips it. A genuine MAX
@@ -98,12 +98,6 @@ impl ApprovalPurpose {
 /// while wrap/deposit would revert with `ERC20InsufficientAllowance`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StartupApprovalError {
-    #[error("failed to resolve token addresses for symbol {symbol}")]
-    SymbolResolution {
-        symbol: Symbol,
-        #[source]
-        source: Box<WrapperError>,
-    },
     #[error(
         "failed to read allowance for token {token} spender {spender} \
          (symbol {symbol:?})"
@@ -128,34 +122,28 @@ pub(crate) enum StartupApprovalError {
     },
 }
 
-/// Builds the full list of startup approval targets: for every configured
-/// equity symbol, the two wrap/deposit grants, plus the single USDC grant.
-///
-/// Token addresses are resolved through the [`Wrapper`] trait so the symbol ->
-/// address mapping is owned in one place; the orderbook and USDC addresses come
-/// from the caller (EVM config / raindex constant).
+/// Builds the deterministic list of startup approval targets: for every equity
+/// with trading or rebalancing enabled, the two wrap/deposit grants, plus the
+/// single USDC grant.
 pub(crate) fn build_approval_targets(
-    wrapper: &dyn Wrapper,
-    symbols: impl IntoIterator<Item = Symbol>,
+    assets: &AssetsConfig,
     orderbook: Address,
     usdc: Address,
-) -> Result<Vec<ApprovalTarget>, StartupApprovalError> {
+) -> Vec<ApprovalTarget> {
     let mut targets = Vec::new();
+    let mut enabled_equities = assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(symbol, _)| {
+            assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
+        })
+        .collect::<Vec<_>>();
+    enabled_equities.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
-    for symbol in symbols {
-        let underlying = wrapper.lookup_underlying(&symbol).map_err(|source| {
-            StartupApprovalError::SymbolResolution {
-                symbol: symbol.clone(),
-                source: Box::new(source),
-            }
-        })?;
-
-        let derivative = wrapper.lookup_derivative(&symbol).map_err(|source| {
-            StartupApprovalError::SymbolResolution {
-                symbol: symbol.clone(),
-                source: Box::new(source),
-            }
-        })?;
+    for (symbol, config) in enabled_equities {
+        let underlying = config.tokenized_equity;
+        let derivative = config.tokenized_equity_derivative;
 
         targets.push(ApprovalTarget {
             token: underlying,
@@ -167,7 +155,7 @@ pub(crate) fn build_approval_targets(
         targets.push(ApprovalTarget {
             token: derivative,
             spender: orderbook,
-            symbol: Some(symbol),
+            symbol: Some(symbol.clone()),
             purpose: ApprovalPurpose::DepositWrappedEquity,
         });
     }
@@ -179,7 +167,7 @@ pub(crate) fn build_approval_targets(
         purpose: ApprovalPurpose::DepositUsdc,
     });
 
-    Ok(targets)
+    targets
 }
 
 /// Grants idempotent MAX approvals for every target, reading each current
@@ -279,123 +267,17 @@ pub(crate) async fn grant_startup_approvals<W: Wallet>(
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, TxHash, U256};
+    use alloy::primitives::{B256, U256};
     use alloy::providers::{Provider, ProviderBuilder};
-    use async_trait::async_trait;
     use std::collections::HashMap;
 
+    use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_wrapper::{UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, WrappedEquity};
 
     use super::*;
     use crate::bindings::TestERC20;
     use crate::test_utils::{TestAnvilInstance, spawn_anvil};
-
-    /// Per-symbol wrapper stub: resolves underlying/derivative addresses from a
-    /// configured map and errors on an unconfigured symbol, so the
-    /// target-building path can be exercised with real address resolution.
-    /// `MockWrapper` returns fixed addresses regardless of symbol and has no
-    /// unconfigured-symbol path, so it cannot drive these tests.
-    struct StubWrapper {
-        equities: HashMap<Symbol, WrappedEquity>,
-    }
-
-    impl StubWrapper {
-        fn lookup(&self, symbol: &Symbol) -> Result<&WrappedEquity, WrapperError> {
-            self.equities
-                .get(symbol)
-                .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))
-        }
-    }
-
-    #[async_trait]
-    impl Wrapper for StubWrapper {
-        async fn get_ratio_for_symbol(
-            &self,
-            _symbol: &Symbol,
-        ) -> Result<UnderlyingPerWrapped, WrapperError> {
-            unimplemented!("ratio not used by approval target building")
-        }
-
-        fn lookup_underlying(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-            Ok(self.lookup(symbol)?.underlying)
-        }
-
-        fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-            Ok(self.lookup(symbol)?.derivative)
-        }
-
-        async fn to_wrapped(
-            &self,
-            _wrapped_token: Address,
-            _underlying_amount: U256,
-            _receiver: Address,
-        ) -> Result<(TxHash, U256), WrapperError> {
-            unimplemented!("wrap not used by approval target building")
-        }
-
-        async fn to_underlying(
-            &self,
-            _wrapped_token: Address,
-            _wrapped_amount: U256,
-            _receiver: Address,
-            _owner: Address,
-        ) -> Result<(TxHash, U256), WrapperError> {
-            unimplemented!("unwrap not used by approval target building")
-        }
-
-        async fn donate(
-            &self,
-            _wrapped_token: Address,
-            _underlying_amount: U256,
-        ) -> Result<TxHash, WrapperError> {
-            unimplemented!("donate not used by approval target building")
-        }
-
-        async fn submit_wrap(
-            &self,
-            _wrapped_token: Address,
-            _underlying_amount: U256,
-            _receiver: Address,
-        ) -> Result<TxHash, WrapperError> {
-            unimplemented!("submit_wrap not used by approval target building")
-        }
-
-        async fn confirm_wrap(
-            &self,
-            _wrapped_token: Address,
-            _tx_hash: TxHash,
-        ) -> Result<WrapConfirmation, WrapperError> {
-            unimplemented!("confirm_wrap not used by approval target building")
-        }
-
-        async fn submit_unwrap(
-            &self,
-            _wrapped_token: Address,
-            _wrapped_amount: U256,
-            _receiver: Address,
-            _owner: Address,
-        ) -> Result<TxHash, WrapperError> {
-            unimplemented!("submit_unwrap not used by approval target building")
-        }
-
-        async fn confirm_unwrap(
-            &self,
-            _wrapped_token: Address,
-            _tx_hash: TxHash,
-        ) -> Result<UnwrapConfirmation, WrapperError> {
-            unimplemented!("confirm_unwrap not used by approval target building")
-        }
-
-        async fn wait_for_block(&self, _block: u64) -> Result<(), WrapperError> {
-            unimplemented!("wait_for_block not used by approval target building")
-        }
-
-        fn owner(&self) -> Address {
-            Address::ZERO
-        }
-    }
 
     /// Watermark sits exactly at `U256::MAX / 2`, the midpoint between a bounded
     /// per-operation allowance and an already-granted MAX approval.
@@ -441,10 +323,38 @@ mod tests {
         );
     }
 
-    fn wrapper_with(symbol: &str, equity: WrappedEquity) -> StubWrapper {
-        let mut equities = HashMap::new();
-        equities.insert(symbol.parse::<Symbol>().unwrap(), equity);
-        StubWrapper { equities }
+    fn equity_asset(
+        underlying: Address,
+        derivative: Address,
+        trading: OperationMode,
+        rebalancing: OperationMode,
+    ) -> EquityAssetConfig {
+        EquityAssetConfig {
+            tokenized_equity: underlying,
+            tokenized_equity_derivative: derivative,
+            pyth_feed_id: None,
+            vault_ids: Vec::new(),
+            trading,
+            rebalancing,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            extended_hours_counter_trading: OperationMode::Disabled,
+            operational_limit: None,
+        }
+    }
+
+    fn assets_with(
+        equities: impl IntoIterator<Item = (&'static str, EquityAssetConfig)>,
+    ) -> AssetsConfig {
+        AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols: equities
+                    .into_iter()
+                    .map(|(symbol, config)| (symbol.parse().unwrap(), config))
+                    .collect::<HashMap<_, _>>(),
+            },
+            cash: None,
+        }
     }
 
     #[test]
@@ -454,16 +364,17 @@ mod tests {
         let orderbook = Address::random();
         let usdc = Address::random();
 
-        let wrapper = wrapper_with(
+        let assets = assets_with([(
             "AAPL",
-            WrappedEquity {
+            equity_asset(
                 underlying,
                 derivative,
-            },
-        );
+                OperationMode::Enabled,
+                OperationMode::Disabled,
+            ),
+        )]);
 
-        let symbols = vec!["AAPL".parse::<Symbol>().unwrap()];
-        let targets = build_approval_targets(&wrapper, symbols, orderbook, usdc).unwrap();
+        let targets = build_approval_targets(&assets, orderbook, usdc);
 
         assert_eq!(
             targets,
@@ -491,27 +402,51 @@ mod tests {
     }
 
     #[test]
-    fn build_targets_errors_on_unconfigured_symbol() {
-        let wrapper = wrapper_with(
-            "AAPL",
-            WrappedEquity {
-                underlying: Address::random(),
-                derivative: Address::random(),
-            },
-        );
-
-        let symbols = vec!["TSLA".parse::<Symbol>().unwrap()];
-        let error = build_approval_targets(&wrapper, symbols, Address::random(), Address::random())
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                StartupApprovalError::SymbolResolution { ref symbol, .. }
-                    if *symbol == "TSLA"
+    fn build_targets_omit_disabled_symbols_and_sort_enabled_symbols() {
+        let aapl_underlying = Address::random();
+        let aapl_derivative = Address::random();
+        let tsla_underlying = Address::random();
+        let tsla_derivative = Address::random();
+        let orderbook = Address::random();
+        let usdc = Address::random();
+        let assets = assets_with([
+            (
+                "TSLA",
+                equity_asset(
+                    tsla_underlying,
+                    tsla_derivative,
+                    OperationMode::Disabled,
+                    OperationMode::Enabled,
+                ),
             ),
-            "expected SymbolResolution for TSLA, got: {error:?}"
-        );
+            (
+                "DISABLED",
+                equity_asset(
+                    Address::random(),
+                    Address::random(),
+                    OperationMode::Disabled,
+                    OperationMode::Disabled,
+                ),
+            ),
+            (
+                "AAPL",
+                equity_asset(
+                    aapl_underlying,
+                    aapl_derivative,
+                    OperationMode::Enabled,
+                    OperationMode::Disabled,
+                ),
+            ),
+        ]);
+
+        let targets = build_approval_targets(&assets, orderbook, usdc);
+
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0].symbol.as_ref().unwrap().as_str(), "AAPL");
+        assert_eq!(targets[1].symbol.as_ref().unwrap().as_str(), "AAPL");
+        assert_eq!(targets[2].symbol.as_ref().unwrap().as_str(), "TSLA");
+        assert_eq!(targets[3].symbol.as_ref().unwrap().as_str(), "TSLA");
+        assert_eq!(targets[4].symbol, None);
     }
 
     /// Spawns anvil, builds a wallet from key[0], and deploys `count`

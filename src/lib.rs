@@ -42,6 +42,8 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
 mod alerts;
 pub mod api;
+#[cfg(feature = "wallet-turnkey")]
+pub mod approval_policy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
