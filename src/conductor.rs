@@ -36,8 +36,8 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, LifecycleError, Projection, SendError, Store, StoreBuilder,
-    compact_events, incremental_vacuum, load_all_ids, load_entity,
+    AggregateError, EventSourced, LifecycleError, Projection, RetryOnBusy, SendError, Store,
+    StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
@@ -179,8 +179,12 @@ where
     let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
-            .with(Arc::new(LifecycleFailureProjection::new(pool.clone())))
+            .with(Arc::new(RetryOnBusy {
+                inner: HedgeLatencyProjection::new(pool.clone()),
+            }))
+            .with(Arc::new(RetryOnBusy {
+                inner: LifecycleFailureProjection::new(pool.clone()),
+            }))
             .build(order_placer.clone())
             .await?;
 
@@ -1491,10 +1495,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         .await?;
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
-        let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
-        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(deps.pool.clone()));
-        let equity_timing = Arc::new(EquityTimingProjection::new(deps.pool.clone()));
-        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(deps.pool.clone()));
+        let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
+        let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
+        let equity_timing = EquityTimingProjection::new(deps.pool.clone());
+        let lifecycle_failure = LifecycleFailureProjection::new(deps.pool.clone());
         catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
 
         let manifest = QueryManifest::new(
@@ -2161,7 +2165,9 @@ async fn build_position_cqrs(
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
     let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(broadcaster)
-        .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+        .with(Arc::new(RetryOnBusy {
+            inner: HedgeLatencyProjection::new(pool.clone()),
+        }))
         .build(())
         .await?;
 

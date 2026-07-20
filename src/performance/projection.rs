@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use st0x_event_sorcery::{EntityList, Reactor, deps};
+use st0x_event_sorcery::{EntityList, IdempotentReactor, Reactor, deps};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -20,7 +20,7 @@ use st0x_execution::Symbol;
 use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
 use crate::position::{Position, PositionEvent, TradeId};
 
-use super::{PerformanceError, covered_fills, uncovered_fills};
+use super::{PerformanceError, covered_fills, uncovered_fills_on_connection};
 
 /// Reactor maintaining the hedge-latency read model from live events.
 pub(crate) struct HedgeLatencyProjection {
@@ -102,11 +102,22 @@ impl HedgeLatencyProjection {
         symbol: &Symbol,
         adjusted_at: DateTime<Utc>,
     ) -> Result<(), ProjectionError> {
-        sqlx::query("INSERT INTO hedge_attribution_reset (symbol, adjusted_at) VALUES (?, ?)")
-            .bind(symbol.to_string())
-            .bind(adjusted_at.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
+        let symbol = symbol.to_string();
+        let adjusted_at = adjusted_at.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO hedge_attribution_reset (symbol, adjusted_at) \
+             SELECT ?, ? \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM hedge_attribution_reset \
+                 WHERE symbol = ? AND adjusted_at = ?\
+             )",
+        )
+        .bind(&symbol)
+        .bind(&adjusted_at)
+        .bind(&symbol)
+        .bind(&adjusted_at)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -155,11 +166,12 @@ impl HedgeLatencyProjection {
         offchain_order_id: OffchainOrderId,
         placed_at: DateTime<Utc>,
     ) -> Result<(), ProjectionError> {
-        // Snapshot the current uncovered set as this placement's covered batch.
-        // The per-aggregate serial-delivery invariant means no concurrent writer
-        // mutates hedge_fill or hedge_attribution_reset between this read and the
-        // INSERT, and ON CONFLICT DO NOTHING keeps redelivery idempotent.
-        let batch = uncovered_fills(&self.pool, symbol).await?;
+        // Snapshot the current uncovered set and insert the corresponding cycle
+        // in one transaction. A retry therefore re-runs the complete reaction
+        // against a fresh snapshot, while ON CONFLICT keeps redelivery
+        // idempotent.
+        let mut tx = self.pool.begin().await?;
+        let batch = uncovered_fills_on_connection(&mut tx, symbol).await?;
         let covered = covered_fills(&batch);
 
         let (earliest_block_ts, latest_seen_at) = covered.as_ref().map_or((None, None), |cov| {
@@ -183,8 +195,10 @@ impl HedgeLatencyProjection {
         .bind(count)
         .bind(earliest_block_ts)
         .bind(latest_seen_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -372,6 +386,8 @@ impl Reactor for HedgeLatencyProjection {
             .await
     }
 }
+
+impl IdempotentReactor for HedgeLatencyProjection {}
 
 #[cfg(test)]
 mod tests {
@@ -800,6 +816,34 @@ mod tests {
         assert_eq!(covered.count, 1);
         assert_eq!(covered.earliest_block_timestamp, timestamp(0));
         assert!(after[0].open_exposure.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_manual_adjustment_is_idempotent() {
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+        let adjustment = PositionEvent::ManualPositionAdjusted {
+            previous_net: FractionalShares::new(float!(1)),
+            target_net: FractionalShares::new(float!(0)),
+            reason: "manual reset".to_string(),
+            price_usdc: None,
+            adjusted_at: timestamp(5),
+        };
+
+        harness
+            .receive::<Position>(symbol(), adjustment.clone())
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), adjustment)
+            .await
+            .unwrap();
+
+        let reset_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hedge_attribution_reset")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reset_count, 1);
     }
 
     /// A manual adjustment writes a durable reset boundary; fills observed after
