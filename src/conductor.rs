@@ -628,6 +628,13 @@ impl Conductor {
         // database. Without this, the first post-restart poll may emit
         // no events (unchanged values are deduplicated), leaving the
         // view empty and potentially causing incorrect rebalancing.
+        //
+        // Ordering: this must run before
+        // `recover_pending_offchain_order_symbols` (below). Hydration replays
+        // offchain equity snapshots through the pending-offchain-order guards,
+        // which are inert only while the pending set is still empty; seeding
+        // the set first would skip hydration for every symbol with an open
+        // hedge order, booting it with an uninitialized offchain balance.
         hydrate_inventory_from_snapshot(&pool, &inventory).await;
         if let Some(service) = &rebalancing_service {
             service.enqueue_recovery_for_current_wallet_balances().await;

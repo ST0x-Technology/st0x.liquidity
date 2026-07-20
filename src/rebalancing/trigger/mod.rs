@@ -484,7 +484,6 @@ pub(crate) struct RebalancingService {
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
-    pending_offchain_order_symbols: Arc<RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     wrapper: Arc<dyn Wrapper>,
@@ -635,7 +634,6 @@ impl RebalancingService {
             inventory,
             freeze_status: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            pending_offchain_order_symbols: Arc::new(RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             notifier,
             wrapper,
@@ -712,7 +710,10 @@ impl RebalancingService {
             })
             .collect();
 
-        *self.pending_offchain_order_symbols.write().await = pending_symbols;
+        self.inventory
+            .write()
+            .await
+            .set_pending_offchain_order_symbols(pending_symbols);
         Ok(())
     }
 
@@ -2103,20 +2104,27 @@ impl Reactor for RebalancingService {
                         )
                     }
                     OffChainOrderPlaced { .. } => {
-                        self.pending_offchain_order_symbols
+                        // Also stops offchain snapshots from writing this
+                        // symbol's balance while the order is open: the broker
+                        // bakes a fill into its position the instant it
+                        // executes, which is before we observe the fill, so a
+                        // snapshot landing in that window already contains it.
+                        self.inventory
                             .write()
                             .await
-                            .insert(symbol);
+                            .mark_offchain_order_pending(symbol);
                         return Ok(());
                     }
                     OffChainOrderFailed { .. } | OffChainOrderCancelled { .. } => {
                         // A failure or an intentional cancellation both release
                         // the symbol's pending-offchain-order gate; nudge an
                         // immediate equity check rather than waiting a poll cycle.
-                        self.pending_offchain_order_symbols
+                        // No fill was applied, so nothing bars the next snapshot
+                        // from taking the balance back over.
+                        self.inventory
                             .write()
                             .await
-                            .remove(&symbol);
+                            .clear_offchain_order_pending(&symbol, None);
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
@@ -2146,12 +2154,26 @@ impl Reactor for RebalancingService {
                     if let Ok(updated) = &result {
                         *inventory = updated.clone();
                     }
+
+                    if clear_pending_offchain_order {
+                        // Release the snapshot block in the same critical
+                        // section that applied the delta, so no snapshot can
+                        // land in between and overwrite the fill just recorded.
+                        // Stamp the local clock rather than reusing `timestamp`
+                        // (the event's `broker_timestamp`): this is compared
+                        // against snapshot `fetched_at`, which is stamped from
+                        // this host's clock.
+                        inventory
+                            .clear_offchain_order_pending(&symbol, result.is_ok().then(Utc::now));
+                    }
+
                     result
                 };
 
                 if clear_pending_offchain_order {
-                    // Clear the gate regardless of inventory outcome. See the
-                    // OffChainOrderFilled arm above for the rationale.
+                    // The gate was cleared above regardless of inventory
+                    // outcome. See the OffChainOrderFilled arm for the
+                    // rationale.
                     if let Err(error) = &inventory_result {
                         warn!(
                             target: "rebalance",
@@ -2160,10 +2182,6 @@ impl Reactor for RebalancingService {
                             "Inventory update failed for offchain fill; clearing gate anyway and relying on next polling snapshot"
                         );
                     }
-                    self.pending_offchain_order_symbols
-                        .write()
-                        .await
-                        .remove(&symbol);
                     self.equity_scheduler.enqueue_check(symbol).await;
                     // Only re-check USDC if the cash leg actually applied.
                     // With and_then chaining, inventory_result == Err means
@@ -2288,10 +2306,10 @@ impl RebalancingService {
     }
 
     async fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
-        self.pending_offchain_order_symbols
+        self.inventory
             .read()
             .await
-            .contains(symbol)
+            .has_pending_offchain_order(symbol)
     }
 
     async fn build_equity_operation(
@@ -9060,10 +9078,10 @@ mod tests {
         // Seed the pending-hedge gate so we can prove no-op events leave it intact
         // (OffChainOrderFailed clears it; manual adjustments must not).
         trigger
-            .pending_offchain_order_symbols
+            .inventory
             .write()
             .await
-            .insert(symbol.clone());
+            .mark_offchain_order_pending(symbol.clone());
 
         // Initialized, ThresholdUpdated, and ManualPositionAdjusted all return
         // Ok(()) without touching inventory or the pending-hedge gate.
@@ -9117,10 +9135,10 @@ mod tests {
 
         assert!(
             trigger
-                .pending_offchain_order_symbols
+                .inventory
                 .read()
                 .await
-                .contains(&symbol),
+                .has_pending_offchain_order(&symbol),
             "manual adjustment must not clear the pending-hedge gate"
         );
 
@@ -21762,10 +21780,10 @@ mod tests {
         let trigger = reactor.clone();
 
         trigger
-            .pending_offchain_order_symbols
+            .inventory
             .write()
             .await
-            .insert(symbol.clone());
+            .mark_offchain_order_pending(symbol.clone());
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -21895,6 +21913,162 @@ mod tests {
         assert!(
             !trigger.has_pending_offchain_order(&symbol).await,
             "Inventory update failure on a Filled event must not leave the gate stuck"
+        );
+    }
+
+    /// The silent sibling of the underflow above. When the polled balance is
+    /// larger than the fill, the double-subtraction does not underflow -- it
+    /// succeeds, and the mirror is left short by exactly one fill's worth with
+    /// no error anywhere. A snapshot taken inside the ~100ms window after the
+    /// broker executes already has the fill baked in, so applying the fill
+    /// delta on top of it counts the same shares twice.
+    #[tokio::test]
+    async fn offchain_snapshot_absorbing_a_fill_is_not_subtracted_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        // Pre-fill broker truth: 100 shares offchain.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // The poll lands between execution and our own observation of the
+        // fill, so Alpaca already reports the post-fill 90.
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            ),
+        )
+        .await
+        .expect("snapshot reaction must not hang")
+        .unwrap();
+
+        // Only now does the fill event reach the reactor.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        let hedging = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging);
+        assert_eq!(
+            hedging,
+            Some(shares(90)),
+            "the snapshot already absorbed the 10-share sell, so the fill delta \
+             must not subtract it again; 80 means it was counted twice"
+        );
+    }
+
+    /// The reverse ordering of the race above: a poll whose positions read
+    /// predates the fill, but whose snapshot event lands after the fill was
+    /// applied. Without the applied-fill watermark it would overwrite the
+    /// correctly decremented balance with the pre-fill number.
+    #[tokio::test]
+    async fn snapshot_fetched_before_applied_fill_does_not_overwrite_it() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // Captured before the fill is applied, so it predates the local-clock
+        // stamp the reactor records for the fill.
+        let pre_fill = Utc::now();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        // The stale poll reports the pre-fill 100 with a pre-fill stamp.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.receive::<InventorySnapshot>(
+                snapshot_id.clone(),
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(100))]),
+                    fetched_at: pre_fill,
+                },
+            ),
+        )
+        .await
+        .expect("snapshot reaction must not hang")
+        .unwrap();
+
+        let hedging = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging);
+        assert_eq!(
+            hedging,
+            Some(shares(90)),
+            "a snapshot fetched before the applied fill must not resurrect the \
+             pre-fill balance"
+        );
+
+        // A fresh poll after the fill applies normally. 91 is deliberately
+        // distinct from 90 so application is observable.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(91))]),
+                    fetched_at: Utc::now(),
+                },
+            ),
+        )
+        .await
+        .expect("snapshot reaction must not hang")
+        .unwrap();
+
+        let hedging = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging);
+        assert_eq!(
+            hedging,
+            Some(shares(91)),
+            "a snapshot fetched after the applied fill must apply normally"
         );
     }
 
@@ -22030,10 +22204,10 @@ mod tests {
         // Pre-populate a stale entry to prove recovery replaces the set rather
         // than merging into it.
         trigger
-            .pending_offchain_order_symbols
+            .inventory
             .write()
             .await
-            .insert(clear_symbol.clone());
+            .mark_offchain_order_pending(clear_symbol.clone());
 
         trigger
             .recover_pending_offchain_order_symbols(&projection)
