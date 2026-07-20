@@ -41,8 +41,15 @@ impl Broadcaster {
     }
 
     fn broadcast_trade(&self, trade: Trade) {
+        let legacy_fill = trade.legacy_fill();
         if let Err(error) = self.sender.send(Statement::TradeUpdate(trade)) {
             debug!(target: "dashboard", %error, "Failed to broadcast trade update (no receivers)");
+        }
+
+        if let Some(legacy_fill) = legacy_fill
+            && let Err(error) = self.sender.send(Statement::TradeFill(legacy_fill))
+        {
+            debug!(target: "dashboard", %error, "Failed to broadcast legacy trade fill (no receivers)");
         }
     }
 
@@ -244,6 +251,15 @@ mod tests {
             }
             other => panic!("expected TradeUpdate message, got {other:?}"),
         }
+
+        let legacy = receiver.recv().await.expect("should receive legacy fill");
+        let legacy = serde_json::to_value(legacy).expect("legacy fill should serialize");
+        assert_eq!(legacy["type"], "trade_fill");
+        assert_eq!(
+            legacy["data"]["filledAt"],
+            serde_json::to_value(now).expect("timestamp should serialize")
+        );
+        assert!(legacy["data"].get("outcome").is_none());
     }
 
     #[tokio::test]
@@ -320,6 +336,15 @@ mod tests {
             }
             other => panic!("expected TradeUpdate message, got {other:?}"),
         }
+
+        let legacy = receiver.recv().await.expect("should receive legacy fill");
+        let legacy = serde_json::to_value(legacy).expect("legacy fill should serialize");
+        assert_eq!(legacy["type"], "trade_fill");
+        assert_eq!(
+            legacy["data"]["filledAt"],
+            serde_json::to_value(now).expect("timestamp should serialize")
+        );
+        assert!(legacy["data"].get("outcome").is_none());
     }
 
     #[tokio::test]
@@ -429,6 +454,13 @@ mod tests {
             },
             other => panic!("expected TradeUpdate message, got {other:?}"),
         }
+
+        let unexpected =
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
+        assert!(
+            unexpected.is_err(),
+            "failed outcomes must not be broadcast as legacy fills"
+        );
     }
 
     #[tokio::test]
