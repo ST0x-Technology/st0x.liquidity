@@ -286,8 +286,8 @@ create and migrate the local database before any cargo commands.
 **Verifying a migration against real data**: `sqlx db reset -y` only proves a
 migration applies to an empty schema, not that it behaves correctly against real
 prod/staging data or that legacy events still deserialize under current code.
-While developing a migration, run `nix run .#prod-verify-migrations` (or
-`.#staging-verify-migrations`) -- it takes a _consistent_ server-side
+While developing a migration, run `nix run .#prodVerifyMigrations` (or
+`.#stagingVerifyMigrations`) -- it takes a _consistent_ server-side
 `VACUUM INTO` snapshot of the live database (`<env>-db-snapshot` in
 `infra/default.nix`; a plain `scp` of a live WAL-mode SQLite file can race the
 bot's writes and download a torn/corrupt copy, so never `scp` the `.db` file

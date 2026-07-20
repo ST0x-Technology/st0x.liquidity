@@ -131,6 +131,18 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(TaskSink::push(&mut self.0, task).await?)
     }
 
+    /// Enqueues at most one row for a stable domain identity.
+    pub(crate) async fn push_idempotent(
+        &mut self,
+        idempotency_key: &str,
+        task: Task,
+    ) -> Result<(), QueuePushError> {
+        let task = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .with_idempotency_key(idempotency_key)
+            .build();
+        Ok(TaskSink::push_task(&mut self.0, task).await?)
+    }
+
     /// Schedules a task to run after `delay` from now. Used by self-rescheduling
     /// jobs (e.g. status pollers waiting for a broker to fill an order) to
     /// avoid burning the retry budget on a successful poll that simply hasn't
@@ -465,6 +477,7 @@ pub enum JobKind {
     TransferEquityToMarketMaking,
     TransferEquityToHedging,
     ResumeTokenizationAggregate,
+    DashboardTradeDelivery,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -506,6 +519,7 @@ pub struct FailureInjector {
     transfer_equity_to_market_making: Arc<Mutex<InjectionState>>,
     transfer_equity_to_hedging: Arc<Mutex<InjectionState>>,
     resume_tokenization_aggregate: Arc<Mutex<InjectionState>>,
+    dashboard_trade_delivery: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -545,6 +559,7 @@ impl FailureInjector {
             transfer_equity_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_equity_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
             resume_tokenization_aggregate: Arc::new(Mutex::new(InjectionState::Idle)),
+            dashboard_trade_delivery: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -596,6 +611,7 @@ impl FailureInjector {
             JobKind::TransferEquityToMarketMaking => &self.transfer_equity_to_market_making,
             JobKind::TransferEquityToHedging => &self.transfer_equity_to_hedging,
             JobKind::ResumeTokenizationAggregate => &self.resume_tokenization_aggregate,
+            JobKind::DashboardTradeDelivery => &self.dashboard_trade_delivery,
         };
 
         match mutex.lock() {
