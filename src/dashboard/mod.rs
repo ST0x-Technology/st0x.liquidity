@@ -1,18 +1,19 @@
 //! WebSocket-based dashboard for real-time server state streaming.
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
+use serde::Deserialize;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::{info, trace, warn};
 
 use st0x_config::{ExecutionThreshold, OperationMode};
-use st0x_dto::{CurrentState, Statement};
+use st0x_dto::{CurrentState, Statement, Trade, TradeOutcome};
 use st0x_event_sorcery::{load_all_ids, load_entity};
 use st0x_finance::Positive;
 
@@ -25,8 +26,61 @@ mod trade_loader;
 pub(crate) mod transfer_loader;
 pub(crate) use event::Broadcaster;
 
-async fn ws_endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TradeProtocol {
+    #[default]
+    LegacyFills,
+    TerminalOutcomesV1,
+}
+
+impl TradeProtocol {
+    fn includes_trade(self, trade: &Trade) -> bool {
+        match self {
+            Self::LegacyFills => match trade.outcome {
+                TradeOutcome::Filled => true,
+                TradeOutcome::Failed { .. } => false,
+            },
+            Self::TerminalOutcomesV1 => match trade.outcome {
+                TradeOutcome::Filled | TradeOutcome::Failed { .. } => true,
+            },
+        }
+    }
+
+    fn includes_statement(self, statement: &Statement) -> bool {
+        match self {
+            Self::LegacyFills => match statement {
+                Statement::TradeUpdate(_) => false,
+                Statement::CurrentState(_)
+                | Statement::TradeFill(_)
+                | Statement::PositionUpdate(_)
+                | Statement::InventorySnapshot(_)
+                | Statement::TransferUpdate(_) => true,
+            },
+            Self::TerminalOutcomesV1 => match statement {
+                Statement::TradeFill(_) => false,
+                Statement::CurrentState(_)
+                | Statement::TradeUpdate(_)
+                | Statement::PositionUpdate(_)
+                | Statement::InventorySnapshot(_)
+                | Statement::TransferUpdate(_) => true,
+            },
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct WebSocketQuery {
+    #[serde(default)]
+    trade_protocol: TradeProtocol,
+}
+
+async fn ws_endpoint(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(query): Query<WebSocketQuery>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state, query.trade_protocol))
 }
 
 /// Outcome of attempting to send a serialized message over the socket.
@@ -53,16 +107,16 @@ async fn send_json(sink: &mut SplitSink<WebSocket, Message>, value: &Statement) 
     SendOutcome::Sent
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, trade_protocol: TradeProtocol) {
     let mut receiver = state.event_sender.subscribe();
     let (mut sink, mut stream) = socket.split();
 
-    if !send_initial_state(&mut sink, &state).await {
+    if !send_initial_state(&mut sink, &state, trade_protocol).await {
         return;
     }
 
     tokio::select! {
-        () = stream_broadcasts(&mut sink, &mut receiver) => {}
+        () = stream_broadcasts(&mut sink, &mut receiver, trade_protocol) => {}
         () = drain_client_messages(&mut stream) => {}
     }
 }
@@ -83,16 +137,21 @@ async fn drain_client_messages(stream: &mut futures_util::stream::SplitStream<We
     }
 }
 
-async fn send_initial_state(sink: &mut SplitSink<WebSocket, Message>, state: &AppState) -> bool {
+async fn send_initial_state(
+    sink: &mut SplitSink<WebSocket, Message>,
+    state: &AppState,
+    trade_protocol: TradeProtocol,
+) -> bool {
     let inventory_dto = state.inventory.read().await.to_dto();
     let transfers = transfer_loader::load_transfers(&state.pool).await;
-    let trades = match trade_loader::load_trades(&state.pool).await {
+    let mut trades = match trade_loader::load_trades(&state.pool).await {
         Ok(trades) => trades,
         Err(error) => {
             warn!(target: "dashboard", %error, "Failed to load initial trade history");
             return false;
         }
     };
+    trades.retain(|trade| trade_protocol.includes_trade(trade));
     let positions = load_positions(&state.pool).await;
 
     let initial = Statement::CurrentState(Box::new(CurrentState {
@@ -117,10 +176,14 @@ async fn send_initial_state(sink: &mut SplitSink<WebSocket, Message>, state: &Ap
 async fn stream_broadcasts(
     sink: &mut SplitSink<WebSocket, Message>,
     receiver: &mut broadcast::Receiver<Statement>,
+    trade_protocol: TradeProtocol,
 ) {
     loop {
         match receiver.recv().await {
             Ok(msg) => {
+                if !trade_protocol.includes_statement(&msg) {
+                    continue;
+                }
                 trace!(target: "dashboard", ?msg, "Broadcasting to dashboard client");
                 match send_json(sink, &msg).await {
                     SendOutcome::Sent => {}
@@ -319,7 +382,10 @@ mod tests {
     use st0x_config::{EquityAssetConfig, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{ClientOrderId, FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_execution::{
+        ClientOrderId, ExecutorOrderId, FractionalShares, MarketSession, Positive,
+        SupportedExecutor, Symbol, Usd,
+    };
     use st0x_float_macro::float;
 
     use super::*;
@@ -339,6 +405,24 @@ mod tests {
             shares: st0x_finance::FractionalShares::new(st0x_float_macro::float!(1)),
             outcome: st0x_dto::TradeOutcome::Filled,
         })
+    }
+
+    #[test]
+    fn trade_protocol_routes_only_its_trade_statement_version() {
+        let Statement::TradeUpdate(trade) = dummy_fill("AAPL") else {
+            panic!("dummy fill should be a trade update")
+        };
+        let legacy_fill = Statement::TradeFill(
+            trade
+                .legacy_fill()
+                .expect("filled trade should have a legacy representation"),
+        );
+        let trade_update = Statement::TradeUpdate(trade);
+
+        assert!(TradeProtocol::LegacyFills.includes_statement(&legacy_fill));
+        assert!(!TradeProtocol::LegacyFills.includes_statement(&trade_update));
+        assert!(TradeProtocol::TerminalOutcomesV1.includes_statement(&trade_update));
+        assert!(!TradeProtocol::TerminalOutcomesV1.includes_statement(&legacy_fill));
     }
 
     fn empty_settings() -> st0x_dto::Settings {
@@ -587,6 +671,44 @@ mod tests {
             )
             .await
             .unwrap();
+        let filled_id = OffchainOrderId::new();
+        store
+            .send(
+                &filled_id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(filled_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &filled_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("broker-fill"),
+                    placed_shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                    submitted_at: chrono::Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &filled_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(100)),
+                    filled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
         store
             .send(
                 &id,
@@ -598,7 +720,26 @@ mod tests {
             .unwrap();
 
         let mut server = start_test_server_with_state(state).await;
-        let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+        let legacy_url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+        let (mut legacy_client, _) = connect_async(&legacy_url).await.unwrap();
+        let legacy_message = legacy_client
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let legacy_state: serde_json::Value = serde_json::from_str(&legacy_message).unwrap();
+        assert_eq!(legacy_state["data"]["trades"].as_array().unwrap().len(), 1);
+        let legacy_trade = &legacy_state["data"]["trades"][0];
+        assert_eq!(legacy_trade["id"], filled_id.to_string());
+        assert!(legacy_trade["filledAt"].as_str().is_some());
+        assert_eq!(legacy_trade["outcome"]["status"], "filled");
+
+        let url = format!(
+            "ws://127.0.0.1:{}/api/ws?trade_protocol=terminal_outcomes_v1",
+            server.port
+        );
         let (mut client, _) = connect_async(&url).await.unwrap();
         let message = client.next().await.unwrap().unwrap().into_text().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
@@ -611,6 +752,46 @@ mod tests {
         assert_eq!(trade["outcome"]["filledShares"], "0");
         assert_eq!(trade["outcome"]["remainingShares"], "1");
         assert_eq!(trade["outcome"]["excessShares"], "0");
+
+        let live_trade = Trade {
+            id: "live-fill".to_string(),
+            occurred_at: chrono::Utc::now(),
+            venue: TradingVenue::Raindex,
+            direction: Direction::Buy,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: FractionalShares::new(float!(1)),
+            outcome: TradeOutcome::Filled,
+        };
+        server
+            .event_sender
+            .send(Statement::TradeUpdate(live_trade.clone()))
+            .unwrap();
+        server
+            .event_sender
+            .send(Statement::TradeFill(live_trade.legacy_fill().unwrap()))
+            .unwrap();
+
+        let legacy_live: serde_json::Value = serde_json::from_str(
+            &legacy_client
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_live["type"], "trade_fill");
+        assert_eq!(legacy_live["data"]["id"], "live-fill");
+        assert!(legacy_live["data"]["filledAt"].as_str().is_some());
+        assert!(legacy_live["data"].get("outcome").is_none());
+
+        let canonical_live: serde_json::Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(canonical_live["type"], "trade_update");
+        assert_eq!(canonical_live["data"]["id"], "live-fill");
+        assert_eq!(canonical_live["data"]["outcome"]["status"], "filled");
 
         server.shutdown().await;
     }
@@ -657,7 +838,10 @@ mod tests {
     #[tokio::test]
     async fn broadcast_message_reaches_connected_clients() {
         let mut server = start_test_server().await;
-        let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+        let url = format!(
+            "ws://127.0.0.1:{}/api/ws?trade_protocol=terminal_outcomes_v1",
+            server.port
+        );
 
         let (mut client1, _) = connect_async(&url)
             .await
@@ -699,7 +883,10 @@ mod tests {
     #[tokio::test]
     async fn client_disconnect_does_not_affect_other_clients() {
         let mut server = start_test_server().await;
-        let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+        let url = format!(
+            "ws://127.0.0.1:{}/api/ws?trade_protocol=terminal_outcomes_v1",
+            server.port
+        );
 
         let (mut client1, _) = connect_async(&url)
             .await
@@ -737,7 +924,10 @@ mod tests {
     #[tokio::test]
     async fn new_client_receives_initial_not_previous_broadcasts() {
         let mut server = start_test_server().await;
-        let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+        let url = format!(
+            "ws://127.0.0.1:{}/api/ws?trade_protocol=terminal_outcomes_v1",
+            server.port
+        );
 
         let (mut client1, _) = connect_async(&url)
             .await

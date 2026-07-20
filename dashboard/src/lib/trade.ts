@@ -1,9 +1,24 @@
 import type { Trade } from '$lib/api/Trade'
 import type { TradeOutcome } from '$lib/api/TradeOutcome'
 import type { TradingVenue } from '$lib/api/TradingVenue'
+import type { LegacyTrade } from '$lib/api/LegacyTrade'
 import { matcher } from '$lib/fp'
 
 const matchOutcome = matcher<TradeOutcome>()('status')
+
+export const normalizeTrade = (trade: Trade | LegacyTrade): Trade => {
+  if ('occurredAt' in trade) return trade
+
+  return {
+    id: trade.id,
+    occurredAt: trade.filledAt,
+    venue: trade.venue,
+    direction: trade.direction,
+    symbol: trade.symbol,
+    shares: trade.shares,
+    outcome: { status: 'filled' }
+  }
+}
 
 export const tradeOutcomeLabel = (outcome: TradeOutcome): string =>
   matchOutcome(outcome, {
@@ -64,6 +79,39 @@ const parseOnchainTradeId = (id: string): { txHash: string; logIndex: bigint } |
 const compareStrings = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0
 
+type UtcTimestampParts = {
+  wholeSeconds: number
+  fraction: string
+}
+
+const parseUtcTimestamp = (timestamp: string): UtcTimestampParts | null => {
+  const match = /^(.*:\d{2})(?:\.(\d+))?Z$/.exec(timestamp)
+  if (match === null) return null
+
+  const [, wholeTimestamp, fraction = ''] = match
+  if (wholeTimestamp === undefined) return null
+
+  const wholeSeconds = Date.parse(`${wholeTimestamp}Z`)
+  return Number.isNaN(wholeSeconds) ? null : { wholeSeconds, fraction }
+}
+
+const compareRfc3339Timestamps = (left: string, right: string): number => {
+  const leftParts = parseUtcTimestamp(left)
+  const rightParts = parseUtcTimestamp(right)
+  if (leftParts !== null && rightParts !== null) {
+    const secondsComparison = leftParts.wholeSeconds - rightParts.wholeSeconds
+    if (secondsComparison !== 0) return secondsComparison
+
+    const precision = Math.max(leftParts.fraction.length, rightParts.fraction.length)
+    return compareStrings(
+      leftParts.fraction.padEnd(precision, '0'),
+      rightParts.fraction.padEnd(precision, '0')
+    )
+  }
+
+  return Date.parse(left) - Date.parse(right)
+}
+
 const compareTradeIds = (left: Trade, right: Trade): number => {
   if (left.venue === 'raindex' && right.venue === 'raindex') {
     const leftId = parseOnchainTradeId(left.id)
@@ -76,6 +124,9 @@ const compareTradeIds = (left: Trade, right: Trade): number => {
   return compareStrings(left.id, right.id)
 }
 
+export const compareTradesNewestFirst = (left: Trade, right: Trade): number =>
+  compareRfc3339Timestamps(right.occurredAt, left.occurredAt) || compareTradeIds(left, right)
+
 export const mergeTradeHistory = (
   current: Trade[],
   live: Trade[],
@@ -86,8 +137,5 @@ export const mergeTradeHistory = (
 
   return [...byId.values()]
     .filter((trade) => matchesHistoryFilter(trade, filter))
-    .sort(
-      (left, right) =>
-        Date.parse(right.occurredAt) - Date.parse(left.occurredAt) || compareTradeIds(left, right)
-    )
+    .sort(compareTradesNewestFirst)
 }

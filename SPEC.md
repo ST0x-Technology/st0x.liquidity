@@ -4007,6 +4007,20 @@ multiple broker-specific contexts.
    history unavailable. Terminal outcomes appear in both initial history and
    live dashboard updates.
 
+   Dashboard trade messages remain compatible during rolling deploys. The
+   canonical protocol sends every terminal outcome as `trade_update`. Filled
+   outcomes also carry the legacy `filledAt` timestamp field and are broadcast
+   as a legacy `trade_fill`, so an older dashboard connected to a newer backend
+   continues to receive fills. Snapshot, HTTP, and live protocols default to
+   legacy filled-only behavior; a newer dashboard opts into terminal outcomes
+   with `trade_protocol=terminal_outcomes_v1`. Old backends ignore that query
+   parameter. A newer dashboard accepts legacy `trade_fill` messages and legacy
+   snapshot/HTTP trade rows, normalizing them to a filled outcome before merging
+   by trade ID. Failed outcomes are sent only through the canonical protocol.
+   Trade ordering compares the complete RFC 3339 timestamp, including
+   sub-millisecond precision, then uses the same stable trade-ID tie-breaker for
+   initial history and live updates.
+
 5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
    event type, timestamp). Starts empty, populates via WebSocket.
 

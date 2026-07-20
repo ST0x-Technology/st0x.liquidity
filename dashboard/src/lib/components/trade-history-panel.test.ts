@@ -3,6 +3,7 @@
 import { QueryClient } from '@tanstack/svelte-query'
 import { mount, tick, unmount } from 'svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { LegacyTrade } from '$lib/api/LegacyTrade'
 import type { Statement } from '$lib/api/Statement'
 import type { Trade } from '$lib/api/Trade'
 import { createWebSocket } from '$lib/websocket'
@@ -73,7 +74,7 @@ const setupTestWebSocket = () => {
   }
 }
 
-const tradeResponse = (entries: Trade[], total: number, hasMore = false): Response =>
+const tradeResponse = (entries: Array<Trade | LegacyTrade>, total: number, hasMore = false): Response =>
   new Response(JSON.stringify({ entries, total, hasMore }), {
     status: 200,
     headers: { 'content-type': 'application/json' }
@@ -96,6 +97,29 @@ const mountPanel = () => {
 describe('TradeHistoryPanel', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it('normalizes legacy REST fills from an old server', async () => {
+    const legacyTrade: LegacyTrade = {
+      id: 'legacy-rest-fill',
+      filledAt: '2026-01-01T00:00:00.123456789Z',
+      venue: 'alpaca',
+      direction: 'sell',
+      symbol: 'TSLA',
+      shares: '2'
+    }
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(tradeResponse([legacyTrade], 1))))
+
+    const { target, component } = mountPanel()
+
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('TSLA')
+      expect(target.textContent).toContain('Filled')
+      expect(target.textContent).toContain('1 of 1')
+    })
+
+    await unmount(component)
+    target.remove()
   })
 
   it('renders initial failures and replaces live rows with an authoritative total', async () => {
@@ -158,6 +182,10 @@ describe('TradeHistoryPanel', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('limit=100'), expect.any(Object))
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('trade_protocol=terminal_outcomes_v1'),
+      expect.any(Object)
+    )
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
     connection.disconnect()

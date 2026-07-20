@@ -130,4 +130,18 @@ describe('live trade history', () => {
       })
     ).toEqual([log2, log10])
   })
+
+  it('preserves sub-millisecond RFC 3339 ordering', () => {
+    const earlier = trade({ id: 'a-earlier', occurredAt: '2026-01-01T00:00:00.123456788Z' })
+    const later = trade({ id: 'z-later', occurredAt: '2026-01-01T00:00:00.123456789Z' })
+
+    expect(
+      mergeTradeHistory([earlier], [later], {
+        venues: new Set(['alpaca']),
+        symbols: new Set(),
+        since: null,
+        until: null
+      })
+    ).toEqual([later, earlier])
+  })
 })
