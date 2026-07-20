@@ -55,7 +55,7 @@ use st0x_wrapper::WrapperService;
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
-use crate::dashboard::Broadcaster;
+use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
@@ -560,10 +560,11 @@ impl Conductor {
         setup_apalis_tables(&apalis_pool).await?;
         let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
+        let dashboard_delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender);
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
-        let broadcaster = Arc::new(Broadcaster::new(event_sender.clone(), pool.clone()));
 
-        let onchain_trade = setup_onchain_trade_store(&pool, broadcaster.clone()).await?;
+        let onchain_trade =
+            setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
 
         let (vault_registry, vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -620,7 +621,7 @@ impl Conductor {
                 apalis_pool: apalis_pool.clone(),
                 ctx: ctx.clone(),
                 inventory: inventory.clone(),
-                event_sender: event_sender.clone(),
+                broadcaster: dashboard_delivery.broadcaster.clone(),
                 vault_registry: vault_registry.clone(),
                 vault_registry_projection,
                 schedulers: schedulers.clone(),
@@ -658,9 +659,11 @@ impl Conductor {
             &executor,
             &position,
             &position_projection,
-            broadcaster,
+            dashboard_delivery.broadcaster.clone(),
         )
         .await?;
+
+        dashboard_delivery.reconcile(&pool).await?;
 
         let frameworks = CqrsFrameworks {
             onchain_trade,
@@ -747,6 +750,9 @@ impl Conductor {
             .context(conductor_ctx)
             .job_queue(job_queue)
             .backfill_queue(backfill_queue)
+            .dashboard_trade_delivery_queue(dashboard_delivery.queue)
+            .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
+            .dashboard_trade_handoff_monitor(dashboard_delivery.handoff_monitor)
             .hedge_queue(hedge_queue)
             .poll_status_queue(poll_status_queue)
             .reconcile_queue(reconcile_queue)
@@ -1161,7 +1167,7 @@ struct RebalancingDeps {
     apalis_pool: apalis_sqlite::SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_sender: broadcast::Sender<Statement>,
+    broadcaster: Arc<Broadcaster>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     schedulers: RebalancingSchedulers,
@@ -1249,11 +1255,10 @@ impl PositionAndRebalancing {
             let RebalancingDeps {
                 pool,
                 inventory,
-                event_sender,
+                broadcaster,
                 ..
             } = deps;
 
-            let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
             let (position, position_projection) = build_position_cqrs(&pool, broadcaster).await?;
 
             // Without the service, the projection is the only subscriber
@@ -1512,7 +1517,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
-        let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
         let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
         let equity_timing = EquityTimingProjection::new(deps.pool.clone());
@@ -1521,7 +1525,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let manifest = QueryManifest::new(
             rebalancing_service.clone(),
-            broadcaster,
+            deps.broadcaster,
             hedge_latency,
             rebalance_timing,
             equity_timing,
@@ -3599,6 +3603,7 @@ mod tests {
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::conductor::builder::CqrsFrameworks;
+    use crate::dashboard::{DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue};
     use crate::equity_redemption::{EquityRedemptionCommand, redemption_aggregate_id};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
@@ -3762,15 +3767,24 @@ mod tests {
         }
     }
 
-    fn test_broadcaster(pool: &SqlitePool) -> (Arc<Broadcaster>, broadcast::Receiver<Statement>) {
+    fn test_broadcaster(
+        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> (
+        Arc<Broadcaster>,
+        broadcast::Receiver<Statement>,
+        DashboardTradeDeliveryJobQueue,
+        Arc<DashboardTradeDeliveryCtx>,
+    ) {
         let (sender, receiver) = broadcast::channel(16);
-        (Arc::new(Broadcaster::new(sender, pool.clone())), receiver)
+        let delivery = DashboardTradeDelivery::new(apalis_pool, pool, sender);
+        (delivery.broadcaster, receiver, delivery.queue, delivery.ctx)
     }
 
     #[tokio::test]
-    async fn onchain_trade_store_broadcasts_filled_trades() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let (broadcaster, mut receiver) = test_broadcaster(&pool);
+    async fn onchain_trade_store_enqueues_terminal_dashboard_delivery() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, _receiver, queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
         let store = setup_onchain_trade_store(&pool, broadcaster).await.unwrap();
         let id = crate::onchain_trade::OnChainTradeId {
             tx_hash: TxHash::ZERO,
@@ -3792,28 +3806,25 @@ mod tests {
             .await
             .unwrap();
 
-        let message = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .expect("wired store should broadcast the onchain fill")
-            .expect("dashboard receiver should remain connected");
-        assert!(matches!(
-            message,
-            Statement::TradeUpdate(st0x_dto::Trade {
-                venue: st0x_dto::TradingVenue::Raindex,
-                outcome: st0x_dto::TradeOutcome::Filled,
-                ..
-            })
-        ));
+        let pending: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<crate::dashboard::DeliverDashboardTrade>())
+        .fetch_one(queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(pending, 1, "production store wiring must enqueue the fill");
     }
 
     #[tokio::test]
     async fn offchain_order_store_broadcasts_failed_counter_trades() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
             .await
             .unwrap();
-        let (broadcaster, mut receiver) = test_broadcaster(&pool);
+        let (broadcaster, mut receiver, queue, delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
         let (offchain_order, _) = setup_offchain_order_store(
             &pool,
             &MockExecutor::new(),
@@ -3839,6 +3850,7 @@ mod tests {
             )
             .await
             .unwrap();
+
         offchain_order
             .send(
                 &id,
@@ -3846,6 +3858,19 @@ mod tests {
                     error: "asset is not tradable".to_string(),
                 },
             )
+            .await
+            .unwrap();
+
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ? LIMIT 1",
+        )
+        .bind(std::any::type_name::<crate::dashboard::DeliverDashboardTrade>())
+        .fetch_one(queue.pool())
+        .await
+        .unwrap();
+        let job: crate::dashboard::DeliverDashboardTrade =
+            serde_json::from_slice(&payload).unwrap();
+        crate::conductor::job::Job::perform(&job, &delivery_ctx)
             .await
             .unwrap();
 
@@ -8378,12 +8403,13 @@ mod tests {
 
     #[tokio::test]
     async fn restart_hydrates_position_view_from_persisted_events() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         // First "session": create position store, execute commands.
         {
-            let (broadcaster, _receiver) = test_broadcaster(&pool);
+            let (broadcaster, _receiver, _queue, _delivery_ctx) =
+                test_broadcaster(&pool, &apalis_pool);
             let (position_store, position_projection) =
                 build_position_cqrs(&pool, broadcaster).await.unwrap();
 
@@ -8419,7 +8445,8 @@ mod tests {
 
         // Second "session": create NEW position store against the same pool.
         {
-            let (broadcaster, _receiver) = test_broadcaster(&pool);
+            let (broadcaster, _receiver, _queue, _delivery_ctx) =
+                test_broadcaster(&pool, &apalis_pool);
             let (_position_store, position_projection) =
                 build_position_cqrs(&pool, broadcaster).await.unwrap();
 
@@ -8444,9 +8471,10 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_position_cqrs_broadcasts_live_position_updates() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let (broadcaster, mut receiver) = test_broadcaster(&pool);
+        let (broadcaster, mut receiver, _queue, _delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
         let (position_store, _position_projection) =
             build_position_cqrs(&pool, broadcaster).await.unwrap();
 
@@ -8505,6 +8533,7 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
+        let dashboard_delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender);
 
         let position_and_rebalancing = PositionAndRebalancing::setup(
             None,
@@ -8513,7 +8542,7 @@ mod tests {
                 apalis_pool: apalis_pool.clone(),
                 ctx: ctx.clone(),
                 inventory,
-                event_sender,
+                broadcaster: dashboard_delivery.broadcaster,
                 vault_registry,
                 vault_registry_projection,
                 schedulers: RebalancingSchedulers::new(&apalis_pool),
