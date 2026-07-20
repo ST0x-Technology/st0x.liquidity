@@ -4021,6 +4021,19 @@ multiple broker-specific contexts.
    sub-millisecond precision, then uses the same stable trade-ID tie-breaker for
    initial history and live updates.
 
+   Every dashboard transport validates trade payloads at runtime before they
+   enter client state. Snapshot, live WebSocket, and paginated HTTP paths use
+   the same validation rules for the canonical and legacy wire shapes:
+   timestamps must be valid UTC RFC 3339 values, venues/directions/outcomes must
+   be known variants, the total share quantity must be positive, and outcome
+   quantities must be non-negative decimal strings. An invalid payload is
+   reported visibly and leaves the last known-good trade state unchanged. The
+   remaining domains from an otherwise valid snapshot still refresh. An invalid
+   WebSocket payload closes the connection, shows the reconnect banner, and
+   retries with bounded exponential backoff. The Rust trade DTO encodes the
+   positive total-quantity invariant so an invalid trade cannot be constructed
+   or deserialized at the server boundary.
+
    Terminal trade live updates are delivered through a persistent delivery
    ledger and job queue, not directly from the CQRS reactor. The ledger is keyed
    by trade ID. The reactor attempts to register the outcome and idempotently

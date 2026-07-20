@@ -96,6 +96,7 @@ const mountPanel = () => {
 
 describe('TradeHistoryPanel', () => {
   afterEach(() => {
+    vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
 
@@ -237,6 +238,121 @@ describe('TradeHistoryPanel', () => {
     })
 
     connection.disconnect()
+    await unmount(component)
+    target.remove()
+  })
+
+  it('reports an invalid refresh without replacing known-good history', async () => {
+    const invalidResponse = new Response(
+      JSON.stringify({
+        entries: [failedTrade('invalid', { shares: '0' })],
+        total: 1,
+        hasMore: false
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      }
+    )
+    const fetchMock = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(tradeResponse([staleTrade], 1))
+      .mockResolvedValueOnce(invalidResponse)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target, component } = mountPanel()
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('SPCX')
+      expect(target.textContent).toContain('1 of 1')
+    })
+
+    const refresh = [...target.querySelectorAll('button')].find(
+      (button) => button.textContent.trim() === 'Refresh'
+    )
+    expect(refresh).toBeDefined()
+    refresh?.click()
+
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain(
+        'Failed to load trades: Invalid trade payload at entries[0].shares'
+      )
+      expect(target.textContent).toContain('SPCX')
+      expect(target.textContent).toContain('1 of 1')
+    })
+
+    await unmount(component)
+    target.remove()
+  })
+
+  it('retries the same page after a failed append', async () => {
+    const fetchMock = vi
+      .fn<(url: string, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(tradeResponse([staleTrade], 201, true))
+      .mockResolvedValueOnce(new Response(null, { status: 500 }))
+      .mockResolvedValueOnce(tradeResponse([failedTrade('older-trade')], 201, true))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target, component } = mountPanel()
+    await vi.waitFor(() => expect(target.textContent).toContain('1 of 201'))
+
+    const findLoadMore = (): HTMLButtonElement | undefined =>
+      [...target.querySelectorAll('button')].find(
+        (button) => button.textContent.trim() === 'Load older trades'
+      )
+
+    findLoadMore()?.click()
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('Failed to load trades: HTTP 500')
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    })
+
+    findLoadMore()?.click()
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('2 of 201')
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+    })
+
+    const requestedUrls = fetchMock.mock.calls.map(([url]) => url)
+    expect(requestedUrls[1]).toContain('offset=100')
+    expect(requestedUrls[2]).toContain('offset=100')
+
+    await unmount(component)
+    target.remove()
+  })
+
+  it('does not let polling supersede an in-flight page load', async () => {
+    let poll: (() => void) | undefined
+    vi.spyOn(globalThis, 'setInterval').mockImplementation((handler) => {
+      poll = handler as () => void
+      return {} as ReturnType<typeof setInterval>
+    })
+    let resolveOlder: ((response: Response) => void) | undefined
+    const fetchMock = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(tradeResponse([staleTrade], 201, true))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveOlder = resolve
+          })
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target, component } = mountPanel()
+    await vi.waitFor(() => expect(target.textContent).toContain('1 of 201'))
+
+    const loadMore = [...target.querySelectorAll('button')].find(
+      (button) => button.textContent.trim() === 'Load older trades'
+    )
+    loadMore?.click()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    poll?.()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    resolveOlder?.(tradeResponse([failedTrade('older-trade')], 201, true))
+    await vi.waitFor(() => expect(target.textContent).toContain('2 of 201'))
+
     await unmount(component)
     target.remove()
   })

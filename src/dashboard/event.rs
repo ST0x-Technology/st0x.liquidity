@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use st0x_dto::{Statement, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{EntityList, Reactor, SendError, deps, load_entity};
+use st0x_finance::{FractionalShares, NotPositive, Positive};
 
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::EquityRedemption;
@@ -727,6 +728,8 @@ enum DashboardTradePersistenceError {
 pub(crate) enum DashboardTradeEnqueueError {
     #[error("dashboard trade handoff retry queue closed before retaining the outcome: {0}")]
     RetryQueue(#[from] mpsc::error::SendError<DashboardTradeHandoff>),
+    #[error("terminal trade quantity is not positive: {0}")]
+    Quantity(#[from] NotPositive<FractionalShares>),
 }
 
 #[async_trait]
@@ -753,7 +756,7 @@ impl Reactor for Broadcaster {
                         venue: TradingVenue::Raindex,
                         direction,
                         symbol,
-                        shares: st0x_finance::FractionalShares::new(amount),
+                        shares: Positive::new(FractionalShares::new(amount))?,
                         outcome: TradeOutcome::Filled,
                     })
                     .await?;
@@ -889,7 +892,7 @@ mod tests {
             venue: TradingVenue::Alpaca,
             direction: st0x_execution::Direction::Sell,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: st0x_finance::FractionalShares::new(st0x_float_macro::float!(1)),
+            shares: Positive::new(FractionalShares::new(st0x_float_macro::float!(1))).unwrap(),
             outcome: TradeOutcome::Filled,
         }
     }

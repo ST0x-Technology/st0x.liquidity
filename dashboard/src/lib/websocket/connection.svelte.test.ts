@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { createWebSocket } from '.'
 import { QueryClient } from '@tanstack/svelte-query'
+import type { CurrentState } from '$lib/api/CurrentState'
 import type { Statement } from '$lib/api/Statement'
 import type { Trade } from '$lib/api/Trade'
 import type { TransferOperation } from '$lib/api/TransferOperation'
@@ -94,6 +95,49 @@ const makeTransfer = (overrides: Partial<TransferOperation> = {}): TransferOpera
     updatedAt: '2024-01-01T12:00:00Z',
     ...overrides
   }) as TransferOperation
+
+const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState => ({
+  trades: [makeTrade()],
+  inventory: {
+    perSymbol: [],
+    usdc: {
+      onchainAvailable: '0',
+      onchainInflight: '0',
+      offchainAvailable: '0',
+      offchainInflight: '0',
+      offchainGross: null,
+      withdrawableCash: null,
+      alpacaUsdc: null,
+      inflightCash: {
+        ethereumWallet: null,
+        baseWallet: null
+      }
+    }
+  },
+  positions: [],
+  settings: {
+    equityTarget: 0.5,
+    equityDeviation: 0.2,
+    usdcTarget: null,
+    usdcDeviation: null,
+    cashReserved: null,
+    executionThreshold: '$2',
+    assets: [],
+    wallet: null,
+    logLevel: 'Debug',
+    serverPort: 8001,
+    orderbook: '0x0',
+    deploymentBlock: 0,
+    tradingMode: 'standalone',
+    broker: 'dry_run',
+    orderPollingInterval: 5,
+    inventoryPollInterval: 15
+  },
+  activeTransfers: [],
+  recentTransfers: [],
+  warnings: [],
+  ...overrides
+})
 
 const setupWebSocketTest = () => {
   const instances: MockWebSocket[] = []
@@ -190,44 +234,11 @@ describe('createWebSocket', () => {
 
       const message: Statement = {
         type: 'current_state',
-        data: {
+        data: makeCurrentState({
           trades: [trade],
-          inventory: {
-            perSymbol: [],
-            usdc: {
-              onchainAvailable: '0',
-              onchainInflight: '0',
-              offchainAvailable: '0',
-              offchainInflight: '0',
-              offchainGross: null,
-              withdrawableCash: null,
-              alpacaUsdc: null,
-              inflightCash: { ethereumWallet: null, baseWallet: null }
-            }
-          },
-          positions: [],
-          settings: {
-            equityTarget: 0.5,
-            equityDeviation: 0.2,
-            usdcTarget: null,
-            usdcDeviation: null,
-            cashReserved: null,
-            executionThreshold: '$2',
-            assets: [],
-            wallet: null,
-            logLevel: 'Debug',
-            serverPort: 8001,
-            orderbook: '0x0',
-            deploymentBlock: 0,
-            tradingMode: 'standalone',
-            broker: 'dry_run',
-            orderPollingInterval: 5,
-            inventoryPollInterval: 15
-          },
           activeTransfers: [activeTransfer],
-          recentTransfers: [recentTransfer],
-          warnings: []
-        }
+          recentTransfers: [recentTransfer]
+        })
       }
 
       getInstance(0).simulateMessage(message)
@@ -359,6 +370,72 @@ describe('createWebSocket', () => {
           outcome: { status: 'filled' }
         }
       ])
+    })
+
+    it.each([
+      [
+        'initial snapshot',
+        {
+          type: 'current_state',
+          data: { trades: [makeTrade({ shares: '0' })] }
+        }
+      ],
+      [
+        'live update',
+        {
+          type: 'trade_update',
+          data: makeTrade({ shares: '0' })
+        }
+      ]
+    ])('rejects an invalid trade from %s without replacing the cache', (_case, message) => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const knownGood = makeTrade({ id: 'known-good' })
+      queryClient.cache.set('["trades"]', [knownGood])
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(JSON.stringify(message))
+
+      expect(queryClient.cache.get('["trades"]')).toEqual([knownGood])
+      expect(ws.state).toBe('error')
+      expect(ws.error?.message).toContain('Invalid trade payload')
+      expect(consoleError).toHaveBeenCalledWith(
+        'Failed to parse WebSocket message:',
+        expect.objectContaining({ message: expect.stringContaining('shares') }),
+        'Raw data:',
+        JSON.stringify(message)
+      )
+    })
+
+    it('seeds non-trade snapshot domains when a snapshot trade is invalid', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const knownGood = makeTrade({ id: 'known-good' })
+      const activeTransfer = makeTransfer({ id: 'fresh-transfer' })
+      const state = makeCurrentState({
+        trades: [makeTrade({ shares: '0' })],
+        activeTransfers: [activeTransfer]
+      })
+      queryClient.cache.set('["trades"]', [knownGood])
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(
+        JSON.stringify({
+          type: 'current_state',
+          data: state
+        })
+      )
+
+      expect(queryClient.cache.get('["trades"]')).toEqual([knownGood])
+      expect(queryClient.cache.get('["inventory"]')).toEqual(state.inventory)
+      expect(queryClient.cache.get('["transfers","active"]')).toEqual([activeTransfer])
+      expect(ws.state).toBe('error')
     })
 
     it('replaces a matching initial trade with its live update', () => {
@@ -514,6 +591,7 @@ describe('createWebSocket', () => {
       expect(ws.state).toBe('error')
       expect(ws.error).not.toBeNull()
       expect(ws.error?.attempts).toBe(1)
+      expect(ws.error?.message).toBe('WebSocket connection error')
     })
 
     it('reconnects after delay', () => {
@@ -544,7 +622,38 @@ describe('createWebSocket', () => {
       getInstance(1).simulateOpen()
 
       expect(ws.state).toBe('connected')
+      expect(ws.error).not.toBeNull()
+
+      getInstance(1).simulateMessage({ type: 'trade_update', data: makeTrade() })
+
       expect(ws.error).toBeNull()
+    })
+
+    it('backs off repeated invalid messages until a valid message arrives', () => {
+      const { instances, getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage('{"not":"valid"}')
+
+      expect(ws.error?.attempts).toBe(1)
+      expect(ws.error?.nextRetryMs).toBe(1000)
+
+      vi.advanceTimersByTime(1000)
+      getInstance(1).simulateOpen()
+      getInstance(1).simulateRawMessage('{"not":"valid"}')
+
+      expect(ws.error?.attempts).toBe(2)
+      expect(ws.error?.nextRetryMs).toBe(2000)
+
+      vi.advanceTimersByTime(1000)
+      expect(instances).toHaveLength(2)
+      vi.advanceTimersByTime(1000)
+      expect(instances).toHaveLength(3)
+      expect(consoleError).toHaveBeenCalledTimes(2)
     })
   })
 })
