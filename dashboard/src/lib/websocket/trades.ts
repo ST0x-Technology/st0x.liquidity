@@ -1,15 +1,14 @@
 import type { QueryClient } from '@tanstack/svelte-query'
-import type { CurrentState } from '$lib/api/CurrentState'
 import type { LegacyTrade } from '$lib/api/LegacyTrade'
 import type { Trade } from '$lib/api/Trade'
 import { compareTradesNewestFirst, normalizeTrade } from '$lib/trade'
 
 const MAX_TRADES = 100
 
-export const seedTrades = (queryClient: QueryClient, state: CurrentState) => {
+export const seedTrades = (queryClient: QueryClient, wireTrades: Array<Trade | LegacyTrade>) => {
   queryClient.setQueryData<Trade[]>(
     ['trades'],
-    state.trades.map(normalizeTrade).sort(compareTradesNewestFirst)
+    wireTrades.map(normalizeTrade).sort(compareTradesNewestFirst)
   )
 }
 

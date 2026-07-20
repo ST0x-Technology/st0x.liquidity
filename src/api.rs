@@ -21,8 +21,9 @@ use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
     TradeOutcome, TradingVenue, sort_trades_newest_first,
 };
+use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_finance::{FractionalShares, NotPositive, Positive};
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
@@ -754,7 +755,7 @@ fn parse_onchain_trade_row(
             venue: TradingVenue::Raindex,
             direction,
             symbol,
-            shares: FractionalShares::new(amount),
+            shares: Positive::new(FractionalShares::new(amount))?,
             outcome: TradeOutcome::Filled,
         })
     })()
@@ -821,6 +822,8 @@ enum OnchainTradeRowError {
     Payload(#[from] serde_json::Error),
     #[error("query returned a non-fill onchain event")]
     UnexpectedEvent,
+    #[error("onchain trade quantity is not positive: {0}")]
+    Quantity(#[from] NotPositive<FractionalShares>),
 }
 
 #[derive(Debug, thiserror::Error)]

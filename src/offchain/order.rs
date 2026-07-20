@@ -1476,7 +1476,7 @@ impl OffchainOrder {
             },
             direction,
             symbol,
-            shares: shares.inner(),
+            shares,
             outcome,
         })
     }
@@ -2838,7 +2838,7 @@ mod tests {
             .try_into_trade(&OffchainOrderId::new())
             .expect("valid terminal failure should convert");
         assert_eq!(trade.occurred_at, failure_time);
-        assert!(trade.shares.inner().eq(float!(2)).unwrap());
+        assert!(trade.shares.inner().inner().eq(float!(2)).unwrap());
         match trade.outcome {
             TradeOutcome::Failed {
                 error,

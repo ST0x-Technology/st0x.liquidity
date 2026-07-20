@@ -48,13 +48,11 @@ impl Statement {
     /// TypeScript-side compile error if the tags ever drift from the
     /// generated `Statement` type definition.
     ///
-    /// The generated `isStatement` performs tag-only validation: it checks
-    /// that the `type` field is a known `Statement` variant, but does not
-    /// validate the shape of `data`. This is intentional — the TypeScript
-    /// type system enforces payload shape after the type guard narrows to
-    /// `Statement`, so per-variant structural checks would be redundant.
-    /// Callers must not assume `data` is well-formed until they pattern-match
-    /// on `type`.
+    /// The generated `isStatement` validates only the envelope tag. Transport
+    /// handlers must still pass external `data` through the feature-specific
+    /// runtime validator before storing it. For example, every dashboard trade
+    /// path uses the shared trade-payload parser for structural and financial
+    /// validation after matching the statement variant.
     #[must_use]
     pub fn guard_ts() -> String {
         let tags = Self::VARIANTS
@@ -90,7 +88,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
 
-    use st0x_finance::{FractionalShares, Symbol};
+    use st0x_finance::{FractionalShares, Positive, Symbol};
     use st0x_float_macro::float;
 
     use super::*;
@@ -132,7 +130,7 @@ mod tests {
             venue: TradingVenue::Raindex,
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(float!(10)),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
             outcome: crate::TradeOutcome::Filled,
         };
         let msg = Statement::TradeUpdate(trade);

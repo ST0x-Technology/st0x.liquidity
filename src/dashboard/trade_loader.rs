@@ -6,9 +6,10 @@ use tracing::warn;
 
 use st0x_dto::{Trade, sort_trades_newest_first};
 use st0x_event_sorcery::{LoadAllIdsError, SendError, load_all_ids, load_entity};
+use st0x_finance::{FractionalShares, NotPositive};
 
 use crate::offchain::order::{OffchainOrder, TradeConversionError};
-use crate::onchain_trade::OnChainTrade;
+use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 
 const MAX_TRADES: usize = 100;
 
@@ -60,7 +61,14 @@ async fn load_onchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHisto
                 }
             };
 
-            Some(entity.into_trade(&id))
+            match entity.try_into_trade(&id) {
+                Ok(trade) => Some(trade),
+                Err(source) => {
+                    let error = TradeHistoryError::OnchainConversion { id, source };
+                    warn!(target: "dashboard", %error, "Skipping unrepresentable onchain trade");
+                    None
+                }
+            }
         })
         .collect()
         .await)
@@ -127,6 +135,12 @@ pub(crate) enum TradeHistoryError {
     },
     #[error("onchain trade {id} replayed to empty state")]
     OnchainMissing { id: String },
+    #[error("onchain trade {id} cannot be represented in history: {source}")]
+    OnchainConversion {
+        id: OnChainTradeId,
+        #[source]
+        source: NotPositive<FractionalShares>,
+    },
     #[error("failed to replay offchain trade {id}: {source}")]
     OffchainReplay {
         id: String,
