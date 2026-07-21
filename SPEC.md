@@ -683,6 +683,17 @@ capital under this long-inventory definition; the collateral or margin
 supporting shorts is not modeled. Hedging-venue USDC (cash) is included -- idle
 or reserved offchain cash is still capital under management.
 
+No separate broker maintenance-margin term is added: the Alpaca account is
+long-only, so it never posts one. Buys are capped to `cash` with no margin loan
+(ADR 0001 -- covers only the buy leg); sells are capped to shares already held
+(`resolve_sell_preflight`, `crates/execution/src/lib.rs`), so a counter-trade
+reduces a pre-existing long position rather than borrowing stock to go
+net-negative. The Hedging-venue cash counted above is therefore not inflated by
+short-sale proceeds, and no Reg-T maintenance margin is posted against it. If
+true short-selling is ever added on Alpaca, this definition must be revisited:
+short-sale proceeds would inflate the counted cash, and posted maintenance
+margin would become genuinely uncounted capital.
+
 **USD marks**: USDC is treated as par (`1:1`), matching the reporting-currency
 assumption used elsewhere in `/pnl`. Equity balances are marked at the symbol's
 `last_price_usdc` (the same fill-derived price already tracked on the `Position`
