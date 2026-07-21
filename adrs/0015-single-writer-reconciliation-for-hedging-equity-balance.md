@@ -113,6 +113,14 @@ critical section, which no cross-struct copy could guarantee.
   reintroduce alternative D's cross-clock defect). It marks when the fill was
   _applied_, slightly after the true fill instant, so guard 2 rejects marginally
   more snapshots than necessary — the safe direction.
+- **`fetched_at` is captured before the broker read**, in the poller, and
+  carried through the command (matching the pre-existing `InflightEquity`
+  pattern) — not stamped at command-handling time. A command-time stamp
+  postdates the read, so a pre-fill read could be stamped after the fill was
+  applied and slip past guard 2. A before-read stamp lower-bounds the broker's
+  as-of time, so a pre-fill read always stamps before the fill's execution and
+  guard 2 catches it structurally. Cost: a post-fill read whose request started
+  pre-execution is rejected and retries next poll — the safe direction again.
 
 Walking the incident through: the order is placed, marking MSTR pending; the
 16:08:34.711 poll is skipped for MSTR and its watermark does not advance; the

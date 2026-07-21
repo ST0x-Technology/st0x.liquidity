@@ -22271,6 +22271,7 @@ mod tests {
             &snapshot_id,
             InventorySnapshotCommand::OffchainEquity {
                 positions: positions.clone(),
+                fetched_at: Utc::now(),
             },
             (),
         )
@@ -22301,7 +22302,10 @@ mod tests {
         send_command::<InventorySnapshot>(
             &pool,
             &snapshot_id,
-            InventorySnapshotCommand::OffchainEquity { positions },
+            InventorySnapshotCommand::OffchainEquity {
+                positions,
+                fetched_at: Utc::now(),
+            },
             (),
         )
         .await
@@ -22355,8 +22359,11 @@ mod tests {
             .await
             .unwrap();
 
-        // The broker read happens HERE, pre-fill, reporting 100. Its command
-        // is still in flight while the fill below executes and applies.
+        // The broker read happens HERE, pre-fill, reporting 100 — and the
+        // poller stamps the read time before issuing it, exactly as
+        // production now does. The command is still in flight while the fill
+        // below executes and applies.
+        let pre_fill_read_at = Utc::now();
         let pre_fill_positions = BTreeMap::from([(symbol.clone(), shares(100))]);
 
         harness
@@ -22377,6 +22384,7 @@ mod tests {
             &snapshot_id,
             InventorySnapshotCommand::OffchainEquity {
                 positions: pre_fill_positions,
+                fetched_at: pre_fill_read_at,
             },
             (),
         )
