@@ -638,16 +638,37 @@ partially-hydrated view (e.g. equity seen onchain but not yet offchain) is
 skipped and retried shortly after, since a captured day can never be amended.
 This is a PRESENCE check, not a freshness check: a balance that is merely
 present (e.g. replayed from a persisted `InventorySnapshot` at startup, without
-ever being re-polled this run) still satisfies it. In steady state the capture
-job only wakes shortly after the `00:05` ET boundary, by which point the poller
-has already polled fresh this run, so the residual risk is narrow: a restart
-that hydrates stale data from a persisted snapshot and then captures before the
-poller gets a chance to poll again. A robust poll-driven freshness signal (an
-earlier attempt at a time-window freshness gate was reverted: the underlying
-`InventorySnapshot` suppresses events, and their watermarks, on unchanged
-balances, so the watermark freezes on a static book and the window would
-eventually block every future capture) is accepted as out of scope for v1 and
-tracked as a follow-up.
+ever being re-polled this run) still satisfies it on its own. An earlier attempt
+at a time-window freshness gate was reverted: the underlying `InventorySnapshot`
+suppresses events, and their watermarks, on unchanged balances, so tying
+freshness to that watermark freezes on a static book and the window would
+eventually block every future capture.
+
+**Poll-driven freshness gate**: an additional, independent freshness check now
+closes the gap presence alone leaves open. An ephemeral `PollFreshness` tracker
+(`src/inventory/freshness.rs`) records the timestamp of each `(location,
+asset)`
+slot's most recent successful poll, updated by the live inventory poller on
+every fetch -- independent of `InventorySnapshot`'s change suppression, so a
+static book still refreshes its timestamp on every tick. The capture job
+additionally requires every required slot to have been observed on or after the
+TARGET ET day's `00:00` midnight, not merely "observed at some point since
+process start": day-scoping (rather than plain run-scoped membership) prevents a
+slot polled once early in a long-running process's life from reading as
+permanently fresh for every later day's capture, even after the venue that fed
+it stops polling entirely -- the same stale-capture hole the gate exists to
+close, just on a longer timescale than a single restart.
+
+If a required slot never becomes fresh (a persistently failing venue, or a
+`poll_inflight_equity` outage that aborts the whole poll tick before any slot
+stamps), an escape hatch abandons that day's capture rather than blocking
+forever: `perform` gives up once `now` is more than `MAX_FRESHNESS_DEFER` (~6h)
+past the LATER of the target day's capture boundary or the poller's own
+process-start time. Anchoring to the later of the two matters for restarts: a
+process that restarts late in the trading day still gets a full defer window
+measured from when it actually started, rather than being judged solely against
+a boundary whose own window may have elapsed hours earlier (which would abandon
+the day on the very first freshness check after such a restart).
 
 **Deployed capital definition**: a day's total USD capital is the sum of cash
 (USDC) balances across every location (both trading venues plus every

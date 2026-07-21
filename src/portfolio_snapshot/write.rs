@@ -20,9 +20,12 @@
 //! Return Tracking"):** one snapshot per ET day, labeled by the ET day it is
 //! captured on, taken at/after that day's `CAPTURE_BUFFER` boundary using
 //! same-day inventory ([`hydration_gap`] guarantees COMPLETE -- every
-//! required slot has been polled at least once this run; see that
-//! function's doc for the presence-vs-freshness tradeoff accepted for v1).
-//! In steady state this fires once a day, right after the
+//! required slot has a row this run; [`freshness_gap`] additionally
+//! guarantees FRESH -- every required slot was observed by a poll on or after
+//! the TARGET ET day's midnight, day-scoped rather than merely "observed at
+//! some point this process run", closing both the restart-stale hole AND the
+//! long-running-process hole presence alone cannot see; see both functions'
+//! docs). In steady state this fires once a day, right after the
 //! boundary. If a restart or a stuck hydration retry causes `perform` to
 //! run after its `target_et_day` has already passed, it CATCHES UP to a
 //! fresh reading for the CURRENT ET day rather than either back-dating a live
@@ -43,7 +46,7 @@ use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{error, warn};
 
 use st0x_event_sorcery::{AggregateError, LifecycleError, Projection, SendError, Store};
 use st0x_execution::{FractionalShares, Symbol};
@@ -55,7 +58,7 @@ use super::{
 };
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
-    BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+    BroadcastingInventory, PollFreshness, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
 };
 use crate::position::Position;
 
@@ -78,6 +81,16 @@ const HYDRATION_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// [`HYDRATION_RETRY_BACKOFF`]: both cases want an uneventful, short retry
 /// rather than any change to `target_et_day`.
 const EARLY_WAKE_BACKOFF: Duration = HYDRATION_RETRY_BACKOFF;
+
+/// Bounds how long [`freshness_gap`] may keep deferring today's capture
+/// before giving up and abandoning the day entirely (livelock escape
+/// hatch): a venue that never polls this run -- or a persistent
+/// `poll_inflight_equity` outage, which aborts the whole poll tick before any
+/// slot stamps (`crate::inventory::polling`) -- would otherwise block capture
+/// forever. ~6h: long enough to ride out a startup hydration retry loop or a
+/// temporary venue outage, short enough that a genuinely stuck freshness
+/// signal does not silently swallow the whole trading day's capital sample.
+const MAX_FRESHNESS_DEFER: chrono::Duration = chrono::Duration::hours(6);
 
 /// Shared dependencies for the [`PortfolioSnapshotJob`].
 pub(crate) struct PortfolioSnapshotCtx {
@@ -102,6 +115,13 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// locations (Ethereum wallet, Base wallet unwrapped/wrapped) to have
     /// been polled at least once before capture.
     pub(crate) wallet_polling_enabled: bool,
+    /// Ephemeral "observed this run" freshness signal, stamped by the live
+    /// inventory poller on every successful sub-poll
+    /// (`crate::inventory::polling`). Wired from the same clone the poller
+    /// got (`crate::conductor::builder`), so [`freshness_gap`] sees exactly
+    /// what this process has actually polled -- closing the restart-stale
+    /// hole [`hydration_gap`] alone cannot see (see that function's doc).
+    pub(crate) poll_freshness: PollFreshness,
     pub(crate) queue: PortfolioSnapshotJobQueue,
 }
 
@@ -161,7 +181,21 @@ impl Job<PortfolioSnapshotCtx> for PortfolioSnapshotJob {
     }
 
     async fn perform(&self, ctx: &PortfolioSnapshotCtx) -> Result<Self::Output, Self::Error> {
-        let now = Utc::now();
+        self.perform_at(ctx, Utc::now()).await
+    }
+}
+
+impl PortfolioSnapshotJob {
+    /// The full body of [`Job::perform`], with `now` taken as a parameter
+    /// instead of read from the wall clock, so tests can deterministically
+    /// exercise time-dependent branches (the freshness-defer escape hatch in
+    /// particular) without racing real time. `perform` itself is a thin
+    /// `Utc::now()` -> here delegation.
+    async fn perform_at(
+        &self,
+        ctx: &PortfolioSnapshotCtx,
+        now: DateTime<Utc>,
+    ) -> Result<(), PortfolioSnapshotJobError> {
         let today = et_day(now);
 
         if self.target_et_day > today {
@@ -186,6 +220,39 @@ impl Job<PortfolioSnapshotCtx> for PortfolioSnapshotJob {
             );
         }
         let target_et_day = today;
+
+        // Freshness is checked BEFORE the inventory view is read: the live
+        // poller always updates the view and only then stamps
+        // `poll_freshness` (see each `observe()` call site's own comment in
+        // `crate::inventory::polling`), so checking freshness first and
+        // reading `rows` only after it passes guarantees the captured rows
+        // can never predate the freshness confirmation that gated them. The
+        // reverse order (read `rows` first, check freshness second) would let
+        // a poll tick land in the gap between the two reads, stamping
+        // freshness for a view that has since moved past the already-read
+        // `rows` -- see this module's `PortfolioSnapshotCtx::poll_freshness`
+        // doc.
+        if let Some(gap) = freshness_gap(ctx, target_et_day) {
+            if !freshness_defer_exhausted(target_et_day, now, ctx.poll_freshness.created_at()) {
+                warn!(
+                    %gap,
+                    %target_et_day,
+                    "Portfolio snapshot capture skipped this tick: inventory view is not fresh \
+                     yet this run; retrying shortly"
+                );
+                return ctx.reschedule(target_et_day, HYDRATION_RETRY_BACKOFF).await;
+            }
+
+            error!(
+                %gap,
+                %target_et_day,
+                max_freshness_defer = ?MAX_FRESHNESS_DEFER,
+                "Portfolio snapshot capture never became fresh within the defer window; \
+                 abandoning today's capture rather than persisting stale data"
+            );
+            let (delay, next_target_et_day) = next_capture_delay(now);
+            return ctx.reschedule(next_target_et_day, delay).await;
+        }
 
         let rows = {
             let view = ctx.inventory.read().await;
@@ -339,8 +406,61 @@ fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
     (delay, target_et_day)
 }
 
-/// Checks that every REQUIRED `(location, asset)` balance has been observed
-/// at least once this run -- i.e. is PRESENT in `rows`
+/// Enumerates every `(location, asset)` slot the daily portfolio snapshot
+/// capture requires to have been observed before it may capture, driven by
+/// `configured_equity_symbols`, `usdc_tracking_enabled`, and
+/// `wallet_polling_enabled`. Shared by both [`hydration_gap`] (PRESENCE --
+/// the slot has a row in the live `InventoryView`) and [`freshness_gap`]
+/// (FRESHNESS -- the slot has been observed by a poll THIS process run,
+/// membership) so the two gates can never diverge on what "complete" means.
+fn required_slots(
+    ctx: &PortfolioSnapshotCtx,
+) -> impl Iterator<Item = (PortfolioLocation, PortfolioAsset)> + '_ {
+    let equity_pairs = ctx.configured_equity_symbols.iter().flat_map(|symbol| {
+        [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging]
+            .into_iter()
+            .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+    });
+
+    let usdc_pairs = ctx
+        .usdc_tracking_enabled
+        .then_some([PortfolioLocation::MarketMaking, PortfolioLocation::Hedging])
+        .into_iter()
+        .flatten()
+        .map(|location| (location, PortfolioAsset::Usdc));
+
+    let wallet_usdc_pairs = ctx
+        .wallet_polling_enabled
+        .then_some([
+            PortfolioLocation::EthereumWallet,
+            PortfolioLocation::BaseWalletUnwrapped,
+        ])
+        .into_iter()
+        .flatten()
+        .map(|location| (location, PortfolioAsset::Usdc));
+
+    let wallet_equity_pairs = ctx
+        .wallet_polling_enabled
+        .then(|| ctx.configured_equity_symbols.iter())
+        .into_iter()
+        .flatten()
+        .flat_map(|symbol| {
+            [
+                PortfolioLocation::BaseWalletUnwrapped,
+                PortfolioLocation::BaseWalletWrapped,
+            ]
+            .into_iter()
+            .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+        });
+
+    equity_pairs
+        .chain(usdc_pairs)
+        .chain(wallet_usdc_pairs)
+        .chain(wallet_equity_pairs)
+}
+
+/// Checks that every REQUIRED `(location, asset)` balance ([`required_slots`])
+/// has been observed at least once this run -- i.e. is PRESENT in `rows`
 /// (`InventoryView::to_portfolio_snapshot_rows` only emits a row for a slot
 /// once it has actually been polled, distinguishing "never polled" from
 /// "polled to a genuine zero balance"; see that function's doc comment). A
@@ -349,75 +469,88 @@ fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
 /// unconditionally rejects a second `Capture`). Returns a human-readable
 /// description of the first gap found, or `None` if fully hydrated.
 ///
-/// **v1 accepted limitation** (see SPEC.md "Portfolio Capital and Return
-/// Tracking"): this is a PRESENCE gate, not a FRESHNESS gate -- it does not
-/// verify the observation happened recently, only that it happened at all
-/// this run (including via startup hydration replaying a persisted
-/// `InventorySnapshot`'s original readings). An earlier revision attempted a
-/// time-window freshness gate on top of presence, but `InventorySnapshot`
-/// suppresses events (and their watermarks) whenever a poll observes an
-/// unchanged balance, so the watermark freezes on a static book and the
-/// freshness window would eventually block every future capture, not just a
-/// stale-hydrated one. In steady state this job only wakes shortly after the
-/// ET-midnight `CAPTURE_BUFFER` boundary, by which point the poller has
-/// already polled fresh this run, so the residual risk is narrow: a restart
-/// that hydrates stale data from a persisted snapshot and then captures
-/// before the poller gets a chance to poll again. A robust poll-driven
-/// freshness signal (distinct from `InventorySnapshot`'s change-suppressed
-/// events) is a tracked follow-up, accepted as out of scope for v1.
+/// This is a PRESENCE gate, not a FRESHNESS gate -- it does not verify the
+/// observation happened recently, only that it happened at all this run
+/// (including via startup hydration replaying a persisted
+/// `InventorySnapshot`'s original readings). [`freshness_gap`] is the
+/// poll-driven freshness signal that closes the restart-stale hole this gate
+/// alone cannot see; both run in `perform`, FRESHNESS first (it only needs
+/// `ctx`, not `rows`, so it gates before the inventory view is even read) and
+/// PRESENCE second, against the rows read after that freshness check passed
+/// -- never the reverse, so a captured row can never predate the freshness
+/// confirmation that gated it.
 fn hydration_gap(rows: &[PortfolioBalanceRow], ctx: &PortfolioSnapshotCtx) -> Option<String> {
     let present: HashSet<(PortfolioLocation, &PortfolioAsset)> =
         rows.iter().map(|row| (row.location, &row.asset)).collect();
 
-    let is_polled = |location: PortfolioLocation, asset: &PortfolioAsset| -> bool {
-        present.contains(&(location, asset))
+    required_slots(ctx).find_map(|(location, asset)| {
+        if present.contains(&(location, &asset)) {
+            None
+        } else {
+            Some(format!("{asset} not yet polled at {location}"))
+        }
+    })
+}
+
+/// Checks that every REQUIRED `(location, asset)` slot ([`required_slots`])
+/// has been observed by a successful poll on or after `target_et_day`'s ET
+/// midnight (`PollFreshness::observed_since` -- see
+/// `crate::inventory::freshness`). Closes two holes [`hydration_gap`] alone
+/// cannot see: (1) the restart-stale hole -- after a restart the inventory
+/// view hydrates from persisted `InventorySnapshot` state, so presence passes
+/// immediately even though the current process has not polled anything yet;
+/// (2) a slot observed once early in a long-running process's life staying
+/// "fresh" for every later day's capture even after the venue that fed it
+/// stops polling entirely -- day-scoping, not plain run-scoped membership, is
+/// what closes this second hole (see `crate::inventory::freshness`'s module
+/// doc). Returns a human-readable description of the first un-observed slot,
+/// or `None` if every required slot has been freshly polled since that day's
+/// midnight. A DST-ambiguous midnight (`et_midnight` returns `None`) is
+/// treated as a gap: retry rather than guessing a floor.
+fn freshness_gap(ctx: &PortfolioSnapshotCtx, target_et_day: NaiveDate) -> Option<String> {
+    let Some(floor) = et_midnight(target_et_day) else {
+        warn!(
+            %target_et_day,
+            "Ambiguous ET midnight while checking portfolio snapshot freshness; treating as not \
+             yet fresh"
+        );
+        return Some(format!(
+            "ET midnight for {target_et_day} is ambiguous (DST transition)"
+        ));
     };
 
-    for symbol in &ctx.configured_equity_symbols {
-        for location in [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging] {
-            let asset = PortfolioAsset::Equity(symbol.clone());
-            if !is_polled(location, &asset) {
-                return Some(format!("{symbol} not yet polled at {location}"));
-            }
+    required_slots(ctx).find_map(|(location, asset)| {
+        if ctx.poll_freshness.observed_since(location, &asset, floor) {
+            None
+        } else {
+            Some(format!(
+                "{asset} not observed by a poll on/after {target_et_day} at {location}"
+            ))
         }
-    }
+    })
+}
 
-    if ctx.usdc_tracking_enabled {
-        for location in [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging] {
-            if !is_polled(location, &PortfolioAsset::Usdc) {
-                return Some(format!("USDC not yet polled at {location}"));
-            }
-        }
-    }
-
-    if ctx.wallet_polling_enabled {
-        for location in [
-            PortfolioLocation::EthereumWallet,
-            PortfolioLocation::BaseWalletUnwrapped,
-        ] {
-            if !is_polled(location, &PortfolioAsset::Usdc) {
-                return Some(format!(
-                    "USDC wallet-transit balance not yet polled at {location}"
-                ));
-            }
-        }
-
-        for symbol in &ctx.configured_equity_symbols {
-            for location in [
-                PortfolioLocation::BaseWalletUnwrapped,
-                PortfolioLocation::BaseWalletWrapped,
-            ] {
-                let asset = PortfolioAsset::Equity(symbol.clone());
-                if !is_polled(location, &asset) {
-                    return Some(format!(
-                        "{symbol} wallet-transit balance not yet polled at {location}"
-                    ));
-                }
-            }
-        }
-    }
-
-    None
+/// Whether [`freshness_gap`]'s escape hatch should abandon `target_et_day`'s
+/// capture rather than keep deferring it: true once `now` is more than
+/// [`MAX_FRESHNESS_DEFER`] past the LATER of that day's capture boundary or
+/// `poll_freshness_created_at` (livelock fix -- see this module's `perform`
+/// for the caller). Anchoring to only the day's boundary would give a
+/// freshly-restarted process almost no grace on a restart late in the trading
+/// day (the boundary+defer window may have already elapsed hours earlier);
+/// taking the max with the tracker's own construction time instead grants
+/// such a restart a full `MAX_FRESHNESS_DEFER` window from when it actually
+/// started polling, while a long-running process (whose `poll_freshness` was
+/// created well before the boundary) is still bounded by the boundary-anchored
+/// window as before. A DST-ambiguous boundary (`et_midnight` returns `None`)
+/// is treated as "not yet exhausted": keep retrying rather than guessing.
+fn freshness_defer_exhausted(
+    target_et_day: NaiveDate,
+    now: DateTime<Utc>,
+    poll_freshness_created_at: DateTime<Utc>,
+) -> bool {
+    et_midnight(target_et_day)
+        .map(|midnight| midnight + CAPTURE_BUFFER)
+        .is_some_and(|boundary| now > boundary.max(poll_freshness_created_at) + MAX_FRESHNESS_DEFER)
 }
 
 /// Converts MarketMaking-venue and BaseWalletWrapped-transit equity balances
@@ -617,6 +750,7 @@ mod tests {
     use chrono::TimeZone;
     use sqlx::SqlitePool;
     use tokio::sync::broadcast;
+    use tokio::time::timeout;
 
     use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
@@ -672,17 +806,36 @@ mod tests {
             configured_equity_symbols,
             usdc_tracking_enabled,
             wallet_polling_enabled,
+            // Always starts empty, mirroring a fresh process boot: callers
+            // that need the freshness gate to pass call
+            // `mark_all_required_fresh` explicitly, the same way they mutate
+            // `ctx.inventory` to simulate a poll landing.
+            poll_freshness: PollFreshness::new(),
             queue,
         };
 
         (ctx, position)
     }
 
+    /// Observes every `(location, asset)` slot [`required_slots`] would name
+    /// for `ctx`, onto `ctx.poll_freshness` -- the test-side stand-in for
+    /// what a real poll tick (`crate::inventory::polling`) would stamp,
+    /// without needing a fully wired `InventoryPollingService` in every
+    /// `write.rs` test. Reuses the same enumeration `freshness_gap` itself
+    /// walks, so a test marking "all required slots fresh" can never drift
+    /// from what the gate actually requires.
+    fn mark_all_required_fresh(ctx: &PortfolioSnapshotCtx) {
+        for (location, asset) in required_slots(ctx) {
+            ctx.poll_freshness.observe(location, asset);
+        }
+    }
+
     /// A view with equity and USDC balances present at both venues for
-    /// `symbol` -- `hydration_gap` is a PRESENCE gate (v1, see its doc
-    /// comment), so `with_equity`/`with_usdc` alone are sufficient; this
-    /// helper exists purely so callers can pass one `InventoryView` around
-    /// instead of chaining both builders inline at every call site.
+    /// `symbol` -- `hydration_gap` is a PRESENCE gate, so `with_equity`/
+    /// `with_usdc` alone are sufficient; this helper exists purely so callers
+    /// can pass one `InventoryView` around instead of chaining both builders
+    /// inline at every call site. Callers that also need the FRESHNESS gate
+    /// to pass must additionally call `mark_all_required_fresh`.
     fn freshly_polled_view(
         symbol: Symbol,
         onchain: FractionalShares,
@@ -709,7 +862,7 @@ mod tests {
             Usdc::new(float!(500)),
         );
 
-        build_ctx(
+        let (ctx, position) = build_ctx(
             pool,
             apalis_pool,
             view,
@@ -718,7 +871,11 @@ mod tests {
             false,
             Some(Arc::new(MockWrapper::new())),
         )
-        .await
+        .await;
+
+        mark_all_required_fresh(&ctx);
+
+        (ctx, position)
     }
 
     async fn portfolio_snapshot_job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
@@ -805,6 +962,7 @@ mod tests {
             None,
         )
         .await;
+        mark_all_required_fresh(&ctx);
 
         pool.close().await;
 
@@ -858,6 +1016,96 @@ mod tests {
         assert_eq!(
             et_day(after_midnight),
             NaiveDate::from_ymd_opt(2026, 7, 15).unwrap()
+        );
+    }
+
+    /// The DST spring-forward gap (2026: 2am ET on March 8, second Sunday of
+    /// March) is 02:00-03:00 local, never midnight -- so `et_midnight` for
+    /// this calendar day is an ordinary, unambiguous EST instant, not the
+    /// `None` branch. Locks in that assumption so a future change to the
+    /// transition-detection logic that wrongly treats midnight itself as
+    /// ambiguous is caught here, not first noticed on a real DST day.
+    #[test]
+    fn et_midnight_on_the_spring_forward_date_is_an_unambiguous_est_instant() {
+        let spring_forward_day = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+
+        let midnight = et_midnight(spring_forward_day).unwrap();
+
+        assert_eq!(midnight, Utc.with_ymd_and_hms(2026, 3, 8, 5, 0, 0).unwrap());
+    }
+
+    /// Complements the spring-forward test: the DST fall-back ambiguous
+    /// window (2026: 1am-2am ET on November 1, first Sunday of November) is
+    /// also never midnight, so `et_midnight` for this calendar day is an
+    /// ordinary, unambiguous EDT instant.
+    #[test]
+    fn et_midnight_on_the_fall_back_date_is_an_unambiguous_edt_instant() {
+        let fall_back_day = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+
+        let midnight = et_midnight(fall_back_day).unwrap();
+
+        assert_eq!(
+            midnight,
+            Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap()
+        );
+    }
+
+    /// `freshness_gap`'s DST-ambiguous branch (`et_midnight` returning
+    /// `None`) is never reached on a real spring-forward day -- this locks in
+    /// that a target day right on the transition still gates and passes
+    /// normally, not via the "treating as not yet fresh" ambiguous-midnight
+    /// arm.
+    #[tokio::test]
+    async fn freshness_gap_passes_normally_on_the_spring_forward_et_day() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            true,
+            false,
+            None,
+        )
+        .await;
+        mark_all_required_fresh(&ctx);
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        assert_eq!(
+            freshness_gap(&ctx, target_et_day),
+            None,
+            "spring-forward midnight is unambiguous, so a freshly-observed slot must pass \
+             normally, not hit the DST-ambiguous gap branch"
+        );
+    }
+
+    /// `freshness_defer_exhausted`'s DST-ambiguous branch (treats `None` as
+    /// "never exhausted") is never reached on a real fall-back day -- this
+    /// locks in that ordinary within-window/past-window defer behavior holds
+    /// on that day, not the always-keep-retrying ambiguous-midnight arm.
+    #[test]
+    fn freshness_defer_exhausted_behaves_normally_on_the_fall_back_et_day() {
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
+
+        assert!(
+            !freshness_defer_exhausted(
+                target_et_day,
+                boundary + MAX_FRESHNESS_DEFER - chrono::Duration::minutes(1),
+                poll_freshness_created_at
+            ),
+            "fall-back midnight is unambiguous, so ordinary within-defer-window behavior must \
+             hold, not the DST-ambiguous never-exhausted branch"
+        );
+        assert!(
+            freshness_defer_exhausted(
+                target_et_day,
+                boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1),
+                poll_freshness_created_at
+            ),
+            "fall-back midnight is unambiguous, so the day must still become abandonable past \
+             the defer window"
         );
     }
 
@@ -1005,6 +1253,10 @@ mod tests {
                 Usdc::new(float!(500)),
             );
         }
+        // Mirrors what a real poll tick would additionally stamp alongside
+        // the view update above: presence alone (the view mutation) is not
+        // enough once the freshness gate is in play.
+        mark_all_required_fresh(&ctx);
 
         job_for_today().perform(&ctx).await.unwrap();
         assert!(portfolio_snapshot_row_count(&pool, &et_day_string).await > 0);
@@ -1201,7 +1453,10 @@ mod tests {
     /// Round-3 fix scenario (a): a job whose `target_et_day` is yesterday
     /// (hydration stuck past midnight, or a very late wake) must capture
     /// TODAY's fresh balances under TODAY's id -- never back-date a live read
-    /// under yesterday's stale id.
+    /// under yesterday's stale id. `build_fully_hydrated_ctx` marks every
+    /// required slot fresh, so this also doubles as the "catch-up
+    /// succeeds once fresh" half of the catch-up+freshness coverage -- the
+    /// complementary "catch-up is gated by freshness" half is the next test.
     #[tokio::test]
     async fn perform_past_its_target_day_catches_up_and_captures_under_today() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -1222,6 +1477,48 @@ mod tests {
         assert!(
             portfolio_snapshot_row_count(&pool, &today.to_string()).await > 0,
             "the catch-up must be labeled with today, the day the balances were observed on"
+        );
+    }
+
+    /// Complements the test above: the catch-up rebind to today must still be
+    /// gated by FRESHNESS, not just presence -- a fully-hydrated view
+    /// (presence passes) with an empty `PollFreshness` (nothing observed by a
+    /// poll this run) must never capture, even under the rebound `today` id.
+    #[tokio::test]
+    async fn catch_up_capture_is_gated_by_freshness_even_when_presence_gate_passes() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        );
+        let (ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        // Deliberately no `mark_all_required_fresh`: presence passes (the
+        // view is fully hydrated) but nothing has been observed by a poll
+        // this run.
+
+        let today = et_day(Utc::now());
+        let stale_job = PortfolioSnapshotJob {
+            target_et_day: today - Days::new(1),
+        };
+
+        stale_job.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &today.to_string()).await,
+            0,
+            "the catch-up rebind to today must still be gated by freshness, not just presence"
         );
     }
 
@@ -1528,6 +1825,7 @@ mod tests {
             None,
         )
         .await;
+        mark_all_required_fresh(&ctx);
 
         let error = job_for_today().perform(&ctx).await.unwrap_err();
 
@@ -1594,6 +1892,7 @@ mod tests {
             Some(Arc::new(MockWrapper::with_ratio(ratio_1_5))),
         )
         .await;
+        mark_all_required_fresh(&ctx);
 
         job_for_today().perform(&ctx).await.unwrap();
 
@@ -1642,6 +1941,359 @@ mod tests {
             inflight_balance(&pool, &et_day, "base_wallet_unwrapped").await,
             "3",
             "unwrapped transit balance is already underlying units and must stay unconverted"
+        );
+    }
+
+    /// Proves `perform_at` checks `freshness_gap` before it ever reads
+    /// `ctx.inventory` (the fix for the restart-stale race: reading `rows`
+    /// first would let a poll tick land in the gap between the read and the
+    /// freshness check, stamping freshness for a view that has since moved
+    /// past the already-captured `rows`). Holds the inventory's write lock
+    /// for the whole call: if `perform_at` regressed to reading the view
+    /// before rejecting on an unmet freshness gate, the read would deadlock
+    /// against this held write guard (same task, non-reentrant
+    /// `tokio::sync::RwLock`) and the `timeout` below would fire instead of
+    /// `perform_at` returning promptly.
+    #[tokio::test]
+    async fn freshness_gate_is_checked_before_the_inventory_view_is_read() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            true,
+            false,
+            None,
+        )
+        .await;
+        // Deliberately no `mark_all_required_fresh`: freshness_gap must fail
+        // and the job must reschedule without ever touching ctx.inventory.
+
+        let _held_write_guard = ctx.inventory.write().await;
+
+        let perform_result = timeout(Duration::from_millis(200), job_for_today().perform(&ctx))
+            .await
+            .expect(
+                "perform_at must reject on the freshness gate before reading ctx.inventory; \
+                 timed out waiting for the held write lock, meaning the view was read first",
+            );
+        perform_result.unwrap();
+    }
+
+    // freshness_gap and its escape hatch.
+
+    #[tokio::test]
+    async fn freshness_gap_blocks_when_a_required_slot_was_never_observed_since_target_et_day() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            true,
+            false,
+            None,
+        )
+        .await;
+
+        // Deterministic: with a single configured symbol, `required_slots`
+        // always yields (MarketMaking, Equity(AAPL)) first.
+        let target_et_day = et_day(Utc::now());
+        assert_eq!(
+            freshness_gap(&ctx, target_et_day),
+            Some(format!(
+                "AAPL not observed by a poll on/after {target_et_day} at market_making"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_gap_passes_when_every_required_slot_was_observed_on_or_after_target_et_day()
+    {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            true,
+            false,
+            None,
+        )
+        .await;
+
+        mark_all_required_fresh(&ctx);
+        // Re-observing an already-fresh slot (simulating a second poll tick
+        // of an unchanged balance) must not un-freshen it -- the core
+        // regression this module exists to fix: a static book
+        // must stay fresh across ticks, unlike the reverted
+        // InventorySnapshot-watermark-based attempt.
+        mark_all_required_fresh(&ctx);
+
+        assert_eq!(freshness_gap(&ctx, et_day(Utc::now())), None);
+    }
+
+    /// Proves the `(location, asset)` key does not collapse the two
+    /// co-located rows at `BaseWalletUnwrapped`: USDC observed, equity not,
+    /// must still block on the equity slot specifically.
+    #[tokio::test]
+    async fn base_wallet_unwrapped_equity_and_usdc_freshness_are_tracked_independently() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            false,
+            true,
+            None,
+        )
+        .await;
+
+        for (location, asset) in required_slots(&ctx) {
+            if location == PortfolioLocation::BaseWalletUnwrapped
+                && asset == PortfolioAsset::Equity(aapl())
+            {
+                continue;
+            }
+            ctx.poll_freshness.observe(location, asset);
+        }
+
+        let target_et_day = et_day(Utc::now());
+        assert_eq!(
+            freshness_gap(&ctx, target_et_day),
+            Some(format!(
+                "AAPL not observed by a poll on/after {target_et_day} at base_wallet_unwrapped"
+            ))
+        );
+        assert!(
+            ctx.poll_freshness.observed_since(
+                PortfolioLocation::BaseWalletUnwrapped,
+                &PortfolioAsset::Usdc,
+                DateTime::<Utc>::MIN_UTC
+            ),
+            "the USDC leg at the same location must remain observed"
+        );
+    }
+
+    #[test]
+    fn freshness_defer_exhausted_false_within_the_defer_window() {
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary + MAX_FRESHNESS_DEFER - chrono::Duration::minutes(1);
+        // A long-running process: created well before the boundary, so the
+        // boundary alone drives exhaustion, matching this test's original
+        // (pre-restart-anchoring) semantics.
+        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
+
+        assert!(!freshness_defer_exhausted(
+            target_et_day,
+            now,
+            poll_freshness_created_at
+        ));
+    }
+
+    #[test]
+    fn freshness_defer_exhausted_true_past_the_defer_window() {
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
+        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
+
+        assert!(freshness_defer_exhausted(
+            target_et_day,
+            now,
+            poll_freshness_created_at
+        ));
+    }
+
+    #[test]
+    fn freshness_defer_exhausted_false_exactly_at_the_defer_window_boundary() {
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary + MAX_FRESHNESS_DEFER;
+        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
+
+        assert!(
+            !freshness_defer_exhausted(target_et_day, now, poll_freshness_created_at),
+            "exactly at the boundary must still defer (strictly greater-than triggers abandonment)"
+        );
+    }
+
+    /// Round-4 fix (restart-anchoring): a process that restarts late in the
+    /// trading day must still get a full `MAX_FRESHNESS_DEFER` grace window
+    /// measured from when IT started, not from the target day's boundary
+    /// (which may have elapsed its own defer window hours earlier). Here the
+    /// boundary+defer window ended long ago, but `poll_freshness` was only
+    /// created an hour ago.
+    #[test]
+    fn freshness_defer_exhausted_grants_full_window_from_a_late_restart_not_the_days_boundary() {
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let poll_freshness_created_at = boundary + chrono::Duration::hours(20);
+        let now = poll_freshness_created_at + chrono::Duration::hours(1);
+
+        assert!(
+            !freshness_defer_exhausted(target_et_day, now, poll_freshness_created_at),
+            "a freshly-restarted process must get its own MAX_FRESHNESS_DEFER grace window, not \
+             be judged against the day's boundary alone"
+        );
+    }
+
+    /// Complements the test above: once that late restart's OWN grace window
+    /// elapses, the day must still be abandoned.
+    #[test]
+    fn freshness_defer_exhausted_true_once_a_late_restarts_own_grace_window_elapses() {
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let poll_freshness_created_at = boundary + chrono::Duration::hours(20);
+        let now = poll_freshness_created_at + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
+
+        assert!(freshness_defer_exhausted(
+            target_et_day,
+            now,
+            poll_freshness_created_at
+        ));
+    }
+
+    /// Deterministic coverage of `perform_at`'s "keep deferring" branch
+    /// (finding: the prior single wall-clock-dependent test could not tell
+    /// which of the two escape-hatch branches it exercised on a given CI
+    /// run). `now` is pinned inside the defer window, so the freshness-gap
+    /// failure must reschedule under the SAME `target_et_day` with the short
+    /// hydration-retry backoff, never capture.
+    #[tokio::test]
+    async fn perform_at_keeps_deferring_target_et_day_when_freshness_gap_fails_within_the_defer_window()
+     {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        );
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        // Deliberately no `mark_all_required_fresh`: presence passes (the
+        // view is fully hydrated) but nothing has been observed by a poll
+        // this run -- exactly the restart-stale hole freshness_gap closes.
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary + chrono::Duration::minutes(1);
+        // A long-running process, created well before the boundary, so the
+        // boundary alone (not this test's `now`) determines the defer state.
+        ctx.poll_freshness = PollFreshness::new_at(boundary - chrono::Duration::days(1));
+
+        let job = PortfolioSnapshotJob { target_et_day };
+        job.perform_at(&ctx, now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await,
+            0,
+            "freshness gap must block capture even though presence-only hydration_gap passes"
+        );
+
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day, target_et_day,
+            "within the defer window, the retry must keep targeting the same day"
+        );
+    }
+
+    /// Deterministic coverage of `perform_at`'s "abandon the day" branch: the
+    /// actual livelock-escape-hatch behavior this feature introduces. `now`
+    /// is pinned past `MAX_FRESHNESS_DEFER`, so the job must give up on
+    /// `target_et_day`, never capture stale data, and reschedule under the
+    /// NEXT capture day computed by `next_capture_delay`.
+    #[tokio::test]
+    async fn perform_at_abandons_target_et_day_once_the_defer_window_is_exhausted() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        );
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        // Deliberately no `mark_all_required_fresh`.
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
+        // A long-running process: the boundary-anchored window alone must
+        // drive this exhaustion, not a fresh restart's own grace window.
+        ctx.poll_freshness = PollFreshness::new_at(boundary - chrono::Duration::days(1));
+
+        let job = PortfolioSnapshotJob { target_et_day };
+        // `reschedule` (via apalis's `push_with_delay`) anchors `run_at` to
+        // the REAL wall clock at insertion time, not the fictitious injected
+        // `now` -- only the delay's LENGTH is derived from `now`.
+        let real_before = Utc::now();
+        job.perform_at(&ctx, now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await,
+            0,
+            "the abandoned day must never be captured with stale data"
+        );
+
+        let (expected_delay, expected_next_target_et_day) = next_capture_delay(now);
+        assert_ne!(
+            expected_next_target_et_day, target_et_day,
+            "sanity: the abandon branch must advance to a different day"
+        );
+
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day, expected_next_target_et_day,
+            "past the defer window, the job must abandon target_et_day and advance to the next \
+             capture day computed by next_capture_delay, never resume retrying the abandoned day"
+        );
+
+        let run_at: i64 =
+            sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let expected_run_at =
+            real_before.timestamp() + i64::try_from(expected_delay.as_secs()).unwrap();
+        assert!(
+            (run_at - expected_run_at).abs() <= 5,
+            "expected run_at near {expected_run_at}, got {run_at}"
         );
     }
 }

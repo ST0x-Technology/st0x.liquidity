@@ -1,6 +1,7 @@
 //! Inventory tracking for cross-venue asset management.
 
 mod broadcasting;
+mod freshness;
 mod polling;
 pub(crate) mod projection;
 pub(crate) mod snapshot;
@@ -10,6 +11,7 @@ pub(crate) mod view;
 pub(crate) use st0x_config::ImbalanceThreshold;
 
 pub(crate) use broadcasting::BroadcastingInventory;
+pub(crate) use freshness::PollFreshness;
 #[cfg(test)]
 pub(crate) use polling::PollerError;
 pub(crate) use polling::{

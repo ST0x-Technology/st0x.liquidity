@@ -37,7 +37,7 @@ use super::monitor::order_fills::OrderFillMonitor;
 use crate::alerts::TelegramNotifier;
 use crate::inventory::{
     BroadcastingInventory, InventoryPollingService, InventorySnapshot, InventorySnapshotId,
-    WalletPollingCtx,
+    PollFreshness, WalletPollingCtx,
 };
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
@@ -241,6 +241,11 @@ where
     let wallet_polling_enabled = wallet_polling.is_some();
     let tokenizer = context.tokenizer;
 
+    // Constructed once and cloned into both the live poller and the daily
+    // capture job's ctx below, so `freshness_gap` (write.rs) sees exactly
+    // what this poller has stamped this run.
+    let poll_freshness = PollFreshness::new();
+
     let mut polling_service = InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
@@ -253,7 +258,8 @@ where
         reserved_cash,
     )
     .with_configured_equity_symbols(configured_equity_symbols.clone())
-    .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults);
+    .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults)
+    .with_poll_freshness(poll_freshness.clone());
 
     if let Some(rebalancing_service) = &rebalancing_service {
         polling_service =
@@ -341,6 +347,7 @@ where
         configured_equity_symbols,
         usdc_tracking_enabled: context.ctx.assets.cash.is_some(),
         wallet_polling_enabled,
+        poll_freshness,
         queue: portfolio_snapshot_queue.clone(),
     });
 

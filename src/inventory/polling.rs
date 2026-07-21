@@ -24,9 +24,11 @@ use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
+use crate::inventory::freshness::PollFreshness;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
+use crate::inventory::view::{PortfolioAsset, PortfolioLocation};
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
@@ -128,6 +130,12 @@ where
     configured_equity_vaults: Option<BTreeMap<Address, BTreeSet<B256>>>,
     configured_usdc_vaults: Option<BTreeSet<B256>>,
     reserved_cash: Usd,
+    /// Stamped on every successful sub-poll fetch this run, so the
+    /// daily portfolio snapshot capture can gate on FRESHNESS in addition to
+    /// presence. Defaults to a fresh, empty tracker; production wiring passes
+    /// the same clone the capture job's `PortfolioSnapshotCtx` reads
+    /// (`crate::conductor::builder`).
+    poll_freshness: PollFreshness,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -165,7 +173,17 @@ where
             configured_equity_vaults: None,
             configured_usdc_vaults: None,
             reserved_cash,
+            poll_freshness: PollFreshness::new(),
         }
+    }
+
+    /// Overrides the default (fresh, empty) freshness tracker with `poll_freshness`
+    /// -- production wiring passes the same clone
+    /// [`crate::portfolio_snapshot::PortfolioSnapshotCtx`] reads, so the daily
+    /// capture job's freshness gate observes exactly what this poller stamps.
+    pub(crate) fn with_poll_freshness(mut self, poll_freshness: PollFreshness) -> Self {
+        self.poll_freshness = poll_freshness;
+        self
     }
 
     pub(crate) fn with_configured_equity_symbols(
@@ -332,12 +350,23 @@ where
             });
         }
 
+        let symbols: Vec<Symbol> = balances.keys().cloned().collect();
+
         self.snapshot
             .send(
                 snapshot_id,
                 InventorySnapshotCommand::OnchainEquity { balances },
             )
             .await?;
+
+        // Stamped only after `send` returns Ok, so a failed persist (which
+        // propagates via `?` above) never leaves this slot falsely fresh.
+        for symbol in symbols {
+            self.poll_freshness.observe(
+                PortfolioLocation::MarketMaking,
+                PortfolioAsset::Equity(symbol),
+            );
+        }
 
         Ok(())
     }
@@ -378,6 +407,11 @@ where
             )
             .await?;
 
+        // Stamped only after `send` returns Ok, so a failed persist (which
+        // propagates via `?` above) never leaves this slot falsely fresh.
+        self.poll_freshness
+            .observe(PortfolioLocation::MarketMaking, PortfolioAsset::Usdc);
+
         Ok(())
     }
 
@@ -402,6 +436,7 @@ where
                 &wallets.unwrapped_equity_token_addresses,
             )
             .await?;
+        let symbols: Vec<Symbol> = balances.keys().cloned().collect();
 
         if !balances.is_empty() {
             self.snapshot
@@ -412,9 +447,20 @@ where
                 .await?;
         }
 
+        // Reached whether or not `send` ran above (a zero-token-map poll is
+        // still a real observation), but never reached when `send` errors,
+        // so a failed persist never leaves these slots falsely fresh.
+        for symbol in symbols {
+            self.poll_freshness.observe(
+                PortfolioLocation::BaseWalletUnwrapped,
+                PortfolioAsset::Equity(symbol),
+            );
+        }
+
         let balances = self
             .poll_base_wallet_token_balances(&wallets.base, &wallets.wrapped_equity_token_addresses)
             .await?;
+        let symbols: Vec<Symbol> = balances.keys().cloned().collect();
 
         if !balances.is_empty() {
             self.snapshot
@@ -423,6 +469,13 @@ where
                     InventorySnapshotCommand::BaseWalletWrappedEquity { balances },
                 )
                 .await?;
+        }
+
+        for symbol in symbols {
+            self.poll_freshness.observe(
+                PortfolioLocation::BaseWalletWrapped,
+                PortfolioAsset::Equity(symbol),
+            );
         }
 
         Ok(())
@@ -451,6 +504,11 @@ where
             )
             .await?;
 
+        // Stamped only after `send` returns Ok, so a failed persist (which
+        // propagates via `?` above) never leaves this slot falsely fresh.
+        self.poll_freshness
+            .observe(PortfolioLocation::EthereumWallet, PortfolioAsset::Usdc);
+
         Ok(())
     }
 
@@ -476,6 +534,11 @@ where
                 InventorySnapshotCommand::BaseWalletUsdc { usdc_balance },
             )
             .await?;
+
+        // Stamped only after `send` returns Ok, so a failed persist (which
+        // propagates via `?` above) never leaves this slot falsely fresh.
+        self.poll_freshness
+            .observe(PortfolioLocation::BaseWalletUnwrapped, PortfolioAsset::Usdc);
 
         Ok(())
     }
@@ -520,6 +583,7 @@ where
         };
 
         let positions = self.normalize_offchain_positions(inventory.positions);
+        let symbols: Vec<Symbol> = positions.keys().cloned().collect();
 
         self.snapshot
             .send(
@@ -527,6 +591,13 @@ where
                 InventorySnapshotCommand::OffchainEquity { positions },
             )
             .await?;
+
+        // Stamped only after `send` returns Ok, so a failed persist (which
+        // propagates via `?` above) never leaves these slots falsely fresh.
+        for symbol in symbols {
+            self.poll_freshness
+                .observe(PortfolioLocation::Hedging, PortfolioAsset::Equity(symbol));
+        }
 
         let (gross_usd_cents, available_usd_cents) =
             compute_available_cash(inventory.usd_balance_cents, self.reserved_cash)?;
@@ -540,6 +611,11 @@ where
                 },
             )
             .await?;
+
+        // Stamped only after `send` returns Ok, so a failed persist (which
+        // propagates via `?` above) never leaves this slot falsely fresh.
+        self.poll_freshness
+            .observe(PortfolioLocation::Hedging, PortfolioAsset::Usdc);
 
         self.snapshot
             .send(
@@ -2549,6 +2625,76 @@ mod tests {
         );
     }
 
+    /// `MAX_FRESHNESS_DEFER`'s doc comment (`crate::portfolio_snapshot::write`)
+    /// names a persistent `poll_inflight_equity` outage -- which aborts the
+    /// whole poll tick before any of the onchain/wallet/offchain groups run --
+    /// as one of the two motivating scenarios for the escape hatch. This is
+    /// the freshness-side counterpart to the test above: not only must no
+    /// `InventorySnapshot` event be emitted, `PollFreshness` itself must stay
+    /// fully unobserved, so a future refactor that accidentally moved an
+    /// `observe()` call ahead of the inflight-equity check would be caught
+    /// here.
+    #[tokio::test]
+    async fn poll_and_record_leaves_poll_freshness_fully_unobserved_when_inflight_poll_aborts_the_tick()
+     {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+        let symbol = test_symbol("AAPL");
+
+        // Inventory is present, so poll_offchain would stamp Hedging
+        // equity/USDC freshness if the tick were allowed to continue past the
+        // failed inflight poll.
+        let inventory = Inventory {
+            positions: vec![EquityPosition {
+                symbol: symbol.clone(),
+                quantity: test_shares(5),
+                market_value: Some(float!(750)),
+            }],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: Some(Usdc::new(float!(125.75))),
+            cash_withdrawable_cents: None,
+        };
+
+        let tokenizer =
+            Arc::new(st0x_tokenization::mock::MockTokenizer::new().with_list_pending_failure());
+
+        let poll_freshness = PollFreshness::new();
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new().with_inventory(inventory),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        service.poll_and_record().await.unwrap();
+
+        let equity_asset = PortfolioAsset::Equity(symbol);
+        assert!(
+            !observed(&poll_freshness, PortfolioLocation::Hedging, &equity_asset),
+            "Hedging equity must stay unobserved when the inflight poll aborts the whole tick"
+        );
+        assert!(
+            !observed(
+                &poll_freshness,
+                PortfolioLocation::Hedging,
+                &PortfolioAsset::Usdc
+            ),
+            "Hedging USDC must stay unobserved when the inflight poll aborts the whole tick"
+        );
+    }
+
     async fn load_snapshot_events(
         pool: &SqlitePool,
         orderbook: Address,
@@ -4059,5 +4205,504 @@ mod tests {
             "Duplicate provider rows should only count once"
         );
         assert!(redemptions.is_empty());
+    }
+
+    // PollFreshness stamping. `.with_poll_freshness(...)` clones a
+    // caller-owned handle into the service so tests can inspect exactly what
+    // got stamped, mirroring how production wires the same clone into
+    // `PortfolioSnapshotCtx` (`crate::conductor::builder`).
+
+    /// Test-only "was this slot ever observed, at all" check --
+    /// `PollFreshness::observed_since` is day-scoped and needs an explicit
+    /// floor (see `crate::portfolio_snapshot::write`'s tests for coverage of
+    /// that day-scoping); the polling tests in this module only care whether
+    /// a sub-poll stamped a slot at all, so `DateTime::<Utc>::MIN_UTC` is
+    /// always at or before any real stamp.
+    fn observed(
+        poll_freshness: &PollFreshness,
+        location: PortfolioLocation,
+        asset: &PortfolioAsset,
+    ) -> bool {
+        poll_freshness.observed_since(location, asset, chrono::DateTime::<Utc>::MIN_UTC)
+    }
+
+    /// The core regression this feature exists to fix: an earlier attempt
+    /// tied freshness to `InventorySnapshot`'s own event watermark, which
+    /// freezes whenever a poll observes an UNCHANGED balance (that aggregate
+    /// returns `Ok(vec![])`, emitting no event -- see
+    /// `InventorySnapshot::transition`'s `OnchainEquity` arm). Two ticks with
+    /// the identical balance must still leave the slot observed AT OR AFTER a
+    /// floor captured before either tick, proving the day-scoped signal is
+    /// stamped (and its timestamp advanced) on every successful fetch,
+    /// independent of the aggregate's change-suppression.
+    #[tokio::test]
+    async fn poll_freshness_stamped_on_both_ticks_of_a_static_onchain_equity_book() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&vault_balance_hex(float!(7))); // tick 1
+        asserter.push_success(&vault_balance_hex(float!(7))); // tick 2, unchanged
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let poll_freshness = PollFreshness::new();
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let asset = PortfolioAsset::Equity(test_symbol("AAPL"));
+        // Captured before tick 1: both ticks' stamps must land at or after
+        // this instant, proving the day-scoped timestamp is refreshed on
+        // every successful fetch, not just set once.
+        let floor = Utc::now();
+
+        service.poll_onchain(&snapshot_id).await.unwrap();
+        assert!(
+            poll_freshness.observed_since(PortfolioLocation::MarketMaking, &asset, floor),
+            "tick 1 must stamp freshness at/after the floor"
+        );
+
+        service.poll_onchain(&snapshot_id).await.unwrap();
+        assert!(
+            poll_freshness.observed_since(PortfolioLocation::MarketMaking, &asset, floor),
+            "tick 2 (unchanged balance) must still stamp freshness at/after the floor -- the \
+             day-scoped signal is independent of InventorySnapshot's change-suppression"
+        );
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let onchain_equity_events = events
+            .iter()
+            .filter(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }))
+            .count();
+        assert_eq!(
+            onchain_equity_events, 1,
+            "the aggregate must have suppressed the second, unchanged-balance event -- freshness \
+             must not depend on the aggregate actually emitting one"
+        );
+    }
+
+    /// A zero on-chain balance for a configured wallet-transit symbol is
+    /// still a real observation and must be stamped, even though the send of
+    /// `BaseWalletUnwrappedEquity` is gated by `if !balances.is_empty()`
+    /// (the map has one entry here, so that guard passes regardless -- the
+    /// point under test is that stamping happens for every symbol actually
+    /// queried, not filtered by a nonzero balance).
+    #[tokio::test]
+    async fn poll_wallets_stamps_base_wallet_unwrapped_equity_freshness_even_at_zero_balance() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+
+        let token_addr = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let zero_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        let asserter = Asserter::new();
+        asserter.push_success(&zero_encoded); // base wallet USDC balanceOf (zero)
+        asserter.push_success(&zero_encoded); // equity token balanceOf (zero)
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let mut equity_tokens = HashMap::new();
+        equity_tokens.insert(test_symbol("AAPL"), token_addr);
+
+        let server = MockServer::start();
+        let poll_freshness = PollFreshness::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            Some(WalletPollingCtx {
+                base: base_wallet,
+                unwrapped_equity_token_addresses: equity_tokens,
+                ..mock_wallet_polling_ctx(&server)
+            }),
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            observed(
+                &poll_freshness,
+                PortfolioLocation::BaseWalletUnwrapped,
+                &PortfolioAsset::Equity(test_symbol("AAPL"))
+            ),
+            "a zero on-chain balance is still a real observation and must be stamped"
+        );
+    }
+
+    /// A failed fetch must leave its slot un-observed, so the freshness gate
+    /// keeps it closed rather than treating a failed venue as polled.
+    #[tokio::test]
+    async fn poll_wallets_ethereum_rpc_failure_leaves_ethereum_usdc_freshness_unobserved() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("Ethereum RPC failure");
+        let ethereum_wallet = MockEthereumWallet::with_asserter(&asserter);
+
+        let server = MockServer::start();
+        let poll_freshness = PollFreshness::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            Some(WalletPollingCtx {
+                ethereum: ethereum_wallet,
+                ..mock_wallet_polling_ctx(&server)
+            }),
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
+        assert!(matches!(error, InventoryPollingError::Evm(_)));
+
+        assert!(
+            !observed(
+                &poll_freshness,
+                PortfolioLocation::EthereumWallet,
+                &PortfolioAsset::Usdc
+            ),
+            "a failed fetch must leave the slot un-observed so the gate keeps it closed"
+        );
+    }
+
+    /// Onchain-vault-fetch failure leg of the same invariant: an RPC failure
+    /// while fetching an equity vault's balance must leave that symbol's
+    /// MarketMaking slot un-observed, mirroring
+    /// `poll_wallets_ethereum_rpc_failure_leaves_ethereum_usdc_freshness_unobserved`
+    /// for the onchain side.
+    #[tokio::test]
+    async fn poll_onchain_equity_vault_rpc_failure_leaves_market_making_equity_freshness_unobserved()
+     {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let poll_freshness = PollFreshness::new();
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_onchain(&snapshot_id).await.unwrap_err();
+        assert!(matches!(error, InventoryPollingError::Raindex(_)));
+
+        assert!(
+            !observed(
+                &poll_freshness,
+                PortfolioLocation::MarketMaking,
+                &PortfolioAsset::Equity(test_symbol("AAPL"))
+            ),
+            "a failed vault-balance fetch must leave the slot un-observed so the gate keeps it \
+             closed"
+        );
+    }
+
+    /// Wallet-fetch failure leg of the same invariant, on the BASE wallet
+    /// USDC slot (distinct from the ethereum-wallet slot already covered by
+    /// `poll_wallets_ethereum_rpc_failure_leaves_ethereum_usdc_freshness_unobserved`):
+    /// a failed base-wallet balance fetch must leave `BaseWalletUnwrapped`'s
+    /// USDC slot un-observed, even though `poll_ethereum_usdc` (which runs
+    /// first in `poll_wallets`) succeeded and stamped its own slot.
+    #[tokio::test]
+    async fn poll_wallets_base_wallet_rpc_failure_leaves_base_wallet_usdc_freshness_unobserved() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("Base RPC failure");
+        let base_wallet = MockBaseWallet::with_asserter(&asserter);
+
+        let server = MockServer::start();
+        let poll_freshness = PollFreshness::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            Some(WalletPollingCtx {
+                base: base_wallet,
+                ..mock_wallet_polling_ctx(&server)
+            }),
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
+        assert!(matches!(error, InventoryPollingError::Evm(_)));
+
+        assert!(
+            !observed(
+                &poll_freshness,
+                PortfolioLocation::BaseWalletUnwrapped,
+                &PortfolioAsset::Usdc
+            ),
+            "a failed fetch must leave the slot un-observed so the gate keeps it closed"
+        );
+        assert!(
+            observed(
+                &poll_freshness,
+                PortfolioLocation::EthereumWallet,
+                &PortfolioAsset::Usdc
+            ),
+            "the ethereum-wallet slot, which succeeded before the base-wallet failure, must \
+             stay observed"
+        );
+    }
+
+    /// Exercises the onchain-equity/onchain-usdc/offchain-equity/offchain-usdc
+    /// leg of the row->sub-poll mapping table in one
+    /// successful `poll_and_record`: (MarketMaking, Equity), (Hedging,
+    /// Equity), (MarketMaking, Usdc), (Hedging, Usdc).
+    #[tokio::test]
+    async fn poll_and_record_stamps_onchain_and_offchain_freshness_slots_on_success() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let symbol = test_symbol("AAPL");
+
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            symbol.clone(),
+        )
+        .await;
+        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&vault_balance_hex(float!(7))); // equity vaultBalance2
+        asserter.push_success(&vault_balance_hex(float!(3))); // usdc vaultBalance2
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let inventory = Inventory {
+            positions: vec![EquityPosition {
+                symbol: symbol.clone(),
+                quantity: test_shares(5),
+                market_value: Some(float!(750)),
+            }],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            alpaca_usdc: None,
+            cash_withdrawable_cents: None,
+        };
+        let executor = MockExecutor::new().with_inventory(inventory);
+
+        let poll_freshness = PollFreshness::new();
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        service.poll_and_record().await.unwrap();
+
+        let equity_asset = PortfolioAsset::Equity(symbol);
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::MarketMaking,
+            &equity_asset
+        ));
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::Hedging,
+            &equity_asset
+        ));
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::MarketMaking,
+            &PortfolioAsset::Usdc
+        ));
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::Hedging,
+            &PortfolioAsset::Usdc
+        ));
+    }
+
+    /// The wallet-transit leg of the row->sub-poll mapping table:
+    /// (EthereumWallet, Usdc), (BaseWalletUnwrapped, Usdc),
+    /// (BaseWalletUnwrapped, Equity), (BaseWalletWrapped, Equity).
+    #[tokio::test]
+    async fn poll_wallets_stamps_freshness_for_all_wallet_transit_slots_on_success() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+        let symbol = test_symbol("AAPL");
+
+        let zero_encoded = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+
+        let ethereum_asserter = Asserter::new();
+        ethereum_asserter.push_success(&zero_encoded);
+        let ethereum_wallet = MockEthereumWallet::with_asserter(&ethereum_asserter);
+
+        let base_asserter = Asserter::new();
+        base_asserter.push_success(&zero_encoded); // base wallet USDC
+        base_asserter.push_success(&zero_encoded); // unwrapped equity balanceOf
+        base_asserter.push_success(&zero_encoded); // wrapped equity balanceOf
+        let base_wallet = MockBaseWallet::with_asserter(&base_asserter);
+
+        let token_addr = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let mut unwrapped_equity_token_addresses = HashMap::new();
+        unwrapped_equity_token_addresses.insert(symbol.clone(), token_addr);
+        let mut wrapped_equity_token_addresses = HashMap::new();
+        wrapped_equity_token_addresses.insert(symbol.clone(), token_addr);
+
+        let poll_freshness = PollFreshness::new();
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            Some(WalletPollingCtx {
+                ethereum: ethereum_wallet,
+                base: base_wallet,
+                unwrapped_equity_token_addresses,
+                wrapped_equity_token_addresses,
+            }),
+            None,
+            Usd::ZERO,
+        )
+        .with_poll_freshness(poll_freshness.clone());
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_wallets(&snapshot_id).await.unwrap();
+
+        let equity_asset = PortfolioAsset::Equity(symbol);
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::EthereumWallet,
+            &PortfolioAsset::Usdc
+        ));
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::BaseWalletUnwrapped,
+            &PortfolioAsset::Usdc
+        ));
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::BaseWalletUnwrapped,
+            &equity_asset
+        ));
+        assert!(observed(
+            &poll_freshness,
+            PortfolioLocation::BaseWalletWrapped,
+            &equity_asset
+        ));
     }
 }
