@@ -3242,6 +3242,48 @@ mod tests {
         );
     }
 
+    /// The recovery force path bypasses the staleness guards by design, but
+    /// it must not bypass the open-hedge gate: a symbol with an open order
+    /// owns its balance via the fill delta, and force-writing the ambiguous
+    /// mid-order snapshot value re-opens the double-count the gate exists to
+    /// prevent -- on the recovery path, which exists precisely for when
+    /// things already went wrong.
+    #[test]
+    fn force_apply_offchain_snapshot_respects_open_hedge_gate() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(100))
+            .with_equity(tsla.clone(), shares(10), shares(50));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        let positions = BTreeMap::from([(aapl.clone(), shares(90)), (tsla.clone(), shares(45))]);
+        let forced = view
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: now,
+                },
+                now,
+                Arc::new(InventoryViewError::UsdBalanceConversion(0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            forced.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "a symbol with an open hedge order owns its balance via the fill \
+             delta; even the force path must not overwrite it"
+        );
+        assert_eq!(
+            forced.equity_available(&tsla, Venue::Hedging),
+            Some(shares(45)),
+            "ungated symbols must still force-apply"
+        );
+    }
+
     #[test]
     fn reset_preserves_offchain_order_guard_state_only() {
         let aapl = Symbol::new("AAPL").unwrap();
