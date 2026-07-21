@@ -67,7 +67,7 @@ use crate::unwrapped_equity_recovery::{
 };
 use crate::usdc_rebalance::{
     AlpacaToBaseReservationRecovery, InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance,
-    UsdcRebalanceEvent, UsdcRebalanceId, interrupted_usdc_rebalance_ids,
+    UsdcRebalanceId, interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -5195,27 +5195,6 @@ impl RebalancingService {
             | Detected { .. } => false,
         }
     }
-
-    fn is_terminal_usdc_rebalance_event(event: &UsdcRebalanceEvent) -> bool {
-        use UsdcRebalanceEvent::*;
-
-        matches!(
-            event,
-            WithdrawalFailed { .. }
-                | BridgingFailed { .. }
-                | DepositFailed { .. }
-                | ConversionFailed { .. }
-                | OperatorReconciled { .. }
-                | ConversionConfirmed {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    ..
-                }
-                | DepositConfirmed {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    ..
-                }
-        )
-    }
 }
 
 /// Test fixture: drain every pending equity- and USDC-check row the service
@@ -5283,9 +5262,11 @@ mod tests {
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
-        ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+        ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
+        UsdcRebalanceId,
     };
     use crate::vault_registry::VaultRegistryCommand;
+    use usdc::UsdcEventDisposition;
 
     #[test]
     fn mint_inventory_update_skips_cancel_for_pre_acceptance_fail() {
@@ -19141,82 +19122,105 @@ mod tests {
         drop(inventory);
     }
 
-    #[test]
-    fn usdc_failure_events_are_terminal() {
-        assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_withdrawal_failed()
-        ));
-        assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_bridging_failed()
-        ));
-        assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_deposit_failed()
-        ));
-        assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_conversion_failed()
-        ));
+    /// Terminal failure events always classify as terminal (clear or
+    /// preserve, never `NotTerminal`). The classification now comes from the
+    /// same exhaustive match that produces the settlement outcome, so these
+    /// pin the disposition rather than a separate terminality predicate.
+    /// Whether a given failure clears or preserves depends on post-burn
+    /// evidence (e.g. the fixture's `BridgingFailed` carries a burn hash and
+    /// so preserves), which the guard-lifecycle tests cover.
+    #[tokio::test]
+    async fn usdc_failure_events_classify_as_terminal() {
+        for event in [
+            make_usdc_withdrawal_failed(),
+            make_usdc_bridging_failed(),
+            make_usdc_deposit_failed(),
+            make_usdc_conversion_failed(),
+        ] {
+            let trigger = make_trigger().await;
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let disposition = trigger
+                .apply_usdc_rebalance_event(&id, &event)
+                .await
+                .unwrap();
+            assert!(
+                !matches!(disposition, UsdcEventDisposition::NotTerminal),
+                "a terminal failure must classify as terminal (clear or \
+                 preserve), got {disposition:?} for {event:?}"
+            );
+        }
     }
 
-    #[test]
-    fn non_terminal_usdc_events_are_not_terminal() {
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(1000))
-        ));
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_withdrawal_confirmed()
-        ));
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_bridging_initiated()
-        ));
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_bridged()
-        ));
-        // A recovered post-burn bridge re-enters the Bridged stage and must stay
-        // non-terminal so the guard holds until the terminal deposit leg.
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_bridging_completion_recovered()
-        ));
+    #[tokio::test]
+    async fn non_terminal_usdc_events_classify_as_not_terminal() {
+        // Funded inventory: `Initiated` deducts the rebalanced amount from
+        // the source venue's available balance as a tracking side effect.
+        let trigger =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(5000), usdc(5000)))
+                .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Applied in flow order so stage-tracking side effects see the
+        // tracking context a live flow would have. A recovered post-burn
+        // bridge re-enters the Bridged stage and must stay non-terminal so
+        // the guard holds until the terminal deposit leg.
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(1000)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridged(),
+            make_usdc_bridging_completion_recovered(),
+            make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(1000), usdc(998)),
+            make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
+        ] {
+            let disposition = trigger
+                .apply_usdc_rebalance_event(&id, &event)
+                .await
+                .unwrap();
+            assert!(
+                matches!(disposition, UsdcEventDisposition::NotTerminal),
+                "a progress event must keep the claim held with no settlement \
+                 outcome, got {disposition:?} for {event:?}"
+            );
+        }
     }
 
-    #[test]
-    fn conversion_confirmed_is_terminal_for_base_to_alpaca() {
-        // For BaseToAlpaca, ConversionConfirmed IS the terminal event.
-        assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_conversion_confirmed(
-                RebalanceDirection::BaseToAlpaca,
-                usdc(1000),
-                usdc(998),
+    /// For BaseToAlpaca, ConversionConfirmed IS the terminal event; for
+    /// AlpacaToBase, DepositConfirmed is. Both clear the claim with a
+    /// settlement outcome; their direction-mirrored counterparts are covered
+    /// as non-terminal above.
+    #[tokio::test]
+    async fn direction_specific_terminal_events_classify_as_clear() {
+        let trigger = make_trigger().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let conversion = trigger
+            .apply_usdc_rebalance_event(
+                &id,
+                &make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(1000),
+                    usdc(998),
+                ),
             )
-        ));
-    }
+            .await
+            .unwrap();
+        assert!(
+            matches!(conversion, UsdcEventDisposition::Clear(_)),
+            "BaseToAlpaca ConversionConfirmed is the terminal event, got {conversion:?}"
+        );
 
-    #[test]
-    fn conversion_confirmed_is_not_terminal_for_alpaca_to_base() {
-        // For AlpacaToBase, ConversionConfirmed is NOT terminal (flow continues
-        // to withdrawal).
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_conversion_confirmed(
-                RebalanceDirection::AlpacaToBase,
-                usdc(1000),
-                usdc(998),
+        let deposit = trigger
+            .apply_usdc_rebalance_event(
+                &id,
+                &make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
             )
-        ));
-    }
-
-    #[test]
-    fn deposit_confirmed_is_terminal_for_alpaca_to_base() {
-        assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase)
-        ));
-    }
-
-    #[test]
-    fn deposit_confirmed_is_not_terminal_for_base_to_alpaca() {
-        // For BaseToAlpaca, DepositConfirmed is NOT terminal because
-        // post-deposit conversion (USDC->USD) is still required.
-        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca)
-        ));
+            .await
+            .unwrap();
+        assert!(
+            matches!(deposit, UsdcEventDisposition::Clear(_)),
+            "AlpacaToBase DepositConfirmed is the terminal event, got {deposit:?}"
+        );
     }
 
     #[tokio::test]
@@ -19265,16 +19269,17 @@ mod tests {
     }
 
     /// Spy reactor that records all dispatched events for verification.
+    /// Classification happens after the flow via
+    /// `apply_usdc_rebalance_event`, which takes one event at a time — so the
+    /// dispositions asserted below are inherently derived without history.
     struct EventCapturingReactor {
         captured_events: Arc<tokio::sync::Mutex<Vec<UsdcRebalanceEvent>>>,
-        terminal_detection_results: Arc<tokio::sync::Mutex<Vec<bool>>>,
     }
 
     impl EventCapturingReactor {
         fn new() -> Self {
             Self {
                 captured_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                terminal_detection_results: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -19292,14 +19297,30 @@ mod tests {
             let (_id, event) = event.into_inner();
             self.captured_events.lock().await.push(event.clone());
 
-            let is_terminal = RebalancingService::is_terminal_usdc_rebalance_event(&event);
-            self.terminal_detection_results
-                .lock()
-                .await
-                .push(is_terminal);
-
             Ok(())
         }
+    }
+
+    /// Classifies the last event the spy captured through a fresh trigger's
+    /// disposition method. The events these flow tests drive classify
+    /// state-independently, so a fresh trigger gives the same answer the
+    /// live reactor would.
+    async fn last_event_disposition(
+        spy: &EventCapturingReactor,
+        id: &UsdcRebalanceId,
+    ) -> UsdcEventDisposition {
+        let last_event = spy
+            .captured_events
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("flow dispatched events");
+        make_trigger()
+            .await
+            .apply_usdc_rebalance_event(id, &last_event)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -19385,14 +19406,11 @@ mod tests {
 
         // For BaseToAlpaca, DepositConfirmed is NOT terminal because post-deposit
         // conversion (USDC->USD) is still required
+        let disposition = last_event_disposition(&spy, &id).await;
         assert!(
-            !spy.terminal_detection_results
-                .lock()
-                .await
-                .last()
-                .copied()
-                .unwrap(),
-            "DepositConfirmed(BaseToAlpaca) should NOT be terminal - needs conversion"
+            matches!(disposition, UsdcEventDisposition::NotTerminal),
+            "DepositConfirmed(BaseToAlpaca) should NOT be terminal - needs \
+             conversion; got {disposition:?}"
         );
     }
 
@@ -19476,14 +19494,11 @@ mod tests {
             .await
             .unwrap();
 
+        let disposition = last_event_disposition(&spy, &id).await;
         assert!(
-            spy.terminal_detection_results
-                .lock()
-                .await
-                .last()
-                .copied()
-                .unwrap(),
-            "has_terminal_usdc_rebalance_event must identify DepositConfirmed alone as terminal"
+            matches!(disposition, UsdcEventDisposition::Clear(_)),
+            "DepositConfirmed(AlpacaToBase) alone must classify as a clearing \
+             terminal; got {disposition:?}"
         );
     }
 
@@ -19517,14 +19532,10 @@ mod tests {
             .await
             .unwrap();
 
+        let disposition = last_event_disposition(&spy, &id).await;
         assert!(
-            spy.terminal_detection_results
-                .lock()
-                .await
-                .last()
-                .copied()
-                .unwrap(),
-            "WithdrawalFailed should be terminal"
+            matches!(disposition, UsdcEventDisposition::Clear(_)),
+            "WithdrawalFailed should classify as a clearing terminal; got {disposition:?}"
         );
     }
 
@@ -19578,14 +19589,13 @@ mod tests {
             .await
             .unwrap();
 
+        // A post-burn BridgingFailed preserves the guard rather than clearing
+        // it; either way it must classify as terminal (never NotTerminal).
+        let disposition = last_event_disposition(&spy, &id).await;
         assert!(
-            spy.terminal_detection_results
-                .lock()
-                .await
-                .last()
-                .copied()
-                .unwrap(),
-            "has_terminal_usdc_rebalance_event must identify BridgingFailed alone as terminal"
+            !matches!(disposition, UsdcEventDisposition::NotTerminal),
+            "BridgingFailed alone must classify as terminal (clear or \
+             preserve); got {disposition:?}"
         );
     }
 
@@ -19618,14 +19628,10 @@ mod tests {
             .await
             .unwrap();
 
+        let disposition = last_event_disposition(&spy, &id).await;
         assert!(
-            spy.terminal_detection_results
-                .lock()
-                .await
-                .last()
-                .copied()
-                .unwrap(),
-            "has_terminal_usdc_rebalance_event must identify ConversionFailed alone as terminal"
+            !matches!(disposition, UsdcEventDisposition::NotTerminal),
+            "ConversionFailed alone must classify as terminal; got {disposition:?}"
         );
     }
 
@@ -19800,20 +19806,34 @@ mod tests {
             .await
             .unwrap();
 
-        // Our terminal detection receives only the latest event(s) per dispatch
-        let terminal_results = spy.terminal_detection_results.lock().await;
-        let deposit_confirmed_idx = 6;
-        assert!(
-            !terminal_results[deposit_confirmed_idx],
-            "DepositConfirmed(BaseToAlpaca) should NOT be terminal - needs conversion"
-        );
+        // Classification receives only one event at a time, so mid-flow
+        // events must classify on their own.
+        {
+            let (deposit_confirmed, conversion_initiated) = {
+                let captured = spy.captured_events.lock().await;
+                (captured[6].clone(), captured[7].clone())
+            };
+            let classifier = make_trigger().await;
 
-        let conversion_initiated_idx = 7;
-        assert!(
-            !terminal_results[conversion_initiated_idx],
-            "has_terminal_usdc_rebalance_event must NOT identify ConversionInitiated as terminal"
-        );
-        drop(terminal_results);
+            let disposition = classifier
+                .apply_usdc_rebalance_event(&id, &deposit_confirmed)
+                .await
+                .unwrap();
+            assert!(
+                matches!(disposition, UsdcEventDisposition::NotTerminal),
+                "DepositConfirmed(BaseToAlpaca) should NOT be terminal - needs \
+                 conversion; got {disposition:?}"
+            );
+
+            let disposition = classifier
+                .apply_usdc_rebalance_event(&id, &conversion_initiated)
+                .await
+                .unwrap();
+            assert!(
+                matches!(disposition, UsdcEventDisposition::NotTerminal),
+                "ConversionInitiated must NOT classify as terminal; got {disposition:?}"
+            );
+        }
 
         store
             .send(
@@ -19828,14 +19848,11 @@ mod tests {
             .await
             .unwrap();
 
+        let disposition = last_event_disposition(&spy, &id).await;
         assert!(
-            spy.terminal_detection_results
-                .lock()
-                .await
-                .last()
-                .copied()
-                .unwrap(),
-            "has_terminal_usdc_rebalance_event must identify ConversionConfirmed alone as terminal"
+            matches!(disposition, UsdcEventDisposition::Clear(_)),
+            "ConversionConfirmed(BaseToAlpaca) alone must classify as a \
+             clearing terminal; got {disposition:?}"
         );
     }
 
