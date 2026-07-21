@@ -22253,18 +22253,18 @@ mod tests {
             .await
             .unwrap();
 
-        let view = trigger.inventory.read().await;
-        assert!(
-            view.has_pending_offchain_order(&symbol),
-            "recovery reset must not clear the open-hedge gate"
-        );
+        let (gated, hedging_equity, market_making_usdc) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.has_pending_offchain_order(&symbol),
+                view.equity_available(&symbol, Venue::Hedging),
+                view.usdc_available(Venue::MarketMaking),
+            )
+        };
+        assert!(gated, "recovery reset must not clear the open-hedge gate");
+        assert_eq!(hedging_equity, None, "recovery must still reset balances");
         assert_eq!(
-            view.equity_available(&symbol, Venue::Hedging),
-            None,
-            "recovery must still reset balances"
-        );
-        assert_eq!(
-            view.usdc_available(Venue::MarketMaking),
+            market_making_usdc,
             Some(usdc(500)),
             "recovery must force-apply the failed snapshot"
         );
