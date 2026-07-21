@@ -22327,6 +22327,82 @@ mod tests {
         );
     }
 
+    /// The reverse race through the production stamping path. The aggregate
+    /// stamps `fetched_at` when it handles the command -- after the broker
+    /// read -- so a read taken before the fill can be stamped after the fill
+    /// was applied, slip past the applied-fill guard, and resurrect the
+    /// pre-fill balance. The guard-2 test above delivers hand-stamped events
+    /// directly and cannot catch this; this one sends the command the way
+    /// production does.
+    #[tokio::test]
+    async fn reverse_race_late_handled_pre_fill_read_does_not_resurrect_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
+        trigger
+            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .await;
+        let mut seen_sequence = 0i64;
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // The broker read happens HERE, pre-fill, reporting 100. Its command
+        // is still in flight while the fill below executes and applies.
+        let pre_fill_positions = BTreeMap::from([(symbol.clone(), shares(100))]);
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        // Only now does the stale read's command reach the aggregate.
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        send_command::<InventorySnapshot>(
+            &pool,
+            &snapshot_id,
+            InventorySnapshotCommand::OffchainEquity {
+                positions: pre_fill_positions,
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
+            harness
+                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let hedging = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging);
+        assert_eq!(
+            hedging,
+            Some(shares(90)),
+            "a pre-fill read handled after the fill applied must not \
+             resurrect the pre-fill balance; 100 means the stale read \
+             overwrote the fill"
+        );
+    }
+
     #[tokio::test]
     async fn offchain_order_failed_enqueues_equity_recheck() {
         let symbol = Symbol::new("AAPL").unwrap();
