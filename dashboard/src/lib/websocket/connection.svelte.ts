@@ -16,10 +16,11 @@ type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
 const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 10000
+type TradeProtocol = 'terminal_outcomes_v2' | 'terminal_outcomes_v1'
 
-const withTradeProtocol = (url: string): string => {
+const withTradeProtocol = (url: string, tradeProtocol: TradeProtocol): string => {
   const protocolUrl = new URL(url)
-  protocolUrl.searchParams.set('trade_protocol', 'terminal_outcomes_v1')
+  protocolUrl.searchParams.set('trade_protocol', tradeProtocol)
   return protocolUrl.toString()
 }
 
@@ -33,8 +34,8 @@ export type ErrorContext = {
 }
 
 export const createWebSocket = (url: string, queryClient: QueryClient) => {
-  const protocolUrl = withTradeProtocol(url)
   let socket: WebSocket | null = null
+  let tradeProtocol: TradeProtocol = 'terminal_outcomes_v2'
   let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
   let failureMessage = 'WebSocket connection error'
   const reconnectAttempts = reactive(0)
@@ -76,9 +77,19 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
   }
 
   const createSocket = () => {
+    const attemptedProtocol = tradeProtocol
+    const protocolUrl = withTradeProtocol(url, attemptedProtocol)
+    let opened = false
     socket = new WebSocket(protocolUrl)
 
     socket.onopen = () => {
+      opened = true
+      // A v1 connection proves the fallback works, not that v2 is permanently
+      // unavailable. Probe v2 again after the next disconnect so a transient
+      // restart cannot pin this dashboard to the lower-fidelity protocol.
+      if (attemptedProtocol === 'terminal_outcomes_v1') {
+        tradeProtocol = 'terminal_outcomes_v2'
+      }
       if (import.meta.env.DEV) console.log(`[ws] connected to ${protocolUrl}`)
       fsm.send('open')
     }
@@ -118,6 +129,9 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     }
 
     socket.onclose = (event) => {
+      if (!opened && attemptedProtocol === 'terminal_outcomes_v2') {
+        tradeProtocol = 'terminal_outcomes_v1'
+      }
       if (import.meta.env.DEV)
         console.log(`[ws] closed (code=${String(event.code)}, reason="${event.reason}")`)
       failureMessage = 'WebSocket connection closed'
@@ -126,6 +140,9 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     }
 
     socket.onerror = () => {
+      if (!opened && attemptedProtocol === 'terminal_outcomes_v2') {
+        tradeProtocol = 'terminal_outcomes_v1'
+      }
       failureMessage = 'WebSocket connection error'
       fsm.send('error')
     }

@@ -426,6 +426,8 @@ pub enum OffchainOrder {
     Submitted {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
+        #[serde(default)]
+        requested_shares: Option<Positive<FractionalShares>>,
         direction: Direction,
         executor: SupportedExecutor,
         executor_order_id: ExecutorOrderId,
@@ -441,6 +443,8 @@ pub enum OffchainOrder {
     PartiallyFilled {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
+        #[serde(default)]
+        requested_shares: Option<Positive<FractionalShares>>,
         shares_filled: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
@@ -459,6 +463,8 @@ pub enum OffchainOrder {
     Cancelling {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
+        #[serde(default)]
+        requested_shares: Option<Positive<FractionalShares>>,
         #[serde(default)]
         retained_fill: Option<RetainedFill>,
         direction: Direction,
@@ -489,10 +495,14 @@ pub enum OffchainOrder {
     Failed {
         symbol: Symbol,
         shares: Positive<FractionalShares>,
+        #[serde(default)]
+        requested_shares: Option<Positive<FractionalShares>>,
         direction: Direction,
         executor: SupportedExecutor,
         #[serde(default)]
         retained_fill: Option<RetainedFill>,
+        #[serde(default)]
+        filled_shares: Option<FractionalShares>,
         #[serde(default)]
         executor_order_id: Option<ExecutorOrderId>,
         error: String,
@@ -659,7 +669,7 @@ impl EventSourced for OffchainOrder {
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
     const PROJECTION: Table = Table("offchain_order_view");
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         originate_offchain_order(event)
@@ -689,6 +699,7 @@ impl EventSourced for OffchainOrder {
                 Ok(Some(Self::Submitted {
                     symbol: symbol.clone(),
                     shares: *shares,
+                    requested_shares: None,
                     direction: *direction,
                     executor: *executor,
                     executor_order_id: executor_order_id.clone(),
@@ -707,6 +718,7 @@ impl EventSourced for OffchainOrder {
             } => {
                 let Self::Pending {
                     symbol,
+                    shares: requested_shares,
                     direction,
                     executor,
                     placed_at,
@@ -722,6 +734,7 @@ impl EventSourced for OffchainOrder {
                 Ok(Some(Self::Submitted {
                     symbol: symbol.clone(),
                     shares: *placed_shares,
+                    requested_shares: Some(*requested_shares),
                     direction: *direction,
                     executor: *executor,
                     executor_order_id: executor_order_id.clone(),
@@ -753,7 +766,16 @@ impl EventSourced for OffchainOrder {
                 *cancel_requested_at,
             )),
 
-            Failed { error, failed_at } => Ok(evolve_failed(entity, error.clone(), *failed_at)),
+            Failed {
+                error,
+                filled_shares,
+                failed_at,
+            } => Ok(evolve_failed(
+                entity,
+                error.clone(),
+                *filled_shares,
+                *failed_at,
+            )),
 
             Cancelled {
                 reason,
@@ -989,6 +1011,7 @@ impl EventSourced for OffchainOrder {
             OffchainOrderCommand::MarkPlacementFailed { error } => match self {
                 Self::Pending { .. } => Ok(vec![OffchainOrderEvent::Failed {
                     error,
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 }]),
                 Self::Submitted { symbol, .. }
@@ -1006,13 +1029,19 @@ impl EventSourced for OffchainOrder {
                 }
             },
 
-            OffchainOrderCommand::MarkFailed { error, failed_at } => match self {
+            OffchainOrderCommand::MarkFailed {
+                error,
+                filled_shares,
+                failed_at,
+            } => match self {
                 Self::Pending { .. }
                 | Self::Submitted { .. }
                 | Self::PartiallyFilled { .. }
-                | Self::Cancelling { .. } => {
-                    Ok(vec![OffchainOrderEvent::Failed { error, failed_at }])
-                }
+                | Self::Cancelling { .. } => Ok(vec![OffchainOrderEvent::Failed {
+                    error,
+                    filled_shares,
+                    failed_at,
+                }]),
                 // Idempotent: re-failing an already-failed order records nothing.
                 Self::Failed { .. } => Ok(vec![]),
                 Self::Filled { .. } | Self::Cancelled { .. } => {
@@ -1087,6 +1116,7 @@ fn evolve_partially_filled(
         OffchainOrder::Submitted {
             symbol,
             shares,
+            requested_shares,
             direction,
             executor,
             executor_order_id,
@@ -1097,6 +1127,7 @@ fn evolve_partially_filled(
         | OffchainOrder::PartiallyFilled {
             symbol,
             shares,
+            requested_shares,
             direction,
             executor,
             executor_order_id,
@@ -1107,6 +1138,7 @@ fn evolve_partially_filled(
         } => Some(OffchainOrder::PartiallyFilled {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             shares_filled,
             direction: *direction,
             executor: *executor,
@@ -1120,6 +1152,7 @@ fn evolve_partially_filled(
         OffchainOrder::Cancelling {
             symbol,
             shares,
+            requested_shares,
             direction,
             executor,
             executor_order_id,
@@ -1132,6 +1165,7 @@ fn evolve_partially_filled(
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             retained_fill: Some(RetainedFill::priced(
                 shares_filled,
                 avg_price,
@@ -1162,6 +1196,7 @@ fn evolve_cancel_requested(
         OffchainOrder::Submitted {
             symbol,
             shares,
+            requested_shares,
             direction,
             executor,
             executor_order_id,
@@ -1171,6 +1206,7 @@ fn evolve_cancel_requested(
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             retained_fill: None,
             direction: *direction,
             executor: *executor,
@@ -1184,6 +1220,7 @@ fn evolve_cancel_requested(
         OffchainOrder::PartiallyFilled {
             symbol,
             shares,
+            requested_shares,
             shares_filled,
             direction,
             executor,
@@ -1197,6 +1234,7 @@ fn evolve_cancel_requested(
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             retained_fill: Some(RetainedFill::priced(
                 *shares_filled,
                 *avg_price,
@@ -1222,6 +1260,7 @@ fn evolve_cancel_requested(
 fn evolve_failed(
     entity: &OffchainOrder,
     error: String,
+    filled_shares: Option<FractionalShares>,
     failed_at: DateTime<Utc>,
 ) -> Option<OffchainOrder> {
     match entity {
@@ -1235,9 +1274,11 @@ fn evolve_failed(
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: None,
             direction: *direction,
             executor: *executor,
             retained_fill: None,
+            filled_shares,
             executor_order_id: None,
             error,
             placed_at: *placed_at,
@@ -1246,6 +1287,7 @@ fn evolve_failed(
         OffchainOrder::Submitted {
             symbol,
             shares,
+            requested_shares,
             direction,
             executor,
             executor_order_id,
@@ -1254,9 +1296,11 @@ fn evolve_failed(
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             direction: *direction,
             executor: *executor,
             retained_fill: None,
+            filled_shares,
             executor_order_id: Some(executor_order_id.clone()),
             error,
             placed_at: *placed_at,
@@ -1265,6 +1309,7 @@ fn evolve_failed(
         OffchainOrder::PartiallyFilled {
             symbol,
             shares,
+            requested_shares,
             shares_filled,
             direction,
             executor,
@@ -1276,6 +1321,7 @@ fn evolve_failed(
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             direction: *direction,
             executor: *executor,
             retained_fill: Some(RetainedFill::priced(
@@ -1283,6 +1329,7 @@ fn evolve_failed(
                 *avg_price,
                 *partially_filled_at,
             )),
+            filled_shares: filled_shares.or(Some(*shares_filled)),
             executor_order_id: Some(executor_order_id.clone()),
             error,
             placed_at: *placed_at,
@@ -1291,6 +1338,7 @@ fn evolve_failed(
         OffchainOrder::Cancelling {
             symbol,
             shares,
+            requested_shares,
             retained_fill,
             direction,
             executor,
@@ -1300,9 +1348,11 @@ fn evolve_failed(
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
             shares: *shares,
+            requested_shares: *requested_shares,
             direction: *direction,
             executor: *executor,
             retained_fill: *retained_fill,
+            filled_shares: filled_shares.or_else(|| retained_fill.map(RetainedFill::shares_filled)),
             executor_order_id: Some(executor_order_id.clone()),
             error,
             placed_at: *placed_at,
@@ -1418,42 +1468,68 @@ impl OffchainOrder {
             Self::Failed {
                 symbol,
                 shares,
+                requested_shares,
                 direction,
                 executor,
                 retained_fill,
+                filled_shares,
                 error,
                 failed_at,
                 ..
             } => {
-                let filled_shares =
-                    retained_fill.map_or(FractionalShares::ZERO, RetainedFill::shares_filled);
-                let accepted_shares = shares.inner();
-                let (filled_portion, remaining_shares, excess_shares) =
-                    if filled_shares.inner().gt(accepted_shares.inner())? {
-                        (
-                            accepted_shares,
-                            FractionalShares::ZERO,
-                            (filled_shares - accepted_shares)?,
-                        )
-                    } else {
-                        (
-                            filled_shares,
-                            (accepted_shares - filled_shares)?,
-                            FractionalShares::ZERO,
-                        )
-                    };
-                let filled_shares = NonNegative::new(filled_portion)?;
-                let remaining_shares = NonNegative::new(remaining_shares)?;
-                let excess_shares = NonNegative::new(excess_shares)?;
+                // Modern acceptance preserves the original request separately,
+                // proving that `shares` is the broker-accepted quantity. Legacy
+                // `Submitted` events do not, so acceptance remains unknown and
+                // `shares` is only safe to report as the original request.
+                let accepted_shares = requested_shares.map(|_| shares);
+                let requested_shares = requested_shares.unwrap_or(shares);
+                let event_fill = filled_shares.map(NonNegative::new).transpose()?;
+                let retained_fill = retained_fill
+                    .map(RetainedFill::shares_filled)
+                    .map(NonNegative::new)
+                    .transpose()?;
+                // Cumulative fill evidence cannot regress. If a stale terminal
+                // broker response reports less than an earlier persisted partial
+                // fill, retain the larger proven quantity rather than replacing
+                // it with the stale observation.
+                let filled_shares = match (event_fill, retained_fill) {
+                    (Some(event), Some(retained))
+                        if event.inner().inner().gt(retained.inner().inner())? =>
+                    {
+                        Some(event)
+                    }
+                    (Some(_), Some(retained)) => Some(retained),
+                    (Some(event), None) => Some(event),
+                    (None, retained) => retained,
+                };
+                let (remaining_shares, excess_shares) = match (accepted_shares, filled_shares) {
+                    (Some(accepted), Some(filled)) => {
+                        let accepted = accepted.inner();
+                        let filled = filled.inner();
+                        if filled.inner().gt(accepted.inner())? {
+                            (
+                                Some(NonNegative::new(FractionalShares::ZERO)?),
+                                Some(NonNegative::new((filled - accepted)?)?),
+                            )
+                        } else {
+                            (
+                                Some(NonNegative::new((accepted - filled)?)?),
+                                Some(NonNegative::new(FractionalShares::ZERO)?),
+                            )
+                        }
+                    }
+                    _ => (None, None),
+                };
 
                 (
                     symbol,
-                    shares,
+                    requested_shares,
                     direction,
                     executor,
                     failed_at,
                     TradeOutcome::Failed {
                         error,
+                        accepted_shares,
                         filled_shares,
                         remaining_shares,
                         excess_shares,
@@ -1942,7 +2018,11 @@ async fn reconcile_pre_cancel(
                 shares_filled,
                 avg_price,
                 failed_at,
-                OffchainOrderEvent::Failed { error, failed_at },
+                OffchainOrderEvent::Failed {
+                    error,
+                    filled_shares: shares_filled,
+                    failed_at,
+                },
             )
         }
 
@@ -2369,6 +2449,9 @@ pub enum OffchainOrderCommand {
     },
     MarkFailed {
         error: String,
+        /// Broker-reported cumulative fill quantity. `None` means the caller
+        /// has no persisted evidence for the actual fill.
+        filled_shares: Option<FractionalShares>,
         /// Broker-reported failure time when available; callers without a
         /// broker timestamp pass their observation time, which is still
         /// closer to the truth than stamping inside the handler after
@@ -2442,6 +2525,11 @@ pub enum OffchainOrderEvent {
     },
     Failed {
         error: String,
+        /// Broker-reported cumulative fill quantity. Absent on legacy events,
+        /// where the actual fill remains explicitly unknown unless an earlier
+        /// partial-fill event proves it.
+        #[serde(default)]
+        filled_shares: Option<FractionalShares>,
         failed_at: DateTime<Utc>,
     },
     Cancelled {
@@ -2787,6 +2875,7 @@ mod tests {
         let order = OffchainOrder::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             retained_fill: Some(RetainedFill::priced(
@@ -2794,6 +2883,7 @@ mod tests {
                 Usd::new(float!(195.25)),
                 fill_time,
             )),
+            filled_shares: Some(FractionalShares::new(float!(0.5))),
             executor_order_id: Some(ExecutorOrderId::new("failed-with-fill")),
             error: "broker rejected remainder".to_string(),
             placed_at: fill_time,
@@ -2815,12 +2905,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_trade_reports_filled_and_remaining_shares() {
+    fn failed_trade_preserves_requested_accepted_and_filled_shares() {
         let fill_time = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
         let order = OffchainOrder::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
+            requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             retained_fill: Some(RetainedFill::priced(
@@ -2828,6 +2919,7 @@ mod tests {
                 Usd::new(float!(195.25)),
                 fill_time,
             )),
+            filled_shares: Some(FractionalShares::new(float!(0.5))),
             executor_order_id: Some(ExecutorOrderId::new("failed-with-fill")),
             error: "broker rejected remainder".to_string(),
             placed_at: fill_time,
@@ -2842,14 +2934,37 @@ mod tests {
         match trade.outcome {
             TradeOutcome::Failed {
                 error,
+                accepted_shares,
                 filled_shares,
                 remaining_shares,
                 excess_shares,
             } => {
                 assert_eq!(error, "broker rejected remainder");
-                assert!(filled_shares.inner().inner().eq(float!(0.5)).unwrap());
-                assert!(remaining_shares.inner().inner().eq(float!(1.5)).unwrap());
-                assert!(excess_shares.inner().inner().is_zero().unwrap());
+                assert!(
+                    accepted_shares
+                        .unwrap()
+                        .inner()
+                        .inner()
+                        .eq(float!(1.5))
+                        .unwrap()
+                );
+                assert!(
+                    filled_shares
+                        .unwrap()
+                        .inner()
+                        .inner()
+                        .eq(float!(0.5))
+                        .unwrap()
+                );
+                assert!(
+                    remaining_shares
+                        .unwrap()
+                        .inner()
+                        .inner()
+                        .eq(float!(1))
+                        .unwrap()
+                );
+                assert!(excess_shares.unwrap().inner().inner().is_zero().unwrap());
             }
             TradeOutcome::Filled => panic!("failed order must retain its failure outcome"),
         }
@@ -2861,6 +2976,7 @@ mod tests {
         let order = OffchainOrder::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            requested_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             retained_fill: Some(RetainedFill::priced(
@@ -2868,6 +2984,7 @@ mod tests {
                 Usd::new(float!(195.25)),
                 failed_at,
             )),
+            filled_shares: Some(FractionalShares::new(float!(1.5))),
             executor_order_id: Some(ExecutorOrderId::new("invalid-retained-fill")),
             error: "broker reported an impossible fill".to_string(),
             placed_at: failed_at,
@@ -2886,16 +3003,65 @@ mod tests {
         else {
             panic!("failed order must retain its failure outcome");
         };
-        assert!(filled_shares.inner().inner().eq(float!(1)).unwrap());
-        assert!(remaining_shares.inner().inner().is_zero().unwrap());
-        assert!(excess_shares.inner().inner().eq(float!(0.5)).unwrap());
+        assert!(
+            filled_shares
+                .unwrap()
+                .inner()
+                .inner()
+                .eq(float!(1.5))
+                .unwrap()
+        );
+        assert!(remaining_shares.unwrap().inner().inner().is_zero().unwrap());
+        assert!(
+            excess_shares
+                .unwrap()
+                .inner()
+                .inner()
+                .eq(float!(0.5))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_trade_does_not_regress_earlier_cumulative_fill_evidence() {
+        let failed_at = Utc::now();
+        let order = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: Some(RetainedFill::priced(
+                FractionalShares::new(float!(0.5)),
+                Usd::new(float!(195.25)),
+                failed_at,
+            )),
+            filled_shares: Some(FractionalShares::new(float!(0.25))),
+            executor_order_id: Some(ExecutorOrderId::new("stale-terminal-fill")),
+            error: "broker rejected remainder".to_string(),
+            placed_at: failed_at,
+            failed_at,
+        };
+
+        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let TradeOutcome::Failed { filled_shares, .. } = trade.outcome else {
+            panic!("failed order must retain its failure outcome");
+        };
+        assert!(
+            filled_shares
+                .unwrap()
+                .inner()
+                .inner()
+                .eq(float!(0.5))
+                .unwrap()
+        );
     }
 
     #[test]
     fn legacy_failed_state_without_fill_fields_deserializes() {
-        // Materialized `Failed` payloads persisted before this PR lack the new
-        // retained-fill key; they must deserialize with the fill defaulted to
-        // None, not error.
+        // Materialized `Failed` payloads persisted before provenance tracking
+        // lack the requested, retained-fill, and explicit-fill keys. They must
+        // deserialize as unknown rather than inventing zero quantities.
         let legacy_payload = json!({
             "Failed": {
                 "symbol": "AAPL",
@@ -2920,6 +3086,22 @@ mod tests {
             ),
             "legacy Failed payload must default fill metadata to None, got: {state:?}"
         );
+        let trade = state.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let TradeOutcome::Failed {
+            accepted_shares,
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("legacy failed state must retain its failure outcome");
+        };
+        assert!(trade.shares.inner().inner().eq(float!(100)).unwrap());
+        assert_eq!(accepted_shares, None);
+        assert_eq!(filled_shares, None);
+        assert_eq!(remaining_shares, None);
+        assert_eq!(excess_shares, None);
     }
 
     #[test]
@@ -2928,6 +3110,7 @@ mod tests {
         let submitted = OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            requested_shares: None,
             direction: Direction::Buy,
             executor: SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("broker-123"),
@@ -2972,6 +3155,118 @@ mod tests {
             expected,
             "Persisted shares should reflect the broker-accepted quantity, not the original request"
         );
+        assert!(matches!(
+            inner,
+            OffchainOrder::Submitted {
+                requested_shares: Some(requested),
+                ..
+            } if requested.inner().inner().eq(float!(100)).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_trade_replays_requested_accepted_and_fill_provenance() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        let accepted = Positive::new(FractionalShares::new(float!(50))).unwrap();
+        let filled = FractionalShares::new(float!(25));
+
+        store.send(&id, place_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
+                    placed_shares: accepted,
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "broker rejected remainder".to_string(),
+                    filled_shares: Some(filled),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let trade = store
+            .load(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into_trade(&id)
+            .unwrap();
+        assert!(trade.shares.inner().inner().eq(float!(100)).unwrap());
+        let TradeOutcome::Failed {
+            accepted_shares,
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("failed order must retain its failure outcome");
+        };
+        assert_eq!(accepted_shares, Some(accepted));
+        assert_eq!(
+            filled_shares,
+            Some(NonNegative::new(FractionalShares::new(float!(25))).unwrap())
+        );
+        assert_eq!(
+            remaining_shares,
+            Some(NonNegative::new(FractionalShares::new(float!(25))).unwrap())
+        );
+        assert_eq!(
+            excess_shares,
+            Some(NonNegative::new(FractionalShares::ZERO).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_acceptance_failure_keeps_broker_provenance_unknown() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+
+        store.send(&id, place_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "broker did not accept order".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let trade = store
+            .load(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into_trade(&id)
+            .unwrap();
+        let TradeOutcome::Failed {
+            accepted_shares,
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("failed order must retain its failure outcome");
+        };
+        assert_eq!(accepted_shares, None);
+        assert_eq!(filled_shares, None);
+        assert_eq!(remaining_shares, None);
+        assert_eq!(excess_shares, None);
     }
 
     /// Builds a real store and runs the durable placement path against
@@ -3475,6 +3770,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "Market closed".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -3570,6 +3866,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "first failure".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -3584,6 +3881,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "second failure".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -3608,6 +3906,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "broker rejected".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -3874,6 +4173,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "Insufficient funds".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -3906,6 +4206,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "Order cancelled".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -4004,6 +4305,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "Test error".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -4693,6 +4995,7 @@ mod tests {
             .unwrap(),
             serde_json::to_value(OffchainOrderEvent::Failed {
                 error: "broker rejected".to_string(),
+                filled_shares: None,
                 failed_at,
             })
             .unwrap(),
@@ -5808,6 +6111,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "Extended hours session expired".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )

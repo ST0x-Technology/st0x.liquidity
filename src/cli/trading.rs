@@ -2412,9 +2412,11 @@ mod tests {
         let failed_order = OffchainOrder::Failed {
             symbol: symbol.clone(),
             shares: positive_shares("1"),
+            requested_shares: None,
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             retained_fill: None,
+            filled_shares: None,
             executor_order_id: None,
             error: "previous placement failed".to_string(),
             placed_at: block_timestamp,
@@ -2556,6 +2558,7 @@ mod tests {
         let cancelling_order = OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares: positive_shares("1"),
+            requested_shares: None,
             retained_fill: None,
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,

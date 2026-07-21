@@ -2103,6 +2103,7 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: "broker rejected".to_string(),
+                    filled_shares: None,
                     failed_at: chrono::Utc::now(),
                 },
             )

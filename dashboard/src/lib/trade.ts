@@ -40,10 +40,16 @@ export const tradeFailureReason = (outcome: TradeOutcome): string | null =>
 
 export const tradeFailureShares = (
   outcome: TradeOutcome
-): { filled: string; remaining: string; excess: string } | null =>
+): {
+  accepted: string | null
+  filled: string | null
+  remaining: string | null
+  excess: string | null
+} | null =>
   matchOutcome(outcome, {
     filled: () => null,
-    failed: ({ filledShares, remainingShares, excessShares }) => ({
+    failed: ({ acceptedShares, filledShares, remainingShares, excessShares }) => ({
+      accepted: acceptedShares,
       filled: filledShares,
       remaining: remainingShares,
       excess: excessShares

@@ -144,7 +144,7 @@ struct StuckTransferInfo {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TradeResponse {
-    entries: Vec<Trade>,
+    entries: Vec<serde_json::Value>,
     total: usize,
     has_more: bool,
 }
@@ -584,7 +584,20 @@ async fn trades(
 
     let total = all_trades.len();
     let end = total.min(offset.saturating_add(limit));
-    let entries = all_trades[offset.min(total)..end].to_vec();
+    let entries = all_trades[offset.min(total)..end]
+        .iter()
+        .map(|trade| {
+            if query.trade_protocol == TradeProtocol::TerminalOutcomesV1 {
+                serde_json::to_value(trade.terminal_outcomes_v1())
+            } else {
+                serde_json::to_value(trade)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .inspect_err(
+            |error| warn!(target: "dashboard", ?error, "Failed to serialize trade history"),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let has_more = end < total;
 
     Ok(Json(TradeResponse {
@@ -1975,26 +1988,23 @@ mod tests {
         match &failed.outcome {
             TradeOutcome::Failed {
                 error,
+                accepted_shares,
                 filled_shares,
                 remaining_shares,
                 excess_shares,
             } => {
                 assert_eq!(error, "asset is not tradable");
+                assert_eq!(accepted_shares, &None);
                 assert!(
                     filled_shares
+                        .unwrap()
                         .inner()
                         .inner()
                         .eq(st0x_float_macro::float!(0.25))
                         .unwrap()
                 );
-                assert!(
-                    remaining_shares
-                        .inner()
-                        .inner()
-                        .eq(st0x_float_macro::float!(0.75))
-                        .unwrap()
-                );
-                assert!(excess_shares.inner().inner().is_zero().unwrap());
+                assert_eq!(remaining_shares, &None);
+                assert_eq!(excess_shares, &None);
             }
             TradeOutcome::Filled => panic!("failed projection must remain failed"),
         }
@@ -2027,10 +2037,28 @@ mod tests {
             "legacy clients must not receive failed trades"
         );
 
-        let response = build_app(state)
+        let v1_response = build_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/trades?trade_protocol=terminal_outcomes_v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v1_response.status(), StatusCode::OK);
+        let v1_body: serde_json::Value =
+            serde_json::from_str(&body_to_string(v1_response).await).unwrap();
+        let v1_outcome = &v1_body["entries"][0]["outcome"];
+        assert!(v1_outcome.get("acceptedShares").is_none());
+        assert_eq!(v1_outcome["filledShares"], "0.25");
+        assert_eq!(v1_outcome["remainingShares"], "0.75");
+        assert_eq!(v1_outcome["excessShares"], "0");
+
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/trades?trade_protocol=terminal_outcomes_v2")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2045,8 +2073,19 @@ mod tests {
             body["entries"][0]["outcome"]["error"],
             "asset is not tradable"
         );
+        assert_eq!(
+            body["entries"][0]["outcome"]["acceptedShares"],
+            serde_json::Value::Null
+        );
         assert_eq!(body["entries"][0]["outcome"]["filledShares"], "0.25");
-        assert_eq!(body["entries"][0]["outcome"]["remainingShares"], "0.75");
+        assert_eq!(
+            body["entries"][0]["outcome"]["remainingShares"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            body["entries"][0]["outcome"]["excessShares"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]
@@ -3008,6 +3047,7 @@ mod tests {
                 OffchainOrderId::new(),
                 OffchainOrderEvent::Failed {
                     error: "rejected".to_string(),
+                    filled_shares: None,
                     failed_at: now,
                 },
             )

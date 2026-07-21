@@ -201,6 +201,8 @@ where
             .build(order_placer.clone())
             .await?;
 
+    rebuild_stale_offchain_order_projection(pool, &offchain_order_projection).await?;
+
     // Startup recovery runs before any job worker starts, so no concurrent
     // placement can race its broker re-drive -- it intentionally runs without
     // `counter_trade_submission_lock` (which the builder constructs later). The
@@ -215,6 +217,41 @@ where
     .await?;
 
     Ok((offchain_order, offchain_order_projection))
+}
+
+async fn rebuild_stale_offchain_order_projection(
+    pool: &SqlitePool,
+    projection: &Projection<OffchainOrder>,
+) -> Result<(), st0x_event_sorcery::ProjectionError<OffchainOrder>> {
+    // StoreBuilder records the aggregate schema version before its catch-up,
+    // which intentionally skips projection rows already at the latest event
+    // sequence. Detect the old serialized shape itself so an interruption
+    // between version registration and this rebuild remains repairable on the
+    // next startup. A present JSON null is current; SQL NULL means the field is
+    // absent from a pre-v3 projection row.
+    let has_stale_rows: i64 = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM offchain_order_view \
+             WHERE (json_type(payload, '$.Live.Submitted') IS NOT NULL \
+                    AND json_type(payload, '$.Live.Submitted.requested_shares') IS NULL) \
+                OR (json_type(payload, '$.Live.PartiallyFilled') IS NOT NULL \
+                    AND json_type(payload, '$.Live.PartiallyFilled.requested_shares') IS NULL) \
+                OR (json_type(payload, '$.Live.Cancelling') IS NOT NULL \
+                    AND json_type(payload, '$.Live.Cancelling.requested_shares') IS NULL) \
+                OR (json_type(payload, '$.Live.Failed') IS NOT NULL \
+                    AND (json_type(payload, '$.Live.Failed.requested_shares') IS NULL \
+                         OR json_type(payload, '$.Live.Failed.filled_shares') IS NULL)) \
+             LIMIT 1 \
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if has_stale_rows != 0 {
+        projection.rebuild_all().await?;
+    }
+
+    Ok(())
 }
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
@@ -3584,7 +3621,7 @@ mod tests {
         create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
-    use st0x_event_sorcery::{DomainEvent, StoreBuilder, test_store};
+    use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
         Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
@@ -3884,6 +3921,246 @@ mod tests {
                 outcome: st0x_dto::TradeOutcome::Failed { error, .. },
                 ..
             }) if error == "asset is not tradable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_schema_change_rebuilds_existing_offchain_order_projection_rows() {
+        let pool = setup_test_db().await;
+        let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let id = OffchainOrderId::new();
+        let requested_shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let accepted_shares = Positive::new(FractionalShares::new(float!(0.5))).unwrap();
+        let filled_shares = FractionalShares::new(float!(0.25));
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: requested_shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("TEST-ACCEPTED"),
+                    placed_shares: accepted_shares,
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "broker rejected remainder".to_string(),
+                    filled_shares: Some(filled_shares),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE offchain_order_view \
+             SET payload = json_remove(\
+                 payload,\
+                 '$.Live.Failed.requested_shares',\
+                 '$.Live.Failed.filled_shares'\
+             ) \
+             WHERE view_id = ?",
+        )
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stale = projection.load(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            stale,
+            OffchainOrder::Failed {
+                requested_shares: None,
+                filled_shares: None,
+                ..
+            }
+        ));
+
+        let schema_changed = Reconciler::new(pool.clone())
+            .reconcile::<OffchainOrder>()
+            .await
+            .unwrap();
+        assert_eq!(
+            schema_changed,
+            st0x_event_sorcery::SchemaReconciliation::Unchanged,
+            "the schema registry is already current"
+        );
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+
+        let rebuilt = projection.load(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            rebuilt,
+            OffchainOrder::Failed {
+                requested_shares: Some(requested),
+                filled_shares: Some(filled),
+                ..
+            } if requested == requested_shares && filled == filled_shares
+        ));
+    }
+
+    async fn place_and_accept_projection_order(store: &Store<OffchainOrder>, id: &OffchainOrderId) {
+        store
+            .send(
+                id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new(id),
+                    placed_shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_schema_change_rebuilds_live_offchain_order_projection_rows() {
+        let pool = setup_test_db().await;
+        let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let submitted_id = OffchainOrderId::new();
+        let partially_filled_id = OffchainOrderId::new();
+        let cancelling_id = OffchainOrderId::new();
+
+        place_and_accept_projection_order(&store, &submitted_id).await;
+        place_and_accept_projection_order(&store, &partially_filled_id).await;
+        store
+            .send(
+                &partially_filled_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(0.25)),
+                    avg_price: Usd::new(float!(100)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        place_and_accept_projection_order(&store, &cancelling_id).await;
+        store
+            .send(
+                &cancelling_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        for (id, path) in [
+            (&submitted_id, "$.Live.Submitted.requested_shares"),
+            (
+                &partially_filled_id,
+                "$.Live.PartiallyFilled.requested_shares",
+            ),
+            (&cancelling_id, "$.Live.Cancelling.requested_shares"),
+        ] {
+            sqlx::query(
+                "UPDATE offchain_order_view SET payload = json_remove(payload, ?) WHERE view_id = ?",
+            )
+            .bind(path)
+            .bind(id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            projection.load(&submitted_id).await.unwrap().unwrap(),
+            OffchainOrder::Submitted {
+                requested_shares: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            projection
+                .load(&partially_filled_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::PartiallyFilled {
+                requested_shares: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            projection.load(&cancelling_id).await.unwrap().unwrap(),
+            OffchainOrder::Cancelling {
+                requested_shares: None,
+                ..
+            }
+        ));
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            projection.load(&submitted_id).await.unwrap().unwrap(),
+            OffchainOrder::Submitted {
+                requested_shares: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            projection
+                .load(&partially_filled_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::PartiallyFilled {
+                requested_shares: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            projection.load(&cancelling_id).await.unwrap().unwrap(),
+            OffchainOrder::Cancelling {
+                requested_shares: Some(_),
+                ..
+            }
         ));
     }
 
@@ -9585,6 +9862,7 @@ mod tests {
                 &offchain_order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: "insufficient qty".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -10463,9 +10741,11 @@ mod tests {
         let failed_state = OffchainOrder::Failed {
             symbol: symbol.clone(),
             shares,
+            requested_shares: None,
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
             retained_fill: None,
+            filled_shares: None,
             executor_order_id: None,
             error: "broker rejected".to_string(),
             placed_at: Utc::now(),
@@ -10616,6 +10896,7 @@ mod tests {
         let cancelling = OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares,
+            requested_shares: None,
             retained_fill: None,
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
