@@ -34,8 +34,10 @@ Existing mechanisms this fix builds on:
   watermark, inflight transfers, and `last_rebalancing` — precedent for the
   guard shape below. It is called per symbol inside a `try_fold`, so skipping
   one symbol leaves the rest of the snapshot unaffected, and the watermark
-  advances only for symbols that actually applied (so a skipped symbol heals on
-  the next poll).
+  advances only for symbols that actually applied. A skipped symbol can heal on
+  a later poll — but only if that poll _emits_: the `InventorySnapshot`
+  aggregate dedupes unchanged values, which the forget-on-clear mechanism below
+  exists to defeat.
 - Commit
   [`1937c4b0`](https://github.com/ST0x-Technology/st0x.liquidity/commit/1937c4b0)
   ([PR #690](https://github.com/ST0x-Technology/st0x.liquidity/pull/690)) made
@@ -93,6 +95,17 @@ critical section, which no cross-struct copy could guarantee.
   plain `default()` reset would silently clear every open-hedge block and
   re-open the race. Preservation (not re-derivation) because the applied-fill
   times are local-clock readings no projection stores.
+- **Forget-on-clear** makes skipped snapshots retryable. The aggregate dedupes
+  unchanged positions, so a snapshot skipped during an open order would never
+  re-emit on its own — leaving the view stale until the position changed or a
+  restart, and silently breaking the "next snapshot heals" assumption both PR
+  #690 and the guards lean on. On gate clear the trigger sends
+  `ForgetOffchainEquity { symbol }`; the aggregate marks the symbol undelivered
+  (in a `offchain_equity_forgotten` set — the cached map stays intact so startup
+  hydration still seeds last-known balances) and the next poll re-emits broker
+  truth with a fresh local stamp, which passes guard 2 and heals within one poll
+  of the clear. The skipped value itself is never replayed — it is ambiguous
+  mid-order data; only fresh reads are ever applied.
 - On a fill, the block is released inside the **same write-lock critical
   section** that applied the delta, so no snapshot can interleave. The recorded
   time is `Utc::now()`, not the event's `broker_timestamp` — it is compared

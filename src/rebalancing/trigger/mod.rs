@@ -37,7 +37,9 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::inventory::projection::InventoryProjectionError;
-use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
+use crate::inventory::snapshot::{
+    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
+};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
@@ -483,6 +485,12 @@ pub(crate) struct RebalancingService {
     /// config, mirroring `set_stores`); `None` only in tests that do not
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
+    /// Sends `ForgetOffchainEquity` when the offchain-order gate clears, so a
+    /// snapshot skipped during the open order is re-emitted by the next poll
+    /// despite the aggregate's unchanged-value dedupe. Set after construction
+    /// via `set_snapshot_store` (mirroring `set_stores`); `None` only in tests
+    /// that do not exercise snapshot healing.
+    snapshot_store: RwLock<Option<Arc<Store<InventorySnapshot>>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
@@ -633,6 +641,7 @@ impl RebalancingService {
             registry_id,
             inventory,
             freeze_status: RwLock::new(None),
+            snapshot_store: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             notifier,
@@ -684,6 +693,56 @@ impl RebalancingService {
     /// (the reader wraps the issuance client built from config).
     pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
         *self.freeze_status.write().await = Some(reader);
+    }
+
+    /// Wires the shared `InventorySnapshot` store (the single instance built
+    /// in `Conductor::start`) so gate clears can defeat the aggregate's
+    /// unchanged-value dedupe. Called by the conductor after construction.
+    pub(crate) async fn set_snapshot_store(&self, store: Arc<Store<InventorySnapshot>>) {
+        *self.snapshot_store.write().await = Some(store);
+    }
+
+    /// Ask the snapshot aggregate to forget its cached offchain positions for
+    /// `symbol`, so the next poll re-emits broker truth even if unchanged.
+    /// Called when the offchain-order gate clears: any snapshot polled while
+    /// the order was open was skipped by the view but recorded by the
+    /// aggregate, and would otherwise never be retried.
+    ///
+    /// Best-effort: on failure the balance stays stale until the broker value
+    /// changes or the bot restarts, which is the pre-forget status quo.
+    async fn forget_offchain_equity(&self, symbol: &Symbol) {
+        let store = self.snapshot_store.read().await.clone();
+        let Some(store) = store else {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "No snapshot store wired; a snapshot skipped during the open \
+                 order cannot be retried until the broker value changes"
+            );
+            return;
+        };
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: self.registry_id.orderbook,
+            owner: self.registry_id.owner,
+        };
+        if let Err(error) = store
+            .send(
+                &snapshot_id,
+                InventorySnapshotCommand::ForgetOffchainEquity {
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+        {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                ?error,
+                "Failed to forget cached offchain equity; the balance may stay \
+                 stale until the broker value changes"
+            );
+        }
     }
 
     /// Whether a freeze-status reader has been wired. Lets the conductor's
@@ -1645,7 +1704,8 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
+            | BaseWalletWrappedEquity { .. }
+            | OffchainEquityForgotten { .. } => inventory.clone().apply_snapshot_event(&event, now),
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1755,7 +1815,8 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => {
+            | BaseWalletWrappedEquity { .. }
+            | OffchainEquityForgotten { .. } => {
                 inventory
                     .clone()
                     .force_apply_snapshot_event(&event, now, recovery_reason)
@@ -1982,7 +2043,9 @@ impl RebalancingService {
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
-            | InflightEquity { .. } => {}
+            | InflightEquity { .. }
+            // Aggregate-cache bookkeeping; no balance changed.
+            | OffchainEquityForgotten { .. } => {}
         }
     }
 
@@ -2129,6 +2192,7 @@ impl Reactor for RebalancingService {
                             .write()
                             .await
                             .clear_offchain_order_pending(&symbol, None);
+                        self.forget_offchain_equity(&symbol).await;
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
@@ -2186,6 +2250,11 @@ impl Reactor for RebalancingService {
                             "Inventory update failed for offchain fill; clearing gate anyway and relying on next polling snapshot"
                         );
                     }
+                    // Defeat the aggregate's unchanged-value dedupe so the
+                    // "next polling snapshot" the gate design relies on
+                    // actually emits, even when the broker value is unchanged
+                    // since the poll the view skipped during the open order.
+                    self.forget_offchain_equity(&symbol).await;
                     self.equity_scheduler.enqueue_check(symbol).await;
                     // Only re-check USDC if the cash leg actually applied.
                     // With and_then chaining, inventory_result == Err means
@@ -22177,6 +22246,11 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
+        // The trigger's forget-on-clear command must land in the same event
+        // stream this test polls through, so wire a store on the same pool.
+        trigger
+            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .await;
         let mut seen_sequence = 0i64;
 
         harness

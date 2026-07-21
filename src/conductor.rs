@@ -1529,6 +1529,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             )
             .await;
 
+        rebalancing_service
+            .set_snapshot_store(built.snapshot.clone())
+            .await;
+
         let recovery_transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex_service.clone(),
             vault_lookup.clone(),

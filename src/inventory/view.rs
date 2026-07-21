@@ -1779,6 +1779,10 @@ impl InventoryView {
             InflightEquity {
                 mints, redemptions, ..
             } => self.apply_inflight_snapshot(mints, redemptions, fetched_at, now),
+
+            // Aggregate-cache bookkeeping only (defeats the unchanged-value
+            // dedupe); carries no balance for the view to apply.
+            OffchainEquityForgotten { .. } => Ok(self),
         }
     }
 
@@ -1937,6 +1941,9 @@ impl InventoryView {
                 redemptions,
                 fetched_at,
             } => self.apply_inflight_snapshot(mints, redemptions, *fetched_at, now),
+
+            // Aggregate-cache bookkeeping only; nothing to force-apply.
+            OffchainEquityForgotten { .. } => Ok(self),
         }
     }
 }
@@ -3134,8 +3141,10 @@ mod tests {
         );
 
         // Re-delivering the *same* snapshot after the order terminates must
-        // apply: if the skip had advanced the watermark, `fetched_at <=
-        // watermark` would reject it and the balance could never heal.
+        // apply: the skip must not advance the watermark, or `fetched_at <=
+        // watermark` would reject the retry. (Whether a retry event is
+        // emitted at all is the aggregate's forget-on-clear concern, covered
+        // in trigger tests; this pins the view-side precondition.)
         view.clear_offchain_order_pending(&aapl, None);
         let view = view.apply_snapshot_event(&snapshot, now).unwrap();
         assert_eq!(
