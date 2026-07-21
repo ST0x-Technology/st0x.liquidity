@@ -65,28 +65,24 @@ async fn reorg_reverts_witnessed_fill() -> anyhow::Result<()> {
 
     let pool = connect_db(&infra.db_path).await?;
 
-    // The reversal is append-only: the original fill survives, the reorg is a
-    // new event, and the views expose a `reorged` flag rather than deleting rows.
+    // The reversal is append-only and asserted against the event stream: the
+    // original fill survives and the reorg is recorded as new events, rather than
+    // any row being deleted. (onchain_trade_view has no writer, so reorg state is
+    // read from the event log / Position aggregate, not from a view.)
     assert_eq!(
         count_events_of_type(&pool, "OnChainTradeEvent::Filled").await?,
         1,
         "the original fill must be preserved, not deleted",
     );
     assert_eq!(
+        count_events_of_type(&pool, "OnChainTradeEvent::Reorged").await?,
+        1,
+        "the reorged fill must be marked via a Reorged event, not removed",
+    );
+    assert_eq!(
         count_events_of_type(&pool, "PositionEvent::Reorged").await?,
         1,
         "the reorg must reverse the fill's position impact exactly once",
-    );
-
-    let reorged_trades: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM onchain_trade_view \
-         WHERE json_extract(payload, '$.Live.reorged') = 1",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(
-        reorged_trades, 1,
-        "the reorged fill must be flagged in onchain_trade_view, not removed",
     );
 
     bot.abort();
