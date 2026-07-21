@@ -20,7 +20,9 @@ pub use id::{BlankIdError, Id};
 pub use shares::{FractionalShares, SharesConversionError};
 pub use symbol::{EmptySymbolError, Symbol};
 pub use usd::{Usd, UsdToCentsError};
-pub use usdc::{Usdc, UsdcConversionError};
+pub use usdc::{
+    Usdc, UsdcConversionError, UsdcToCentsError, cents as usdc_cents, opt_cents as usdc_opt_cents,
+};
 
 /// Trait for types that have a zero value and can be compared to it.
 ///

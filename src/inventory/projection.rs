@@ -201,12 +201,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_offchain_usd_converts_and_updates_view() {
+    async fn apply_offchain_usd_updates_view() {
         let (projection, inventory) = make_projection();
 
         let event = InventorySnapshotEvent::OffchainUsd {
-            usd_balance_cents: 12345,
-            gross_usd_cents: None,
+            usd_balance: Usdc::from_cents(12345).unwrap(),
+            gross_usd: None,
             fetched_at: Utc::now(),
         };
 
@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(
             read_usdc_available(&inventory, Venue::Hedging).await,
             Some(Usdc::from_cents(12345).unwrap()),
-            "offchain usdc available should reflect converted cents",
+            "offchain usdc available should reflect the typed balance",
         );
     }
 
@@ -343,24 +343,26 @@ mod tests {
 
     /// Force-apply must leave untouched venue slots alone while
     /// overwriting the event's targeted slot. Tested at the view level
-    /// because the only `InventoryViewError` reachable from
-    /// `apply_snapshot_event` (`UsdBalanceConversion`) fails identically
-    /// in `force_apply_snapshot_event`, so the projection's recovery
+    /// because every `InventoryViewError` reachable from
+    /// `apply_snapshot_event` fails identically in
+    /// `force_apply_snapshot_event`, so the projection's recovery
     /// branch is not reachable via a real event.
     #[tokio::test]
     async fn force_apply_preserves_unrelated_state_and_overwrites_target() {
         let seed = InventoryView::default()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OffchainUsd {
-                    usd_balance_cents: 500_000,
-                    gross_usd_cents: None,
+                    usd_balance: Usdc::from_cents(500_000).unwrap(),
+                    gross_usd: None,
                     fetched_at: Utc::now(),
                 },
                 Utc::now(),
             )
             .unwrap();
 
-        let reason = Arc::new(InventoryViewError::UsdBalanceConversion(-1));
+        let reason = Arc::new(InventoryViewError::Float(
+            rain_math_float::FloatError::InvalidHex("test".to_string()),
+        ));
         let forced = seed
             .force_apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
@@ -392,8 +394,8 @@ mod tests {
 
         projection
             .apply(&InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents: 500_000,
-                gross_usd_cents: None,
+                usd_balance: Usdc::from_cents(500_000).unwrap(),
+                gross_usd: None,
                 fetched_at: Utc::now(),
             })
             .await

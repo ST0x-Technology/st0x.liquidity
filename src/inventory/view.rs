@@ -31,8 +31,6 @@ pub(crate) enum InventoryViewError {
     Usdc(#[from] InventoryError<Usdc>),
     #[error("float arithmetic error: {0}")]
     Float(#[from] FloatError),
-    #[error("failed to convert USD balance cents {0} to USDC")]
-    UsdBalanceConversion(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,17 +593,17 @@ pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
-    /// Margin-safe buying power in cents from the offchain broker.
+    /// Margin-safe buying power from the offchain broker.
     #[serde(default)]
-    buying_power_cents: Option<i64>,
-    /// Settled (withdrawable) cash in cents from the offchain broker.
+    buying_power: Option<Usdc>,
+    /// Settled (withdrawable) cash from the offchain broker.
     /// Excludes T+1 unsettled equity-sale proceeds; this is the amount
     /// actually movable to Raindex during rebalancing.
     #[serde(default)]
-    withdrawable_cash_cents: Option<i64>,
-    /// Gross offchain USD balance in cents (before cash reserve subtraction).
+    withdrawable_cash: Option<Usdc>,
+    /// Gross offchain USD balance (before cash reserve subtraction).
     #[serde(default)]
-    offchain_gross_usd_cents: Option<i64>,
+    offchain_gross_usd: Option<Usdc>,
     /// USDC token balance held in the Alpaca account.
     #[serde(default)]
     alpaca_usdc: Option<Usdc>,
@@ -780,10 +778,8 @@ impl InventoryView {
         }
 
         let onchain = onchain_venue.total()?;
-        let offchain = match (self.offchain_gross_usd_cents, reserved) {
-            (Some(cents), _) => {
-                Usdc::from_cents(cents).ok_or(InventoryViewError::UsdBalanceConversion(cents))?
-            }
+        let offchain = match (self.offchain_gross_usd, reserved) {
+            (Some(gross), _) => gross,
             (None, None) => offchain_venue.total()?,
             (None, Some(_)) => {
                 tracing::warn!(
@@ -831,11 +827,9 @@ impl InventoryView {
         &self,
         reserved: Option<Usd>,
     ) -> Result<Option<Usdc>, InventoryViewError> {
-        let Some(withdrawable_cents) = self.withdrawable_cash_cents else {
+        let Some(withdrawable) = self.withdrawable_cash else {
             return Ok(None);
         };
-        let withdrawable = Usdc::from_cents(withdrawable_cents)
-            .ok_or(InventoryViewError::UsdBalanceConversion(withdrawable_cents))?;
         let reserved = reserved.map_or(Usdc::ZERO, |amount| Usdc::new(amount.inner()));
 
         if reserved.gt(&withdrawable)? {
@@ -891,9 +885,9 @@ impl InventoryView {
 
         let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
 
-        let withdrawable_cash = self.withdrawable_cash_cents.and_then(Usdc::from_cents);
+        let withdrawable_cash = self.withdrawable_cash;
 
-        let offchain_gross = self.offchain_gross_usd_cents.and_then(Usdc::from_cents);
+        let offchain_gross = self.offchain_gross_usd;
 
         let inflight_cash = InFlightCash {
             ethereum_wallet: self
@@ -941,9 +935,9 @@ impl Default for InventoryView {
             usdc: Inventory::default(),
             equities: HashMap::new(),
             last_updated: Utc::now(),
-            buying_power_cents: None,
-            withdrawable_cash_cents: None,
-            offchain_gross_usd_cents: None,
+            buying_power: None,
+            withdrawable_cash: None,
+            offchain_gross_usd: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -1062,7 +1056,7 @@ impl InventoryView {
     #[cfg(test)]
     pub(crate) fn with_offchain_gross_usd_cents(self, cents: i64) -> Self {
         Self {
-            offchain_gross_usd_cents: Some(cents),
+            offchain_gross_usd: Some(Usdc::from_cents(cents).expect("valid cents")),
             ..self
         }
     }
@@ -1071,7 +1065,7 @@ impl InventoryView {
     #[cfg(test)]
     pub(crate) fn with_withdrawable_cash_cents(self, cents: i64) -> Self {
         Self {
-            withdrawable_cash_cents: Some(cents),
+            withdrawable_cash: Some(Usdc::from_cents(cents).expect("valid cents")),
             ..self
         }
     }
@@ -1114,9 +1108,9 @@ impl InventoryView {
             equities,
             last_updated: now,
             usdc: self.usdc,
-            buying_power_cents: self.buying_power_cents,
-            withdrawable_cash_cents: self.withdrawable_cash_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            buying_power: self.buying_power,
+            withdrawable_cash: self.withdrawable_cash,
+            offchain_gross_usd: self.offchain_gross_usd,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1142,9 +1136,9 @@ impl InventoryView {
             usdc: updated,
             last_updated: now,
             equities: self.equities,
-            buying_power_cents: self.buying_power_cents,
-            withdrawable_cash_cents: self.withdrawable_cash_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            buying_power: self.buying_power,
+            withdrawable_cash: self.withdrawable_cash,
+            offchain_gross_usd: self.offchain_gross_usd,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1382,9 +1376,9 @@ impl InventoryView {
             equities,
             last_updated: now,
             usdc: self.usdc,
-            buying_power_cents: self.buying_power_cents,
-            withdrawable_cash_cents: self.withdrawable_cash_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            buying_power: self.buying_power,
+            withdrawable_cash: self.withdrawable_cash,
+            offchain_gross_usd: self.offchain_gross_usd,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1411,9 +1405,9 @@ impl InventoryView {
             usdc: cleared,
             last_updated: now,
             equities: self.equities,
-            buying_power_cents: self.buying_power_cents,
-            withdrawable_cash_cents: self.withdrawable_cash_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            buying_power: self.buying_power,
+            withdrawable_cash: self.withdrawable_cash,
+            offchain_gross_usd: self.offchain_gross_usd,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1680,48 +1674,44 @@ impl InventoryView {
             }
 
             OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
                 ..
             } => {
-                let usdc = Usdc::from_cents(*usd_balance_cents)
-                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                 let updated = self.update_usdc(
-                    Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
+                    Inventory::on_snapshot(Venue::Hedging, *usd_balance, fetched_at),
                     now,
                 )?;
                 Ok(Self {
-                    offchain_gross_usd_cents: *gross_usd_cents,
+                    offchain_gross_usd: *gross_usd,
                     ..updated
                 })
             }
 
             OffchainCashBuyingPower {
-                cash_buying_power_cents,
-                ..
+                cash_buying_power, ..
             } => {
                 debug!(
                     target: "inventory",
-                    ?cash_buying_power_cents,
+                    ?cash_buying_power,
                     "apply_snapshot_event: OffchainCashBuyingPower"
                 );
                 Ok(Self {
-                    buying_power_cents: *cash_buying_power_cents,
+                    buying_power: *cash_buying_power,
                     ..self
                 })
             }
 
             OffchainCashWithdrawable {
-                cash_withdrawable_cents,
-                ..
+                cash_withdrawable, ..
             } => {
                 debug!(
                     target: "inventory",
-                    ?cash_withdrawable_cents,
+                    ?cash_withdrawable,
                     "apply_snapshot_event: OffchainCashWithdrawable"
                 );
                 Ok(Self {
-                    withdrawable_cash_cents: *cash_withdrawable_cents,
+                    withdrawable_cash: *cash_withdrawable,
                     ..self
                 })
             }
@@ -1855,35 +1845,31 @@ impl InventoryView {
                 }),
 
             OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
                 ..
             } => {
-                let usdc = Usdc::from_cents(*usd_balance_cents)
-                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                 let updated = self.update_usdc(
-                    Inventory::force_on_snapshot(Venue::Hedging, usdc, reason),
+                    Inventory::force_on_snapshot(Venue::Hedging, *usd_balance, reason),
                     now,
                 )?;
                 Ok(Self {
-                    offchain_gross_usd_cents: *gross_usd_cents,
+                    offchain_gross_usd: *gross_usd,
                     ..updated
                 })
             }
 
             OffchainCashBuyingPower {
-                cash_buying_power_cents,
-                ..
+                cash_buying_power, ..
             } => Ok(Self {
-                buying_power_cents: *cash_buying_power_cents,
+                buying_power: *cash_buying_power,
                 ..self
             }),
 
             OffchainCashWithdrawable {
-                cash_withdrawable_cents,
-                ..
+                cash_withdrawable, ..
             } => Ok(Self {
-                withdrawable_cash_cents: *cash_withdrawable_cents,
+                withdrawable_cash: *cash_withdrawable,
                 ..self
             }),
 
@@ -2140,9 +2126,9 @@ mod tests {
             usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
             last_updated: Utc::now(),
-            buying_power_cents: None,
-            withdrawable_cash_cents: None,
-            offchain_gross_usd_cents: None,
+            buying_power: None,
+            withdrawable_cash: None,
+            offchain_gross_usd: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -2172,9 +2158,9 @@ mod tests {
             ),
             equities: HashMap::new(),
             last_updated: Utc::now(),
-            buying_power_cents: None,
-            withdrawable_cash_cents: None,
-            offchain_gross_usd_cents: None,
+            buying_power: None,
+            withdrawable_cash: None,
+            offchain_gross_usd: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -2512,7 +2498,9 @@ mod tests {
     #[test]
     fn force_apply_snapshot_event_also_populates_inflight_cash() {
         let now = Utc::now();
-        let reason = std::sync::Arc::new(InventoryViewError::UsdBalanceConversion(-1));
+        let reason = std::sync::Arc::new(InventoryViewError::Float(
+            rain_math_float::FloatError::InvalidHex("test".to_string()),
+        ));
         let view = InventoryView::default()
             .force_apply_snapshot_event(
                 &InventorySnapshotEvent::EthereumUsdc {
@@ -2879,7 +2867,9 @@ mod tests {
     fn force_apply_snapshot_event_also_populates_inflight_equity() {
         let symbol_aapl = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
-        let reason = std::sync::Arc::new(InventoryViewError::UsdBalanceConversion(-1));
+        let reason = std::sync::Arc::new(InventoryViewError::Float(
+            rain_math_float::FloatError::InvalidHex("test".to_string()),
+        ));
 
         let mut unwrapped = BTreeMap::new();
         unwrapped.insert(symbol_aapl.clone(), shares(2));
@@ -3553,9 +3543,9 @@ mod tests {
             equities: std::iter::once((tsla, make_inventory(80, 20, 40, 10))).collect(),
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
             last_updated: Utc::now(),
-            buying_power_cents: None,
-            withdrawable_cash_cents: None,
-            offchain_gross_usd_cents: None,
+            buying_power: None,
+            withdrawable_cash: None,
+            offchain_gross_usd: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -3607,9 +3597,9 @@ mod tests {
             .collect(),
             usdc: Inventory::default(),
             last_updated: Utc::now(),
-            buying_power_cents: None,
-            withdrawable_cash_cents: None,
-            offchain_gross_usd_cents: None,
+            buying_power: None,
+            withdrawable_cash: None,
+            offchain_gross_usd: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -3666,7 +3656,7 @@ mod tests {
     #[test]
     fn to_dto_includes_withdrawable_cash() {
         let view = InventoryView {
-            withdrawable_cash_cents: Some(3_200_000),
+            withdrawable_cash: Some(Usdc::new(float!(32000))),
             ..InventoryView::default()
         };
 
@@ -3720,7 +3710,9 @@ mod tests {
     fn to_dto_exports_alpaca_usdc_from_force_applied_snapshot_event() {
         let now = Utc::now();
         let balance = Usdc::new(float!(12.5));
-        let reason = Arc::new(InventoryViewError::UsdBalanceConversion(0));
+        let reason = Arc::new(InventoryViewError::Float(
+            rain_math_float::FloatError::InvalidHex("test".to_string()),
+        ));
 
         let dto = InventoryView::default()
             .force_apply_snapshot_event(

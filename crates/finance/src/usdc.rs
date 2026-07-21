@@ -15,6 +15,17 @@ use crate::HasZero;
 #[derive(Clone, Copy)]
 pub struct Usdc(Float);
 
+/// Error returned by [`Usdc::to_cents`].
+#[derive(Debug, thiserror::Error)]
+pub enum UsdcToCentsError {
+    #[error("USDC value {0} has sub-cent precision; whole cents required")]
+    SubCentPrecision(Usdc),
+    #[error("USDC value {0} out of range for whole-cent representation")]
+    Overflow(Usdc),
+    #[error(transparent)]
+    Float(#[from] FloatError),
+}
+
 impl std::fmt::Debug for Usdc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Usdc({})", format_float_with_fallback(&self.0))
@@ -36,6 +47,27 @@ impl Usdc {
         let cents_float = Float::parse(cents.to_string()).ok()?;
         let hundred = Float::parse("100".to_string()).ok()?;
         (cents_float / hundred).ok().map(Self)
+    }
+
+    /// Converts to cents exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsdcToCentsError`] if the value has sub-cent precision or
+    /// overflows `i64`.
+    pub fn to_cents(self) -> Result<i64, UsdcToCentsError> {
+        let scaled = (self.0 * float_result!(100)?)?;
+        let frac = scaled.frac()?;
+
+        if !frac.is_zero()? {
+            return Err(UsdcToCentsError::SubCentPrecision(self));
+        }
+
+        let formatted = scaled.format_with_scientific(false)?;
+        let integer_str = formatted.split('.').next().unwrap_or(&formatted);
+        integer_str
+            .parse::<i64>()
+            .map_err(|_| UsdcToCentsError::Overflow(self))
     }
 
     /// Fallible equality comparison.
@@ -165,7 +197,67 @@ mod alloy_support {
 }
 
 pub use alloy_support::UsdcConversionError;
-use st0x_float_macro::float;
+use st0x_float_macro::{float, float_result};
+
+/// Serde adapter persisting a [`Usdc`] as an `i64` cents integer on the wire.
+///
+/// Use with `#[serde(with = "st0x_finance::usdc_cents")]` on fields whose
+/// persisted representation predates the `Usdc` newtype and must remain
+/// integer cents for compatibility.
+pub mod cents {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Usdc;
+
+    pub fn serialize<S>(usdc: &Usdc, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let cents = usdc.to_cents().map_err(serde::ser::Error::custom)?;
+        cents.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Usdc, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let cents = i64::deserialize(deserializer)?;
+        Usdc::from_cents(cents).ok_or_else(|| {
+            serde::de::Error::custom(format!("failed to convert {cents} cents to Usdc"))
+        })
+    }
+}
+
+/// Serde adapter persisting an [`Option<Usdc>`] as an optional `i64` cents
+/// integer on the wire. The `Option` counterpart of [`cents`].
+pub mod opt_cents {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Usdc;
+
+    pub fn serialize<S>(usdc: &Option<Usdc>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        usdc.map(Usdc::to_cents)
+            .transpose()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Usdc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<i64>::deserialize(deserializer)?
+            .map(|cents| {
+                Usdc::from_cents(cents).ok_or_else(|| {
+                    serde::de::Error::custom(format!("failed to convert {cents} cents to Usdc"))
+                })
+            })
+            .transpose()
+    }
+}
 
 impl std::ops::Mul<Float> for Usdc {
     type Output = Result<Self, FloatError>;
@@ -250,6 +342,72 @@ mod tests {
         let json = serde_json::to_string(&usdc).unwrap();
         let roundtripped: Usdc = serde_json::from_str(&json).unwrap();
         assert_eq!(usdc, roundtripped);
+    }
+
+    #[test]
+    fn to_cents_converts_whole_dollars() {
+        let usdc = Usdc::new(float!(500));
+        assert_eq!(usdc.to_cents().unwrap(), 50_000);
+    }
+
+    #[test]
+    fn to_cents_converts_dollars_and_cents() {
+        let usdc = Usdc::new(float!(123.45));
+        assert_eq!(usdc.to_cents().unwrap(), 12_345);
+    }
+
+    #[test]
+    fn to_cents_converts_negative() {
+        let usdc = Usdc::from_cents(-500).unwrap();
+        assert_eq!(usdc.to_cents().unwrap(), -500);
+    }
+
+    #[test]
+    fn to_cents_rejects_sub_cent_precision() {
+        let usdc = Usdc::new(float!(1.005));
+        assert!(matches!(
+            usdc.to_cents(),
+            Err(UsdcToCentsError::SubCentPrecision(_))
+        ));
+    }
+
+    #[test]
+    fn cents_serde_writes_integer_cents() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wire {
+            #[serde(with = "super::cents")]
+            amount: Usdc,
+        }
+
+        let json = serde_json::to_value(Wire {
+            amount: Usdc::from_cents(12_345).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "amount": 12345 }));
+
+        let parsed: Wire = serde_json::from_value(serde_json::json!({ "amount": 12345 })).unwrap();
+        assert_eq!(parsed.amount, Usdc::new(float!(123.45)));
+    }
+
+    #[test]
+    fn opt_cents_serde_writes_optional_integer_cents() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wire {
+            #[serde(with = "super::opt_cents")]
+            amount: Option<Usdc>,
+        }
+
+        let json = serde_json::to_value(Wire {
+            amount: Some(Usdc::from_cents(500).unwrap()),
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "amount": 500 }));
+
+        let json = serde_json::to_value(Wire { amount: None }).unwrap();
+        assert_eq!(json, serde_json::json!({ "amount": null }));
+
+        let parsed: Wire = serde_json::from_value(serde_json::json!({ "amount": null })).unwrap();
+        assert_eq!(parsed.amount, None);
     }
 
     #[test]

@@ -93,23 +93,40 @@ pub(crate) struct InventorySnapshot {
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
     #[serde(default)]
     pub(crate) offchain_equity_fetched_at: Option<DateTime<Utc>>,
-    /// Latest offchain USD balance in cents (post-reserve, available for trading)
-    pub(crate) offchain_usd_cents: Option<i64>,
+    /// Latest offchain USD balance (post-reserve, available for trading).
+    /// Persisted as integer cents for snapshot compatibility.
+    #[serde(rename = "offchain_usd_cents", with = "st0x_finance::usdc_opt_cents")]
+    pub(crate) offchain_usd: Option<Usdc>,
     #[serde(default)]
     pub(crate) offchain_usd_fetched_at: Option<DateTime<Utc>>,
-    /// Latest offchain gross USD balance in cents (before reserve subtraction)
-    #[serde(default)]
-    pub(crate) offchain_gross_usd_cents: Option<i64>,
-    /// Latest offchain cash buying power in cents (Alpaca's `cash` field --
+    /// Latest offchain gross USD balance (before reserve subtraction).
+    /// Persisted as integer cents for snapshot compatibility.
+    #[serde(
+        rename = "offchain_gross_usd_cents",
+        default,
+        with = "st0x_finance::usdc_opt_cents"
+    )]
+    pub(crate) offchain_gross_usd: Option<Usdc>,
+    /// Latest offchain cash buying power (Alpaca's `cash` field --
     /// includes unsettled T+1 equity-sale proceeds, excludes margin. The same
     /// value used for counter-trade preflight checks.) See
     /// adrs/1-cash-bp-for-equity-hedges.md.
-    pub(crate) offchain_cash_buying_power_cents: Option<i64>,
-    /// Latest offchain settled (withdrawable) cash in cents (Alpaca's
+    /// Persisted as integer cents for snapshot compatibility.
+    #[serde(
+        rename = "offchain_cash_buying_power_cents",
+        with = "st0x_finance::usdc_opt_cents"
+    )]
+    pub(crate) offchain_cash_buying_power: Option<Usdc>,
+    /// Latest offchain settled (withdrawable) cash (Alpaca's
     /// `cash_withdrawable` field -- excludes T+1 unsettled equity-sale
     /// proceeds). What's actually movable to Raindex during rebalancing.
-    #[serde(default)]
-    pub(crate) offchain_cash_withdrawable_cents: Option<i64>,
+    /// Persisted as integer cents for snapshot compatibility.
+    #[serde(
+        rename = "offchain_cash_withdrawable_cents",
+        default,
+        with = "st0x_finance::usdc_opt_cents"
+    )]
+    pub(crate) offchain_cash_withdrawable: Option<Usdc>,
     /// Latest USDC token balance held in the Alpaca account.
     #[serde(default)]
     pub(crate) alpaca_usdc: Option<Usdc>,
@@ -158,11 +175,11 @@ impl EventSourced for InventorySnapshot {
             onchain_usdc_fetched_at: None,
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
-            offchain_usd_cents: None,
+            offchain_usd: None,
             offchain_usd_fetched_at: None,
-            offchain_gross_usd_cents: None,
-            offchain_cash_buying_power_cents: None,
-            offchain_cash_withdrawable_cents: None,
+            offchain_gross_usd: None,
+            offchain_cash_buying_power: None,
+            offchain_cash_withdrawable: None,
             alpaca_usdc: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
@@ -204,25 +221,25 @@ impl EventSourced for InventorySnapshot {
                 fetched_at: now,
             },
             OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
             } => InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
                 fetched_at: now,
             },
-            OffchainCashBuyingPower {
-                cash_buying_power_cents,
-            } => InventorySnapshotEvent::OffchainCashBuyingPower {
-                cash_buying_power_cents,
-                fetched_at: now,
-            },
-            OffchainCashWithdrawable {
-                cash_withdrawable_cents,
-            } => InventorySnapshotEvent::OffchainCashWithdrawable {
-                cash_withdrawable_cents,
-                fetched_at: now,
-            },
+            OffchainCashBuyingPower { cash_buying_power } => {
+                InventorySnapshotEvent::OffchainCashBuyingPower {
+                    cash_buying_power,
+                    fetched_at: now,
+                }
+            }
+            OffchainCashWithdrawable { cash_withdrawable } => {
+                InventorySnapshotEvent::OffchainCashWithdrawable {
+                    cash_withdrawable,
+                    fetched_at: now,
+                }
+            }
             AlpacaUsdc { usdc_balance } => InventorySnapshotEvent::AlpacaUsdc {
                 usdc_balance,
                 fetched_at: now,
@@ -258,19 +275,19 @@ impl EventSourced for InventorySnapshot {
             }
             RecordOffchainObservation {
                 positions,
-                usd_balance_cents,
-                gross_usd_cents,
-                cash_buying_power_cents,
-                cash_withdrawable_cents,
+                usd_balance,
+                gross_usd,
+                cash_buying_power,
+                cash_withdrawable,
                 alpaca_usdc,
                 observed_at,
             } => {
                 return Ok(OffchainObservation {
                     positions,
-                    usd_balance_cents,
-                    gross_usd_cents,
-                    cash_buying_power_cents,
-                    cash_withdrawable_cents,
+                    usd_balance,
+                    gross_usd,
+                    cash_buying_power,
+                    cash_withdrawable,
                     alpaca_usdc,
                     observed_at,
                 }
@@ -323,39 +340,33 @@ impl EventSourced for InventorySnapshot {
                 }])
             }
             OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
             } => {
-                if self.offchain_usd_cents == Some(usd_balance_cents)
-                    && self.offchain_gross_usd_cents == gross_usd_cents
-                {
+                if self.offchain_usd == Some(usd_balance) && self.offchain_gross_usd == gross_usd {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainUsd {
-                    usd_balance_cents,
-                    gross_usd_cents,
+                    usd_balance,
+                    gross_usd,
                     fetched_at: now,
                 }])
             }
-            OffchainCashBuyingPower {
-                cash_buying_power_cents,
-            } => {
-                if self.offchain_cash_buying_power_cents == cash_buying_power_cents {
+            OffchainCashBuyingPower { cash_buying_power } => {
+                if self.offchain_cash_buying_power == cash_buying_power {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainCashBuyingPower {
-                    cash_buying_power_cents,
+                    cash_buying_power,
                     fetched_at: now,
                 }])
             }
-            OffchainCashWithdrawable {
-                cash_withdrawable_cents,
-            } => {
-                if self.offchain_cash_withdrawable_cents == cash_withdrawable_cents {
+            OffchainCashWithdrawable { cash_withdrawable } => {
+                if self.offchain_cash_withdrawable == cash_withdrawable {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainCashWithdrawable {
-                    cash_withdrawable_cents,
+                    cash_withdrawable,
                     fetched_at: now,
                 }])
             }
@@ -433,18 +444,18 @@ impl EventSourced for InventorySnapshot {
             }
             RecordOffchainObservation {
                 positions,
-                usd_balance_cents,
-                gross_usd_cents,
-                cash_buying_power_cents,
-                cash_withdrawable_cents,
+                usd_balance,
+                gross_usd,
+                cash_buying_power,
+                cash_withdrawable,
                 alpaca_usdc,
                 observed_at,
             } => Ok(OffchainObservation {
                 positions,
-                usd_balance_cents,
-                gross_usd_cents,
-                cash_buying_power_cents,
-                cash_withdrawable_cents,
+                usd_balance,
+                gross_usd,
+                cash_buying_power,
+                cash_withdrawable,
                 alpaca_usdc,
                 observed_at,
             }
@@ -529,26 +540,26 @@ impl InventorySnapshot {
             });
         }
 
-        if let (Some(usd_balance_cents), Some(fetched_at)) =
-            (self.offchain_usd_cents, self.offchain_usd_fetched_at)
+        if let (Some(usd_balance), Some(fetched_at)) =
+            (self.offchain_usd, self.offchain_usd_fetched_at)
         {
             emit(InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents: self.offchain_gross_usd_cents,
+                usd_balance,
+                gross_usd: self.offchain_gross_usd,
                 fetched_at,
             });
         }
 
-        if self.offchain_cash_buying_power_cents.is_some() {
+        if self.offchain_cash_buying_power.is_some() {
             emit(InventorySnapshotEvent::OffchainCashBuyingPower {
-                cash_buying_power_cents: self.offchain_cash_buying_power_cents,
+                cash_buying_power: self.offchain_cash_buying_power,
                 fetched_at,
             });
         }
 
-        if self.offchain_cash_withdrawable_cents.is_some() {
+        if self.offchain_cash_withdrawable.is_some() {
             emit(InventorySnapshotEvent::OffchainCashWithdrawable {
-                cash_withdrawable_cents: self.offchain_cash_withdrawable_cents,
+                cash_withdrawable: self.offchain_cash_withdrawable,
                 fetched_at,
             });
         }
@@ -644,28 +655,26 @@ impl InventorySnapshot {
                 self.offchain_equity_fetched_at = Some(*fetched_at);
             }
             InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
                 fetched_at,
             } if self
                 .offchain_usd_fetched_at
                 .is_none_or(|current| *fetched_at >= current) =>
             {
-                self.offchain_usd_cents = Some(*usd_balance_cents);
-                self.offchain_gross_usd_cents = *gross_usd_cents;
+                self.offchain_usd = Some(*usd_balance);
+                self.offchain_gross_usd = *gross_usd;
                 self.offchain_usd_fetched_at = Some(*fetched_at);
             }
             InventorySnapshotEvent::OffchainCashBuyingPower {
-                cash_buying_power_cents,
-                ..
+                cash_buying_power, ..
             } => {
-                self.offchain_cash_buying_power_cents = *cash_buying_power_cents;
+                self.offchain_cash_buying_power = *cash_buying_power;
             }
             InventorySnapshotEvent::OffchainCashWithdrawable {
-                cash_withdrawable_cents,
-                ..
+                cash_withdrawable, ..
             } => {
-                self.offchain_cash_withdrawable_cents = *cash_withdrawable_cents;
+                self.offchain_cash_withdrawable = *cash_withdrawable;
             }
             InventorySnapshotEvent::AlpacaUsdc { usdc_balance, .. } => {
                 self.alpaca_usdc = Some(*usdc_balance);
@@ -722,16 +731,16 @@ pub(crate) enum InventorySnapshotCommand {
         positions: BTreeMap<Symbol, FractionalShares>,
     },
     OffchainUsd {
-        usd_balance_cents: i64,
+        usd_balance: Usdc,
         /// Gross USD balance before reserve subtraction. `None` when no
         /// cash reserve is configured, so the dashboard hides the row.
-        gross_usd_cents: Option<i64>,
+        gross_usd: Option<Usdc>,
     },
     OffchainCashBuyingPower {
-        cash_buying_power_cents: Option<i64>,
+        cash_buying_power: Option<Usdc>,
     },
     OffchainCashWithdrawable {
-        cash_withdrawable_cents: Option<i64>,
+        cash_withdrawable: Option<Usdc>,
     },
     AlpacaUsdc {
         usdc_balance: Usdc,
@@ -750,10 +759,10 @@ pub(crate) enum InventorySnapshotCommand {
     },
     RecordOffchainObservation {
         positions: BTreeMap<Symbol, FractionalShares>,
-        usd_balance_cents: i64,
-        gross_usd_cents: Option<i64>,
-        cash_buying_power_cents: Option<i64>,
-        cash_withdrawable_cents: Option<i64>,
+        usd_balance: Usdc,
+        gross_usd: Option<Usdc>,
+        cash_buying_power: Option<Usdc>,
+        cash_withdrawable: Option<Usdc>,
         alpaca_usdc: Option<Usdc>,
         observed_at: DateTime<Utc>,
     },
@@ -790,18 +799,38 @@ pub(crate) enum InventorySnapshotEvent {
     },
     #[serde(alias = "OffchainCash")]
     OffchainUsd {
-        #[serde(alias = "cash_balance_cents")]
-        usd_balance_cents: i64,
-        #[serde(default)]
-        gross_usd_cents: Option<i64>,
+        /// Persisted as integer cents for event-stream compatibility.
+        #[serde(
+            rename = "usd_balance_cents",
+            alias = "cash_balance_cents",
+            with = "st0x_finance::usdc_cents"
+        )]
+        usd_balance: Usdc,
+        /// Persisted as integer cents for event-stream compatibility.
+        #[serde(
+            rename = "gross_usd_cents",
+            default,
+            with = "st0x_finance::usdc_opt_cents"
+        )]
+        gross_usd: Option<Usdc>,
         fetched_at: DateTime<Utc>,
     },
     OffchainCashBuyingPower {
-        cash_buying_power_cents: Option<i64>,
+        /// Persisted as integer cents for event-stream compatibility.
+        #[serde(
+            rename = "cash_buying_power_cents",
+            with = "st0x_finance::usdc_opt_cents"
+        )]
+        cash_buying_power: Option<Usdc>,
         fetched_at: DateTime<Utc>,
     },
     OffchainCashWithdrawable {
-        cash_withdrawable_cents: Option<i64>,
+        /// Persisted as integer cents for event-stream compatibility.
+        #[serde(
+            rename = "cash_withdrawable_cents",
+            with = "st0x_finance::usdc_opt_cents"
+        )]
+        cash_withdrawable: Option<Usdc>,
         fetched_at: DateTime<Utc>,
     },
     AlpacaUsdc {
@@ -893,10 +922,10 @@ impl DomainEvent for InventorySnapshotEvent {
 
 struct OffchainObservation {
     positions: BTreeMap<Symbol, FractionalShares>,
-    usd_balance_cents: i64,
-    gross_usd_cents: Option<i64>,
-    cash_buying_power_cents: Option<i64>,
-    cash_withdrawable_cents: Option<i64>,
+    usd_balance: Usdc,
+    gross_usd: Option<Usdc>,
+    cash_buying_power: Option<Usdc>,
+    cash_withdrawable: Option<Usdc>,
     alpaca_usdc: Option<Usdc>,
     observed_at: DateTime<Utc>,
 }
@@ -905,10 +934,10 @@ impl OffchainObservation {
     fn into_events(self, current: Option<&InventorySnapshot>) -> Vec<InventorySnapshotEvent> {
         let Self {
             positions,
-            usd_balance_cents,
-            gross_usd_cents,
-            cash_buying_power_cents,
-            cash_withdrawable_cents,
+            usd_balance,
+            gross_usd,
+            cash_buying_power,
+            cash_withdrawable,
             alpaca_usdc,
             observed_at,
         } = self;
@@ -921,28 +950,23 @@ impl OffchainObservation {
             });
         }
         if current.is_none_or(|snapshot| {
-            snapshot.offchain_usd_cents != Some(usd_balance_cents)
-                || snapshot.offchain_gross_usd_cents != gross_usd_cents
+            snapshot.offchain_usd != Some(usd_balance) || snapshot.offchain_gross_usd != gross_usd
         }) {
             events.push(InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents,
+                usd_balance,
+                gross_usd,
                 fetched_at: observed_at,
             });
         }
-        if current.is_none_or(|snapshot| {
-            snapshot.offchain_cash_buying_power_cents != cash_buying_power_cents
-        }) {
+        if current.is_none_or(|snapshot| snapshot.offchain_cash_buying_power != cash_buying_power) {
             events.push(InventorySnapshotEvent::OffchainCashBuyingPower {
-                cash_buying_power_cents,
+                cash_buying_power,
                 fetched_at: observed_at,
             });
         }
-        if current.is_none_or(|snapshot| {
-            snapshot.offchain_cash_withdrawable_cents != cash_withdrawable_cents
-        }) {
+        if current.is_none_or(|snapshot| snapshot.offchain_cash_withdrawable != cash_withdrawable) {
             events.push(InventorySnapshotEvent::OffchainCashWithdrawable {
-                cash_withdrawable_cents,
+                cash_withdrawable,
                 fetched_at: observed_at,
             });
         }
@@ -977,6 +1001,124 @@ mod tests {
 
     use super::*;
     use st0x_event_sorcery::{TestHarness, replay};
+
+    /// The typed cash fields must keep serializing as integer cents under
+    /// their legacy field names: the events table and compacted aggregate
+    /// snapshots hold that exact shape, and `CompactAfterSnapshot` forbids
+    /// a schema bump for this aggregate.
+    #[test]
+    fn offchain_cash_events_keep_legacy_cents_wire_format() {
+        let fetched_at = "2026-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+
+        let event = InventorySnapshotEvent::OffchainUsd {
+            usd_balance: Usdc::from_cents(5_000_000).unwrap(),
+            gross_usd: Some(Usdc::from_cents(10_000_000).unwrap()),
+            fetched_at,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "OffchainUsd": {
+                    "usd_balance_cents": 5_000_000,
+                    "gross_usd_cents": 10_000_000,
+                    "fetched_at": "2026-01-02T03:04:05Z",
+                }
+            })
+        );
+
+        let event = InventorySnapshotEvent::OffchainCashBuyingPower {
+            cash_buying_power: Some(Usdc::from_cents(3_000_000).unwrap()),
+            fetched_at,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "OffchainCashBuyingPower": {
+                    "cash_buying_power_cents": 3_000_000,
+                    "fetched_at": "2026-01-02T03:04:05Z",
+                }
+            })
+        );
+
+        let event = InventorySnapshotEvent::OffchainCashWithdrawable {
+            cash_withdrawable: None,
+            fetched_at,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "OffchainCashWithdrawable": {
+                    "cash_withdrawable_cents": null,
+                    "fetched_at": "2026-01-02T03:04:05Z",
+                }
+            })
+        );
+    }
+
+    /// Events persisted before this change (integer cents, including the
+    /// pre-rename `OffchainCash`/`cash_balance_cents` aliases and events
+    /// lacking `gross_usd_cents`) must deserialize into the typed fields.
+    #[test]
+    fn legacy_cents_events_deserialize_into_typed_fields() {
+        let event: InventorySnapshotEvent = serde_json::from_value(serde_json::json!({
+            "OffchainUsd": {
+                "usd_balance_cents": 12_345,
+                "fetched_at": "2026-01-02T03:04:05Z",
+            }
+        }))
+        .unwrap();
+        let InventorySnapshotEvent::OffchainUsd {
+            usd_balance,
+            gross_usd,
+            ..
+        } = event
+        else {
+            panic!("expected OffchainUsd, got {event:?}");
+        };
+        assert_eq!(usd_balance, Usdc::from_cents(12_345).unwrap());
+        assert_eq!(gross_usd, None);
+
+        let event: InventorySnapshotEvent = serde_json::from_value(serde_json::json!({
+            "OffchainCash": {
+                "cash_balance_cents": 4_200,
+                "fetched_at": "2026-01-02T03:04:05Z",
+            }
+        }))
+        .unwrap();
+        let InventorySnapshotEvent::OffchainUsd { usd_balance, .. } = event else {
+            panic!("expected OffchainUsd, got {event:?}");
+        };
+        assert_eq!(usd_balance, Usdc::from_cents(4_200).unwrap());
+    }
+
+    /// The aggregate state itself is persisted in the snapshots table, so
+    /// its cents fields must keep the legacy wire shape and old snapshots
+    /// must keep deserializing.
+    #[test]
+    fn aggregate_snapshot_keeps_legacy_cents_wire_format() {
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::OffchainUsd {
+            usd_balance: Usdc::from_cents(42_00).unwrap(),
+            gross_usd: Some(Usdc::from_cents(50_00).unwrap()),
+            fetched_at: Utc::now(),
+        }])
+        .unwrap()
+        .unwrap();
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["offchain_usd_cents"], serde_json::json!(4_200));
+        assert_eq!(json["offchain_gross_usd_cents"], serde_json::json!(5_000));
+        assert_eq!(
+            json["offchain_cash_buying_power_cents"],
+            serde_json::json!(null)
+        );
+
+        let reconstructed: InventorySnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(reconstructed.offchain_usd, snapshot.offchain_usd);
+        assert_eq!(
+            reconstructed.offchain_gross_usd,
+            snapshot.offchain_gross_usd
+        );
+    }
 
     #[test]
     fn inventory_snapshot_id_roundtrips_through_display_and_parse() {
@@ -1128,13 +1270,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_offchain_usd_emits_event() {
-        let usd_balance_cents = 50_000_000; // $500,000.00
+        let usd_balance = Usdc::from_cents(50_000_000).unwrap(); // $500,000.00
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OffchainUsd {
-                usd_balance_cents,
-                gross_usd_cents: None,
+                usd_balance,
+                gross_usd: None,
             })
             .await
             .events();
@@ -1142,10 +1284,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents: event_cents,
+                usd_balance: event_balance,
                 ..
             } => {
-                assert_eq!(*event_cents, usd_balance_cents);
+                assert_eq!(*event_balance, usd_balance);
             }
             _ => panic!("Expected OffchainUsd event"),
         }
@@ -1153,16 +1295,14 @@ mod tests {
 
     #[tokio::test]
     async fn offchain_cash_buying_power_skips_unchanged_value() {
-        let cash_buying_power_cents = Some(3_000_000);
+        let cash_buying_power = Some(Usdc::from_cents(3_000_000).unwrap());
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OffchainCashBuyingPower {
-                cash_buying_power_cents,
+                cash_buying_power,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::OffchainCashBuyingPower {
-                cash_buying_power_cents,
-            })
+            .when(InventorySnapshotCommand::OffchainCashBuyingPower { cash_buying_power })
             .await
             .events();
 
@@ -1179,7 +1319,7 @@ mod tests {
         let usdc_balance = Usdc::from_str("1000").unwrap();
         let mut positions = BTreeMap::new();
         positions.insert(test_symbol("AAPL"), test_shares(75));
-        let usd_balance_cents = 50_000_000;
+        let offchain_usd_balance = Usdc::from_cents(50_000_000).unwrap();
         let fetched_at = Utc::now();
 
         let cases = vec![
@@ -1206,13 +1346,13 @@ mod tests {
             ),
             (
                 vec![InventorySnapshotEvent::OffchainUsd {
-                    usd_balance_cents,
-                    gross_usd_cents: None,
+                    usd_balance: offchain_usd_balance,
+                    gross_usd: None,
                     fetched_at,
                 }],
                 InventorySnapshotCommand::OffchainUsd {
-                    usd_balance_cents,
-                    gross_usd_cents: None,
+                    usd_balance: offchain_usd_balance,
+                    gross_usd: None,
                 },
             ),
         ];
@@ -1266,10 +1406,10 @@ mod tests {
             .given_no_previous_events()
             .when(InventorySnapshotCommand::RecordOffchainObservation {
                 positions: positions.clone(),
-                usd_balance_cents: 42_00,
-                gross_usd_cents: Some(50_00),
-                cash_buying_power_cents: Some(10_000),
-                cash_withdrawable_cents: Some(38_00),
+                usd_balance: Usdc::from_cents(42_00).unwrap(),
+                gross_usd: Some(Usdc::from_cents(50_00).unwrap()),
+                cash_buying_power: Some(Usdc::from_cents(10_000).unwrap()),
+                cash_withdrawable: Some(Usdc::from_cents(38_00).unwrap()),
                 alpaca_usdc: Some(alpaca_usdc),
                 observed_at,
             })
@@ -1284,16 +1424,16 @@ mod tests {
                     fetched_at: observed_at,
                 },
                 InventorySnapshotEvent::OffchainUsd {
-                    usd_balance_cents: 42_00,
-                    gross_usd_cents: Some(50_00),
+                    usd_balance: Usdc::from_cents(42_00).unwrap(),
+                    gross_usd: Some(Usdc::from_cents(50_00).unwrap()),
                     fetched_at: observed_at,
                 },
                 InventorySnapshotEvent::OffchainCashBuyingPower {
-                    cash_buying_power_cents: Some(10_000),
+                    cash_buying_power: Some(Usdc::from_cents(10_000).unwrap()),
                     fetched_at: observed_at,
                 },
                 InventorySnapshotEvent::OffchainCashWithdrawable {
-                    cash_withdrawable_cents: Some(38_00),
+                    cash_withdrawable: Some(Usdc::from_cents(38_00).unwrap()),
                     fetched_at: observed_at,
                 },
                 InventorySnapshotEvent::AlpacaUsdc {
@@ -1320,16 +1460,16 @@ mod tests {
                 fetched_at: previous_observed_at,
             },
             InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents: 42_00,
-                gross_usd_cents: Some(50_00),
+                usd_balance: Usdc::from_cents(42_00).unwrap(),
+                gross_usd: Some(Usdc::from_cents(50_00).unwrap()),
                 fetched_at: previous_observed_at,
             },
             InventorySnapshotEvent::OffchainCashBuyingPower {
-                cash_buying_power_cents: Some(10_000),
+                cash_buying_power: Some(Usdc::from_cents(10_000).unwrap()),
                 fetched_at: previous_observed_at,
             },
             InventorySnapshotEvent::OffchainCashWithdrawable {
-                cash_withdrawable_cents: Some(38_00),
+                cash_withdrawable: Some(Usdc::from_cents(38_00).unwrap()),
                 fetched_at: previous_observed_at,
             },
             InventorySnapshotEvent::AlpacaUsdc {
@@ -1346,10 +1486,10 @@ mod tests {
             .given(previous_events)
             .when(InventorySnapshotCommand::RecordOffchainObservation {
                 positions,
-                usd_balance_cents: 42_00,
-                gross_usd_cents: Some(50_00),
-                cash_buying_power_cents: Some(10_000),
-                cash_withdrawable_cents: Some(38_00),
+                usd_balance: Usdc::from_cents(42_00).unwrap(),
+                gross_usd: Some(Usdc::from_cents(50_00).unwrap()),
+                cash_buying_power: Some(Usdc::from_cents(10_000).unwrap()),
+                cash_withdrawable: Some(Usdc::from_cents(38_00).unwrap()),
                 alpaca_usdc: Some(alpaca_usdc),
                 observed_at,
             })
@@ -2198,11 +2338,11 @@ mod tests {
             onchain_usdc_fetched_at: None,
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
-            offchain_usd_cents: None,
+            offchain_usd: None,
             offchain_usd_fetched_at: None,
-            offchain_gross_usd_cents: None,
-            offchain_cash_buying_power_cents: None,
-            offchain_cash_withdrawable_cents: None,
+            offchain_gross_usd: None,
+            offchain_cash_buying_power: None,
+            offchain_cash_withdrawable: None,
             alpaca_usdc: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
@@ -2235,11 +2375,11 @@ mod tests {
             onchain_usdc_fetched_at: Some(now),
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
-            offchain_usd_cents: Some(42_00),
+            offchain_usd: Some(Usdc::from_cents(42_00).unwrap()),
             offchain_usd_fetched_at: Some(now),
-            offchain_gross_usd_cents: Some(50_00),
-            offchain_cash_buying_power_cents: Some(10_000),
-            offchain_cash_withdrawable_cents: Some(38_00),
+            offchain_gross_usd: Some(Usdc::from_cents(50_00).unwrap()),
+            offchain_cash_buying_power: Some(Usdc::from_cents(10_000).unwrap()),
+            offchain_cash_withdrawable: Some(Usdc::from_cents(38_00).unwrap()),
             alpaca_usdc: Some(Usdc::from_str("125").unwrap()),
             ethereum_usdc: None,
             base_wallet_usdc: None,
@@ -2260,13 +2400,10 @@ mod tests {
 
         assert_eq!(reconstructed.onchain_equity, original.onchain_equity);
         assert_eq!(reconstructed.onchain_usdc, original.onchain_usdc);
+        assert_eq!(reconstructed.offchain_usd, original.offchain_usd);
         assert_eq!(
-            reconstructed.offchain_usd_cents,
-            original.offchain_usd_cents
-        );
-        assert_eq!(
-            reconstructed.offchain_cash_buying_power_cents,
-            original.offchain_cash_buying_power_cents
+            reconstructed.offchain_cash_buying_power,
+            original.offchain_cash_buying_power
         );
         assert_eq!(reconstructed.alpaca_usdc, original.alpaca_usdc);
         assert_eq!(reconstructed.inflight_mints, original.inflight_mints);

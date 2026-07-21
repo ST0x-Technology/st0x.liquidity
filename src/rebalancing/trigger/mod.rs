@@ -11492,7 +11492,9 @@ mod tests {
 
         trigger
             .on_snapshot_recovery(
-                RebalancingServiceError::Inventory(InventoryViewError::UsdBalanceConversion(-1)),
+                RebalancingServiceError::Inventory(InventoryViewError::Float(
+                    rain_math_float::FloatError::InvalidHex("test".to_string()),
+                )),
                 InventorySnapshotEvent::OnchainUsdc {
                     usdc_balance: usdc(600),
                     fetched_at: Utc::now(),
@@ -11542,7 +11544,7 @@ mod tests {
             reactor.clone(),
             id,
             InventorySnapshotEvent::OffchainCashWithdrawable {
-                cash_withdrawable_cents: Some(50_000),
+                cash_withdrawable: Some(Usdc::from_cents(50_000).unwrap()),
                 fetched_at: Utc::now(),
             },
         )
@@ -11595,8 +11597,8 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents: 90000,
-                gross_usd_cents: None,
+                usd_balance: Usdc::from_cents(90000).unwrap(),
+                gross_usd: None,
                 fetched_at: Utc::now(),
             },
         )
