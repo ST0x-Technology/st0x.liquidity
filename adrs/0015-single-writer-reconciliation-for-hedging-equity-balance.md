@@ -87,6 +87,12 @@ critical section, which no cross-struct copy could guarantee.
 - `RebalancingService::pending_offchain_order_symbols` is **deleted**; the
   trigger's `has_pending_offchain_order` reads the view, and startup recovery
   seeds the view instead.
+- Snapshot-error recovery (`on_snapshot_recovery`) resets the view but
+  **preserves the guard state** via `reset_preserving_offchain_order_state`: the
+  state is fed by `Position` events and nothing re-seeds it after startup, so a
+  plain `default()` reset would silently clear every open-hedge block and
+  re-open the race. Preservation (not re-derivation) because the applied-fill
+  times are local-clock readings no projection stores.
 - On a fill, the block is released inside the **same write-lock critical
   section** that applied the delta, so no snapshot can interleave. The recorded
   time is `Utc::now()`, not the event's `broker_timestamp` — it is compared

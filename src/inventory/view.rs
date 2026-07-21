@@ -1130,6 +1130,25 @@ impl InventoryView {
         }
     }
 
+    /// A fresh default view retaining only the offchain-order guard state
+    /// (pending orders and applied-fill times).
+    ///
+    /// Snapshot-error recovery resets the view before force-applying the
+    /// failed snapshot. The guard state must survive that reset: it is derived
+    /// from the `Position` event stream, not from snapshots, and nothing
+    /// re-seeds it after startup — wiping it would re-admit offchain snapshots
+    /// for symbols whose hedge order is still open, re-opening the
+    /// double-apply race. Every other field is intentionally defaulted, which
+    /// is why this uses functional-update syntax rather than an exhaustive
+    /// literal: a future field should default here unless it is guard state.
+    pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
+        Self {
+            pending_offchain_order_symbols: self.pending_offchain_order_symbols.clone(),
+            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
+            ..Self::default()
+        }
+    }
+
     fn equity_snapshot_watermark(&self, symbol: &Symbol, venue: Venue) -> Option<DateTime<Utc>> {
         let watermarks = match venue {
             Venue::MarketMaking => &self.onchain_equity_snapshot_watermarks,
@@ -3206,6 +3225,50 @@ mod tests {
             view.equity_available(&aapl, Venue::Hedging),
             Some(shares(100)),
             "the offchain balance is untouched by an onchain snapshot",
+        );
+    }
+
+    #[test]
+    fn reset_preserves_offchain_order_guard_state_only() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let applied_at = Utc::now();
+
+        let mut view = InventoryView::default().with_equity(aapl.clone(), shares(20), shares(100));
+        view.clear_offchain_order_pending(&aapl, Some(applied_at));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        let mut reset = view.reset_preserving_offchain_order_state();
+
+        assert!(
+            reset.has_pending_offchain_order(&aapl),
+            "the pending-order set must survive the reset"
+        );
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::Hedging),
+            None,
+            "balances must not survive the reset"
+        );
+
+        // Guard 2 state must survive too: with the pending flag cleared, a
+        // snapshot predating the preserved applied-fill time is still
+        // rejected. Had the reset dropped it, this snapshot would apply.
+        reset.clear_offchain_order_pending(&aapl, None);
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(50));
+        let healed = reset
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: applied_at - Duration::seconds(1),
+                },
+                applied_at,
+            )
+            .unwrap();
+        assert_eq!(
+            healed.equity_available(&aapl, Venue::Hedging),
+            None,
+            "a snapshot predating the preserved applied-fill time must still \
+             be rejected after the reset"
         );
     }
 

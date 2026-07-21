@@ -1730,7 +1730,11 @@ impl RebalancingService {
             _ => None,
         };
         let mut inventory = self.inventory.write().await;
-        *inventory = InventoryView::default();
+        // Reset everything except the offchain-order guard state: it is fed by
+        // Position events, not snapshots, and nothing re-seeds it after
+        // startup, so a plain default() here would clear the open-hedge block
+        // for every symbol and re-open the double-apply race.
+        *inventory = inventory.reset_preserving_offchain_order_state();
 
         let updated = match &event {
             OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
@@ -22069,6 +22073,61 @@ mod tests {
             hedging,
             Some(shares(91)),
             "a snapshot fetched after the applied fill must apply normally"
+        );
+    }
+
+    /// Snapshot-error recovery resets the whole view before force-applying
+    /// the failed snapshot. The open-hedge gate is fed by Position events,
+    /// not snapshots, and nothing re-seeds it after startup — so a recovery
+    /// for an unrelated asset (here USDC) must not clear it, or the next
+    /// offchain poll writes into a balance whose order is still open.
+    #[tokio::test]
+    async fn snapshot_recovery_reset_preserves_open_hedge_gate() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        let error = RebalancingServiceError::Inventory(InventoryViewError::Usdc(
+            InventoryError::InsufficientAvailable {
+                requested: usdc(1),
+                available: usdc(0),
+            },
+        ));
+        trigger
+            .on_snapshot_recovery(
+                error,
+                InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: usdc(500),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert!(
+            view.has_pending_offchain_order(&symbol),
+            "recovery reset must not clear the open-hedge gate"
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            None,
+            "recovery must still reset balances"
+        );
+        assert_eq!(
+            view.usdc_available(Venue::MarketMaking),
+            Some(usdc(500)),
+            "recovery must force-apply the failed snapshot"
         );
     }
 
