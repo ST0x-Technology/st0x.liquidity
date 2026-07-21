@@ -22544,6 +22544,96 @@ mod tests {
         );
     }
 
+    /// Boot must leave a symbol with an open hedge order both gated AND
+    /// hydrated, driven through the production boot seam
+    /// (`restore_inventory_at_boot`). If the seam seeds the gate before
+    /// hydrating, guard 1 is live during hydration and the symbol boots with
+    /// an uninitialized offchain balance.
+    #[tokio::test]
+    async fn boot_hydrates_offchain_balance_for_symbol_with_open_hedge_order() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Persisted state from the previous run: an inventory snapshot with
+        // AAPL at 90 offchain, and a position whose hedge order was still
+        // open when the bot went down.
+        let snapshot_store = test_store::<InventorySnapshot>(pool.clone(), ());
+        snapshot_store
+            .send(
+                &InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_store = test_store::<Position>(pool.clone(), ());
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        crate::conductor::restore_inventory_at_boot(
+            &pool,
+            &trigger.inventory,
+            Some(&trigger),
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            trigger.has_pending_offchain_order(&symbol).await,
+            "the open hedge order must be gated after boot"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "a symbol with an open hedge order must still hydrate its \
+             offchain balance from the persisted snapshot; None means the \
+             seeded gate blocked hydration"
+        );
+    }
+
     #[tokio::test]
     async fn recover_pending_offchain_order_symbols_restores_block_from_projection() {
         let pending_symbol = Symbol::new("AAPL").unwrap();
