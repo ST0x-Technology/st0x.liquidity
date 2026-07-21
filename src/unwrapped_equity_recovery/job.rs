@@ -1,11 +1,12 @@
 //! Apalis job that orchestrates unwrapped-equity recovery.
 //!
 //! Enqueued per symbol with a positive `BaseWalletUnwrappedEquity`
-//! balance. The job is a thin orchestrator: it reads `InventoryView`,
-//! picks a dispatch path, and sends the command sequence through the
-//! aggregate's store. All side effects (raindex deposit/confirm,
-//! wrapper wrap/confirm, mint/redemption resume) live in the
-//! aggregate's command handlers via its `Services`.
+//! balance. The job owns the recovery's side effects: it reads
+//! `InventoryView`, picks a dispatch path, and drives the onchain/transfer
+//! work (raindex deposit/confirm, wrapper wrap/confirm, mint/redemption
+//! resume) directly via `ctx.services`, recording each outcome through the
+//! aggregate's pure recording commands. The aggregate's handlers are pure
+//! event recorders (`type Services = ()`).
 //!
 //! Steps:
 //!
@@ -32,6 +33,7 @@
 //! target the same aggregate -- the next command in the sequence picks
 //! up wherever the previous attempt stopped.
 
+use alloy::primitives::{TxHash, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -40,29 +42,33 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use st0x_event_sorcery::{SendError, Store};
+use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
+use st0x_wrapper::{WrapConfirmation, WrapperError, node_sync_attempts};
 
 use super::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCommand, UnwrappedEquityRecoveryError,
-    UnwrappedEquityRecoveryId,
+    UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
 };
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
 use crate::rebalancing::trigger::{GuardState, claim_guard_for_recovery_or_orphan};
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::tokenized_equity_mint::{TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint};
 
 /// Apalis queue type for [`UnwrappedEquityRecoveryJob`].
 pub(crate) type UnwrappedEquityRecoveryJobQueue = JobQueue<UnwrappedEquityRecoveryJob>;
 
 /// Dependencies the recovery job needs to claim the per-symbol concurrency
-/// guard, read inventory, and send commands through the aggregate's store.
-/// Services (raindex/wrapper/transfer/wallet) live on the store -- not here.
+/// guard, read inventory, perform the recovery's onchain/transfer side effects,
+/// and record outcomes through the aggregate's pure command store.
 pub(crate) struct UnwrappedEquityRecoveryCtx {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) store: Arc<Store<UnwrappedEquityRecovery>>,
+    /// Onchain/transfer dependencies the job drives before recording outcomes.
+    pub(crate) services: UnwrappedEquityRecoveryServices,
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
     pub(crate) equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>>,
@@ -75,8 +81,10 @@ pub(crate) struct UnwrappedEquityRecoveryCtx {
 }
 
 /// Why a single recovery job attempt failed. Errors propagate up through
-/// apalis; service-call failures inside the aggregate's command handlers
-/// are recorded as `RecoveryFailed` events and don't surface here.
+/// apalis. Terminal service failures are recorded as `RecoveryFailed` via
+/// `fail_recovery`; retryable service failures surface here as
+/// `RetryableWrapConfirmation`/`RetryableDepositConfirmation`/`NodeSyncFailed`
+/// so apalis retries.
 #[derive(Debug, Error)]
 pub(crate) enum UnwrappedEquityRecoveryJobError {
     #[error("recovery aggregate error: {0}")]
@@ -139,6 +147,12 @@ pub(crate) enum UnwrappedEquityRecoveryJobError {
          guard drop restores HeldForRecovery or removes orphan entry"
     )]
     NoBalanceSkip { symbol: Symbol },
+    #[error("wrap confirmation for tx {wrap_tx_hash} is retryable")]
+    RetryableWrapConfirmation { wrap_tx_hash: TxHash },
+    #[error("deposit confirmation for tx {vault_deposit_tx_hash} is retryable")]
+    RetryableDepositConfirmation { vault_deposit_tx_hash: TxHash },
+    #[error("RPC node did not catch up to wrap block {required_block} after {attempts} polls")]
+    NodeSyncFailed { required_block: u64, attempts: u32 },
 }
 
 /// Apalis job payload. The reactor pushes one of these per symbol with a
@@ -215,15 +229,27 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
             Some(UnwrappedEquityRecovery::Detected { shares, .. }) => {
                 resume_from_detected(ctx, &self.recovery_id, &symbol, shares).await
             }
-            Some(UnwrappedEquityRecovery::OrphanWrapSubmitted { .. }) => {
-                resume_from_confirm_wrap(ctx, &self.recovery_id).await
+            Some(UnwrappedEquityRecovery::OrphanWrapSubmitted { wrap_tx_hash, .. }) => {
+                resume_from_confirm_wrap(ctx, &self.recovery_id, &symbol, wrap_tx_hash).await
             }
-            Some(UnwrappedEquityRecovery::OrphanWrapped { .. }) => {
-                resume_from_submit_deposit(ctx, &self.recovery_id).await
+            Some(UnwrappedEquityRecovery::OrphanWrapped {
+                wrapped_amount,
+                wrap_block,
+                ..
+            }) => {
+                resume_from_submit_deposit(
+                    ctx,
+                    &self.recovery_id,
+                    &symbol,
+                    wrapped_amount,
+                    wrap_block,
+                )
+                .await
             }
-            Some(UnwrappedEquityRecovery::OrphanDepositSubmitted { .. }) => {
-                resume_from_confirm_deposit(ctx, &self.recovery_id).await
-            }
+            Some(UnwrappedEquityRecovery::OrphanDepositSubmitted {
+                vault_deposit_tx_hash,
+                ..
+            }) => resume_from_confirm_deposit(ctx, &self.recovery_id, vault_deposit_tx_hash).await,
             // Terminal states are already short-circuited by the `is_terminal`
             // early-return above; they are enumerated explicitly here (rather
             // than a `_` arm) so that adding a new non-terminal state fails to
@@ -332,7 +358,7 @@ async fn start_from_detect(
         "Unwrapped equity recovery: dispatched detection",
     );
 
-    dispatch_from_detected(ctx, recovery_id, symbol, snapshot.dispatch).await
+    dispatch_from_detected(ctx, recovery_id, symbol, snapshot.shares, snapshot.dispatch).await
 }
 
 /// Resume from `Detected`: a previous attempt persisted `Detect` but crashed
@@ -435,37 +461,85 @@ async fn resume_from_detected(
         "Resuming unwrapped recovery from Detected",
     );
 
-    dispatch_from_detected(ctx, recovery_id, symbol, snapshot.dispatch).await
+    dispatch_from_detected(ctx, recovery_id, symbol, snapshot.shares, snapshot.dispatch).await
 }
 
-/// Picks the dispatch command from a `Detected` state. For the orphan path,
-/// chains into the four-step sequence; for active mint/redemption, sends the
-/// single dispatch command; for conflict, fails the aggregate and returns
-/// success so apalis does not retry a terminal domain rejection.
+/// Records a terminal recovery failure as a `RecoveryFailed` event. Returns
+/// `Ok(())` so the caller stops the chain without burning an apalis retry on an
+/// already-terminal aggregate.
+async fn fail_recovery(
+    ctx: &UnwrappedEquityRecoveryCtx,
+    recovery_id: &UnwrappedEquityRecoveryId,
+    reason: String,
+) -> Result<(), UnwrappedEquityRecoveryJobError> {
+    ctx.store
+        .send(
+            recovery_id,
+            UnwrappedEquityRecoveryCommand::FailRecovery { reason },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Performs the dispatch step's I/O and records the outcome. For active
+/// mint/redemption, resumes the transfer and records the dispatch (or
+/// `RecoveryFailed`); for the orphan path, chains into the four-step sequence;
+/// for conflict, fails the aggregate.
 async fn dispatch_from_detected(
     ctx: &UnwrappedEquityRecoveryCtx,
     recovery_id: &UnwrappedEquityRecoveryId,
     symbol: &Symbol,
+    shares: FractionalShares,
     dispatch: DispatchDecision,
 ) -> Result<(), UnwrappedEquityRecoveryJobError> {
     match dispatch {
-        DispatchDecision::ActiveMint(mint_id) => ctx
-            .store
-            .send(
-                recovery_id,
-                UnwrappedEquityRecoveryCommand::DispatchToMint { mint_id },
-            )
-            .await
-            .map_err(Into::into),
-        DispatchDecision::ActiveRedemption(redemption_id) => ctx
-            .store
-            .send(
-                recovery_id,
-                UnwrappedEquityRecoveryCommand::DispatchToRedemption { redemption_id },
-            )
-            .await
-            .map_err(Into::into),
-        DispatchDecision::Orphan => resume_from_submit_wrap(ctx, recovery_id).await,
+        DispatchDecision::ActiveMint(mint_id) => {
+            match ctx.services.transfer.resume_mint(&mint_id).await {
+                Ok(()) => {
+                    info!(target: "rebalance", %mint_id, "Unwrapped equity recovery: resume_mint succeeded");
+                    ctx.store
+                        .send(
+                            recovery_id,
+                            UnwrappedEquityRecoveryCommand::DispatchToMint { mint_id },
+                        )
+                        .await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    warn!(target: "rebalance", %mint_id, ?error, "Unwrapped equity recovery: resume_mint failed");
+                    fail_recovery(ctx, recovery_id, format!("resume_mint failed: {error}")).await
+                }
+            }
+        }
+        DispatchDecision::ActiveRedemption(redemption_id) => {
+            match ctx
+                .services
+                .transfer
+                .resume_redemption(&redemption_id)
+                .await
+            {
+                Ok(()) => {
+                    info!(target: "rebalance", %redemption_id, "Unwrapped equity recovery: resume_redemption succeeded");
+                    ctx.store
+                        .send(
+                            recovery_id,
+                            UnwrappedEquityRecoveryCommand::DispatchToRedemption { redemption_id },
+                        )
+                        .await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    warn!(target: "rebalance", %redemption_id, ?error, "Unwrapped equity recovery: resume_redemption failed");
+                    fail_recovery(
+                        ctx,
+                        recovery_id,
+                        format!("resume_redemption failed: {error}"),
+                    )
+                    .await
+                }
+            }
+        }
+        DispatchDecision::Orphan => resume_from_submit_wrap(ctx, recovery_id, symbol, shares).await,
         DispatchDecision::Conflict {
             mint_id,
             redemption_id,
@@ -475,13 +549,7 @@ async fn dispatch_from_detected(
                  {redemption_id} for symbol {symbol}; refusing to dispatch"
             );
             warn!(target: "rebalance", %symbol, %mint_id, %redemption_id, "Unwrapped equity recovery: conflict");
-            ctx.store
-                .send(
-                    recovery_id,
-                    UnwrappedEquityRecoveryCommand::FailRecovery { reason },
-                )
-                .await?;
-            Ok(())
+            fail_recovery(ctx, recovery_id, reason).await
         }
     }
 }
@@ -497,92 +565,286 @@ fn is_business_validation_error(error: &UnwrappedEquityRecoveryJobError) -> bool
         | UnwrappedEquityRecoveryJobError::ActiveMintAggregate(_)
         | UnwrappedEquityRecoveryJobError::ActiveRedemptionAggregate(_)
         | UnwrappedEquityRecoveryJobError::Reschedule(_)
+        | UnwrappedEquityRecoveryJobError::RetryableWrapConfirmation { .. }
+        | UnwrappedEquityRecoveryJobError::RetryableDepositConfirmation { .. }
+        | UnwrappedEquityRecoveryJobError::NodeSyncFailed { .. }
         | UnwrappedEquityRecoveryJobError::NoBalanceSkip { .. } => false,
     }
 }
 
-/// Starts the four-step orphan path. Each step is sent independently and
-/// chains to the next via a `resume_from_*` function, so a retry that enters
-/// at any orphan state can pick up at the right command instead of replaying
-/// from `SubmitOrphanWrap`.
+/// Orphan path step 1: resolves the wrapped token, wraps the bot wallet's
+/// underlying tokens, records the submitted tx hash, then chains to confirm.
+/// A lookup/conversion/submit failure is terminal (`RecoveryFailed`).
 async fn resume_from_submit_wrap(
     ctx: &UnwrappedEquityRecoveryCtx,
     recovery_id: &UnwrappedEquityRecoveryId,
+    symbol: &Symbol,
+    shares: FractionalShares,
 ) -> Result<(), UnwrappedEquityRecoveryJobError> {
-    ctx.store
-        .send(
-            recovery_id,
-            UnwrappedEquityRecoveryCommand::SubmitOrphanWrap,
-        )
-        .await?;
-    if aggregate_terminal(ctx, recovery_id).await? {
-        return Ok(());
+    let underlying_amount = match shares.to_u256_18_decimals() {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: shares conversion failed");
+            return fail_recovery(
+                ctx,
+                recovery_id,
+                format!("shares conversion failed: {error}"),
+            )
+            .await;
+        }
+    };
+
+    let wrapped_token = match ctx.services.wrapper.lookup_derivative(symbol) {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_derivative failed");
+            return fail_recovery(
+                ctx,
+                recovery_id,
+                format!("wrapper.lookup_derivative failed: {error}"),
+            )
+            .await;
+        }
+    };
+
+    match ctx
+        .services
+        .wrapper
+        .submit_wrap(wrapped_token, underlying_amount, ctx.services.wallet)
+        .await
+    {
+        Ok(wrap_tx_hash) => {
+            info!(target: "rebalance", %symbol, %wrap_tx_hash, "Unwrapped equity recovery: submit_wrap succeeded");
+            ctx.store
+                .send(
+                    recovery_id,
+                    UnwrappedEquityRecoveryCommand::SubmitOrphanWrap { wrap_tx_hash },
+                )
+                .await?;
+            resume_from_confirm_wrap(ctx, recovery_id, symbol, wrap_tx_hash).await
+        }
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: submit_wrap failed");
+            fail_recovery(
+                ctx,
+                recovery_id,
+                format!("wrapper.submit_wrap failed: {error}"),
+            )
+            .await
+        }
     }
-    resume_from_confirm_wrap(ctx, recovery_id).await
 }
 
-/// Continues the orphan path from `OrphanWrapSubmitted` -- the wrap tx hash
-/// is already persisted in state and the aggregate's command handler will
-/// call `wrapper.confirm_wrap` on that tx.
+/// Orphan path step 2: confirms the wrap, records the minted amount and block,
+/// then chains to deposit. A confirmed-missing/dropped receipt is terminal; any
+/// other confirmation error is retryable (the job error propagates so apalis
+/// retries from the persisted `OrphanWrapSubmitted` state).
 async fn resume_from_confirm_wrap(
     ctx: &UnwrappedEquityRecoveryCtx,
     recovery_id: &UnwrappedEquityRecoveryId,
+    symbol: &Symbol,
+    wrap_tx_hash: TxHash,
 ) -> Result<(), UnwrappedEquityRecoveryJobError> {
-    ctx.store
-        .send(
-            recovery_id,
-            UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap,
-        )
-        .await?;
-    if aggregate_terminal(ctx, recovery_id).await? {
-        return Ok(());
+    let wrapped_token = match ctx.services.wrapper.lookup_derivative(symbol) {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_derivative failed");
+            return fail_recovery(
+                ctx,
+                recovery_id,
+                format!("wrapper.lookup_derivative failed: {error}"),
+            )
+            .await;
+        }
+    };
+
+    match ctx
+        .services
+        .wrapper
+        .confirm_wrap(wrapped_token, wrap_tx_hash)
+        .await
+    {
+        Ok(WrapConfirmation {
+            shares: wrapped_amount,
+            block: wrap_block,
+        }) => {
+            info!(target: "rebalance", %symbol, %wrap_tx_hash, %wrapped_amount, "Unwrapped equity recovery: confirm_wrap succeeded");
+            ctx.store
+                .send(
+                    recovery_id,
+                    UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap {
+                        wrapped_amount,
+                        wrap_block,
+                    },
+                )
+                .await?;
+            resume_from_submit_deposit(ctx, recovery_id, symbol, wrapped_amount, Some(wrap_block))
+                .await
+        }
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, %wrap_tx_hash, ?error, "Unwrapped equity recovery: confirm_wrap failed");
+            match error {
+                // Terminal: the tx will not succeed on retry (malformed receipt,
+                // dropped tx, config/drift). Record `RecoveryFailed` for the audit
+                // trail instead of looping on apalis.
+                WrapperError::MissingDepositEvent
+                | WrapperError::MissingWithdrawEvent
+                | WrapperError::SymbolNotConfigured(_)
+                | WrapperError::RedeemExceedsMax { .. }
+                | WrapperError::Evm(EvmError::TransactionDropped { .. }) => {
+                    fail_recovery(
+                        ctx,
+                        recovery_id,
+                        format!("wrapper.confirm_wrap failed: {error}"),
+                    )
+                    .await
+                }
+                // Transient: RPC transport/lag, contract view, ratio read, or a
+                // not-yet-finalized receipt -- apalis re-drives the confirm from
+                // the persisted state. Enumerated (no `_`) so a new WrapperError
+                // variant forces a terminal-vs-retryable decision here.
+                WrapperError::Evm(_)
+                | WrapperError::Contract(_)
+                | WrapperError::Ratio(_)
+                | WrapperError::MissingBlockNumber { .. } => {
+                    Err(UnwrappedEquityRecoveryJobError::RetryableWrapConfirmation { wrap_tx_hash })
+                }
+            }
+        }
     }
-    resume_from_submit_deposit(ctx, recovery_id).await
 }
 
-/// Continues the orphan path from `OrphanWrapped` -- the wrapped amount is
-/// persisted in state and the deposit command will use it.
+/// Orphan path step 3: waits for the wrap block (skipped for legacy aggregates
+/// persisted before `wrap_block` existed), resolves the vault, deposits the
+/// wrapped shares, records the tx hash, then chains to confirm. A wait failure
+/// is retryable; a lookup/deposit failure is terminal.
 async fn resume_from_submit_deposit(
     ctx: &UnwrappedEquityRecoveryCtx,
     recovery_id: &UnwrappedEquityRecoveryId,
+    symbol: &Symbol,
+    wrapped_amount: U256,
+    wrap_block: Option<u64>,
 ) -> Result<(), UnwrappedEquityRecoveryJobError> {
-    ctx.store
-        .send(
-            recovery_id,
-            UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit,
-        )
-        .await?;
-    if aggregate_terminal(ctx, recovery_id).await? {
-        return Ok(());
+    if let Some(block) = wrap_block {
+        ctx.services
+            .wrapper
+            .wait_for_block(block)
+            .await
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: wait_for_block failed");
+            })
+            .map_err(|error| UnwrappedEquityRecoveryJobError::NodeSyncFailed {
+                required_block: block,
+                attempts: node_sync_attempts(&error),
+            })?;
     }
-    resume_from_confirm_deposit(ctx, recovery_id).await
+
+    let wrapped_token = match ctx.services.wrapper.lookup_derivative(symbol) {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_derivative failed");
+            return fail_recovery(
+                ctx,
+                recovery_id,
+                format!("wrapper.lookup_derivative failed: {error}"),
+            )
+            .await;
+        }
+    };
+
+    let vault_id = match ctx
+        .services
+        .vault_lookup
+        .vault_id_for_token(wrapped_token)
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: vault_id_for_token failed");
+            return fail_recovery(
+                ctx,
+                recovery_id,
+                format!("vault_lookup.vault_id_for_token failed: {error}"),
+            )
+            .await;
+        }
+    };
+
+    // `wrapped_amount` is the raw ERC-4626 share amount from the wrap's Deposit
+    // event. Wrapped equity tokens (wtSTOCK) are minted at the system-wide
+    // tokenized-equity precision -- `TOKENIZED_EQUITY_DECIMALS` (18), the same
+    // standard the tSTOCK underlying and `FractionalShares` use -- so the raw
+    // amount is already in 18-decimal units and is interpreted as such.
+    match ctx
+        .services
+        .raindex
+        .submit_deposit(
+            wrapped_token,
+            vault_id,
+            wrapped_amount,
+            TOKENIZED_EQUITY_DECIMALS,
+        )
+        .await
+    {
+        Ok(vault_deposit_tx_hash) => {
+            info!(target: "rebalance", %symbol, %vault_deposit_tx_hash, "Unwrapped equity recovery: submit_deposit succeeded");
+            ctx.store
+                .send(
+                    recovery_id,
+                    UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit {
+                        vault_deposit_tx_hash,
+                    },
+                )
+                .await?;
+            resume_from_confirm_deposit(ctx, recovery_id, vault_deposit_tx_hash).await
+        }
+        Err(error) => {
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: submit_deposit failed");
+            fail_recovery(
+                ctx,
+                recovery_id,
+                format!("raindex.submit_deposit failed: {error}"),
+            )
+            .await
+        }
+    }
 }
 
-/// Continues the orphan path from `OrphanDepositSubmitted` -- the deposit
-/// tx hash is persisted in state and the aggregate confirms it via
-/// `raindex.confirm_tx`.
+/// Orphan path step 4: confirms the Raindex deposit and records it. A dropped
+/// tx is terminal; any other confirmation error is retryable.
 async fn resume_from_confirm_deposit(
     ctx: &UnwrappedEquityRecoveryCtx,
     recovery_id: &UnwrappedEquityRecoveryId,
+    vault_deposit_tx_hash: TxHash,
 ) -> Result<(), UnwrappedEquityRecoveryJobError> {
-    ctx.store
-        .send(
-            recovery_id,
-            UnwrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
-        )
-        .await
-        .map_err(Into::into)
-}
-
-async fn aggregate_terminal(
-    ctx: &UnwrappedEquityRecoveryCtx,
-    recovery_id: &UnwrappedEquityRecoveryId,
-) -> Result<bool, UnwrappedEquityRecoveryJobError> {
-    Ok(ctx
-        .store
-        .load(recovery_id)
-        .await?
-        .is_some_and(|agg| agg.is_terminal()))
+    match ctx.services.raindex.confirm_tx(vault_deposit_tx_hash).await {
+        Ok(()) => {
+            info!(target: "rebalance", %vault_deposit_tx_hash, "Unwrapped equity recovery: confirm_tx succeeded");
+            ctx.store
+                .send(
+                    recovery_id,
+                    UnwrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
+                )
+                .await
+                .map_err(Into::into)
+        }
+        Err(error) => {
+            warn!(target: "rebalance", %vault_deposit_tx_hash, ?error, "Unwrapped equity recovery: confirm_tx failed");
+            if error.is_transaction_dropped() {
+                return fail_recovery(
+                    ctx,
+                    recovery_id,
+                    format!("raindex.confirm_tx failed: {error}"),
+                )
+                .await;
+            }
+            Err(
+                UnwrappedEquityRecoveryJobError::RetryableDepositConfirmation {
+                    vault_deposit_tx_hash,
+                },
+            )
+        }
+    }
 }
 
 struct RecoverySnapshot {
@@ -700,6 +962,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::test_store;
+    use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::Tokenizer;
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
@@ -709,11 +972,11 @@ mod tests {
     use crate::equity_redemption::{
         EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
     };
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{ConfirmTxBehavior, DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::equity::CrossVenueEquityTransfer;
     use crate::rebalancing::trigger::InProgressGuard;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
-    use crate::vault_lookup::MockVaultLookup;
+    use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
     use super::super::aggregate::UnwrappedEquityRecoveryServices;
     use super::*;
@@ -741,37 +1004,58 @@ mod tests {
         equity_in_progress: HashMap<Symbol, GuardState>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> UnwrappedEquityRecoveryCtx {
+        test_ctx_with_services(
+            view,
+            equity_in_progress,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+            Arc::new(mock_vault_lookup()),
+            tokenizer,
+        )
+        .await
+    }
+
+    /// `test_ctx` with caller-supplied raindex/wrapper/vault-lookup mocks, so a
+    /// failure-path test can inject reverting/failing variants while the rest of
+    /// the recovery stays wired to succeeding mocks. The aggregate store is pure
+    /// (`()` services); the onchain services live on the ctx, mirroring
+    /// production wiring.
+    async fn test_ctx_with_services(
+        view: InventoryView,
+        equity_in_progress: HashMap<Symbol, GuardState>,
+        raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
+        vault_lookup: Arc<dyn VaultLookup>,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> UnwrappedEquityRecoveryCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let mint_store = Arc::new(test_store(pool.clone(), ()));
         let redemption_store = Arc::new(test_store(pool.clone(), ()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
-            Arc::new(mock_vault_lookup()),
+            vault_lookup.clone(),
             tokenizer,
             wrapper.clone(),
             Address::random(),
             mint_store.clone(),
             redemption_store.clone(),
         ));
-        let store = Arc::new(test_store(
-            pool,
-            UnwrappedEquityRecoveryServices {
-                raindex,
-                vault_lookup: Arc::new(mock_vault_lookup()),
-                wrapper,
-                transfer,
-                wallet: Address::random(),
-            },
-        ));
+        let services = UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+            wallet: Address::random(),
+        };
+        let store = Arc::new(test_store(pool, ()));
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(view, sender));
 
         UnwrappedEquityRecoveryCtx {
             inventory,
             store,
+            services,
             mint_store,
             redemption_store,
             equity_in_progress: Arc::new(RwLock::new(equity_in_progress)),
@@ -823,16 +1107,14 @@ mod tests {
             mint_store.clone(),
             redemption_store.clone(),
         ));
-        let store = Arc::new(test_store(
-            pool.clone(),
-            UnwrappedEquityRecoveryServices {
-                raindex,
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                wrapper,
-                transfer,
-                wallet: Address::random(),
-            },
-        ));
+        let services = UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            wrapper,
+            transfer,
+            wallet: Address::random(),
+        };
+        let store = Arc::new(test_store(pool.clone(), ()));
 
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
@@ -840,6 +1122,7 @@ mod tests {
         let ctx = UnwrappedEquityRecoveryCtx {
             inventory,
             store,
+            services,
             mint_store,
             redemption_store,
             equity_in_progress,
@@ -898,16 +1181,14 @@ mod tests {
             mint_store.clone(),
             redemption_store.clone(),
         ));
-        let store = Arc::new(test_store(
-            pool.clone(),
-            UnwrappedEquityRecoveryServices {
-                raindex,
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                wrapper,
-                transfer,
-                wallet: Address::random(),
-            },
-        ));
+        let services = UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            wrapper,
+            transfer,
+            wallet: Address::random(),
+        };
+        let store = Arc::new(test_store(pool.clone(), ()));
 
         // Inventory reports an unwrapped balance (so a snapshot exists) and an
         // active mint for the symbol (so dispatch resolves to `ActiveMint`), but
@@ -933,6 +1214,7 @@ mod tests {
         let ctx = UnwrappedEquityRecoveryCtx {
             inventory,
             store,
+            services,
             mint_store,
             redemption_store,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -1774,9 +2056,19 @@ mod tests {
     #[tokio::test]
     async fn perform_resumes_from_orphan_wrap_submitted_without_rewrapping() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let ctx = test_ctx(
+        // Seed the wrapper with the persisted wrap tx so the resumed run's
+        // `confirm_wrap` succeeds against it (a prior attempt's `submit_wrap`
+        // would have recorded it).
+        let wrap_tx = TxHash::from([0x11; 32]);
+        let wrapper = Arc::new(MockWrapper::new());
+        wrapper.seed_submitted_amount(wrap_tx, U256::from(5u64));
+        let ctx = test_ctx_with_services(
             view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5))),
             HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            wrapper,
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
         )
         .await;
         let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
@@ -1794,7 +2086,9 @@ mod tests {
         ctx.store
             .send(
                 &recovery_id,
-                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
             )
             .await
             .unwrap();
@@ -1852,14 +2146,19 @@ mod tests {
         ctx.store
             .send(
                 &recovery_id,
-                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: TxHash::from([0x11; 32]),
+                },
             )
             .await
             .unwrap();
         ctx.store
             .send(
                 &recovery_id,
-                UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap,
+                UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap {
+                    wrapped_amount: U256::from(5u64),
+                    wrap_block: 0,
+                },
             )
             .await
             .unwrap();
@@ -1917,21 +2216,28 @@ mod tests {
         ctx.store
             .send(
                 &recovery_id,
-                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: TxHash::from([0x11; 32]),
+                },
             )
             .await
             .unwrap();
         ctx.store
             .send(
                 &recovery_id,
-                UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap,
+                UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap {
+                    wrapped_amount: U256::from(5u64),
+                    wrap_block: 0,
+                },
             )
             .await
             .unwrap();
         ctx.store
             .send(
                 &recovery_id,
-                UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit {
+                    vault_deposit_tx_hash: TxHash::from([0x22; 32]),
+                },
             )
             .await
             .unwrap();
@@ -1965,5 +2271,487 @@ mod tests {
             vault_deposit_tx_hash, seeded_deposit_tx,
             "the resumed run must confirm the persisted deposit tx, not submit a second deposit",
         );
+    }
+
+    // --- Orphan-path I/O outcomes (the failure/retryable behaviour the job
+    // records through the aggregate's pure commands; relocated here from the
+    // aggregate when the I/O moved to the job). ---
+
+    fn aapl() -> Symbol {
+        Symbol::new("AAPL").unwrap()
+    }
+
+    fn five_shares() -> FractionalShares {
+        FractionalShares::new(float!(5))
+    }
+
+    /// Seeds `Detect` so the orphan path's first step runs against a real
+    /// `Detected` aggregate, then returns the recovery id.
+    async fn seed_detected(ctx: &UnwrappedEquityRecoveryCtx) -> UnwrappedEquityRecoveryId {
+        let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::Detect {
+                    symbol: aapl(),
+                    shares: five_shares(),
+                },
+            )
+            .await
+            .unwrap();
+        recovery_id
+    }
+
+    async fn assert_failed_with(
+        ctx: &UnwrappedEquityRecoveryCtx,
+        id: &UnwrappedEquityRecoveryId,
+        needle: &str,
+    ) {
+        let state = ctx.store.load(id).await.unwrap();
+        let Some(UnwrappedEquityRecovery::Failed { reason, .. }) = state else {
+            panic!("expected Failed state, got {state:?}");
+        };
+        assert!(
+            reason.contains(needle),
+            "RecoveryFailed reason should mention {needle:?}; got {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_wrap_failure_records_recovery_failed() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_detected(&ctx).await;
+
+        resume_from_submit_wrap(&ctx, &recovery_id, &aapl(), five_shares())
+            .await
+            .expect("a terminal wrap failure is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "submit_wrap failed").await;
+    }
+
+    #[tokio::test]
+    async fn submit_wrap_derivative_lookup_failure_records_recovery_failed() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_derivative_lookup()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_detected(&ctx).await;
+
+        resume_from_submit_wrap(&ctx, &recovery_id, &aapl(), five_shares())
+            .await
+            .expect("a terminal lookup failure is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "lookup_derivative failed").await;
+    }
+
+    #[tokio::test]
+    async fn confirm_wrap_failure_records_recovery_failed() {
+        let wrap_tx = TxHash::from([0x11; 32]);
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_confirm_wrap()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_detected(&ctx).await;
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        resume_from_confirm_wrap(&ctx, &recovery_id, &aapl(), wrap_tx)
+            .await
+            .expect("a confirmed-missing-receipt is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "confirm_wrap failed").await;
+    }
+
+    #[tokio::test]
+    async fn confirm_wrap_retryable_error_propagates_and_keeps_state_live() {
+        let wrap_tx = TxHash::from([0x11; 32]);
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::retryable_confirm_wrap()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_detected(&ctx).await;
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = resume_from_confirm_wrap(&ctx, &recovery_id, &aapl(), wrap_tx)
+            .await
+            .expect_err(
+                "a retryable confirm failure must surface as a job error so apalis retries",
+            );
+
+        assert!(matches!(
+            error,
+            UnwrappedEquityRecoveryJobError::RetryableWrapConfirmation { .. }
+        ));
+        let state = ctx.store.load(&recovery_id).await.unwrap();
+        assert!(
+            matches!(
+                state,
+                Some(UnwrappedEquityRecovery::OrphanWrapSubmitted { .. })
+            ),
+            "a retryable error must leave the aggregate live in OrphanWrapSubmitted, got {state:?}",
+        );
+    }
+
+    /// Seeds `OrphanWrapped` (the deposit step's entry state) with the given
+    /// confirmation block, returning the recovery id.
+    async fn seed_orphan_wrapped(
+        ctx: &UnwrappedEquityRecoveryCtx,
+        wrap_block: u64,
+    ) -> UnwrappedEquityRecoveryId {
+        let recovery_id = seed_detected(ctx).await;
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: TxHash::from([0x11; 32]),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap {
+                    wrapped_amount: U256::from(123u64),
+                    wrap_block,
+                },
+            )
+            .await
+            .unwrap();
+        recovery_id
+    }
+
+    #[tokio::test]
+    async fn submit_deposit_revert_records_recovery_failed() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            ),
+            Arc::new(MockWrapper::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_wrapped(&ctx, 0).await;
+
+        resume_from_submit_deposit(&ctx, &recovery_id, &aapl(), U256::from(123u64), None)
+            .await
+            .expect("a reverted deposit is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "submit_deposit failed").await;
+    }
+
+    #[tokio::test]
+    async fn submit_deposit_vault_lookup_failure_records_recovery_failed() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new().with_wrapped_token(Address::random())),
+            // Empty vault lookup -> `vault_id_for_token` fails.
+            Arc::new(MockVaultLookup::new()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_wrapped(&ctx, 0).await;
+
+        resume_from_submit_deposit(&ctx, &recovery_id, &aapl(), U256::from(123u64), None)
+            .await
+            .expect("a vault lookup failure is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "vault_id_for_token failed").await;
+    }
+
+    #[tokio::test]
+    async fn submit_deposit_derivative_lookup_failure_records_recovery_failed() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            // `lookup_derivative` fails before the vault lookup / deposit run.
+            Arc::new(MockWrapper::failing_derivative_lookup()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_wrapped(&ctx, 0).await;
+
+        resume_from_submit_deposit(&ctx, &recovery_id, &aapl(), U256::from(123u64), None)
+            .await
+            .expect("a derivative lookup failure is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "wrapper.lookup_derivative failed").await;
+    }
+
+    #[tokio::test]
+    async fn submit_deposit_waits_for_block_then_deposits_at_tokenized_precision() {
+        let wrapped_token = Address::random();
+        let raindex = Arc::new(MockRaindex::new());
+        let wrapper = Arc::new(MockWrapper::new().with_wrapped_token(wrapped_token));
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            raindex.clone(),
+            wrapper.clone(),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_wrapped(&ctx, 9999).await;
+
+        resume_from_submit_deposit(&ctx, &recovery_id, &aapl(), U256::from(123u64), Some(9999))
+            .await
+            .expect("deposit should succeed after the node-sync wait");
+
+        assert_eq!(
+            wrapper.wait_for_block_calls(),
+            vec![9999u64],
+            "the deposit step must wait for the wrap block before depositing",
+        );
+        assert_eq!(
+            raindex.last_deposit_call(),
+            Some(DepositCall {
+                token: wrapped_token,
+                vault_id: RaindexVaultId(B256::ZERO),
+                amount: U256::from(123u64),
+                decimals: TOKENIZED_EQUITY_DECIMALS,
+            }),
+            "the deposit must use the resolved wrapped token at tokenized-equity precision",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_deposit_wait_failure_propagates_node_sync_error() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_wrapped(&ctx, 9999).await;
+
+        let error =
+            resume_from_submit_deposit(&ctx, &recovery_id, &aapl(), U256::from(123u64), Some(9999))
+                .await
+                .expect_err("a node-sync wait failure must surface as a retryable job error");
+
+        assert!(matches!(
+            error,
+            UnwrappedEquityRecoveryJobError::NodeSyncFailed {
+                required_block: 9999,
+                ..
+            }
+        ));
+    }
+
+    /// Seeds `OrphanDepositSubmitted` (the confirm step's entry state).
+    async fn seed_orphan_deposit_submitted(
+        ctx: &UnwrappedEquityRecoveryCtx,
+        deposit_tx: TxHash,
+    ) -> UnwrappedEquityRecoveryId {
+        let recovery_id = seed_orphan_wrapped(ctx, 0).await;
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit {
+                    vault_deposit_tx_hash: deposit_tx,
+                },
+            )
+            .await
+            .unwrap();
+        recovery_id
+    }
+
+    #[tokio::test]
+    async fn confirm_deposit_failure_records_recovery_failed() {
+        let deposit_tx = TxHash::from([0x22; 32]);
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Fail)),
+            Arc::new(MockWrapper::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_deposit_submitted(&ctx, deposit_tx).await;
+
+        resume_from_confirm_deposit(&ctx, &recovery_id, deposit_tx)
+            .await
+            .expect("a dropped deposit tx is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "confirm_tx failed").await;
+    }
+
+    #[tokio::test]
+    async fn confirm_deposit_retryable_error_propagates_against_persisted_tx() {
+        let deposit_tx = TxHash::from([0x22; 32]);
+        let raindex =
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Retryable));
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_deposit_submitted(&ctx, deposit_tx).await;
+
+        let error = resume_from_confirm_deposit(&ctx, &recovery_id, deposit_tx)
+            .await
+            .expect_err("a retryable confirmation must surface as a job error so apalis retries");
+
+        assert!(matches!(
+            error,
+            UnwrappedEquityRecoveryJobError::RetryableDepositConfirmation { .. }
+        ));
+        assert_eq!(
+            raindex.last_confirmed_tx(),
+            Some(deposit_tx),
+            "the confirm step must confirm the persisted deposit tx hash",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_resume_mint_failure_records_recovery_failed() {
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
+        let recovery_id = seed_detected(&ctx).await;
+
+        // No mint aggregate exists, so `resume_mint` fails.
+        dispatch_from_detected(
+            &ctx,
+            &recovery_id,
+            &aapl(),
+            five_shares(),
+            DispatchDecision::ActiveMint(issuer_request_id("ISS-NONEXISTENT")),
+        )
+        .await
+        .expect("a failed mint resume is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "resume_mint failed").await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_resume_redemption_failure_records_recovery_failed() {
+        let ctx = test_ctx(InventoryView::default(), HashMap::new()).await;
+        let recovery_id = seed_detected(&ctx).await;
+
+        dispatch_from_detected(
+            &ctx,
+            &recovery_id,
+            &aapl(),
+            five_shares(),
+            DispatchDecision::ActiveRedemption(redemption_aggregate_id("nonexistent")),
+        )
+        .await
+        .expect("a failed redemption resume is recorded, not surfaced as a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "resume_redemption failed").await;
+    }
+
+    /// A `wait_for_block` transport error (every poll failed before a tip was
+    /// observed) must still surface as `NodeSyncFailed` with the full budget of
+    /// `NODE_SYNC_MAX_ATTEMPTS` -- the `node_sync_attempts` fallback arm, distinct
+    /// from the `NodeBehindRequiredBlock` arm covered above.
+    #[tokio::test]
+    async fn submit_deposit_transport_error_wait_failure_pins_max_attempts() {
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block_transport_error()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_orphan_wrapped(&ctx, 9999).await;
+
+        let error =
+            resume_from_submit_deposit(&ctx, &recovery_id, &aapl(), U256::from(123u64), Some(9999))
+                .await
+                .expect_err("a transport-error wait failure must surface as a retryable job error");
+
+        assert!(matches!(
+            error,
+            UnwrappedEquityRecoveryJobError::NodeSyncFailed {
+                required_block: 9999,
+                attempts: NODE_SYNC_MAX_ATTEMPTS,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_wrap_derivative_lookup_failure_records_recovery_failed() {
+        let wrap_tx = TxHash::from([0x11; 32]);
+        let ctx = test_ctx_with_services(
+            InventoryView::default(),
+            HashMap::new(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_derivative_lookup()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+        )
+        .await;
+        let recovery_id = seed_detected(&ctx).await;
+        ctx.store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        resume_from_confirm_wrap(&ctx, &recovery_id, &aapl(), wrap_tx)
+            .await
+            .expect("a terminal lookup failure at the confirm step is recorded, not a job error");
+
+        assert_failed_with(&ctx, &recovery_id, "lookup_derivative failed").await;
     }
 }
