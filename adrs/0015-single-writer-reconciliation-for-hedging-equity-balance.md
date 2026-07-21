@@ -1,6 +1,6 @@
 # ADR 0015: Single-writer reconciliation for the Hedging equity balance
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-20
 
 ## Context
