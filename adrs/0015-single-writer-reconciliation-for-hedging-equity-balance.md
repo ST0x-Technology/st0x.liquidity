@@ -163,6 +163,22 @@ sustained starvation needs long-resting orders or a leaked flag. The residue:
 failed fill applications grow with volume, and each waits for an unblocked
 snapshot — what open question 1's staleness bound would cap.
 
+**Residual: a restart across an open order re-opens one double-count window.**
+The aggregate records every poll regardless of the view's gate (that is what
+makes forget-on-clear able to heal), so the persisted snapshot can hold the
+mid-order value the live view correctly refused. The guard state that refused it
+is in-memory and unrecoverable (`last_offchain_fill_applied_at` is a local clock
+reading), so hydration applies the ambiguous value, and the still-open order's
+fill then double-counts — for at most one poll, until the fill's forget defeats
+the dedupe and the next emission converges the view. Before this change the
+window was unbounded: the unchanged-value dedupe suppressed every subsequent
+poll, so the double-counted balance persisted until the position happened to
+change or the bot restarted again — this PR narrows it to at most one poll via
+forget-on-clear. Closing it entirely would require the snapshot to record which
+fills it absorbed — the same missing broker-side ordering as alternative C.
+Pinned by `restart_with_mid_order_snapshot_heals_within_one_poll`, which asserts
+the heal as the contract.
+
 **It extends the lifetime of pre-existing drift.** The guard rejects the
 symbol's whole snapshot, not just the contested fill, so unrelated drift loses
 the poll that would have healed it — and a dropped fill event has no catch-up

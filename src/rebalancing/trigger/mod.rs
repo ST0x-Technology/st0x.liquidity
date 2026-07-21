@@ -22634,6 +22634,132 @@ mod tests {
         );
     }
 
+    /// Restart with a snapshot persisted while the hedge order was OPEN. The
+    /// persisted value is ambiguous mid-order data and the guard state that
+    /// refused it live did not survive the restart, so hydration applies it
+    /// and the fill's delta transiently double-counts -- an accepted,
+    /// bounded residual. The contract this test pins is the heal: the fill's
+    /// gate-clear forgets the cached positions, so the first post-fill poll
+    /// re-emits and converges the view to broker truth within one cycle.
+    #[tokio::test]
+    async fn restart_with_mid_order_snapshot_heals_within_one_poll() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        trigger
+            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .await;
+        let mut seen_sequence = 0i64;
+
+        // Previous run: order placed, then a poll captured the POST-FILL 90
+        // while the order was still open (the live view refused it; the
+        // aggregate recorded it), then the bot died before observing the fill.
+        let position_store = test_store::<Position>(pool.clone(), ());
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        send_command::<InventorySnapshot>(
+            &pool,
+            &snapshot_id,
+            InventorySnapshotCommand::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                fetched_at: Utc::now(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+        drain_snapshot_events(&pool, &mut seen_sequence).await;
+
+        // Restart: hydrate applies the ambiguous 90, then recovery gates.
+        crate::conductor::restore_inventory_at_boot(
+            &pool,
+            &trigger.inventory,
+            Some(&trigger),
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        // The still-open order's fill is observed post-restart. Its delta
+        // double-counts (90 - 10 = 80) because the hydrated 90 had already
+        // absorbed it; the gate-clear sends the forget.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        // Next poll: broker still reports 90; the forget defeats the dedupe
+        // so the aggregate re-emits and the view converges.
+        send_command::<InventorySnapshot>(
+            &pool,
+            &snapshot_id,
+            InventorySnapshotCommand::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                fetched_at: Utc::now(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
+            harness
+                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "the first post-fill poll must heal the restart double-count; 80 \
+             means the forgotten-cache re-emission never applied"
+        );
+    }
+
     #[tokio::test]
     async fn recover_pending_offchain_order_symbols_restores_block_from_projection() {
         let pending_symbol = Symbol::new("AAPL").unwrap();
