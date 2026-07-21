@@ -1840,6 +1840,16 @@ impl InventoryView {
             } => positions
                 .iter()
                 .try_fold(self, |view, (symbol, snapshot_balance)| {
+                    // The force path bypasses the staleness guards, not the
+                    // ownership one: a symbol with an open hedge order keeps
+                    // its delta-owned balance, or the recovery path re-opens
+                    // the snapshot-vs-fill double-count. Skipped symbols also
+                    // keep their watermark un-advanced below, so the
+                    // post-clear healing emission still applies.
+                    if view.has_pending_offchain_order(symbol) {
+                        return Ok(view);
+                    }
+
                     view.update_equity(
                         symbol,
                         Inventory::force_on_snapshot(
@@ -1851,11 +1861,11 @@ impl InventoryView {
                     )
                 })
                 .map(|view| {
-                    view.record_equity_snapshot_watermarks(
-                        Venue::Hedging,
-                        positions.keys(),
-                        *fetched_at,
-                    )
+                    let applied: Vec<&Symbol> = positions
+                        .keys()
+                        .filter(|symbol| !view.has_pending_offchain_order(symbol))
+                        .collect();
+                    view.record_equity_snapshot_watermarks(Venue::Hedging, applied, *fetched_at)
                 }),
 
             OffchainUsd {
