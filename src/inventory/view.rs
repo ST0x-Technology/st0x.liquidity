@@ -1173,29 +1173,34 @@ impl InventoryView {
 
         // The offchain venue has a second writer (the fill delta) that the
         // onchain venue does not; yield to it while it owns the balance.
-        if venue == Venue::Hedging {
-            if self.pending_offchain_order_symbols.contains(symbol) {
-                debug!(
-                    target: "inventory",
-                    %symbol,
-                    ?fetched_at,
-                    "Skipping offchain equity snapshot: hedge order still open",
-                );
-                return Ok(false);
-            }
+        // Exhaustive so a new venue forces a decision on whether it has a
+        // second writer of its own.
+        match venue {
+            Venue::MarketMaking => {}
+            Venue::Hedging => {
+                if self.pending_offchain_order_symbols.contains(symbol) {
+                    debug!(
+                        target: "inventory",
+                        %symbol,
+                        ?fetched_at,
+                        "Skipping offchain equity snapshot: hedge order still open",
+                    );
+                    return Ok(false);
+                }
 
-            if self
-                .last_offchain_fill_applied_at
-                .get(symbol)
-                .is_some_and(|filled_at| fetched_at < *filled_at)
-            {
-                debug!(
-                    target: "inventory",
-                    %symbol,
-                    ?fetched_at,
-                    "Skipping offchain equity snapshot: predates last applied fill",
-                );
-                return Ok(false);
+                if self
+                    .last_offchain_fill_applied_at
+                    .get(symbol)
+                    .is_some_and(|filled_at| fetched_at < *filled_at)
+                {
+                    debug!(
+                        target: "inventory",
+                        %symbol,
+                        ?fetched_at,
+                        "Skipping offchain equity snapshot: predates last applied fill",
+                    );
+                    return Ok(false);
+                }
             }
         }
 
