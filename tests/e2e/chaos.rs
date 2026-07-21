@@ -65,7 +65,28 @@ pub(crate) enum ChaosBehaviour {
     /// RPC node on a forked branch re-serving an already-ingested fill's
     /// log under the fork's block -- the reorg the consumer detects via
     /// block-hash mismatch against the hash it persisted at ingestion.
+    /// `eth_getBlockByNumber` for the re-served block's height is also
+    /// stamped with [`FORK_BLOCK_HASH`] (see [`Perturbation::ForkBlockHash`])
+    /// so the consumer's canonical-ancestry re-verification reads the same
+    /// swapped block the getLogs re-serve advertises.
     ForkReplay,
+    /// Models a fill the reorg DROPPED rather than re-mined: the witnessed
+    /// fill never re-appears under its own `(tx_hash, log_index)`, yet the
+    /// block at its height is replaced by a competing one. Each cached fill
+    /// log is re-served at its original block height carrying
+    /// [`FORK_BLOCK_HASH`] but with the fill's transaction identity replaced
+    /// by [`ORPHAN_DROP_TX_HASH`] and its event topics cleared -- the
+    /// orphaned block's unrelated content, not the fill. The consumer thus
+    /// sees the fill's block orphaned (a competing hash at that height) while
+    /// the fill's own identity is gone, so the block-hash-mismatch detector --
+    /// which only fires on a re-observed witnessed identity -- never flags it.
+    /// This is the dropped-and-not-reappearing reorg the `removed: true` path
+    /// is inert against over `eth_getLogs`. In addition, `eth_getBlockByNumber`
+    /// for the dropped fill's block height is stamped with [`FORK_BLOCK_HASH`]
+    /// (see [`Perturbation::ForkBlockHash`]): the consumer's canonical-ancestry
+    /// re-verification reads the fill's block by number and must see the competing
+    /// hash there, since the orphaned block never re-appears over `eth_getLogs`.
+    ForkDrop,
 }
 
 /// Block hash the [`ChaosBehaviour::ForkReplay`] perturbation stamps onto
@@ -74,6 +95,14 @@ pub(crate) enum ChaosBehaviour {
 /// mismatch and treats the re-served fill as reorged off the canonical
 /// chain.
 const FORK_BLOCK_HASH: &str = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+/// Transaction hash the [`ChaosBehaviour::ForkDrop`] perturbation stamps onto
+/// the orphan-block marker it serves in place of a dropped fill. All-`0xdd`
+/// cannot collide with a real Anvil transaction hash, so the consumer can never
+/// match the marker to the witnessed fill's own `(tx_hash, log_index)` -- the
+/// fill stays dropped (never re-observed) rather than detected as re-mined.
+const ORPHAN_DROP_TX_HASH: &str =
+    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 /// Knob describing which method to perturb and for how many calls.
 ///
@@ -264,6 +293,26 @@ impl ChaosProxy {
         *self.config.lock().await = Some(ChaosConfig {
             method: "eth_getLogs".to_owned(),
             behaviour: ChaosBehaviour::ForkReplay,
+            remaining: count,
+            pending_stale_tips: 0,
+        });
+    }
+
+    /// Convenience: for the next `count` `eth_getLogs` responses, replace the
+    /// last non-empty result for the same event signature with an orphan-block
+    /// marker -- the cached fill re-served at its original block height under
+    /// [`FORK_BLOCK_HASH`], with [`ORPHAN_DROP_TX_HASH`] for its transaction and
+    /// its event topics cleared -- modelling a fill the reorg DROPPED. Unlike
+    /// [`ChaosProxy::fork_replay_get_logs`], the witnessed fill's own
+    /// `(tx_hash, log_index)` never re-appears, so the consumer's block-hash
+    /// reorg detector (which keys off a re-observed witnessed identity) cannot
+    /// flag it: this exercises the gap where a dropped-and-not-reappearing fill
+    /// leaves a naked hedge. A generous `count` covers both event-signature
+    /// polls across several rounds.
+    pub(crate) async fn fork_drop_get_logs(&self, count: usize) {
+        *self.config.lock().await = Some(ChaosConfig {
+            method: "eth_getLogs".to_owned(),
+            behaviour: ChaosBehaviour::ForkDrop,
             remaining: count,
             pending_stale_tips: 0,
         });
@@ -619,6 +668,14 @@ enum Perturbation {
     /// Forward upstream, then merge previously-cached logs for the same
     /// event signature into the response, in the given mode.
     ReplayResponse(ReplayMode),
+    /// Forward the `eth_getBlockByNumber` upstream, then overwrite the returned
+    /// block's `hash` with [`FORK_BLOCK_HASH`]. Pairs the fork perturbations'
+    /// getLogs re-serve with the block-by-number read the consumer's
+    /// canonical-ancestry re-verification issues: under both [`ChaosBehaviour::ForkReplay`]
+    /// (re-mine) and [`ChaosBehaviour::ForkDrop`] (drop) the fill's block at that
+    /// height must show the competing fork hash, so the re-verification sees
+    /// `hash != persisted` and agrees with the getLogs signal.
+    ForkBlockHash,
 }
 
 /// How [`replay_cached_logs`] re-serves cached logs.
@@ -631,6 +688,12 @@ enum ReplayMode {
     /// [`FORK_BLOCK_HASH`], modelling a node on a competing fork
     /// ([`ChaosBehaviour::ForkReplay`]).
     Forked,
+    /// Re-serve cached logs as orphan-block markers: their `blockHash`
+    /// rewritten to [`FORK_BLOCK_HASH`], their `transactionHash` replaced by
+    /// [`ORPHAN_DROP_TX_HASH`], and their `topics` cleared. Models a fill the
+    /// reorg DROPPED -- the fill's block is orphaned but the fill's own
+    /// identity never re-appears ([`ChaosBehaviour::ForkDrop`]).
+    Dropped,
 }
 
 /// Decide a single JSON-RPC request: synthesize, delay, or replay a
@@ -650,7 +713,7 @@ async fn process_one(state: &ProxyState, request: Value) -> Value {
     let is_get_logs = method.as_deref() == Some("eth_getLogs");
 
     let perturbation = match method {
-        Some(method) => perturb(state, &method, &id).await,
+        Some(method) => perturb(state, &method, &request, &id).await,
         None => None,
     };
 
@@ -664,6 +727,10 @@ async fn process_one(state: &ProxyState, request: Value) -> Value {
         Some(Perturbation::ReplayResponse(mode)) => {
             let response = forward_or_rpc_error(state, &request, id).await;
             replay_cached_logs(state, &request, response, mode).await
+        }
+        Some(Perturbation::ForkBlockHash) => {
+            let response = forward_or_rpc_error(state, &request, id).await;
+            rewrite_block_hash(response, FORK_BLOCK_HASH)
         }
         None => {
             let response = forward_or_rpc_error(state, &request, id).await;
@@ -711,7 +778,11 @@ async fn cache_get_logs_result(state: &ProxyState, request: &Value, response: &V
 /// The merged response models a stale node re-serving logs from outside
 /// the requested block range. Under [`ReplayMode::Forked`] each re-served
 /// log's `blockHash` is rewritten to [`FORK_BLOCK_HASH`] so the merge
-/// models a competing fork rather than the same chain.
+/// models a competing fork rather than the same chain. Under
+/// [`ReplayMode::Dropped`] each re-served log is additionally stripped of
+/// the fill's identity ([`ORPHAN_DROP_TX_HASH`], topics cleared) so the
+/// height shows a competing block whose content is no longer the witnessed
+/// fill -- a dropped, not re-mined, reorg.
 async fn replay_cached_logs(
     state: &ProxyState,
     request: &Value,
@@ -769,6 +840,18 @@ async fn replay_cached_logs(
                 log["blockHash"] = json!(FORK_BLOCK_HASH);
             }
         }
+        ReplayMode::Dropped => {
+            // Present the competing block at the fill's height while dropping
+            // the fill itself: keep the cached log's `blockNumber`, stamp the
+            // fork hash, but replace the transaction identity and clear the
+            // topics so the marker is neither matched to the witnessed fill
+            // (no re-mined re-application) nor re-decoded as a fresh fill.
+            for log in &mut replayed {
+                log["blockHash"] = json!(FORK_BLOCK_HASH);
+                log["transactionHash"] = json!(ORPHAN_DROP_TX_HASH);
+                log["topics"] = json!([]);
+            }
+        }
         ReplayMode::SameChain => {}
     }
 
@@ -797,7 +880,26 @@ async fn forward_or_rpc_error(state: &ProxyState, request: &Value, id: Value) ->
 
 /// Returns the perturbation the active chaos config applies to this
 /// method, or `None` to forward untouched.
-async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturbation> {
+async fn perturb(
+    state: &ProxyState,
+    method: &str,
+    request: &Value,
+    id: &Value,
+) -> Option<Perturbation> {
+    // A `ForkReplay`/`ForkDrop` arm swaps the block at the cached fill's height for
+    // the competing fork's. The consumer re-verifies a witnessed fill by reading
+    // that block by number, so `eth_getBlockByNumber` for the height must agree with
+    // the getLogs re-serve and carry the same `FORK_BLOCK_HASH`. Independent of the
+    // getLogs drop budget (the re-verification polls repeatedly; the reversal is
+    // exactly-once) and limited to the cached fill's height so unrelated reads -- the
+    // `safe`/`finalized` cutoff tag, other blocks -- pass through untouched.
+    if method == "eth_getBlockByNumber"
+        && forked_block_hash_armed(state).await
+        && requested_block_is_cached_fill_height(state, request).await
+    {
+        return Some(Perturbation::ForkBlockHash);
+    }
+
     let mut guard = state.config.lock().await;
 
     let result = match guard.as_mut() {
@@ -840,6 +942,10 @@ async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturb
                         cfg.remaining -= 1;
                         Some(Perturbation::ReplayResponse(ReplayMode::Forked))
                     }
+                    ChaosBehaviour::ForkDrop => {
+                        cfg.remaining -= 1;
+                        Some(Perturbation::ReplayResponse(ReplayMode::Dropped))
+                    }
                 }
             } else {
                 None
@@ -849,6 +955,58 @@ async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturb
 
     drop(guard);
     result
+}
+
+/// True when the active chaos behaviour presents the cached fill's block under the
+/// competing [`FORK_BLOCK_HASH`]: both the re-mine ([`ChaosBehaviour::ForkReplay`])
+/// and the drop ([`ChaosBehaviour::ForkDrop`]) model the fork swapping the block at
+/// the fill's height, so a canonical-ancestry read of that height must see the fork
+/// hash too.
+async fn forked_block_hash_armed(state: &ProxyState) -> bool {
+    matches!(
+        state.config.lock().await.as_ref(),
+        Some(ChaosConfig {
+            behaviour: ChaosBehaviour::ForkReplay | ChaosBehaviour::ForkDrop,
+            ..
+        })
+    )
+}
+
+/// True when `request` is an `eth_getBlockByNumber` for a numeric height matching
+/// the `blockNumber` of a cached fill log. A block tag (`safe`, `finalized`,
+/// `latest`, ...) is never a specific fill height, so tag reads return `false` and
+/// are left untouched.
+async fn requested_block_is_cached_fill_height(state: &ProxyState, request: &Value) -> bool {
+    let Some(requested) = request["params"][0].as_str().and_then(parse_hex_quantity) else {
+        return false;
+    };
+
+    state
+        .logs_cache
+        .lock()
+        .await
+        .values()
+        .flatten()
+        .any(|log| log["blockNumber"].as_str().and_then(parse_hex_quantity) == Some(requested))
+}
+
+/// Parses a `0x`-prefixed JSON-RPC hex quantity into a `u64`.
+fn parse_hex_quantity(value: &str) -> Option<u64> {
+    u64::from_str_radix(value.strip_prefix("0x")?, 16).ok()
+}
+
+/// Overwrites the `hash` of a block returned by `eth_getBlockByNumber` with `hash`,
+/// modelling the competing fork swapping the canonical block at that height. A null
+/// result (block not found) is left untouched.
+fn rewrite_block_hash(mut response: Value, hash: &str) -> Value {
+    if let Some(block) = response
+        .get_mut("result")
+        .filter(|result| result.is_object())
+    {
+        block["hash"] = json!(hash);
+    }
+
+    response
 }
 
 /// Forward a single parsed JSON-RPC request to the upstream node and
@@ -901,13 +1059,16 @@ fn json_response(value: &Value) -> Response {
 #[cfg(test)]
 mod tests {
     use reqwest::Client;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use url::Url;
 
-    use super::{ProxyState, ReplayMode, replay_cached_logs};
+    use super::{
+        ChaosBehaviour, ChaosConfig, FORK_BLOCK_HASH, Perturbation, ProxyState, ReplayMode,
+        forked_block_hash_armed, perturb, replay_cached_logs, rewrite_block_hash,
+    };
 
     /// Pins the [`ChaosBehaviour::ForkReplay`] harness contract the reorg e2e
     /// depends on: a fill log cached from an earlier witnessing round is re-served
@@ -991,6 +1152,287 @@ mod tests {
             json!(canonical_block_hash),
             "the re-served block hash must differ from the canonical hash the bot \
              persisted, so the bot detects the block-hash mismatch",
+        );
+    }
+
+    /// Pins the [`ChaosBehaviour::ForkDrop`] harness contract the dropped-fill
+    /// reorg e2e depends on: a fill log cached from an earlier witnessing round
+    /// is re-served on a later `eth_getLogs` round as an *orphan-block marker* --
+    /// the fill's block height under a competing block hash, but with the fill's
+    /// own transaction identity replaced and its topics cleared. The bot's reorg
+    /// detection keys off a re-observed *witnessed* `(tx_hash, log_index)`, so a
+    /// marker that no longer carries the fill's identity must leave the fill
+    /// dropped and never flagged. If the transform ever stopped replacing the
+    /// identity (re-serving the witnessed fill) or stopped clearing the topics
+    /// (letting the marker re-ingest as a fresh fill), the e2e would stop
+    /// exercising the dropped-and-not-reappearing reorg gap.
+    ///
+    /// This exercises [`replay_cached_logs`] directly under
+    /// [`ReplayMode::Dropped`] -- the proxy's response transform -- without the
+    /// upstream node or the full bot: the only collaborator it needs is the
+    /// pre-seeded logs cache.
+    #[tokio::test]
+    async fn fork_drop_orphans_witnessed_fill_without_re_serving_its_identity() {
+        let signature =
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_owned();
+        let canonical_block_hash =
+            "0x00000000000000000000000000000000000000000000000000000000000000aa";
+        let transaction_hash = "0x00000000000000000000000000000000000000000000000000000000000000bb";
+        let log_index = "0x0";
+        let block_number = "0x2a";
+
+        // The fill the bot already ingested, cached by the proxy under its event
+        // signature during the witnessing round, on its original canonical block.
+        let cached_log = json!({
+            "transactionHash": transaction_hash,
+            "logIndex": log_index,
+            "blockNumber": block_number,
+            "blockHash": canonical_block_hash,
+            "topics": [signature],
+        });
+
+        let state = ProxyState {
+            config: Arc::new(Mutex::new(None)),
+            logs_cache: Arc::new(Mutex::new(HashMap::from([(
+                signature.clone(),
+                vec![cached_log],
+            )]))),
+            // Never used by `replay_cached_logs` (it transforms an already-received
+            // response), but required to build the handler state.
+            upstream: Url::parse("http://127.0.0.1:1").unwrap(),
+            client: Client::new(),
+        };
+
+        // A later poll round whose live result is empty: the forked node serves
+        // no new logs in the requested range and the dropped fill never returns.
+        let request = json!({ "params": [{ "topics": [signature] }] });
+        let live_response = json!({ "jsonrpc": "2.0", "id": 1, "result": [] });
+
+        let dropped =
+            replay_cached_logs(&state, &request, live_response, ReplayMode::Dropped).await;
+
+        let result = dropped["result"]
+            .as_array()
+            .expect("the response must carry a result array");
+        assert_eq!(
+            result.len(),
+            1,
+            "ForkDrop must serve a single orphan-block marker at the fill's height",
+        );
+
+        let marker = &result[0];
+
+        // The witnessed fill's own transaction identity must be gone: the fill is
+        // dropped, never re-observed, so the block-hash detector cannot flag it.
+        assert_ne!(
+            marker["transactionHash"],
+            json!(transaction_hash),
+            "the dropped fill's transaction identity must NOT be re-served",
+        );
+        // 32 bytes of 0xdd, derived independently of the production constant so the
+        // assertion pins the value rather than comparing the code against itself.
+        let orphan_tx_hash = format!("0x{}", "d".repeat(64));
+        assert_eq!(
+            marker["transactionHash"],
+            json!(orphan_tx_hash),
+            "the orphan marker must carry the sentinel drop transaction hash",
+        );
+
+        // The block at the fill's height is orphaned: same number, competing hash.
+        assert_eq!(
+            marker["blockNumber"],
+            json!(block_number),
+            "the orphan marker must sit at the dropped fill's block height",
+        );
+        // 32 bytes of 0xff, derived independently of the production constant.
+        let competing_fork_hash = format!("0x{}", "f".repeat(64));
+        assert_eq!(
+            marker["blockHash"],
+            json!(competing_fork_hash),
+            "ForkDrop must present a competing block hash at the fill's height",
+        );
+        assert_ne!(
+            marker["blockHash"],
+            json!(canonical_block_hash),
+            "the orphaned block hash must differ from the canonical hash the bot \
+             persisted at ingestion",
+        );
+
+        // Topics cleared so the marker fails event decoding and is never
+        // re-ingested as a brand-new fill that would inflate the fill count.
+        assert_eq!(
+            marker["topics"],
+            json!([]),
+            "the orphan marker's topics must be cleared so it cannot re-ingest as a fill",
+        );
+    }
+
+    /// Builds a handler state with the given chaos config and logs cache. The
+    /// upstream is never reached by the decision/transform helpers under test.
+    fn proxy_state(
+        config: Option<ChaosConfig>,
+        logs_cache: HashMap<String, Vec<Value>>,
+    ) -> ProxyState {
+        ProxyState {
+            config: Arc::new(Mutex::new(config)),
+            logs_cache: Arc::new(Mutex::new(logs_cache)),
+            upstream: Url::parse("http://127.0.0.1:1").unwrap(),
+            client: Client::new(),
+        }
+    }
+
+    fn fork_config(behaviour: ChaosBehaviour) -> ChaosConfig {
+        ChaosConfig {
+            method: "eth_getLogs".to_owned(),
+            behaviour,
+            remaining: 10,
+            pending_stale_tips: 0,
+        }
+    }
+
+    /// Pins which behaviours arm the `eth_getBlockByNumber` rewrite: both fork
+    /// perturbations (re-mine and drop) present the cached fill's block under the
+    /// competing hash, so the consumer's canonical-ancestry re-verification must see
+    /// it; the stale/empty behaviours and an unarmed proxy leave block reads alone.
+    #[tokio::test]
+    async fn forked_block_hash_armed_covers_only_fork_behaviours() {
+        let no_logs = HashMap::new();
+
+        for behaviour in [ChaosBehaviour::ForkReplay, ChaosBehaviour::ForkDrop] {
+            let state = proxy_state(Some(fork_config(behaviour.clone())), no_logs.clone());
+            assert!(
+                forked_block_hash_armed(&state).await,
+                "a fork perturbation must arm the block-by-number rewrite: {behaviour:?}",
+            );
+        }
+
+        let replay = proxy_state(
+            Some(fork_config(ChaosBehaviour::ReplayLogs)),
+            no_logs.clone(),
+        );
+        assert!(
+            !forked_block_hash_armed(&replay).await,
+            "same-chain replay must NOT touch block reads",
+        );
+
+        let empty = proxy_state(
+            Some(fork_config(ChaosBehaviour::EmptyResult)),
+            no_logs.clone(),
+        );
+        assert!(
+            !forked_block_hash_armed(&empty).await,
+            "empty-result chaos must NOT touch block reads",
+        );
+
+        let unarmed = proxy_state(None, no_logs);
+        assert!(
+            !forked_block_hash_armed(&unarmed).await,
+            "an unarmed proxy must NOT touch block reads",
+        );
+    }
+
+    /// Pins the [`Perturbation::ForkBlockHash`] decision: under a fork arm, an
+    /// `eth_getBlockByNumber` for the CACHED fill's height is perturbed, but a read
+    /// of any other height -- and crucially the `safe`/`finalized` cutoff TAG the
+    /// fill monitor uses -- passes through untouched. The cached fill sits at block
+    /// `0x2a`.
+    #[tokio::test]
+    async fn fork_block_perturbation_targets_only_the_cached_fill_height() {
+        let signature =
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_owned();
+        let cached_fill_height = "0x2a";
+        let cached_log = json!({
+            "transactionHash": "0x00000000000000000000000000000000000000000000000000000000000000bb",
+            "logIndex": "0x0",
+            "blockNumber": cached_fill_height,
+            "blockHash": "0x00000000000000000000000000000000000000000000000000000000000000aa",
+            "topics": [signature],
+        });
+        let state = proxy_state(
+            Some(fork_config(ChaosBehaviour::ForkDrop)),
+            HashMap::from([(signature, vec![cached_log])]),
+        );
+        let id = json!(1);
+
+        // A read of the dropped fill's own block height is perturbed.
+        let at_fill = json!({
+            "method": "eth_getBlockByNumber",
+            "params": [cached_fill_height, false],
+        });
+        assert!(
+            matches!(
+                perturb(&state, "eth_getBlockByNumber", &at_fill, &id).await,
+                Some(Perturbation::ForkBlockHash),
+            ),
+            "a block read at the cached fill's height must be perturbed",
+        );
+
+        // A read of an unrelated height is forwarded untouched.
+        let elsewhere = json!({
+            "method": "eth_getBlockByNumber",
+            "params": ["0x99", false],
+        });
+        let elsewhere_perturbation = perturb(&state, "eth_getBlockByNumber", &elsewhere, &id).await;
+        assert!(
+            elsewhere_perturbation.is_none(),
+            "a block read at an unrelated height must NOT be perturbed",
+        );
+
+        // The `safe` cutoff tag is never a specific fill height: the fill monitor's
+        // cutoff read must pass through so it is not corrupted by the drop.
+        let cutoff_tag = json!({
+            "method": "eth_getBlockByNumber",
+            "params": ["safe", false],
+        });
+        let cutoff_perturbation = perturb(&state, "eth_getBlockByNumber", &cutoff_tag, &id).await;
+        assert!(
+            cutoff_perturbation.is_none(),
+            "a block-tag cutoff read must NOT be perturbed",
+        );
+    }
+
+    /// Pins the [`Perturbation::ForkBlockHash`] transform: the returned block's
+    /// `hash` is overwritten with the competing fork hash while the rest of the
+    /// block is preserved, and a null result (block not found) is left untouched.
+    #[tokio::test]
+    async fn fork_block_hash_stamps_competing_hash_onto_block_result() {
+        let canonical_block_hash =
+            "0x00000000000000000000000000000000000000000000000000000000000000aa";
+        let block_number = "0x2a";
+        let upstream_block = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "number": block_number, "hash": canonical_block_hash },
+        });
+
+        let stamped = rewrite_block_hash(upstream_block, FORK_BLOCK_HASH);
+
+        // 32 bytes of 0xff, derived independently of the production constant so the
+        // assertion pins the value rather than comparing the code against itself.
+        let competing_fork_hash = format!("0x{}", "f".repeat(64));
+        assert_eq!(
+            stamped["result"]["hash"],
+            json!(competing_fork_hash),
+            "the canonical block's hash must be swapped for the competing fork hash",
+        );
+        assert_ne!(
+            stamped["result"]["hash"],
+            json!(canonical_block_hash),
+            "the stamped hash must differ from the canonical hash the bot persisted",
+        );
+        assert_eq!(
+            stamped["result"]["number"],
+            json!(block_number),
+            "the block's other fields must be preserved -- only the hash is swapped",
+        );
+
+        // A null result (the node has no block at this height) must pass through.
+        let absent = json!({ "jsonrpc": "2.0", "id": 1, "result": null });
+        let untouched = rewrite_block_hash(absent, FORK_BLOCK_HASH);
+        assert_eq!(
+            untouched["result"],
+            json!(null),
+            "a null block result must be left untouched -- there is nothing to swap",
         );
     }
 }
