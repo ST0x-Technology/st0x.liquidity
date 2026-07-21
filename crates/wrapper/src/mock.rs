@@ -179,6 +179,17 @@ impl MockWrapper {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// The amount passed to `submit_unwrap`, or `None` if no unwrap was
+    /// submitted. Lets a test assert that a step short-circuited (e.g. on a
+    /// failed `wait_for_block`) before submitting the unwrap.
+    pub fn submitted_unwrap_amount(&self) -> Option<U256> {
+        self.submitted_amounts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&self.unwrap_tx)
+            .copied()
+    }
 }
 
 impl Default for MockWrapper {

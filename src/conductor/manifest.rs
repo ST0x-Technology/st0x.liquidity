@@ -26,7 +26,7 @@ use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::position::Position;
-use crate::rebalancing::{RebalancingService, equity::EquityTransferServices};
+use crate::rebalancing::RebalancingService;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -90,11 +90,7 @@ impl QueryManifest {
     /// Destructures `self` to ensure every field is handled. If you
     /// add a new query to the manifest, this method won't compile
     /// until you wire it.
-    pub(super) async fn build(
-        self,
-        pool: SqlitePool,
-        services: EquityTransferServices,
-    ) -> anyhow::Result<BuiltFrameworks> {
+    pub(super) async fn build(self, pool: SqlitePool) -> anyhow::Result<BuiltFrameworks> {
         let Self {
             rebalancing_service,
             broadcaster,
@@ -124,7 +120,7 @@ impl QueryManifest {
             .with(broadcaster.clone())
             .with(equity_timing)
             .with(lifecycle_failure.clone())
-            .build(services)
+            .build(())
             .await?;
 
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
@@ -165,7 +161,6 @@ mod tests {
     use st0x_execution::{Direction, FractionalShares, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
-    use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -173,14 +168,12 @@ mod tests {
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, Venue,
     };
-    use crate::onchain::mock::MockRaindex;
     use crate::position::{PositionCommand, TradeId};
     use crate::rebalancing::equity::TransferEquityToMarketMaking;
     use crate::rebalancing::{
         RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
     };
     use crate::test_utils::{rebalancing_enabled_equities, setup_test_pools};
-    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
     use st0x_config::{AssetsConfig, ExecutionThreshold};
 
@@ -242,14 +235,7 @@ mod tests {
             lifecycle_failure,
         );
 
-        let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        };
-
-        let frameworks = manifest.build(pool, services).await.unwrap();
+        let frameworks = manifest.build(pool).await.unwrap();
 
         // Verify stores are usable by checking that loading a
         // nonexistent position returns None
@@ -303,13 +289,7 @@ mod tests {
             equity_timing,
             lifecycle_failure,
         );
-        let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        };
-        let built = manifest.build(pool, services).await.unwrap();
+        let built = manifest.build(pool).await.unwrap();
 
         // Dispatch a live snapshot command through the built store and
         // verify it lands in the shared BroadcastingInventory via the
@@ -422,13 +402,7 @@ mod tests {
             equity_timing,
             lifecycle_failure,
         );
-        let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-        };
-        let built = manifest.build(pool.clone(), services).await.unwrap();
+        let built = manifest.build(pool.clone()).await.unwrap();
 
         built
             .position
