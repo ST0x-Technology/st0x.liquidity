@@ -86,6 +86,12 @@ critical section, which no cross-struct copy could guarantee.
 
 - New `InventoryView` fields: `pending_offchain_order_symbols`,
   `last_offchain_fill_applied_at`, with mark/clear/has/set accessors.
+- Gate-only mutations (order placed, terminal clear without a fill, startup
+  seeding) use a **non-broadcasting write path**
+  (`BroadcastingInventory::write_without_broadcast`): the gate is not in the
+  dashboard DTO, so the broadcasting guard would build and emit a byte-identical
+  snapshot per order event. The fill path keeps the broadcasting guard — its
+  critical section changes balances.
 - `RebalancingService::pending_offchain_order_symbols` is **deleted**; the
   trigger's `has_pending_offchain_order` reads the view, and startup recovery
   seeds the view instead.

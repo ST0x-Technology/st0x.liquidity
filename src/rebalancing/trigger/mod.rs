@@ -770,7 +770,7 @@ impl RebalancingService {
             .collect();
 
         self.inventory
-            .write()
+            .write_without_broadcast()
             .await
             .set_pending_offchain_order_symbols(pending_symbols);
         Ok(())
@@ -2177,7 +2177,7 @@ impl Reactor for RebalancingService {
                         // executes, which is before we observe the fill, so a
                         // snapshot landing in that window already contains it.
                         self.inventory
-                            .write()
+                            .write_without_broadcast()
                             .await
                             .mark_offchain_order_pending(symbol);
                         return Ok(());
@@ -2189,7 +2189,7 @@ impl Reactor for RebalancingService {
                         // No fill was applied, so nothing bars the next snapshot
                         // from taking the balance back over.
                         self.inventory
-                            .write()
+                            .write_without_broadcast()
                             .await
                             .clear_offchain_order_pending(&symbol, None);
                         self.forget_offchain_equity(&symbol).await;
