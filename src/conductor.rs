@@ -1088,21 +1088,29 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 /// Replay persisted [`InventorySnapshot`] state into the in-memory
 /// [`BroadcastingInventory`] so the runtime view starts warm.
 /// Restore the in-memory inventory picture at boot: hydrate the view from
-/// persisted `InventorySnapshot` state and seed the open-hedge gate from the
-/// `Position` projection. The single seam owning the relative order of the
-/// two steps.
+/// persisted `InventorySnapshot` state, then seed the open-hedge gate from
+/// the `Position` projection. The single seam owning the relative order of
+/// the two steps.
+///
+/// Hydration MUST run first: it replays offchain equity snapshots through
+/// the pending-offchain-order guards, which are inert only while the gate is
+/// still empty. Seeding the gate first would skip hydration for every symbol
+/// with an open hedge order, booting it with an uninitialized offchain
+/// balance that imbalance detection could then misread.
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
     rebalancing_service: Option<&Arc<RebalancingService>>,
     position_projection: &Projection<Position>,
 ) -> Result<(), ProjectionError<Position>> {
+    hydrate_inventory_from_snapshot(pool, inventory).await;
+
     if let Some(service) = rebalancing_service {
         service
             .recover_pending_offchain_order_symbols(position_projection)
             .await?;
     }
-    hydrate_inventory_from_snapshot(pool, inventory).await;
+
     Ok(())
 }
 

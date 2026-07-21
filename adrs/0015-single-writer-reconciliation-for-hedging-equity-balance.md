@@ -181,12 +181,12 @@ would surface it. Not implemented here.
 tests. No migration, no event-schema change, no persisted state.
 
 **New startup ordering dependency.** Hydration replays snapshot events _through_
-`apply_equity_snapshot`, so these guards now run during it. That is safe only
-because `hydrate_inventory_from_snapshot` (`conductor.rs:631`) runs before
-`recover_pending_offchain_order_symbols` (`conductor.rs:1514`), leaving the
-pending set empty and both guards inert while the view warms up. Reversing the
-two would skip hydration for every symbol with an open order, starting it with
-an uninitialized offchain balance. Nothing currently enforces the order.
+`apply_equity_snapshot`, so the guards run during it; they are inert only while
+the open-hedge gate is still empty. Seeding the gate first would skip hydration
+for every symbol with an open hedge order, booting it with an uninitialized
+offchain balance. The order is therefore structural, not conventional: both
+steps live in `restore_inventory_at_boot` (`conductor.rs`), hydrate first,
+pinned by `boot_hydrates_offchain_balance_for_symbol_with_open_hedge_order`.
 
 ## Alternatives considered
 
