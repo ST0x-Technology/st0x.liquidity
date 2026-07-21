@@ -574,6 +574,15 @@ impl Conductor {
         // without one the bot cannot submit on-chain transactions at all.
         grant_startup_token_approvals(&ctx).await?;
 
+        // Catch the lifecycle-failure read model up to the event log before
+        // its OffchainOrder reactor (registered below) goes live, in both
+        // modes. Must run BEFORE `PositionAndRebalancing::setup`: setup spawns
+        // resume workers that write the event store concurrently, and this
+        // catch-up's deferred read-then-write transaction surfaces
+        // SQLITE_BUSY_SNAPSHOT immediately (busy_timeout does not apply to
+        // deferred-upgrade conflicts), failing the whole boot.
+        catch_up_lifecycle_failures(&pool).await?;
+
         let rebalancing = match ctx.rebalancing_ctx() {
             Ok(ctx) => Some(ctx.clone()),
             Err(CtxError::NotRebalancing) => None,
@@ -638,10 +647,6 @@ impl Conductor {
         if let Some(service) = &rebalancing_service {
             service.enqueue_recovery_for_current_wallet_balances().await;
         }
-
-        // Catch the lifecycle-failure read model up to the event log before its
-        // OffchainOrder reactor (registered below) goes live, in both modes.
-        catch_up_lifecycle_failures(&pool).await?;
 
         let (offchain_order, offchain_order_projection) =
             setup_offchain_order_store(&pool, &executor, &position, &position_projection).await?;
