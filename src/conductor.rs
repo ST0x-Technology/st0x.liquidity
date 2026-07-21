@@ -36,8 +36,8 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, LifecycleError, Projection, SendError, Store, StoreBuilder,
-    compact_events, incremental_vacuum, load_all_ids, load_entity,
+    AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, SendError, Store,
+    StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
@@ -623,19 +623,18 @@ impl Conductor {
         )
         .await?;
 
-        // Hydrate the in-memory InventoryView from persisted snapshot
-        // state so the runtime projection has the same data as the
-        // database. Without this, the first post-restart poll may emit
-        // no events (unchanged values are deduplicated), leaving the
-        // view empty and potentially causing incorrect rebalancing.
-        //
-        // Ordering: this must run before
-        // `recover_pending_offchain_order_symbols` (below). Hydration replays
-        // offchain equity snapshots through the pending-offchain-order guards,
-        // which are inert only while the pending set is still empty; seeding
-        // the set first would skip hydration for every symbol with an open
-        // hedge order, booting it with an uninitialized offchain balance.
-        hydrate_inventory_from_snapshot(&pool, &inventory).await;
+        // Restore the in-memory InventoryView from persisted snapshot state
+        // and seed the open-hedge gate. Without hydration, the first
+        // post-restart poll may emit no events (unchanged values are
+        // deduplicated), leaving the view empty and potentially causing
+        // incorrect rebalancing.
+        restore_inventory_at_boot(
+            &pool,
+            &inventory,
+            rebalancing_service.as_ref(),
+            &position_projection,
+        )
+        .await?;
         if let Some(service) = &rebalancing_service {
             service.enqueue_recovery_for_current_wallet_balances().await;
         }
@@ -1088,6 +1087,25 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 
 /// Replay persisted [`InventorySnapshot`] state into the in-memory
 /// [`BroadcastingInventory`] so the runtime view starts warm.
+/// Restore the in-memory inventory picture at boot: hydrate the view from
+/// persisted `InventorySnapshot` state and seed the open-hedge gate from the
+/// `Position` projection. The single seam owning the relative order of the
+/// two steps.
+pub(crate) async fn restore_inventory_at_boot(
+    pool: &SqlitePool,
+    inventory: &Arc<BroadcastingInventory>,
+    rebalancing_service: Option<&Arc<RebalancingService>>,
+    position_projection: &Projection<Position>,
+) -> Result<(), ProjectionError<Position>> {
+    if let Some(service) = rebalancing_service {
+        service
+            .recover_pending_offchain_order_symbols(position_projection)
+            .await?;
+    }
+    hydrate_inventory_from_snapshot(pool, inventory).await;
+    Ok(())
+}
+
 async fn hydrate_inventory_from_snapshot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
@@ -1515,10 +1533,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)
-            .await?;
-
-        rebalancing_service
-            .recover_pending_offchain_order_symbols(&built.position_projection)
             .await?;
 
         rebalancing_service
