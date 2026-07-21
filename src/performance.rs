@@ -20,10 +20,11 @@
 //! tables, so the read model survives a restart with no in-memory state.
 //!
 //! Forward-only: the reactor processes only events emitted after construction.
-//! There is NO startup backfill of pre-existing history. A crash between an
-//! event being persisted and this reactor's tables being updated can drop that
-//! single event from the read model -- accepted as best-effort, matching the
-//! `Broadcaster` reactor's guarantees.
+//! There is NO startup backfill of pre-existing history. Transient SQLite
+//! busy/locked failures are retried because each database-only reaction is
+//! idempotent; a crash between an event being persisted and this reactor's
+//! tables being updated can still drop that single event from the read model --
+//! accepted as best-effort, matching the `Broadcaster` reactor's guarantees.
 //!
 //! The implementation splits into a write side ([`projection`]) that reacts to
 //! events and a read side ([`report`]) that loads and assembles the report. The
@@ -38,7 +39,7 @@ use chrono::Duration;
 use chrono::{DateTime, Utc};
 #[cfg(any(test, feature = "test-support"))]
 use rain_math_float::Float;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use tracing::warn;
@@ -46,7 +47,7 @@ use tracing::warn;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
-use st0x_event_sorcery::StoreBuilder;
+use st0x_event_sorcery::{RetryOnBusy, StoreBuilder};
 use st0x_execution::Symbol;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::{
@@ -167,14 +168,18 @@ pub async fn seed_simulated_hedge_latency_history(
     sqlx::migrate!().set_ignore_missing(true).run(pool).await?;
 
     let (position, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-        .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+        .with(Arc::new(RetryOnBusy {
+            inner: HedgeLatencyProjection::new(pool.clone()),
+        }))
         .build(())
         .await?;
 
     let order_placer: Arc<dyn OrderPlacer> = Arc::new(FixtureOrderPlacer);
     let (offchain_order, _offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+            .with(Arc::new(RetryOnBusy {
+                inner: HedgeLatencyProjection::new(pool.clone()),
+            }))
             .build(order_placer)
             .await?;
 
@@ -394,6 +399,17 @@ async fn uncovered_fills(
     pool: &SqlitePool,
     symbol: &Symbol,
 ) -> Result<Vec<UncoveredFill>, PerformanceError> {
+    let mut connection = pool.acquire().await?;
+    uncovered_fills_on_connection(&mut connection, symbol).await
+}
+
+/// Connection-scoped form used by placement so its attribution snapshot and
+/// cycle insert share one transaction. The report path delegates here through
+/// an acquired pool connection to keep the attribution algorithm single-sourced.
+async fn uncovered_fills_on_connection(
+    connection: &mut SqliteConnection,
+    symbol: &Symbol,
+) -> Result<Vec<UncoveredFill>, PerformanceError> {
     let symbol_text = symbol.to_string();
 
     // MAX over zero matching rows yields a single NULL row, so the aggregate is
@@ -401,7 +417,7 @@ async fn uncovered_fills(
     let (latest_reset,): (Option<String>,) =
         sqlx::query_as("SELECT MAX(adjusted_at) FROM hedge_attribution_reset WHERE symbol = ?")
             .bind(&symbol_text)
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
 
     let latest_reset_at = latest_reset
@@ -412,7 +428,7 @@ async fn uncovered_fills(
         "SELECT block_timestamp, seen_at FROM hedge_fill WHERE symbol = ? ORDER BY id",
     )
     .bind(&symbol_text)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
     // Parse, reset-filter, and collect in a single pass. Malformed rows are
@@ -441,7 +457,7 @@ async fn uncovered_fills(
          FROM hedge_cycle WHERE symbol = ? ORDER BY placed_at, offchain_order_id",
     )
     .bind(&symbol_text)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
     for (placed_at, covered_count, filled_at, failed_at) in cycle_rows {

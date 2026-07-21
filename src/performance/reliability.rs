@@ -49,7 +49,7 @@ use st0x_dto::{
     LogVolumeBucket,
 };
 
-use st0x_event_sorcery::{EntityList, EventSourced, Reactor, deps};
+use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, deps};
 
 use super::{PerformanceError, ReportRange};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
@@ -429,6 +429,8 @@ impl Reactor for LifecycleFailureProjection {
     }
 }
 
+impl IdempotentReactor for LifecycleFailureProjection {}
+
 /// Failure signal carried by an `OffchainOrder` event, if any.
 fn offchain_order_failure(event: &OffchainOrderEvent) -> Option<(FailureEventType, DateTime<Utc>)> {
     match event {
@@ -696,19 +698,20 @@ fn count(value: i64) -> Result<usize, PerformanceError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use alloy::primitives::TxHash;
     use chrono::TimeZone;
     use serde_json::json;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{DomainEvent, ReactorHarness};
+    use st0x_event_sorcery::{DomainEvent, ReactorHarness, RetryOnBusy};
     use st0x_execution::Symbol;
     use st0x_float_macro::float;
 
     use crate::equity_redemption::DetectionFailure;
     use crate::offchain::order::OffchainOrderId;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{setup_file_backed_test_db, setup_test_db};
     use crate::usdc_rebalance::UsdcRebalanceId;
 
     use super::*;
@@ -828,6 +831,38 @@ mod tests {
             error: "rejected".to_string(),
             failed_at: timestamp(failed_offset),
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_failure_reactor_survives_transient_sqlite_busy() {
+        let (pool, _apalis_pool, _database_path, _database_guard) =
+            setup_file_backed_test_db(Duration::from_millis(1)).await;
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let release_blocker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(35)).await;
+            sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+        });
+
+        let harness = ReactorHarness::new(RetryOnBusy {
+            inner: LifecycleFailureProjection::new(pool.clone()),
+        });
+        let order_id = OffchainOrderId::new();
+        let result = harness
+            .receive::<OffchainOrder>(order_id, offchain_order_failed(100))
+            .await;
+
+        release_blocker.await.unwrap();
+        result.unwrap();
+        let failures = load_failure_events(&pool, &range()).await.unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].event_type,
+            FailureEventType::OffchainOrderFailed
+        );
     }
 
     #[tokio::test]

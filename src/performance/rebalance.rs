@@ -44,7 +44,7 @@ use st0x_dto::{
     AttestationSample, RebalanceOperationTiming, RebalanceStageName, RebalanceStageStats,
     RebalanceStageTiming, RebalanceTimingStatus, RebalanceTimings, StageOutcome,
 };
-use st0x_event_sorcery::{EntityList, EventSourced, Reactor, deps};
+use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, deps};
 use st0x_finance::Usdc;
 
 use super::{PerformanceError, ReportRange, latency_stats};
@@ -445,6 +445,8 @@ impl Reactor for RebalanceTimingProjection {
             .await
     }
 }
+
+impl IdempotentReactor for RebalanceTimingProjection {}
 
 /// Accumulated per-operation timing state, persisted as JSON.
 ///

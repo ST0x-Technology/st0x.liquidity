@@ -13,7 +13,9 @@ mod job;
 mod resume_job;
 
 #[cfg(test)]
-pub(crate) use job::TransferEquityToMarketMakingJobError;
+pub(crate) use job::{
+    ResumeEquityToHedging, ResumeEquityToMarketMaking, TransferEquityToMarketMakingJobError,
+};
 pub(crate) use job::{
     TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,

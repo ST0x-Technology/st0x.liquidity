@@ -36,8 +36,8 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, SendError, Store,
-    StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
+    AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
+    SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
@@ -87,7 +87,8 @@ use crate::position::{Position, PositionCommand, PositionError, PositionEvent, T
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
     ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
-    TransferEquityToHedgingCtx, TransferEquityToMarketMakingCtx,
+    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToMarketMaking,
+    TransferEquityToMarketMakingCtx,
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{
@@ -179,8 +180,12 @@ where
     let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
-            .with(Arc::new(LifecycleFailureProjection::new(pool.clone())))
+            .with(Arc::new(RetryOnBusy {
+                inner: HedgeLatencyProjection::new(pool.clone()),
+            }))
+            .with(Arc::new(RetryOnBusy {
+                inner: LifecycleFailureProjection::new(pool.clone()),
+            }))
             .build(order_placer.clone())
             .await?;
 
@@ -1036,16 +1041,14 @@ fn spawn_finished_job_cleanup(
         loop {
             interval.tick().await;
 
-            // USDC transfer-job rows are the durable startup re-arm
-            // idempotency + redrive-budget signal. Pruning them while the
-            // aggregate is still mid-flight (e.g. `BridgingSubmitting`) resets
-            // the redrive bound to a fresh budget on restart and silences the
-            // stranded-transfer operator alert. Transfer jobs are low-volume,
-            // so retaining their finished rows is cheap; exclude both transfer
-            // job types from cleanup.
+            // Transfer-job rows are the durable startup ownership signal.
+            // USDC rows additionally preserve the redrive budget. Equity rows
+            // prevent generic tokenization recovery from racing a requeued
+            // transfer job or resurrecting a terminal dead letter. Transfer
+            // jobs are low-volume, so retaining their finished rows is cheap.
             let cleanup_result = sqlx_apalis::query(
                 "DELETE FROM Jobs \
-                 WHERE job_type NOT IN (?, ?) \
+                 WHERE job_type NOT IN (?, ?, ?, ?) \
                  AND ( \
                      status = ? \
                      OR status = ? \
@@ -1054,6 +1057,8 @@ fn spawn_finished_job_cleanup(
             )
             .bind(std::any::type_name::<TransferUsdcToHedging>())
             .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .bind(std::any::type_name::<TransferEquityToHedging>())
+            .bind(std::any::type_name::<TransferEquityToMarketMaking>())
             .bind(Status::Done.to_string())
             .bind(Status::Killed.to_string())
             .bind(Status::Failed.to_string())
@@ -1529,10 +1534,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         .await?;
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
-        let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
-        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(deps.pool.clone()));
-        let equity_timing = Arc::new(EquityTimingProjection::new(deps.pool.clone()));
-        let lifecycle_failure = Arc::new(LifecycleFailureProjection::new(deps.pool.clone()));
+        let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
+        let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
+        let equity_timing = EquityTimingProjection::new(deps.pool.clone());
+        let lifecycle_failure = LifecycleFailureProjection::new(deps.pool.clone());
         catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
 
         let manifest = QueryManifest::new(
@@ -1854,6 +1859,8 @@ async fn recover_interrupted_tokenization_aggregates(
 
     let interrupted_mints = interrupted_mint_ids(pool).await?;
     let interrupted_redemptions = interrupted_redemption_ids(pool).await?;
+    let transfer_mints = load_transfer_jobs::<TransferEquityToMarketMaking>(pool).await?;
+    let transfer_redemptions = load_transfer_jobs::<TransferEquityToHedging>(pool).await?;
 
     for mint_id in &interrupted_mints {
         let Some(mint) = mint_store.load(mint_id).await? else {
@@ -1877,7 +1884,12 @@ async fn recover_interrupted_tokenization_aggregates(
         // If cancel_all_pending silently failed above, a stale Pending row for
         // this aggregate may still exist. The duplicate Pending row is tolerated
         // because resume_mint is idempotent.
-        if !is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress) {
+        let owned_by_transfer_job = transfer_mints
+            .iter()
+            .any(|job| job.issuer_request_id == *mint_id);
+        if !owned_by_transfer_job
+            && !is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress)
+        {
             resume_queue
                 .push(ResumeTokenizationAggregate {
                     target: ResumeTokenizationTarget::Mint(mint_id.clone()),
@@ -1897,19 +1909,52 @@ async fn recover_interrupted_tokenization_aggregates(
             .recover_redemption_state(redemption_id, &redemption)
             .await?;
 
-        // If cancel_all_pending silently failed above, a stale Pending row for
-        // this aggregate may still exist. The duplicate Pending row is tolerated
-        // because resume_redemption is idempotent.
-        resume_queue
-            .push(ResumeTokenizationAggregate {
-                target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
-            })
-            .await?;
+        let owned_by_transfer_job = transfer_redemptions
+            .iter()
+            .any(|job| job.aggregate_id == *redemption_id);
+        if !owned_by_transfer_job {
+            // If cancel_all_pending silently failed above, a stale Pending row for
+            // this aggregate may still exist. The duplicate Pending row is tolerated
+            // because resume_redemption is idempotent.
+            resume_queue
+                .push(ResumeTokenizationAggregate {
+                    target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+                })
+                .await?;
+        }
     }
 
     recover_stuck_redemptions(pool, inventory).await?;
 
     Ok(())
+}
+
+/// Loads every durable row for a transfer-job type, including terminal rows.
+///
+/// A non-terminal row is the sole owner that restart recovery must re-drive.
+/// A terminal row is a dead letter and must remain terminal across restarts.
+/// Treating both as ownership prevents the generic tokenization queue from
+/// racing the transfer queue or silently resetting an exhausted retry budget.
+async fn load_transfer_jobs<Task>(pool: &SqlitePool) -> anyhow::Result<Vec<Task>>
+where
+    Task: serde::de::DeserializeOwned + 'static,
+{
+    let payloads: Vec<Vec<u8>> = sqlx::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+        .bind(std::any::type_name::<Task>())
+        .fetch_all(pool)
+        .await?;
+
+    payloads
+        .into_iter()
+        .map(|payload| {
+            serde_json::from_slice(&payload).with_context(|| {
+                format!(
+                    "failed to deserialize durable {} transfer job",
+                    std::any::type_name::<Task>()
+                )
+            })
+        })
+        .collect()
 }
 
 /// Returns `true` when `mint` is a pre-wrap post-receipt state
@@ -2199,7 +2244,9 @@ async fn build_position_cqrs(
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
     let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(broadcaster)
-        .with(Arc::new(HedgeLatencyProjection::new(pool.clone())))
+        .with(Arc::new(RetryOnBusy {
+            inner: HedgeLatencyProjection::new(pool.clone()),
+        }))
         .build(())
         .await?;
 
@@ -4102,6 +4149,161 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn transfer_jobs_own_interrupted_aggregate_resume_on_restart() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id,
+            redemption_id,
+            tokenizer: _,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            4,
+            "transfer-owned-mint",
+            "transfer-owned-redemption",
+        )
+        .await;
+
+        let mut transfer_queue =
+            crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        transfer_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: mint_id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 1,
+            })
+            .await
+            .unwrap();
+        let mut redemption_queue =
+            crate::rebalancing::equity::TransferEquityToHedgingJobQueue::new(&apalis_pool);
+        redemption_queue
+            .push(TransferEquityToHedging {
+                aggregate_id: redemption_id,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+        let targets: Vec<_> = payloads
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(payload)
+                    .unwrap()
+                    .target
+            })
+            .collect();
+
+        assert!(
+            targets.is_empty(),
+            "live transfer jobs must exclusively own mint and redemption resume; generic jobs found: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_transfer_job_remains_dead_lettered_on_restart() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id,
+            redemption_id,
+            tokenizer: _,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            5,
+            "dead-lettered-mint",
+            "dead-lettered-redemption",
+        )
+        .await;
+
+        let mut transfer_queue =
+            crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        transfer_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: mint_id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 1,
+            })
+            .await
+            .unwrap();
+        let mut redemption_queue =
+            crate::rebalancing::equity::TransferEquityToHedgingJobQueue::new(&apalis_pool);
+        redemption_queue
+            .push(TransferEquityToHedging {
+                aggregate_id: redemption_id,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = ?, attempts = max_attempts \
+             WHERE job_type IN (?, ?)",
+        )
+        .bind(Status::Failed.to_string())
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+        assert!(
+            payloads.is_empty(),
+            "dead-lettered mint and redemption transfers must not be resurrected through the generic resume queue"
+        );
+    }
+
     /// Extension of the above: a crash mid-job leaves a `Running` row (not
     /// `Pending`). `cancel_all_pending` alone cannot clean it up; the orphan
     /// must be promoted to `Pending` first and then cancelled. Without the
@@ -4550,10 +4752,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_finished_job_cleanup_retains_usdc_transfer_rows() {
+    async fn spawn_finished_job_cleanup_retains_transfer_rows() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let hedging_type = std::any::type_name::<TransferUsdcToHedging>();
         let market_making_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+        let equity_to_hedging_type = std::any::type_name::<TransferEquityToHedging>();
+        let equity_to_market_making_type = std::any::type_name::<TransferEquityToMarketMaking>();
 
         // Non-transfer finished rows must be pruned (Done and exhausted Failed).
         insert_job_row(&apalis_pool, "other-done", "test", Status::Done, 1, 25).await;
@@ -4579,12 +4783,30 @@ mod tests {
             25,
         )
         .await;
+        insert_job_row(
+            &apalis_pool,
+            "equity-to-hedging-done",
+            equity_to_hedging_type,
+            Status::Done,
+            1,
+            25,
+        )
+        .await;
+        insert_job_row(
+            &apalis_pool,
+            "equity-to-market-making-failed",
+            equity_to_market_making_type,
+            Status::Failed,
+            25,
+            25,
+        )
+        .await;
 
         let handle =
             spawn_finished_job_cleanup(pool.clone(), apalis_pool.clone(), Duration::from_secs(60));
 
-        // The two non-transfer finished rows are pruned; the two transfer rows remain.
-        wait_for_job_count(&apalis_pool, 2).await;
+        // The two non-transfer finished rows are pruned; all transfer rows remain.
+        wait_for_job_count(&apalis_pool, 4).await;
         handle.abort();
 
         let mut remaining: Vec<String> = sqlx_apalis::query_scalar("SELECT job_type FROM Jobs")
@@ -4592,11 +4814,16 @@ mod tests {
             .await
             .unwrap();
         remaining.sort();
-        let mut expected = vec![hedging_type.to_string(), market_making_type.to_string()];
+        let mut expected = vec![
+            hedging_type.to_string(),
+            market_making_type.to_string(),
+            equity_to_hedging_type.to_string(),
+            equity_to_market_making_type.to_string(),
+        ];
         expected.sort();
         assert_eq!(
             remaining, expected,
-            "USDC transfer finished rows must survive cleanup regardless of Done/Failed status"
+            "transfer finished rows must survive cleanup regardless of direction or Done/Failed status"
         );
     }
 

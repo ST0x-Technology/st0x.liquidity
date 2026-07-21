@@ -512,11 +512,19 @@ migration files in `migrations/`.
 
 The dashboard exposes a Performance tab measuring the _technological_ health of
 the system (latency and reliability), complementing the P&L tab's economic view.
-All phase-1 metrics are maintained by a forward-only reactor that subscribes to
-live CQRS events and writes into bespoke read-model tables (`hedge_fill`,
-`hedge_cycle`, `hedge_attribution_state`). The read model reflects activity
-since deployment only -- there is no historical backfill from pre-existing
-events in the event store. No new write paths touch the trading path.
+The hedge-latency metrics are maintained by a forward-only reactor that
+subscribes to live CQRS events and writes into bespoke read-model tables
+(`hedge_fill`, `hedge_cycle`, `hedge_submission`, and
+`hedge_attribution_reset`). That read model reflects activity since deployment
+only -- there is no historical backfill from pre-existing events in the event
+store. The USDC/equity stage-timing and lifecycle-failure reactors maintain
+their own bespoke tables with startup catch-up from the event store.
+
+All four bespoke reactors are idempotent, database-only units and retry
+transient SQLite busy/locked failures with bounded exponential backoff. A retry
+re-runs the complete event reaction: multi-statement reactions therefore execute
+in one transaction, and every insert is conflict-safe under redelivery. No new
+write paths touch the trading path.
 
 #### Hedge latency pipeline
 
@@ -1553,6 +1561,14 @@ Four transfer jobs exist:
 | TransferEquityToHedging      | Equity | Withdraw from Raindex vault, unwrap, redeem via Alpaca ITN     |
 | TransferUsdcToMarketMaking   | USDC   | Convert USD->USDC, withdraw, bridge via CCTP, deposit to vault |
 | TransferUsdcToHedging        | USDC   | Withdraw from vault, bridge via CCTP, deposit USDC to Alpaca   |
+
+Equity-transfer workers dead-letter a job that exhausts its retries: the Jobs
+row is recorded as terminal and retained as the durable ownership record, while
+the worker and conductor continue processing unrelated jobs. On startup, any
+equity-transfer row owns recovery of its aggregate: a non-terminal row is
+requeued, while a terminal row remains dead-lettered instead of being
+resurrected through generic tokenization recovery. A poison mint or redemption
+row therefore cannot put the bot into a process restart loop.
 
 The trigger enqueues at most one transfer per scope at a time, guarded both by
 an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard

@@ -376,9 +376,10 @@ pub(crate) use build_supervised_worker;
 /// worker idle after retries are exhausted because `poll_ready` returns
 /// `Pending` without scheduling a wakeup when the circuit is open.
 ///
-/// Use for background recovery workers (e.g. `ResumeTokenizationAggregate`)
-/// where a persistently failing individual job must not block processing of
-/// sibling jobs or bring down hedging and fill detection.
+/// Use for jobs whose exhausted item is a visible dead letter rather than a
+/// process-level fault, including equity transfers and background tokenization
+/// recovery. A persistently failing individual job must not block sibling jobs
+/// or bring down hedging and fill detection.
 macro_rules! build_best_effort_worker {
     (
         ::<$ctx_type:ty, $job:ty>,
@@ -689,10 +690,10 @@ pub(crate) fn on_terminal_failure(
 /// On-event handler for workers where terminal failure must not crash the
 /// conductor. Logs the error at `error!` level but does NOT call
 /// `failure_notify.notify_waiters()` and does NOT call `ctx.stop()`.
-/// Used for best-effort background workers (e.g. `ResumeTokenizationAggregate`)
-/// where a persistently failing individual job should not bring down hedging
-/// and fill detection. See [`build_best_effort_worker!`] for why these workers
-/// do not install Apalis' circuit-breaker layer.
+/// Used for dead-lettering per-item workers (equity transfers and background
+/// tokenization recovery) where a persistently failing individual job should
+/// not bring down hedging and fill detection. See [`build_best_effort_worker!`]
+/// for why these workers do not install Apalis' circuit-breaker layer.
 ///
 /// Structural invariant: unlike [`on_terminal_failure`], this function takes
 /// no `Notify` argument and therefore can never call `notify_waiters()` or

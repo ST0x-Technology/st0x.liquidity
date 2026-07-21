@@ -570,8 +570,6 @@ where
         let failure_notify_for_check_positions = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_hedging = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_market_making = failure_notify.clone();
-        let failure_notify_for_transfer_equity_to_market_making = failure_notify.clone();
-        let failure_notify_for_transfer_equity_to_hedging = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -590,8 +588,6 @@ where
         let fail_stop_for_check_positions = fail_stop.clone();
         let fail_stop_for_transfer_usdc_to_hedging = fail_stop.clone();
         let fail_stop_for_transfer_usdc_to_market_making = fail_stop.clone();
-        let fail_stop_for_transfer_equity_to_market_making = fail_stop.clone();
-        let fail_stop_for_transfer_equity_to_hedging = fail_stop.clone();
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
         tokio::spawn(async move {
@@ -772,8 +768,6 @@ where
                 apalis_monitor,
                 transfer_equity_to_market_making_ctx,
                 transfer_equity_to_market_making_queue,
-                FailStopCircuit(fail_stop_for_transfer_equity_to_market_making),
-                failure_notify_for_transfer_equity_to_market_making,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_market_making,
             );
@@ -782,8 +776,6 @@ where
                 apalis_monitor,
                 transfer_equity_to_hedging_ctx,
                 transfer_equity_to_hedging_queue,
-                FailStopCircuit(fail_stop_for_transfer_equity_to_hedging),
-                failure_notify_for_transfer_equity_to_hedging,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_hedging,
             );
@@ -1011,12 +1003,12 @@ fn register_transfer_usdc_to_market_making_worker(
 /// Conditionally registers the `TransferEquityToMarketMaking` worker. Same
 /// pattern as the USDC transfer workers: the ctx is `None` when rebalancing
 /// is disabled, in which case the queue exists but no worker consumes it.
+/// Terminal per-transfer failures remain dead-lettered in apalis without
+/// stopping this worker or the conductor.
 fn register_transfer_equity_to_market_making_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
     transfer_queue: TransferEquityToMarketMakingJobQueue,
-    FailStopCircuit(fail_stop): FailStopCircuit,
-    failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1028,13 +1020,11 @@ fn register_transfer_equity_to_market_making_worker(
     };
 
     monitor.register(move |index| {
-        build_supervised_worker!(
+        build_best_effort_worker!(
             ::<TransferEquityToMarketMakingCtx, TransferEquityToMarketMaking>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
-            fail_stop.clone(),
-            failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1047,8 +1037,6 @@ fn register_transfer_equity_to_hedging_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     transfer_queue: TransferEquityToHedgingJobQueue,
-    FailStopCircuit(fail_stop): FailStopCircuit,
-    failure_notify: Arc<tokio::sync::Notify>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1060,13 +1048,11 @@ fn register_transfer_equity_to_hedging_worker(
     };
 
     monitor.register(move |index| {
-        build_supervised_worker!(
+        build_best_effort_worker!(
             ::<TransferEquityToHedgingCtx, TransferEquityToHedging>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
-            fail_stop.clone(),
-            failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1101,4 +1087,245 @@ fn register_resume_tokenization_worker(
             failure_injector.clone(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::RwLock;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use st0x_config::EquitiesConfig;
+    use st0x_event_sorcery::test_store;
+    use st0x_execution::{FractionalShares, Symbol};
+    use st0x_float_macro::float;
+    use st0x_raindex::Raindex;
+    use st0x_tokenization::IssuerRequestId;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_wrapper::{MockWrapper, Wrapper};
+
+    use super::*;
+    use crate::equity_redemption::RedemptionAggregateId;
+    use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::equity::{
+        EquityTransferServices, MintError, MintTransferError, RedemptionError,
+        ResumeEquityToHedging, ResumeEquityToMarketMaking,
+    };
+    use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
+    use crate::vault_lookup::MockVaultLookup;
+
+    struct PoisonThenHealthyRedemptionResume {
+        poison_id: RedemptionAggregateId,
+        healthy_completed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ResumeEquityToHedging for PoisonThenHealthyRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            if aggregate_id == &self.poison_id {
+                return Err(RedemptionError::EntityNotFound {
+                    aggregate_id: aggregate_id.clone(),
+                });
+            }
+
+            self.healthy_completed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct PoisonThenHealthyMintResume {
+        poison_id: IssuerRequestId,
+        healthy_completed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for PoisonThenHealthyMintResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            _symbol: &Symbol,
+            _quantity: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            if issuer_request_id == &self.poison_id {
+                return Err(MintTransferError::PreReceipt(MintError::EntityNotFound {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_state: "healthy test mint",
+                }));
+            }
+
+            self.healthy_completed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    async fn wait_for_terminal_job<Task: 'static>(apalis_pool: &apalis_sqlite::SqlitePool) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let terminal_count: i64 = sqlx_apalis::query_scalar(
+                    "SELECT COUNT(*) FROM Jobs \
+                     WHERE job_type = ? AND status IN ('Failed', 'Killed') \
+                     AND attempts >= max_attempts",
+                )
+                .bind(std::any::type_name::<Task>())
+                .fetch_one(apalis_pool)
+                .await
+                .unwrap();
+                if terminal_count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the poison job must reach a visible terminal state");
+    }
+
+    fn mint_transfer_ctx(
+        transfer: Arc<dyn ResumeEquityToMarketMaking>,
+        cqrs_pool: sqlx::SqlitePool,
+    ) -> Arc<TransferEquityToMarketMakingCtx> {
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let services = EquityTransferServices {
+            raindex,
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper,
+        };
+
+        Arc::new(TransferEquityToMarketMakingCtx {
+            transfer,
+            equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+            mint_store: Arc::new(test_store(cqrs_pool, services)),
+            equities_config: EquitiesConfig::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn terminal_equity_transfer_is_dead_lettered_without_stopping_worker() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = TransferEquityToHedgingJobQueue::new(&apalis_pool);
+        let poison_id = RedemptionAggregateId::generate();
+        let healthy_id = RedemptionAggregateId::generate();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        queue
+            .push(TransferEquityToHedging {
+                aggregate_id: poison_id.clone(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+        let mut push_queue = queue.clone();
+
+        let healthy_completed = Arc::new(tokio::sync::Notify::new());
+        let transfer_ctx = Arc::new(TransferEquityToHedgingCtx {
+            transfer: Arc::new(PoisonThenHealthyRedemptionResume {
+                poison_id,
+                healthy_completed: healthy_completed.clone(),
+            }),
+        });
+        let monitor = register_transfer_equity_to_hedging_worker(
+            Monitor::new().should_restart(|_ctx, _error, _attempt| false),
+            Some(transfer_ctx),
+            queue,
+            FailureInjector::new(),
+        );
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+        wait_for_terminal_job::<TransferEquityToHedging>(&apalis_pool).await;
+
+        push_queue
+            .push(TransferEquityToHedging {
+                aggregate_id: healthy_id,
+                symbol,
+                quantity: FractionalShares::new(float!(1)),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), healthy_completed.notified())
+            .await
+            .expect("the worker must process a healthy sibling after dead-lettering a poison job");
+
+        let terminal_count: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? AND status IN ('Failed', 'Killed') AND attempts >= max_attempts",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal_count, 1, "the poison job must remain visible");
+
+        assert!(
+            !monitor_handle.is_finished(),
+            "a terminal equity-transfer job must not stop the conductor monitor",
+        );
+        monitor_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_equity_mint_is_dead_lettered_without_stopping_worker() {
+        let (cqrs_pool, apalis_pool) = setup_test_pools().await;
+        let mut queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        let poison_id = IssuerRequestId::generate();
+        let healthy_id = IssuerRequestId::generate();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: poison_id.clone(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+        let mut push_queue = queue.clone();
+
+        let healthy_completed = Arc::new(tokio::sync::Notify::new());
+        let transfer_ctx = mint_transfer_ctx(
+            Arc::new(PoisonThenHealthyMintResume {
+                poison_id,
+                healthy_completed: healthy_completed.clone(),
+            }),
+            cqrs_pool,
+        );
+        let monitor = register_transfer_equity_to_market_making_worker(
+            Monitor::new().should_restart(|_ctx, _error, _attempt| false),
+            Some(transfer_ctx),
+            queue,
+            FailureInjector::new(),
+        );
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+        wait_for_terminal_job::<TransferEquityToMarketMaking>(&apalis_pool).await;
+        push_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: healthy_id,
+                symbol,
+                quantity: FractionalShares::new(float!(1)),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), healthy_completed.notified())
+            .await
+            .expect("the mint worker must process a healthy sibling after a poison job");
+        assert!(
+            !monitor_handle.is_finished(),
+            "a terminal equity-mint job must not stop the conductor monitor",
+        );
+        monitor_handle.abort();
+    }
 }
