@@ -614,19 +614,15 @@ async fn convert_wrapped_equity_rows(
 /// no observed price yet gets `usd_mark: None, mark_captured_at: None` --
 /// never a fabricated zero.
 ///
-/// `mark_captured_at` for an equity row is `Position.last_updated`, NOT a
-/// dedicated price-observation timestamp -- a precise one is a deferred
-/// follow-up. `last_updated` is the aggregate's last-touched time, advanced by
-/// several non-price events too (offchain order placement/fill/cancel,
-/// threshold updates), so it is only an UPPER BOUND on how recently
-/// `last_price_usdc` was actually observed: a symbol whose price hasn't moved
-/// in weeks but was otherwise recently touched still reports a "fresh"
-/// `mark_captured_at`. `read.rs`'s staleness guard (`is_stale_mark`) therefore
-/// reliably EXCLUDES a day once the position itself has gone stale, but is not
-/// guaranteed to exclude every day with a genuinely stale price -- a stale
-/// `last_price_usdc` can still pass the guard if its position was recently
-/// touched for an unrelated (non-price) reason. Known and accepted for this
-/// iteration; see SPEC.md "Portfolio Capital and Return Tracking".
+/// `mark_captured_at` for an equity row is `Position.last_price_observed_at`,
+/// a dedicated price-observation timestamp set only by the events that also
+/// set `last_price_usdc` (`OnChainOrderFilled`, priced `ManualPositionAdjusted`)
+/// -- unlike `last_updated`, which advances on every event including
+/// price-less ones (offchain order placement/fill/cancel, threshold updates).
+/// `read.rs`'s staleness guard (`is_stale_mark`) therefore keys off how
+/// recently the price itself was actually observed, not how recently the
+/// position was last touched for any reason; see SPEC.md "Portfolio Capital
+/// and Return Tracking".
 async fn resolve_marks(
     position_projection: &Projection<Position>,
     captured_at: DateTime<Utc>,
@@ -639,7 +635,7 @@ async fn resolve_marks(
             PortfolioAsset::Usdc => (Some(USDC_PAR), Some(captured_at)),
             PortfolioAsset::Equity(symbol) => match position_projection.load(symbol).await? {
                 Some(position) => match position.last_price_usdc {
-                    Some(mark) => (Some(mark), position.last_updated),
+                    Some(mark) => (Some(mark), position.last_price_observed_at),
                     None => (None, None),
                 },
                 None => (None, None),
@@ -761,7 +757,8 @@ mod tests {
 
     use crate::inventory::view::{InFlightCashLocation, InFlightEquityLocation};
     use crate::inventory::{Inventory, InventoryView, Operator, Venue};
-    use crate::portfolio_snapshot::PortfolioSnapshotProjection;
+    use crate::portfolio_snapshot::read::{DayCapital, DayExclusionReason};
+    use crate::portfolio_snapshot::{EtDayRange, PortfolioSnapshotProjection, load_portfolio_days};
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_pools;
 
@@ -1325,19 +1322,23 @@ mod tests {
     }
 
     /// The one branch of `resolve_marks` that reads a real fill-derived price
-    /// out of `Position` and pairs it with `position.last_updated`: this must
-    /// persist the position's OWN `last_updated`, never the job's `captured_at`
-    /// (an easy one-line regression, since both are `DateTime<Utc>` and
-    /// `captured_at` is in scope at that line).
+    /// out of `Position` and pairs it with `position.last_price_observed_at`:
+    /// this must persist the position's price-observation time, never
+    /// `last_updated` (which a trailing non-price event advances) nor the
+    /// job's own `captured_at`. A trailing `UpdateThreshold` after the fill
+    /// diverges `last_updated` from `last_price_observed_at` so a regression
+    /// that reverted to `last_updated` would be caught, not accidentally pass
+    /// by coincidence of all three timestamps lining up.
     #[tokio::test]
-    async fn equity_position_with_known_price_persists_that_price_and_its_own_last_updated() {
+    async fn equity_position_with_known_price_persists_its_price_observation_time() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
 
-        // Deliberately far from "now" so a regression that swapped in the
-        // job's own `captured_at` would be unmistakable in the assertion
-        // below, rather than accidentally matching by coincidence.
-        let seen_at = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+        // Deliberately far from "now" so a regression that swapped in
+        // `last_updated` or the job's own `captured_at` would be unmistakable
+        // in the assertion below, rather than accidentally matching by
+        // coincidence.
+        let block_timestamp = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
         position
             .send(
                 &aapl(),
@@ -1351,8 +1352,20 @@ mod tests {
                     amount: FractionalShares::new(float!(1)),
                     direction: Direction::Buy,
                     price_usdc: float!(150),
-                    block_timestamp: seen_at,
-                    seen_at,
+                    block_timestamp,
+                    seen_at: block_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Trailing non-price event: advances last_updated to ~now without
+        // touching last_price_usdc/last_price_observed_at.
+        position
+            .send(
+                &aapl(),
+                PositionCommand::UpdateThreshold {
+                    threshold: ExecutionThreshold::whole_share(),
                 },
             )
             .await
@@ -1373,8 +1386,134 @@ mod tests {
         assert_eq!(usd_mark.as_deref(), Some("150"));
         assert_eq!(
             mark_captured_at.as_deref(),
-            Some(seen_at.to_rfc3339().as_str()),
-            "mark_captured_at must be Position.last_updated, not the job's own captured_at"
+            Some(block_timestamp.to_rfc3339().as_str()),
+            "mark_captured_at must be Position.last_price_observed_at, not last_updated \
+             (which the trailing UpdateThreshold advanced past it)"
+        );
+    }
+
+    /// The ticket's regression: a position whose price is genuinely stale
+    /// (over `MARK_STALENESS_THRESHOLD_DAYS` old) but was touched again today
+    /// by an unrelated non-price event must still have its day excluded.
+    /// Before this change `mark_captured_at` was `Position.last_updated`,
+    /// which the trailing `UpdateThreshold` below would have refreshed to
+    /// "now" -- passing the staleness gate despite the price being over a
+    /// week old.
+    #[tokio::test]
+    async fn stale_price_with_recent_non_price_touch_excludes_the_day() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+
+        let block_timestamp = Utc::now() - chrono::Duration::days(10);
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp,
+                    seen_at: block_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Recent, unrelated non-price touch: advances last_updated to ~now
+        // without touching last_price_usdc/last_price_observed_at.
+        position
+            .send(
+                &aapl(),
+                PositionCommand::UpdateThreshold {
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        job_for_today().perform(&ctx).await.unwrap();
+
+        let today = et_day(Utc::now());
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days.len(), 1);
+        assert_eq!(
+            days[0].capital,
+            DayCapital::Excluded(DayExclusionReason::StaleMark(
+                PortfolioAsset::Equity(aapl()),
+                block_timestamp
+            )),
+            "a stale price must exclude the day even though the position was touched today"
+        );
+    }
+
+    /// `resolve_marks` must key staleness off `block_timestamp` (the
+    /// economic price time), not `seen_at` (when the bot detected the fill).
+    /// A fill seen recently but whose `block_timestamp` is old simulates
+    /// catch-up backfill after downtime -- using `seen_at` here would read as
+    /// fresh and reintroduce the false-fresh bug this field exists to close.
+    #[tokio::test]
+    async fn stale_block_timestamp_with_recent_seen_at_excludes_the_day() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+
+        let block_timestamp = Utc::now() - chrono::Duration::days(10);
+        let seen_at = Utc::now();
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp,
+                    seen_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        job_for_today().perform(&ctx).await.unwrap();
+
+        let today = et_day(Utc::now());
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days.len(), 1);
+        assert_eq!(
+            days[0].capital,
+            DayCapital::Excluded(DayExclusionReason::StaleMark(
+                PortfolioAsset::Equity(aapl()),
+                block_timestamp
+            )),
+            "staleness must key off block_timestamp, not the recent seen_at"
         );
     }
 
