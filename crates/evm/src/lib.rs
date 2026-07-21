@@ -353,19 +353,83 @@ impl EvmError {
     }
 }
 
+/// The node-reported next nonce parsed from a "nonce too low" rejection's
+/// error message (see [`EvmError::next_nonce_hint`]). A distinct type from
+/// `submit::NonceFloor` so the two -- both otherwise plain `u64` values
+/// flowing through the same recovery loop -- cannot be silently transposed
+/// at a call site.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NextNonceHint(pub(crate) u64);
+
 impl EvmError {
+    /// The error payload if this is a "nonce too low" RPC rejection, or
+    /// `None` otherwise. Shared by [`is_nonce_too_low`](Self::is_nonce_too_low)
+    /// and [`next_nonce_hint`](Self::next_nonce_hint) so neither
+    /// re-derives the `Transport` match or the substring check
+    /// independently -- both facts (is this a nonce-too-low rejection,
+    /// and what does its payload say) come from one traversal.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn nonce_too_low_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
+        let Self::Transport(rpc_error) = self else {
+            return None;
+        };
+
+        let payload = rpc_error.as_error_resp()?;
+
+        payload.message.contains("nonce too low").then_some(payload)
+    }
+
     /// Returns `true` if this is a "nonce too low" RPC error, which
     /// occurs when an external process (e.g. CLI) submitted
     /// transactions from the same wallet, advancing the chain nonce
     /// past the locally cached value.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn is_nonce_too_low(&self) -> bool {
-        match self {
-            Self::Transport(rpc_error) => rpc_error
-                .as_error_resp()
-                .is_some_and(|payload| payload.message.contains("nonce too low")),
-            _ => false,
+        self.nonce_too_low_payload().is_some()
+    }
+
+    /// The nonce the rejecting node expects, parsed out of a "nonce too
+    /// low" rejection.
+    ///
+    /// go-ethereum's `core/txpool/validation.go`, in
+    /// `ValidateTransactionWithState`, rejects with
+    /// `fmt.Errorf("%w: next nonce %v, tx nonce %v", core.ErrNonceTooLow, next, tx.Nonce())`,
+    /// where `next := opts.State.GetNonce(from)` -- the account's nonce in
+    /// the head-block *mined* state, exactly what
+    /// `eth_getTransactionCount(addr, "latest")` returns on that node.
+    /// op-geth inherits this format unmodified. The reported value is
+    /// authoritative as a floor (the node will not accept anything lower)
+    /// but is not mempool-aware, so it can be lower than the pool's actual
+    /// next free nonce when the competing signer has more than one
+    /// transaction queued. Callers combine it with a `pending`-block read
+    /// rather than trusting it alone (see `submit::retry_after_nonce_too_low`).
+    ///
+    /// This is a best-effort parse of a non-contractual error string, not
+    /// a stable API: a different client, an RPC proxy that rewrites error
+    /// messages, or a future go-ethereum release could phrase the
+    /// rejection differently. `None` is the safe and fully expected
+    /// outcome when that happens -- the caller falls back to the
+    /// `pending`-block read alone, which is still correct, only less
+    /// immediately authoritative. Also returns `None` for any error that
+    /// is not "nonce too low" at all, and for a "nonce too low" phrasing
+    /// that omits the value.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn next_nonce_hint(&self) -> Option<NextNonceHint> {
+        let payload = self.nonce_too_low_payload()?;
+        let (_, tail) = payload.message.split_once("next nonce ")?;
+        let token = tail.split([',', ' ']).next()?;
+
+        // Require the whole token up to the next delimiter to be a bare
+        // decimal number, not merely to start with one: a hex-formatted
+        // value (`0x34ac`) or a signed one (`+13476`) is not the format
+        // go-ethereum emits, and parsing only a leading digit run would
+        // silently turn either into a bogus, misleadingly low hint.
+        if token.is_empty() || !token.chars().all(|character| character.is_ascii_digit()) {
+            return None;
         }
+
+        token.parse().ok().map(NextNonceHint)
     }
 
     /// Returns `true` if this is a "replacement transaction underpriced"
@@ -1143,12 +1207,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{Address, Bloom, U256};
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    use alloy::primitives::Bloom;
+    use alloy::primitives::{Address, U256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::rpc::types::TransactionReceipt;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
