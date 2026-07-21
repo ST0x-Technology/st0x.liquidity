@@ -390,8 +390,10 @@ fn evaluate_day(et_day: NaiveDate, rows: Vec<RawBalanceRow>) -> Result<Portfolio
         // counter-trades consume or replenish that inventory rather than
         // creating a separate hedge leg. A negative broker position does not
         // contribute under this long-inventory definition because the margin
-        // supporting shorts is not modeled. Skip it before mark validation:
-        // a row that cannot contribute must not gate the whole day.
+        // supporting shorts is not modeled. The Alpaca account is long-only:
+        // sells are capped to shares already held, so no separate maintenance-
+        // margin term exists today. Skip a defensive negative row before mark
+        // validation: a row that cannot contribute must not gate the whole day.
         if matches!(&row.asset, PortfolioAsset::Equity(_)) && balance.is_negative()? {
             continue;
         }
@@ -758,7 +760,8 @@ mod tests {
 
     /// Positive equity inventory counts at both venues: the Hedging row is
     /// the broker's current holding, not a distinct short leg paired with the
-    /// MarketMaking balance.
+    /// MarketMaking balance. The account is long-only, so there is no
+    /// maintenance-margin term to add beside these holdings.
     #[tokio::test]
     async fn deployed_capital_includes_positive_equity_at_both_venues() {
         let pool = setup_test_db().await;
