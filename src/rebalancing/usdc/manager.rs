@@ -3192,22 +3192,74 @@ impl<
                 Ok(None)
             }
             BurnTxStatus::Dropped => {
-                // A burn tx hash is durably recorded, so we must NEVER auto-issue a
-                // second burn for an ambiguous "dropped" classification: a
-                // load-balanced RPC can falsely report a still-pending burn as
-                // dropped, and a reburn there would double-burn. Page the operator
-                // for manual on-chain verification instead.
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %burn_tx,
-                    "Recorded CCTP burn not mined and no longer in mempool (dropped); \
-                     NOT reburning -- operator must verify on-chain"
-                );
-                Err(UsdcTransferError::BurnTxDropped {
-                    id: id.clone(),
-                    burn_tx,
-                })
+                // A drop verdict is drawn from receipt/mempool ABSENCE, which a
+                // load-balanced RPC can produce for a burn that actually mined
+                // (the 2026-07-07 `5c6f3fdd` incident: the DepositForBurn event
+                // was on-chain the whole time). Before latching the terminal
+                // verdict and paging the operator, cross-check the one signal
+                // that positively proves a mined burn: this transfer's
+                // `DepositForBurn` log at/after the recorded pre-burn head.
+                match self
+                    .cctp_bridge
+                    .find_recent_burn(direction, amount, self.market_maker_wallet, from_block)
+                    .await
+                {
+                    Ok(Some(mined_tx)) => {
+                        info!(
+                            target: "rebalance",
+                            %id,
+                            %burn_tx,
+                            %mined_tx,
+                            "Suspected-dropped CCTP burn found on-chain via DepositForBurn \
+                             scan; adopting instead of paging"
+                        );
+                        // Same adopt path as MinedSuccess: confirm_burn runs the
+                        // MessageSent validation the normal burn path gets.
+                        let burn_receipt = self
+                            .cctp_bridge
+                            .confirm_burn(direction, mined_tx, amount)
+                            .await
+                            .map_err(|error| {
+                                warn!(target: "rebalance", %id, %mined_tx, "Adopt-path confirm of scan-recovered burn failed: {error}");
+                                UsdcTransferError::Cctp(Box::new(error))
+                            })?;
+                        Ok(Some(burn_receipt))
+                    }
+                    // The scan could not produce an authoritative answer (lagging
+                    // node, inconclusive retries): paging on it would be a false
+                    // page half the time, so redrive and re-check later.
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %id,
+                            %burn_tx,
+                            %error,
+                            "Suspected-dropped CCTP burn could not be cross-checked \
+                             against the DepositForBurn scan; retrying later"
+                        );
+                        Err(UsdcTransferError::SettlementCheckTransient {
+                            id: id.clone(),
+                            source: Box::new(error),
+                        })
+                    }
+                    // Authoritatively absent on-chain too. A burn tx hash is
+                    // durably recorded, so we must still NEVER auto-issue a second
+                    // burn: page the operator for manual verification instead.
+                    Ok(None) => {
+                        error!(
+                            target: "rebalance",
+                            %id,
+                            %burn_tx,
+                            "Recorded CCTP burn not mined, not in mempool, and absent \
+                             from the DepositForBurn scan (dropped); NOT reburning -- \
+                             operator must verify on-chain"
+                        );
+                        Err(UsdcTransferError::BurnTxDropped {
+                            id: id.clone(),
+                            burn_tx,
+                        })
+                    }
+                }
             }
         }
     }
@@ -11344,6 +11396,145 @@ mod tests {
         );
 
         // Aggregate must be at Bridging (InitiateBridging emitted by record_cctp_burn).
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == existing_burn.tx
+            ),
+            "Aggregate must reach Bridging with the adopted burn tx; got: {state:?}"
+        );
+    }
+
+    /// RAI-1242 (the 2026-07-07 `5c6f3fdd` incident shape): the recorded burn
+    /// hash classifies `Dropped` (absent from receipt lookup and mempool), but
+    /// this transfer's `DepositForBurn` event IS on-chain. The suspected drop
+    /// must cross-check the log scan and ADOPT the mined burn instead of paging
+    /// the operator with a false `BurnTxDropped`. The nonce check proves no
+    /// second burn was submitted.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_dropped_verdict_adopts_burn_found_by_scan() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap()
+            .with_fast_burn_drop_policy(),
+        );
+
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            amount_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        let from_block = cctp_bridge
+            .source_block(BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        // The real burn mines on-chain -- its DepositForBurn is what the
+        // cross-check must find.
+        let existing_burn = cctp_bridge
+            .burn(
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        // Advance the head past the freshness margin so the fabricated hash's
+        // absence is trusted and the fast drop policy concludes Dropped.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        ethereum_provider.anvil_mine(Some(5), None).await.unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        let nonce_before = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        // The recorded hash never existed on-chain: burn_status classifies it
+        // Dropped, and only the DepositForBurn cross-check stands between the
+        // resume and a false operator page.
+        let phantom_recorded_tx =
+            b256!("0x00000000000000000000000000000000000000000000000000000000deadfeed");
+
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(
+                &id,
+                amount_u256,
+                from_block,
+                Some(phantom_recorded_tx),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            burn_receipt.tx, existing_burn.tx,
+            "the suspected drop must adopt the mined burn found by the scan"
+        );
+        assert_eq!(
+            ethereum_provider
+                .get_transaction_count(chains.bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "adopting the scan-recovered burn must NOT submit a second burn"
+        );
+
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
