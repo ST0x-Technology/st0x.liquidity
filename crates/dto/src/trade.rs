@@ -143,6 +143,16 @@ pub enum TradeOutcome {
         #[ts(type = "string | null")]
         excess_shares: Option<NonNegative<FractionalShares>>,
     },
+    Cancelled {
+        #[ts(type = "string | null")]
+        accepted_shares: Option<Positive<FractionalShares>>,
+        #[ts(type = "string | null")]
+        filled_shares: Option<NonNegative<FractionalShares>>,
+        #[ts(type = "string | null")]
+        remaining_shares: Option<NonNegative<FractionalShares>>,
+        #[ts(type = "string | null")]
+        excess_shares: Option<NonNegative<FractionalShares>>,
+    },
 }
 
 #[derive(Default)]
@@ -176,6 +186,83 @@ enum TradeOutcomeWire {
         remaining_shares: Option<NonNegative<FractionalShares>>,
         excess_shares: Option<NonNegative<FractionalShares>>,
     },
+    Cancelled {
+        #[serde(default, deserialize_with = "deserialize_present")]
+        accepted_shares: FieldPresence<Option<Positive<FractionalShares>>>,
+        filled_shares: Option<NonNegative<FractionalShares>>,
+        remaining_shares: Option<NonNegative<FractionalShares>>,
+        excess_shares: Option<NonNegative<FractionalShares>>,
+    },
+}
+
+/// Rejects a terminal outcome whose derived quantities contradict its
+/// accepted and filled quantities.
+///
+/// The dashboard parser enforces this contract on the same payload, so
+/// without it the two ends of the wire disagree on what a valid outcome is:
+/// `Trade` also deserializes from durable job payloads, and a corrupt row
+/// would pass here only to fail later in the browser.
+fn validate_derived_quantities<E: serde::de::Error>(
+    accepted_shares: Option<Positive<FractionalShares>>,
+    filled_shares: Option<NonNegative<FractionalShares>>,
+    remaining_shares: Option<NonNegative<FractionalShares>>,
+    excess_shares: Option<NonNegative<FractionalShares>>,
+) -> Result<(), E> {
+    let (Some(accepted), Some(filled)) = (accepted_shares, filled_shares) else {
+        if remaining_shares.is_some() {
+            return Err(E::custom(
+                "remainingShares must be null when fill provenance is incomplete",
+            ));
+        }
+        if excess_shares.is_some() {
+            return Err(E::custom(
+                "excessShares must be null when fill provenance is incomplete",
+            ));
+        }
+
+        return Ok(());
+    };
+
+    let remaining = remaining_shares.ok_or_else(|| E::missing_field("remainingShares"))?;
+    let excess = excess_shares.ok_or_else(|| E::missing_field("excessShares"))?;
+    let accepted = accepted.inner();
+    let filled = filled.inner();
+    let overfilled = filled.inner().gt(accepted.inner()).map_err(E::custom)?;
+    let (expected_remaining, expected_excess) = if overfilled {
+        (
+            FractionalShares::ZERO,
+            (filled - accepted).map_err(E::custom)?,
+        )
+    } else {
+        (
+            (accepted - filled).map_err(E::custom)?,
+            FractionalShares::ZERO,
+        )
+    };
+
+    if !remaining
+        .inner()
+        .inner()
+        .eq(expected_remaining.inner())
+        .map_err(E::custom)?
+    {
+        return Err(E::custom(
+            "remainingShares must be the accepted quantity minus the fill",
+        ));
+    }
+
+    if !excess
+        .inner()
+        .inner()
+        .eq(expected_excess.inner())
+        .map_err(E::custom)?
+    {
+        return Err(E::custom(
+            "excessShares must be the fill beyond the accepted quantity",
+        ));
+    }
+
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for TradeOutcome {
@@ -191,13 +278,22 @@ impl<'de> Deserialize<'de> for TradeOutcome {
                 filled_shares,
                 remaining_shares,
                 excess_shares,
-            } => Ok(Self::Failed {
-                error,
-                accepted_shares,
-                filled_shares,
-                remaining_shares,
-                excess_shares,
-            }),
+            } => {
+                validate_derived_quantities::<D::Error>(
+                    accepted_shares,
+                    filled_shares,
+                    remaining_shares,
+                    excess_shares,
+                )?;
+
+                Ok(Self::Failed {
+                    error,
+                    accepted_shares,
+                    filled_shares,
+                    remaining_shares,
+                    excess_shares,
+                })
+            }
             TradeOutcomeWire::Failed {
                 error,
                 accepted_shares: FieldPresence::Missing,
@@ -232,6 +328,30 @@ impl<'de> Deserialize<'de> for TradeOutcome {
                     excess_shares: None,
                 })
             }
+            TradeOutcomeWire::Cancelled {
+                accepted_shares: FieldPresence::Present(accepted_shares),
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } => {
+                validate_derived_quantities::<D::Error>(
+                    accepted_shares,
+                    filled_shares,
+                    remaining_shares,
+                    excess_shares,
+                )?;
+
+                Ok(Self::Cancelled {
+                    accepted_shares,
+                    filled_shares,
+                    remaining_shares,
+                    excess_shares,
+                })
+            }
+            TradeOutcomeWire::Cancelled {
+                accepted_shares: FieldPresence::Missing,
+                ..
+            } => Err(D::Error::missing_field("acceptedShares")),
         }
     }
 }
@@ -249,9 +369,10 @@ pub struct Trade {
     pub direction: Direction,
     #[ts(type = "string")]
     pub symbol: Symbol,
-    /// Executed quantity for fills, or requested quantity for a failed
-    /// counter-trade. Failed outcomes carry broker-accepted and fill provenance
-    /// separately when those facts are known.
+    /// Executed quantity for fills, or requested quantity for a failed or
+    /// cancelled counter-trade. Terminal non-fill outcomes carry
+    /// broker-accepted and fill provenance separately when those facts are
+    /// known.
     #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
     pub outcome: TradeOutcome,
@@ -608,6 +729,191 @@ mod tests {
         );
         assert_eq!(remaining_shares, None);
         assert_eq!(excess_shares, None);
+    }
+
+    #[test]
+    fn cancelled_trade_roundtrips_explicit_zero_fill() {
+        let trade = Trade {
+            id: "cancelled-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: positive_shares("1.5"),
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: Some(positive_shares("1")),
+                filled_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
+                remaining_shares: Some(NonNegative::new(FractionalShares::new(float!(1))).unwrap()),
+                excess_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
+            },
+        };
+
+        let wire = serde_json::to_value(&trade).unwrap();
+        assert_eq!(
+            wire["outcome"],
+            json!({
+                "status": "cancelled",
+                "acceptedShares": "1",
+                "filledShares": "0",
+                "remainingShares": "1",
+                "excessShares": "0"
+            })
+        );
+        assert!(
+            wire.get("filledAt").is_none(),
+            "cancelled outcomes must not masquerade as legacy fills"
+        );
+        let restored: Trade = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.outcome, trade.outcome);
+    }
+
+    #[test]
+    fn cancelled_trade_roundtrips_all_null_provenance_in_job_payload() {
+        let trade = Trade {
+            id: "legacy-cancelled-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: positive_shares("1"),
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+        };
+
+        let payload = serde_json::to_vec(&trade).unwrap();
+        let restored: Trade = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(restored.outcome, trade.outcome);
+    }
+
+    #[test]
+    fn cancelled_trade_rejects_missing_v2_acceptance_field() {
+        let wire = json!({
+            "id": "cancelled-order-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": {
+                "status": "cancelled",
+                "filledShares": "0",
+                "remainingShares": "1",
+                "excessShares": "0"
+            }
+        });
+
+        let error = serde_json::from_value::<Trade>(wire).unwrap_err();
+        assert!(error.to_string().contains("acceptedShares"));
+    }
+
+    fn v2_cancelled_wire(outcome: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "cancelled-order-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": outcome
+        })
+    }
+
+    #[test]
+    fn v2_outcome_rejects_remaining_shares_that_are_not_the_unfilled_quantity() {
+        let error = serde_json::from_value::<Trade>(v2_cancelled_wire(&json!({
+            "status": "cancelled",
+            "acceptedShares": "1",
+            "filledShares": "0.25",
+            "remainingShares": "0.5",
+            "excessShares": "0"
+        })))
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "remainingShares must be the accepted quantity minus the fill"
+        );
+    }
+
+    #[test]
+    fn v2_outcome_rejects_excess_shares_that_are_not_the_overfill() {
+        let error = serde_json::from_value::<Trade>(v2_cancelled_wire(&json!({
+            "status": "cancelled",
+            "acceptedShares": "1",
+            "filledShares": "1.5",
+            "remainingShares": "0",
+            "excessShares": "0.25"
+        })))
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "excessShares must be the fill beyond the accepted quantity"
+        );
+    }
+
+    #[test]
+    fn v2_outcome_rejects_derived_quantities_without_complete_provenance() {
+        let error = serde_json::from_value::<Trade>(v2_cancelled_wire(&json!({
+            "status": "cancelled",
+            "acceptedShares": null,
+            "filledShares": null,
+            "remainingShares": "1",
+            "excessShares": null
+        })))
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "remainingShares must be null when fill provenance is incomplete"
+        );
+    }
+
+    #[test]
+    fn v2_outcome_rejects_missing_derived_quantities_with_complete_provenance() {
+        let error = serde_json::from_value::<Trade>(v2_cancelled_wire(&json!({
+            "status": "cancelled",
+            "acceptedShares": "1",
+            "filledShares": "0.25",
+            "remainingShares": null,
+            "excessShares": "0"
+        })))
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("remainingShares"),
+            "expected a missing-field error for remainingShares, got: {error}"
+        );
+    }
+
+    #[test]
+    fn v2_failed_outcome_rejects_inconsistent_derived_quantities() {
+        let error = serde_json::from_value::<Trade>(json!({
+            "id": "failed-order-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": {
+                "status": "failed",
+                "error": "asset is not tradable",
+                "acceptedShares": "1",
+                "filledShares": "0.25",
+                "remainingShares": "0.75",
+                "excessShares": "0.5"
+            }
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "excessShares must be the fill beyond the accepted quantity"
+        );
     }
 
     #[test]

@@ -48,7 +48,35 @@ pub enum MockMode {
     /// Place succeeds, order stays "new" for N polls before filling.
     /// Simulates real broker latency where fills aren't instant.
     DelayedFill { polls_before_fill: usize },
+    /// Place succeeds, the first poll returns a half-quantity partial fill
+    /// and the next poll returns "canceled" retaining that fill. Models a
+    /// broker-side cancellation the bot never requested.
+    PartialFillThenCancel,
+    /// Place succeeds and each new equity order is assigned its own terminal
+    /// outcome in round-robin order -- filled, rejected, then partially
+    /// filled and cancelled. Unlike the single-outcome modes, one run drives
+    /// the trade history through every outcome the dashboard renders.
+    /// Crypto (USDCUSD) orders are unaffected and keep filling immediately.
+    RotatingOutcomes,
 }
+
+/// The terminal outcome the mock drives one order to, assigned at placement
+/// under [`MockMode::RotatingOutcomes`] so that concurrent orders keep their
+/// own outcome instead of racing on the server-wide mode.
+#[derive(Debug, Clone, Copy)]
+enum PlannedOutcome {
+    Filled,
+    Rejected,
+    CancelledAfterPartialFill,
+}
+
+/// The outcomes [`MockMode::RotatingOutcomes`] cycles through, in the order
+/// they are handed to newly placed orders.
+const ROTATING_OUTCOMES: [PlannedOutcome; 3] = [
+    PlannedOutcome::Filled,
+    PlannedOutcome::Rejected,
+    PlannedOutcome::CancelledAfterPartialFill,
+];
 
 pub struct MockPosition {
     pub symbol: Symbol,
@@ -82,7 +110,9 @@ impl std::fmt::Display for OrderSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStatus {
     New,
+    PartiallyFilled,
     Filled,
+    Canceled,
     Rejected,
 }
 
@@ -90,7 +120,9 @@ impl std::fmt::Display for OrderStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::New => write!(formatter, "new"),
+            Self::PartiallyFilled => write!(formatter, "partially_filled"),
             Self::Filled => write!(formatter, "filled"),
+            Self::Canceled => write!(formatter, "canceled"),
             Self::Rejected => write!(formatter, "rejected"),
         }
     }
@@ -101,9 +133,16 @@ struct MockOrder {
     quantity: Float,
     side: OrderSide,
     status: OrderStatus,
+    /// Quantity executed so far. Zero until a fill applies, the ordered
+    /// quantity once filled, and the partial quantity for an order that was
+    /// cancelled after a partial fill.
+    filled_quantity: Float,
     poll_count: usize,
     filled_price: Option<Float>,
     client_order_id: Option<String>,
+    /// Set only for orders placed under [`MockMode::RotatingOutcomes`];
+    /// overrides the server-wide mode when this order is polled.
+    planned_outcome: Option<PlannedOutcome>,
 }
 
 /// A single calendar entry controlling market open/close times.
@@ -156,6 +195,9 @@ struct MockState {
     orders: HashMap<String, MockOrder>,
     symbol_fill_prices: HashMap<Symbol, Float>,
     mode: MockMode,
+    /// Cursor into [`ROTATING_OUTCOMES`], advanced once per equity order
+    /// placed under [`MockMode::RotatingOutcomes`].
+    rotating_outcome_index: usize,
     /// Per-symbol fill delays: number of polls before filling.
     /// Symbols without an entry fill immediately in `HappyPath` mode.
     symbol_fill_delays: HashMap<Symbol, usize>,
@@ -336,6 +378,7 @@ impl AlpacaBrokerMock {
             orders: HashMap::new(),
             symbol_fill_prices,
             mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
             symbol_fill_delays: HashMap::new(),
             calendar_entries,
             wallet_transfers: Vec::new(),
@@ -1057,6 +1100,20 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 }
             }
 
+            let planned_outcome = match state.mode {
+                MockMode::RotatingOutcomes => {
+                    let outcome = ROTATING_OUTCOMES[state.rotating_outcome_index];
+                    state.rotating_outcome_index =
+                        (state.rotating_outcome_index + 1) % ROTATING_OUTCOMES.len();
+                    Some(outcome)
+                }
+                MockMode::HappyPath
+                | MockMode::OrderRejected
+                | MockMode::PlacementFails
+                | MockMode::DelayedFill { .. }
+                | MockMode::PartialFillThenCancel => None,
+            };
+
             state.orders.insert(
                 order_id.clone(),
                 MockOrder {
@@ -1064,9 +1121,11 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     quantity,
                     side,
                     status: OrderStatus::New,
+                    filled_quantity: float!(0),
                     poll_count: 0,
                     filled_price: None,
                     client_order_id: client_order_id.clone(),
+                    planned_outcome,
                 },
             );
 
@@ -1216,9 +1275,11 @@ fn handle_crypto_order(
             quantity: quantized_quantity,
             side,
             status: OrderStatus::Filled,
+            filled_quantity: quantized_quantity,
             poll_count: 0,
             filled_price: Some(fill_price),
             client_order_id: None,
+            planned_outcome: None,
         },
     );
 
@@ -1301,85 +1362,14 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     order.poll_count += 1;
                 }
 
-                let mode = state.mode;
-
-                match mode {
-                    MockMode::HappyPath => {
-                        let symbol_key = state.orders[&order_id].symbol.clone();
-
-                        let delay = state
-                            .symbol_fill_delays
-                            .get(&symbol_key)
-                            .copied()
-                            .unwrap_or(0);
-                        let poll_count = state.orders[&order_id].poll_count;
-
-                        if poll_count >= delay {
-                            let Some(fill_price) =
-                                state.symbol_fill_prices.get(&symbol_key).copied()
-                            else {
-                                return json_response(
-                                    500,
-                                    &json!({"message": "no fill price configured"}),
-                                );
-                            };
-
-                            if let Err(error) =
-                                apply_happy_path_fill(&mut state, &order_id, fill_price)
-                            {
-                                return json_response(
-                                    500,
-                                    &json!({"message": format!("fill arithmetic error: {error}")}),
-                                );
-                            }
-                        }
-                    }
-                    MockMode::OrderRejected => {
-                        if let Some(order) = state.orders.get_mut(&order_id) {
-                            order.status = OrderStatus::Rejected;
-                        }
-                    }
-                    MockMode::DelayedFill { polls_before_fill } => {
-                        let ready = state
-                            .orders
-                            .get(&order_id)
-                            .is_some_and(|o| o.poll_count >= polls_before_fill);
-
-                        if ready {
-                            let symbol_key = state.orders[&order_id].symbol.clone();
-                            let Some(fill_price) =
-                                state.symbol_fill_prices.get(&symbol_key).copied()
-                            else {
-                                return json_response(
-                                    500,
-                                    &json!({"message": "no fill price configured"}),
-                                );
-                            };
-
-                            if let Err(error) =
-                                apply_happy_path_fill(&mut state, &order_id, fill_price)
-                            {
-                                return json_response(
-                                    500,
-                                    &json!({"message": format!("fill arithmetic error: {error}")}),
-                                );
-                            }
-                        }
-                    }
-                    MockMode::PlacementFails => {
-                        // Placement already rejected at order creation -
-                        // no orders exist to poll.
-                    }
+                if let Err(error) = advance_polled_order(&mut state, &order_id) {
+                    return json_response(500, &json!({"message": error.to_string()}));
                 }
 
                 let order = &state.orders[&order_id];
                 // The real API always reports filled_qty ("0" when unfilled);
                 // the client fails closed on terminal responses without it.
-                let filled_quantity = if order.status == OrderStatus::Filled {
-                    format_float_with_fallback(&order.quantity)
-                } else {
-                    "0".to_string()
-                };
+                let filled_quantity = format_float_with_fallback(&order.filled_quantity);
                 let filled_price: Option<String> =
                     order.filled_price.as_ref().map(format_float_with_fallback);
                 let quantity = format_float_with_fallback(&order.quantity);
@@ -1389,6 +1379,8 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     (order.status == OrderStatus::Filled).then_some("2025-01-01T00:00:01Z");
                 let failed_at =
                     (order.status == OrderStatus::Rejected).then_some("2025-01-01T00:00:01Z");
+                let canceled_at =
+                    (order.status == OrderStatus::Canceled).then_some("2025-01-01T00:00:01Z");
                 let body = json!({
                     "id": order_id,
                     "symbol": order.symbol,
@@ -1401,6 +1393,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     "updated_at": "2025-01-01T00:00:01Z",
                     "filled_at": filled_at,
                     "failed_at": failed_at,
+                    "canceled_at": canceled_at,
                 });
                 drop(state);
                 body
@@ -1411,11 +1404,118 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
     });
 }
 
-/// Transitions a "new" order to "filled" and updates account balances.
-fn apply_happy_path_fill(
+/// Resolves which single-outcome mode governs one polled order. An order
+/// placed under [`MockMode::RotatingOutcomes`] follows the outcome it was
+/// assigned at placement; every other order follows the server-wide mode.
+const fn poll_mode(mode: MockMode, planned_outcome: Option<PlannedOutcome>) -> MockMode {
+    match planned_outcome {
+        Some(PlannedOutcome::Filled) => MockMode::HappyPath,
+        Some(PlannedOutcome::Rejected) => MockMode::OrderRejected,
+        Some(PlannedOutcome::CancelledAfterPartialFill) => MockMode::PartialFillThenCancel,
+        // Orders placed before the switch to `RotatingOutcomes` carry no
+        // planned outcome; they keep the happy path they were placed under.
+        None => match mode {
+            MockMode::RotatingOutcomes => MockMode::HappyPath,
+            other => other,
+        },
+    }
+}
+
+/// Why the mock could not advance a polled order.
+#[derive(Debug, thiserror::Error)]
+enum PollAdvanceError {
+    #[error("no fill price configured for {symbol}")]
+    NoFillPrice { symbol: Symbol },
+    #[error("fill arithmetic error: {0}")]
+    Arithmetic(#[from] rain_math_float::FloatError),
+}
+
+/// Applies one poll's worth of state transition to an order, per the mode
+/// governing it. Called once per status request, after the poll counter has
+/// been incremented.
+fn advance_polled_order(state: &mut MockState, order_id: &str) -> Result<(), PollAdvanceError> {
+    let order = &state.orders[order_id];
+    let symbol = order.symbol.clone();
+    let poll_count = order.poll_count;
+
+    match poll_mode(state.mode, order.planned_outcome) {
+        MockMode::HappyPath => {
+            let delay = state.symbol_fill_delays.get(&symbol).copied().unwrap_or(0);
+            if poll_count >= delay {
+                apply_fill(
+                    state,
+                    order_id,
+                    fill_price(state, &symbol)?,
+                    FillExtent::Full,
+                )?;
+            }
+            Ok(())
+        }
+        MockMode::DelayedFill { polls_before_fill } => {
+            if poll_count >= polls_before_fill {
+                apply_fill(
+                    state,
+                    order_id,
+                    fill_price(state, &symbol)?,
+                    FillExtent::Full,
+                )?;
+            }
+            Ok(())
+        }
+        MockMode::OrderRejected => {
+            if let Some(order) = state.orders.get_mut(order_id) {
+                order.status = OrderStatus::Rejected;
+            }
+            Ok(())
+        }
+        MockMode::PartialFillThenCancel => {
+            // The first poll reports the partial fill so the bot records it
+            // on the aggregate; the next poll cancels, retaining that fill.
+            if state.orders[order_id].status == OrderStatus::New {
+                apply_fill(
+                    state,
+                    order_id,
+                    fill_price(state, &symbol)?,
+                    FillExtent::Half,
+                )?;
+            } else if let Some(order) = state.orders.get_mut(order_id) {
+                order.status = OrderStatus::Canceled;
+            }
+            Ok(())
+        }
+        // `PlacementFails` rejects at order creation, so no order exists to
+        // poll; `poll_mode` never resolves to the rotating mode itself.
+        MockMode::PlacementFails | MockMode::RotatingOutcomes => Ok(()),
+    }
+}
+
+fn fill_price(state: &MockState, symbol: &Symbol) -> Result<Float, PollAdvanceError> {
+    state
+        .symbol_fill_prices
+        .get(symbol)
+        .copied()
+        .ok_or_else(|| PollAdvanceError::NoFillPrice {
+            symbol: symbol.clone(),
+        })
+}
+
+/// How much of an order's quantity a fill executes.
+#[derive(Debug, Clone, Copy)]
+enum FillExtent {
+    Full,
+    Half,
+}
+
+/// Executes a fill against a "new" order and updates account balances.
+///
+/// A [`FillExtent::Full`] fill moves the order to "filled"; a
+/// [`FillExtent::Half`] fill moves it to "partially_filled", leaving the
+/// remainder open for a later cancellation.
+fn apply_fill(
     state: &mut MockState,
     order_id: &str,
     fill_price: Float,
+    extent: FillExtent,
 ) -> Result<(), rain_math_float::FloatError> {
     let should_fill = state
         .orders
@@ -1426,14 +1526,22 @@ fn apply_happy_path_fill(
     }
 
     let symbol_key = state.orders[order_id].symbol.clone();
-    let qty = state.orders[order_id].quantity;
     let side = state.orders[order_id].side;
+    let ordered_quantity = state.orders[order_id].quantity;
+    let (qty, status) = match extent {
+        FillExtent::Full => (ordered_quantity, OrderStatus::Filled),
+        FillExtent::Half => (
+            (ordered_quantity * float!(0.5))?,
+            OrderStatus::PartiallyFilled,
+        ),
+    };
     let raw_cost = (qty * fill_price)?;
     let (cost_fixed, _) = raw_cost.to_fixed_decimal_lossy(2)?;
     let cost = Float::from_fixed_decimal(cost_fixed, 2)?;
 
     if let Some(order) = state.orders.get_mut(order_id) {
-        order.status = OrderStatus::Filled;
+        order.status = status;
+        order.filled_quantity = qty;
         order.filled_price = Some(fill_price);
     }
 
@@ -1973,6 +2081,82 @@ mod tests {
         );
     }
 
+    /// Places one order per rotation step and polls each to its terminal
+    /// status. `RotatingOutcomes` is only useful if a single run yields all
+    /// three outcomes the dashboard renders, so this asserts the full cycle
+    /// -- including the fill quantities and terminal timestamps the order
+    /// status parser needs to accept a cancellation.
+    #[tokio::test]
+    async fn rotating_outcomes_drives_each_order_to_its_own_terminal_status() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let broker = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol, float!(150))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        broker.set_mode(MockMode::RotatingOutcomes);
+
+        let client = reqwest::Client::new();
+        let orders_url = format!(
+            "{}/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders",
+            broker.base_url()
+        );
+
+        let mut order_ids = Vec::new();
+        for index in 0..3 {
+            let placed: serde_json::Value = client
+                .post(&orders_url)
+                .json(&serde_json::json!({
+                    "symbol": "AAPL",
+                    "qty": "4",
+                    "side": "buy",
+                    "client_order_id": format!("rotating-{index}"),
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            order_ids.push(placed["id"].as_str().unwrap().to_string());
+        }
+
+        let poll = async |order_id: &str| -> serde_json::Value {
+            client
+                .get(format!("{orders_url}/{order_id}"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        };
+
+        let filled = poll(&order_ids[0]).await;
+        assert_eq!(filled["status"], serde_json::json!("filled"));
+        assert_eq!(filled["filled_qty"], serde_json::json!("4"));
+        assert_eq!(
+            filled["filled_at"],
+            serde_json::json!("2025-01-01T00:00:01Z")
+        );
+
+        let rejected = poll(&order_ids[1]).await;
+        assert_eq!(rejected["status"], serde_json::json!("rejected"));
+        assert_eq!(rejected["filled_qty"], serde_json::json!("0"));
+
+        let partial = poll(&order_ids[2]).await;
+        assert_eq!(partial["status"], serde_json::json!("partially_filled"));
+        assert_eq!(partial["filled_qty"], serde_json::json!("2"));
+
+        let cancelled = poll(&order_ids[2]).await;
+        assert_eq!(cancelled["status"], serde_json::json!("canceled"));
+        assert_eq!(cancelled["filled_qty"], serde_json::json!("2"));
+        assert_eq!(
+            cancelled["canceled_at"],
+            serde_json::json!("2025-01-01T00:00:01Z")
+        );
+    }
+
     #[test]
     fn format_u256_as_usdc_cases() {
         assert_eq!(format_u256_as_usdc(U256::ZERO), "0");
@@ -2066,6 +2250,7 @@ mod tests {
             orders: HashMap::new(),
             symbol_fill_prices: HashMap::new(),
             mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
             symbol_fill_delays: HashMap::new(),
             calendar_entries: vec![],
             wallet_transfers: vec![],
@@ -2113,6 +2298,7 @@ mod tests {
             orders: HashMap::new(),
             symbol_fill_prices: HashMap::new(),
             mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
             symbol_fill_delays: HashMap::new(),
             calendar_entries: vec![],
             wallet_transfers: vec![],
@@ -2167,6 +2353,7 @@ mod tests {
             orders: HashMap::new(),
             symbol_fill_prices: HashMap::new(),
             mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
             symbol_fill_delays: HashMap::new(),
             calendar_entries: vec![],
             wallet_transfers: vec![],

@@ -1002,6 +1002,21 @@ async fn simulate() -> anyhow::Result<()> {
         Some(db_path),
     )
     .await?;
+
+    // Every counter-trade fills by default, so the dashboard's trade history
+    // only ever shows one outcome. This knob rotates each hedge through
+    // filled, rejected, and partially-filled-then-cancelled instead, so the
+    // Outcome column can be inspected (and screenshotted) in one run.
+    if std::env::var_os("SIMULATE_BROKER_OUTCOME_ROTATION").is_some() {
+        infra
+            .broker_service
+            .set_mode(st0x_execution::alpaca_broker_api::MockMode::RotatingOutcomes);
+        info!(
+            "Rotating counter-trade outcomes: every third hedge is rejected, every third is \
+             cancelled after a partial fill"
+        );
+    }
+
     debug!("Starting CCTP mock infrastructure");
     let cctp = CctpInfra::start(&infra).await?;
 

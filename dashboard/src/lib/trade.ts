@@ -23,22 +23,25 @@ export const normalizeTrade = (trade: Trade | LegacyTrade): Trade => {
 export const tradeOutcomeLabel = (outcome: TradeOutcome): string =>
   matchOutcome(outcome, {
     filled: () => 'Filled',
-    failed: () => 'Failed'
+    failed: () => 'Failed',
+    cancelled: () => 'Cancelled'
   })
 
 export const tradeOutcomeClass = (outcome: TradeOutcome): string =>
   matchOutcome(outcome, {
     filled: () => 'text-green-500',
-    failed: () => 'text-destructive'
+    failed: () => 'text-destructive',
+    cancelled: () => 'text-amber-500'
   })
 
 export const tradeFailureReason = (outcome: TradeOutcome): string | null =>
   matchOutcome(outcome, {
     filled: () => null,
-    failed: ({ error }) => error
+    failed: ({ error }) => error,
+    cancelled: () => null
   })
 
-export const tradeFailureShares = (
+export const tradeOutcomeShares = (
   outcome: TradeOutcome
 ): {
   accepted: string | null
@@ -49,6 +52,12 @@ export const tradeFailureShares = (
   matchOutcome(outcome, {
     filled: () => null,
     failed: ({ acceptedShares, filledShares, remainingShares, excessShares }) => ({
+      accepted: acceptedShares,
+      filled: filledShares,
+      remaining: remainingShares,
+      excess: excessShares
+    }),
+    cancelled: ({ acceptedShares, filledShares, remainingShares, excessShares }) => ({
       accepted: acceptedShares,
       filled: filledShares,
       remaining: remainingShares,

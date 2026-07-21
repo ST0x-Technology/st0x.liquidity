@@ -17,7 +17,7 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::{
     Executor, ExecutorOrderId, FractionalShares, OrderState, Positive, SupportedExecutor, Symbol,
 };
-use st0x_finance::Usd;
+use st0x_finance::{NonNegative, Usd};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::handle_rejection::{
@@ -25,8 +25,8 @@ use crate::offchain::order::handle_rejection::{
 };
 use crate::offchain::order::reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 use crate::offchain::order::{
-    CancellationReason, JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
-    RetainedFill, TerminalPositionFinalization, position_command_for_finalization,
+    CancellationReason, JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderError,
+    OffchainOrderId, RetainedFill, TerminalPositionFinalization, position_command_for_finalization,
     terminal_position_finalization,
 };
 use crate::position::Position;
@@ -139,7 +139,7 @@ impl PollOrderStatus {
         let parsed_order_id = ctx.executor.parse_order_id(executor_order_id.as_ref())?;
         let order_state = ctx.executor.get_order_status(&parsed_order_id).await?;
 
-        self.dispatch_for_broker_state(ctx, order, order_state)
+        self.dispatch_for_broker_state(ctx, order, &executor_order_id, order_state)
             .await
     }
 
@@ -147,6 +147,7 @@ impl PollOrderStatus {
         &self,
         ctx: &PollOrderStatusCtx<E>,
         order: &OffchainOrder,
+        executor_order_id: &ExecutorOrderId,
         order_state: OrderState,
     ) -> Result<(), JobError>
     where
@@ -154,6 +155,7 @@ impl PollOrderStatus {
         JobError: From<E::Error>,
     {
         use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
+        validate_broker_terminal_fill(executor_order_id, &order_state)?;
         let symbol = order.symbol();
         match order_state {
             Filled {
@@ -188,15 +190,14 @@ impl PollOrderStatus {
             // never surface the missing price -- the old `reschedule_self`
             // looped forever. Fail closed instead: leave the position pending
             // (NEVER clear it -- clearing under-accounts the executed shares and
-            // double-hedges on the next scan) and stop re-polling. The order
-            // stays non-terminal, so startup orphan-recovery re-polls it on the
-            // next restart without an in-process tight loop; the error log
-            // surfaces it for manual reconciliation.
+            // double-hedges on the next scan), persist the terminal order, and
+            // stop re-polling. The dashboard outcome and error log surface it
+            // for manual reconciliation.
             Failed {
-                error_reason: _,
+                error_reason,
                 shares_filled: Some(shares_filled),
                 avg_price: None,
-                ..
+                failed_at,
             } if Positive::new(shares_filled).is_ok() => {
                 error!(
                     target: "broker",
@@ -204,9 +205,10 @@ impl PollOrderStatus {
                     offchain_order_id = %self.offchain_order_id,
                     %shares_filled,
                     "Broker reports Failed with filled shares but no avg_price; \
-                     leaving the position pending (fail closed) and not re-polling"
+                     recording the terminal failure while leaving the position pending"
                 );
-                Ok(())
+                self.persist_unpriced_failure(ctx, symbol, error_reason, shares_filled, failed_at)
+                    .await
             }
 
             Failed {
@@ -227,7 +229,8 @@ impl PollOrderStatus {
             } if Positive::new(shares_filled).is_ok() => {
                 self.record_partial_fill(ctx, symbol, shares_filled, Some(avg_price), cancelled_at)
                     .await?;
-                self.confirm_cancellation(ctx, symbol, cancelled_at).await
+                self.confirm_cancellation(ctx, symbol, shares_filled, cancelled_at)
+                    .await
             }
 
             // Broker-terminal Cancelled with a positive unpriced fill -- same
@@ -235,7 +238,7 @@ impl PollOrderStatus {
             // pending and stop re-polling rather than looping forever or
             // clearing the executed shares.
             Cancelled {
-                cancelled_at: _,
+                cancelled_at,
                 shares_filled,
                 avg_price: None,
                 ..
@@ -246,13 +249,19 @@ impl PollOrderStatus {
                     offchain_order_id = %self.offchain_order_id,
                     %shares_filled,
                     "Broker reports Cancelled with filled shares but no avg_price; \
-                     leaving the position pending (fail closed) and not re-polling"
+                     recording the terminal cancellation while leaving the position pending"
                 );
-                Ok(())
+                self.persist_unpriced_cancellation(ctx, symbol, shares_filled, cancelled_at)
+                    .await
             }
 
-            Cancelled { cancelled_at, .. } => {
-                self.confirm_cancellation(ctx, symbol, cancelled_at).await
+            Cancelled {
+                shares_filled,
+                cancelled_at,
+                ..
+            } => {
+                self.confirm_cancellation(ctx, symbol, shares_filled, cancelled_at)
+                    .await
             }
 
             PartiallyFilled {
@@ -479,6 +488,7 @@ impl PollOrderStatus {
         &self,
         ctx: &PollOrderStatusCtx<E>,
         symbol: &Symbol,
+        filled_shares: FractionalShares,
         cancelled_at: DateTime<Utc>,
     ) -> Result<(), JobError>
     where
@@ -510,7 +520,10 @@ impl PollOrderStatus {
                 ctx.offchain_order_store
                     .send(
                         &self.offchain_order_id,
-                        OffchainOrderCommand::ConfirmCancellation { cancelled_at },
+                        OffchainOrderCommand::ConfirmCancellation {
+                            filled_shares,
+                            cancelled_at,
+                        },
                     )
                     .await?;
 
@@ -527,7 +540,7 @@ impl PollOrderStatus {
             // and let the next replacement adopt the cancelled broker order
             // via duplicate-client-order-id recovery.
             OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-                self.recover_unrequested_cancellation(ctx, symbol, cancelled_at)
+                self.recover_unrequested_cancellation(ctx, symbol, filled_shares, cancelled_at)
                     .await
             }
 
@@ -555,6 +568,95 @@ impl PollOrderStatus {
         }
     }
 
+    async fn persist_unpriced_failure<E>(
+        &self,
+        ctx: &PollOrderStatusCtx<E>,
+        symbol: &Symbol,
+        error_reason: Option<String>,
+        shares_filled: FractionalShares,
+        failed_at: DateTime<Utc>,
+    ) -> Result<(), JobError>
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+    {
+        ctx.offchain_order_store
+            .send(
+                &self.offchain_order_id,
+                OffchainOrderCommand::MarkFailed {
+                    error: error_reason
+                        .unwrap_or_else(|| "Order failed with no error reason".to_string()),
+                    filled_shares: Some(shares_filled),
+                    failed_at,
+                },
+            )
+            .await?;
+
+        self.finalize_position_for_terminal_order(ctx, symbol).await
+    }
+
+    /// Reloads the aggregate before branching. The state this job read at
+    /// startup predates the broker round-trip, so a cancellation persisted in
+    /// that window would otherwise steer this into a command the current
+    /// state rejects. The priced `confirm_cancellation` path reloads for the
+    /// same reason.
+    async fn persist_unpriced_cancellation<E>(
+        &self,
+        ctx: &PollOrderStatusCtx<E>,
+        symbol: &Symbol,
+        shares_filled: FractionalShares,
+        cancelled_at: DateTime<Utc>,
+    ) -> Result<(), JobError>
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+    {
+        let Some(order) = ctx
+            .offchain_order_projection
+            .load(&self.offchain_order_id)
+            .await?
+        else {
+            warn!(
+                target: "broker",
+                %symbol,
+                offchain_order_id = %self.offchain_order_id,
+                "PollOrderStatus: order disappeared before recording an unpriced cancellation"
+            );
+            return Ok(());
+        };
+
+        let command = match order {
+            OffchainOrder::Cancelling { .. } => OffchainOrderCommand::ConfirmCancellation {
+                filled_shares: shares_filled,
+                cancelled_at,
+            },
+            OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
+                OffchainOrderCommand::MarkUnrequestedCancellation {
+                    filled_shares: shares_filled,
+                    cancelled_at,
+                }
+            }
+            OffchainOrder::Pending { .. }
+            | OffchainOrder::Filled { .. }
+            | OffchainOrder::Failed { .. }
+            | OffchainOrder::Cancelled { .. } => {
+                warn!(
+                    target: "broker",
+                    %symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    state = ?order,
+                    %shares_filled,
+                    "Broker reported an unpriced cancellation fill for an order that is \
+                     neither live nor Cancelling; ignoring terminal-state discrepancy"
+                );
+                return Ok(());
+            }
+        };
+        ctx.offchain_order_store
+            .send(&self.offchain_order_id, command)
+            .await?;
+
+        self.finalize_position_for_terminal_order(ctx, symbol).await
+    }
+
     /// Recovers a broker-side cancellation observed while the local order is
     /// still `Submitted`/`PartiallyFilled` (the cancel request did not survive
     /// a crash). Re-drives `CancelOrder`: its pre-cancel reconcile reads the
@@ -566,6 +668,7 @@ impl PollOrderStatus {
         &self,
         ctx: &PollOrderStatusCtx<E>,
         symbol: &Symbol,
+        filled_shares: FractionalShares,
         cancelled_at: DateTime<Utc>,
     ) -> Result<(), JobError>
     where
@@ -614,7 +717,10 @@ impl PollOrderStatus {
                 ctx.offchain_order_store
                     .send(
                         &self.offchain_order_id,
-                        OffchainOrderCommand::ConfirmCancellation { cancelled_at },
+                        OffchainOrderCommand::ConfirmCancellation {
+                            filled_shares,
+                            cancelled_at,
+                        },
                     )
                     .await?;
             }
@@ -732,6 +838,31 @@ impl PollOrderStatus {
             }
         }
     }
+}
+
+fn validate_broker_terminal_fill(
+    executor_order_id: &ExecutorOrderId,
+    order_state: &OrderState,
+) -> Result<(), OffchainOrderError> {
+    let filled_shares = match order_state {
+        OrderState::Failed { shares_filled, .. } => *shares_filled,
+        OrderState::Cancelled { shares_filled, .. } => Some(*shares_filled),
+        OrderState::Pending
+        | OrderState::Submitted { .. }
+        | OrderState::PartiallyFilled { .. }
+        | OrderState::Filled { .. } => None,
+    };
+
+    if let Some(shares_filled) = filled_shares {
+        NonNegative::new(shares_filled).map_err(|_| {
+            OffchainOrderError::InvalidTerminalFillQuantity {
+                executor_order_id: executor_order_id.clone(),
+                shares_filled,
+            }
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Decision derived from the order's current aggregate state, before any
@@ -884,6 +1015,7 @@ pub(crate) async fn recover_submitted_offchain_orders(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Utc;
@@ -1316,6 +1448,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_rejects_negative_terminal_cancellation_fill() {
+        let executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("noop"),
+            shares_filled: FractionalShares::new(float!(-0.5)),
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        infra
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            JobError::OffchainOrder(
+                crate::offchain::order::OffchainOrderError::InvalidTerminalFillQuantity { .. }
+            )
+        ));
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(
+            matches!(order, OffchainOrder::Cancelling { .. }),
+            "invalid broker fill must not make the cancellation terminal, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_after_confirmed_cancellation_finalizes_position() {
         let executor = MockExecutor::new();
         let infra = build_test_infra(executor).await;
@@ -1339,6 +1516,7 @@ mod tests {
             .send(
                 &order_id,
                 OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
                     cancelled_at: Utc::now(),
                 },
             )
@@ -1766,12 +1944,245 @@ mod tests {
             0,
             "Unpriced terminal fill must not be routed to rejection"
         );
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(matches!(
+            order,
+            OffchainOrder::Cancelled {
+                retained_fill: Some(RetainedFill::Unpriced { shares_filled }),
+                filled_shares: Some(terminal_filled),
+                ..
+            } if shares_filled == FractionalShares::new(float!(50))
+                && terminal_filled == shares_filled
+        ));
 
         let position = infra.position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
             position.pending_offchain_order_id,
             Some(order_id),
             "Unpriced fill must leave the position pending (fail closed), never cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn larger_unpriced_cancellation_from_partial_fill_keeps_position_pending() {
+        let executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("noop"),
+            shares_filled: FractionalShares::new(float!(50)),
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        infra
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(25)),
+                    avg_price: Usd::new(float!(150.0)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(matches!(
+            order,
+            OffchainOrder::Cancelled {
+                retained_fill: Some(RetainedFill::Unpriced { shares_filled }),
+                reason: CancellationReason::Unrequested,
+                ..
+            } if shares_filled == FractionalShares::new(float!(50))
+        ));
+        let position = infra.position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.pending_offchain_order_id, Some(order_id));
+    }
+
+    #[tokio::test]
+    async fn larger_unpriced_cancellation_while_cancelling_keeps_position_pending() {
+        let executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at: Utc::now(),
+            order_id: ExecutorOrderId::new("noop"),
+            shares_filled: FractionalShares::new(float!(50)),
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        infra
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(25)),
+                    avg_price: Usd::new(float!(150.0)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        infra
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(matches!(
+            order,
+            OffchainOrder::Cancelled {
+                retained_fill: Some(RetainedFill::Unpriced { shares_filled }),
+                reason: CancellationReason::MarketOpenReplacement,
+                ..
+            } if shares_filled == FractionalShares::new(float!(50))
+        ));
+        let position = infra.position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.pending_offchain_order_id, Some(order_id));
+    }
+
+    /// The job reads the aggregate before the broker round-trip, so a
+    /// cancellation persisted during that call leaves the job holding stale
+    /// state. Acting on it would send `MarkUnrequestedCancellation` to an
+    /// order that is already `Cancelling`, which the aggregate rejects.
+    #[tokio::test]
+    async fn unpriced_cancellation_reloads_state_that_changed_during_the_broker_call() {
+        #[derive(Clone)]
+        struct CancelDuringStatusExecutor {
+            target: Arc<OnceLock<(Arc<Store<OffchainOrder>>, OffchainOrderId)>>,
+            inner: MockExecutor,
+        }
+
+        #[async_trait::async_trait]
+        impl Executor for CancelDuringStatusExecutor {
+            type Error = ExecutionError;
+            type OrderId = String;
+            type Ctx = ();
+
+            async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+                unimplemented!()
+            }
+
+            async fn is_market_open(&self) -> Result<bool, Self::Error> {
+                self.inner.is_market_open().await
+            }
+
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+                self.inner.place_market_order(order).await
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+                self.inner.place_limit_order(order).await
+            }
+
+            async fn cancel_order(
+                &self,
+                order_id: &Self::OrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
+                self.inner.cancel_order(order_id).await
+            }
+
+            async fn get_order_status(
+                &self,
+                order_id: &Self::OrderId,
+            ) -> Result<OrderState, Self::Error> {
+                if let Some((store, offchain_order_id)) = self.target.get() {
+                    store
+                        .send(
+                            offchain_order_id,
+                            OffchainOrderCommand::CancelOrder {
+                                reason: CancellationReason::MarketOpenReplacement,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+
+                self.inner.get_order_status(order_id).await
+            }
+
+            fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+                self.inner.parse_order_id(order_id_str)
+            }
+
+            async fn get_inventory(&self) -> Result<st0x_execution::InventoryResult, Self::Error> {
+                self.inner.get_inventory().await
+            }
+
+            fn to_supported_executor(&self) -> SupportedExecutor {
+                self.inner.to_supported_executor()
+            }
+        }
+
+        let target = Arc::new(OnceLock::new());
+        let infra = build_test_infra(CancelDuringStatusExecutor {
+            target: Arc::clone(&target),
+            inner: MockExecutor::new().with_order_status(OrderState::Cancelled {
+                cancelled_at: Utc::now(),
+                order_id: ExecutorOrderId::new("noop"),
+                shares_filled: FractionalShares::new(float!(50)),
+                avg_price: None,
+            }),
+        })
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        assert!(
+            target
+                .set((Arc::clone(&infra.offchain_order), order_id))
+                .is_ok(),
+            "the cancellation target must only be armed once"
+        );
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Cancelled {
+                    reason: CancellationReason::MarketOpenReplacement,
+                    ..
+                }
+            ),
+            "The reloaded Cancelling state must confirm the requested cancellation, got: {order:?}"
         );
     }
 
@@ -1806,14 +2217,123 @@ mod tests {
         assert_eq!(
             count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             0,
-            "Unpriced terminal fill must not be routed to rejection"
+            "Unpriced terminal failure is persisted directly without rejection cleanup"
         );
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(matches!(
+            order,
+            OffchainOrder::Failed {
+                retained_fill: Some(RetainedFill::Unpriced { shares_filled }),
+                filled_shares: Some(terminal_filled),
+                ..
+            } if shares_filled == FractionalShares::new(float!(50))
+                && terminal_filled == shares_filled
+        ));
 
         let position = infra.position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
             position.pending_offchain_order_id,
             Some(order_id),
             "Unpriced fill must leave the position pending (fail closed), never cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpriced_failure_equal_to_priced_partial_fill_finalizes_position() {
+        let failed_at = Utc::now();
+        let executor = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at,
+            error_reason: Some("broker rejected remainder".to_string()),
+            shares_filled: Some(FractionalShares::new(float!(50))),
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        let partially_filled_at = failed_at - chrono::Duration::seconds(1);
+        infra
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(150.0)),
+                    partially_filled_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(matches!(
+            order,
+            OffchainOrder::Failed {
+                retained_fill: Some(RetainedFill::Priced { shares_filled, .. }),
+                ..
+            } if shares_filled == FractionalShares::new(float!(50))
+        ));
+        let position = infra.position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Matching terminal quantity must retain the known price and finalize the position"
+        );
+    }
+
+    #[tokio::test]
+    async fn larger_unpriced_failure_keeps_position_pending() {
+        let executor = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at: Utc::now(),
+            error_reason: Some("broker rejected remainder".to_string()),
+            shares_filled: Some(FractionalShares::new(float!(50))),
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        infra
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(25)),
+                    avg_price: Usd::new(float!(150.0)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        assert!(matches!(
+            order,
+            OffchainOrder::Failed {
+                retained_fill: Some(RetainedFill::Unpriced { shares_filled }),
+                ..
+            } if shares_filled == FractionalShares::new(float!(50))
+        ));
+        let position = infra.position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(order_id),
+            "A larger unpriced terminal fill must remain pending for manual reconciliation"
         );
     }
 

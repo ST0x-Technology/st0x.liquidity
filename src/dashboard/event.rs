@@ -310,28 +310,9 @@ impl DashboardTradeHandoffMonitor {
                     })?
                     .ok_or(DashboardTradeHandoffAttemptError::Missing { id: *id })?;
 
-                match order.try_into_trade(id) {
-                    Ok(trade) => trade,
-                    // A cancellation racing an earlier terminal handoff is
-                    // benign: the rest of the system treats cancelled orders
-                    // as "nothing to deliver", so the handoff completes as a
-                    // no-op instead of fail-stopping the monitor.
-                    Err(TradeConversionError::Cancelled) => {
-                        warn!(
-                            target: "dashboard",
-                            %id,
-                            "Offchain order was cancelled after its terminal handoff; \
-                             skipping dashboard delivery",
-                        );
-                        return Ok(());
-                    }
-                    Err(source) => {
-                        return Err(DashboardTradeHandoffAttemptError::Conversion {
-                            id: *id,
-                            source,
-                        });
-                    }
-                }
+                order.try_into_trade(id).map_err(|source| {
+                    DashboardTradeHandoffAttemptError::Conversion { id: *id, source }
+                })?
             }
         };
 
@@ -488,13 +469,10 @@ impl DashboardTradeHandoffAttemptError {
                 | TradeConversionError::Submitted
                 | TradeConversionError::PartiallyFilled
                 | TradeConversionError::Cancelling => true,
-                // A cancellation is terminal, and corrupt persisted
-                // quantities never become convertible, so neither is worth
-                // retrying. `persist_once` completes a cancelled order as a
-                // no-op, so that variant does not reach here in practice.
-                TradeConversionError::Cancelled
-                | TradeConversionError::Arithmetic(_)
-                | TradeConversionError::NegativeShares(_) => false,
+                // Corrupt persisted quantities never become convertible.
+                TradeConversionError::Arithmetic(_) | TradeConversionError::NegativeShares(_) => {
+                    false
+                }
             },
         }
     }
@@ -843,15 +821,14 @@ impl Reactor for Broadcaster {
             .on(|id, event| async move {
                 use OffchainOrderEvent::*;
                 match event {
-                    Filled { .. } | Failed { .. } => {
+                    Filled { .. } | Failed { .. } | Cancelled { .. } => {
                         self.enqueue_offchain_trade(id).await?;
                     }
                     Placed { .. }
                     | Submitted { .. }
                     | Accepted { .. }
                     | PartiallyFilled { .. }
-                    | CancelRequested { .. }
-                    | Cancelled { .. } => {}
+                    | CancelRequested { .. } => {}
                 }
 
                 Ok(())
@@ -1001,60 +978,54 @@ mod tests {
             .unwrap();
     }
 
-    async fn persist_cancelled_offchain_order(pool: SqlitePool, id: OffchainOrderId) {
-        let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool)
-            .build(crate::offchain::order::noop_order_placer())
-            .await
-            .unwrap();
-        let shares = st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
-            st0x_float_macro::float!(1),
-        ))
+    /// Rewrites the persisted terminal fill to a negative quantity, modelling
+    /// history written before the aggregate rejected corrupt broker fills.
+    /// `MarkFailed` refuses that value now, so replayed legacy rows are the
+    /// only remaining source of a non-retryable conversion failure.
+    async fn corrupt_persisted_terminal_fill(pool: &SqlitePool, id: OffchainOrderId) {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT sequence, payload FROM events \
+             WHERE aggregate_id = ? AND payload LIKE '%filled_shares%'",
+        )
+        .bind(id.to_string())
+        .fetch_all(pool)
+        .await
         .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::Place {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    shares,
-                    direction: st0x_execution::Direction::Sell,
-                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
-                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
-                },
-            )
+        let [(sequence, payload)] = rows.as_slice() else {
+            panic!("expected exactly one persisted event carrying a fill, got: {rows:?}");
+        };
+
+        let mut event: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert!(
+            replace_filled_shares(&mut event, "-0.5"),
+            "the persisted terminal event must carry a filled_shares field: {payload}"
+        );
+
+        sqlx::query("UPDATE events SET payload = ? WHERE aggregate_id = ? AND sequence = ?")
+            .bind(serde_json::to_string(&event).unwrap())
+            .bind(id.to_string())
+            .bind(sequence)
+            .execute(pool)
             .await
             .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::MarkAccepted {
-                    executor_order_id: st0x_execution::ExecutorOrderId::new("broker-order"),
-                    placed_shares: shares,
-                    submitted_at: chrono::Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
-                    limit_price: None,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::CancelOrder {
-                    reason: crate::offchain::order::CancellationReason::MarketOpenReplacement,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::ConfirmCancellation {
-                    cancelled_at: chrono::Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+    }
+
+    fn replace_filled_shares(event: &mut serde_json::Value, shares: &str) -> bool {
+        let serde_json::Value::Object(fields) = event else {
+            return false;
+        };
+
+        if fields.contains_key("filled_shares") {
+            fields.insert(
+                "filled_shares".to_string(),
+                serde_json::Value::String(shares.to_string()),
+            );
+            return true;
+        }
+
+        fields
+            .values_mut()
+            .any(|nested| replace_filled_shares(nested, shares))
     }
 
     async fn enqueue_test_delivery(
@@ -1355,10 +1326,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_offchain_order_handoff_is_a_noop() {
+    async fn deterministic_trade_conversion_failure_stops_the_handoff_monitor() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let id = OffchainOrderId::new();
-        persist_cancelled_offchain_order(pool.clone(), id).await;
+        persist_failed_offchain_order(
+            pool.clone(),
+            id,
+            Some(st0x_execution::FractionalShares::new(
+                st0x_float_macro::float!(0.5),
+            )),
+        )
+        .await;
+        corrupt_persisted_terminal_fill(&pool, id).await;
         let (sender, _receiver) = broadcast::channel(16);
         let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
         let mut handoff_monitor = delivery.handoff_monitor.clone();
@@ -1370,34 +1349,18 @@ mod tests {
             .send(DashboardTradeHandoff::ReloadOffchainOrder(id))
             .await
             .unwrap();
-        delivery
-            .broadcaster
-            .handoff_retry_sender
-            .send(DashboardTradeHandoff::Trade(Box::new(test_trade())))
+
+        let error = tokio::time::timeout(Duration::from_secs(1), monitor)
             .await
-            .unwrap();
-
-        // The handoffs are processed in order, so once the trade job lands the
-        // monitor has survived the cancelled handoff, and exactly one job
-        // proves the cancellation delivered nothing.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let jobs: i64 =
-                    sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-                        .bind(std::any::type_name::<DeliverDashboardTrade>())
-                        .fetch_one(delivery.queue.pool())
-                        .await
-                        .unwrap();
-                if jobs == 1 {
-                    break;
-                }
-
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a cancelled handoff must not stop the monitor or deliver anything");
-        monitor.abort();
+            .expect("deterministic conversion must stop the monitor")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<DashboardTradeHandoffMonitorError>(),
+            Some(DashboardTradeHandoffMonitorError::DeterministicConversion(
+                _
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -2009,7 +1972,10 @@ mod tests {
         let message = receiver.recv().await.expect("should receive failure");
         match message {
             Statement::TradeUpdate(trade) => {
-                let history = load_trades(&pool).await.unwrap();
+                let history =
+                    load_trades(&pool, crate::dashboard::TradeProtocol::TerminalOutcomesV2)
+                        .await
+                        .unwrap();
                 assert_eq!(
                     &trade.outcome, &history[0].outcome,
                     "live and historical failure provenance must be identical"
@@ -2049,7 +2015,7 @@ mod tests {
                         );
                         assert!(excess_shares.unwrap().inner().inner().is_zero().unwrap());
                     }
-                    st0x_dto::TradeOutcome::Filled => {
+                    st0x_dto::TradeOutcome::Filled | st0x_dto::TradeOutcome::Cancelled { .. } => {
                         panic!("failed order must broadcast a failure outcome")
                     }
                 }
@@ -2063,6 +2029,108 @@ mod tests {
             unexpected.is_err(),
             "failed outcomes must not be broadcast as legacy fills"
         );
+    }
+
+    #[tokio::test]
+    async fn offchain_order_cancelled_broadcasts_same_provenance_as_history() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(crate::offchain::order::noop_order_placer())
+            .await
+            .unwrap();
+        let (broadcaster, mut receiver, queue, delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
+        let harness = ReactorHarness::new(broadcaster);
+        let id = crate::offchain::order::OffchainOrderId::new();
+        let now = chrono::Utc::now();
+        let shares = Positive::new(FractionalShares::new(st0x_float_macro::float!(1))).unwrap();
+        let filled = FractionalShares::new(st0x_float_macro::float!(0.25));
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares,
+                    direction: st0x_execution::Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("partial-cancel"),
+                    placed_shares: shares,
+                    submitted_at: now,
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: filled,
+                    avg_price: st0x_finance::Usd::new(st0x_float_macro::float!(25)),
+                    partially_filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: crate::offchain::order::CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: filled,
+                    cancelled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let cancelled = OffchainOrderEvent::Cancelled {
+            reason: crate::offchain::order::CancellationReason::MarketOpenReplacement,
+            filled_shares: Some(filled),
+            cancelled_at: now,
+        };
+        harness
+            .receive::<OffchainOrder>(id, cancelled)
+            .await
+            .unwrap();
+        perform_pending_delivery(&queue, &delivery_ctx).await;
+
+        let Statement::TradeUpdate(trade) = receiver.recv().await.unwrap() else {
+            panic!("cancelled order must broadcast a trade update");
+        };
+        let history = load_trades(&pool, crate::dashboard::TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
+        assert_eq!(trade.outcome, history[0].outcome);
+        assert!(matches!(
+            trade.outcome,
+            TradeOutcome::Cancelled {
+                filled_shares: Some(observed),
+                remaining_shares: Some(remaining),
+                ..
+            } if observed.inner().inner().eq(st0x_float_macro::float!(0.25)).unwrap()
+                && remaining.inner().inner().eq(st0x_float_macro::float!(0.75)).unwrap()
+        ));
     }
 
     #[tokio::test]

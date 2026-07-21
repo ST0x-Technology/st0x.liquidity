@@ -240,15 +240,19 @@
     void fetchTrades('append', offset.current + PAGE_SIZE)
   }
 
+  const applyFilterChange = () => {
+    offset.update(() => 0)
+    resetHistoryForFilter()
+    void fetchTrades('replace')
+  }
+
   const applyPreset = (minutes: number) => () => {
     const sinceDate = new Date(Date.now() - minutes * 60_000)
     since.update(() => toDatetimeLocal(sinceDate))
     until.update(() => '')
     if (sinceInput) sinceInput.value = toDatetimeLocal(sinceDate)
     if (untilInput) untilInput.value = ''
-    offset.update(() => 0)
-    resetHistoryForFilter()
-    void fetchTrades('replace')
+    applyFilterChange()
   }
 
   const jumpToLatest = () => {
@@ -256,11 +260,9 @@
     until.update(() => '')
     selectedVenues.update(() => new Set(ALL_VENUES))
     selectedSymbols.update(() => new Set())
-    offset.update(() => 0)
     if (sinceInput) sinceInput.value = ''
     if (untilInput) untilInput.value = ''
-    resetHistoryForFilter()
-    void fetchTrades('replace')
+    applyFilterChange()
   }
 
   const hasFilters = $derived(
@@ -281,30 +283,22 @@
 
   const handleVenueChange = (selected: Set<TradingVenue>) => {
     selectedVenues.update(() => selected)
-    offset.update(() => 0)
-    resetHistoryForFilter()
-    void fetchTrades('replace')
+    applyFilterChange()
   }
 
   const handleSymbolChange = (selected: Set<string>) => {
     selectedSymbols.update(() => selected)
-    offset.update(() => 0)
-    resetHistoryForFilter()
-    void fetchTrades('replace')
+    applyFilterChange()
   }
 
   const handleSinceChange = (event: Event) => {
     since.update(() => (event.target as HTMLInputElement).value)
-    offset.update(() => 0)
-    resetHistoryForFilter()
-    void fetchTrades('replace')
+    applyFilterChange()
   }
 
   const handleUntilChange = (event: Event) => {
     until.update(() => (event.target as HTMLInputElement).value)
-    offset.update(() => 0)
-    resetHistoryForFilter()
-    void fetchTrades('replace')
+    applyFilterChange()
   }
 
   const directionColor = (direction: string): string =>
@@ -313,7 +307,7 @@
   const fmtSize = (value: string): string => formatDecimal(value, 3)
 
   const shareTooltip = (trade: TradeEntry): string =>
-    `${trade.outcome.status === 'failed' ? 'Order quantity. ' : ''}${equityUsdTooltip(
+    `${trade.outcome.status !== 'filled' ? 'Order quantity. ' : ''}${equityUsdTooltip(
       trade.shares,
       positionPrices.get(trade.symbol) ?? null
     )}`

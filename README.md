@@ -301,6 +301,13 @@ preloads 14 days of seeded hedge-latency, mint, redemption, and USDC-rebalance
 history so Performance tab trends and the Transfers panel are populated
 immediately.
 
+`nix run .#simulate-trade-outcomes` starts the same stack as `simulate-market`,
+but rotates every counter-trade through the three outcomes the trade history
+renders: filled, rejected by the broker, and cancelled by the broker after a
+partial fill. Use it to inspect the Status column, the venue/asset/time-range
+filters, and the accepted/filled/unfilled breakdown in the detail panel without
+waiting for a real failure.
+
 `nix run .#simulate-failures` starts the same stack as `simulate-market`, then
 creates failed mint and redemption rebalances whose mock Alpaca provider later
 completes and prints the `transfer recheck` commands that recover them.
