@@ -19,7 +19,7 @@ use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId, ConversionDirection,
-    CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer, TransferStatus,
+    CryptoOrderOutcome, HasZero, Network, Positive, TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
@@ -1437,7 +1437,7 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<Transfer, UsdcTransferError> {
-        let usdc = TokenSymbol::new("USDC");
+        let usdc = usdc_token_symbol();
         let positive_amount = Positive::new(amount)?;
 
         let transfer = match self
@@ -2217,9 +2217,7 @@ impl<
 
                 warn!(target: "rebalance", order_id = %order.id, ?reason, ?partial_fill, "Resumed conversion order failed terminally");
                 let partial_suffix = partial_fill
-                    .map(|filled| {
-                        format!(" (partial fill {} needs reconciliation)", Usdc::new(filled))
-                    })
+                    .map(|filled| format!(" (partial fill {filled} needs reconciliation)"))
                     .unwrap_or_default();
                 self.cqrs
                     .send(
@@ -2512,7 +2510,7 @@ impl<
         &self,
         id: &UsdcRebalanceId,
     ) -> Result<Address, UsdcTransferError> {
-        let usdc = TokenSymbol::new("USDC");
+        let usdc = usdc_token_symbol();
         let ethereum = Network::new("ethereum");
 
         match self
@@ -3591,6 +3589,13 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
     Ok(usdc.to_u256_6_decimals()?)
 }
 
+fn usdc_token_symbol() -> TokenSymbol {
+    let Ok(symbol) = TokenSymbol::new("USDC") else {
+        unreachable!("USDC is a non-empty token symbol")
+    };
+    symbol
+}
+
 /// Converts a U256 amount (with 6 decimals) to USDC decimal.
 pub(crate) fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
     Ok(Usdc::new(Float::from_fixed_decimal(amount, 6)?))
@@ -3614,8 +3619,7 @@ fn conversion_amounts_from_order(
                 order_id: correlation_id.clone(),
             })?;
 
-    let filled_quantity = Usdc::new(filled_quantity);
-    let cash_proceeds = std::ops::Mul::mul(filled_quantity, filled_average_price)?;
+    let cash_proceeds = std::ops::Mul::mul(filled_quantity, filled_average_price.inner())?;
 
     Ok(match direction {
         ConversionDirection::UsdToUsdc => ConversionAmounts::new(cash_proceeds, filled_quantity),
@@ -4186,7 +4190,7 @@ mod tests {
             "test_secret".to_string(),
         );
 
-        AlpacaWalletService::new_with_client(client, None)
+        AlpacaWalletService::new_with_client(client.unwrap(), None)
     }
 
     fn create_test_wallet(
@@ -8402,7 +8406,7 @@ mod tests {
             max_retry_delay: Duration::from_millis(20),
         };
 
-        AlpacaWalletService::new_with_client(client, Some(polling))
+        AlpacaWalletService::new_with_client(client.unwrap(), Some(polling))
     }
 
     const ALPACA_DEPOSIT_ADDRESS: Address = address!("0x000000000000000000000000000000000000A1BC");

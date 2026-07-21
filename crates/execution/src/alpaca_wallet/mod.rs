@@ -1,56 +1,147 @@
-//! Alpaca Broker API crypto wallet client for USDC deposits and withdrawals.
-//!
-//! This module integrates with the wallet endpoints of the Alpaca Broker API,
-//! supporting USDC deposit address lookup, deposits, and withdrawals.
-//!
-//! # Authentication
-//!
-//! Authentication uses Alpaca Broker API credentials (API key and secret).
-//! The client automatically fetches and caches the account ID.
-//!
-//! # Whitelisting
-//!
-//! Alpaca requires addresses to be whitelisted before
-//! withdrawals. After whitelisting, there is a 24-hour
-//! approval period before the address can be used.
-//!
-//! # Transfer Lifecycle
-//!
-//! Transfers progress through states:
-//! Pending -> Processing -> Complete/Failed.
-//! Use `poll_transfer_until_complete()` to wait for a
-//! transfer to reach a terminal state.
-
-mod asset;
-mod client;
-mod status;
-mod transfer;
-mod whitelist;
-
 use alloy::primitives::{Address, TxHash};
-use std::sync::Arc;
-use tracing::error;
+use std::time::Duration;
+use thiserror::Error;
 
-use st0x_finance::Usdc;
+use crate::{AlpacaAccountId, Positive, Usdc};
 
-use crate::{AlpacaAccountId, Positive};
+pub use st0x_alpaca::wallet::{
+    AlpacaTransferId, Network, PollingConfig, TokenSymbol, Transfer, TransferStatus,
+    TravelRuleInfo, WhitelistEntry, WhitelistStatus,
+};
 
-#[cfg(any(test, feature = "test-support"))]
-pub use client::AlpacaWalletClient;
-#[cfg(not(any(test, feature = "test-support")))]
-use client::AlpacaWalletClient;
-pub use client::AlpacaWalletError;
-pub use status::PollingConfig;
-pub use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
-pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
+#[derive(Debug, Error)]
+pub enum AlpacaWalletError {
+    #[error(transparent)]
+    Shared(st0x_alpaca::wallet::AlpacaWalletError),
+    #[error("API error (status {status}): {message}")]
+    ApiError {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+    #[error("Transfer not found: {transfer_id}")]
+    TransferNotFound { transfer_id: AlpacaTransferId },
+    #[error("Transfer {transfer_id} failed but reported on-chain tx {tx_hash}")]
+    FailedTransferHasTx {
+        transfer_id: AlpacaTransferId,
+        tx_hash: TxHash,
+    },
+    #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
+    TransferTimeout {
+        transfer_id: AlpacaTransferId,
+        elapsed: Duration,
+    },
+    #[error("Invalid status transition for transfer {transfer_id}: {previous:?} -> {next:?}")]
+    InvalidStatusTransition {
+        transfer_id: AlpacaTransferId,
+        previous: TransferStatus,
+        next: TransferStatus,
+    },
+    #[error("Address {address} is not whitelisted for {asset} on {network}")]
+    AddressNotWhitelisted {
+        address: Address,
+        asset: TokenSymbol,
+        network: Network,
+    },
+    #[error("No whitelist entries found for address {address}")]
+    NoWhitelistEntries { address: Address },
+    #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
+    DepositTimeout { tx_hash: TxHash, elapsed: Duration },
+    #[error("Invalid status transition for deposit {tx_hash}: {previous:?} -> {next:?}")]
+    InvalidDepositTransition {
+        tx_hash: TxHash,
+        previous: TransferStatus,
+        next: TransferStatus,
+    },
+}
 
-/// Service facade for Alpaca crypto wallet operations.
-///
-/// Provides a high-level API for deposit address lookup, deposits, withdrawals,
-/// and transfer polling.
+impl From<st0x_alpaca::wallet::AlpacaWalletError> for AlpacaWalletError {
+    fn from(error: st0x_alpaca::wallet::AlpacaWalletError) -> Self {
+        use st0x_alpaca::wallet::AlpacaWalletError as Shared;
+
+        match error {
+            Shared::Alpaca(st0x_alpaca::AlpacaError::Api { status_code, body }) => {
+                let Ok(status) = reqwest::StatusCode::from_u16(status_code) else {
+                    unreachable!("reqwest status codes always round-trip through u16");
+                };
+                Self::ApiError {
+                    status,
+                    message: body,
+                }
+            }
+            Shared::TransferNotFound { transfer_id } => Self::TransferNotFound { transfer_id },
+            Shared::TransferTimeout {
+                transfer_id,
+                elapsed,
+            } => Self::TransferTimeout {
+                transfer_id,
+                elapsed,
+            },
+            Shared::InvalidStatusTransition {
+                transfer_id,
+                previous,
+                next,
+            } => Self::InvalidStatusTransition {
+                transfer_id,
+                previous,
+                next,
+            },
+            Shared::AddressNotWhitelisted {
+                address,
+                asset,
+                network,
+            } => Self::AddressNotWhitelisted {
+                address,
+                asset,
+                network,
+            },
+            Shared::NoWhitelistEntries { address } => Self::NoWhitelistEntries { address },
+            Shared::DepositTimeout { tx_hash, elapsed } => {
+                Self::DepositTimeout { tx_hash, elapsed }
+            }
+            Shared::InvalidDepositTransition {
+                tx_hash,
+                previous,
+                next,
+            } => Self::InvalidDepositTransition {
+                tx_hash,
+                previous,
+                next,
+            },
+            error @ Shared::Alpaca(_) => Self::Shared(error),
+        }
+    }
+}
+
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub struct AlpacaWalletClient(st0x_alpaca::AlpacaClient);
+
+impl AlpacaWalletClient {
+    pub fn new(
+        base_url: String,
+        account_id: AlpacaAccountId,
+        api_key: String,
+        api_secret: String,
+    ) -> Result<Self, AlpacaWalletError> {
+        st0x_alpaca::AlpacaClient::new(
+            base_url,
+            account_id.to_string(),
+            api_key,
+            api_secret,
+            HTTP_CONNECT_TIMEOUT,
+            HTTP_REQUEST_TIMEOUT,
+        )
+        .map(Self)
+        .map_err(st0x_alpaca::wallet::AlpacaWalletError::from)
+        .map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AlpacaWalletService {
-    client: Arc<AlpacaWalletClient>,
-    polling_config: PollingConfig,
+    inner: st0x_alpaca::wallet::AlpacaWalletService,
 }
 
 impl AlpacaWalletService {
@@ -59,90 +150,53 @@ impl AlpacaWalletService {
         account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
-    ) -> Self {
-        let client = AlpacaWalletClient::new(base_url, account_id, api_key, api_secret);
-
-        Self {
-            client: Arc::new(client),
-            polling_config: PollingConfig::default(),
-        }
+    ) -> Result<Self, AlpacaWalletError> {
+        AlpacaWalletClient::new(base_url, account_id, api_key, api_secret)
+            .map(|client| Self::new_with_client(client, None))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_client(
         client: AlpacaWalletClient,
         polling_config: Option<PollingConfig>,
     ) -> Self {
         Self {
-            client: Arc::new(client),
-            polling_config: polling_config.unwrap_or_default(),
+            inner: st0x_alpaca::wallet::AlpacaWalletService {
+                client: client.0,
+                polling_config: polling_config.unwrap_or_default(),
+            },
         }
     }
 
-    /// Initiates a withdrawal to a whitelisted address.
-    ///
-    /// The address must be whitelisted and approved before this call.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The address is not whitelisted and approved
-    /// - The API call fails
     pub async fn initiate_withdrawal(
         &self,
         amount: Positive<Usdc>,
         asset: &TokenSymbol,
         to_address: &Address,
     ) -> Result<Transfer, AlpacaWalletError> {
-        let network = Network::new("ethereum");
-
-        if !self
-            .client
-            .is_address_whitelisted_and_approved(to_address, asset, &network)
-            .await?
-        {
-            return Err(AlpacaWalletError::AddressNotWhitelisted {
-                address: *to_address,
-                asset: asset.clone(),
-                network,
-            });
-        }
-
-        transfer::initiate_withdrawal(&self.client, amount, asset, to_address).await
+        self.inner
+            .initiate_withdrawal(amount.inner(), asset, to_address)
+            .await
+            .map_err(Into::into)
     }
 
-    /// Polls a transfer until it reaches a terminal state (Complete or Failed).
-    ///
-    /// This method will retry transient errors and timeout after the configured duration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The transfer times out
-    /// - An invalid status regression is detected
-    /// - The API call fails persistently
     pub async fn poll_transfer_until_complete(
         &self,
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
-        status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
+        self.inner
+            .poll_transfer_until_complete(transfer_id)
+            .await
+            .map_err(Into::into)
     }
 
-    /// Polls for an incoming deposit by its on-chain transaction hash.
-    ///
-    /// Alpaca auto-detects incoming transfers to their funding wallet addresses.
-    /// This method polls until the deposit is detected and reaches a terminal state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The deposit times out (not detected within timeout)
-    /// - The API call fails persistently
     pub async fn poll_deposit_by_tx_hash(
         &self,
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
-        status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
+        self.inner
+            .poll_deposit_by_tx_hash(tx_hash)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn get_wallet_address(
@@ -150,7 +204,10 @@ impl AlpacaWalletService {
         asset: &TokenSymbol,
         network: &Network,
     ) -> Result<Address, AlpacaWalletError> {
-        self.client.get_wallet_address(asset, network).await
+        self.inner
+            .get_wallet_address(asset, network)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn create_whitelist_entry(
@@ -159,400 +216,43 @@ impl AlpacaWalletService {
         asset: &TokenSymbol,
         network: &Network,
         travel_rule_info: &TravelRuleInfo,
-    ) -> Result<whitelist::WhitelistEntry, AlpacaWalletError> {
-        self.client
+    ) -> Result<WhitelistEntry, AlpacaWalletError> {
+        self.inner
             .create_whitelist_entry(address, asset, network, travel_rule_info)
             .await
+            .map_err(Into::into)
     }
 
-    /// Removes all whitelist entries matching the given address.
-    ///
-    /// Returns the entries that were deleted. Errors if no entries
-    /// match the address.
     pub async fn remove_whitelist_entries(
         &self,
         address: &Address,
-    ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
-        let entries = self.client.get_whitelisted_addresses().await?;
-
-        let matching: Vec<_> = entries
-            .into_iter()
-            .filter(|e| e.address == *address)
-            .collect();
-
-        if matching.is_empty() {
-            return Err(AlpacaWalletError::NoWhitelistEntries { address: *address });
-        }
-
-        for entry in &matching {
-            self.client.delete_whitelist_entry(&entry.id).await?;
-        }
-
-        Ok(matching)
+    ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
+        self.inner
+            .remove_whitelist_entries(address)
+            .await
+            .map_err(Into::into)
     }
 
-    /// Patches travel rule info on all existing whitelisted addresses.
-    ///
-    /// Returns all whitelist entries that were patched.
     pub async fn patch_all_whitelist_travel_rules(
         &self,
         travel_rule_info: &TravelRuleInfo,
-    ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
-        let entries = self.client.get_whitelisted_addresses().await?;
-
-        for entry in &entries {
-            self.client
-                .patch_whitelist_travel_rule(&entry.id, travel_rule_info)
-                .await
-                .inspect_err(|err| {
-                    error!(
-                        target: "wallet",
-                        whitelist_id = %entry.id,
-                        address = %entry.address,
-                        ?err,
-                        "failed to patch travel rule on whitelist entry"
-                    );
-                })?;
-        }
-
-        Ok(entries)
+    ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
+        self.inner
+            .patch_all_whitelist_travel_rules(travel_rule_info)
+            .await
+            .map_err(Into::into)
     }
 
-    /// Gets all whitelisted addresses for this account.
     pub async fn get_whitelisted_addresses(
         &self,
-    ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
-        self.client.get_whitelisted_addresses().await
-    }
-
-    /// Lists all transfers for this account.
-    pub async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
-        transfer::list_all_transfers(&self.client).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::primitives::address;
-    use httpmock::prelude::*;
-    use serde_json::json;
-    use std::time::Duration;
-    use uuid::{Uuid, uuid};
-
-    use crate::AlpacaAccountId;
-
-    use super::*;
-    use st0x_float_macro::float;
-
-    const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
-
-    fn create_test_service(server: &MockServer) -> AlpacaWalletService {
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
-
-        AlpacaWalletService::new_with_client(client, None)
-    }
-
-    #[tokio::test]
-    async fn test_initiate_withdrawal_not_whitelisted() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let asset = TokenSymbol::new("USDC");
-        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
-
-        assert!(matches!(
-            service
-                .initiate_withdrawal(amount, &asset, &to_address)
-                .await
-                .unwrap_err(),
-            AlpacaWalletError::AddressNotWhitelisted { .. }
-        ));
-        whitelist_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_initiate_withdrawal_pending_whitelist() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "id": "whitelist-123",
-                    "address": to_address.to_string(),
-                    "asset": "USDC",
-                    "chain": "ethereum",
-                    "status": "PENDING",
-                    "created_at": "2024-01-01T00:00:00Z"
-                }]));
-        });
-
-        let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
-
-        assert!(matches!(
-            service
-                .initiate_withdrawal(amount, &asset, &to_address)
-                .await
-                .unwrap_err(),
-            AlpacaWalletError::AddressNotWhitelisted { .. }
-        ));
-        whitelist_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_initiate_withdrawal_approved() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "id": "whitelist-123",
-                    "address": to_address.to_string(),
-                    "asset": "USDC",
-                    "chain": "ethereum",
-                    "status": "APPROVED",
-                    "created_at": "2024-01-01T00:00:00Z"
-                }]));
-        });
-
-        let transfer_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "550e8400-e29b-41d4-a716-446655440000",
-                    "direction": "OUTGOING",
-                    "amount": "100",
-                    "usd_value": "100",
-                    "chain": "ethereum",
-                    "asset": "USDC",
-                    "from_address": "0x0000000000000000000000000000000000000001",
-                    "to_address": to_address.to_string(),
-                    "status": "PENDING",
-                    "tx_hash": null,
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee": "0",
-                    "fees": "0"
-                }));
-        });
-
-        let asset = TokenSymbol::new("USDC");
-        let amount = Positive::new(Usdc::new(float!(100))).unwrap();
-
-        let result = service
-            .initiate_withdrawal(amount, &asset, &to_address)
+    ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
+        self.inner
+            .get_whitelisted_addresses()
             .await
-            .unwrap();
-
-        assert_eq!(result.to, to_address);
-        whitelist_mock.assert();
-        transfer_mock.assert();
+            .map_err(Into::into)
     }
 
-    #[tokio::test]
-    async fn test_poll_transfer_until_complete() {
-        let server = MockServer::start();
-
-        let polling_config = PollingConfig {
-            interval: Duration::from_millis(10),
-            timeout: Duration::from_secs(5),
-            max_retries: 3,
-            min_retry_delay: Duration::from_millis(10),
-            max_retry_delay: Duration::from_millis(100),
-        };
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
-
-        let service = AlpacaWalletService::new_with_client(client, Some(polling_config));
-
-        let transfer_id = Uuid::new_v4();
-
-        let status_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_id}"
-            ));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": transfer_id,
-                    "direction": "OUTGOING",
-                    "amount": "100",
-                    "usd_value": "100",
-                    "chain": "ethereum",
-                    "asset": "USDC",
-                    "from_address": "0x0000000000000000000000000000000000000001",
-                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "status": "COMPLETE",
-                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee": "0.5",
-                    "fees": "0"
-                }));
-        });
-
-        let tid = transfer::AlpacaTransferId::from(transfer_id);
-        let result = service.poll_transfer_until_complete(&tid).await.unwrap();
-
-        assert_eq!(result.status, transfer::TransferStatus::Complete);
-        status_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_remove_whitelist_entries_found() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let target = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let list_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "id": "wl-111",
-                    "address": target.to_string(),
-                    "asset": "USDC",
-                    "chain": "ethereum",
-                    "status": "APPROVED",
-                    "created_at": "2024-01-01T00:00:00Z"
-                }]));
-        });
-
-        let delete_mock = server.mock(|when, then| {
-            when.method(DELETE).path(
-                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists/wl-111",
-            );
-            then.status(204);
-        });
-
-        let removed = service.remove_whitelist_entries(&target).await.unwrap();
-
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].id, "wl-111");
-        assert_eq!(removed[0].address, target);
-        list_mock.assert();
-        delete_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_remove_whitelist_entries_not_found() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let target = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let other = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-
-        let list_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "id": "wl-222",
-                    "address": other,
-                    "asset": "USDC",
-                    "chain": "ethereum",
-                    "status": "APPROVED",
-                    "created_at": "2024-01-01T00:00:00Z"
-                }]));
-        });
-
-        assert!(matches!(
-            service
-                .remove_whitelist_entries(&target)
-                .await
-                .unwrap_err(),
-            AlpacaWalletError::NoWhitelistEntries { address }
-                if address == target
-        ));
-        list_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_remove_whitelist_entries_multiple() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let target = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let list_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": "wl-aaa",
-                        "address": target.to_string(),
-                        "asset": "USDC",
-                        "chain": "ethereum",
-                        "status": "APPROVED",
-                        "created_at": "2024-01-01T00:00:00Z"
-                    },
-                    {
-                        "id": "wl-bbb",
-                        "address": target.to_string(),
-                        "asset": "USDC",
-                        "chain": "ethereum",
-                        "status": "PENDING",
-                        "created_at": "2024-02-01T00:00:00Z"
-                    }
-                ]));
-        });
-
-        let delete_aaa = server.mock(|when, then| {
-            when.method(DELETE).path(
-                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists/wl-aaa",
-            );
-            then.status(204);
-        });
-
-        let delete_bbb = server.mock(|when, then| {
-            when.method(DELETE).path(
-                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists/wl-bbb",
-            );
-            then.status(204);
-        });
-
-        let removed = service.remove_whitelist_entries(&target).await.unwrap();
-
-        assert_eq!(removed.len(), 2);
-        list_mock.assert();
-        delete_aaa.assert();
-        delete_bbb.assert();
+    pub async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
+        self.inner.list_all_transfers().await.map_err(Into::into)
     }
 }

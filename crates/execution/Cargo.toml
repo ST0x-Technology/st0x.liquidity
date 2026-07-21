@@ -40,6 +40,11 @@ urlencoding.workspace = true
 uuid.workspace = true
 
 st0x-dto = { version = "0.1.0", path = "../dto" }
+st0x-alpaca = { workspace = true, features = [
+  "broker",
+  "market-data",
+  "wallet",
+] }
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true

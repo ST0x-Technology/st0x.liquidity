@@ -9,15 +9,9 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{debug, info};
 
-pub(crate) use st0x_float_serde::{
-    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
-    serialize_float_as_string,
-};
-
 pub use st0x_float_macro::float;
 
 pub mod alpaca_broker_api;
-mod alpaca_market_data;
 mod alpaca_wallet;
 pub mod error;
 pub mod mock;

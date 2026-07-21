@@ -1616,7 +1616,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             alpaca_auth.account_id,
             alpaca_auth.api_key.clone(),
             alpaca_auth.api_secret.clone(),
-        ));
+        )?);
 
         // Wrap with telemetry before threading down so rebalancer Alpaca calls
         // emit broker dependency samples (mirrors hedge executor wrapping).
