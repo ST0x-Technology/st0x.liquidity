@@ -119,6 +119,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_number: 12345,
+                    block_hash: None,
                     block_timestamp: now,
                 },
             )
@@ -220,6 +221,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp: now,
                 },
             )
@@ -235,6 +237,7 @@ mod tests {
                     direction: Direction::Sell,
                     price_usdc: float!(200),
                     block_number: 2,
+                    block_hash: None,
                     block_timestamp: now,
                 },
             )
@@ -276,6 +279,7 @@ mod tests {
                         direction: Direction::Buy,
                         price_usdc: float!(100),
                         block_number: log_index,
+                        block_hash: None,
                         block_timestamp: now,
                     },
                 )

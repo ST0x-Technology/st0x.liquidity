@@ -8,7 +8,7 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 
 use alloy::hex::FromHexError;
-use alloy::primitives::TxHash;
+use alloy::primitives::{B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
@@ -74,6 +74,12 @@ pub(crate) struct OnChainTrade {
     )]
     pub(crate) price_usdc: Float,
     pub(crate) block_number: Option<u64>,
+    /// Hash of the block this fill was confirmed in, persisted so a later
+    /// replay against a different fork is detectable as a reorg rather than a
+    /// duplicate. Absent on aggregates persisted before the field existed and on
+    /// fills whose source log carried no block hash.
+    #[serde(default)]
+    pub(crate) block_hash: Option<B256>,
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) filled_at: DateTime<Utc>,
     pub(crate) enrichment: Option<Enrichment>,
@@ -109,6 +115,7 @@ impl EventSourced for OnChainTrade {
                 direction,
                 price_usdc,
                 block_number,
+                block_hash,
                 block_timestamp,
                 filled_at,
             } => Some(Self {
@@ -117,6 +124,7 @@ impl EventSourced for OnChainTrade {
                 direction: *direction,
                 price_usdc: *price_usdc,
                 block_number: Some(*block_number),
+                block_hash: *block_hash,
                 block_timestamp: *block_timestamp,
                 filled_at: *filled_at,
                 enrichment: None,
@@ -167,6 +175,7 @@ impl EventSourced for OnChainTrade {
                 direction,
                 price_usdc,
                 block_number,
+                block_hash,
                 block_timestamp,
             } => Ok(vec![Filled {
                 symbol,
@@ -174,6 +183,7 @@ impl EventSourced for OnChainTrade {
                 direction,
                 price_usdc,
                 block_number,
+                block_hash,
                 block_timestamp,
                 filled_at: Utc::now(),
             }]),
@@ -185,6 +195,7 @@ impl EventSourced for OnChainTrade {
                 direction,
                 price_usdc,
                 block_number,
+                block_hash,
                 block_timestamp,
                 filled_at,
             } => Ok(vec![Filled {
@@ -193,6 +204,7 @@ impl EventSourced for OnChainTrade {
                 direction,
                 price_usdc,
                 block_number,
+                block_hash,
                 block_timestamp,
                 filled_at,
             }]),
@@ -309,6 +321,7 @@ pub(crate) enum OnChainTradeCommand {
         )]
         price_usdc: Float,
         block_number: u64,
+        block_hash: Option<B256>,
         block_timestamp: DateTime<Utc>,
     },
     /// Test/fixture-only: identical to `Witness` but takes `filled_at`
@@ -329,6 +342,7 @@ pub(crate) enum OnChainTradeCommand {
         )]
         price_usdc: Float,
         block_number: u64,
+        block_hash: Option<B256>,
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
     },
@@ -359,6 +373,8 @@ pub(crate) enum OnChainTradeEvent {
         )]
         price_usdc: Float,
         block_number: u64,
+        #[serde(default)]
+        block_hash: Option<B256>,
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
     },
@@ -384,6 +400,7 @@ impl PartialEq for OnChainTradeEvent {
                     direction: dir_a,
                     price_usdc: price_a,
                     block_number: block_num_a,
+                    block_hash: block_hash_a,
                     block_timestamp: block_ts_a,
                     filled_at: fill_a,
                 },
@@ -393,6 +410,7 @@ impl PartialEq for OnChainTradeEvent {
                     direction: dir_b,
                     price_usdc: price_b,
                     block_number: block_num_b,
+                    block_hash: block_hash_b,
                     block_timestamp: block_ts_b,
                     filled_at: fill_b,
                 },
@@ -402,6 +420,7 @@ impl PartialEq for OnChainTradeEvent {
                     && dir_a == dir_b
                     && price_a.eq(*price_b).unwrap_or(false)
                     && block_num_a == block_num_b
+                    && block_hash_a == block_hash_b
                     && block_ts_a == block_ts_b
                     && fill_a == fill_b
             }
@@ -466,6 +485,7 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::b256;
     use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
 
     use super::*;
@@ -484,6 +504,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
             })
             .await
@@ -510,6 +531,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp,
                 filled_at,
             })
@@ -525,6 +547,39 @@ mod tests {
             panic!("Expected Filled, got: {:?}", events[0]);
         };
         assert_eq!(*event_filled_at, filled_at);
+    }
+
+    #[tokio::test]
+    async fn witness_threads_block_hash_into_filled_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let block_hash =
+            b256!("0xabababababababababababababababababababababababababababababababab");
+
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given_no_previous_events()
+            .when(OnChainTradeCommand::Witness {
+                symbol,
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_hash: Some(block_hash),
+                block_timestamp: now,
+            })
+            .await
+            .events();
+
+        let [
+            OnChainTradeEvent::Filled {
+                block_hash: emitted,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected a single Filled event, got {events:?}");
+        };
+        assert_eq!(*emitted, Some(block_hash));
     }
 
     #[tokio::test]
@@ -546,6 +601,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
                 filled_at: now,
             }])
@@ -581,6 +637,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.25),
                     block_number: 12345,
+                    block_hash: None,
                     block_timestamp: now,
                     filled_at: now,
                 },
@@ -651,6 +708,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!("150.25"),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
                 filled_at: now,
             }])
@@ -680,6 +738,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
                 filled_at: now,
             }])
@@ -706,6 +765,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.25),
                     block_number: 12345,
+                    block_hash: None,
                     block_timestamp: now,
                     filled_at: now,
                 },
@@ -753,6 +813,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
                 filled_at: now,
             },
@@ -790,6 +851,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
                 filled_at: now,
             }])
@@ -799,6 +861,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
             })
             .await
@@ -830,6 +893,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.25),
                     block_number: 12345,
+                    block_hash: None,
                     block_timestamp: now,
                     filled_at: now,
                 },
@@ -846,6 +910,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
             })
             .await
@@ -868,6 +933,7 @@ mod tests {
             direction: Direction::Buy,
             price_usdc: float!(150.25),
             block_number: 12345,
+            block_hash: None,
             block_timestamp: now,
             filled_at: now,
         }])
@@ -878,6 +944,54 @@ mod tests {
         assert!(trade.amount.eq(float!(10.5)).unwrap());
         assert_eq!(trade.direction, Direction::Buy);
         assert!(!trade.is_enriched());
+    }
+
+    #[test]
+    fn filled_carries_block_hash_into_live_state() {
+        let block_hash =
+            b256!("0xabababababababababababababababababababababababababababababababab");
+        let now = Utc::now();
+
+        let trade = replay::<OnChainTrade>(vec![OnChainTradeEvent::Filled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            amount: float!(10.5),
+            direction: Direction::Buy,
+            price_usdc: float!(150.25),
+            block_number: 12345,
+            block_hash: Some(block_hash),
+            block_timestamp: now,
+            filled_at: now,
+        }])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(trade.block_hash, Some(block_hash));
+    }
+
+    /// Fills persisted before `block_hash` existed deserialize with `None`
+    /// rather than failing replay (the `#[serde(default)]` resume guarantee).
+    #[test]
+    fn filled_event_without_block_hash_deserializes_to_none() {
+        let now = Utc::now();
+        let legacy_filled = serde_json::json!({
+            "Filled": {
+                "symbol": "AAPL",
+                "amount": "10.5",
+                "direction": "Buy",
+                "price_usdc": "150.25",
+                "block_number": 12345,
+                "block_timestamp": now,
+                "filled_at": now,
+            }
+        });
+
+        let event: OnChainTradeEvent = serde_json::from_value(legacy_filled).unwrap();
+
+        let OnChainTradeEvent::Filled { block_hash, .. } = event else {
+            panic!("expected Filled, got {event:?}");
+        };
+
+        assert_eq!(block_hash, None);
     }
 
     #[test]
@@ -898,6 +1012,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150.25),
                 block_number: 12345,
+                block_hash: None,
                 block_timestamp: now,
                 filled_at: now,
             },

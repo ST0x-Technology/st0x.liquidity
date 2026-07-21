@@ -25,4 +25,5 @@ mod full_system_chaos;
 mod hedging;
 mod poll;
 mod rebalancing;
+mod reorg;
 mod test_infra;

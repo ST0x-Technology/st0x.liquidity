@@ -243,6 +243,7 @@ pub async fn seed_simulated_hedge_latency_history(
                         direction: Direction::Buy,
                         price_usdc: onchain_price,
                         block_number,
+                        block_hash: None,
                         block_timestamp,
                         filled_at: seen_at,
                     },

@@ -586,6 +586,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             tx_hash,
             log_index,
             block_number: take_log.block_number.unwrap(),
+            block_hash: take_log.block_hash,
             event: RaindexTradeEvent::TakeOrderV3(Box::new(take_event_for_queue)),
             block_timestamp: trade.block_timestamp,
         };
