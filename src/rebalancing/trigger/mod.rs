@@ -21951,6 +21951,12 @@ mod tests {
     /// only path that could re-issue a terminal offchain event for the
     /// symbol is itself gated. Inventory drift is bounded by the next
     /// polling snapshot (~60s) and is preferable to indefinite deadlock.
+    ///
+    /// Also pins the failed-fill clear's `None` semantics for
+    /// `last_offchain_fill_applied_at`: the prior successful fill's timestamp
+    /// must be retained (a pre-prior-fill snapshot stays rejected) but not
+    /// advanced (a post-prior-fill snapshot still applies and heals). Either
+    /// flip of `result.is_ok().then(Utc::now)` breaks one of the two.
     #[tokio::test]
     async fn offchain_order_filled_releases_gate_even_when_inventory_update_fails() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -21965,6 +21971,16 @@ mod tests {
 
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        // A previous hedge on this symbol filled successfully at
+        // `prior_fill_at`; a poll read shortly after it at `mid_read_at`.
+        let prior_fill_at = Utc::now() - chrono::Duration::seconds(2);
+        let mid_read_at = Utc::now() - chrono::Duration::seconds(1);
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .clear_offchain_order_pending(&symbol, Some(prior_fill_at));
 
         harness
             .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
@@ -21986,6 +22002,60 @@ mod tests {
         assert!(
             !trigger.has_pending_offchain_order(&symbol).await,
             "Inventory update failure on a Filled event must not leave the gate stuck"
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Retention: a snapshot read before the prior fill must stay
+        // rejected. Delivered first, before any snapshot has applied, so the
+        // watermark cannot mask the guard. If the failed clear had removed
+        // the timestamp, this stale read would resurrect 100.
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id.clone(),
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(100))]),
+                    fetched_at: prior_fill_at - chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(4)),
+            "a snapshot read before the prior fill must stay rejected after \
+             a failed clear; 100 means the retained timestamp was dropped"
+        );
+
+        // Non-advancement: a snapshot read after the prior fill but before
+        // the failed fill must still apply and heal. If the failed clear had
+        // stamped `Utc::now()`, this read would be over-blocked.
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(7))]),
+                    fetched_at: mid_read_at,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(7)),
+            "a snapshot read after the prior fill must still heal a failed \
+             clear; 4 means the failed clear advanced the applied-fill time"
         );
     }
 
