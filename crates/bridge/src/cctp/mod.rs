@@ -1164,10 +1164,17 @@ where
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<crate::BurnTxStatus, Self::Error> {
         match direction {
-            BridgeDirection::EthereumToBase => self.ethereum.burn_status(tx_hash).await,
-            BridgeDirection::BaseToEthereum => self.base.burn_status(tx_hash).await,
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .burn_status(tx_hash, submitted_after_block)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base.burn_status(tx_hash, submitted_after_block).await
+            }
         }
     }
 
@@ -4610,7 +4617,7 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .burn_status(success_receipt.transaction_hash)
+                .burn_status(success_receipt.transaction_hash, 0)
                 .await
                 .unwrap(),
             crate::BurnTxStatus::MinedSuccess
@@ -4618,7 +4625,7 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .burn_status(reverted_receipt.transaction_hash)
+                .burn_status(reverted_receipt.transaction_hash, 0)
                 .await
                 .unwrap(),
             crate::BurnTxStatus::MinedReverted
@@ -4662,7 +4669,7 @@ mod tests {
         // for a truly-absent tx), a mempool-visible tx must be Pending.
         let status = bridge
             .ethereum
-            .burn_status_with_config(pending_tx, super::evm::BurnDropConfig::fast())
+            .burn_status_with_config(pending_tx, 0, super::evm::BurnDropConfig::fast())
             .await
             .unwrap();
 
@@ -4674,9 +4681,10 @@ mod tests {
     }
 
     /// A tx absent from both the receipt lookup and the mempool, observed past the
-    /// grace window and the consecutive-miss threshold, classifies as `Dropped`
-    /// so the caller can fail closed and require operator verification. Uses a
-    /// zero grace + single miss to keep the test fast.
+    /// grace window and the consecutive-miss threshold BY A CAUGHT-UP NODE (head
+    /// confirmations-deep past the pre-burn block), classifies as `Dropped` so the
+    /// caller can fail closed and require operator verification. Uses a zero grace
+    /// + single miss to keep the test fast.
     #[tokio::test]
     async fn burn_status_reports_dropped_for_absent_tx_past_grace() {
         let (_anvil, endpoint, private_key) = setup_anvil();
@@ -4684,12 +4692,17 @@ mod tests {
             .await
             .unwrap();
 
+        // Advance the head past the freshness margin so the node's absence
+        // report is trusted as evidence (submitted_after_block = 0).
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        provider.anvil_mine(Some(5), None).await.unwrap();
+
         let unknown_tx =
             b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let status = bridge
             .ethereum
-            .burn_status_with_config(unknown_tx, super::evm::BurnDropConfig::fast())
+            .burn_status_with_config(unknown_tx, 0, super::evm::BurnDropConfig::fast())
             .await
             .unwrap();
 
@@ -4697,6 +4710,38 @@ mod tests {
             status,
             crate::BurnTxStatus::Dropped,
             "an absent tx past the grace + consecutive-miss threshold must classify as Dropped"
+        );
+    }
+
+    /// The RAI-1241 incident shape: a mined-but-lagging node reports BOTH the
+    /// receipt and `get_transaction_by_hash` as `None` while its head is still
+    /// behind the pre-burn block. Such a node proves nothing, so the verdict
+    /// must be `Pending` (retryable), never `Dropped` -- a synced node would
+    /// never return `None` for a mined tx.
+    #[tokio::test]
+    async fn burn_status_reports_pending_when_node_lags_submission_block() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap();
+
+        // Fresh anvil head is 0; claiming the burn broadcast after block 100
+        // makes this node provably NOT confirmations-deep past the submission
+        // block -- the lagging-backend scenario.
+        let unknown_tx =
+            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let status = bridge
+            .ethereum
+            .burn_status_with_config(unknown_tx, 100, super::evm::BurnDropConfig::fast())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            crate::BurnTxStatus::Pending,
+            "a node behind the pre-burn block cannot prove a drop; the verdict must be \
+             Pending (retryable), never Dropped"
         );
     }
 

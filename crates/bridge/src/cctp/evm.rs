@@ -459,11 +459,17 @@ impl<W: Wallet> CctpEndpoint<W> {
 
     /// Resolves the on-chain status of a broadcast burn tx for crash-safe resume,
     /// using this endpoint's configured drop policy (`burn_drop_config`).
+    ///
+    /// `submitted_after_block` is the chain head recorded before the burn was
+    /// broadcast (the same pre-burn head `find_recent_burn` scans from): the
+    /// burn can only have mined strictly after it, so it anchors the
+    /// node-freshness gate on the `Dropped` verdict.
     pub(super) async fn burn_status(
         &self,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<crate::BurnTxStatus, CctpError> {
-        self.burn_status_with_config(tx_hash, self.burn_drop_config)
+        self.burn_status_with_config(tx_hash, submitted_after_block, self.burn_drop_config)
             .await
     }
 
@@ -478,8 +484,15 @@ impl<W: Wallet> CctpEndpoint<W> {
     ///   [`BurnTxStatus::Pending`] (returns immediately)
     /// - no receipt and tx absent from the mempool -> KEEPS POLLING (does NOT
     ///   return `Pending` early); only once `config.grace` has elapsed AND
-    ///   `config.consecutive_misses` consecutive post-grace absences are observed
-    ///   does it return [`BurnTxStatus::Dropped`].
+    ///   `config.consecutive_misses` consecutive post-grace absences are
+    ///   observed **by a node provably past where the burn could have mined**
+    ///   does it return [`BurnTxStatus::Dropped`]. An absence reported by a
+    ///   node whose head is not `SCAN_FINALITY_MARGIN` blocks past
+    ///   `submitted_after_block` is no evidence at all (a lagging dRPC backend
+    ///   returns `None` for an already-mined tx it has not indexed); once the
+    ///   grace has elapsed such a node resolves the poll as
+    ///   [`BurnTxStatus::Pending`] -- retryable by the caller's redrive --
+    ///   never `Dropped`.
     ///
     /// A still-pending burn (broadcast but unmined) thus never reports `Dropped`,
     /// so the caller never re-burns a tx that may still land -- the exact
@@ -487,6 +500,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     pub(super) async fn burn_status_with_config(
         &self,
         tx_hash: TxHash,
+        submitted_after_block: u64,
         config: BurnDropConfig,
     ) -> Result<crate::BurnTxStatus, CctpError> {
         let provider = self.wallet.provider();
@@ -526,12 +540,33 @@ impl<W: Wallet> CctpEndpoint<W> {
                 return Ok(crate::BurnTxStatus::Pending);
             }
 
-            // Absent from both receipt and mempool. Keep polling within this call
-            // rather than returning early: only after the grace period AND
-            // `consecutive_misses` consecutive absences is the absence trusted as a
-            // true drop. Before that, a transient absence (lagging node, not-yet-
-            // propagated tx) keeps polling so a tx that mines late is still seen and
-            // a still-pending tx is never re-burned.
+            // Absent from both receipt and mempool. An absence only counts as
+            // evidence when the answering node's head is provably past the
+            // region where this burn could have mined: the burn broadcast after
+            // the pre-burn head `submitted_after_block`, so a node that is not
+            // `SCAN_FINALITY_MARGIN` blocks beyond it may simply not have
+            // indexed the mined burn yet (a synced node never returns `None`
+            // for a mined tx; a lagging dRPC backend routinely does).
+            let head = provider.get_block_number().await?;
+            let node_caught_up = head >= submitted_after_block.saturating_add(SCAN_FINALITY_MARGIN);
+
+            if !node_caught_up {
+                // A lagging node cannot prove a drop. Within the grace window
+                // keep polling (a later tick may hit a synced backend); past it,
+                // resolve as Pending -- retryable by the caller's redrive --
+                // rather than spinning here until the fleet catches up.
+                if start.elapsed() >= config.grace {
+                    return Ok(crate::BurnTxStatus::Pending);
+                }
+                continue;
+            }
+
+            // Keep polling within this call rather than returning early: only
+            // after the grace period AND `consecutive_misses` caught-up-node
+            // absences is the absence trusted as a true drop. Before that, a
+            // transient absence (not-yet-propagated tx) keeps polling so a tx
+            // that mines late is still seen and a still-pending tx is never
+            // re-burned.
             if start.elapsed() >= config.grace {
                 consecutive_misses += 1;
                 if consecutive_misses >= config.consecutive_misses {
