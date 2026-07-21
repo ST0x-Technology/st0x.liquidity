@@ -3,7 +3,7 @@
   import { decimalIsZero, formatDecimal } from '$lib/decimal'
   import {
     tradeFailureReason,
-    tradeFailureShares,
+    tradeOutcomeShares,
     tradeOutcomeClass,
     tradeOutcomeLabel
   } from '$lib/trade'
@@ -11,7 +11,7 @@
   let { outcome, compact = true }: { outcome: TradeOutcome; compact?: boolean } = $props()
 
   const failureReason = $derived(tradeFailureReason(outcome))
-  const failureShares = $derived(tradeFailureShares(outcome))
+  const outcomeShares = $derived(tradeOutcomeShares(outcome))
   const quantity = (value: string | null): string =>
     value === null ? 'unknown' : formatDecimal(value, 9)
 </script>
@@ -27,16 +27,16 @@
     {failureReason}
   </div>
 {/if}
-{#if failureShares !== null}
+{#if outcomeShares !== null}
   <div class="text-muted-foreground">
-    Accepted {quantity(failureShares.accepted)} · Filled {quantity(failureShares.filled)}
-    {#if failureShares.remaining !== null}
-      · Unfilled {formatDecimal(failureShares.remaining, 9)}
+    Accepted {quantity(outcomeShares.accepted)} · Filled {quantity(outcomeShares.filled)}
+    {#if outcomeShares.remaining !== null}
+      · Unfilled {formatDecimal(outcomeShares.remaining, 9)}
     {/if}
   </div>
-  {#if failureShares.excess !== null && !decimalIsZero(failureShares.excess)}
+  {#if outcomeShares.excess !== null && !decimalIsZero(outcomeShares.excess)}
     <div class="text-destructive">
-      Excess fill {formatDecimal(failureShares.excess, 9)}
+      Excess fill {formatDecimal(outcomeShares.excess, 9)}
     </div>
   {/if}
 {/if}

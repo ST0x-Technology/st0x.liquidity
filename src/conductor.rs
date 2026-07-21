@@ -228,7 +228,8 @@ async fn rebuild_stale_offchain_order_projection(
     // sequence. Detect the old serialized shape itself so an interruption
     // between version registration and this rebuild remains repairable on the
     // next startup. A present JSON null is current; SQL NULL means the field is
-    // absent from a pre-v3 projection row.
+    // absent from a projection row created before the corresponding schema
+    // version.
     let has_stale_rows: i64 = sqlx::query_scalar(
         "SELECT EXISTS( \
              SELECT 1 FROM offchain_order_view \
@@ -241,6 +242,9 @@ async fn rebuild_stale_offchain_order_projection(
                 OR (json_type(payload, '$.Live.Failed') IS NOT NULL \
                     AND (json_type(payload, '$.Live.Failed.requested_shares') IS NULL \
                          OR json_type(payload, '$.Live.Failed.filled_shares') IS NULL)) \
+                OR (json_type(payload, '$.Live.Cancelled') IS NOT NULL \
+                    AND (json_type(payload, '$.Live.Cancelled.requested_shares') IS NULL \
+                         OR json_type(payload, '$.Live.Cancelled.filled_shares') IS NULL)) \
              LIMIT 1 \
          )",
     )
@@ -4054,6 +4058,17 @@ mod tests {
             .unwrap();
     }
 
+    async fn remove_requested_shares(pool: &SqlitePool, id: &OffchainOrderId, path: &str) {
+        sqlx::query(
+            "UPDATE offchain_order_view SET payload = json_remove(payload, ?) WHERE view_id = ?",
+        )
+        .bind(path)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn interrupted_schema_change_rebuilds_live_offchain_order_projection_rows() {
         let pool = setup_test_db().await;
@@ -4088,25 +4103,7 @@ mod tests {
             )
             .await
             .unwrap();
-
-        for (id, path) in [
-            (&submitted_id, "$.Live.Submitted.requested_shares"),
-            (
-                &partially_filled_id,
-                "$.Live.PartiallyFilled.requested_shares",
-            ),
-            (&cancelling_id, "$.Live.Cancelling.requested_shares"),
-        ] {
-            sqlx::query(
-                "UPDATE offchain_order_view SET payload = json_remove(payload, ?) WHERE view_id = ?",
-            )
-            .bind(path)
-            .bind(id.to_string())
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
+        remove_requested_shares(&pool, &submitted_id, "$.Live.Submitted.requested_shares").await;
         assert!(matches!(
             projection.load(&submitted_id).await.unwrap().unwrap(),
             OffchainOrder::Submitted {
@@ -4114,6 +4111,24 @@ mod tests {
                 ..
             }
         ));
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            projection.load(&submitted_id).await.unwrap().unwrap(),
+            OffchainOrder::Submitted {
+                requested_shares: Some(_),
+                ..
+            }
+        ));
+
+        remove_requested_shares(
+            &pool,
+            &partially_filled_id,
+            "$.Live.PartiallyFilled.requested_shares",
+        )
+        .await;
         assert!(matches!(
             projection
                 .load(&partially_filled_id)
@@ -4125,6 +4140,23 @@ mod tests {
                 ..
             }
         ));
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            projection
+                .load(&partially_filled_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::PartiallyFilled {
+                requested_shares: Some(_),
+                ..
+            }
+        ));
+
+        remove_requested_shares(&pool, &cancelling_id, "$.Live.Cancelling.requested_shares").await;
         assert!(matches!(
             projection.load(&cancelling_id).await.unwrap().unwrap(),
             OffchainOrder::Cancelling {
@@ -4136,31 +4168,108 @@ mod tests {
         rebuild_stale_offchain_order_projection(&pool, &projection)
             .await
             .unwrap();
-
-        assert!(matches!(
-            projection.load(&submitted_id).await.unwrap().unwrap(),
-            OffchainOrder::Submitted {
-                requested_shares: Some(_),
-                ..
-            }
-        ));
-        assert!(matches!(
-            projection
-                .load(&partially_filled_id)
-                .await
-                .unwrap()
-                .unwrap(),
-            OffchainOrder::PartiallyFilled {
-                requested_shares: Some(_),
-                ..
-            }
-        ));
         assert!(matches!(
             projection.load(&cancelling_id).await.unwrap().unwrap(),
             OffchainOrder::Cancelling {
                 requested_shares: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_cancellation_schema_change_rebuilds_projection_provenance() {
+        let pool = setup_test_db().await;
+        let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let id = OffchainOrderId::new();
+        let requested_shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let accepted_shares = Positive::new(FractionalShares::new(float!(0.5))).unwrap();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: requested_shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("TEST-CANCELLED"),
+                    placed_shares: accepted_shares,
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
+                    cancelled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE offchain_order_view \
+             SET payload = json_remove(\
+                 payload,\
+                 '$.Live.Cancelled.requested_shares',\
+                 '$.Live.Cancelled.filled_shares'\
+             ) \
+             WHERE view_id = ?",
+        )
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale = projection.load(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            stale,
+            OffchainOrder::Cancelled {
+                requested_shares: None,
+                filled_shares: None,
+                ..
+            }
+        ));
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+
+        let rebuilt = projection.load(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            rebuilt,
+            OffchainOrder::Cancelled {
+                requested_shares: Some(requested),
+                filled_shares: Some(filled),
+                ..
+            } if requested == requested_shares && filled == FractionalShares::ZERO
         ));
     }
 
@@ -9992,6 +10101,7 @@ mod tests {
             .send(
                 &offchain_order_id,
                 OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
                     cancelled_at: Utc::now(),
                 },
             )
@@ -10276,6 +10386,7 @@ mod tests {
             .send(
                 &offchain_order_id,
                 OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::new(float!(0.3)),
                     cancelled_at: Utc::now(),
                 },
             )
@@ -10322,9 +10433,13 @@ mod tests {
         let order = OffchainOrder::Cancelled {
             symbol: symbol.clone(),
             shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
+            requested_shares: Some(
+                Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
+            ),
             retained_fill: Some(RetainedFill::Unpriced {
                 shares_filled: st0x_execution::FractionalShares::new(float!(0.3)),
             }),
+            filled_shares: Some(st0x_execution::FractionalShares::new(float!(0.3))),
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
             executor_order_id: ExecutorOrderId::new("unpriced-fill"),
@@ -10351,7 +10466,11 @@ mod tests {
         let order = OffchainOrder::Cancelled {
             symbol: symbol.clone(),
             shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
+            requested_shares: Some(
+                Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
+            ),
             retained_fill: None,
+            filled_shares: Some(st0x_execution::FractionalShares::ZERO),
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
             executor_order_id: ExecutorOrderId::new("cancelled-no-fill"),
@@ -10498,7 +10617,9 @@ mod tests {
         let cancelled = OffchainOrder::Cancelled {
             symbol: symbol.clone(),
             shares,
+            requested_shares: Some(shares),
             retained_fill: None,
+            filled_shares: Some(FractionalShares::ZERO),
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("cancelled-after-place"),
@@ -10954,11 +11075,13 @@ mod tests {
         let cancelled_partial = OffchainOrder::Cancelled {
             symbol: symbol.clone(),
             shares,
+            requested_shares: Some(shares),
             retained_fill: Some(RetainedFill::Priced {
                 shares_filled: st0x_execution::FractionalShares::new(float!(0.3)),
                 avg_price: Usd::new(float!(95.0)),
                 partially_filled_at: Utc::now(),
             }),
+            filled_shares: Some(st0x_execution::FractionalShares::new(float!(0.3))),
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("cancelled-partial-after-place"),

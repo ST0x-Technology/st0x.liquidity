@@ -1170,6 +1170,7 @@ mod tests {
             .send(
                 &offchain_order_id,
                 OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
                     cancelled_at: chrono::Utc::now(),
                 },
             )
@@ -1249,6 +1250,7 @@ mod tests {
             .send(
                 &offchain_order_id,
                 OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::new(float!(0.5)),
                     cancelled_at: chrono::Utc::now(),
                 },
             )

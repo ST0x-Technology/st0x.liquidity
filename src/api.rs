@@ -577,9 +577,7 @@ async fn trades(
         .await
         .inspect_err(|error| warn!(target: "dashboard", ?error, "Failed to load trade history"))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if query.trade_protocol == TradeProtocol::LegacyFills {
-        all_trades.retain(|trade| matches!(trade.outcome, TradeOutcome::Filled));
-    }
+    all_trades.retain(|trade| query.trade_protocol.includes_trade(trade));
     sort_trades_newest_first(&mut all_trades);
 
     let total = all_trades.len();
@@ -779,7 +777,7 @@ async fn load_offchain_trade_rows(
 ) -> Result<Vec<Trade>, TradeHistoryError> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT view_id, payload FROM offchain_order_view \
-         WHERE status IN ('Filled', 'Failed')",
+         WHERE status IN ('Filled', 'Failed', 'Cancelled')",
     )
     .fetch_all(pool)
     .await?;
@@ -1966,6 +1964,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let cancelled_view_id = "00000000-0000-0000-0000-000000000139";
+        let cancelled_payload = r#"{"Live":{"Cancelled":{"symbol":"MSFT","shares":"1","requested_shares":"1.5","filled_shares":"0","direction":"Sell","executor":"AlpacaBrokerApi","executor_order_id":"broker-cancel","reason":"MarketOpenReplacement","placed_at":"2026-01-01T00:00:01Z","cancelled_at":"2026-01-01T00:00:02Z"}}}"#;
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(cancelled_view_id)
+            .bind(cancelled_payload)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let entries = load_offchain_trade_rows(
             &pool,
@@ -1979,7 +1985,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         let failed = entries
             .iter()
             .find(|trade| trade.id == view_id)
@@ -2006,7 +2012,9 @@ mod tests {
                 assert_eq!(remaining_shares, &None);
                 assert_eq!(excess_shares, &None);
             }
-            TradeOutcome::Filled => panic!("failed projection must remain failed"),
+            TradeOutcome::Filled | TradeOutcome::Cancelled { .. } => {
+                panic!("failed projection must remain failed")
+            }
         }
 
         let legacy_response = build_app(state.clone())
@@ -2037,6 +2045,21 @@ mod tests {
             "legacy clients must not receive failed trades"
         );
 
+        let legacy_page = build_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/trades?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let legacy_page: serde_json::Value =
+            serde_json::from_str(&body_to_string(legacy_page).await).unwrap();
+        assert_eq!(legacy_page["total"], 1);
+        assert_eq!(legacy_page["entries"][0]["id"], filled_view_id);
+        assert_eq!(legacy_page["hasMore"], false);
+
         let v1_response = build_app(state.clone())
             .oneshot(
                 Request::builder()
@@ -2049,11 +2072,35 @@ mod tests {
         assert_eq!(v1_response.status(), StatusCode::OK);
         let v1_body: serde_json::Value =
             serde_json::from_str(&body_to_string(v1_response).await).unwrap();
+        assert_eq!(v1_body["total"], 2);
+        assert!(
+            v1_body["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|trade| trade["id"] != cancelled_view_id),
+            "v1 clients must not receive cancelled trades"
+        );
         let v1_outcome = &v1_body["entries"][0]["outcome"];
         assert!(v1_outcome.get("acceptedShares").is_none());
         assert_eq!(v1_outcome["filledShares"], "0.25");
         assert_eq!(v1_outcome["remainingShares"], "0.75");
         assert_eq!(v1_outcome["excessShares"], "0");
+
+        let v1_page = build_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/trades?trade_protocol=terminal_outcomes_v1&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v1_page: serde_json::Value =
+            serde_json::from_str(&body_to_string(v1_page).await).unwrap();
+        assert_eq!(v1_page["total"], 2);
+        assert_eq!(v1_page["entries"][0]["id"], view_id);
+        assert_eq!(v1_page["hasMore"], true);
 
         let response = build_app(state)
             .oneshot(
@@ -2067,25 +2114,35 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value =
             serde_json::from_str(&body_to_string(response).await).unwrap();
-        assert_eq!(body["entries"][0]["occurredAt"], "2026-01-01T00:00:01Z");
-        assert_eq!(body["entries"][0]["outcome"]["status"], "failed");
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["entries"][0]["occurredAt"], "2026-01-01T00:00:02Z");
+        let failed = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trade| trade["id"] == view_id)
+            .expect("v2 clients should receive failed trades");
+        assert_eq!(failed["outcome"]["status"], "failed");
+        assert_eq!(failed["outcome"]["error"], "asset is not tradable");
+        assert_eq!(failed["outcome"]["acceptedShares"], serde_json::Value::Null);
+        assert_eq!(failed["outcome"]["filledShares"], "0.25");
         assert_eq!(
-            body["entries"][0]["outcome"]["error"],
-            "asset is not tradable"
-        );
-        assert_eq!(
-            body["entries"][0]["outcome"]["acceptedShares"],
+            failed["outcome"]["remainingShares"],
             serde_json::Value::Null
         );
-        assert_eq!(body["entries"][0]["outcome"]["filledShares"], "0.25");
-        assert_eq!(
-            body["entries"][0]["outcome"]["remainingShares"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            body["entries"][0]["outcome"]["excessShares"],
-            serde_json::Value::Null
-        );
+        assert_eq!(failed["outcome"]["excessShares"], serde_json::Value::Null);
+        let cancelled = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trade| trade["id"] == cancelled_view_id)
+            .expect("v2 clients should receive cancelled trades");
+        assert_eq!(cancelled["shares"], "1.5");
+        assert_eq!(cancelled["outcome"]["status"], "cancelled");
+        assert_eq!(cancelled["outcome"]["acceptedShares"], "1");
+        assert_eq!(cancelled["outcome"]["filledShares"], "0");
+        assert_eq!(cancelled["outcome"]["remainingShares"], "1");
+        assert_eq!(cancelled["outcome"]["excessShares"], "0");
     }
 
     #[tokio::test]

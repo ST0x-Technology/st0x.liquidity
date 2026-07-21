@@ -89,4 +89,41 @@ describe('TradeOutcome', () => {
     expect(body).toContain('Filled unknown')
     expect(body).not.toContain('Unfilled 0')
   })
+
+  it('renders a partially-filled cancellation distinctly', () => {
+    const { body } = render(TradeOutcome, {
+      props: {
+        outcome: {
+          status: 'cancelled',
+          acceptedShares: '1',
+          filledShares: '0.25',
+          remainingShares: '0.75',
+          excessShares: '0'
+        }
+      }
+    })
+
+    expect(body).toContain('Cancelled')
+    expect(body).toContain('text-amber-500')
+    expect(body).toContain('Filled 0.25')
+    expect(body).toContain('Unfilled 0.75')
+  })
+
+  it('renders an explicit zero-fill cancellation as wholly unfilled', () => {
+    const { body } = render(TradeOutcome, {
+      props: {
+        outcome: {
+          status: 'cancelled',
+          acceptedShares: '1',
+          filledShares: '0',
+          remainingShares: '1',
+          excessShares: '0'
+        }
+      }
+    })
+
+    expect(body).toContain('Filled 0')
+    expect(body).toContain('Unfilled 1')
+    expect(body).not.toContain('Filled unknown')
+  })
 })

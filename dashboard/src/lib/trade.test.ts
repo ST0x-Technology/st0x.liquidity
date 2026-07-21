@@ -3,7 +3,7 @@ import type { Trade } from '$lib/api/Trade'
 import {
   mergeTradeHistory,
   tradeFailureReason,
-  tradeFailureShares,
+  tradeOutcomeShares,
   tradeOutcomeClass,
   tradeOutcomeLabel
 } from './trade'
@@ -30,7 +30,27 @@ describe('trade outcome presentation', () => {
     expect(tradeOutcomeLabel(outcome)).toBe('Failed')
     expect(tradeOutcomeClass(outcome)).toBe('text-destructive')
     expect(tradeFailureReason(outcome)).toBe('asset is not tradable')
-    expect(tradeFailureShares(outcome)).toEqual({
+    expect(tradeOutcomeShares(outcome)).toEqual({
+      accepted: '1',
+      filled: '0.25',
+      remaining: '0.75',
+      excess: '0'
+    })
+  })
+
+  it('renders cancelled outcomes distinctly with their fill provenance', () => {
+    const outcome = {
+      status: 'cancelled',
+      acceptedShares: '1',
+      filledShares: '0.25',
+      remainingShares: '0.75',
+      excessShares: '0'
+    } as const
+
+    expect(tradeOutcomeLabel(outcome)).toBe('Cancelled')
+    expect(tradeOutcomeClass(outcome)).toBe('text-amber-500')
+    expect(tradeFailureReason(outcome)).toBeNull()
+    expect(tradeOutcomeShares(outcome)).toEqual({
       accepted: '1',
       filled: '0.25',
       remaining: '0.75',

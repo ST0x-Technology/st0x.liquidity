@@ -309,7 +309,7 @@
   const fmtSize = (value: string): string => formatDecimal(value, 3)
 
   const shareTooltip = (trade: TradeEntry): string =>
-    `${trade.outcome.status === 'failed' ? 'Order quantity. ' : ''}${equityUsdTooltip(
+    `${trade.outcome.status !== 'filled' ? 'Order quantity. ' : ''}${equityUsdTooltip(
       trade.shares,
       positionPrices.get(trade.symbol) ?? null
     )}`
