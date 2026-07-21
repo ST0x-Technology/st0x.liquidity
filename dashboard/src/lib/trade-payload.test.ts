@@ -55,6 +55,7 @@ describe('trade payload validation', () => {
         outcome: {
           status: 'failed',
           error: 'rejected',
+          acceptedShares: '1',
           filledShares: '-1',
           remainingShares: '2',
           excessShares: '0'
@@ -68,6 +69,7 @@ describe('trade payload validation', () => {
         outcome: {
           status: 'failed',
           error: 'rejected',
+          acceptedShares: '1',
           filledShares: '0',
           remainingShares: '1'
         }
@@ -76,6 +78,145 @@ describe('trade payload validation', () => {
     ]
   ])('rejects an invalid %s', (_case, overrides, path) => {
     expect(() => parseTrade(validTrade(overrides))).toThrow(`Invalid trade payload at ${path}`)
+  })
+
+  it('accepts explicit unknown provenance without inventing zero quantities', () => {
+    const failed = validTrade({
+      outcome: {
+        status: 'failed',
+        error: 'placement failed before acceptance',
+        acceptedShares: null,
+        filledShares: null,
+        remainingShares: null,
+        excessShares: null
+      }
+    })
+
+    expect(parseTrade(failed)).toEqual(failed)
+  })
+
+  it('normalizes the v1 failure shape without accepted quantity to unknown', () => {
+    const legacy = validTrade({
+      outcome: {
+        status: 'failed',
+        error: 'partially filled before cancellation',
+        filledShares: '0.25',
+        remainingShares: '0.75',
+        excessShares: '0'
+      }
+    }) as Record<string, unknown>
+
+    expect(parseTrade(legacy)).toEqual({
+      ...legacy,
+      outcome: {
+        status: 'failed',
+        error: 'partially filled before cancellation',
+        acceptedShares: null,
+        filledShares: '0.25',
+        remainingShares: null,
+        excessShares: null
+      }
+    })
+  })
+
+  it('reconstructs the complete fill from a v1 overfill split', () => {
+    const legacy = validTrade({
+      outcome: {
+        status: 'failed',
+        error: 'broker failed after overfill',
+        filledShares: '1',
+        remainingShares: '0',
+        excessShares: '0.25'
+      }
+    }) as Record<string, unknown>
+
+    expect(parseTrade(legacy)).toEqual({
+      ...legacy,
+      outcome: {
+        status: 'failed',
+        error: 'broker failed after overfill',
+        acceptedShares: null,
+        filledShares: '1.25',
+        remainingShares: null,
+        excessShares: null
+      }
+    })
+  })
+
+  it('keeps a synthetic v1 zero fill unknown', () => {
+    const legacy = validTrade({
+      outcome: {
+        status: 'failed',
+        error: 'placement rejected',
+        filledShares: '0',
+        remainingShares: '1.25',
+        excessShares: '0'
+      }
+    }) as Record<string, unknown>
+
+    expect(parseTrade(legacy)).toEqual({
+      ...legacy,
+      outcome: {
+        status: 'failed',
+        error: 'placement rejected',
+        acceptedShares: null,
+        filledShares: null,
+        remainingShares: null,
+        excessShares: null
+      }
+    })
+  })
+
+  it.each(['filledShares', 'remainingShares', 'excessShares'] as const)(
+    'rejects a nullable %s in a v1 failure',
+    (field) => {
+      const outcome = {
+        status: 'failed',
+        error: 'malformed v1 failure',
+        filledShares: '0',
+        remainingShares: '1.25',
+        excessShares: '0',
+        [field]: null
+      }
+
+      expect(() => parseTrade(validTrade({ outcome }))).toThrow(
+        `Invalid trade payload at outcome.${field}`
+      )
+    }
+  )
+
+  it('rejects derived quantities when acceptance or fill provenance is unknown', () => {
+    expect(() =>
+      parseTrade(
+        validTrade({
+          outcome: {
+            status: 'failed',
+            error: 'legacy failure',
+            acceptedShares: null,
+            filledShares: null,
+            remainingShares: '1',
+            excessShares: null
+          }
+        })
+      )
+    ).toThrow('Invalid trade payload at outcome.remainingShares')
+  })
+
+  it('rejects quantities that do not derive from accepted and filled evidence', () => {
+    expect(() =>
+      parseTrade(
+        validTrade({
+          outcome: {
+            status: 'failed',
+            error: 'inconsistent broker evidence',
+            acceptedShares: '1',
+            filledShares: '1.5',
+            remainingShares: '0',
+            excessShares: '0'
+          }
+        })
+      )
+    ).toThrow('Invalid trade payload at outcome.excessShares')
   })
 
   it('identifies the invalid entry in a snapshot', () => {

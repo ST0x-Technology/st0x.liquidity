@@ -13,9 +13,11 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 
 const MAX_TRADES: usize = 100;
 
-/// Load recent filled trades from both onchain and offchain sources.
+/// Load recent terminal trades from both onchain and offchain sources.
 ///
-/// Returns up to [`MAX_TRADES`] trades sorted by fill time (newest first).
+/// Onchain trades are always fills; offchain counter-trades contribute both
+/// filled and failed outcomes. Returns up to [`MAX_TRADES`] trades sorted by
+/// the time the outcome occurred, newest first.
 pub(crate) async fn load_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
     let mut trades = load_all_trades(pool).await?;
 
@@ -161,11 +163,15 @@ pub(crate) enum TradeHistoryError {
 mod tests {
     use chrono::Utc;
 
-    use st0x_execution::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
+    use st0x_execution::{
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketSession, Positive,
+        Symbol,
+    };
+    use st0x_finance::Usd;
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderId};
+    use crate::offchain::order::{CancellationReason, OffchainOrderCommand, OffchainOrderId};
     use crate::onchain_trade::{OnChainTradeCommand, OnChainTradeId};
     use crate::test_utils::setup_test_db;
 
@@ -487,29 +493,25 @@ mod tests {
             &trades[0].outcome,
             st0x_dto::TradeOutcome::Failed {
                 error,
+                accepted_shares,
                 filled_shares,
                 remaining_shares,
                 excess_shares,
             } if error == "asset is not tradable"
-                && filled_shares.inner().inner().eq(float!(0)).unwrap()
-                && remaining_shares.inner().inner().eq(float!(10)).unwrap()
-                && excess_shares.inner().inner().is_zero().unwrap()
+                && accepted_shares.is_none()
+                && filled_shares.is_none()
+                && remaining_shares.is_none()
+                && excess_shares.is_none()
         ));
     }
 
-    #[tokio::test]
-    async fn load_trades_excludes_pending_offchain_orders() {
-        let pool = setup_test_db().await;
-        let (store, _projection) =
-            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(crate::offchain::order::noop_order_placer())
-                .await
-                .unwrap();
-        let id = OffchainOrderId::new();
-
+    async fn place_pending_order(
+        store: &st0x_event_sorcery::Store<OffchainOrder>,
+        id: &OffchainOrderId,
+    ) {
         store
             .send(
-                &id,
+                id,
                 OffchainOrderCommand::Place {
                     symbol: Symbol::new("NVDA").unwrap(),
                     shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
@@ -521,8 +523,68 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn accept_order(store: &st0x_event_sorcery::Store<OffchainOrder>, id: &OffchainOrderId) {
+        store
+            .send(
+                id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new(id),
+                    placed_shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_trades_excludes_all_nonterminal_offchain_orders() {
+        let pool = setup_test_db().await;
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(crate::offchain::order::noop_order_placer())
+                .await
+                .unwrap();
+        let pending_id = OffchainOrderId::new();
+        place_pending_order(&store, &pending_id).await;
+
+        let submitted_id = OffchainOrderId::new();
+        place_pending_order(&store, &submitted_id).await;
+        accept_order(&store, &submitted_id).await;
+
+        let partially_filled_id = OffchainOrderId::new();
+        place_pending_order(&store, &partially_filled_id).await;
+        accept_order(&store, &partially_filled_id).await;
+        store
+            .send(
+                &partially_filled_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(1)),
+                    avg_price: Usd::new(float!(100)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cancelling_id = OffchainOrderId::new();
+        place_pending_order(&store, &cancelling_id).await;
+        accept_order(&store, &cancelling_id).await;
+        store
+            .send(
+                &cancelling_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
 
         let trades = load_trades(&pool).await.unwrap();
-        assert!(trades.is_empty(), "pending orders should not appear");
+        assert!(trades.is_empty(), "nonterminal orders should not appear");
     }
 }

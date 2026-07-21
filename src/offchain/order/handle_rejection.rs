@@ -36,6 +36,10 @@ pub(crate) struct HandleOrderRejectionCtx {
 pub(crate) struct HandleOrderRejection {
     pub(crate) offchain_order_id: OffchainOrderId,
     pub(crate) error: String,
+    /// Broker-reported cumulative fill quantity. `None` means this rejection
+    /// carries no persisted evidence for the actual fill.
+    #[serde(default)]
+    pub(crate) broker_filled_shares: Option<FractionalShares>,
     /// Broker-reported failure time, when the enqueuing poll observed a
     /// broker `Failed` state. `None` when the rejection has no broker
     /// timestamp (the job then stamps its own observation time).
@@ -92,6 +96,7 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                         &self.offchain_order_id,
                         OffchainOrderCommand::MarkFailed {
                             error: self.error.clone(),
+                            filled_shares: self.broker_filled_shares,
                             // Prefer the broker's failure time; rejections
                             // without one (e.g. cleanup paths) fall back to
                             // this job's observation time.
@@ -436,6 +441,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: error_message.clone(),
+            broker_filled_shares: Some(FractionalShares::ZERO),
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
@@ -451,12 +457,14 @@ mod tests {
             .expect("offchain order should exist");
         let OffchainOrder::Failed {
             error: stored_error,
+            filled_shares,
             ..
         } = offchain
         else {
             panic!("expected OffchainOrder::Failed, got {offchain:?}");
         };
         assert_eq!(stored_error, error_message);
+        assert_eq!(filled_shares, Some(FractionalShares::ZERO));
 
         let position = infra
             .ctx
@@ -498,6 +506,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: "broker cancelled after partial fill".to_string(),
+            broker_filled_shares: None,
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
@@ -568,6 +577,7 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: original_error.clone(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -590,6 +600,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: original_error,
+            broker_filled_shares: None,
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
@@ -638,6 +649,7 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: "broker failed after partial fill".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )
@@ -647,6 +659,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: "broker failed after partial fill".to_string(),
+            broker_filled_shares: None,
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
@@ -683,6 +696,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: error_message.clone(),
+            broker_filled_shares: None,
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
@@ -693,6 +707,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: error_message,
+            broker_filled_shares: None,
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
@@ -728,6 +743,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: "broker rejected".to_string(),
+            broker_filled_shares: None,
             broker_failed_at: Some(broker_failed_at),
         }
         .perform(&infra.ctx)
@@ -792,6 +808,7 @@ mod tests {
         HandleOrderRejection {
             offchain_order_id: order_id,
             error: "broker rejected during cancellation".to_string(),
+            broker_filled_shares: None,
             broker_failed_at: None,
         }
         .perform(&infra.ctx)
