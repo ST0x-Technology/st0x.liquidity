@@ -50,7 +50,9 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
 };
 use crate::inventory::view::InFlightEquityLocation;
-use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
+use crate::inventory::{
+    BroadcastingInventory, ImbalanceThreshold, InventoryView, PollFreshness, Venue,
+};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
@@ -1348,6 +1350,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let reserved_cash = Usd::new(float!(300));
 
     let polling_service = InventoryPollingService::new(
+        PollFreshness::new(),
         raindex_service,
         executor,
         vault_registry,
