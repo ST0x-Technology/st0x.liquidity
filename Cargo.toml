@@ -4,11 +4,8 @@ members = [
   "crates/config",
   "crates/dto",
   "crates/execution",
-  "crates/finance",
   "crates/bridge",
   "crates/evm",
-  "crates/float-macro",
-  "crates/float-serde",
   "crates/raindex",
   "crates/registry",
   "crates/tokenization",
@@ -101,9 +98,9 @@ st0x-config = { path = "crates/config" }
 st0x-dto = { path = "crates/dto" }
 st0x-evm = { path = "crates/evm" }
 st0x-execution = { path = "crates/execution" }
-st0x-finance = { path = "crates/finance" }
-st0x-float-macro = { path = "crates/float-macro" }
-st0x-float-serde = { path = "crates/float-serde" }
+st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0" }
+st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0" }
+st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0" }
 st0x-hedge = { path = "." }
 st0x-raindex = { path = "crates/raindex" }
 st0x-registry = { path = "crates/registry" }
@@ -143,6 +140,9 @@ wasm-bindgen = "=0.2.122"
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
 tag = "v0.2.0"
 package = "event-sorcery"
+
+[patch."https://github.com/rainlanguage/rain.math.float"]
+rain-math-float = { path = ".tmp/rain-math-float/crates/float" }
 
 [package]
 name = "st0x-hedge"

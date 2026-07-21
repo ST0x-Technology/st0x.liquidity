@@ -136,11 +136,6 @@ jobs:
             cargo nextest archive --workspace --all-features --profile ci \
               --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
             cargo clippy --workspace --all-targets --all-features
-            # compile_fail_tests (trybuild) shells out to cargo at run time, so
-            # run it here where the workspace build cache is warm. The archive
-            # partitions only carry prebuilt binaries and would compile it cold.
-            cargo nextest run --workspace --all-features --profile ci \
-              -E "test(compile_fail_tests)"
           '
 
       - name: Upload nextest archive
@@ -210,7 +205,6 @@ jobs:
             set -euxo pipefail
             cargo nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
               --workspace-remap . --profile ci \
-              -E "not test(compile_fail_tests)" \
               --partition hash:${{ matrix.partition }}/4
           '
 

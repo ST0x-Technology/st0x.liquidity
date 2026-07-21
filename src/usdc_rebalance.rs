@@ -85,7 +85,7 @@ use uuid::Uuid;
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
-use st0x_finance::{HasZero, Id, Usdc};
+use st0x_finance::{HasZero, Usdc};
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1184,7 +1184,7 @@ impl UsdcRebalance {
         };
 
         TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::new(id.to_string()),
+            id: crate::transfer_id(id.0),
             direction: match direction {
                 RebalanceDirection::AlpacaToBase => st0x_dto::UsdcBridgeDirection::AlpacaToBase,
                 RebalanceDirection::BaseToAlpaca => st0x_dto::UsdcBridgeDirection::BaseToAlpaca,
@@ -8880,7 +8880,7 @@ mod tests {
             panic!("expected UsdcBridge variant");
         };
 
-        assert_eq!(bridge.id, Id::new(id.to_string()));
+        assert_eq!(bridge.id, crate::transfer_id(id.0));
         assert!(matches!(
             bridge.direction,
             st0x_dto::UsdcBridgeDirection::AlpacaToBase
