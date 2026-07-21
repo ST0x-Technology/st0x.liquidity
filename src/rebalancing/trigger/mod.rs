@@ -4985,7 +4985,7 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
-        EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
+        EntityList, Never, Reactor, ReactorHarness, TestStore, deps, send_command, test_store,
     };
     use st0x_execution::{
         AlpacaTransferId, ClientOrderId, Direction, ExecutorOrderId, HasZero, Positive,
@@ -5004,7 +5004,7 @@ mod tests {
         DetectionFailure, EquityRedemptionCommand, redemption_aggregate_id,
     };
     use crate::inventory::snapshot::{
-        InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
+        InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
     };
     use crate::inventory::view::{InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
@@ -22128,6 +22128,128 @@ mod tests {
             view.usdc_available(Venue::MarketMaking),
             Some(usdc(500)),
             "recovery must force-apply the failed snapshot"
+        );
+    }
+
+    /// Reads events persisted by the real `InventorySnapshot` aggregate since
+    /// `seen`, so tests exercise its dedupe behavior instead of hand-crafting
+    /// events. Reading the events table is fine; only writes must go through
+    /// the framework.
+    async fn drain_snapshot_events(
+        pool: &SqlitePool,
+        seen: &mut i64,
+    ) -> Vec<InventorySnapshotEvent> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT sequence, payload FROM events \
+             WHERE aggregate_type = 'InventorySnapshot' AND sequence > ? \
+             ORDER BY sequence",
+        )
+        .bind(*seen)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+
+        rows.into_iter()
+            .map(|(sequence, payload)| {
+                *seen = sequence;
+                serde_json::from_str(&payload).unwrap()
+            })
+            .collect()
+    }
+
+    /// The aggregate dedupes unchanged offchain positions, so a snapshot the
+    /// view skipped during an open hedge order is never re-emitted on its
+    /// own: once the gate clears, an unchanged broker state produces no new
+    /// event and the view stays stale until the position changes or the bot
+    /// restarts. The skipped broker truth must still reach the view within
+    /// one poll of the gate clearing.
+    #[tokio::test]
+    async fn skipped_offchain_snapshot_heals_after_gate_clears_despite_dedupe() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        // Mirror believes 100. Real broker balance during the hedge is 85:
+        // the post-fill 90 minus 5 shares of external drift the fill delta
+        // cannot know about.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let mut seen_sequence = 0i64;
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        let positions = BTreeMap::from([(symbol.clone(), shares(85))]);
+
+        // Poll 1 lands while the order is open: the aggregate emits, the view
+        // skips the symbol (guard 1).
+        send_command::<InventorySnapshot>(
+            &pool,
+            &snapshot_id,
+            InventorySnapshotCommand::OffchainEquity {
+                positions: positions.clone(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        let poll_one = drain_snapshot_events(&pool, &mut seen_sequence).await;
+        assert_eq!(poll_one.len(), 1, "first poll must emit an event");
+        for event in poll_one {
+            harness
+                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // The hedge fills. The delta heals only its own 10 shares
+        // (100 -> 90), not the external drift, and clears the gate.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        // Poll 2 after the gate cleared: the broker still reports 85, so the
+        // aggregate's dedupe decides whether anything is emitted. Deliver
+        // whatever it produces.
+        send_command::<InventorySnapshot>(
+            &pool,
+            &snapshot_id,
+            InventorySnapshotCommand::OffchainEquity { positions },
+            (),
+        )
+        .await
+        .unwrap();
+        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
+            harness
+                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let hedging = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::Hedging);
+        assert_eq!(
+            hedging,
+            Some(shares(85)),
+            "after the gate clears, the view must converge to the broker \
+             truth the skipped snapshot carried; 90 means the deduped \
+             snapshot was never retried"
         );
     }
 
