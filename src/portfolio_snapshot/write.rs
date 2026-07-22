@@ -32,10 +32,16 @@
 //! read under the stale day's id or leaving that day's capital sample
 //! permanently absent: for a roughly delta-neutral book, deployed capital
 //! moves slowly and is dominated by deliberate flows, so a same-day reading
-//! remains a valid proxy for the missed day. A snapshot is never labeled with
-//! a day other than the one its balances were actually observed on. A day the
-//! bot is down across entirely (no wake before the next boundary) is simply
-//! absent from the series -- coverage is sparse by design, not backfilled.
+//! remains a valid proxy for the missed day -- but only within a BOUNDED
+//! lateness window, `[boundary, boundary + MAX_FRESHNESS_DEFER]` (see
+//! [`capture_lateness_exceeded`]). That window is anchored to the target
+//! day's boundary alone, never to process start, which makes it
+//! restart-proof: a same-day restart after the window has already elapsed
+//! cannot reopen it and recapture an already-abandoned day off-boundary. Past
+//! the cap the day is a gap. A snapshot is never labeled with a day other
+//! than the one its balances were actually observed on. A day the bot is down
+//! across entirely (no wake before the next boundary) is simply absent from
+//! the series -- coverage is sparse by design, not backfilled.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -82,14 +88,16 @@ const HYDRATION_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// rather than any change to `target_et_day`.
 const EARLY_WAKE_BACKOFF: Duration = HYDRATION_RETRY_BACKOFF;
 
-/// Bounds how long [`freshness_gap`] may keep deferring today's capture
-/// before giving up and abandoning the day entirely (livelock escape
-/// hatch): a venue that never polls this run -- or a persistent
-/// `poll_inflight_equity` outage, which aborts the whole poll tick before any
-/// slot stamps (`crate::inventory::polling`) -- would otherwise block capture
-/// forever. ~6h: long enough to ride out a startup hydration retry loop or a
-/// temporary venue outage, short enough that a genuinely stuck freshness
-/// signal does not silently swallow the whole trading day's capital sample.
+/// Bounds how long a capture may be deferred past its boundary before
+/// [`capture_lateness_exceeded`] gives up and abandons the day entirely
+/// (livelock escape hatch), independent of whether [`freshness_gap`] would
+/// otherwise still be blocking it: a venue that never polls this run -- or a
+/// persistent `poll_inflight_equity` outage, which aborts the whole poll tick
+/// before any slot stamps (`crate::inventory::polling`) -- would otherwise
+/// block capture forever. ~6h: long enough to ride out a startup hydration
+/// retry loop or a temporary venue outage, short enough that a genuinely
+/// stuck freshness signal does not silently swallow the whole trading day's
+/// capital sample.
 const MAX_FRESHNESS_DEFER: chrono::Duration = chrono::Duration::hours(6);
 
 /// Shared dependencies for the [`PortfolioSnapshotJob`].
@@ -221,6 +229,70 @@ impl PortfolioSnapshotJob {
         }
         let target_et_day = today;
 
+        // Resolved once here and threaded through the lower-bound gate and
+        // both capped retry backoffs below, instead of each re-deriving it
+        // from `target_et_day` independently: `target_et_day` never changes
+        // within a single `perform_at` call, so re-resolving it per-check
+        // bought nothing but a repeated `et_midnight`/timezone-offset
+        // lookup. `capture_lateness_exceeded` below still resolves its own
+        // (identical) boundary rather than taking this one, purely so it
+        // stays callable with a plain `NaiveDate` for tests -- see its doc.
+        let boundary = capture_window_boundary(target_et_day);
+
+        // Gate the CAPTURE itself on a boundary-anchored capture WINDOW,
+        // independent of freshness, BEFORE the freshness check below. Lower
+        // bound first: a tick landing before target_et_day's boundary (e.g.
+        // a hydration/early-wake retry straddling midnight) waits for the
+        // window to open rather than capturing off-boundary early. A `None`
+        // boundary (DST-ambiguous midnight) never gates here -- structurally
+        // guaranteed by `if let Some`, not a runtime choice -- falling
+        // through instead to `exceeds_lateness_cap`'s own `None`
+        // handling below, and then to `freshness_gap`'s.
+        if let Some(boundary_instant) = boundary
+            && now < boundary_instant
+        {
+            let delay = duration_until_or_backoff(
+                boundary_instant,
+                now,
+                target_et_day,
+                "capture-window wait",
+            );
+            return ctx.reschedule(target_et_day, delay).await;
+        }
+
+        // Upper bound: a tick landing more than MAX_FRESHNESS_DEFER past the
+        // boundary abandons the day even if freshness happens to be fully
+        // passing (a >6h-late sample is a worse proxy than a gap, see this
+        // module's doc comment).
+        if capture_lateness_exceeded(target_et_day, now) {
+            // Re-derive the freshness gap purely for diagnostics: it did not
+            // gate this abandonment (the window check above runs
+            // unconditionally, before freshness is ever consulted), but
+            // naming the specific unfresh slot -- when one exists -- lets ops
+            // tell a genuine venue-freshness failure apart from a purely
+            // late-but-healthy tick from this one log line.
+            if let Some(gap) = freshness_gap(ctx, target_et_day) {
+                error!(
+                    %target_et_day,
+                    max_freshness_defer = ?MAX_FRESHNESS_DEFER,
+                    %gap,
+                    "Portfolio snapshot capture is past its boundary-anchored lateness cap; \
+                     abandoning today's capture rather than persisting an off-boundary sample \
+                     (still not fresh, named above)"
+                );
+            } else {
+                error!(
+                    %target_et_day,
+                    max_freshness_defer = ?MAX_FRESHNESS_DEFER,
+                    "Portfolio snapshot capture is past its boundary-anchored lateness cap; \
+                     abandoning today's capture even though freshness is fully passing -- the \
+                     tick simply arrived too late"
+                );
+            }
+            let (delay, next_target_et_day) = next_capture_delay(now);
+            return ctx.reschedule(next_target_et_day, delay).await;
+        }
+
         // Freshness is checked BEFORE the inventory view is read: the live
         // poller always updates the view and only then stamps
         // `poll_freshness` (see each `observe()` call site's own comment in
@@ -233,25 +305,20 @@ impl PortfolioSnapshotJob {
         // `rows` -- see this module's `PortfolioSnapshotCtx::poll_freshness`
         // doc.
         if let Some(gap) = freshness_gap(ctx, target_et_day) {
-            if !freshness_defer_exhausted(target_et_day, now, ctx.poll_freshness.created_at()) {
-                warn!(
-                    %gap,
-                    %target_et_day,
-                    "Portfolio snapshot capture skipped this tick: inventory view is not fresh \
-                     yet this run; retrying shortly"
-                );
-                return ctx.reschedule(target_et_day, HYDRATION_RETRY_BACKOFF).await;
-            }
-
-            error!(
+            warn!(
                 %gap,
                 %target_et_day,
-                max_freshness_defer = ?MAX_FRESHNESS_DEFER,
-                "Portfolio snapshot capture never became fresh within the defer window; \
-                 abandoning today's capture rather than persisting stale data"
+                "Portfolio snapshot capture skipped this tick: inventory view is not fresh \
+                 yet this run; retrying shortly"
             );
-            let (delay, next_target_et_day) = next_capture_delay(now);
-            return ctx.reschedule(next_target_et_day, delay).await;
+            // Capped to the remaining time before the lateness cap so the
+            // final retry lands at or before the last valid capture instant,
+            // never overshoots it via the fixed backoff (which would abandon
+            // the day on the next tick even if freshness recovers in the
+            // skipped interval).
+            return ctx
+                .reschedule(target_et_day, capped_retry_backoff(boundary, now))
+                .await;
         }
 
         let rows = {
@@ -269,8 +336,11 @@ impl PortfolioSnapshotJob {
             // target_et_day (today), not self.target_et_day: a hydration
             // retry that crosses midnight must keep catching up to the
             // current day, never resume retrying under a day that has since
-            // passed.
-            return ctx.reschedule(target_et_day, HYDRATION_RETRY_BACKOFF).await;
+            // passed. Capped the same way as the freshness-gap retry above,
+            // for the same reason.
+            return ctx
+                .reschedule(target_et_day, capped_retry_backoff(boundary, now))
+                .await;
         }
 
         let rows = convert_wrapped_equity_rows(rows, ctx.wrapper.as_deref()).await?;
@@ -386,23 +456,42 @@ fn next_capture(now: DateTime<Utc>) -> (DateTime<Utc>, NaiveDate) {
     (midnight + CAPTURE_BUFFER, tomorrow)
 }
 
+/// Converts an already-resolved future `target` instant into a
+/// `push_with_delay` delay relative to `now`, falling back to
+/// [`HYDRATION_RETRY_BACKOFF`] (and logging a warning naming `context`) if
+/// the subtraction is not positive -- e.g. `now` caught up to or passed
+/// `target` between when it was computed and when this runs. Shared by every
+/// site that turns such an instant into a delay: `perform_at`'s lower-bound
+/// gate, [`next_capture_delay`], and [`first_capture`]'s before-boundary
+/// branch, so a future change to the fallback behavior (a different backoff,
+/// an added metric) only needs to happen once.
+fn duration_until_or_backoff(
+    target: DateTime<Utc>,
+    now: DateTime<Utc>,
+    target_et_day: NaiveDate,
+    context: &str,
+) -> Duration {
+    (target - now).to_std().unwrap_or_else(|error| {
+        warn!(
+            %error,
+            %target_et_day,
+            %context,
+            "Computed portfolio snapshot delay was not positive; retrying shortly instead"
+        );
+        HYDRATION_RETRY_BACKOFF
+    })
+}
+
 /// [`next_capture`]'s instant converted to a `push_with_delay` delay,
 /// alongside the target ET day it belongs to.
 fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
     let (target, target_et_day) = next_capture(now);
-    let delay = (target - now).to_std().unwrap_or_else(|error| {
-        // `next_capture` only ever returns instants at or after `now` by
-        // construction, so this branch guards the std-duration conversion
-        // itself (e.g. clock adjustments between the two `DateTime::now()`
-        // reads it is derived from), not a reachable scheduling bug.
-        warn!(
-            %error,
-            %target_et_day,
-            "Computed portfolio snapshot capture delay was not positive; retrying shortly \
-             instead"
-        );
-        HYDRATION_RETRY_BACKOFF
-    });
+    // `next_capture` only ever returns instants at or after `now` by
+    // construction, so `duration_until_or_backoff`'s fallback below guards
+    // the std-duration conversion itself (e.g. clock adjustments between the
+    // two `DateTime::now()` reads it is derived from), not a reachable
+    // scheduling bug.
+    let delay = duration_until_or_backoff(target, now, target_et_day, "capture delay");
     (delay, target_et_day)
 }
 
@@ -530,27 +619,87 @@ fn freshness_gap(ctx: &PortfolioSnapshotCtx, target_et_day: NaiveDate) -> Option
     })
 }
 
-/// Whether [`freshness_gap`]'s escape hatch should abandon `target_et_day`'s
-/// capture rather than keep deferring it: true once `now` is more than
-/// [`MAX_FRESHNESS_DEFER`] past the LATER of that day's capture boundary or
-/// `poll_freshness_created_at` (livelock fix -- see this module's `perform`
-/// for the caller). Anchoring to only the day's boundary would give a
-/// freshly-restarted process almost no grace on a restart late in the trading
-/// day (the boundary+defer window may have already elapsed hours earlier);
-/// taking the max with the tracker's own construction time instead grants
-/// such a restart a full `MAX_FRESHNESS_DEFER` window from when it actually
-/// started polling, while a long-running process (whose `poll_freshness` was
-/// created well before the boundary) is still bounded by the boundary-anchored
-/// window as before. A DST-ambiguous boundary (`et_midnight` returns `None`)
-/// is treated as "not yet exhausted": keep retrying rather than guessing.
-fn freshness_defer_exhausted(
-    target_et_day: NaiveDate,
-    now: DateTime<Utc>,
-    poll_freshness_created_at: DateTime<Utc>,
-) -> bool {
-    et_midnight(target_et_day)
-        .map(|midnight| midnight + CAPTURE_BUFFER)
-        .is_some_and(|boundary| now > boundary.max(poll_freshness_created_at) + MAX_FRESHNESS_DEFER)
+/// The capture window's lower boundary for `target_et_day`, resolved from
+/// `et_midnight` (`None` only on a DST-ambiguous midnight -- see that
+/// function's doc). `perform_at` resolves it exactly once per call, into a
+/// `boundary` local it threads through its own lower-bound gate and both
+/// [`capped_retry_backoff`] retries, instead of each re-deriving it
+/// separately; [`first_capture`] resolves it once the same way for its own
+/// bootstrap-only checks. [`capture_lateness_exceeded`] resolves it a second
+/// time within the same `perform_at` call, purely so it stays callable with
+/// a plain `NaiveDate` for tests that want to pin the resolve-then-check
+/// combination end to end.
+fn capture_window_boundary(target_et_day: NaiveDate) -> Option<DateTime<Utc>> {
+    et_midnight(target_et_day).map(|midnight| midnight + CAPTURE_BUFFER)
+}
+
+/// Whether `now` exceeds a lateness cap computed from an already-resolved
+/// capture-window boundary, [`MAX_FRESHNESS_DEFER`] past it. Split out from
+/// [`capture_lateness_exceeded`] as a pure function of an already-resolved
+/// `Option<DateTime<Utc>>` (rather than a `NaiveDate`) purely so the
+/// DST-ambiguous `None` arm can be pinned by a direct unit test: no real US
+/// Eastern calendar date makes `et_midnight` actually return `None` (see
+/// that function's doc), so the only way to exercise this arm at all is to
+/// hand it an unresolved boundary directly instead of a real date.
+fn exceeds_lateness_cap(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    boundary.is_some_and(|boundary| now > boundary + MAX_FRESHNESS_DEFER)
+}
+
+/// Whether `target_et_day`'s capture is past its boundary-anchored lateness
+/// cap: true once `now` is more than [`MAX_FRESHNESS_DEFER`] past that day's
+/// capture boundary -- see this module's `perform_at` for the caller.
+/// Anchored to the boundary ALONE, never to any process-start or restart
+/// time, so the cap is
+/// restart-proof: a same-day restart after the window has already elapsed
+/// cannot reopen it and recapture an already-abandoned day off-boundary (the
+/// bug this boundary-anchoring closes -- an earlier
+/// `PollFreshness::created_at`-based anchor reset on every restart, so an
+/// abandoned day's window re-opened on each restart). A DST-ambiguous
+/// boundary (`et_midnight` returns `None`) MUST NOT skip the cap, so this
+/// returns `false` in that case ([`exceeds_lateness_cap`]'s `None` handling)
+/// -- mirroring `perform_at`'s lower-bound gate, which likewise never blocks
+/// on an unresolved boundary, and [`freshness_gap`]'s own `None` handling,
+/// which independently treats an ambiguous boundary as a gap -- so the
+/// combined effect is always defer-not-capture, never an uncapped or
+/// off-boundary capture.
+fn capture_lateness_exceeded(target_et_day: NaiveDate, now: DateTime<Utc>) -> bool {
+    exceeds_lateness_cap(capture_window_boundary(target_et_day), now)
+}
+
+/// Caps a hydration/freshness retry delay to the time remaining before an
+/// already-resolved capture-window `boundary`'s lateness cap (see
+/// [`capture_lateness_exceeded`]), so the LAST retry before abandonment lands
+/// at or before the final valid capture instant instead of jumping past it
+/// via the fixed [`HYDRATION_RETRY_BACKOFF`] -- otherwise a fixed-backoff
+/// retry scheduled near the end of the window can land its next tick past
+/// the cap, abandoning the day even if the missing signal would have become
+/// fresh inside the skipped interval. Takes the already-resolved
+/// `Option<DateTime<Utc>>` (mirroring [`exceeds_lateness_cap`]) rather than a
+/// `NaiveDate` so callers that already hold a resolved `boundary` -- both
+/// `perform_at`'s two capped retries and [`first_capture`]'s past-boundary
+/// branch -- never re-derive it via a second [`capture_window_boundary`]
+/// call.
+///
+/// Two cases fall back to the ordinary fixed backoff instead of shrinking
+/// it: a DST-ambiguous boundary (`None`) has no cap to bound against --
+/// `capture_lateness_exceeded` never abandons in that case either; and `now`
+/// already past the cap has nothing left to protect (the window is already
+/// closed, so there is no overshoot to prevent) -- collapsing to a
+/// near-immediate delay there would only defeat bootstrap's own "never
+/// enqueue a truly-immediate capture" invariant
+/// (`bootstrap_portfolio_snapshot`'s doc) for no benefit, since a job that
+/// fires 5 minutes from now abandons via `capture_lateness_exceeded` exactly
+/// as surely as one that fires immediately.
+fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Duration {
+    let Some(cap) = boundary.map(|boundary| boundary + MAX_FRESHNESS_DEFER) else {
+        return HYDRATION_RETRY_BACKOFF;
+    };
+
+    (cap - now)
+        .to_std()
+        .map_or(HYDRATION_RETRY_BACKOFF, |remaining| {
+            remaining.min(HYDRATION_RETRY_BACKOFF)
+        })
 }
 
 /// Converts MarketMaking-venue and BaseWalletWrapped-transit equity balances
@@ -654,15 +803,21 @@ async fn resolve_marks(
 
 /// The delay and ET day for the very FIRST job [`bootstrap_portfolio_snapshot`]
 /// pushes. Unlike [`next_capture`] (which always looks forward to the next
-/// boundary, appropriate right after a successful capture), this targets
-/// `today` even when `now` is already past today's boundary -- e.g. a restart
-/// at 9am ET -- so a boot never skips the current ET day's snapshot (round-3
-/// fix: a prior version deferred to `next_capture_delay(now)` unconditionally,
-/// which silently skipped "today" on any restart after the boundary).
+/// boundary, appropriate right after a successful capture), this TARGETS
+/// `today` even when `now` is already past today's boundary (round-3 fix: a
+/// prior version deferred to `next_capture_delay(now)` unconditionally, which
+/// silently skipped "today" on any restart after the boundary). Targeting
+/// today does not by itself guarantee CAPTURING it, though: `perform_at`'s
+/// window gate ([`capture_lateness_exceeded`]) still abandons today's target
+/// once `now` is more than `MAX_FRESHNESS_DEFER` past the boundary, so a
+/// sufficiently late restart (e.g. an afternoon deploy) still re-queues today
+/// but the capture that runs immediately bails and defers to the next ET day
+/// -- only a restart within that bounded window actually lands today's
+/// snapshot.
 fn first_capture(now: DateTime<Utc>) -> (Duration, NaiveDate) {
     let today = et_day(now);
 
-    let Some(midnight) = et_midnight(today) else {
+    let Some(boundary) = capture_window_boundary(today) else {
         warn!(
             %today,
             "Ambiguous ET midnight while bootstrapping today's portfolio snapshot capture; \
@@ -671,34 +826,36 @@ fn first_capture(now: DateTime<Utc>) -> (Duration, NaiveDate) {
         return (HYDRATION_RETRY_BACKOFF, today);
     };
 
-    let boundary = midnight + CAPTURE_BUFFER;
     if now >= boundary {
-        // Already past today's boundary: schedule almost immediately (a
-        // short backoff, giving the inventory poller a moment to warm up)
-        // rather than waiting for tomorrow -- `perform` itself still gates
-        // on `hydration_gap` before it ever captures anything.
-        return (HYDRATION_RETRY_BACKOFF, today);
+        // Already past today's boundary: schedule the first attempt almost
+        // immediately (a short backoff, giving the inventory poller a moment
+        // to warm up) rather than waiting for tomorrow -- `perform` itself
+        // still gates on `hydration_gap` before it ever captures anything.
+        // Capped to the remaining time before the lateness cap, same as the
+        // in-run retries `perform_at` schedules: a bootstrap landing close to
+        // the cap (but still inside it) must not burn its one shot at the
+        // window on a fixed backoff that would land past it. Already past
+        // the cap, `capped_retry_backoff` falls back to the ordinary fixed
+        // backoff -- there is no window left to protect, and the warm-up
+        // delay above still applies.
+        return (capped_retry_backoff(Some(boundary), now), today);
     }
 
-    let delay = (boundary - now).to_std().unwrap_or_else(|error| {
-        warn!(
-            %error,
-            %today,
-            "Computed bootstrap portfolio snapshot delay was not positive; retrying shortly \
-             instead"
-        );
-        HYDRATION_RETRY_BACKOFF
-    });
+    let delay = duration_until_or_backoff(boundary, now, today, "bootstrap delay");
     (delay, today)
 }
 
 /// Removes any non-terminal [`PortfolioSnapshotJob`] rows and pushes a fresh
-/// one targeting today (via [`first_capture`]), so a restart never leaves the
-/// current ET day permanently uncaptured. Each capture re-enqueues itself
-/// with a delay, so a still-scheduled job from a previous run remains in the
-/// queue across restarts. Without the purge, the number of concurrent capture
-/// loops would grow by one with every restart. Mirrors
-/// `bootstrap_check_positions`'s purge-then-push shape.
+/// one targeting today (via [`first_capture`]), so a restart never silently
+/// skips queuing an attempt at the current ET day. Whether that attempt
+/// actually captures today depends on `perform_at`'s boundary-anchored
+/// lateness cap ([`capture_lateness_exceeded`]) -- a sufficiently late
+/// restart still leaves today a gap, by design (see this module's doc
+/// comment). Each capture re-enqueues itself with a delay, so a
+/// still-scheduled job from a previous run remains in the queue across
+/// restarts. Without the purge, the number of concurrent capture loops would
+/// grow by one with every restart. Mirrors `bootstrap_check_positions`'s
+/// purge-then-push shape.
 pub(crate) async fn bootstrap_portfolio_snapshot(
     apalis_pool: &apalis_sqlite::SqlitePool,
     queue: &PortfolioSnapshotJobQueue,
@@ -899,12 +1056,28 @@ mod tests {
         }
     }
 
+    /// A deterministic instant just past today's capture boundary, safely
+    /// inside `capture_lateness_exceeded`'s window regardless of what real
+    /// wall-clock time of day the test suite happens to run at. Ordinary
+    /// capture-behavior tests (not specifically exercising the lateness cap
+    /// itself) call `perform_at` with this instead of `perform`'s internal
+    /// `Utc::now()`, so a CI run late in the ET day cannot spuriously trip
+    /// the boundary-anchored lateness cap this module's escape hatch
+    /// introduces.
+    fn safe_capture_now() -> DateTime<Utc> {
+        let today = et_day(Utc::now());
+        et_midnight(today).unwrap() + CAPTURE_BUFFER + chrono::Duration::minutes(1)
+    }
+
     #[tokio::test]
     async fn first_capture_of_an_et_day_sends_capture_and_succeeds() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         assert!(portfolio_snapshot_row_count(&pool, &et_day).await > 0);
@@ -915,8 +1088,14 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
 
-        job_for_today().perform(&ctx).await.unwrap();
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         // Still exactly the rows from the first capture -- the second
@@ -963,7 +1142,10 @@ mod tests {
 
         pool.close().await;
 
-        let error = job_for_today().perform(&ctx).await.unwrap_err();
+        let error = job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, PortfolioSnapshotJobError::Capture(_)),
@@ -1076,48 +1258,90 @@ mod tests {
         );
     }
 
-    /// `freshness_defer_exhausted`'s DST-ambiguous branch (treats `None` as
-    /// "never exhausted") is never reached on a real fall-back day -- this
-    /// locks in that ordinary within-window/past-window defer behavior holds
-    /// on that day, not the always-keep-retrying ambiguous-midnight arm.
+    /// `capture_lateness_exceeded`'s DST-ambiguous branch (returns `false`,
+    /// never skipping the cap) is never reached on a real fall-back day --
+    /// this locks in that ordinary within-window/past-window behavior holds
+    /// on that day, not the ambiguous-midnight arm.
     #[test]
-    fn freshness_defer_exhausted_behaves_normally_on_the_fall_back_et_day() {
+    fn capture_lateness_exceeded_behaves_normally_on_the_fall_back_et_day() {
         let target_et_day = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
-        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
 
         assert!(
-            !freshness_defer_exhausted(
+            !capture_lateness_exceeded(
                 target_et_day,
                 boundary + MAX_FRESHNESS_DEFER - chrono::Duration::minutes(1),
-                poll_freshness_created_at
             ),
-            "fall-back midnight is unambiguous, so ordinary within-defer-window behavior must \
-             hold, not the DST-ambiguous never-exhausted branch"
+            "fall-back midnight is unambiguous, so ordinary within-cap behavior must hold, not \
+             the DST-ambiguous never-exceeded branch"
         );
         assert!(
-            freshness_defer_exhausted(
+            capture_lateness_exceeded(
                 target_et_day,
                 boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1),
-                poll_freshness_created_at
             ),
-            "fall-back midnight is unambiguous, so the day must still become abandonable past \
-             the defer window"
+            "fall-back midnight is unambiguous, so the day must still exceed the cap past the \
+             lateness window"
         );
     }
 
-    /// `now` just after today's boundary (round-3 fix scenario (b)):
-    /// `first_capture` must target TODAY, not tomorrow -- the exact bug this
-    /// fix closes.
+    /// `now` just after today's boundary, well inside the lateness window
+    /// (round-3 fix scenario (b)): `first_capture` must target TODAY, not
+    /// tomorrow -- the exact bug this fix closes -- with the ordinary fixed
+    /// backoff, since there is far more than `HYDRATION_RETRY_BACKOFF` of
+    /// window left to retry within.
     #[test]
     fn first_capture_after_todays_boundary_targets_today_almost_immediately() {
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         let midnight = et_midnight(today).unwrap();
-        let now = midnight + CAPTURE_BUFFER + chrono::Duration::hours(9);
+        let now = midnight + CAPTURE_BUFFER + chrono::Duration::minutes(1);
 
         let (delay, target_et_day) = first_capture(now);
 
         assert_eq!(target_et_day, today, "bootstrap must never skip today");
+        assert_eq!(delay, HYDRATION_RETRY_BACKOFF);
+    }
+
+    /// `now` close to (round-3-fix regression, FIX #2): a bootstrap landing
+    /// with less than `HYDRATION_RETRY_BACKOFF` of window left before the
+    /// lateness cap must not schedule its first attempt past the cap -- the
+    /// delay is capped to the remaining time instead of the fixed backoff.
+    #[test]
+    fn first_capture_close_to_the_cap_uses_the_capped_backoff_not_the_fixed_one() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(today).unwrap() + CAPTURE_BUFFER;
+        let cap = boundary + MAX_FRESHNESS_DEFER;
+        let now = cap - chrono::Duration::minutes(2);
+
+        let (delay, target_et_day) = first_capture(now);
+
+        assert_eq!(target_et_day, today);
+        assert_eq!(
+            delay,
+            Duration::from_secs(2 * 60),
+            "the first attempt must be scheduled for exactly the remaining window, not the \
+             longer fixed HYDRATION_RETRY_BACKOFF that would overshoot the cap"
+        );
+    }
+
+    /// `now` already past the cap entirely: `first_capture` still targets
+    /// today (bootstrap never itself decides to abandon -- that is
+    /// `perform_at`'s job), and the delay stays the ordinary fixed
+    /// `HYDRATION_RETRY_BACKOFF` rather than collapsing to near-zero -- there
+    /// is no window left to protect at this point, and collapsing it would
+    /// defeat bootstrap's own "never enqueue a truly-immediate capture"
+    /// invariant for no benefit (the job abandons via
+    /// `capture_lateness_exceeded` on its first tick regardless of whether
+    /// that tick is immediate or 5 minutes out).
+    #[test]
+    fn first_capture_past_the_cap_still_uses_the_ordinary_fixed_backoff() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let midnight = et_midnight(today).unwrap();
+        let now = midnight + CAPTURE_BUFFER + MAX_FRESHNESS_DEFER + chrono::Duration::hours(3);
+
+        let (delay, target_et_day) = first_capture(now);
+
+        assert_eq!(target_et_day, today, "bootstrap still targets today");
         assert_eq!(delay, HYDRATION_RETRY_BACKOFF);
     }
 
@@ -1152,7 +1376,10 @@ mod tests {
         )
         .await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         assert_eq!(portfolio_snapshot_row_count(&pool, &et_day).await, 0);
@@ -1188,7 +1415,10 @@ mod tests {
         )
         .await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         assert_eq!(portfolio_snapshot_row_count(&pool, &et_day).await, 0);
@@ -1216,7 +1446,10 @@ mod tests {
         )
         .await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         assert_eq!(portfolio_snapshot_row_count(&pool, &et_day).await, 0);
@@ -1236,7 +1469,10 @@ mod tests {
         )
         .await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
         let et_day_string = et_day(Utc::now()).to_string();
         assert_eq!(portfolio_snapshot_row_count(&pool, &et_day_string).await, 0);
 
@@ -1255,7 +1491,10 @@ mod tests {
         // enough once the freshness gate is in play.
         mark_all_required_fresh(&ctx);
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
         assert!(portfolio_snapshot_row_count(&pool, &et_day_string).await > 0);
     }
 
@@ -1264,7 +1503,10 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         let stored: Option<String> = sqlx::query_scalar(
@@ -1303,7 +1545,10 @@ mod tests {
             .await
             .unwrap();
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         let stored: Option<String> = sqlx::query_scalar(
@@ -1371,7 +1616,10 @@ mod tests {
             .await
             .unwrap();
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         let (usd_mark, mark_captured_at): (Option<String>, Option<String>) = sqlx::query_as(
@@ -1437,7 +1685,10 @@ mod tests {
             .await
             .unwrap();
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let today = et_day(Utc::now());
         let days = load_portfolio_days(
@@ -1493,7 +1744,10 @@ mod tests {
             .await
             .unwrap();
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let today = et_day(Utc::now());
         let days = load_portfolio_days(
@@ -1522,8 +1776,14 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
 
-        let before = Utc::now();
-        job_for_today().perform(&ctx).await.unwrap();
+        let now = safe_capture_now();
+        // `reschedule` (via apalis's `push_with_delay`) anchors `run_at` to
+        // the REAL wall clock at insertion time, not `now` -- only the
+        // delay's LENGTH is derived from `now` (see
+        // `perform_at_abandons_target_et_day_once_the_defer_window_is_exhausted`
+        // for the same pattern).
+        let real_before = Utc::now();
+        job_for_today().perform_at(&ctx, now).await.unwrap();
 
         let run_at: i64 =
             sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
@@ -1532,8 +1792,8 @@ mod tests {
                 .await
                 .unwrap();
 
-        let (expected_delay, expected_target_et_day) = next_capture_delay(before);
-        let expected = i64::try_from(expected_delay.as_secs()).unwrap() + before.timestamp();
+        let (expected_delay, expected_target_et_day) = next_capture_delay(now);
+        let expected = i64::try_from(expected_delay.as_secs()).unwrap() + real_before.timestamp();
         assert!(
             (run_at - expected).abs() <= 5,
             "expected run_at near {expected}, got {run_at}"
@@ -1541,7 +1801,7 @@ mod tests {
         // The reschedule after a successful capture always targets the day
         // AFTER the one just captured -- `job_for_today()` captured today,
         // so the follow-up must never target today again.
-        assert_eq!(expected_target_et_day, et_day(before) + Days::new(1));
+        assert_eq!(expected_target_et_day, et_day(now) + Days::new(1));
     }
 
     #[tokio::test]
@@ -1560,7 +1820,10 @@ mod tests {
 
         let before = Utc::now();
         let job = job_for_today();
-        job.clone().perform(&ctx).await.unwrap();
+        job.clone()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let run_at: i64 =
             sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
@@ -1606,7 +1869,10 @@ mod tests {
             target_et_day: today - Days::new(1),
         };
 
-        stale_job.perform(&ctx).await.unwrap();
+        stale_job
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         assert_eq!(
             portfolio_snapshot_row_count(&pool, &(today - Days::new(1)).to_string()).await,
@@ -1652,7 +1918,10 @@ mod tests {
             target_et_day: today - Days::new(1),
         };
 
-        stale_job.perform(&ctx).await.unwrap();
+        stale_job
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         assert_eq!(
             portfolio_snapshot_row_count(&pool, &today.to_string()).await,
@@ -1687,7 +1956,10 @@ mod tests {
             target_et_day: today - Days::new(1),
         };
 
-        stale_job.perform(&ctx).await.unwrap();
+        stale_job
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         assert_eq!(
             portfolio_snapshot_row_count(&pool, &(today - Days::new(1)).to_string()).await,
@@ -1727,7 +1999,10 @@ mod tests {
             target_et_day: future_day,
         };
 
-        early_job.perform(&ctx).await.unwrap();
+        early_job
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         assert_eq!(
             portfolio_snapshot_row_count(&pool, &future_day.to_string()).await,
@@ -1762,27 +2037,44 @@ mod tests {
         .unwrap();
 
         let before = Utc::now();
+        // `first_capture(before)` names the same delay `bootstrap_portfolio_snapshot`
+        // will compute internally (from a slightly later `Utc::now()`), so it is
+        // used below as the expected floor instead of a hardcoded duration: FIX #2
+        // in the RAI-1496 pass-2 review, `first_capture` now caps that delay to the
+        // time remaining before the lateness cap, so a fixed
+        // `HYDRATION_RETRY_BACKOFF`-sized floor would flake if this test happened
+        // to run within that capped window.
+        let (expected_delay, _) = first_capture(before);
+
         bootstrap_portfolio_snapshot(&apalis_pool, &queue)
             .await
             .unwrap();
 
         assert_eq!(portfolio_snapshot_job_count(&apalis_pool).await, 1);
 
-        // Round-2 fix: bootstrap must never enqueue a truly-immediate
-        // (zero-delay) capture -- it always waits at least
-        // HYDRATION_RETRY_BACKOFF, giving the inventory poller a moment to
-        // warm up, even when (round-3 fix) it is catching up to today rather
-        // than deferring to tomorrow's boundary.
+        // Round-2 fix: bootstrap must never enqueue a capture sooner than
+        // `first_capture` itself would schedule it for -- ordinarily
+        // `HYDRATION_RETRY_BACKOFF`, giving the inventory poller a moment to
+        // warm up, but possibly shorter near the boundary-anchored lateness
+        // cap (round-3 fix's catch-up-to-today path, further capped by FIX
+        // #2). `run_at` is derived from a `Utc::now()` at or after `before`,
+        // and `first_capture`'s own delay only ever grows or holds steady as
+        // `now` advances (it either tracks a fixed boundary/cap instant or
+        // adds a constant backoff), so `expected_delay` computed from
+        // `before` is a valid lower bound with a small tolerance for the
+        // sub-second gap between the two `Utc::now()` reads.
         let run_at: i64 =
             sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
                 .bind(std::any::type_name::<PortfolioSnapshotJob>())
                 .fetch_one(&apalis_pool)
                 .await
                 .unwrap();
+        let expected_floor =
+            before.timestamp() + i64::try_from(expected_delay.as_secs()).unwrap() - 1;
         assert!(
-            run_at > before.timestamp() + 60,
-            "bootstrap must not schedule an immediate capture: run_at {run_at}, now {}",
-            before.timestamp()
+            run_at >= expected_floor,
+            "bootstrap must not schedule sooner than first_capture's own delay: run_at \
+             {run_at}, expected floor {expected_floor}"
         );
 
         let job_bytes: Vec<u8> =
@@ -1926,7 +2218,10 @@ mod tests {
         )
         .await;
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
         assert_eq!(
@@ -1966,7 +2261,10 @@ mod tests {
         .await;
         mark_all_required_fresh(&ctx);
 
-        let error = job_for_today().perform(&ctx).await.unwrap_err();
+        let error = job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap_err();
 
         match error {
             PortfolioSnapshotJobError::MissingWrapper { symbol, location } => {
@@ -2033,7 +2331,10 @@ mod tests {
         .await;
         mark_all_required_fresh(&ctx);
 
-        job_for_today().perform(&ctx).await.unwrap();
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let et_day = et_day(Utc::now()).to_string();
 
@@ -2111,12 +2412,15 @@ mod tests {
 
         let _held_write_guard = ctx.inventory.write().await;
 
-        let perform_result = timeout(Duration::from_millis(200), job_for_today().perform(&ctx))
-            .await
-            .expect(
-                "perform_at must reject on the freshness gate before reading ctx.inventory; \
+        let perform_result = timeout(
+            Duration::from_millis(200),
+            job_for_today().perform_at(&ctx, safe_capture_now()),
+        )
+        .await
+        .expect(
+            "perform_at must reject on the freshness gate before reading ctx.inventory; \
                  timed out waiting for the held write lock, meaning the view was read first",
-            );
+        );
         perform_result.unwrap();
     }
 
@@ -2217,83 +2521,88 @@ mod tests {
     }
 
     #[test]
-    fn freshness_defer_exhausted_false_within_the_defer_window() {
+    fn capture_lateness_exceeded_false_within_the_window() {
         let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + MAX_FRESHNESS_DEFER - chrono::Duration::minutes(1);
-        // A long-running process: created well before the boundary, so the
-        // boundary alone drives exhaustion, matching this test's original
-        // (pre-restart-anchoring) semantics.
-        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
 
-        assert!(!freshness_defer_exhausted(
-            target_et_day,
-            now,
-            poll_freshness_created_at
-        ));
+        assert!(!capture_lateness_exceeded(target_et_day, now));
     }
 
     #[test]
-    fn freshness_defer_exhausted_true_past_the_defer_window() {
+    fn capture_lateness_exceeded_true_past_the_window() {
         let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
-        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
 
-        assert!(freshness_defer_exhausted(
-            target_et_day,
-            now,
-            poll_freshness_created_at
-        ));
+        assert!(capture_lateness_exceeded(target_et_day, now));
     }
 
+    /// Pins the strict inequality (`now > cap`, never `>=`): exactly at the
+    /// cap is still within the window, one second past it is not.
     #[test]
-    fn freshness_defer_exhausted_false_exactly_at_the_defer_window_boundary() {
+    fn capture_lateness_exceeded_false_exactly_at_the_cap_true_one_second_past() {
         let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
-        let now = boundary + MAX_FRESHNESS_DEFER;
-        let poll_freshness_created_at = boundary - chrono::Duration::days(1);
+        let cap = boundary + MAX_FRESHNESS_DEFER;
 
         assert!(
-            !freshness_defer_exhausted(target_et_day, now, poll_freshness_created_at),
-            "exactly at the boundary must still defer (strictly greater-than triggers abandonment)"
+            !capture_lateness_exceeded(target_et_day, cap),
+            "exactly at the cap must still be within the window (strictly greater-than triggers \
+             abandonment)"
+        );
+        assert!(
+            capture_lateness_exceeded(target_et_day, cap + chrono::Duration::seconds(1)),
+            "one second past the cap must exceed it"
         );
     }
 
-    /// Round-4 fix (restart-anchoring): a process that restarts late in the
-    /// trading day must still get a full `MAX_FRESHNESS_DEFER` grace window
-    /// measured from when IT started, not from the target day's boundary
-    /// (which may have elapsed its own defer window hours earlier). Here the
-    /// boundary+defer window ended long ago, but `poll_freshness` was only
-    /// created an hour ago.
+    /// `exceeds_lateness_cap`'s DST-ambiguous `None` arm, pinned directly:
+    /// no real US Eastern calendar date makes `et_midnight` actually return
+    /// `None` (see that function's doc), so this is exercised against the
+    /// already-resolved `Option<DateTime<Utc>>` boundary rather than through
+    /// a `NaiveDate`, mirroring the existing fall-back/spring-forward tests'
+    /// intent for `capture_lateness_exceeded`, which is built on top of it.
+    /// An unresolved boundary MUST NOT exceed the cap for ANY `now`, so
+    /// `capture_lateness_exceeded` never abandons on it, falling through
+    /// instead to `perform_at`'s lower-bound gate (also structurally a
+    /// no-op on `None`, via `if let Some`) and then to `freshness_gap`'s own
+    /// independent `None` handling.
     #[test]
-    fn freshness_defer_exhausted_grants_full_window_from_a_late_restart_not_the_days_boundary() {
-        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
-        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
-        let poll_freshness_created_at = boundary + chrono::Duration::hours(20);
-        let now = poll_freshness_created_at + chrono::Duration::hours(1);
+    fn exceeds_lateness_cap_is_false_when_the_boundary_is_unresolved() {
+        let far_past = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+        let far_future = Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap();
 
-        assert!(
-            !freshness_defer_exhausted(target_et_day, now, poll_freshness_created_at),
-            "a freshly-restarted process must get its own MAX_FRESHNESS_DEFER grace window, not \
-             be judged against the day's boundary alone"
-        );
+        for now in [far_past, Utc::now(), far_future] {
+            assert!(
+                !exceeds_lateness_cap(None, now),
+                "an unresolved boundary must never exceed the cap for now = {now}"
+            );
+        }
     }
 
-    /// Complements the test above: once that late restart's OWN grace window
-    /// elapses, the day must still be abandoned.
+    /// `capped_retry_backoff`'s DST-ambiguous `None` arm, pinned directly the
+    /// same way [`exceeds_lateness_cap_is_false_when_the_boundary_is_unresolved`]
+    /// pins `exceeds_lateness_cap`'s: no real US Eastern calendar date makes
+    /// `et_midnight` actually return `None` (see that function's doc), so
+    /// this is exercised against an already-unresolved `Option<DateTime<Utc>>`
+    /// boundary directly rather than through a `NaiveDate`. An unresolved
+    /// boundary has no cap to shrink the retry against, so this must fall
+    /// back to the ordinary fixed [`HYDRATION_RETRY_BACKOFF`] rather than
+    /// panicking or computing a nonsensical duration, for any `now`.
     #[test]
-    fn freshness_defer_exhausted_true_once_a_late_restarts_own_grace_window_elapses() {
-        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
-        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
-        let poll_freshness_created_at = boundary + chrono::Duration::hours(20);
-        let now = poll_freshness_created_at + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
+    fn capped_retry_backoff_is_the_fixed_backoff_when_the_boundary_is_unresolved() {
+        let far_past = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+        let far_future = Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap();
 
-        assert!(freshness_defer_exhausted(
-            target_et_day,
-            now,
-            poll_freshness_created_at
-        ));
+        for now in [far_past, Utc::now(), far_future] {
+            assert_eq!(
+                capped_retry_backoff(None, now),
+                HYDRATION_RETRY_BACKOFF,
+                "an unresolved boundary must fall back to the ordinary fixed backoff for now = \
+                 {now}"
+            );
+        }
     }
 
     /// Deterministic coverage of `perform_at`'s "keep deferring" branch
@@ -2313,7 +2622,7 @@ mod tests {
             Usdc::new(float!(1000)),
             Usdc::new(float!(500)),
         );
-        let (mut ctx, _position) = build_ctx(
+        let (ctx, _position) = build_ctx(
             pool.clone(),
             apalis_pool.clone(),
             view,
@@ -2330,9 +2639,6 @@ mod tests {
         let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + chrono::Duration::minutes(1);
-        // A long-running process, created well before the boundary, so the
-        // boundary alone (not this test's `now`) determines the defer state.
-        ctx.poll_freshness = PollFreshness::new_at(boundary - chrono::Duration::days(1));
 
         let job = PortfolioSnapshotJob { target_et_day };
         job.perform_at(&ctx, now).await.unwrap();
@@ -2352,7 +2658,200 @@ mod tests {
         let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
         assert_eq!(
             rescheduled.target_et_day, target_et_day,
-            "within the defer window, the retry must keep targeting the same day"
+            "within the lateness window, the retry must keep targeting the same day"
+        );
+    }
+
+    /// FIX (RAI-1496 follow-up): the freshness-gap retry delay must be capped
+    /// to the remaining time before the lateness cap, not the fixed
+    /// `HYDRATION_RETRY_BACKOFF` -- otherwise the fixed 5-minute jump can
+    /// land past the cap and abandon the day even if freshness recovers
+    /// inside the skipped interval. Simulates a two-tick sequence: the first
+    /// tick has 2 minutes left before the cap (less than the fixed backoff)
+    /// and is not yet fresh, so its retry must be capped to exactly those 2
+    /// minutes rather than the full 5; the second tick lands exactly at the
+    /// cap with freshness now passing, and must still capture (the cap
+    /// allows exactly-at-cap, per `capture_lateness_exceeded`'s strict `>`).
+    #[tokio::test]
+    async fn freshness_retry_delay_is_capped_so_the_final_retry_lands_at_the_cap_and_still_captures()
+     {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        );
+        let (ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        // Deliberately no `mark_all_required_fresh` yet: presence passes but
+        // freshness has not, simulating a slot not yet re-polled this run.
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let cap = boundary + MAX_FRESHNESS_DEFER;
+        let first_tick_now = cap - chrono::Duration::minutes(2);
+
+        let real_before = Utc::now();
+        let job = PortfolioSnapshotJob { target_et_day };
+        job.perform_at(&ctx, first_tick_now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await,
+            0,
+            "not fresh yet: must not capture on the first tick"
+        );
+
+        let run_at: i64 =
+            sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let expected_run_at = real_before.timestamp() + 2 * 60;
+        assert!(
+            (run_at - expected_run_at).abs() <= 5,
+            "the retry must be capped to the 2 minutes remaining before the cap, not the full \
+             5-minute HYDRATION_RETRY_BACKOFF that would overshoot it: expected run_at near \
+             {expected_run_at}, got {run_at}"
+        );
+
+        // Freshness recovers inside the interval the fixed backoff would
+        // have skipped over. The rescheduled job's second tick lands exactly
+        // at the cap.
+        mark_all_required_fresh(&ctx);
+        let rescheduled = PortfolioSnapshotJob { target_et_day };
+        rescheduled.perform_at(&ctx, cap).await.unwrap();
+
+        assert!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await > 0,
+            "the final retry at the cap must still capture now that freshness has recovered"
+        );
+    }
+
+    /// The LOWER bound of the capture window must be enforced too, not just
+    /// the upper cap: a tick landing one second before target_et_day's
+    /// boundary -- e.g. a hydration or early-wake retry that straddles
+    /// midnight and lands in the first few minutes of the new day -- must
+    /// wait for the window to open rather than capturing off-boundary early,
+    /// even when the view is fully fresh and hydrated (fresh does not mean
+    /// eligible: the window has not opened yet).
+    #[tokio::test]
+    async fn perform_at_reschedules_without_capturing_one_second_before_the_window_opens() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary - chrono::Duration::seconds(1);
+
+        let real_before = Utc::now();
+        let job = PortfolioSnapshotJob { target_et_day };
+        job.perform_at(&ctx, now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await,
+            0,
+            "a tick before the window opens must never capture, even when fully fresh and \
+             hydrated"
+        );
+
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day, target_et_day,
+            "the retry must keep targeting the same day, waiting for its own window to open"
+        );
+
+        let run_at: i64 =
+            sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let expected_run_at = real_before.timestamp() + 1;
+        assert!(
+            (run_at - expected_run_at).abs() <= 5,
+            "expected run_at near {expected_run_at} (almost exactly at the boundary, one second \
+             after `now`), got {run_at}"
+        );
+    }
+
+    /// Boundary case (folded from the critique): `now` exactly at the
+    /// boundary-anchored cap must still be treated as within the window --
+    /// `capture_lateness_exceeded` uses a strict `>`, so a fresh capture at
+    /// exactly `boundary + MAX_FRESHNESS_DEFER` must still succeed.
+    #[tokio::test]
+    async fn perform_at_captures_when_now_is_exactly_at_the_lateness_cap() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let cap = boundary + MAX_FRESHNESS_DEFER;
+
+        let job = PortfolioSnapshotJob { target_et_day };
+        job.perform_at(&ctx, cap).await.unwrap();
+
+        assert!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await > 0,
+            "exactly at the cap must still be within the window and capture when fresh"
+        );
+    }
+
+    /// The ticket's core regression (RAI-1496 resurrection prevention): even
+    /// when freshness genuinely passes -- simulating a same-day restart that
+    /// re-established fresh polls after a prior abandonment, or a scheduler
+    /// tick simply arriving very late -- a tick past the boundary-anchored
+    /// cap must still abandon the day rather than capture it off-boundary.
+    /// Under the reverted `PollFreshness::created_at`-anchored design, this
+    /// exact scenario (fresh signal, `now` past the old anchor) would have
+    /// captured; boundary-anchoring closes that hole because the cap no
+    /// longer depends on when this process (or its `PollFreshness`) started.
+    #[tokio::test]
+    async fn perform_at_abandons_even_when_fresh_one_second_past_the_cap() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::seconds(1);
+
+        let job = PortfolioSnapshotJob { target_et_day };
+        job.perform_at(&ctx, now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await,
+            0,
+            "a fresh-but-past-cap tick must abandon, never capture off-boundary"
+        );
+
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day,
+            target_et_day + Days::new(1),
+            "past the cap the day must be abandoned by advancing to the NEXT capture day, never \
+             resurrected under the same target_et_day"
         );
     }
 
@@ -2360,7 +2859,8 @@ mod tests {
     /// actual livelock-escape-hatch behavior this feature introduces. `now`
     /// is pinned past `MAX_FRESHNESS_DEFER`, so the job must give up on
     /// `target_et_day`, never capture stale data, and reschedule under the
-    /// NEXT capture day computed by `next_capture_delay`.
+    /// NEXT capture day computed by `next_capture_delay` -- not a short
+    /// tight-loop retry of today.
     #[tokio::test]
     async fn perform_at_abandons_target_et_day_once_the_defer_window_is_exhausted() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -2371,7 +2871,7 @@ mod tests {
             Usdc::new(float!(1000)),
             Usdc::new(float!(500)),
         );
-        let (mut ctx, _position) = build_ctx(
+        let (ctx, _position) = build_ctx(
             pool.clone(),
             apalis_pool.clone(),
             view,
@@ -2386,9 +2886,6 @@ mod tests {
         let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
-        // A long-running process: the boundary-anchored window alone must
-        // drive this exhaustion, not a fresh restart's own grace window.
-        ctx.poll_freshness = PollFreshness::new_at(boundary - chrono::Duration::days(1));
 
         let job = PortfolioSnapshotJob { target_et_day };
         // `reschedule` (via apalis's `push_with_delay`) anchors `run_at` to
@@ -2404,9 +2901,15 @@ mod tests {
         );
 
         let (expected_delay, expected_next_target_et_day) = next_capture_delay(now);
-        assert_ne!(
-            expected_next_target_et_day, target_et_day,
-            "sanity: the abandon branch must advance to a different day"
+        assert_eq!(
+            expected_next_target_et_day,
+            target_et_day + Days::new(1),
+            "the abandon branch must advance to TOMORROW, not merely some other day"
+        );
+        assert!(
+            expected_delay > HYDRATION_RETRY_BACKOFF,
+            "no tight loop: the reschedule delay must be to tomorrow's boundary, not a short \
+             retry backoff that re-hammers today"
         );
 
         let rescheduled_job: Vec<u8> =
@@ -2433,6 +2936,103 @@ mod tests {
         assert!(
             (run_at - expected_run_at).abs() <= 5,
             "expected run_at near {expected_run_at}, got {run_at}"
+        );
+    }
+
+    /// Catch-up + cap (folded from the plan): a job whose `target_et_day` has
+    /// already passed rebinds to TODAY (the existing catch-up path), and the
+    /// boundary-anchored cap check that follows is computed against TODAY's
+    /// boundary, not the stale target's. Here `now` is past today's own cap,
+    /// so the catch-up rebind must still abandon today (never resurrect
+    /// yesterday, never capture today off-boundary either) and reschedule to
+    /// the day after today -- not a tight loop re-hammering today or
+    /// yesterday.
+    #[tokio::test]
+    async fn catch_up_rebind_is_still_gated_by_todays_lateness_cap() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
+
+        let yesterday = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let today = yesterday + Days::new(1);
+        let today_boundary = et_midnight(today).unwrap() + CAPTURE_BUFFER;
+        let now = today_boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
+
+        let stale_job = PortfolioSnapshotJob {
+            target_et_day: yesterday,
+        };
+        stale_job.perform_at(&ctx, now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &yesterday.to_string()).await,
+            0,
+            "the stale target day must never be captured"
+        );
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &today.to_string()).await,
+            0,
+            "today's catch-up rebind must still respect today's own lateness cap"
+        );
+
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day,
+            today + Days::new(1),
+            "abandon must advance to the day AFTER today, never resume retrying today or \
+             yesterday (no tight loop)"
+        );
+    }
+
+    /// Catch-up + LOWER bound (the finding's exact scenario): a hydration or
+    /// early-wake retry that straddles midnight rebinds a stale job to TODAY
+    /// in the same tick that lands `now` inside `[midnight, boundary)` --
+    /// i.e. the rebind happens in the ungated first few minutes of the new
+    /// day. Even fully fresh and hydrated, this must wait for today's window
+    /// to open, never capture off-boundary just because the rebind itself
+    /// landed after midnight.
+    #[tokio::test]
+    async fn catch_up_rebind_still_waits_for_todays_window_when_now_is_before_the_boundary() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
+
+        let yesterday = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let today = yesterday + Days::new(1);
+        let today_boundary = et_midnight(today).unwrap() + CAPTURE_BUFFER;
+        let now = today_boundary - chrono::Duration::seconds(1);
+
+        let stale_job = PortfolioSnapshotJob {
+            target_et_day: yesterday,
+        };
+        stale_job.perform_at(&ctx, now).await.unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &yesterday.to_string()).await,
+            0,
+            "the stale target day must never be captured"
+        );
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &today.to_string()).await,
+            0,
+            "the catch-up rebind must still wait for today's own window to open, not capture \
+             one second early"
+        );
+
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day, today,
+            "the rebind to today stands -- it just waits for the window, never resumes \
+             retrying under yesterday's stale id"
         );
     }
 }

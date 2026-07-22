@@ -623,9 +623,19 @@ wake), it CATCHES UP to a fresh reading for the CURRENT ET day rather than
 either back-dating a live read under the stale day's id or leaving that day's
 capital sample permanently absent: for a roughly delta-neutral book, deployed
 capital moves slowly and is dominated by deliberate flows, so a same-day reading
-remains a valid proxy for the missed day. A day the bot is down across entirely,
-with no wake before the next boundary, is simply absent from the series --
-coverage is sparse by design, not backfilled.
+remains a valid proxy for the missed day -- but only within a BOUNDED lateness
+window (see the escape hatch below):
+`[boundary, boundary + MAX_FRESHNESS_DEFER]` (~6h), anchored to that day's
+boundary alone, never to when the process (or its poll-freshness tracker)
+started. Because the anchor is boundary-only, the window is restart-proof: a
+same-day restart after it has already elapsed cannot reopen it and recapture an
+already-abandoned day off-boundary. Past the cap, the day is a gap -- including
+the case of a healthy, fully-fresh capture whose scheduler tick was simply
+delayed more than ~6h past the boundary (e.g. an apalis backlog, or a
+stuck-then-recovered worker): a same-day sample that late is treated as a worse
+proxy than a gap. A day the bot is down across entirely, with no wake before the
+next boundary, is simply absent from the series -- coverage is sparse by design,
+not backfilled.
 
 **What is captured**: every balance the live in-memory inventory view has polled
 at least once that ET day, across both trading venues (onchain Raindex
@@ -659,16 +669,23 @@ permanently fresh for every later day's capture, even after the venue that fed
 it stops polling entirely -- the same stale-capture hole the gate exists to
 close, just on a longer timescale than a single restart.
 
-If a required slot never becomes fresh (a persistently failing venue, or a
-`poll_inflight_equity` outage that aborts the whole poll tick before any slot
-stamps), an escape hatch abandons that day's capture rather than blocking
-forever: `perform` gives up once `now` is more than `MAX_FRESHNESS_DEFER` (~6h)
-past the LATER of the target day's capture boundary or the poller's own
-process-start time. Anchoring to the later of the two matters for restarts: a
-process that restarts late in the trading day still gets a full defer window
-measured from when it actually started, rather than being judged solely against
-a boundary whose own window may have elapsed hours earlier (which would abandon
-the day on the very first freshness check after such a restart).
+The capture itself is additionally gated on a boundary-anchored lateness cap,
+independent of freshness: `perform` abandons `target_et_day` once `now` is more
+than `MAX_FRESHNESS_DEFER` (~6h) past that day's capture boundary, regardless of
+whether freshness currently passes. This closes a resurrection hole an earlier
+design had: anchoring the cap to the poll-freshness tracker's own construction
+time (which resets on every restart) meant a same-day restart after an
+abandonment re-opened a fresh grace window and could recapture the
+previously-abandoned day off-boundary, with fresh but stale-for-the-day data.
+Anchoring to the boundary alone instead of process start makes the cap
+restart-proof: once `now` passes a day's cap, no later restart can recapture
+that day. Within the window, a required slot that never becomes fresh (a
+persistently failing venue, or a `poll_inflight_equity` outage that aborts the
+whole poll tick before any slot stamps) keeps deferring the capture rather than
+blocking forever, retrying until either freshness passes (captures) or the cap
+is reached (abandons). The tradeoff: a healthy, fully-fresh tick whose scheduler
+delay alone exceeded ~6h past the boundary -- not just a late restart -- also
+abandons rather than captures; that day is then a gap in the series.
 
 **Deployed capital definition**: a day's total USD capital is the sum of cash
 (USDC) balances across every location (both trading venues plus every

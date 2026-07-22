@@ -48,12 +48,8 @@ type LocationFreshness = HashMap<PortfolioAsset, DateTime<Utc>>;
 type FreshnessMap = HashMap<PortfolioLocation, LocationFreshness>;
 
 /// Shared state behind [`PollFreshness`]'s `Arc`: the per-slot observation
-/// timestamps, plus `created_at` -- this tracker's own construction time, used
-/// by `crate::portfolio_snapshot::write::freshness_defer_exhausted` to grant a
-/// freshly-restarted process its own defer grace window instead of judging it
-/// solely against the target day's capture boundary.
+/// timestamps.
 struct Inner {
-    created_at: DateTime<Utc>,
     map: Mutex<FreshnessMap>,
 }
 
@@ -69,34 +65,14 @@ struct Inner {
 pub(crate) struct PollFreshness(Arc<Inner>);
 
 impl PollFreshness {
-    /// An empty tracker, `created_at` stamped to the current instant: every
-    /// slot reads un-observed until [`Self::observe`] marks it, which is
-    /// exactly what makes the freshness signal restart-safe -- startup
-    /// hydration alone can never make a slot read fresh.
+    /// An empty tracker: every slot reads un-observed until [`Self::observe`]
+    /// marks it, which is exactly what makes the freshness signal
+    /// restart-safe -- startup hydration alone can never make a slot read
+    /// fresh.
     pub(crate) fn new() -> Self {
-        Self::with_created_at(Utc::now())
-    }
-
-    /// Test-only: builds a tracker whose [`Self::created_at`] is an injected
-    /// instant rather than the real construction time, so
-    /// `freshness_defer_exhausted`'s restart-anchored grace window can be
-    /// tested deterministically instead of racing the real wall clock.
-    #[cfg(test)]
-    pub(crate) fn new_at(created_at: DateTime<Utc>) -> Self {
-        Self::with_created_at(created_at)
-    }
-
-    fn with_created_at(created_at: DateTime<Utc>) -> Self {
         Self(Arc::new(Inner {
-            created_at,
             map: Mutex::new(HashMap::new()),
         }))
-    }
-
-    /// When this tracker was constructed (a fresh, empty map) -- i.e. this
-    /// process run's start, or an injected instant in tests.
-    pub(crate) fn created_at(&self) -> DateTime<Utc> {
-        self.0.created_at
     }
 
     /// Marks `(location, asset)` as observed by a successful poll just now.
@@ -259,15 +235,5 @@ mod tests {
             &PortfolioAsset::Usdc,
             DateTime::<Utc>::MIN_UTC
         ));
-    }
-
-    #[test]
-    fn new_stamps_created_at_to_the_construction_instant() {
-        let before = Utc::now();
-        let poll_freshness = PollFreshness::new();
-        let after = Utc::now();
-
-        assert!(poll_freshness.created_at() >= before);
-        assert!(poll_freshness.created_at() <= after);
     }
 }
