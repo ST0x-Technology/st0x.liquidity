@@ -22518,6 +22518,116 @@ mod tests {
         );
     }
 
+    /// Production splits the two owners: the vault registry is keyed by
+    /// `vault_owner` (the inventory contract under managed mode) while the
+    /// poller writes snapshots under `order_owner` (the signing EOA). The
+    /// forget-on-clear command must land on the stream the poller writes —
+    /// sent anywhere else it no-ops on a virgin aggregate with no event, no
+    /// error, and no log, and the skipped snapshot is never retried.
+    #[tokio::test]
+    async fn forget_on_clear_reaches_poller_stream_when_owners_differ() {
+        const TEST_VAULT_OWNER: Address = address!("0x0000000000000000000000000000000000000003");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_equity(symbol.clone(), shares(20), shares(100))
+                .with_usdc(usdc(5000), usdc(5000)),
+            event_sender,
+        ));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let trigger = Arc::new(RebalancingService::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_VAULT_OWNER,
+            },
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(NoopNotifier),
+        ));
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        trigger
+            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .await;
+        let mut seen_sequence = 0i64;
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // The poller's stream is keyed by the ORDER owner, not the vault
+        // owner the registry uses.
+        let poller_snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        let positions = BTreeMap::from([(symbol.clone(), shares(85))]);
+        send_command::<InventorySnapshot>(
+            &pool,
+            &poller_snapshot_id,
+            InventorySnapshotCommand::OffchainEquity {
+                positions: positions.clone(),
+                fetched_at: Utc::now(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
+            harness
+                .receive::<InventorySnapshot>(poller_snapshot_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // Fill clears the gate; the forget must target the poller's stream.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        // Next poll, unchanged value: only a forget on the poller's stream
+        // defeats the dedupe here.
+        send_command::<InventorySnapshot>(
+            &pool,
+            &poller_snapshot_id,
+            InventorySnapshotCommand::OffchainEquity {
+                positions,
+                fetched_at: Utc::now(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
+            harness
+                .receive::<InventorySnapshot>(poller_snapshot_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(85)),
+            "the forget must land on the stream the poller writes; 90 means \
+             it no-opped on a different stream and the dedupe swallowed the \
+             retry"
+        );
+    }
+
     /// The reverse race through the production stamping path. The aggregate
     /// stamps `fetched_at` when it handles the command -- after the broker
     /// read -- so a read taken before the fill can be stamped after the fill
