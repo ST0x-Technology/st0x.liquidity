@@ -649,23 +649,34 @@ The set of deployed profiles is declared as a registry in `services.nix`. Each
 entry has a `kind` discriminating how it is activated and whether it has a
 systemd unit:
 
-- `st0x-hedge` (kind = `st0x`) - hedging bot binary. Full pipeline: decrypts
-  agenix secret, installs plaintext config, runs `validate-config`, chowns data
-  files, writes git-rev marker, touches the activation marker, and restarts the
-  unit. The server writes its PID to a systemd-managed runtime-directory file
-  only after Conductor has completed startup initialization and every essential
-  supervised runtime task has reached a pending run state. Activation waits for
-  that PID to match the unit's live main process with a bounded startup timeout.
-  If the process exits, readiness reporting fails, or the timeout expires first,
-  activation prints the unit status and recent journal, exits non-zero, and
-  deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
-  rollback stays compatible with service generations from before the readiness
-  handshake was introduced. The first rollout requires deploying the system
-  profile before the service profile; a service-only deploy verifies the
-  installed unit exposes the expected ready file before stopping the running bot
-  and otherwise fails immediately with the required rollout order. Outside
-  systemd, the server uses a no-op readiness notifier so local runs remain
-  available.
+- `st0x-hedge` (kind = `st0x`) - hedging bot binary. Full pipeline: decrypts the
+  candidate agenix secret into a temporary file, stages the plaintext config,
+  and runs `validate-config` while the old process is still running. For Turnkey
+  wallets it then lists policies through Turnkey's authenticated read-only API
+  and proves that every startup MAX approval target (enabled equity token to
+  wrapper, wrapper to orderbook, and USDC to orderbook) is covered by an allow
+  policy whose consensus the authenticated API user can satisfy alone and whose
+  target condition provably applies. Applicable deny policies take precedence;
+  unknown allow or deny applicability, unsupported consensus, and missing
+  coverage fail closed, naming the symbol, token contract, and spender. Only
+  after both gates pass may activation stop the old process and install the
+  candidate files, so a policy or config failure leaves the running bot
+  untouched; a failed stop aborts before candidate files are installed. It then
+  verifies migrations, chowns data files, writes the git-rev marker, touches the
+  activation marker, and restarts the unit. The server writes its PID to a
+  systemd-managed runtime-directory file only after Conductor has completed
+  startup initialization and every essential supervised runtime task has reached
+  a pending run state. Activation waits for that PID to match the unit's live
+  main process with a bounded startup timeout. If the process exits, readiness
+  reporting fails, or the timeout expires first, activation prints the unit
+  status and recent journal, exits non-zero, and deploy-rs rolls the profile
+  back. The unit remains `Type=simple` so automatic rollback stays compatible
+  with service generations from before the readiness handshake was introduced.
+  The first rollout requires deploying the system profile before the service
+  profile; a service-only deploy verifies the installed unit exposes the
+  expected ready file before stopping the running bot and otherwise fails
+  immediately with the required rollout order. Outside systemd, the server uses
+  a no-op readiness notifier so local runs remain available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
@@ -741,6 +752,19 @@ the `st0x-evm` crate and configured via the `[rebalancing.wallet]` TOML section
 The main crate forwards these as `wallet-turnkey` and `wallet-private-key`
 features. Domain logic is decoupled from the signing backend. See
 [crates/evm/](crates/evm/) for implementation details.
+
+The deploy-time Turnkey verifier never signs or submits an activity. It uses the
+same deterministic approval-target builder as server startup, identifies the
+authenticated API user, and lists policies. It accepts only allow policies whose
+consensus that user can satisfy alone and whose condition it can prove applies
+to `SIGN_TRANSACTION` V2 ERC20 `approve` calls for the target token. It trusts
+the raw `0x095ea7b3` selector, not ABI-derived function fields whose smart
+contract interface registration it cannot prove, and rejects applicable or
+unprovable deny policies. This check is intentionally conservative because
+Turnkey does not expose a policy-simulation endpoint. Condition and consensus
+matching ignores syntax whitespace only outside single-quoted literals; literal
+contents remain byte-for-byte significant so a policy with extra literal
+whitespace cannot be certified as covering the runtime activity.
 
 ## Crate Architecture
 

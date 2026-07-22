@@ -1,6 +1,7 @@
 { lib }:
 
-# kind = "st0x"    -- full pipeline: agenix decrypt, install config, validate-config,
+# kind = "st0x"    -- full pipeline: stage/decrypt config, validate config and
+#                    Turnkey approval policies, install, verify migrations,
 #                    chown data dirs, write git-rev, marker file, restart unit.
 # kind = "cli"     -- agenix decrypt + install config + validate-config for an
 #                    on-demand CLI (e.g. the `s01` issuer wrapper). No systemd

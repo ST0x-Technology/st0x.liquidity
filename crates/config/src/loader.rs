@@ -134,6 +134,17 @@ pub struct AssetsConfig {
     pub cash: Option<CashAssetConfig>,
 }
 
+/// Validated, network-free inputs required by the deploy-time Turnkey approval
+/// policy coverage check.
+#[cfg(feature = "wallet-turnkey")]
+#[derive(Clone, Debug)]
+pub struct TurnkeyApprovalPolicyInputs {
+    pub organization_id: st0x_evm::turnkey::TurnkeyOrganizationId,
+    pub api_private_key: st0x_evm::turnkey::TurnkeyApiPrivateKey,
+    pub orderbook: Address,
+    pub assets: AssetsConfig,
+}
+
 /// Parses a hex string (possibly short, e.g. `"0xfab"`) into a
 /// left-padded `B256`.
 fn parse_padded_b256(hex_str: &str) -> Result<B256, String> {
@@ -1064,6 +1075,52 @@ impl Ctx {
             })?;
         parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
         Ok(())
+    }
+
+    /// Loads deploy-time Turnkey policy inputs without constructing wallets or
+    /// connecting to the configured RPC endpoints.
+    #[cfg(feature = "wallet-turnkey")]
+    pub fn load_turnkey_approval_policy_inputs(
+        config_path: &Path,
+        secrets_path: &Path,
+    ) -> Result<Option<TurnkeyApprovalPolicyInputs>, CtxError> {
+        let config_str =
+            std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
+                path: config_path.to_path_buf(),
+                source,
+            })?;
+        let secrets_str =
+            std::fs::read_to_string(secrets_path).map_err(|source| CtxError::SecretsIo {
+                path: secrets_path.to_path_buf(),
+                source,
+            })?;
+        let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+
+        if parts.wallet_meta.kind != "turnkey" {
+            return Ok(None);
+        }
+
+        let st0x_evm::turnkey::TurnkeySettings {
+            organization_id, ..
+        } = st0x_evm::turnkey::TurnkeySettings::deserialize(parts.wallet_inputs.config).map_err(
+            |source| CtxError::ConfigToml {
+                path: config_path.to_path_buf(),
+                source,
+            },
+        )?;
+        let st0x_evm::turnkey::TurnkeyCredentials { api_private_key } =
+            st0x_evm::turnkey::TurnkeyCredentials::deserialize(parts.wallet_inputs.secrets)
+                .map_err(|source| CtxError::SecretsToml {
+                    path: secrets_path.to_path_buf(),
+                    source,
+                })?;
+
+        Ok(Some(TurnkeyApprovalPolicyInputs {
+            organization_id,
+            api_private_key,
+            orderbook: parts.evm.orderbook,
+            assets: parts.assets,
+        }))
     }
 
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
@@ -5216,6 +5273,87 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = dry_run_secrets_toml();
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn load_turnkey_approval_policy_inputs_extracts_validated_deploy_inputs() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0x4444444444444444444444444444444444444444"
+            tokenized_equity_derivative = "0x5555555555555555555555555555555555555555"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "turnkey"
+            address = "0x6666666666666666666666666666666666666666"
+            organization_id = "org-test"
+            "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://ethereum.example.com"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            api_private_key = "secret-p256-key"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+            "#,
+        );
+
+        let inputs = Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inputs.organization_id.as_str(), "org-test");
+        assert_eq!(
+            inputs.orderbook,
+            address!("0x1111111111111111111111111111111111111111")
+        );
+        assert!(
+            inputs
+                .assets
+                .is_trading_enabled(&Symbol::new("AAPL").unwrap())
+        );
+        assert!(!format!("{inputs:?}").contains("secret-p256-key"));
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn load_turnkey_approval_policy_inputs_skips_non_turnkey_wallet() {
+        let config = minimal_config_toml();
+        let secrets = dry_run_secrets_toml();
+
+        let inputs =
+            Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path()).unwrap();
+
+        assert!(inputs.is_none());
     }
 
     #[test]

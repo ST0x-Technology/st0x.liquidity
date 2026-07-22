@@ -81,32 +81,42 @@ let
             exit 1
           fi
         '';
-      in
-      assert lib.assertMsg (
-        lib.hasInfix "--property ActiveState" startupWaitCommand
-        && lib.hasInfix "--property SubState" startupWaitCommand
-        && lib.hasInfix "*/auto-restart" startupWaitCommand
-      ) "st0x activation must stop waiting when the restarted unit cannot become ready";
-      activate.custom pkg (
-        builtins.concatStringsSep " && " [
+        stagedConfigPath = "/run/st0x/${name}.config.staged";
+        stagedSecretPath = "/run/st0x/${name}.secrets.staged";
+        validateCommand = "${cfg.profilePath}/bin/validate-config --config ${stagedConfigPath} --secrets ${stagedSecretPath}";
+        verifyApprovalsCommand = "${cfg.profilePath}/bin/verify-approvals --config ${stagedConfigPath} --secrets ${stagedSecretPath}";
+        readinessPrerequisiteCommand = ''
+          if ! systemctl show --property Environment --value ${name} 2>/dev/null \
+            | grep --fixed-strings --quiet 'ST0X_STARTUP_READY_FILE=${startupReadyFile}'; then
+            echo "${name} systemd unit does not expose ${startupReadyFile}; deploy the system profile before the service profile" >&2
+            exit 1
+          fi
+        '';
+        stopCommand = "systemctl stop ${name}";
+        installConfigCommand = "install -D -m 0640 -o root -g st0x ${stagedConfigPath} ${cfg.configPath}";
+        installSecretCommand = "install -D -m 0640 -o root -g st0x ${stagedSecretPath} ${cfg.decryptedSecretPath}";
+        beforeStopCommands = [
           # The readiness environment ships in the system profile, while this
           # activation ships the binary and wait loop. Enforce system-first on
           # the handshake's first rollout before touching the running service.
-          ''
-            if ! systemctl show --property Environment --value ${name} 2>/dev/null \
-              | grep --fixed-strings --quiet 'ST0X_STARTUP_READY_FILE=${startupReadyFile}'; then
-              echo "${name} systemd unit does not expose ${startupReadyFile}; deploy the system profile before the service profile" >&2
-              exit 1
-            fi
-          ''
-          "systemctl stop ${name} || true"
-          "rm -f ${cfg.markerFile}"
+          readinessPrerequisiteCommand
           "mkdir -p /run/st0x"
-          "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
-          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
-          # Validate config + secrets before restarting. If validation fails,
-          # the activation script exits non-zero and deploy-rs rolls back.
-          "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
+          # Stage and validate the candidate files while the old service is
+          # still running. The EXIT trap removes the decrypted staged secret on
+          # every success/failure path.
+          "trap 'rm -f ${stagedConfigPath} ${stagedSecretPath}' EXIT"
+          "install -D -m 0640 -o root -g st0x ${configFile} ${stagedConfigPath}"
+          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${stagedSecretPath}"
+          validateCommand
+          # Query Turnkey policies read-only before stopping the old process.
+          # Missing coverage exits non-zero, leaving both the running bot and
+          # its installed config/secrets untouched.
+          verifyApprovalsCommand
+        ];
+        afterStopCommands = [
+          "rm -f ${cfg.markerFile}"
+          installConfigCommand
+          installSecretCommand
           # Dry-run migrations + full event replay against the live DB before
           # restarting -- the service is already stopped above (no
           # concurrent writer), and this only ever reads that file: it
@@ -127,8 +137,36 @@ let
           # pre-readiness binary remains possible during the first rollout.
           "systemctl restart ${name} || { restart_status=$?; systemctl status --no-pager --full ${name} >&2 || true; journalctl --no-pager --unit ${name} --lines 100 >&2 || true; rm -f ${cfg.markerFile}; exit $restart_status; }"
           startupWaitCommand
-        ]
-      )
+        ];
+        activationCommands =
+          assert lib.assertMsg (
+            lib.hasInfix "--property ActiveState" startupWaitCommand
+            && lib.hasInfix "--property SubState" startupWaitCommand
+            && lib.hasInfix "*/auto-restart" startupWaitCommand
+          ) "st0x activation must stop waiting when the restarted unit cannot become ready";
+          assert lib.assertMsg (builtins.elem readinessPrerequisiteCommand beforeStopCommands)
+            "st0x activation must verify the systemd readiness environment before stopping the service";
+          assert lib.assertMsg (builtins.elem verifyApprovalsCommand beforeStopCommands)
+            "st0x activation must verify Turnkey approval policies before stopping the service";
+          assert lib.assertMsg (
+            stopCommand == "systemctl stop ${name}"
+          ) "st0x activation must stop the running service successfully before installing candidate files";
+          assert lib.assertMsg (
+            !(builtins.elem stopCommand beforeStopCommands) && !(builtins.elem stopCommand afterStopCommands)
+          ) "st0x activation must have exactly one stop boundary between preflight and installation";
+          assert lib.assertMsg (
+            !(builtins.elem installConfigCommand beforeStopCommands)
+          ) "st0x activation must not install candidate config before policy verification";
+          assert lib.assertMsg (
+            !(builtins.elem installSecretCommand beforeStopCommands)
+          ) "st0x activation must not install candidate secrets before policy verification";
+          assert lib.assertMsg (builtins.elem installConfigCommand afterStopCommands)
+            "st0x activation must install candidate config after stopping the service";
+          assert lib.assertMsg (builtins.elem installSecretCommand afterStopCommands)
+            "st0x activation must install candidate secrets after stopping the service";
+          beforeStopCommands ++ [ stopCommand ] ++ afterStopCommands;
+      in
+      activate.custom pkg (builtins.concatStringsSep " && " activationCommands)
     else if cfg.kind == "cli" then
       # On-demand CLI config: install the config, decrypt the secret, and
       # validate -- exactly like the st0x kind, but start no systemd unit. The
