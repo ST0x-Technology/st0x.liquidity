@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 
 use super::parsing::is_safe_symbol;
+use crate::portfolio_snapshot::EtDayRange;
 
 const ALPACA_ACTIVITY_FETCH_PADDING_DAYS: i64 = 7;
 
@@ -63,6 +64,10 @@ pub(crate) enum PnlError {
     InvalidSymbolFilter { value: String },
     #[error("failed to load PnL rows: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("failed to load portfolio snapshot data for capital/return computation: {0}")]
+    PortfolioSnapshot(#[from] crate::portfolio_snapshot::ReadError),
+    #[error("failed to convert a PnL total for capital/return computation: {0}")]
+    CapitalFloat(#[from] rain_math_float::FloatError),
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -125,6 +130,31 @@ impl PnlQuery {
                 })
             })
             .transpose()
+    }
+
+    /// The query's `fromDate`/`toDate` bounds as independent, optionally-open
+    /// ET-day bounds (inclusive), reusing [`parse_query_date`] -- no new
+    /// query params. Each side is `None` when that bound is not set; no
+    /// sentinel dates stand in for "unbounded". Using `0001-01-01` or
+    /// `9999-12-31` to widen a missing side would make the sentinel
+    /// indistinguishable from the same literal date supplied by a client.
+    /// Downstream query building (`load_portfolio_days`) branches on each
+    /// side's presence directly instead.
+    pub(crate) fn et_day_range(&self) -> Result<EtDayRange, PnlError> {
+        let from = self
+            .from_date
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_query_date(value, "fromDate"))
+            .transpose()?;
+        let to = self
+            .to_date
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_query_date(value, "toDate"))
+            .transpose()?;
+
+        Ok(EtDayRange { from, to })
     }
 
     pub(crate) fn symbol_filter(

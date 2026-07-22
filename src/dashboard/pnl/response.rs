@@ -57,6 +57,7 @@ pub(crate) struct PnlResponse {
     pub(crate) sample_stats: PnlSampleStats,
     pub(crate) summary: PnlSummary,
     pub(crate) costs: PnlCostSummary,
+    pub(crate) capital: PnlCapitalSummary,
     pub(crate) symbols: Vec<PnlSymbolSummary>,
     pub(crate) symbol_universe: Vec<Symbol>,
     pub(crate) entries: Vec<PnlEntry>,
@@ -64,6 +65,22 @@ pub(crate) struct PnlResponse {
     pub(crate) total: usize,
     pub(crate) has_more: bool,
     pub(crate) windows: Vec<PnlWindow>,
+}
+
+/// Capital and return-on-capital figures derived from persisted daily
+/// portfolio snapshots. Every field is `None`/empty when capital could not be
+/// computed for the query (see the accompanying `warnings` entries for why --
+/// symbol-filtered queries, no snapshot coverage in range, missing/stale marks,
+/// or zero average deployed capital).
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PnlCapitalSummary {
+    pub(crate) average_deployed_capital_usd: Option<String>,
+    pub(crate) annualized_return_pct: Option<String>,
+    pub(crate) coverage_days: Option<i64>,
+    pub(crate) sample_days: usize,
+    pub(crate) first_snapshot_day: Option<String>,
+    pub(crate) last_snapshot_day: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -369,10 +369,14 @@ pub(crate) fn summarize_cost_entries(
     cost_summary_to_dto(&summary, entries.len())
 }
 
+/// Applies tracked costs/revenue to `summary`'s gross PnL, returning both the
+/// updated DTO and the internal numeric net realized PnL total -- callers
+/// needing that total (e.g. the capital/return-on-capital computation) read
+/// it from here directly rather than re-parsing the DTO's formatted string.
 pub(crate) fn with_costs(
     summary: PnlSummary,
     costs: &PnlCostSummary,
-) -> Result<PnlSummary, PnlError> {
+) -> Result<(PnlSummary, Num), PnlError> {
     let gross = parse_internal_decimal("summary.totalPnlUsd", &summary.total_pnl_usd)?;
     let tracked_costs =
         parse_internal_decimal("costs.totalTrackedCostsUsd", &costs.total_tracked_costs_usd)?;
@@ -382,13 +386,16 @@ pub(crate) fn with_costs(
     )?;
     let net = &(&gross - &tracked_costs) + &tracked_revenue;
 
-    Ok(PnlSummary {
-        gross_realized_pnl_usd: fmt_decimal(&gross),
-        tracked_costs_usd: fmt_decimal(&tracked_costs),
-        tracked_revenue_usd: fmt_decimal(&tracked_revenue),
-        net_realized_pnl_usd: fmt_decimal(&net),
-        ..summary
-    })
+    Ok((
+        PnlSummary {
+            gross_realized_pnl_usd: fmt_decimal(&gross),
+            tracked_costs_usd: fmt_decimal(&tracked_costs),
+            tracked_revenue_usd: fmt_decimal(&tracked_revenue),
+            net_realized_pnl_usd: fmt_decimal(&net),
+            ..summary
+        },
+        net,
+    ))
 }
 
 fn cost_entry(
