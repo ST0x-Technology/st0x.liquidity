@@ -212,6 +212,18 @@ pub enum EvmError {
     )]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementUnderpriced { attempts: u32 },
+    /// A "replacement transaction underpriced" rejection occurred at a nonce
+    /// [`crate::inflight_nonces::InFlightNonces`] proves this wallet does not
+    /// currently own -- the incumbent transaction occupying it belongs to a
+    /// legitimate co-signer sharing this wallet, not to an under-gassed send
+    /// of our own. Surfaced immediately with zero fee-bump attempts, rather
+    /// than escalating a fee that would evict someone else's transaction.
+    #[error(
+        "replacement transaction underpriced at nonce {nonce}, which is not this \
+         wallet's own -- refusing to fee-bump a co-signer's transaction"
+    )]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    ReplacementNonceNotOwned { nonce: u64 },
     /// Bumping the EIP-1559 fee for a replacement transaction overflowed
     /// `u128`. Only reachable if the RPC returns an absurd fee estimate;
     /// surfaced as a hard error rather than silently wrapping a financial
@@ -275,6 +287,8 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementNonceNotOwned { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
@@ -303,6 +317,8 @@ impl EvmError {
             Self::ReceiptTimeout { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementNonceNotOwned { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
@@ -346,6 +362,8 @@ impl EvmError {
             Self::TransactionDropped { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementNonceNotOwned { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => None,
             #[cfg(feature = "local-signer")]

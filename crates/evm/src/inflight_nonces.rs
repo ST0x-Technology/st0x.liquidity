@@ -24,13 +24,13 @@ use std::sync::Arc;
 /// The answer to "does this wallet own the transaction currently occupying
 /// `nonce`?", as far as this process's own bookkeeping can tell.
 ///
-/// Not yet consulted by any production code path in this crate: PR1 only
-/// wires up recording and releasing entries. A follow-up change replaces
-/// `submit.rs`'s inferred nonce-ownership heuristics with lookups against
-/// this, which is when this type and [`InFlightNonces::ownership`] gain a
-/// production caller. Until then, only this module's own tests construct it,
-/// hence `#[cfg(test)]`.
-#[cfg(test)]
+/// Consulted by `submit.rs`'s `resubmit_with_bumped_fee` and
+/// `retry_after_nonce_too_low` in place of the inferred `latest_nonce()`
+/// heuristics those functions used to rely on exclusively: direct proof from
+/// this wallet's own record beats an inferred read whenever the record has
+/// one, and both functions fall back to the pre-existing heuristic only for
+/// [`NonceOwnership::Unknown`] (the cold-start window before this wallet's
+/// first successful send since process start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NonceOwnership {
     /// This nonce currently has an entry: it's a nonce this wallet itself
@@ -108,10 +108,6 @@ impl InFlightNonces {
     /// presence of the key alone answers "has this address ever been
     /// primed", independent of whether it currently holds zero or more
     /// nonces.
-    ///
-    /// `#[cfg(test)]`: see [`NonceOwnership`]'s doc comment for why this has
-    /// no production caller yet.
-    #[cfg(test)]
     pub(crate) fn ownership(&self, address: Address, nonce: u64) -> NonceOwnership {
         let Some(per_nonce) = self.nonces.get(&address) else {
             return NonceOwnership::Unknown;

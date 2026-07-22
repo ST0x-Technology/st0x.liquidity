@@ -29,62 +29,74 @@
 //!    is trustworthy alone). If a re-targeted retry itself comes back
 //!    "replacement transaction underpriced", the incumbent transaction at
 //!    that nonce could be either an external co-signer's pending
-//!    transaction or our own under-gassed one -- both `next_nonce_hint()`
-//!    (geth's mined-state nonce) and a node-local `pending_nonce` read can
-//!    independently point at our own stuck nonce while the transaction we
-//!    sent there is unmined. The loop tells the two apart by comparing the
-//!    rejected nonce with `latest_nonce()`, our own oldest unconfirmed
-//!    nonce: strictly above it, the incumbent is treated as not ours, so the
-//!    rejection is treated as continued external contention and consumes
-//!    another attempt of the same retry budget. Exactly at it, the
-//!    incumbent is plausibly our own stuck transaction, and advancing past
-//!    it would open a permanent gap behind it that can never mine, so the
-//!    rejection is surfaced immediately instead. Strictly below it, the
-//!    rejected nonce has already been mined according to this follow-up
-//!    read -- the contention resolved while we were retrying, or a
-//!    different load-balanced node is simply ahead -- so the loop raises
-//!    its floor to that value and continues within the retry budget rather
-//!    than surfacing a rejection that no longer reflects reality.
+//!    transaction or our own under-gassed one. The loop first asks
+//!    [`crate::inflight_nonces::InFlightNonces`] whether this wallet's own
+//!    bookkeeping recognizes the occupied nonce: direct proof either way
+//!    settles it without any RPC read. Only when the tracker has no entry
+//!    recorded for this address yet (the cold-start window right after a
+//!    restart, before this wallet's own first successful send) does the
+//!    loop fall back to comparing the rejected nonce with `latest_nonce()`,
+//!    our own oldest unconfirmed nonce: strictly above it, the incumbent
+//!    is treated as not ours, so the rejection is treated as continued
+//!    external contention and consumes another attempt of the same retry
+//!    budget. Exactly at it, the incumbent is plausibly our own stuck
+//!    transaction, and advancing past it would open a permanent gap
+//!    behind it that can never mine, so the rejection is surfaced
+//!    immediately instead. Strictly below it, the rejected nonce has
+//!    already been mined according to this follow-up read -- the
+//!    contention resolved while we were retrying, or a different
+//!    load-balanced node is simply ahead -- so the loop raises its floor
+//!    to that value and continues within the retry budget rather than
+//!    surfacing a rejection that no longer reflects reality.
 //!
-//! **Known limitation: nonce ownership is inferred, not verified.** This
-//! module cannot yet tell its own pending transaction apart from another
-//! signer's with certainty, and every signal used above is a single read
-//! through the same load-balanced RPC. Three accepted gaps follow from that:
+//! **Known limitation.** [`crate::inflight_nonces::InFlightNonces`] records
+//! every successful submission from this module (base send, nonce-too-low
+//! retry, and fee-bumped resubmit), and `Wallet::await_receipt` releases the
+//! entry once the wait resolves definitively (mined, or proven dropped).
+//! `resubmit_with_bumped_fee` and `retry_after_nonce_too_low` both consult it
+//! before falling back to any inference, so nonce ownership is direct proof,
+//! not a guess, for any address that has completed at least one successful
+//! send since process start. Two gaps this module used to accept are
+//! resolved by that proof; a third is unrelated to ownership and remains
+//! open:
 //!
-//! - The `latest_nonce()` comparison above, used to decide whether an
-//!   occupied nonce is this wallet's own stuck transaction, is a single
-//!   point-in-time read through the same load-balanced RPC as every other
-//!   nonce source, with no cross-check. A lagging node can under-report it,
-//!   causing the loop to misclassify the wallet's own stuck transaction as
-//!   external contention.
-//! - Selecting `max(hint, pending_nonce)` (mode 3), and raising the floor
-//!   past a nonce an underpriced rejection proved occupied, can leave the
-//!   cached nonce above the account's actual next free nonce. Once that
-//!   happens, the cache is corrected only by a later RPC rejection that
-//!   invalidates it; until then, further sends from this wallet are
-//!   accepted into the node's queued (non-executable) pool behind the
-//!   nonce gap rather than mining. A targeted self-heal for this -- clearing
-//!   the cache from within `Wallet::await_receipt` when a send stalls --
-//!   was considered and deliberately not shipped here. Every signal
-//!   available to drive it (whether a wait ended in a dropped/timed-out
-//!   classification, and a node-local pending-block count) is a heuristic
-//!   that can misfire on a lagging or load-balanced RPC read, and a false
-//!   positive would clear the cache while a legitimate transaction is
-//!   still live, causing the wallet to replace it. A sound fix needs this
-//!   module to track the nonces of the wallet's own in-flight transactions
-//!   directly, rather than infer an overshoot from after-the-fact RPC reads.
-//! - "replacement transaction underpriced" proves only that the target
-//!   nonce is occupied. It does not prove who owns the incumbent
-//!   transaction.
-//!
-//! [`crate::inflight_nonces::InFlightNonces`] now records every successful
-//! submission from this module (base send, nonce-too-low retry, and
-//! fee-bumped resubmit) and `Wallet::await_receipt` releases the entry once
-//! the wait resolves definitively (mined, or proven dropped). This module
-//! does not yet consult that record when deciding whether an occupied nonce
-//! is this wallet's own -- the gaps above stand as documented until a
-//! follow-up change replaces the inferred heuristics with direct lookups
-//! against it.
+//! - RESOLVED once the tracker is primed for an address: the
+//!   `latest_nonce()` comparison above, previously the only way to decide
+//!   whether an occupied nonce was this wallet's own stuck transaction, was
+//!   a single point-in-time read through the same load-balanced RPC as
+//!   every other nonce source, with no cross-check -- a lagging node could
+//!   under-report it and misclassify the wallet's own stuck transaction as
+//!   external contention. That comparison no longer runs at all once direct
+//!   proof is available. Residual: right after a restart, before this
+//!   wallet's own first successful send in this process's lifetime, the
+//!   tracker has no entry yet
+//!   ([`crate::inflight_nonces::NonceOwnership::Unknown`]), and both
+//!   functions fall back to the same `latest_nonce()` heuristic, with the
+//!   same lagging-node risk as before. This window closes for good the
+//!   moment this wallet's own send succeeds; it only reopens across a
+//!   restart.
+//! - RESOLVED once the tracker is primed for an address: "replacement
+//!   transaction underpriced" proves only that the target nonce is
+//!   occupied, never who owns the incumbent transaction. The tracker now
+//!   supplies ownership as a separate, direct fact instead of that
+//!   inference. Same cold-start residual as above.
+//! - STILL OPEN, unrelated to ownership: selecting `max(hint,
+//!   pending_nonce)` (mode 3), and raising the floor past a nonce an
+//!   underpriced rejection proved occupied, can leave the cached nonce
+//!   above the account's actual next free nonce. Once that happens, the
+//!   cache is corrected only by a later RPC rejection that invalidates it;
+//!   until then, further sends from this wallet are accepted into the
+//!   node's queued (non-executable) pool behind the nonce gap rather than
+//!   mining. A targeted self-heal for this -- clearing the cache from
+//!   within `Wallet::await_receipt` when a send stalls -- was considered
+//!   and deliberately not shipped here. Every signal available to drive it
+//!   (whether a wait ended in a dropped/timed-out classification, and a
+//!   node-local pending-block count) is a heuristic that can misfire on a
+//!   lagging or load-balanced RPC read, and a false positive would clear
+//!   the cache while a legitimate transaction is still live, causing the
+//!   wallet to replace it. [`crate::inflight_nonces::InFlightNonces`]
+//!   tracks nonce *ownership*, not cache *correctness*, so it does not
+//!   close this gap by itself.
 //!
 //! The fee bump is **best-effort**: it escalates over the *current*
 //! network estimate, not the incumbent stuck transaction's fee (which we
@@ -118,7 +130,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::inflight_nonces::InFlightNonces;
+use crate::inflight_nonces::{InFlightNonces, NonceOwnership};
 use crate::nonce::ResettableNonceManager;
 use crate::{EvmError, NextNonceHint};
 
@@ -364,6 +376,101 @@ fn raise_nonce_floor(current_floor: Option<NonceFloor>, candidate_floor: u64) ->
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalletOldestUnconfirmedNonce(u64);
 
+/// Outcome of [`resolve_underpriced_via_latest_nonce`]'s cold-start
+/// comparison, so its caller does not have to re-derive whether to stop
+/// this recovery or continue it from a bare `Result`/`Ordering` value.
+enum LatestNonceFallback {
+    /// The rejected nonce is plausibly this wallet's own stuck transaction
+    /// (or the cross-check needed to tell otherwise itself failed). The
+    /// caller must invalidate the nonce cache and surface the rejection
+    /// that triggered this fallback.
+    Stop,
+    /// The rejected nonce is not this wallet's own stuck transaction;
+    /// continue within budget with this recovery's floor raised to at
+    /// least the given value.
+    RaiseFloorTo(u64),
+}
+
+/// Cold-start fallback for an underpriced rejection during nonce-too-low
+/// recovery, used only when [`crate::inflight_nonces::InFlightNonces`] has
+/// no opinion yet for this address ([`NonceOwnership::Unknown`]) -- see
+/// `retry_after_nonce_too_low`'s doc comment for the full three-way
+/// comparison this performs against `latest_nonce()`, this wallet's own
+/// oldest unconfirmed nonce, and the module doc's "Known limitation" for why
+/// this comparison cannot prove ownership either way.
+async fn resolve_underpriced_via_latest_nonce<Submitter>(
+    submitter: &Submitter,
+    address: Address,
+    contract: Address,
+    note: &str,
+    attempt: u32,
+    next_nonce: u64,
+    retry_error: &EvmError,
+) -> LatestNonceFallback
+where
+    Submitter: TxSubmitter,
+{
+    let latest_nonce_value = match submitter.latest_nonce(address).await {
+        Ok(latest_nonce_value) => WalletOldestUnconfirmedNonce(latest_nonce_value),
+        Err(latest_nonce_error) => {
+            warn!(
+                target: "wallet", %contract, note, attempt, %retry_error,
+                %latest_nonce_error,
+                "Nonce-too-low retry rejected as underpriced, and confirming \
+                 whether the occupied nonce is our own stuck transaction \
+                 failed too -- surfacing the retry rejection rather than \
+                 risk advancing past our own transaction"
+            );
+            return LatestNonceFallback::Stop;
+        }
+    };
+    // Extracted here, right at the comparison: keeping it wrapped up to
+    // this point means no other `u64` in scope can be passed to
+    // `submitter.latest_nonce`'s result slot by mistake.
+    let WalletOldestUnconfirmedNonce(latest_nonce_value) = latest_nonce_value;
+
+    match next_nonce.cmp(&latest_nonce_value) {
+        Ordering::Equal => {
+            warn!(
+                target: "wallet", %contract, note, attempt, next_nonce,
+                latest_nonce_value, %retry_error,
+                "Nonce-too-low retry rejected as underpriced at the wallet's \
+                 own oldest unconfirmed nonce -- treated as plausibly our \
+                 own stuck transaction rather than external contention \
+                 (ownership cannot be proven from this read alone, see the \
+                 module doc's Known limitation); stopping here rather than \
+                 opening a permanent gap past it"
+            );
+            LatestNonceFallback::Stop
+        }
+        Ordering::Less => {
+            warn!(
+                target: "wallet", %contract, note, attempt, next_nonce,
+                latest_nonce_value, %retry_error,
+                "Nonce-too-low retry rejected as underpriced below our own \
+                 oldest unconfirmed nonce -- the rejected nonce has already \
+                 been mined per this follow-up read, so the contention \
+                 resolved while this recovery was retrying; raising the \
+                 floor and retrying within budget instead of surfacing a \
+                 rejection the chain has moved past"
+            );
+            LatestNonceFallback::RaiseFloorTo(latest_nonce_value)
+        }
+        Ordering::Greater => {
+            warn!(
+                target: "wallet", %contract, note, attempt, next_nonce,
+                latest_nonce_value, %retry_error,
+                "Nonce-too-low retry rejected as underpriced above our own \
+                 oldest unconfirmed nonce -- the nonce is occupied but its \
+                 owner is unknown, so it is not fee-bumped; treating as \
+                 continued external nonce contention and retrying within \
+                 budget"
+            );
+            LatestNonceFallback::RaiseFloorTo(next_nonce.saturating_add(1))
+        }
+    }
+}
+
 /// The mutually exclusive combinations of nonce sources available on a
 /// single `retry_after_nonce_too_low` attempt, named so the source-selection
 /// arms in that loop read as a closed set rather than an ad-hoc tuple match.
@@ -472,9 +579,24 @@ impl NonceSource {
 /// that the target nonce is occupied by a pending transaction, not who it
 /// belongs to: the incumbent may be another signer sharing this wallet, or
 /// it may equally be our own under-gassed pending transaction (see the
-/// module doc). It is therefore NOT fee-bumped, and is not always treated
-/// as external contention. The loop asks `latest_nonce()` -- this wallet's
-/// own oldest unconfirmed nonce -- and compares it against the rejected
+/// module doc). It is therefore NOT fee-bumped. The loop first asks
+/// `in_flight.ownership(address, next_nonce)` for direct proof:
+/// [`NonceOwnership::Ours`] means this wallet's own bookkeeping recognizes
+/// the nonce as one of its own unconfirmed sends, so the rejection is
+/// surfaced immediately rather than advancing past a transaction that could
+/// never mine if abandoned (the same outcome the old `Ordering::Equal`
+/// coincidence-based check produced, now resting on proof instead of
+/// inference); [`NonceOwnership::NotOurs`] means the tracker is primed for
+/// this address but this specific nonce is someone else's, so the floor is
+/// raised past it and the loop continues within budget -- this single answer
+/// collapses what used to be two separate `Ordering::Greater`/`Ordering::Less`
+/// arms, since both used to reach the same "advance and retry" action, and no
+/// extra RPC read is needed to reach it anymore. Only
+/// [`NonceOwnership::Unknown`] (no entry has ever been recorded for this
+/// address in this process's lifetime -- the cold-start window right after a
+/// restart, before this wallet's own first successful send) falls back to
+/// the pre-existing heuristic, verbatim: a `latest_nonce()` read of this
+/// wallet's own oldest unconfirmed nonce, compared against the rejected
 /// nonce three ways (see the module doc's "Known limitation" for why this
 /// comparison rests on a single, uncross-checked read and cannot prove
 /// ownership either way): strictly above it, the incumbent is concluded not
@@ -483,10 +605,10 @@ impl NonceSource {
 /// nonce and is therefore treated as plausibly our own, so the rejection is
 /// surfaced immediately instead of advancing, to avoid opening a permanent
 /// gap behind a transaction that can never mine; strictly below it, the
-/// rejected nonce has already been mined per this follow-up read -- the contention
-/// resolved while this loop was retrying -- so the floor is raised to that
-/// value and the loop continues within the retry budget instead of
-/// surfacing a rejection the chain has since moved past.
+/// rejected nonce has already been mined per this follow-up read -- the
+/// contention resolved while this loop was retrying -- so the floor is
+/// raised to that value and the loop continues within the retry budget
+/// instead of surfacing a rejection the chain has since moved past.
 async fn retry_after_nonce_too_low<Submitter>(
     submitter: &Submitter,
     nonce_manager: &ResettableNonceManager,
@@ -625,66 +747,51 @@ where
                 error = retry_error;
             }
             Err(retry_error) if retry_error.is_replacement_underpriced() => {
-                let latest_nonce_value = match submitter.latest_nonce(address).await {
-                    Ok(latest_nonce_value) => WalletOldestUnconfirmedNonce(latest_nonce_value),
-                    Err(latest_nonce_error) => {
+                match in_flight.ownership(address, next_nonce) {
+                    NonceOwnership::Ours => {
                         warn!(
-                            target: "wallet", %contract, note, attempt, %retry_error,
-                            %latest_nonce_error,
-                            "Nonce-too-low retry rejected as underpriced, and confirming \
-                             whether the occupied nonce is our own stuck transaction failed \
-                             too -- surfacing the retry rejection rather than risk advancing \
-                             past our own transaction"
+                            target: "wallet", %contract, note, attempt, next_nonce, %retry_error,
+                            "Nonce-too-low retry rejected as underpriced at a nonce this \
+                             wallet's own bookkeeping proves is one of its own unconfirmed \
+                             sends -- stopping here rather than opening a permanent gap past \
+                             a transaction that could never mine if abandoned"
                         );
                         nonce_manager.invalidate();
                         return Err(retry_error);
                     }
-                };
-                // Extracted here, right at the comparison: keeping it wrapped up to
-                // this point means no other `u64` in scope can be passed to
-                // `submitter.latest_nonce`'s result slot by mistake.
-                let WalletOldestUnconfirmedNonce(latest_nonce_value) = latest_nonce_value;
-
-                match next_nonce.cmp(&latest_nonce_value) {
-                    Ordering::Equal => {
+                    NonceOwnership::NotOurs => {
                         warn!(
-                            target: "wallet", %contract, note, attempt, next_nonce,
-                            latest_nonce_value, %retry_error,
-                            "Nonce-too-low retry rejected as underpriced at the wallet's own \
-                             oldest unconfirmed nonce -- treated as plausibly our own stuck \
-                             transaction rather than external contention (ownership cannot be \
-                             proven from this read alone, see the module doc's Known \
-                             limitation); stopping here rather than opening a permanent gap \
-                             past it"
-                        );
-                        nonce_manager.invalidate();
-                        return Err(retry_error);
-                    }
-                    Ordering::Less => {
-                        warn!(
-                            target: "wallet", %contract, note, attempt, next_nonce,
-                            latest_nonce_value, %retry_error,
-                            "Nonce-too-low retry rejected as underpriced below our own oldest \
-                             unconfirmed nonce -- the rejected nonce has already been mined \
-                             per this follow-up read, so the contention resolved while this \
-                             recovery was retrying; raising the floor and retrying within \
-                             budget instead of surfacing a rejection the chain has moved past"
-                        );
-                        nonce_floor = Some(raise_nonce_floor(nonce_floor, latest_nonce_value));
-                        error = retry_error;
-                    }
-                    Ordering::Greater => {
-                        warn!(
-                            target: "wallet", %contract, note, attempt, next_nonce,
-                            latest_nonce_value, %retry_error,
-                            "Nonce-too-low retry rejected as underpriced above our own oldest \
-                             unconfirmed nonce -- the nonce is occupied but its owner is \
-                             unknown, so it is not fee-bumped; treating as continued external \
-                             nonce contention and retrying within budget"
+                            target: "wallet", %contract, note, attempt, next_nonce, %retry_error,
+                            "Nonce-too-low retry rejected as underpriced at a nonce this \
+                             wallet's own bookkeeping proves it does not own -- raising the \
+                             floor past it and retrying within budget without an extra RPC \
+                             read to confirm ownership"
                         );
                         nonce_floor =
                             Some(raise_nonce_floor(nonce_floor, next_nonce.saturating_add(1)));
                         error = retry_error;
+                    }
+                    NonceOwnership::Unknown => {
+                        match resolve_underpriced_via_latest_nonce(
+                            submitter,
+                            address,
+                            contract,
+                            note,
+                            attempt,
+                            next_nonce,
+                            &retry_error,
+                        )
+                        .await
+                        {
+                            LatestNonceFallback::Stop => {
+                                nonce_manager.invalidate();
+                                return Err(retry_error);
+                            }
+                            LatestNonceFallback::RaiseFloorTo(floor_candidate) => {
+                                nonce_floor = Some(raise_nonce_floor(nonce_floor, floor_candidate));
+                                error = retry_error;
+                            }
+                        }
                     }
                 }
             }
@@ -721,6 +828,19 @@ where
 /// nonce only when the wallet has no other unmined transaction sitting below
 /// it; when it does, `latest` undercounts and `latest_nonce()` would pin the
 /// wrong nonce.
+///
+/// Before bumping anything, the function asks `in_flight.ownership(address,
+/// nonce)` whether this wallet's own bookkeeping recognizes `nonce` as one of
+/// its own unconfirmed sends: [`NonceOwnership::NotOurs`] is direct proof the
+/// incumbent transaction occupying `nonce` belongs to a legitimate co-signer
+/// sharing this wallet, so no fee-bump attempt is made at all --
+/// [`EvmError::ReplacementNonceNotOwned`] is surfaced immediately, since
+/// escalating the fee would evict someone else's transaction rather than our
+/// own stuck one. [`NonceOwnership::Ours`] and [`NonceOwnership::Unknown`]
+/// (the cold-start window before this wallet's first successful send since
+/// process start, where the tracker has no opinion yet) both proceed with the
+/// bounded escalation loop below unchanged -- for `Unknown` this is the same
+/// best-effort behavior this function has always had.
 ///
 /// Each attempt re-estimates the network fee, bumps it, and pins the
 /// nonce explicitly so the filler targets that transaction for
@@ -759,6 +879,21 @@ async fn resubmit_with_bumped_fee<Submitter>(
 where
     Submitter: TxSubmitter,
 {
+    match in_flight.ownership(address, nonce) {
+        NonceOwnership::Ours | NonceOwnership::Unknown => {}
+        NonceOwnership::NotOurs => {
+            warn!(
+                target: "wallet", %contract, note, nonce,
+                "Replacement transaction underpriced at a nonce this wallet's own \
+                 bookkeeping proves it does not own -- refusing to fee-bump a \
+                 legitimate co-signer's transaction; invalidating the cache and \
+                 surfacing immediately"
+            );
+            nonce_manager.invalidate();
+            return Err(EvmError::ReplacementNonceNotOwned { nonce });
+        }
+    }
+
     for attempt in 1..=MAX_REPLACEMENT_RESUBMITS {
         let estimate = submitter
             .estimate_fees()
@@ -880,8 +1015,6 @@ mod tests {
     use alloy::transports::RpcError;
     use tokio::time::Instant;
 
-    use crate::inflight_nonces::NonceOwnership;
-
     use super::*;
 
     const CONTRACT: Address = address!("00000000000000000000000000000000000000c1");
@@ -967,6 +1100,7 @@ mod tests {
         delay: Duration,
         fees: Eip1559Estimation,
         latest_nonce_value: u64,
+        latest_nonce_calls: AtomicUsize,
         failures: HashSet<ScriptedFailure>,
         // Values `pending_nonce` returns, popped in order on successive
         // calls. Once only one value is left, it is returned repeatedly
@@ -986,6 +1120,7 @@ mod tests {
                 delay: Duration::ZERO,
                 fees: base_fees(),
                 latest_nonce_value: STUCK_NONCE,
+                latest_nonce_calls: AtomicUsize::new(0),
                 failures: HashSet::new(),
                 pending_nonce_queue: StdMutex::new(VecDeque::from([DEFAULT_PENDING_NONCE])),
                 nonce_manager: StdMutex::new(None),
@@ -1050,6 +1185,13 @@ mod tests {
 
         fn sent(&self) -> Vec<TransactionRequest> {
             self.sent.lock().expect("sent lock").clone()
+        }
+
+        /// Number of times `latest_nonce` was called, so a test can assert
+        /// direct `InFlightNonces` proof skipped the RPC read entirely
+        /// rather than merely asserting the right outcome was reached.
+        fn latest_nonce_calls(&self) -> usize {
+            self.latest_nonce_calls.load(Ordering::SeqCst)
         }
 
         /// Attaches the nonce manager under test so `submit` can simulate
@@ -1150,6 +1292,7 @@ mod tests {
         }
 
         async fn latest_nonce(&self, _address: Address) -> Result<u64, EvmError> {
+            self.latest_nonce_calls.fetch_add(1, Ordering::SeqCst);
             if self.failures.contains(&ScriptedFailure::LatestNonce) {
                 return Err(rpc_error("connection reset"));
             }
@@ -1523,6 +1666,119 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resubmit_with_bumped_fee_refuses_to_bump_a_nonce_provably_not_ours() {
+        // The tracker is primed for WALLET (it has an entry at some other
+        // nonce), but not at STUCK_NONCE specifically -- direct proof the
+        // incumbent there belongs to a legitimate co-signer, not to us.
+        let in_flight = InFlightNonces::default();
+        in_flight.record(WALLET, STUCK_NONCE + 1000, TxHash::repeat_byte(0x9a));
+        let nonce_manager = ResettableNonceManager::default();
+        let mock = MockSubmitter::new(vec![]);
+
+        let error = resubmit_with_bumped_fee(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"calldata"),
+            "test",
+            STUCK_NONCE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::ReplacementNonceNotOwned { nonce } if nonce == STUCK_NONCE),
+            "expected ReplacementNonceNotOwned at STUCK_NONCE, got {error:?}"
+        );
+        assert_eq!(
+            mock.sent().len(),
+            0,
+            "a nonce provably not ours must not be fee-bumped at all -- zero \
+             resubmit attempts, not MAX_REPLACEMENT_RESUBMITS"
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmit_with_bumped_fee_proceeds_when_nonce_is_provably_ours() {
+        // The tracker already recognizes STUCK_NONCE as this wallet's own
+        // unconfirmed send (e.g. the base send that triggered this resubmit
+        // recorded it moments earlier), so the bounded escalation loop must
+        // run exactly as it always has.
+        let in_flight = InFlightNonces::default();
+        let original_hash = TxHash::repeat_byte(0x9b);
+        in_flight.record(WALLET, STUCK_NONCE, original_hash);
+        let nonce_manager = ResettableNonceManager::default();
+        let replacement_hash = TxHash::repeat_byte(0x9c);
+        let mock = MockSubmitter::new(vec![Ok(replacement_hash)]);
+
+        let result = resubmit_with_bumped_fee(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"calldata"),
+            "test",
+            STUCK_NONCE,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), replacement_hash);
+        let sent = mock.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "direct proof of ownership must proceed with the fee-bump loop, \
+             same as today"
+        );
+        assert_eq!(sent[0].nonce, Some(STUCK_NONCE));
+        assert_eq!(
+            sent[0].max_fee_per_gas,
+            Some(1_000_000_000 * 115 / 100),
+            "the first attempt's usual 15% bump must still apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmit_with_bumped_fee_bumps_when_ownership_is_unknown_cold_start() {
+        // No entry has ever been recorded for WALLET in this tracker --
+        // the cold-start window right after a restart, before this
+        // wallet's own first successful send. The fee-bump loop must still
+        // proceed exactly as it always has, rather than refuse outright.
+        let in_flight = InFlightNonces::default();
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Unknown,
+            "precondition: this tracker has never seen this address"
+        );
+        let nonce_manager = ResettableNonceManager::default();
+        let hash = TxHash::repeat_byte(0x9d);
+        let mock = MockSubmitter::new(vec![Ok(hash)]);
+
+        let result = resubmit_with_bumped_fee(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"calldata"),
+            "test",
+            STUCK_NONCE,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), hash);
+        assert_eq!(
+            mock.sent().len(),
+            1,
+            "an Unknown ownership answer must still fall back to today's \
+             best-effort fee-bump loop rather than refuse outright"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2110,6 +2366,104 @@ mod tests {
             nonce_manager.peek_next_nonce(WALLET).await,
             None,
             "a failed safety check must invalidate the cache, not leave it seeded"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonce_too_low_retry_underpriced_stops_when_nonce_is_provably_ours() {
+        // The tracker already recognizes HINTED_NONCE as this wallet's own
+        // unconfirmed send -- direct proof, not the inferred
+        // `latest_nonce()` coincidence the Unknown fallback relies on.
+        // `retry_after_nonce_too_low` is called directly (bypassing the base
+        // send) so only the one retry submit needs a scripted result.
+        let mock = MockSubmitter::new(vec![Err(underpriced())]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::default();
+        in_flight.record(WALLET, HINTED_NONCE, TxHash::repeat_byte(0x9e));
+
+        let error = retry_after_nonce_too_low(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"calldata"),
+            "test",
+            nonce_too_low_with_hint(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.is_replacement_underpriced(),
+            "expected the underpriced rejection surfaced verbatim, got {error:?}"
+        );
+        assert_eq!(
+            mock.sent().len(),
+            1,
+            "one retry attempt, rejected underpriced at a nonce this wallet's own \
+             bookkeeping proves it owns -- must stop rather than continue"
+        );
+        assert_eq!(
+            mock.latest_nonce_calls(),
+            0,
+            "direct ownership proof must skip the latest_nonce() RPC read entirely"
+        );
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            None,
+            "stopping on our own proven nonce must invalidate the cache"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonce_too_low_retry_advances_past_a_nonce_provably_not_ours_without_rpc_read() {
+        // The tracker is primed for WALLET (it has an entry at some other
+        // nonce), but not at HINTED_NONCE specifically -- direct proof the
+        // incumbent there is not ours. The floor must be raised past it and
+        // the loop must continue within budget without ever calling
+        // `latest_nonce()`, unlike the Unknown-fallback equivalent
+        // (`nonce_too_low_retry_rejected_as_underpriced_does_not_regress_below_occupied_nonce`).
+        let hash = TxHash::repeat_byte(0x9f);
+        let mock =
+            MockSubmitter::new(vec![Err(underpriced()), Ok(hash)]).with_pending_nonce(HINTED_NONCE);
+        let nonce_manager = ResettableNonceManager::default();
+        mock.attach_nonce_manager(nonce_manager.clone());
+        let in_flight = InFlightNonces::default();
+        in_flight.record(WALLET, HINTED_NONCE + 1000, TxHash::repeat_byte(0xa0));
+
+        let result = retry_after_nonce_too_low(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"calldata"),
+            "test",
+            nonce_too_low_with_hint(),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), hash);
+        let sent = mock.sent();
+        assert_eq!(
+            sent.len(),
+            2,
+            "one underpriced attempt at HINTED_NONCE + one successful retry \
+             advancing past it"
+        );
+        assert_eq!(sent[0].nonce, Some(HINTED_NONCE));
+        assert_eq!(
+            sent[1].nonce,
+            Some(HINTED_NONCE + 1),
+            "must advance past the nonce just proven not ours"
+        );
+        assert_eq!(
+            mock.latest_nonce_calls(),
+            0,
+            "a NotOurs answer must skip the latest_nonce() RPC read entirely -- \
+             direct proof already tells the loop to advance, collapsing what \
+             used to require a follow-up read"
         );
     }
 
