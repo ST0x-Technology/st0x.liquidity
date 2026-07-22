@@ -242,6 +242,33 @@ pub(crate) enum UsdcTransferError {
         #[source]
         source: Box<CctpError>,
     },
+    /// A post-burn CCTP mint whose recovery could not be resolved: the recovery
+    /// window expired without ever getting a conclusive `usedNonces()` read, the
+    /// nonce read consumed but its receipt could not be reconstructed, or the
+    /// pre-mint scan for an already-submitted mint (`find_recent_mint`, run on
+    /// `Attested` resume before minting is attempted) failed on a transport-class
+    /// error. The aggregate stays in whichever durable pre-mint state it was
+    /// already in (`Bridging`, `AwaitingAttestation`, `Attested`, or a post-burn
+    /// `BridgingFailed`), so this is safe to delayed-redrive: declaring a
+    /// terminal failure here would strand the rebalancing guard on state that
+    /// was never actually observed, or on funds that may have already moved.
+    ///
+    /// Mirrors `WithdrawalPollInconclusive` in redrive semantics: unbounded,
+    /// returns `Ok` from the job. `initiated_at` is threaded from the
+    /// aggregate's current state (all four reachable states persist it) so the
+    /// job handler can compute a durable deadline: before the deadline only a
+    /// warn log fires; at or after the deadline the operator is paged on every
+    /// redrive while the guard stays held and redriving continues.
+    #[error(
+        "USDC rebalance {id}: CCTP mint recovery inconclusive (nonce state \
+         unknown or receipt unreconstructible); mint may already have landed"
+    )]
+    MintRecoveryInconclusive {
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        #[source]
+        source: Box<CctpError>,
+    },
     /// The detached submit-and-record burn task (spawned so a cancelling job
     /// timeout cannot drop the broadcast->record critical section) panicked and
     /// failed to join. The burn may or may not have broadcast. TERMINAL and

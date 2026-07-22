@@ -210,10 +210,12 @@ const CLI_ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 /// retry resumes the existing transfer instead of starting a second
 /// fund-moving one. The retryable set mirrors the worker: `AttestationTimedOut`,
 /// `WithdrawalPollInconclusive` (Alpaca API unreachable or returned a transient
-/// error), plus the settlement-wait errors (`WithdrawalTxUnderconfirmed`,
-/// `WalletUsdcInsufficient`, `SettlementCheckTransient`). Errors not in this set
-/// -- including `AttestationRetryDeadlineElapsed` and a previously-failed
-/// aggregate -- are terminal and returned to the caller.
+/// error), `MintRecoveryInconclusive` (CCTP mint recovery could not resolve a
+/// conclusive nonce/receipt), plus the settlement-wait errors
+/// (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
+/// `SettlementCheckTransient`). Errors not in this set -- including
+/// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate -- are
+/// terminal and returned to the caller.
 async fn redrive_transfer_until_settled<Resume, Fut>(
     redrive_delay: Duration,
     mut resume: Resume,
@@ -260,6 +262,25 @@ where
                     ?redrive_delay,
                     "Alpaca withdrawal poll inconclusive; Alpaca may be unreachable -- \
                      retrying after delay (aggregate stays in Withdrawing, guard held)"
+                );
+                tokio::time::sleep(redrive_delay).await;
+            }
+            // MintRecoveryInconclusive is non-terminal: the CCTP mint recovery
+            // window could not get a conclusive nonce/receipt read. The aggregate
+            // stays in whichever durable pre-mint state it was already in; the
+            // automatic delayed redrive continues in the background. Retry here
+            // so the CLI polls periodically without spinning, matching the
+            // behaviour of WithdrawalPollInconclusive -- otherwise a manual
+            // transfer would exit on this outcome, leaving the operator unable to
+            // drive the stuck transfer to completion via the CLI (the exact
+            // command the operator alert for this outcome recommends running).
+            Err(UsdcTransferError::MintRecoveryInconclusive { id, .. }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?redrive_delay,
+                    "CCTP mint recovery inconclusive; retrying after delay \
+                     (aggregate stays in its durable pre-mint state, guard held)"
                 );
                 tokio::time::sleep(redrive_delay).await;
             }
@@ -1630,10 +1651,12 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use alloy::providers::ProviderBuilder;
+    use chrono::Utc;
     use rain_math_float::Float;
     use url::Url;
     use uuid::uuid;
 
+    use st0x_bridge::cctp::CctpError;
     use st0x_config::ExecutionThreshold;
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
@@ -1787,6 +1810,41 @@ mod tests {
             calls.get(),
             2,
             "the loop must retry exactly once after the inconclusive poll, then succeed",
+        );
+    }
+
+    /// The manual redrive loop must also retry `MintRecoveryInconclusive` --
+    /// otherwise a manual `stox transfer resume --kind usdc` invocation (the
+    /// exact command the operator alert for this outcome recommends running)
+    /// would exit immediately instead of continuing to drive the stuck mint
+    /// recovery to completion via the CLI.
+    #[tokio::test]
+    async fn redrive_loop_retries_mint_recovery_inconclusive_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+
+        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
+            let attempt = calls.get() + 1;
+            calls.set(attempt);
+            async move {
+                if attempt == 1 {
+                    Err(UsdcTransferError::MintRecoveryInconclusive {
+                        id: UsdcRebalanceId(Uuid::from_u128(43)),
+                        initiated_at: Utc::now(),
+                        source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        result.expect("redrive must succeed once the mint recovery resolves");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the loop must retry exactly once after the inconclusive mint recovery, \
+             then succeed",
         );
     }
 
