@@ -9,10 +9,11 @@
 //! `Live` routes it through [`EventSourced::transition`], which unconditionally
 //! rejects with [`PortfolioSnapshotError::AlreadyCaptured`] and emits no
 //! event. This makes per-day idempotency a property of the framework's
-//! lifecycle routing, not a `SELECT EXISTS` precheck.
+//! lifecycle routing, not a `SELECT EXISTS` precheck. A live aggregate also
+//! accepts audited `SetEquityMark` corrections for equities captured that day.
 //!
-//! `Captured` events are retained forever (no `COMPACTION_POLICY` override):
-//! one event per ET day is a financial-audit record, not an observational
+//! Snapshot events are retained forever (no `COMPACTION_POLICY` override):
+//! captures and operator corrections are financial-audit records, not observational
 //! stream eligible for compaction, and the storage volume is negligible.
 //! `type Materialized = Nil` -- the aggregate's own state only distinguishes
 //! `initialize` from `transition` routing; the queryable balances live in the
@@ -25,6 +26,7 @@
 //! `Captured` events). The [`read`] module computes the capital and return
 //! figures exposed by `/pnl` from that read model.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -36,6 +38,7 @@ use thiserror::Error;
 use tracing::info;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_finance::{Positive, Symbol};
 
 use crate::inventory::PortfolioBalanceRow;
 use crate::position::option_float_eq;
@@ -95,9 +98,8 @@ impl FromStr for PortfolioSnapshotId {
 /// A [`PortfolioBalanceRow`] with the USD mark resolved at capture time.
 /// Composes rather than duplicates `PortfolioBalanceRow`'s fields, so a field
 /// added there is inherited here automatically instead of needing to be
-/// mirrored by hand. Marks are fixed permanently once captured: because the
-/// aggregate's event is retained and immutable, a later price correction
-/// never retroactively changes a previously reported day's capital.
+/// mirrored by hand. The captured value remains immutable in its event; an
+/// audited correction is a later event whose projection value supersedes it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PortfolioBalanceRowWithMark {
     #[serde(flatten)]
@@ -116,20 +118,105 @@ impl PartialEq for PortfolioBalanceRowWithMark {
     }
 }
 
-/// Domain events for [`PortfolioSnapshot`]. `Captured` is the only variant:
-/// one per ET day, retained forever.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Domain events for [`PortfolioSnapshot`], retained forever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PortfolioSnapshotEvent {
     Captured {
         captured_at: DateTime<Utc>,
         rows: Vec<PortfolioBalanceRowWithMark>,
     },
+    EquityMarkSet {
+        symbol: Symbol,
+        usd_mark: Positive<Float>,
+        observed_at: DateTime<Utc>,
+        source: String,
+        reason: String,
+        corrected_at: DateTime<Utc>,
+    },
+    UnusableMarkAlerted {
+        symbol: Symbol,
+        alerted_at: DateTime<Utc>,
+    },
+    UnusableMarkDetected {
+        symbol: Symbol,
+        detected_at: DateTime<Utc>,
+    },
+}
+
+impl PartialEq for PortfolioSnapshotEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Captured {
+                    captured_at: left_at,
+                    rows: left_rows,
+                },
+                Self::Captured {
+                    captured_at: right_at,
+                    rows: right_rows,
+                },
+            ) => left_at == right_at && left_rows == right_rows,
+            (
+                Self::EquityMarkSet {
+                    symbol: left_symbol,
+                    usd_mark: left_mark,
+                    observed_at: left_observed,
+                    source: left_source,
+                    reason: left_reason,
+                    corrected_at: left_corrected,
+                },
+                Self::EquityMarkSet {
+                    symbol: right_symbol,
+                    usd_mark: right_mark,
+                    observed_at: right_observed,
+                    source: right_source,
+                    reason: right_reason,
+                    corrected_at: right_corrected,
+                },
+            ) => {
+                left_symbol == right_symbol
+                    && left_mark.inner().eq(right_mark.inner()).unwrap_or(false)
+                    && left_observed == right_observed
+                    && left_source == right_source
+                    && left_reason == right_reason
+                    && left_corrected == right_corrected
+            }
+            (
+                Self::UnusableMarkAlerted {
+                    symbol: left_symbol,
+                    alerted_at: left_at,
+                },
+                Self::UnusableMarkAlerted {
+                    symbol: right_symbol,
+                    alerted_at: right_at,
+                },
+            )
+            | (
+                Self::UnusableMarkDetected {
+                    symbol: left_symbol,
+                    detected_at: left_at,
+                },
+                Self::UnusableMarkDetected {
+                    symbol: right_symbol,
+                    detected_at: right_at,
+                },
+            ) => left_symbol == right_symbol && left_at == right_at,
+            _ => false,
+        }
+    }
 }
 
 impl DomainEvent for PortfolioSnapshotEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Captured { .. } => "PortfolioSnapshotEvent::Captured".to_string(),
+            Self::EquityMarkSet { .. } => "PortfolioSnapshotEvent::EquityMarkSet".to_string(),
+            Self::UnusableMarkAlerted { .. } => {
+                "PortfolioSnapshotEvent::UnusableMarkAlerted".to_string()
+            }
+            Self::UnusableMarkDetected { .. } => {
+                "PortfolioSnapshotEvent::UnusableMarkDetected".to_string()
+            }
         }
     }
 
@@ -145,6 +232,22 @@ pub(crate) enum PortfolioSnapshotCommand {
         captured_at: DateTime<Utc>,
         rows: Vec<PortfolioBalanceRowWithMark>,
     },
+    SetEquityMark {
+        symbol: Symbol,
+        usd_mark: Positive<Float>,
+        observed_at: DateTime<Utc>,
+        source: String,
+        reason: String,
+        corrected_at: DateTime<Utc>,
+    },
+    RecordUnusableMarkAlerted {
+        symbol: Symbol,
+        alerted_at: DateTime<Utc>,
+    },
+    RecordUnusableMarkDetected {
+        symbol: Symbol,
+        detected_at: DateTime<Utc>,
+    },
 }
 
 /// Errors from [`PortfolioSnapshot`] command handling.
@@ -152,17 +255,47 @@ pub(crate) enum PortfolioSnapshotCommand {
 pub(crate) enum PortfolioSnapshotError {
     #[error("portfolio already captured for this day")]
     AlreadyCaptured,
+    #[error("portfolio has not been captured for this day")]
+    NotCaptured,
+    #[error("portfolio snapshot does not contain equity {symbol}")]
+    EquityNotCaptured { symbol: Symbol },
+    #[error("historical price source must not be blank")]
+    BlankSource,
+    #[error("operator reason must not be blank")]
+    BlankReason,
+    #[error("historical mark for {symbol} must be observed before ET day {et_day}")]
+    MarkNotBeforeCaptureDay { symbol: Symbol, et_day: NaiveDate },
+    #[error("historical mark for {symbol} is too stale to make ET day {et_day} usable")]
+    MarkTooStale { symbol: Symbol, et_day: NaiveDate },
 }
 
-/// One instance per ET day. Tracks only enough state to route a `Capture`
-/// command to `initialize` (not yet captured) or `transition` (already
-/// captured, rejected) -- the queryable balances live in the
-/// `portfolio_snapshot` table maintained by [`PortfolioSnapshotProjection`],
-/// not on this aggregate.
+/// One instance per ET day. Alongside capture idempotency it retains original
+/// rows and per-symbol correction/alert state so durable job retries neither
+/// lose nor repeatedly send unusable-mark alerts. Queryable balances still
+/// live in the `portfolio_snapshot` projection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PortfolioSnapshot {
     pub(crate) captured_at: DateTime<Utc>,
     pub(crate) row_count: usize,
+    equity_symbols: HashSet<Symbol>,
+    captured_rows: Vec<PortfolioBalanceRowWithMark>,
+    alerted_symbols: HashSet<Symbol>,
+    detected_symbols: HashSet<Symbol>,
+    corrected_symbols: HashSet<Symbol>,
+}
+
+impl PortfolioSnapshot {
+    pub(crate) fn captured_equity_row_count(&self, symbol: &Symbol) -> usize {
+        self.captured_rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    &row.row.asset,
+                    crate::inventory::PortfolioAsset::Equity(captured) if captured == symbol
+                )
+            })
+            .count()
+    }
 }
 
 #[async_trait]
@@ -176,30 +309,55 @@ impl EventSourced for PortfolioSnapshot {
 
     const AGGREGATE_TYPE: &'static str = "PortfolioSnapshot";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
             PortfolioSnapshotEvent::Captured { captured_at, rows } => Some(Self {
                 captured_at: *captured_at,
                 row_count: rows.len(),
+                equity_symbols: rows
+                    .iter()
+                    .filter_map(|row| match &row.row.asset {
+                        crate::inventory::PortfolioAsset::Equity(symbol) => Some(symbol.clone()),
+                        crate::inventory::PortfolioAsset::Usdc => None,
+                    })
+                    .collect(),
+                captured_rows: rows.clone(),
+                alerted_symbols: HashSet::new(),
+                detected_symbols: HashSet::new(),
+                corrected_symbols: HashSet::new(),
             }),
+            PortfolioSnapshotEvent::EquityMarkSet { .. }
+            | PortfolioSnapshotEvent::UnusableMarkAlerted { .. }
+            | PortfolioSnapshotEvent::UnusableMarkDetected { .. } => None,
         }
     }
 
-    fn evolve(entity: &Self, _event: &Self::Event) -> Result<Option<Self>, Self::Error> {
-        // Defensive, not expected: transition() below unconditionally
-        // rejects a second Capture for an already-Live aggregate, so a Live
-        // instance never actually observes a second Captured event in
-        // normal operation. Total but a no-op if it ever does.
-        Ok(Some(entity.clone()))
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        let mut next = entity.clone();
+        match event {
+            PortfolioSnapshotEvent::Captured { .. } => {}
+            PortfolioSnapshotEvent::EquityMarkSet { symbol, .. } => {
+                next.corrected_symbols.insert(symbol.clone());
+            }
+            PortfolioSnapshotEvent::UnusableMarkAlerted { symbol, .. } => {
+                next.alerted_symbols.insert(symbol.clone());
+            }
+            PortfolioSnapshotEvent::UnusableMarkDetected { symbol, .. } => {
+                next.detected_symbols.insert(symbol.clone());
+            }
+        }
+        Ok(Some(next))
     }
 
     async fn initialize(
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        let PortfolioSnapshotCommand::Capture { captured_at, rows } = command;
+        let PortfolioSnapshotCommand::Capture { captured_at, rows } = command else {
+            return Err(PortfolioSnapshotError::NotCaptured);
+        };
         // Logged here, not by the job that sent the command (AGENTS.md "Log
         // in command handlers, not callers"): this handler has the full
         // command in scope. `target_et_day` is derived from `captured_at`
@@ -213,16 +371,79 @@ impl EventSourced for PortfolioSnapshot {
 
     async fn transition(
         &self,
-        _command: Self::Command,
+        command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         // Expected, not a failure (decision 11): a scheduling bug that fires
         // more than once a day is still visible via this log naming the day
         // that was already captured, just not treated as retryable by the
         // caller (`write.rs`'s `PortfolioSnapshotJob::perform`).
-        let existing_et_day = write::et_day(self.captured_at);
-        info!(%existing_et_day, "Portfolio already captured for this ET day");
-        Err(PortfolioSnapshotError::AlreadyCaptured)
+        match command {
+            PortfolioSnapshotCommand::Capture { .. } => {
+                let existing_et_day = write::et_day(self.captured_at);
+                info!(%existing_et_day, "Portfolio already captured for this ET day");
+                Err(PortfolioSnapshotError::AlreadyCaptured)
+            }
+            PortfolioSnapshotCommand::SetEquityMark {
+                symbol,
+                usd_mark,
+                observed_at,
+                source,
+                reason,
+                corrected_at,
+            } => {
+                if !self.equity_symbols.contains(&symbol) {
+                    return Err(PortfolioSnapshotError::EquityNotCaptured { symbol });
+                }
+                if source.trim().is_empty() {
+                    return Err(PortfolioSnapshotError::BlankSource);
+                }
+                if reason.trim().is_empty() {
+                    return Err(PortfolioSnapshotError::BlankReason);
+                }
+
+                let et_day = write::et_day(self.captured_at);
+                if write::et_day(observed_at) >= et_day {
+                    return Err(PortfolioSnapshotError::MarkNotBeforeCaptureDay { symbol, et_day });
+                }
+                let asset = crate::inventory::PortfolioAsset::Equity(symbol.clone());
+                if read::is_stale_mark(&asset, observed_at, et_day) {
+                    return Err(PortfolioSnapshotError::MarkTooStale { symbol, et_day });
+                }
+                info!(%et_day, %symbol, ?usd_mark, %observed_at, %source, %reason, %corrected_at, "Portfolio snapshot equity mark set");
+                Ok(vec![PortfolioSnapshotEvent::EquityMarkSet {
+                    symbol,
+                    usd_mark,
+                    observed_at,
+                    source,
+                    reason,
+                    corrected_at,
+                }])
+            }
+            PortfolioSnapshotCommand::RecordUnusableMarkAlerted { symbol, alerted_at } => {
+                if !self.equity_symbols.contains(&symbol) {
+                    return Err(PortfolioSnapshotError::EquityNotCaptured { symbol });
+                }
+                info!(%symbol, %alerted_at, "Portfolio snapshot unusable-mark alert delivered");
+                Ok(vec![PortfolioSnapshotEvent::UnusableMarkAlerted {
+                    symbol,
+                    alerted_at,
+                }])
+            }
+            PortfolioSnapshotCommand::RecordUnusableMarkDetected {
+                symbol,
+                detected_at,
+            } => {
+                if !self.equity_symbols.contains(&symbol) {
+                    return Err(PortfolioSnapshotError::EquityNotCaptured { symbol });
+                }
+                info!(%symbol, %detected_at, "Portfolio snapshot unusable mark detected");
+                Ok(vec![PortfolioSnapshotEvent::UnusableMarkDetected {
+                    symbol,
+                    detected_at,
+                }])
+            }
+        }
     }
 }
 
@@ -246,6 +467,19 @@ mod tests {
             },
             usd_mark: Some(float!(1)),
             mark_captured_at: Some(Utc::now()),
+        }
+    }
+
+    fn equity_row(symbol: &str) -> PortfolioBalanceRowWithMark {
+        PortfolioBalanceRowWithMark {
+            row: PortfolioBalanceRow {
+                location: PortfolioLocation::MarketMaking,
+                asset: PortfolioAsset::Equity(Symbol::new(symbol).unwrap()),
+                available: float!(10),
+                inflight: float!(0),
+            },
+            usd_mark: None,
+            mark_captured_at: None,
         }
     }
 
@@ -284,6 +518,100 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(PortfolioSnapshotError::AlreadyCaptured)
+        ));
+    }
+
+    #[tokio::test]
+    async fn captured_equity_mark_can_be_set_repeatedly_as_append_only_events() {
+        let captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap();
+        let corrected_at = Utc.with_ymd_and_hms(2026, 7, 22, 15, 0, 0).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let command = |mark| PortfolioSnapshotCommand::SetEquityMark {
+            symbol: symbol.clone(),
+            usd_mark: Positive::new(mark).unwrap(),
+            observed_at,
+            source: "Nasdaq historical close".to_owned(),
+            reason: "repair missing capture mark".to_owned(),
+            corrected_at,
+        };
+
+        let first_event = PortfolioSnapshotEvent::EquityMarkSet {
+            symbol: symbol.clone(),
+            usd_mark: Positive::new(float!(150)).unwrap(),
+            observed_at,
+            source: "Nasdaq historical close".to_owned(),
+            reason: "repair missing capture mark".to_owned(),
+            corrected_at,
+        };
+        TestHarness::<PortfolioSnapshot>::with(())
+            .given(vec![PortfolioSnapshotEvent::Captured {
+                captured_at,
+                rows: vec![equity_row("AAPL")],
+            }])
+            .when(command(float!(150)))
+            .await
+            .then_expect_events(std::slice::from_ref(&first_event));
+
+        TestHarness::<PortfolioSnapshot>::with(())
+            .given(vec![
+                PortfolioSnapshotEvent::Captured {
+                    captured_at,
+                    rows: vec![equity_row("AAPL")],
+                },
+                first_event,
+            ])
+            .when(command(float!(151)))
+            .await
+            .then_expect_events(&[PortfolioSnapshotEvent::EquityMarkSet {
+                symbol,
+                usd_mark: Positive::new(float!(151)).unwrap(),
+                observed_at,
+                source: "Nasdaq historical close".to_owned(),
+                reason: "repair missing capture mark".to_owned(),
+                corrected_at,
+            }]);
+    }
+
+    #[tokio::test]
+    async fn correction_rejects_same_day_or_stale_observation() {
+        let captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let command = |observed_at| PortfolioSnapshotCommand::SetEquityMark {
+            symbol: symbol.clone(),
+            usd_mark: Positive::new(float!(150)).unwrap(),
+            observed_at,
+            source: "Nasdaq historical close".to_owned(),
+            reason: "repair missing capture mark".to_owned(),
+            corrected_at: captured_at + chrono::Duration::days(2),
+        };
+        let given = || {
+            vec![PortfolioSnapshotEvent::Captured {
+                captured_at,
+                rows: vec![equity_row("AAPL")],
+            }]
+        };
+
+        let same_day = TestHarness::<PortfolioSnapshot>::with(())
+            .given(given())
+            .when(command(Utc.with_ymd_and_hms(2026, 7, 20, 4, 1, 0).unwrap()))
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            same_day,
+            LifecycleError::Apply(PortfolioSnapshotError::MarkNotBeforeCaptureDay { .. })
+        ));
+
+        let stale = TestHarness::<PortfolioSnapshot>::with(())
+            .given(given())
+            .when(command(
+                Utc.with_ymd_and_hms(2026, 7, 10, 20, 0, 0).unwrap(),
+            ))
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            stale,
+            LifecycleError::Apply(PortfolioSnapshotError::MarkTooStale { .. })
         ));
     }
 

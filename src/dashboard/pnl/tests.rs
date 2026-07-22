@@ -590,7 +590,7 @@ fn report_with_result(
             COST_WARNING.to_owned(),
         ],
     )
-    .map(|(response, _net_realized_pnl_usd)| response)
+    .map(|(response, _daily_net_realized_pnl_usd)| response)
 }
 
 async fn pnl_test_pool(
@@ -699,7 +699,7 @@ fn report_result(events: Vec<PositionEventRow>) -> Result<PnlResponse, PnlError>
             COST_WARNING.to_owned(),
         ],
     )
-    .map(|(response, _net_realized_pnl_usd)| response)
+    .map(|(response, _daily_net_realized_pnl_usd)| response)
 }
 
 fn report(events: Vec<PositionEventRow>) -> PnlResponse {
@@ -2589,6 +2589,122 @@ async fn build_pnl_report_populates_capital_when_snapshots_exist() {
 }
 
 #[tokio::test]
+async fn return_uses_only_pnl_from_days_with_usable_capital() {
+    let pool = pnl_test_pool(
+        vec![
+            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+            onchain_sell(3, "110", "2026-05-16T14:00:00Z"),
+            offchain_buy(4, "2026-05-16T14:01:00Z", "10", "1"),
+            onchain_sell(5, "10", "2026-05-17T14:00:00Z"),
+            offchain_buy(6, "2026-05-17T14:01:00Z", "8", "1"),
+        ],
+        position_rows(),
+    )
+    .await;
+    for et_day in ["2026-05-15", "2026-05-17"] {
+        insert_portfolio_snapshot_row(
+            &pool,
+            et_day,
+            "market_making",
+            "USDC",
+            "1000",
+            Some("1"),
+            Some("2026-05-15T04:05:00+00:00"),
+        )
+        .await;
+    }
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-16",
+        "market_making",
+        "AAPL",
+        "10",
+        None,
+        None,
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            from_date: Some("2026-05-15".to_owned()),
+            to_date: Some("2026-05-17".to_owned()),
+            ..query()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.summary.net_realized_pnl_usd, "104");
+    assert_eq!(report.capital.annualized_return_pct.as_deref(), Some("73"));
+    assert_eq!(report.capital.excluded_days.len(), 1);
+    assert_eq!(report.capital.excluded_days[0].et_day, "2026-05-16");
+}
+
+#[tokio::test]
+async fn return_excludes_signed_cost_effects_from_days_without_usable_capital() {
+    let pool = pnl_test_pool_with_costs(
+        Vec::new(),
+        position_rows(),
+        vec![
+            tokenized_mint_requested(1, "mint-excluded-day", "RKLB"),
+            tokenized_tokens_received(2, "mint-excluded-day", "100", "2026-05-16T14:02:00Z"),
+        ],
+    )
+    .await;
+    for et_day in ["2026-05-15", "2026-05-17"] {
+        insert_portfolio_snapshot_row(
+            &pool,
+            et_day,
+            "market_making",
+            "USDC",
+            "1000",
+            Some("1"),
+            Some("2026-05-15T04:05:00+00:00"),
+        )
+        .await;
+    }
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-16",
+        "market_making",
+        "AAPL",
+        "10",
+        None,
+        None,
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            from_date: Some("2026-05-15".to_owned()),
+            to_date: Some("2026-05-17".to_owned()),
+            ..query()
+        },
+        vec![account_activity(
+            "usable-day-revenue",
+            "FEE",
+            "2",
+            None,
+            "2026-05-15T14:02:00Z",
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.summary.net_realized_pnl_usd, "-98");
+    assert_eq!(
+        report.capital.annualized_return_pct.as_deref(),
+        Some("36.5")
+    );
+    assert_eq!(report.capital.excluded_days.len(), 1);
+    assert_eq!(report.capital.excluded_days[0].et_day, "2026-05-16");
+}
+
+#[tokio::test]
 async fn build_pnl_report_omits_capital_with_warning_when_no_snapshots_exist() {
     let pool = pnl_test_pool(Vec::new(), position_rows()).await;
 
@@ -2604,6 +2720,37 @@ async fn build_pnl_report_omits_capital_with_warning_when_no_snapshots_exist() {
     );
     assert!(!report.warnings.contains(&CAPITAL_AVAILABLE_NOTE.to_owned()));
     assert!(report.warnings.contains(&BASELINE_WARNING.to_owned()));
+}
+
+#[tokio::test]
+async fn from_only_range_exposes_missing_day_after_last_snapshot() {
+    let pool = pnl_test_pool(Vec::new(), position_rows()).await;
+    let report_through = super::source::latest_capture_day(chrono::Utc::now()).unwrap();
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            from_date: Some(report_through.to_string()),
+            to_date: None,
+            ..query()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let excluded = report
+        .capital
+        .excluded_days
+        .iter()
+        .find(|day| day.et_day == report_through.to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "the explicit fromDate must be represented even across the capture boundary: {:?}",
+                report.capital.excluded_days
+            )
+        });
+    assert_eq!(excluded.reason, "no portfolio snapshot was captured");
 }
 
 #[tokio::test]

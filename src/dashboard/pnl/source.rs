@@ -1,12 +1,14 @@
 //! SQLite and broker-backed source loading for backend PnL reports.
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
+use chrono_tz::America::New_York;
 use rain_math_float::Float;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_float_serde::format_float;
 
-use crate::portfolio_snapshot::{capital_summary, load_portfolio_days};
+use crate::portfolio_snapshot::{EtDayRange, capital_summary, load_portfolio_days};
 
 use super::builder::build_pnl_response_from_rows;
 use super::parsing::{fmt_decimal, parse_payload_string};
@@ -41,7 +43,7 @@ pub(crate) async fn build_pnl_report(
     let cost_rows = load_cost_events(&mut tx, resolved_rowid.resolved).await?;
     tx.commit().await?;
 
-    let (mut response, net_realized_pnl_usd) = build_pnl_response_from_rows(
+    let (mut response, daily_net_realized_pnl_usd) = build_pnl_response_from_rows(
         event_rows,
         &position_rows,
         &cost_rows,
@@ -56,7 +58,7 @@ pub(crate) async fn build_pnl_report(
         query,
         &resolved_rowid,
         &symbols,
-        &fmt_decimal(&net_realized_pnl_usd),
+        &daily_net_realized_pnl_usd,
         &mut response,
     )
     .await?;
@@ -79,7 +81,7 @@ async fn apply_capital_summary(
     query: &PnlQuery,
     resolved_rowid: &ResolvedRowid,
     symbols: &BTreeSet<String>,
-    net_realized_pnl_usd_decimal: &str,
+    daily_net_realized_pnl_usd: &BTreeMap<String, num_decimal::Num>,
     response: &mut PnlResponse,
 ) -> Result<(), PnlError> {
     if resolved_rowid.resolved != resolved_rowid.max {
@@ -104,10 +106,19 @@ async fn apply_capital_summary(
         return Ok(());
     }
 
-    let et_day_range = query.et_day_range()?;
+    let et_day_range = complete_capital_range(
+        pool,
+        query.et_day_range()?,
+        daily_net_realized_pnl_usd,
+        latest_capture_day(Utc::now())?,
+    )
+    .await?;
     let days = load_portfolio_days(pool, et_day_range).await?;
-    let net_realized_pnl_usd = Float::parse(net_realized_pnl_usd_decimal.to_owned())?;
-    let capital = capital_summary(&days, net_realized_pnl_usd, et_day_range)?;
+    let daily_net_realized_pnl_usd = daily_net_realized_pnl_usd
+        .iter()
+        .map(|(day, pnl)| Ok((day.clone(), Float::parse(fmt_decimal(pnl))?)))
+        .collect::<Result<BTreeMap<_, _>, PnlError>>()?;
+    let capital = capital_summary(&days, &daily_net_realized_pnl_usd)?;
 
     response.warnings.extend(capital.warnings);
     response.warnings.push(
@@ -134,9 +145,70 @@ async fn apply_capital_summary(
         sample_days: capital.sample_days,
         first_snapshot_day: capital.first_snapshot_day.map(|day| day.to_string()),
         last_snapshot_day: capital.last_snapshot_day.map(|day| day.to_string()),
+        excluded_days: capital
+            .excluded_days
+            .into_iter()
+            .map(|day| super::response::PnlCapitalExcludedDay {
+                et_day: day.et_day.to_string(),
+                reason: day.reason,
+            })
+            .collect(),
     };
 
     Ok(())
+}
+
+pub(crate) fn latest_capture_day(now: DateTime<Utc>) -> Result<NaiveDate, PnlError> {
+    let now_et = now.with_timezone(&New_York);
+    let day = now_et.date_naive();
+    if now_et.time() < NaiveTime::MIN + chrono::Duration::minutes(5) {
+        day.checked_sub_days(Days::new(1))
+            .ok_or_else(|| PnlError::InvalidDate {
+                field: "reportThrough",
+                value: day.to_string(),
+            })
+    } else {
+        Ok(day)
+    }
+}
+
+async fn complete_capital_range(
+    pool: &SqlitePool,
+    mut range: EtDayRange,
+    daily_net_realized_pnl_usd: &BTreeMap<String, num_decimal::Num>,
+    report_through: NaiveDate,
+) -> Result<EtDayRange, PnlError> {
+    if range.from.is_none() {
+        let first_snapshot: Option<String> =
+            sqlx::query_scalar("SELECT MIN(et_day) FROM portfolio_snapshot")
+                .fetch_one(pool)
+                .await?;
+        let first_snapshot = first_snapshot
+            .map(|day| {
+                NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| PnlError::InvalidDate {
+                    field: "portfolioSnapshotDay",
+                    value: day,
+                })
+            })
+            .transpose()?;
+        let first_pnl = daily_net_realized_pnl_usd
+            .keys()
+            .map(|day| {
+                NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| PnlError::InvalidDate {
+                    field: "dailyPnlDay",
+                    value: day.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min();
+        range.from = first_snapshot.into_iter().chain(first_pnl).min();
+    }
+    if range.to.is_none() {
+        range.to = Some(report_through);
+    }
+
+    Ok(range)
 }
 
 pub(crate) async fn validate_pnl_snapshot_rowid(

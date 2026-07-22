@@ -1,22 +1,17 @@
 //! Write side of the daily portfolio snapshot read model: the reactor that
 //! maintains the plain `portfolio_snapshot` table from retained
-//! `PortfolioSnapshot::Captured` events.
+//! `PortfolioSnapshot` capture and historical-mark correction events.
 //!
-//! **Durability model: forward-only, best-effort -- matching
-//! [`crate::performance::HedgeLatencyProjection`] exactly, NOT
-//! `QueryReplay::replay_all()`.** `QueryReplay` targets cqrs-es `Query`/`View`
-//! types; the bridge that would let a `Reactor` participate in that machinery
-//! is crate-private inside `event-sorcery`, and startup auto-catch-up is
-//! wired only for `Materialized = Table` entities. A crash between the
-//! `Captured` event committing and this reactor's write can therefore drop
-//! that day's read-model row. Because the `PortfolioSnapshot` aggregate
-//! permanently rejects any further `Capture` for the same `et_day`, there is
-//! currently no automated repair path for a dropped row -- accepted as the
-//! same best-effort risk `HedgeLatencyProjection` already carries in this
-//! codebase, not a regression introduced here.
+//! The live reactor is forward-only, but the retained event stream remains the
+//! source of truth: [`PortfolioSnapshotProjection::rebuild_all`] truncates and
+//! replays the read model in one transaction. This gives operators a durable
+//! recovery path for a reactor failure and guarantees manual mark corrections
+//! survive projection rebuilds.
 
-use sqlx::SqlitePool;
-use st0x_event_sorcery::{EntityList, Reactor, deps};
+use rain_math_float::Float;
+use sqlx::{Sqlite, SqlitePool, Transaction};
+use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, deps};
+use st0x_finance::{Positive, Symbol};
 use st0x_float_serde::format_float;
 use thiserror::Error;
 
@@ -40,20 +35,20 @@ impl PortfolioSnapshotProjection {
     /// inside a single transaction, defense-in-depth beyond the aggregate's
     /// own command-level idempotency (a second `Capture` for the same day is
     /// rejected before it ever reaches this reactor).
-    async fn on_captured(
-        &self,
+    async fn on_captured_tx(
+        transaction: &mut Transaction<'_, Sqlite>,
         id: PortfolioSnapshotId,
         event: PortfolioSnapshotEvent,
     ) -> Result<(), ProjectionError> {
-        let PortfolioSnapshotEvent::Captured { captured_at, rows } = event;
+        let PortfolioSnapshotEvent::Captured { captured_at, rows } = event else {
+            return Ok(());
+        };
         let et_day = id.to_string();
         let captured_at = captured_at.to_rfc3339();
 
-        let mut transaction = self.pool.begin().await?;
-
         sqlx::query("DELETE FROM portfolio_snapshot WHERE et_day = ?")
             .bind(&et_day)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
 
         for row in &rows {
@@ -76,13 +71,95 @@ impl PortfolioSnapshotProjection {
             .bind(inflight_balance)
             .bind(usd_mark)
             .bind(mark_captured_at)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
         }
 
-        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn on_equity_mark_set_tx(
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: PortfolioSnapshotId,
+        symbol: Symbol,
+        usd_mark: Positive<Float>,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ProjectionError> {
+        let et_day = id.to_string();
+        let mark = format_float(&usd_mark.inner())?;
+        let result = sqlx::query(
+            "UPDATE portfolio_snapshot SET usd_mark = ?, mark_captured_at = ? \
+             WHERE et_day = ? AND asset = ?",
+        )
+        .bind(mark)
+        .bind(observed_at.to_rfc3339())
+        .bind(&et_day)
+        .bind(symbol.to_string())
+        .execute(&mut **transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ProjectionError::EquityRowsMissing { et_day, symbol });
+        }
 
         Ok(())
+    }
+
+    async fn on_event(
+        &self,
+        id: PortfolioSnapshotId,
+        event: PortfolioSnapshotEvent,
+    ) -> Result<(), ProjectionError> {
+        let mut transaction = self.pool.begin().await?;
+        Self::apply_event_tx(&mut transaction, id, event).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn apply_event_tx(
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: PortfolioSnapshotId,
+        event: PortfolioSnapshotEvent,
+    ) -> Result<(), ProjectionError> {
+        match event {
+            captured @ PortfolioSnapshotEvent::Captured { .. } => {
+                Self::on_captured_tx(transaction, id, captured).await
+            }
+            PortfolioSnapshotEvent::EquityMarkSet {
+                symbol,
+                usd_mark,
+                observed_at,
+                ..
+            } => Self::on_equity_mark_set_tx(transaction, id, symbol, usd_mark, observed_at).await,
+            PortfolioSnapshotEvent::UnusableMarkAlerted { .. }
+            | PortfolioSnapshotEvent::UnusableMarkDetected { .. } => Ok(()),
+        }
+    }
+
+    /// Rebuilds the complete read model from retained aggregate events in one
+    /// transaction, so a parse or write failure leaves the prior table intact.
+    pub(crate) async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
+        let mut transaction = self.pool.begin().await?;
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT aggregate_id, payload FROM events WHERE aggregate_type = ? \
+             ORDER BY aggregate_id, sequence ASC",
+        )
+        .bind(PortfolioSnapshot::AGGREGATE_TYPE)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        sqlx::query("DELETE FROM portfolio_snapshot")
+            .execute(&mut *transaction)
+            .await?;
+
+        for (aggregate_id, payload) in &events {
+            let id = aggregate_id.parse()?;
+            let event = serde_json::from_str(payload)?;
+            Self::apply_event_tx(&mut transaction, id, event).await?;
+        }
+
+        transaction.commit().await?;
+        u64::try_from(events.len()).map_err(|source| ProjectionError::EventCount { source })
     }
 }
 
@@ -92,6 +169,17 @@ pub(crate) enum ProjectionError {
     Database(#[from] sqlx::Error),
     #[error("failed to format a portfolio snapshot balance for persistence")]
     Float(#[from] rain_math_float::FloatError),
+    #[error("failed to deserialize a portfolio-snapshot event")]
+    Event(#[from] serde_json::Error),
+    #[error("failed to parse portfolio-snapshot aggregate id")]
+    AggregateId(#[from] super::ParsePortfolioSnapshotIdError),
+    #[error("portfolio-snapshot event count exceeded u64")]
+    EventCount {
+        #[source]
+        source: std::num::TryFromIntError,
+    },
+    #[error("portfolio-snapshot read model has no rows for {symbol} on {et_day}")]
+    EquityRowsMissing { et_day: String, symbol: Symbol },
 }
 
 #[async_trait::async_trait]
@@ -103,17 +191,21 @@ impl Reactor for PortfolioSnapshotProjection {
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
         event
-            .on(|id, event| async move { self.on_captured(id, event).await })
+            .on(|id, event| async move { self.on_event(id, event).await })
             .exhaustive()
             .await
     }
 }
 
+impl IdempotentReactor for PortfolioSnapshotProjection {}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{TimeZone, Utc};
     use sqlx::Row;
-    use st0x_event_sorcery::ReactorHarness;
+    use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_float_macro::float;
 
     use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
@@ -140,6 +232,19 @@ mod tests {
             },
             usd_mark: usd_mark.map(|mark| float!(&mark.to_string())),
             mark_captured_at: usd_mark.map(|_| captured_at()),
+        }
+    }
+
+    fn equity_row(location: PortfolioLocation) -> PortfolioBalanceRowWithMark {
+        PortfolioBalanceRowWithMark {
+            row: PortfolioBalanceRow {
+                location,
+                asset: PortfolioAsset::Equity(Symbol::new("AAPL").unwrap()),
+                available: float!(10),
+                inflight: float!(0),
+            },
+            usd_mark: None,
+            mark_captured_at: None,
         }
     }
 
@@ -226,5 +331,108 @@ mod tests {
             .unwrap();
 
         assert_eq!(row_count(&pool, "2026-07-20").await, 2);
+    }
+
+    #[tokio::test]
+    async fn equity_mark_set_updates_every_location_and_latest_event_wins() {
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(PortfolioSnapshotProjection::new(pool.clone()));
+        let id = PortfolioSnapshotId(chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+        harness
+            .receive::<PortfolioSnapshot>(
+                id,
+                PortfolioSnapshotEvent::Captured {
+                    captured_at: captured_at(),
+                    rows: vec![
+                        equity_row(PortfolioLocation::MarketMaking),
+                        equity_row(PortfolioLocation::Hedging),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+
+        for mark in [float!(150), float!(151)] {
+            harness
+                .receive::<PortfolioSnapshot>(
+                    id,
+                    PortfolioSnapshotEvent::EquityMarkSet {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        usd_mark: Positive::new(mark).unwrap(),
+                        observed_at: captured_at() - chrono::Duration::days(3),
+                        source: "Nasdaq historical close".to_owned(),
+                        reason: "operator correction".to_owned(),
+                        corrected_at: captured_at() + chrono::Duration::days(2),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let marks: Vec<String> = sqlx::query_scalar(
+            "SELECT usd_mark FROM portfolio_snapshot \
+             WHERE et_day = '2026-07-20' AND asset = 'AAPL' ORDER BY location",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, vec!["151", "151"]);
+    }
+
+    #[tokio::test]
+    async fn rebuild_replays_capture_and_latest_mark_correction() {
+        let pool = setup_test_db().await;
+        let projection = Arc::new(PortfolioSnapshotProjection::new(pool.clone()));
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(projection.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = PortfolioSnapshotId(chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+
+        store
+            .send(
+                &id,
+                super::super::PortfolioSnapshotCommand::Capture {
+                    captured_at: captured_at(),
+                    rows: vec![
+                        equity_row(PortfolioLocation::MarketMaking),
+                        equity_row(PortfolioLocation::Hedging),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        for mark in [float!(150), float!(151)] {
+            store
+                .send(
+                    &id,
+                    super::super::PortfolioSnapshotCommand::SetEquityMark {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        usd_mark: Positive::new(mark).unwrap(),
+                        observed_at: captured_at() - chrono::Duration::days(3),
+                        source: "Nasdaq historical close".to_owned(),
+                        reason: "operator correction".to_owned(),
+                        corrected_at: captured_at() + chrono::Duration::days(2),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        sqlx::query("DELETE FROM portfolio_snapshot")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(projection.rebuild_all().await.unwrap(), 3);
+
+        let marks: Vec<String> = sqlx::query_scalar(
+            "SELECT usd_mark FROM portfolio_snapshot \
+             WHERE et_day = '2026-07-20' AND asset = 'AAPL' ORDER BY location",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, vec!["151", "151"]);
     }
 }

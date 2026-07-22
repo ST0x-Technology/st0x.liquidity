@@ -10,7 +10,7 @@ use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
@@ -34,7 +34,7 @@ use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
-use crate::alerts::TelegramNotifier;
+use crate::alerts::Notifier;
 use crate::inventory::{
     BroadcastingInventory, InventoryPollingService, InventorySnapshot, InventorySnapshotId,
     PollFreshness, WalletPollingCtx,
@@ -176,6 +176,7 @@ pub(crate) fn spawn<Prov, Exec>(
     rejection_queue: HandleOrderRejectionJobQueue,
     check_positions_queue: CheckPositionsJobQueue,
     portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
+    notifier: Arc<dyn Notifier>,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
@@ -276,7 +277,7 @@ where
     // Build the gas monitor before `context.provider` is consumed by the
     // order-fill monitor / accountant below. `None` when `[alerts]` is
     // unconfigured -- the monitor is then simply not spawned.
-    let gas_monitor = build_gas_monitor(&context.ctx, context.provider.clone());
+    let gas_monitor = build_gas_monitor(&context.ctx, context.provider.clone(), notifier.clone());
 
     let poll_interval = context.ctx.order_polling_interval();
     info!("Constructing order-job context with poll interval: {poll_interval:?}");
@@ -340,6 +341,7 @@ where
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
+        pool: context.pool.clone(),
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
@@ -348,6 +350,7 @@ where
         usdc_tracking_enabled: context.ctx.assets.cash.is_some(),
         wallet_polling_enabled,
         poll_freshness,
+        notifier,
         queue: portfolio_snapshot_queue.clone(),
     });
 
@@ -885,28 +888,19 @@ where
 /// when alerting is unconfigured. The monitor watches the order-owner wallet
 /// on the orderbook chain (Base in production), which is the same provider the
 /// conductor already uses for fill polling and contract reads.
-fn build_gas_monitor<Prov>(ctx: &Ctx, provider: Prov) -> Option<GasMonitor>
+fn build_gas_monitor<Prov>(
+    ctx: &Ctx,
+    provider: Prov,
+    notifier: Arc<dyn Notifier>,
+) -> Option<GasMonitor>
 where
     Prov: Provider + Send + Sync + 'static,
 {
     let alerts = ctx.alerts.as_ref()?;
 
-    let notifier =
-        match TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id) {
-            Ok(notifier) => notifier,
-            Err(error) => {
-                error!(
-                    target: "gas",
-                    ?error,
-                    "Failed to build Telegram notifier; gas monitor will not be started"
-                );
-                return None;
-            }
-        };
-
     Some(GasMonitor {
         balance_reader: Arc::new(ProviderBalanceReader::new(provider)),
-        notifier: Arc::new(notifier),
+        notifier,
         wallet: ctx.order_owner(),
         chain: "base",
         threshold_wei: alerts.low_balance_threshold_wei,

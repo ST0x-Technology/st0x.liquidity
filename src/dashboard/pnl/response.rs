@@ -81,6 +81,14 @@ pub(crate) struct PnlCapitalSummary {
     pub(crate) sample_days: usize,
     pub(crate) first_snapshot_day: Option<String>,
     pub(crate) last_snapshot_day: Option<String>,
+    pub(crate) excluded_days: Vec<PnlCapitalExcludedDay>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PnlCapitalExcludedDay {
+    pub(crate) et_day: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

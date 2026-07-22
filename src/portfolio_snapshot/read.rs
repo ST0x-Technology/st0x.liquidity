@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use rain_math_float::Float;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use thiserror::Error;
@@ -32,7 +32,7 @@ use crate::inventory::{PortfolioAsset, PortfolioLocation};
 /// the whole day from the capital sample. Only equity marks are
 /// staleness-checked -- USDC's mark is a fixed par assumption captured fresh
 /// at capture time.
-const MARK_STALENESS_THRESHOLD_DAYS: i64 = 7;
+pub(crate) const MARK_STALENESS_THRESHOLD_DAYS: i64 = 7;
 
 /// Minimum included snapshot days, spanning at least this many calendar
 /// days, before an annualized return is computed. A single day's return
@@ -73,11 +73,14 @@ pub(crate) enum ReadError {
     },
     #[error("sample day count {sample_days} does not fit in i64 for the coverage-gap check")]
     SampleDaysOverflow { sample_days: usize },
+    #[error("portfolio snapshot date range overflowed after {day}")]
+    DateRangeOverflow { day: NaiveDate },
 }
 
 /// Why a day was excluded from the capital sample.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DayExclusionReason {
+    MissingSnapshot,
     MissingMark(PortfolioAsset),
     StaleMark(PortfolioAsset, DateTime<Utc>),
 }
@@ -133,7 +136,14 @@ pub(crate) struct CapitalSummary {
     pub(crate) sample_days: usize,
     pub(crate) first_snapshot_day: Option<NaiveDate>,
     pub(crate) last_snapshot_day: Option<NaiveDate>,
+    pub(crate) excluded_days: Vec<CapitalExcludedDay>,
     pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CapitalExcludedDay {
+    pub(crate) et_day: NaiveDate,
+    pub(crate) reason: String,
 }
 
 /// A single `(location, asset)` balance row loaded from `portfolio_snapshot`
@@ -212,27 +222,58 @@ pub(crate) async fn load_portfolio_days(
         });
     }
 
-    by_day
+    let mut evaluated = by_day
         .into_iter()
-        .map(|(et_day, rows)| evaluate_day(et_day, rows))
-        .collect()
+        .map(|(et_day, rows)| evaluate_day(et_day, rows).map(|day| (et_day, day)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+    // Complete the finite report window even when one or both query bounds are
+    // open. An explicit bound anchors that edge; an open edge resolves to the
+    // first/last available snapshot. This exposes interior gaps and a missing
+    // explicit edge without inventing an unbounded calendar range.
+    let first_loaded_day = evaluated.first_key_value().map(|(day, _)| *day);
+    let last_loaded_day = evaluated.last_key_value().map(|(day, _)| *day);
+    let effective_from = from.or(first_loaded_day);
+    let effective_to = to.or(last_loaded_day);
+    let (Some(mut day), Some(last_day)) = (effective_from, effective_to) else {
+        return Ok(evaluated.into_values().collect());
+    };
+    let mut complete_range = Vec::new();
+    while day <= last_day {
+        complete_range.push(evaluated.remove(&day).unwrap_or(PortfolioDay {
+            et_day: day,
+            capital: DayCapital::Excluded(DayExclusionReason::MissingSnapshot),
+        }));
+        if day == last_day {
+            break;
+        }
+        day = day
+            .checked_add_days(Days::new(1))
+            .ok_or(ReadError::DateRangeOverflow { day })?;
+    }
+
+    Ok(complete_range)
 }
 
-/// Computes [`CapitalSummary`] from already-loaded [`PortfolioDay`]s and the
-/// range's numeric net realized PnL accumulator, not a re-parsed response
-/// string.
-///
-/// `query_et_day_range` has the same `(from, to)` bounds that scope
-/// `net_realized_pnl_usd`: the PnL numerator is computed over the caller's
-/// whole query range, not over snapshot coverage, so annualizing by
-/// `365 / coverage_days` is only valid when snapshot coverage fully spans that
-/// range. See [`coverage_spans_query_range`].
+/// Computes [`CapitalSummary`] from already-loaded [`PortfolioDay`]s and net
+/// realized PnL bucketed by ET accounting day. Only PnL whose day has usable
+/// capital enters the return numerator; full-range PnL remains unchanged in
+/// the ordinary report.
 pub(crate) fn capital_summary(
     days: &[PortfolioDay],
-    net_realized_pnl_usd: Float,
-    query_et_day_range: EtDayRange,
+    daily_net_realized_pnl_usd: &BTreeMap<String, Float>,
 ) -> Result<CapitalSummary, ReadError> {
     let mut warnings = exclusion_warnings(days);
+    let excluded_days = days
+        .iter()
+        .filter_map(|day| match &day.capital {
+            DayCapital::Included(_) => None,
+            DayCapital::Excluded(reason) => Some(CapitalExcludedDay {
+                et_day: day.et_day,
+                reason: describe_exclusion_reason(reason),
+            }),
+        })
+        .collect::<Vec<_>>();
 
     let included: Vec<(NaiveDate, Float)> = days
         .iter()
@@ -251,6 +292,7 @@ pub(crate) fn capital_summary(
             sample_days: 0,
             first_snapshot_day: None,
             last_snapshot_day: None,
+            excluded_days,
             warnings,
         });
     }
@@ -291,6 +333,7 @@ pub(crate) fn capital_summary(
             sample_days,
             first_snapshot_day: Some(first_snapshot_day),
             last_snapshot_day: Some(last_snapshot_day),
+            excluded_days,
             warnings,
         });
     }
@@ -298,7 +341,15 @@ pub(crate) fn capital_summary(
     let meets_sample_and_coverage_minimums = sample_days >= MIN_SAMPLE_DAYS_FOR_ANNUALIZATION
         && coverage_days >= MIN_COVERAGE_DAYS_FOR_ANNUALIZATION;
 
-    let annualized_return_pct = if !meets_sample_and_coverage_minimums {
+    let annualized_return_pct = if meets_sample_and_coverage_minimums {
+        let mut usable_pnl = Float::zero()?;
+        for (day, _) in &included {
+            if let Some(day_pnl) = daily_net_realized_pnl_usd.get(&day.to_string()) {
+                usable_pnl = (usable_pnl + *day_pnl)?;
+            }
+        }
+        Some(((((usable_pnl / total)? * DAYS_PER_YEAR)?) * PERCENT)?)
+    } else {
         warnings.push(format!(
             "Annualized return on capital requires at least \
              {MIN_SAMPLE_DAYS_FOR_ANNUALIZATION} included snapshot days spanning at least \
@@ -306,19 +357,6 @@ pub(crate) fn capital_summary(
              covering {coverage_days} calendar day(s) are available"
         ));
         None
-    } else if !coverage_spans_query_range(first_snapshot_day, last_snapshot_day, query_et_day_range)
-    {
-        warnings.push(
-            "Snapshot coverage does not span the full query range; annualized return omitted \
-             to avoid conflating a partial-coverage denominator with full-range realized PnL"
-                .to_owned(),
-        );
-        None
-    } else {
-        let coverage_days_float = Float::parse(coverage_days.to_string())?;
-        let annual_factor = (DAYS_PER_YEAR / coverage_days_float)?;
-        let period_return = (net_realized_pnl_usd / average)?;
-        Some(((period_return * annual_factor)? * PERCENT)?)
     };
 
     Ok(CapitalSummary {
@@ -328,30 +366,9 @@ pub(crate) fn capital_summary(
         sample_days,
         first_snapshot_day: Some(first_snapshot_day),
         last_snapshot_day: Some(last_snapshot_day),
+        excluded_days,
         warnings,
     })
-}
-
-/// Whether `[first_snapshot_day, last_snapshot_day]` fully covers
-/// `query_et_day_range`: the realized-PnL numerator passed into
-/// [`capital_summary`] is scoped to the caller's query range, not to
-/// snapshot coverage, so annualizing by `365 / coverage_days` is only valid
-/// when the two line up. An unbounded query side (`None`, "load every
-/// captured day") can never be proven spanned by a finite snapshot range --
-/// `portfolio_snapshot` does not backfill history -- so it conservatively
-/// counts as not spanning rather than assuming the coverage happens to reach
-/// back to the true start of history.
-fn coverage_spans_query_range(
-    first_snapshot_day: NaiveDate,
-    last_snapshot_day: NaiveDate,
-    query_et_day_range: EtDayRange,
-) -> bool {
-    let EtDayRange {
-        from: query_from,
-        to: query_to,
-    } = query_et_day_range;
-    query_from.is_some_and(|from| first_snapshot_day <= from)
-        && query_to.is_some_and(|to| last_snapshot_day >= to)
 }
 
 fn exclusion_warnings(days: &[PortfolioDay]) -> Vec<String> {
@@ -364,14 +381,21 @@ fn exclusion_warnings(days: &[PortfolioDay]) -> Vec<String> {
 }
 
 fn describe_exclusion(et_day: NaiveDate, reason: &DayExclusionReason) -> String {
+    format!(
+        "Portfolio capital sample excludes {et_day}: {}",
+        describe_exclusion_reason(reason)
+    )
+}
+
+fn describe_exclusion_reason(reason: &DayExclusionReason) -> String {
     match reason {
-        DayExclusionReason::MissingMark(asset) => format!(
-            "Portfolio capital sample excludes {et_day}: no USD mark observed yet for {asset}"
-        ),
-        DayExclusionReason::StaleMark(asset, mark_captured_at) => format!(
-            "Portfolio capital sample excludes {et_day}: USD mark for {asset} is stale \
-             (last observed {mark_captured_at})"
-        ),
+        DayExclusionReason::MissingSnapshot => "no portfolio snapshot was captured".to_owned(),
+        DayExclusionReason::MissingMark(asset) => {
+            format!("no USD mark observed yet for {asset}")
+        }
+        DayExclusionReason::StaleMark(asset, mark_captured_at) => {
+            format!("USD mark for {asset} is stale (last observed {mark_captured_at})")
+        }
     }
 }
 
@@ -435,7 +459,7 @@ fn evaluate_day(et_day: NaiveDate, rows: Vec<RawBalanceRow>) -> Result<Portfolio
     })
 }
 
-fn is_stale_mark(
+pub(crate) fn is_stale_mark(
     asset: &PortfolioAsset,
     mark_captured_at: DateTime<Utc>,
     et_day: NaiveDate,
@@ -719,8 +743,45 @@ mod tests {
         );
     }
 
-    /// An open-ended range (only `from` set) must include every day at or
-    /// after it, with no upper bound.
+    #[tokio::test]
+    async fn bounded_range_surfaces_a_day_with_no_snapshot_as_excluded() {
+        let pool = setup_test_db().await;
+        for et_day in ["2026-07-17", "2026-07-19"] {
+            insert_row(
+                &pool,
+                et_day,
+                "market_making",
+                "USDC",
+                "1000",
+                Some("1"),
+                Some("2026-07-17T04:05:00+00:00"),
+            )
+            .await;
+        }
+
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()),
+                to: Some(NaiveDate::from_ymd_opt(2026, 7, 19).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days.len(), 3);
+        assert_eq!(
+            days[1].et_day,
+            NaiveDate::from_ymd_opt(2026, 7, 18).unwrap()
+        );
+        assert_eq!(
+            days[1].capital,
+            DayCapital::Excluded(DayExclusionReason::MissingSnapshot)
+        );
+    }
+
+    /// A lower-bounded range resolves its open upper edge to the latest
+    /// available snapshot and still exposes a missing requested edge day.
     #[tokio::test]
     async fn load_portfolio_days_respects_open_ended_lower_bound() {
         let pool = setup_test_db().await;
@@ -751,10 +812,49 @@ mod tests {
         };
         let days = load_portfolio_days(&pool, range).await.unwrap();
 
-        assert_eq!(days.len(), 1);
+        assert_eq!(days.len(), 2);
         assert_eq!(
             days[0].et_day,
+            NaiveDate::from_ymd_opt(2026, 7, 18).unwrap()
+        );
+        assert_eq!(
+            days[0].capital,
+            DayCapital::Excluded(DayExclusionReason::MissingSnapshot)
+        );
+        assert_eq!(
+            days[1].et_day,
             NaiveDate::from_ymd_opt(2026, 7, 19).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn upper_bounded_range_exposes_missing_upper_edge() {
+        let pool = setup_test_db().await;
+        insert_row(
+            &pool,
+            "2026-07-17",
+            "market_making",
+            "USDC",
+            "1000",
+            Some("1"),
+            Some("2026-07-17T04:05:00+00:00"),
+        )
+        .await;
+
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: None,
+                to: Some(NaiveDate::from_ymd_opt(2026, 7, 18).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days.len(), 2);
+        assert_eq!(
+            days[1].capital,
+            DayCapital::Excluded(DayExclusionReason::MissingSnapshot)
         );
     }
 
@@ -963,15 +1063,17 @@ mod tests {
             .unwrap()
     }
 
+    fn daily_pnl(values: &[(u64, i64)]) -> BTreeMap<String, Float> {
+        values
+            .iter()
+            .map(|(offset, amount)| (day(*offset).to_string(), usd(*amount)))
+            .collect()
+    }
+
     #[test]
     fn capital_summary_hand_computed_two_day_average_and_annualized_return() {
         let days = vec![included_day(day(0), 1000), included_day(day(1), 2000)];
-        let query_range = EtDayRange {
-            from: Some(day(0)),
-            to: Some(day(1)),
-        };
-
-        let summary = capital_summary(&days, usd(30), query_range).unwrap();
+        let summary = capital_summary(&days, &daily_pnl(&[(0, 10), (1, 20)])).unwrap();
 
         assert_eq!(summary.sample_days, 2);
         assert_eq!(summary.coverage_days, Some(2));
@@ -996,12 +1098,11 @@ mod tests {
             .enumerate()
             .map(|(offset, total)| included_day(day(offset as u64), *total))
             .collect();
-        let query_range = EtDayRange {
-            from: Some(day(0)),
-            to: Some(day(4)),
-        };
-
-        let summary = capital_summary(&days, usd(50), query_range).unwrap();
+        let summary = capital_summary(
+            &days,
+            &daily_pnl(&[(0, 10), (1, 10), (2, 10), (3, 10), (4, 10)]),
+        )
+        .unwrap();
 
         assert_eq!(summary.sample_days, 5);
         assert_eq!(summary.coverage_days, Some(5));
@@ -1021,7 +1122,7 @@ mod tests {
     /// test does not exercise.
     #[test]
     fn capital_summary_zero_included_days_returns_none_without_a_warning() {
-        let summary = capital_summary(&[], usd(0), EtDayRange::default()).unwrap();
+        let summary = capital_summary(&[], &BTreeMap::new()).unwrap();
 
         assert!(summary.average_deployed_capital_usd.is_none());
         assert!(summary.annualized_return_pct.is_none());
@@ -1036,7 +1137,7 @@ mod tests {
     fn capital_summary_single_included_day_reports_average_but_no_annualized_figure() {
         let days = vec![included_day(day(0), 1000)];
 
-        let summary = capital_summary(&days, usd(10), EtDayRange::default()).unwrap();
+        let summary = capital_summary(&days, &daily_pnl(&[(0, 10)])).unwrap();
 
         assert_eq!(summary.sample_days, 1);
         assert_eq!(summary.coverage_days, Some(1));
@@ -1056,7 +1157,7 @@ mod tests {
     fn capital_summary_average_capital_zero_returns_none_without_dividing() {
         let days = vec![included_day(day(0), 0), included_day(day(1), 0)];
 
-        let summary = capital_summary(&days, usd(10), EtDayRange::default()).unwrap();
+        let summary = capital_summary(&days, &daily_pnl(&[(0, 10)])).unwrap();
 
         assert!(summary.average_deployed_capital_usd.is_none());
         assert!(summary.annualized_return_pct.is_none());
@@ -1085,7 +1186,7 @@ mod tests {
             },
         ];
 
-        let summary = capital_summary(&days, usd(0), EtDayRange::default()).unwrap();
+        let summary = capital_summary(&days, &BTreeMap::new()).unwrap();
 
         assert_eq!(summary.sample_days, 0);
         assert_eq!(summary.warnings.len(), 2);
@@ -1096,12 +1197,7 @@ mod tests {
     #[test]
     fn capital_summary_gap_in_coverage_adds_warning_but_still_annualizes() {
         let days = vec![included_day(day(0), 1000), included_day(day(4), 2000)];
-        let query_range = EtDayRange {
-            from: Some(day(0)),
-            to: Some(day(4)),
-        };
-
-        let summary = capital_summary(&days, usd(30), query_range).unwrap();
+        let summary = capital_summary(&days, &daily_pnl(&[(0, 10), (4, 20)])).unwrap();
 
         assert_eq!(summary.sample_days, 2);
         assert_eq!(summary.coverage_days, Some(5));
@@ -1112,7 +1208,7 @@ mod tests {
                 .eq(usd(1500))
                 .unwrap()
         );
-        assert!(summary.annualized_return_pct.unwrap().eq(usd(146)).unwrap());
+        assert!(summary.annualized_return_pct.unwrap().eq(usd(365)).unwrap());
         assert!(
             summary
                 .warnings
@@ -1121,54 +1217,23 @@ mod tests {
         );
     }
 
-    /// The realized-PnL numerator is scoped to the caller's whole query
-    /// range, not to snapshot coverage: when the query range extends beyond
-    /// what was actually captured, annualizing by `365 / coverage_days`
-    /// would conflate a wider-period PnL figure with a narrower capital
-    /// sample. Average capital is still reported honestly.
     #[test]
-    fn capital_summary_omits_annualized_when_query_range_exceeds_snapshot_coverage() {
-        let days = vec![included_day(day(0), 1000), included_day(day(1), 2000)];
-        // Query spans a month before the earliest captured day: realized PnL
-        // over that whole month must not be annualized against the 2-day
-        // coverage denominator.
-        let query_range = EtDayRange {
-            from: Some(day(0).checked_sub_days(Days::new(30)).unwrap()),
-            to: Some(day(1)),
-        };
-
-        let summary = capital_summary(&days, usd(30), query_range).unwrap();
-
-        assert!(
-            summary
-                .average_deployed_capital_usd
-                .unwrap()
-                .eq(usd(1500))
-                .unwrap(),
-            "average deployed capital must still be reported"
-        );
-        assert!(summary.annualized_return_pct.is_none());
-        assert!(
-            summary
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("does not span the full query range"))
-        );
-    }
-
-    /// The mirror case: when snapshot coverage fully spans the query range,
-    /// annualization proceeds as usual.
-    #[test]
-    fn capital_summary_annualizes_when_coverage_fully_spans_query_range() {
-        let days = vec![included_day(day(0), 1000), included_day(day(1), 2000)];
-        let query_range = EtDayRange {
-            from: Some(day(0)),
-            to: Some(day(1)),
-        };
-
-        let summary = capital_summary(&days, usd(30), query_range).unwrap();
+    fn capital_summary_excludes_pnl_from_a_day_with_an_unusable_mark() {
+        let days = vec![
+            included_day(day(0), 1000),
+            PortfolioDay {
+                et_day: day(1),
+                capital: DayCapital::Excluded(DayExclusionReason::MissingMark(
+                    PortfolioAsset::Equity(Symbol::new("AAPL").unwrap()),
+                )),
+            },
+            included_day(day(2), 2000),
+        ];
+        let summary = capital_summary(&days, &daily_pnl(&[(0, 10), (1, 1_000), (2, 20)])).unwrap();
 
         assert!(summary.annualized_return_pct.unwrap().eq(usd(365)).unwrap());
+        assert_eq!(summary.excluded_days.len(), 1);
+        assert_eq!(summary.excluded_days[0].et_day, day(1));
     }
 
     /// Boundary of `is_stale_mark`: exactly `MARK_STALENESS_THRESHOLD_DAYS`

@@ -70,6 +70,7 @@ pub(super) struct TradingJobQueues {
 /// before the apalis monitor spawns, so every `Running` row is orphaned by
 /// definition.
 pub(super) async fn setup_trading_job_queues(
+    cqrs_pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
     job_queue: &DexTradeAccountingJobQueue,
     equity_recovery: EquityRecoveryInputs,
@@ -145,7 +146,7 @@ pub(super) async fn setup_trading_job_queues(
     bootstrap_check_positions(apalis_pool, &check_positions_queue).await?;
 
     let portfolio_snapshot_queue = PortfolioSnapshotJobQueue::new(apalis_pool);
-    bootstrap_portfolio_snapshot(apalis_pool, &portfolio_snapshot_queue).await?;
+    bootstrap_portfolio_snapshot(cqrs_pool, apalis_pool, &portfolio_snapshot_queue).await?;
 
     Ok(TradingJobQueues {
         hedge_queue,
