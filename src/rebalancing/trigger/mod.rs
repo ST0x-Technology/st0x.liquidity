@@ -487,10 +487,14 @@ pub(crate) struct RebalancingService {
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
     /// Sends `ForgetOffchainEquity` when the offchain-order gate clears, so a
     /// snapshot skipped during the open order is re-emitted by the next poll
-    /// despite the aggregate's unchanged-value dedupe. Set after construction
-    /// via `set_snapshot_store` (mirroring `set_stores`); `None` only in tests
-    /// that do not exercise snapshot healing.
-    snapshot_store: RwLock<Option<Arc<Store<InventorySnapshot>>>>,
+    /// despite the aggregate's unchanged-value dedupe. The store travels with
+    /// the id of the stream the POLLER writes (keyed by `order_owner`, not
+    /// this service's vault-owner-keyed `registry_id` — the two differ under
+    /// managed inventory, and a forget sent to any other stream silently
+    /// no-ops). Set after construction via `set_snapshot_store` (mirroring
+    /// `set_stores`); `None` only in tests that do not exercise snapshot
+    /// healing.
+    snapshot_store: RwLock<Option<(Arc<Store<InventorySnapshot>>, InventorySnapshotId)>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
@@ -696,10 +700,17 @@ impl RebalancingService {
     }
 
     /// Wires the shared `InventorySnapshot` store (the single instance built
-    /// in `Conductor::start`) so gate clears can defeat the aggregate's
-    /// unchanged-value dedupe. Called by the conductor after construction.
-    pub(crate) async fn set_snapshot_store(&self, store: Arc<Store<InventorySnapshot>>) {
-        *self.snapshot_store.write().await = Some(store);
+    /// in `Conductor::start`) together with the id of the stream the poller
+    /// writes, so gate clears can defeat the aggregate's unchanged-value
+    /// dedupe. The id must come from `polling_snapshot_id` — the poller's
+    /// stream is keyed by `order_owner`, and a forget sent to any other
+    /// stream silently no-ops. Called by the conductor after construction.
+    pub(crate) async fn set_snapshot_store(
+        &self,
+        store: Arc<Store<InventorySnapshot>>,
+        snapshot_id: InventorySnapshotId,
+    ) {
+        *self.snapshot_store.write().await = Some((store, snapshot_id));
     }
 
     /// Ask the snapshot aggregate to forget its cached offchain positions for
@@ -711,8 +722,8 @@ impl RebalancingService {
     /// Best-effort: on failure the balance stays stale until the broker value
     /// changes or the bot restarts, which is the pre-forget status quo.
     async fn forget_offchain_equity(&self, symbol: &Symbol) {
-        let store = self.snapshot_store.read().await.clone();
-        let Some(store) = store else {
+        let wired = self.snapshot_store.read().await.clone();
+        let Some((store, snapshot_id)) = wired else {
             warn!(
                 target: "rebalance",
                 %symbol,
@@ -722,10 +733,6 @@ impl RebalancingService {
             return;
         };
 
-        let snapshot_id = InventorySnapshotId {
-            orderbook: self.registry_id.orderbook,
-            owner: self.registry_id.owner,
-        };
         if let Err(error) = store
             .send(
                 &snapshot_id,
@@ -22436,7 +22443,13 @@ mod tests {
         // The trigger's forget-on-clear command must land in the same event
         // stream this test polls through, so wire a store on the same pool.
         trigger
-            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .set_snapshot_store(
+                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
+                InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )
             .await;
         let mut seen_sequence = 0i64;
 
@@ -22552,7 +22565,13 @@ mod tests {
         ));
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         trigger
-            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .set_snapshot_store(
+                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
+                InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )
             .await;
         let mut seen_sequence = 0i64;
 
@@ -22647,7 +22666,13 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
         trigger
-            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .set_snapshot_store(
+                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
+                InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )
             .await;
         let mut seen_sequence = 0i64;
 
@@ -22874,7 +22899,13 @@ mod tests {
         let trigger = make_trigger_with_inventory(InventoryView::default()).await;
         let pool = crate::test_utils::setup_test_db().await;
         trigger
-            .set_snapshot_store(Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())))
+            .set_snapshot_store(
+                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
+                InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )
             .await;
         let mut seen_sequence = 0i64;
 

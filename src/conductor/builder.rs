@@ -112,6 +112,21 @@ struct ConfiguredInventoryVaults {
     usdc_vaults: Option<BTreeSet<B256>>,
 }
 
+/// The id of the `InventorySnapshot` stream the poller writes.
+///
+/// The SINGLE construction site for this id. It is keyed by `order_owner`
+/// (the signing EOA), NOT `vault_owner`: under managed inventory the vault
+/// owner is the inventory contract, a different address, and a command sent
+/// to that stream silently no-ops on a virgin aggregate. Everything that
+/// writes or targets the poller's stream (the polling service, the trigger's
+/// forget-on-clear) must take its id from here.
+pub(crate) fn polling_snapshot_id(ctx: &Ctx) -> InventorySnapshotId {
+    InventorySnapshotId {
+        orderbook: ctx.evm.orderbook,
+        owner: ctx.order_owner(),
+    }
+}
+
 fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
     let equity_symbols: HashSet<_> = ctx
         .assets
@@ -205,10 +220,7 @@ where
         .and_then(|cash| cash.reserved)
         .map_or(Usd::ZERO, Positive::inner);
 
-    let snapshot_id = InventorySnapshotId {
-        orderbook: context.ctx.evm.orderbook,
-        owner: order_owner,
-    };
+    let snapshot_id = polling_snapshot_id(&context.ctx);
 
     let ConfiguredInventoryVaults {
         equity_symbols: configured_equity_symbols,

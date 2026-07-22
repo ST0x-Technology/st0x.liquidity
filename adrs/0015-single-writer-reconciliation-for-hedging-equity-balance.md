@@ -119,7 +119,13 @@ critical section, which no cross-struct copy could guarantee.
   hydration still seeds last-known balances) and the next poll re-emits broker
   truth with a fresh local stamp, which passes guard 2 and heals within one poll
   of the clear. The skipped value itself is never replayed — it is ambiguous
-  mid-order data; only fresh reads are ever applied.
+  mid-order data; only fresh reads are ever applied. The forget must target the
+  stream the **poller** writes — keyed by `order_owner`, not the trigger's
+  vault-owner-keyed `registry_id` (the two differ under managed inventory, and a
+  command to any other stream no-ops silently on a virgin aggregate). The id has
+  a single construction site (`polling_snapshot_id`) and travels with the store
+  through `set_snapshot_store`, so the two cannot be wired from different
+  sources.
 - On a fill, the block is released inside the **same write-lock critical
   section** that applied the delta, so no snapshot can interleave. The recorded
   time is `Utc::now()`, not the event's `broker_timestamp` — it is compared
