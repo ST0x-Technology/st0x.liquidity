@@ -2653,6 +2653,114 @@ mod tests {
         );
     }
 
+    /// Regression test for the module doc's claim that nonce-too-low
+    /// recovery holds the per-wallet send lock for its whole bounded worst
+    /// case, including the backoff sleep between attempts, rather than
+    /// releasing it and reacquiring per attempt.
+    ///
+    /// The first call is rejected nonce-too-low with no reported hint, so
+    /// its recovery backs off (`NONCE_RETRY_BACKOFF * 1`) before retargeting
+    /// from a fresh `pending_nonce` read, then succeeds
+    /// (`nonce_too_low_without_hint_seeds_the_pending_nonce` above pins that
+    /// same source-selection outcome). The second call succeeds
+    /// immediately. Both share one `send_lock` and one nonce cache.
+    ///
+    /// The paused clock only makes the first call's backoff resolve without
+    /// a real wait; it does not by itself order the two calls -- that
+    /// ordering comes from the second call's `send_lock.lock().await`
+    /// staying pending (a real contended-mutex wait, not a timer) for as
+    /// long as the first call's guard is held. If a future refactor moved
+    /// the backoff sleep or the retry loop outside that guard's scope, the
+    /// second call's lock would resolve while the first was still asleep,
+    /// and its base send would be recorded ahead of the first call's own
+    /// retry -- exactly what the nonce sequence below pins against.
+    #[tokio::test(start_paused = true)]
+    async fn send_lock_holds_through_the_whole_nonce_too_low_retry_loop() {
+        let first_retry_hash = TxHash::repeat_byte(0x66);
+        let second_hash = TxHash::repeat_byte(0x77);
+        // A per-submit delay gives each call a genuine suspension point, so
+        // two calls that actually ran concurrently would show up as
+        // overlapping `active` windows, not just as a call-order difference.
+        let mock = MockSubmitter::new(vec![
+            Err(nonce_too_low()),
+            Ok(first_retry_hash),
+            Ok(second_hash),
+        ])
+        .with_delay(Duration::from_millis(50));
+
+        let nonce_manager = ResettableNonceManager::default();
+        mock.attach_nonce_manager(nonce_manager.clone());
+        let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
+
+        let first = send_with_recovery(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"first"),
+            "first",
+        );
+        let second = send_with_recovery(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"second"),
+            "second",
+        );
+
+        let started_at = Instant::now();
+        let (first_result, second_result) = tokio::join!(first, second);
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(first_result.unwrap(), first_retry_hash);
+        assert_eq!(second_result.unwrap(), second_hash);
+
+        assert!(
+            elapsed >= NONCE_RETRY_BACKOFF,
+            "the first call's backoff sleep must actually elapse under the \
+             paused clock rather than being skipped, got {elapsed:?}"
+        );
+
+        assert_eq!(
+            mock.max_active.load(Ordering::SeqCst),
+            1,
+            "peak concurrency must stay at 1 across the whole recovery \
+             window, not merely across a single submit call"
+        );
+
+        let sent = mock.sent();
+        assert_eq!(
+            sent.len(),
+            3,
+            "first call's base send + its retry, then second call's base send"
+        );
+        assert_eq!(
+            sent[0].nonce,
+            Some(0),
+            "the first call's base send is assigned nonce 0"
+        );
+        assert_eq!(
+            sent[1].nonce,
+            Some(DEFAULT_PENDING_NONCE),
+            "the first call's own retry must be recorded next -- if the lock \
+             had been released between recovery attempts, the second call \
+             could have run its entire send here instead"
+        );
+        assert_eq!(
+            sent[2].nonce,
+            Some(DEFAULT_PENDING_NONCE + 1),
+            "the second call's base send must only run after the first \
+             call's entire recovery loop, including its backoff sleep, has \
+             completed"
+        );
+    }
+
     /// Anvil is a single geth-style node, so it reports its own unmined
     /// transaction in the `pending`-block transaction count. This test pins
     /// alloy's `.pending()` block-tag encoding against a live node -- it
