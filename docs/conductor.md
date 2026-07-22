@@ -130,9 +130,159 @@ Dedupe/guard queries that want to detect all live rows must therefore use:
 
 **Payload encoding**: the `job` column is the JSON-serialized payload stored as
 a SQL BLOB (apalis `JsonCodec`). Read it as `Vec<u8>` and parse with
-`serde_json::from_slice`, or use `json_extract(job, '$.field')` in SQL. Decoding
-directly as a Rust `String` fails at runtime: "Rust type String (as TEXT) is not
-compatible with SQL type BLOB".
+`serde_json::from_slice`, or use `json_extract(CAST(job AS TEXT), '$.field')` in
+SQL. Decoding directly as a Rust `String` fails at runtime: "Rust type String
+(as TEXT) is not compatible with SQL type BLOB". Prefer the `CAST` form even
+where the bare form happens to work on the SQLite build in hand: it states the
+JSON-text intent explicitly rather than relying on SQLite's own BLOB-vs-JSONB
+auto-detection, and it is pinned by
+`json_extract_reads_the_offchain_order_id_from_a_real_pushed_job`
+(`src/offchain/order/poll_status.rs`), which asserts the exact extracted value
+against a real apalis-pushed job rather than merely checking it is non-NULL.
+
+**Per-order dedup guard, keyed on payload contents (RAI-1493)**: a periodic
+recovery sweep that unconditionally re-pushes a job for every open item, atop a
+job that self-reschedules on every non-terminal poll, is a documented
+combination to watch for: each tick that finds an item still open forks a
+brand-new, independent, self-perpetuating chain in addition to whatever chain(s)
+already exist for it, so the live population grows without bound the longer the
+item stays open. This bit `PollOrderStatus`: `recover_submitted_offchain_orders`
+(`src/offchain/order/poll_status.rs`) polled every `position_check_interval`
+(~60s) for each non-terminal offchain order and pushed a new poll job every
+time, while `PollOrderStatus::perform` independently self-rescheduled via
+`reschedule_self` on every non-terminal broker response -- production
+accumulated tens of thousands of `Pending` rows for orders that stayed open for
+hours. The fix (`reconcile_live_poll_jobs`, wrapped by
+`reconcile_and_check_live_poll_job` and consolidated for every push site by
+`push_poll_job_if_absent`) is an application-layer check before the push: query
+whether a live row already exists for that specific order id via
+`json_extract(CAST(job AS TEXT),
+'$.offchain_order_id')`, and skip the push if
+so. Despite reading like a pure predicate, this can also write: when more than
+one `Pending` row already exists for the order (a pre-existing duplicate from
+before this fix), it atomically collapses every non-survivor row to `Done` as a
+side effect before reporting `true` -- every call site treats this as a
+query-with-a-possible-write, not a read-only check.
+
+That periodic sweep was not the only unconditional push site: an accounted
+onchain fill for a symbol with a live `pending_offchain_order_id`
+(`conductor.rs`'s `dispatch_post_place_state`, reached via
+`reconcile_existing_pending_order` on every such fill, not only on placement),
+the `PendingExecution` retry path (`recover_claimed_offchain_order`), the hedge
+job's own `PendingExecution` recovery (`recover_pending_poll_status`), and that
+recovery's own `Pending` re-drive follow-up (`route_placement_outcome`, shared
+with the hedge job's primary placement path) each pushed unconditionally too --
+an order that stayed open while its symbol kept trading could fork one new chain
+per fill even with the periodic sweep guarded, and a concurrent recovery attempt
+racing the primary placement path could fork one via `route_placement_outcome`
+alone. All five sites now share one guard through `push_poll_job_if_absent`, so
+at most one live `PollOrderStatus` row exists per order at any time, regardless
+of which of the five pushed it. `dispatch_post_place_state` and
+`route_placement_outcome` in particular are each reached both by a genuine new
+placement (whose fresh `offchain_order_id` can never already have a poll job, so
+the guard is a no-op there) and by a reconciliation/recovery path against a
+possibly-already-`Submitted` order (where the guard is what actually matters) --
+neither distinguishes its two callers, gating on the guard's answer instead.
+
+A DB-enforced partial `UNIQUE` index over the same predicate was considered and
+rejected on two grounds. First, `JobQueue::requeue_orphaned` (called from
+`setup_trading_job_queues` on every boot, `src/conductor/trading_queues.rs`)
+resets every orphaned `Running`/`Queued` row of a job type back to `Pending`
+unconditionally on the boot path. Second, apalis's own orphan sweep
+(`reenqueue_orphaned.sql`, apalis-sqlite 1.0.0-rc.8) -- the same sweep this
+doc's earlier Gotcha describes -- resets a `Running`/`Queued` row only once its
+owning worker's heartbeat ages past `reenqueue_orphaned_after` (300s default,
+apalis-sql 1.0.0-rc.9 `src/config.rs`), swept every `keep_alive` tick (30s, same
+file); as that Gotcha notes, deterministic worker names keep the heartbeat
+current in practice, so this sweep almost never fires here. The normal steady
+state is exactly one `Running` row plus its one `Pending` successor for the same
+order, so either bulk update, were it to run, would promote the `Running` row
+into the indexed set where its successor already sits, hitting a `UNIQUE`
+violation that fails `Conductor::run()` on the boot path, or -- in the rare case
+apalis's own sweep does fire -- silently stops that worker's beat stream,
+reproducing the exact "worker silently stops" signature the fix was meant to
+close. A plain `SELECT`-before-`push` has no such failure mode: it never writes
+into apalis's own bulk-update paths.
+
+The guard's live-row predicate bounds a retryable-`Failed` row
+(`attempts < max_attempts`) by `done_at` freshness rather than treating it as
+either unconditionally live or unconditionally excluded. Per the Status
+lifecycle above, such a row is a live, immediately re-dispatchable chain head --
+`ack.sql` never reschedules `run_at` on a `Failed` ack, so `fetch_next.sql`
+picks it straight back up the moment a worker is free -- so counting it as live
+is what actually prevents recovery from forking a second chain alongside the one
+apalis is about to re-run. But a row stuck behind a latched worker (e.g. a
+circuit-breaker fault, RAI-1495) would otherwise sit `Failed` forever without a
+fresh `ack.sql` write, and `done_at` IS refreshed on every ack -- so bounding by
+`done_at > now - stale_after` (the same staleness bound as the
+`Queued`/`Running` arm below) gives both properties: a just-failed row counts as
+live, but one that has sat `Failed` past `stale_after` without a fresh ack stops
+suppressing recovery.
+
+The predicate also bounds the `Queued`/`Running` arm by staleness
+(`lock_at > now - stale_after`, `stale_after` a small multiple of the poll
+interval): an unbounded `status IN ('Queued', 'Running')` check treats a
+stranded row (the "Gotcha" above -- a dropped in-memory fetch buffer, a
+cancelled task, a latched worker) as proof polling is armed forever, since
+nothing else ever ages it out. Bounding it means a stranded row eventually stops
+blocking recovery's re-push, at the cost of not counting a `Queued`/ `Running`
+row that is still genuinely in flight but slow (rare; broker polls are a single
+HTTP round-trip).
+
+Beyond gating the push, `reconcile_live_poll_jobs` also atomically collapses
+pre-existing duplicate chains: when more than one `Pending` row exists for the
+same order (the population an unguarded recovery tick could already have forked
+before this fix), it keeps the row apalis's own dispatch order
+(`queries/backend/fetch_next.sql`, apalis-sqlite 1.0.0-rc.8:
+`ORDER BY priority DESC, run_at ASC, id ASC`) would run first, and marks the
+rest `Done` (with `done_at` set), converging back to one live row per order over
+a small number of ticks. This is one `UPDATE` whose `WHERE` clause selects the
+survivor via a subquery, not a `SELECT` to pick a survivor followed by a
+separately-predicated `UPDATE`: SQLite evaluates the whole statement, subquery
+included, as one atomic unit under its own write lock, so there is no window
+between "decide the survivor" and "collapse the rest" for a concurrent writer
+(another guard call racing this one, or `reschedule_self` pushing a legitimate
+successor) to land in -- it either commits before the statement starts, and is
+included in the survivor decision, or after the statement ends, and is left
+untouched, never observed half-written mid-decision. An earlier two-statement
+version of this guard captured a survivor id from a separate `SELECT`, then
+re-ran `id != <that id>` in a later `UPDATE`; a successor landing in the gap
+between them matched that stale predicate and was collapsed too, leaving the
+order with zero live rows despite the guard reporting `true`. This
+single-statement collapse is always safe to run, even while a `Queued`/`Running`
+row for this order is still fresh: it only ever inspects/touches `Pending` rows,
+so a currently-executing row is never a candidate, and if its `reschedule_self`
+successor has not landed yet there is nothing else to collapse (a lone `Pending`
+row is trivially its own survivor).
+
+Apalis's own `ORDER BY` only ever ranks rows its `WHERE` clause has already made
+eligible (`run_at IS NULL OR run_at <= strftime('%s', 'now')`), so it never
+trades a due row for a not-yet-due one regardless of priority; this guard's
+candidate set is deliberately wider than that (every `Pending` row, not just due
+ones, since the normal steady-state successor `reschedule_self` pushes is one
+poll interval in the future and excluding it would make the guard return `false`
+and push a duplicate), so textually replaying apalis's `ORDER BY` alone over
+that wider set would diverge whenever a due row and a higher-priority
+not-yet-due row coexist. The survivor query therefore ranks due-ness first
+(`(run_at IS NULL OR run_at <= strftime('%s', 'now')) DESC`), then
+`priority DESC, run_at ASC, id ASC` -- the same tie-break apalis applies among
+rows it would actually consider dispatching, and still needed since
+`Jobs.run_at` is epoch-_seconds_, so rows pushed within the same second need
+apalis's own `id ASC` tie-break -- SQLite's row order among ties is otherwise
+unspecified. `Done`, not `Killed`, matches `JobQueue::cancel_all_pending`'s
+precedent for discarding superseded queue rows -- this is routine dedupe, not
+the non-retryable abort that `load_job_queue_health`'s operator-facing `killed`
+counter exists to surface.
+
+Every predicate above also requires `json_valid(CAST(job AS TEXT))` alongside
+the `json_extract` equality check: the order-id comparison does not guarantee
+`json_extract` is skipped for a row it does not match, and `json_extract` raises
+a hard SQL error (not NULL) on a `job` blob that is not valid JSON at all (a
+genuine corruption or foreign codec, not the known `X'6E756C6C'` poison rows --
+the text `null` is valid JSON). Without the `json_valid` guard, one such row
+would fail the guard query -- and, on the boot path, propagate through
+`recover_submitted_offchain_orders` to fail `Conductor::run()` -- for every
+order sharing this job type, not just the corrupt row's own.
 
 ### Job trait
 

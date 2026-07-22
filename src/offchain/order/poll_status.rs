@@ -812,10 +812,255 @@ where
     Ok(())
 }
 
+/// How many poll intervals a `Queued`/`Running` [`PollOrderStatus`] row may
+/// sit without visible progress before [`reconcile_live_poll_jobs`] presumes
+/// it stranded (dropped in-memory fetch buffer, a cancelled task, a latched
+/// worker) rather than a poll genuinely in flight. A poll is a single broker
+/// round-trip, so a live worker clears it within a small multiple of the
+/// interval.
+const STRANDED_POLL_JOB_INTERVAL_MULTIPLIER: u32 = 5;
+
+/// Reconciles the live [`PollOrderStatus`] rows for `offchain_order_id`
+/// toward a single-live-row invariant and returns whether one exists
+/// afterward -- the caller should skip pushing a new job when this is
+/// `true`.
+///
+/// "Live" means `Pending`; `Queued`/`Running` with `lock_at` newer than
+/// `stale_after`; or retryable-`Failed` (`attempts < max_attempts`) with
+/// `done_at` newer than `stale_after`. `lock_at`/`done_at` are read as
+/// INTEGER unix-epoch-seconds values, which is what apalis-sqlite 1.0.0-rc.8
+/// always writes there -- `queries/backend/fetch_next.sql` and
+/// `queries/task/lock.sql` both set `lock_at = strftime('%s', 'now')`,
+/// `queries/task/ack.sql` sets `done_at` the same way on every ack including
+/// a `Failed` one, and `migrations/20251018164941_move_to_bytes.sql` declares
+/// both columns `INTEGER` -- pinned in-repo by
+/// `reconcile_live_poll_jobs_lock_at_from_a_real_apalis_lock_reads_back_as_recent_epoch_seconds`
+/// (`src/offchain/order/poll_status.rs`), which pushes a job through apalis's
+/// own `fetch_next`/`lock` path rather than a hand-seeded fixture. A
+/// `Queued`/`Running` row past `stale_after` is presumed stranded (dropped
+/// in-memory fetch buffer, a cancelled task, a latched worker) rather than a
+/// poll genuinely in flight: nothing else ever ages such a row out under a
+/// deterministic worker name (see `docs/conductor.md`'s "Gotcha" on orphaned
+/// in-flight rows).
+///
+/// A retryable-`Failed` row is a live, immediately re-dispatchable chain head
+/// under apalis's own `fetch_next.sql` (`status = 'Failed' AND attempts <
+/// max_attempts`, ignoring `run_at`'s original value once already elapsed),
+/// not an inert parked row -- so it must count as live here too, or recovery
+/// forks a second chain alongside the one apalis is about to re-run the
+/// moment a worker is free. But `ack.sql` never reschedules a `Failed` row
+/// (no `run_at` bump), so a row stuck behind a latched worker (e.g. RAI-1495's
+/// circuit breaker) would otherwise sit `Failed` forever and, if counted as
+/// live unconditionally, would permanently suppress recovery's re-push for
+/// that order. Bounding it by `done_at` freshness resolves both: a
+/// just-failed row still counts as live (no duplicate chain forked while a
+/// worker is about to retry it), but once it has sat `Failed` past
+/// `stale_after` without a fresh ack, it stops suppressing recovery.
+///
+/// Beyond gating the return value, this also atomically converges
+/// pre-existing duplicate `Pending` chains (each an independent,
+/// self-perpetuating chain a prior unguarded recovery tick forked, RAI-1493)
+/// back down to one: it keeps the survivor apalis's own dispatch order would
+/// run first, and marks every other `Pending` row `Done` (with `done_at`
+/// set). This is a single `UPDATE` whose `WHERE` clause selects the survivor
+/// via a subquery, rather than a `SELECT` to pick a survivor followed by a
+/// separately-predicated `UPDATE` -- SQLite evaluates the whole statement,
+/// subquery included, as one atomic unit under its own write lock, so there
+/// is no window between "decide the survivor" and "collapse the rest" for a
+/// concurrent writer (another guard call racing this one, or
+/// `reschedule_self` pushing a legitimate successor) to land in: it either
+/// commits before this statement starts, and is included in the survivor
+/// decision, or after this statement ends, and is left untouched -- never
+/// observed half-written mid-decision. The old two-statement shape captured
+/// a survivor id from a separate `SELECT`, then re-ran `id != <that id>` in a
+/// later `UPDATE`; a successor landing in the gap between them matched that
+/// stale predicate and was collapsed too, leaving zero live rows for the
+/// order despite this function returning `true`. Pinned by
+/// `reconcile_live_poll_jobs_atomic_collapse_never_leaves_zero_live_rows_when_a_successor_`
+/// `commits_while_the_collapse_is_blocked`.
+///
+/// This single-statement collapse is always safe to run, even while a
+/// `Queued`/`Running` row for this order is still fresh: it only ever
+/// inspects/touches `Pending` rows, so a currently-executing row is never a
+/// candidate, and if its `reschedule_self` successor has not landed yet
+/// there is nothing else to collapse (a lone `Pending` row is trivially its
+/// own survivor).
+///
+/// Apalis's `fetch_next.sql` (apalis-sqlite 1.0.0-rc.8) only ever ranks rows
+/// it has already made eligible -- its `WHERE` clause requires `run_at IS
+/// NULL OR run_at <= strftime('%s', 'now')` before its `ORDER BY priority
+/// DESC, run_at ASC, id ASC` ever runs -- so a due row always beats a
+/// not-yet-due one there, regardless of priority. This guard's own candidate
+/// set is deliberately wider (every `Pending` row, not just due ones: the
+/// normal steady-state successor `reschedule_self` pushes is one poll
+/// interval in the future, and excluding it would make the guard return
+/// `false` and push a duplicate). Textually replaying apalis's `ORDER BY`
+/// alone over that wider set would therefore diverge from what apalis would
+/// actually dispatch first whenever a due row and a higher-priority
+/// not-yet-due row coexist, so due-ness is ranked first here too
+/// (`(run_at IS NULL OR run_at <= strftime('%s', 'now')) DESC`) before
+/// `priority DESC, run_at ASC, id ASC` -- the same tie-break apalis applies
+/// among rows it would actually consider dispatching. `Jobs.run_at` is
+/// epoch-*seconds*, so rows pushed within the same second need apalis's own
+/// `id ASC` tie-break -- SQLite's row order among ties is otherwise
+/// unspecified. `Done`, not `Killed`, matches `JobQueue::cancel_all_pending`'s
+/// precedent for discarding superseded queue rows: this is routine dedupe,
+/// not a non-retryable abort, and `load_job_queue_health`'s operator-facing
+/// `killed` counter (`status = 'Killed' AND attempts < max_attempts`) exists
+/// to surface the latter.
+///
+/// `json_extract` requires `CAST(job AS TEXT)` -- `Jobs.job` is a `BLOB`
+/// (apalis's `JsonCodec`), and a bare BLOB argument is not guaranteed to be
+/// read as JSON text on every SQLite build. `json_extract` also raises a hard
+/// SQL error (not NULL) on a row whose `job` blob is not valid JSON at all,
+/// and the order-id equality is not guaranteed to filter such a row out
+/// before `json_extract` runs on it -- so every predicate here also requires
+/// `json_valid(CAST(job AS TEXT))`, skipping a corrupt/foreign-codec row
+/// instead of failing the whole guard (and, on the boot path, `Conductor::run()`)
+/// for every order sharing this job type.
+async fn reconcile_live_poll_jobs(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    offchain_order_id: OffchainOrderId,
+    stale_after: Duration,
+) -> Result<bool, JobError> {
+    let job_type = std::any::type_name::<PollOrderStatus>();
+    let stale_after_secs = i64::try_from(stale_after.as_secs())?;
+
+    let collapsed = sqlx_apalis::query(
+        "UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now') \
+         WHERE job_type = ? \
+           AND json_valid(CAST(job AS TEXT)) \
+           AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+           AND status = 'Pending' \
+           AND id != ( \
+             SELECT id FROM Jobs \
+             WHERE job_type = ? \
+               AND json_valid(CAST(job AS TEXT)) \
+               AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+               AND status = 'Pending' \
+             ORDER BY (run_at IS NULL OR run_at <= strftime('%s', 'now')) DESC, \
+                      priority DESC, run_at ASC, id ASC \
+             LIMIT 1 \
+           )",
+    )
+    .bind(job_type)
+    .bind(offchain_order_id.to_string())
+    .bind(job_type)
+    .bind(offchain_order_id.to_string())
+    .execute(apalis_pool)
+    .await?;
+
+    if collapsed.rows_affected() > 0 {
+        warn!(
+            target: "broker",
+            %offchain_order_id,
+            collapsed = collapsed.rows_affected(),
+            "Collapsed duplicate live PollOrderStatus rows for one order down to one"
+        );
+    }
+
+    let is_live: bool = sqlx_apalis::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM Jobs \
+         WHERE job_type = ? \
+           AND json_valid(CAST(job AS TEXT)) \
+           AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+           AND ( \
+             status = 'Pending' \
+             OR (status IN ('Queued', 'Running') \
+                  AND lock_at IS NOT NULL AND lock_at > strftime('%s', 'now') - ?) \
+             OR (status = 'Failed' AND attempts < max_attempts \
+                  AND done_at IS NOT NULL AND done_at > strftime('%s', 'now') - ?) \
+           ))",
+    )
+    .bind(job_type)
+    .bind(offchain_order_id.to_string())
+    .bind(stale_after_secs)
+    .bind(stale_after_secs)
+    .fetch_one(apalis_pool)
+    .await?;
+
+    Ok(is_live)
+}
+
+/// Wrapper over [`reconcile_live_poll_jobs`] that computes `stale_after` from
+/// `poll_interval` so every caller shares the same overflow-checked
+/// staleness bound instead of repeating it. [`push_poll_job_if_absent`] is
+/// the only caller, and every push site outside this module goes through
+/// that, not this function directly.
+///
+/// Despite reading like a pure predicate, this call can also **write**: when
+/// more than one `Pending` row already exists for `offchain_order_id` (a
+/// pre-existing duplicate, RAI-1493), it collapses every non-survivor row to
+/// `Done` as a side effect before returning `true`. Every call site must treat
+/// this as a query-with-a-possible-write, not a read-only check.
+///
+/// RAI-1493's guard originally covered only the periodic recovery sweep
+/// ([`recover_submitted_offchain_orders`]); four other push sites -- the
+/// post-`Place` enqueue and per-fill reconciliation in `conductor.rs`'s
+/// `dispatch_post_place_state`, the `PendingExecution` retry in
+/// `recover_claimed_offchain_order`, the hedge job's
+/// `recover_pending_poll_status`, and that recovery's own `Pending` re-drive
+/// follow-up (`route_placement_outcome`, shared with the hedge job's primary
+/// placement path) -- pushed unconditionally, so an order that stayed open
+/// while its symbol kept trading could still fork one independent,
+/// self-perpetuating chain per fill. This wrapper lets all five sites share
+/// one guard, consolidated via [`push_poll_job_if_absent`] so the
+/// check-then-push shape only needs to be implemented once.
+async fn reconcile_and_check_live_poll_job(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    offchain_order_id: OffchainOrderId,
+    poll_interval: Duration,
+) -> Result<bool, JobError> {
+    let stale_after = poll_interval
+        .checked_mul(STRANDED_POLL_JOB_INTERVAL_MULTIPLIER)
+        .ok_or(JobError::StaleAfterOverflow)?;
+
+    reconcile_live_poll_jobs(apalis_pool, offchain_order_id, stale_after).await
+}
+
+/// Outcome of [`push_poll_job_if_absent`]: whether a new [`PollOrderStatus`]
+/// job was pushed, or one was already live and the push was skipped.
+pub(crate) enum PollJobPushOutcome {
+    AlreadyLive,
+    Pushed,
+}
+
+/// Pushes a [`PollOrderStatus`] job for `offchain_order_id` unless one is
+/// already live ([`reconcile_and_check_live_poll_job`], which may also
+/// collapse pre-existing duplicate `Pending` rows for this order to `Done`
+/// as a side effect first). Consolidates the check-then-push shape every
+/// `PollOrderStatus` push site shares (RAI-1493) so a future change to the
+/// push step (a metric, different logging, another guard condition) only
+/// needs to land once instead of being replicated by hand at every call
+/// site -- exactly the class of gap that originally left the fifth push
+/// site (`route_placement_outcome`) unguarded.
+pub(crate) async fn push_poll_job_if_absent(
+    mut queue: PollOrderStatusJobQueue,
+    offchain_order_id: OffchainOrderId,
+    poll_interval: Duration,
+) -> Result<PollJobPushOutcome, JobError> {
+    if reconcile_and_check_live_poll_job(queue.pool(), offchain_order_id, poll_interval).await? {
+        return Ok(PollJobPushOutcome::AlreadyLive);
+    }
+
+    queue.push(PollOrderStatus { offchain_order_id }).await?;
+
+    Ok(PollJobPushOutcome::Pushed)
+}
+
 /// Re-enqueue a [`PollOrderStatus`] job for every offchain order still in a
-/// non-terminal post-submission state. Idempotent: workers that pick up a
-/// duplicate poll job for an already-reconciled order observe the terminal
-/// state and exit cleanly.
+/// non-terminal post-submission state that does not already have a live poll
+/// job ([`push_poll_job_if_absent`]), which also collapses any pre-existing
+/// duplicate live rows for an order back down to one. Without the guard,
+/// every periodic tick that finds an order still open would fork a
+/// brand-new, independent, self-perpetuating poll chain (via
+/// [`reschedule_self`]) on top of whatever chain(s) already exist for that
+/// order, growing the live population without bound the longer the order
+/// stays open (RAI-1493). The same guard also covers the other four
+/// unconditional `PollOrderStatus` push sites (`conductor.rs`'s
+/// `dispatch_post_place_state` and `recover_claimed_offchain_order`, and the
+/// hedge job's `recover_pending_poll_status` and `route_placement_outcome`)
+/// -- this sweep is only the periodic backstop, not the sole guarded path.
 ///
 /// Closes the gap between
 /// [`OffchainOrderCommand::Place`](crate::offchain::order::OffchainOrderCommand::Place)
@@ -824,8 +1069,9 @@ where
 /// `Submitted` forever waiting for a poll that never comes.
 pub(crate) async fn recover_submitted_offchain_orders(
     offchain_order_projection: &Projection<OffchainOrder>,
-    poll_status_queue: &mut PollOrderStatusJobQueue,
+    poll_status_queue: &PollOrderStatusJobQueue,
     executor_type: SupportedExecutor,
+    poll_interval: Duration,
 ) -> Result<(), JobError> {
     use OffchainOrder::{
         Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
@@ -854,16 +1100,35 @@ pub(crate) async fn recover_submitted_offchain_orders(
         return Ok(());
     }
 
-    info!(
-        count = pending_poll.len(),
-        "Re-enqueuing PollOrderStatus jobs for offchain orders awaiting broker fill"
-    );
+    let candidate_count = pending_poll.len();
+    let mut pushed = 0usize;
+    let mut skipped = 0usize;
 
     for offchain_order_id in pending_poll {
-        poll_status_queue
-            .push(PollOrderStatus { offchain_order_id })
-            .await?;
+        match push_poll_job_if_absent(poll_status_queue.clone(), offchain_order_id, poll_interval)
+            .await?
+        {
+            PollJobPushOutcome::AlreadyLive => {
+                skipped += 1;
+            }
+            PollJobPushOutcome::Pushed => {
+                pushed += 1;
+
+                debug!(
+                    target: "broker",
+                    %offchain_order_id,
+                    "PollOrderStatus: recovery armed polling for an order with no live poll job"
+                );
+            }
+        }
     }
+
+    info!(
+        candidate_count,
+        pushed,
+        skipped,
+        "Periodic submitted-order poll recovery swept offchain orders awaiting broker fill"
+    );
 
     Ok(())
 }
@@ -873,6 +1138,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Utc;
+    use sqlx_apalis::ConnectOptions;
 
     use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
@@ -887,9 +1153,9 @@ mod tests {
         terminal_position_finalization,
     };
     use crate::position::{Position, PositionCommand, TradeId};
-    use crate::test_utils::{OnchainTradeBuilder, setup_test_pools};
-
-    const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
+    use crate::test_utils::{
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, setup_file_backed_test_db, setup_test_pools,
+    };
 
     struct TestInfra<E: Executor + Clone + Send + Sync + 'static> {
         ctx: PollOrderStatusCtx<E>,
@@ -1989,12 +2255,13 @@ mod tests {
     #[tokio::test]
     async fn recover_with_no_orders_enqueues_nothing() {
         let infra = build_test_infra(MockExecutor::new()).await;
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
 
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2013,11 +2280,12 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let _ = submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2049,11 +2317,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2083,11 +2352,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2118,11 +2388,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2153,11 +2424,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2194,11 +2466,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2237,11 +2510,12 @@ mod tests {
         )
         .await;
 
-        let mut queue = infra.ctx.poll_status_queue.clone();
+        let queue = infra.ctx.poll_status_queue.clone();
         recover_submitted_offchain_orders(
             &infra.ctx.offchain_order_projection,
-            &mut queue,
+            &queue,
             SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
         )
         .await
         .unwrap();
@@ -2289,6 +2563,1075 @@ mod tests {
             count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             0,
             "Executor mismatch must not enqueue HandleOrderRejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_extract_reads_the_offchain_order_id_from_a_real_pushed_job() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let mut queue = infra.ctx.poll_status_queue.clone();
+        queue
+            .push(PollOrderStatus { offchain_order_id })
+            .await
+            .unwrap();
+
+        let extracted: String = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.offchain_order_id') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(poll_order_status_job_type())
+        .fetch_one(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            extracted,
+            offchain_order_id.to_string(),
+            "json_extract(CAST(job AS TEXT), ...) must recover the exact offchain_order_id \
+             UUID string from a real pushed job's BLOB payload"
+        );
+    }
+
+    /// Pins the assumption `reconcile_live_poll_jobs`'s staleness predicate
+    /// depends on (`lock_at > strftime('%s', 'now') - ?`): that apalis writes
+    /// `lock_at` as an INTEGER unix-epoch-seconds value. Drives a real job
+    /// through apalis's own `fetch_next` (`queries/backend/fetch_next.sql`,
+    /// which sets `lock_at = strftime('%s', 'now')`) rather than a hand-seeded
+    /// fixture, so an apalis upgrade that changed the representation would
+    /// fail this test instead of silently passing every hand-seeded one.
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_lock_at_from_a_real_apalis_lock_reads_back_as_recent_epoch_seconds()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let mut queue = infra.ctx.poll_status_queue.clone();
+        queue
+            .push(PollOrderStatus { offchain_order_id })
+            .await
+            .unwrap();
+
+        // `Jobs.lock_by` has a foreign key onto `Workers.id`; fetch_next
+        // writes `lock_by` to this worker's name, so a matching Worker row
+        // must exist first, exactly as apalis's own worker registration would
+        // create in production.
+        sqlx_apalis::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, ?, 'test')",
+        )
+        .bind("test-worker")
+        .bind(poll_order_status_job_type())
+        .execute(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        let config = apalis_sqlite::Config::new(poll_order_status_job_type());
+        let worker = apalis_core::worker::context::WorkerContext::new::<()>("test-worker");
+        let fetched = apalis_sqlite::fetcher::fetch_next(infra.apalis_pool.clone(), config, worker)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fetched.len(),
+            1,
+            "apalis's own fetch_next must lock exactly the one pushed job"
+        );
+
+        let lock_at: i64 = sqlx_apalis::query_scalar("SELECT lock_at FROM Jobs WHERE job_type = ?")
+            .bind(poll_order_status_job_type())
+            .fetch_one(&infra.apalis_pool)
+            .await
+            .unwrap();
+
+        let now = Utc::now().timestamp();
+        assert!(
+            lock_at <= now && lock_at >= now - 5,
+            "apalis's fetch_next must write lock_at as INTEGER unix-epoch-seconds close to \
+             now (got {lock_at}, now {now}); reconcile_live_poll_jobs's staleness predicate \
+             assumes this representation"
+        );
+    }
+
+    /// The staleness bound `recover_submitted_offchain_orders` would derive
+    /// from `TEST_POLL_INTERVAL` in production.
+    const TEST_STALE_AFTER: Duration = Duration::from_secs(
+        TEST_POLL_INTERVAL.as_secs() * STRANDED_POLL_JOB_INTERVAL_MULTIPLIER as u64,
+    );
+
+    async fn seed_poll_job_row(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        offchain_order_id: OffchainOrderId,
+        status: &str,
+        attempts: i64,
+        lock_at: Option<i64>,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
+            .expect("serialize PollOrderStatus payload");
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at, lock_at) \
+             VALUES (?, ?, ?, ?, ?, 25, strftime('%s', 'now'), ?)",
+        )
+        .bind(&id)
+        .bind(poll_order_status_job_type())
+        .bind(payload)
+        .bind(status)
+        .bind(attempts)
+        .bind(lock_at)
+        .execute(apalis_pool)
+        .await
+        .expect("seed PollOrderStatus job row");
+
+        id
+    }
+
+    /// Seeds a `Pending` row with an explicit `run_at`, used to control which
+    /// of several duplicate rows for one order is the earliest.
+    async fn seed_pending_poll_job_row_at(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        offchain_order_id: OffchainOrderId,
+        run_at: i64,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
+            .expect("serialize PollOrderStatus payload");
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at) \
+             VALUES (?, ?, ?, 'Pending', 0, 25, ?)",
+        )
+        .bind(&id)
+        .bind(poll_order_status_job_type())
+        .bind(payload)
+        .bind(run_at)
+        .execute(apalis_pool)
+        .await
+        .expect("seed PollOrderStatus job row");
+
+        id
+    }
+
+    /// Seeds a retryable-`Failed` row (`attempts < max_attempts`, the default
+    /// `max_attempts` of 25) with an explicit `done_at`, used to control
+    /// whether `reconcile_live_poll_jobs`'s staleness predicate reads it as
+    /// fresh or stale. A real apalis ack (`queries/task/ack.sql`) always sets
+    /// `done_at` to the ack time -- this only hand-seeds the value so a test
+    /// can pin the staleness boundary precisely, unlike the fresh case, which
+    /// is pinned against a real ack instead (see
+    /// `reconcile_live_poll_jobs_true_when_a_fresh_retryable_failed_row_exists_via_a_real_apalis_ack`).
+    async fn seed_failed_poll_job_row_at(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        offchain_order_id: OffchainOrderId,
+        done_at: i64,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
+            .expect("serialize PollOrderStatus payload");
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at, done_at) \
+             VALUES (?, ?, ?, 'Failed', 1, 25, strftime('%s', 'now'), ?)",
+        )
+        .bind(&id)
+        .bind(poll_order_status_job_type())
+        .bind(payload)
+        .bind(done_at)
+        .execute(apalis_pool)
+        .await
+        .expect("seed retryable Failed PollOrderStatus job row");
+
+        id
+    }
+
+    /// Seeds a `Pending` row with an explicit `run_at` and `priority`, used to
+    /// pin the survivor query's tie-break ordering
+    /// (`priority DESC, run_at ASC, id ASC`, mirroring apalis's own
+    /// `fetch_next.sql`).
+    async fn seed_pending_poll_job_row_with_priority(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        offchain_order_id: OffchainOrderId,
+        run_at: i64,
+        priority: i64,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
+            .expect("serialize PollOrderStatus payload");
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, ?, 'Pending', 0, 25, ?, ?)",
+        )
+        .bind(&id)
+        .bind(poll_order_status_job_type())
+        .bind(payload)
+        .bind(run_at)
+        .bind(priority)
+        .execute(apalis_pool)
+        .await
+        .expect("seed PollOrderStatus job row");
+
+        id
+    }
+
+    async fn live_poll_job_ids(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        offchain_order_id: OffchainOrderId,
+    ) -> Vec<String> {
+        sqlx_apalis::query_scalar(
+            "SELECT id FROM Jobs \
+             WHERE job_type = ? \
+               AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+               AND status IN ('Pending', 'Queued', 'Running')",
+        )
+        .bind(poll_order_status_job_type())
+        .bind(offchain_order_id.to_string())
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_true_when_a_pending_row_exists_for_the_order() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        seed_poll_job_row(&infra.apalis_pool, offchain_order_id, "Pending", 0, None).await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_true_when_a_fresh_queued_row_exists_for_the_order() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        seed_poll_job_row(
+            &infra.apalis_pool,
+            offchain_order_id,
+            "Queued",
+            0,
+            Some(Utc::now().timestamp()),
+        )
+        .await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_true_when_a_fresh_running_row_exists_for_the_order() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        seed_poll_job_row(
+            &infra.apalis_pool,
+            offchain_order_id,
+            "Running",
+            0,
+            Some(Utc::now().timestamp()),
+        )
+        .await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_false_when_the_only_running_row_is_stale() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let stale_lock_at =
+            Utc::now().timestamp() - i64::try_from(TEST_STALE_AFTER.as_secs()).unwrap() - 60;
+        seed_poll_job_row(
+            &infra.apalis_pool,
+            offchain_order_id,
+            "Running",
+            0,
+            Some(stale_lock_at),
+        )
+        .await;
+
+        assert!(
+            !reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap(),
+            "a Running row whose lock_at is older than stale_after must not count as live \
+             (RAI-1493: a stranded row must not permanently suppress recovery's re-push)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_false_when_no_row_exists_for_the_order() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+
+        assert!(
+            !reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_false_when_only_a_different_orders_row_exists() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let other_order_id = OffchainOrderId::new();
+        seed_poll_job_row(&infra.apalis_pool, other_order_id, "Pending", 0, None).await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        assert!(
+            !reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_false_when_the_only_row_is_terminal_done() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        seed_poll_job_row(&infra.apalis_pool, offchain_order_id, "Done", 1, None).await;
+
+        assert!(
+            !reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Pins apalis's own contract that a retryable-`Failed` row
+    /// (`attempts < max_attempts`) is a live, immediately re-dispatchable
+    /// chain head, not an inert parked row: `fetch_next.sql` re-selects it
+    /// (`status = 'Failed' AND attempts < max_attempts`, ignoring `run_at`'s
+    /// original elapsed value) the moment a worker is free. Independent of
+    /// `reconcile_live_poll_jobs`'s own staleness bound -- this only proves
+    /// the external fact that bound is built on.
+    #[tokio::test]
+    async fn fetch_next_re_dispatches_a_retryable_failed_row_pinning_the_apalis_contract() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+
+        // Push through the real queue (rather than hand-seeding an id) so
+        // the row carries a real apalis-generated ULID id -- fetch_next's
+        // own row decoding requires that format, and a hand-seeded id in a
+        // foreign format would fail to decode regardless of this test's
+        // point (apalis's re-dispatch contract), not because of it.
+        let mut queue = infra.ctx.poll_status_queue.clone();
+        queue
+            .push(PollOrderStatus { offchain_order_id })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed', attempts = 1 WHERE job_type = ?")
+            .bind(poll_order_status_job_type())
+            .execute(&infra.apalis_pool)
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, ?, 'test')",
+        )
+        .bind("test-worker")
+        .bind(poll_order_status_job_type())
+        .execute(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        let config = apalis_sqlite::Config::new(poll_order_status_job_type());
+        let worker = apalis_core::worker::context::WorkerContext::new::<()>("test-worker");
+        let fetched = apalis_sqlite::fetcher::fetch_next(infra.apalis_pool.clone(), config, worker)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fetched.len(),
+            1,
+            "apalis's own fetch_next must re-dispatch a retryable-Failed row \
+             (attempts < max_attempts), not treat it as an inert parked row"
+        );
+    }
+
+    /// Drives a real apalis fail/ack path (rather than a hand-seeded fixture)
+    /// so the guard's assumption about apalis's retry state machine cannot
+    /// silently encode a wrong model: `ack.sql` parks an errored, still-
+    /// retryable task as `Failed` in place, without rescheduling `run_at`,
+    /// and `fetch_next.sql` will immediately re-select it once a worker is
+    /// free. A just-failed row must therefore count as live here too, or
+    /// recovery forks a duplicate chain alongside the one apalis is about to
+    /// re-run.
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_true_when_a_fresh_retryable_failed_row_exists_via_a_real_apalis_ack()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let mut queue = infra.ctx.poll_status_queue.clone();
+        queue
+            .push(PollOrderStatus { offchain_order_id })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, ?, 'test')",
+        )
+        .bind("test-worker")
+        .bind(poll_order_status_job_type())
+        .execute(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        let config = apalis_sqlite::Config::new(poll_order_status_job_type());
+        let worker = apalis_core::worker::context::WorkerContext::new::<()>("test-worker");
+        let fetched = apalis_sqlite::fetcher::fetch_next(infra.apalis_pool.clone(), config, worker)
+            .await
+            .unwrap();
+        assert_eq!(fetched.len(), 1);
+
+        let (_args, parts) = fetched.into_iter().next().unwrap().take();
+        let task_id = parts.task_id.unwrap().to_string();
+        let worker_id = parts.ctx.lock_by().clone().unwrap();
+
+        apalis_sqlite::queries::ack_task::ack_task(
+            &infra.apalis_pool,
+            &task_id,
+            &worker_id,
+            "simulated transient broker error",
+            &apalis_core::task::status::Status::Failed,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap(),
+            "a just-failed retryable row (attempts < max_attempts) is a live, immediately \
+             re-dispatchable chain head per apalis's own fetch_next.sql -- it must count as \
+             live so recovery does not fork a duplicate chain alongside it"
+        );
+    }
+
+    /// The RAI-1495 decoupling half of the same tradeoff: once a retryable-
+    /// Failed row has sat past `stale_after` without a fresh ack (e.g. stuck
+    /// behind a latched worker), it must stop suppressing recovery, or a
+    /// stuck row would permanently block a fresh push for that order.
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_false_when_the_only_row_is_a_stale_retryable_failed_row() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let stale_done_at =
+            Utc::now().timestamp() - i64::try_from(TEST_STALE_AFTER.as_secs()).unwrap() - 60;
+        seed_failed_poll_job_row_at(&infra.apalis_pool, offchain_order_id, stale_done_at).await;
+
+        assert!(
+            !reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap(),
+            "a retryable-Failed row whose done_at is older than stale_after must not \
+             permanently suppress recovery (RAI-1493/1495 decoupling): a row stuck behind a \
+             latched worker must eventually allow a fresh push"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_collapses_duplicate_pending_rows_to_the_earliest() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let now = Utc::now().timestamp();
+        // Three independent forked chains for one order (RAI-1493), each a
+        // Pending row with a different run_at.
+        let earliest_id =
+            seed_pending_poll_job_row_at(&infra.apalis_pool, offchain_order_id, now - 120).await;
+        seed_pending_poll_job_row_at(&infra.apalis_pool, offchain_order_id, now - 60).await;
+        seed_pending_poll_job_row_at(&infra.apalis_pool, offchain_order_id, now).await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, offchain_order_id).await,
+            vec![earliest_id.clone()],
+            "reconcile_live_poll_jobs must collapse duplicate live rows for one order down to \
+             exactly the one with the earliest run_at"
+        );
+
+        let collapsed_rows: Vec<(String, Option<i64>)> = sqlx_apalis::query_as(
+            "SELECT status, done_at FROM Jobs \
+             WHERE job_type = ? \
+               AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+               AND id != ?",
+        )
+        .bind(poll_order_status_job_type())
+        .bind(offchain_order_id.to_string())
+        .bind(&earliest_id)
+        .fetch_all(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            collapsed_rows.len(),
+            2,
+            "both non-earliest duplicate rows must still exist, now collapsed"
+        );
+        let now = Utc::now().timestamp();
+        for (status, done_at) in collapsed_rows {
+            assert_eq!(
+                status, "Done",
+                "a collapsed duplicate must be marked Done, matching \
+                 JobQueue::cancel_all_pending's precedent for discarding superseded queue rows, \
+                 not Killed (which would pollute load_job_queue_health's operator-facing abort \
+                 metric)"
+            );
+            assert!(
+                matches!(done_at, Some(value) if value <= now && value >= now - 5),
+                "a collapsed duplicate's done_at must be a fresh unix-epoch-seconds timestamp \
+                 close to now (got {done_at:?}, now {now}), matching every other terminal row \
+                 apalis itself writes -- not merely non-NULL, which would miss a regression \
+                 that dropped or replaced the UPDATE's strftime('%s', 'now') expression"
+            );
+        }
+    }
+
+    /// Proves the collapse is atomic with the survivor decision by
+    /// reproducing the exact precondition that broke the old two-statement
+    /// implementation: a legitimate successor (as `reschedule_self` would
+    /// push) committing while `reconcile_live_poll_jobs`'s own collapse
+    /// write is already blocked in flight. The old code captured
+    /// `pending_ids` in one `SELECT`, then re-ran `id != <captured
+    /// survivor>` in a later `UPDATE`; a successor committing in that
+    /// window matched the stale predicate and was wrongly collapsed
+    /// alongside the real duplicate, leaving zero live rows despite the
+    /// function returning `true`. Holding SQLite's own write lock before
+    /// spawning the guard call, then committing the successor only after
+    /// the guard has had a chance to start blocking on that same lock,
+    /// proves the new single-statement collapse has no such window:
+    /// whichever row survives, there is always exactly one -- never zero.
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_atomic_collapse_never_leaves_zero_live_rows_when_a_successor_commits_while_the_collapse_is_blocked()
+     {
+        let (_pool, apalis_pool, db_path, _dir) =
+            setup_file_backed_test_db(Duration::from_secs(2)).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let now = Utc::now().timestamp();
+
+        // A pre-existing duplicate chain (the RAI-1493 steady state this
+        // guard exists to collapse), due now so due-ness-first ordering
+        // picks it as survivor over the not-yet-due successor below.
+        let due_duplicate_id =
+            seed_pending_poll_job_row_at(&apalis_pool, offchain_order_id, now - 60).await;
+
+        let mut locker = sqlx_apalis::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .connect()
+            .await
+            .unwrap();
+        sqlx_apalis::query("BEGIN IMMEDIATE")
+            .execute(&mut locker)
+            .await
+            .unwrap();
+
+        let pool_for_task = apalis_pool.clone();
+        let collapse_task = tokio::spawn(async move {
+            reconcile_live_poll_jobs(&pool_for_task, offchain_order_id, TEST_STALE_AFTER).await
+        });
+
+        // Give the spawned collapse a chance to reach and start blocking on
+        // the write lock we already hold before we commit the successor --
+        // the assertions below hold regardless of whether it actually got
+        // there in time, since the collapse either observes the successor
+        // fully committed or not at all, never mid-write.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // `reschedule_self`'s legitimate successor: not yet due, pushed one
+        // poll interval in the future -- committed under the lock the
+        // blocked collapse above is waiting to acquire.
+        let successor_payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id }).unwrap();
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at) \
+             VALUES (?, ?, ?, 'Pending', 0, 25, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(poll_order_status_job_type())
+        .bind(successor_payload)
+        .bind(now + 300)
+        .execute(&mut locker)
+        .await
+        .unwrap();
+
+        sqlx_apalis::query("COMMIT")
+            .execute(&mut locker)
+            .await
+            .unwrap();
+
+        assert!(
+            collapse_task.await.unwrap().unwrap(),
+            "a live Pending row must remain after the collapse"
+        );
+
+        let live_ids = live_poll_job_ids(&apalis_pool, offchain_order_id).await;
+        assert_eq!(
+            live_ids.len(),
+            1,
+            "the collapse must never leave zero live rows for an order even when a legitimate \
+             successor commits while the collapse's own write is blocked in flight; got \
+             {live_ids:?}"
+        );
+        assert_eq!(
+            live_ids[0], due_duplicate_id,
+            "due-ness-first ordering must still pick the due pre-existing row over the \
+             not-yet-due successor as survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_survivor_selection_prefers_higher_priority_over_earlier_run_at()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let now = Utc::now().timestamp();
+
+        // Lower priority but earlier run_at: apalis's fetch_next.sql dispatches
+        // by `priority DESC, run_at ASC, id ASC`, so this row loses despite
+        // firing sooner -- `run_at` alone would have kept it instead.
+        seed_pending_poll_job_row_with_priority(
+            &infra.apalis_pool,
+            offchain_order_id,
+            now - 120,
+            0,
+        )
+        .await;
+        let higher_priority_id =
+            seed_pending_poll_job_row_with_priority(&infra.apalis_pool, offchain_order_id, now, 1)
+                .await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, offchain_order_id).await,
+            vec![higher_priority_id],
+            "the survivor must be the row apalis's fetch_next.sql would dispatch first \
+             (priority DESC before run_at ASC), not merely the earliest run_at"
+        );
+    }
+
+    /// RAI-1493: apalis's own `fetch_next.sql` only ranks rows its `WHERE`
+    /// clause has already made eligible (`run_at IS NULL OR run_at <=
+    /// strftime('%s', 'now')`), so a due row always beats a not-yet-due one
+    /// there regardless of priority -- it is never a candidate for
+    /// `priority DESC` to lose against. Replaying only the `ORDER BY` over
+    /// this guard's wider candidate set (every `Pending` row, not just due
+    /// ones) would pick the not-yet-due higher-priority row instead, which
+    /// apalis itself would never dispatch first. The survivor query must
+    /// therefore rank due-ness ahead of priority.
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_survivor_selection_prefers_a_due_row_over_a_higher_priority_not_yet_due_row()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let now = Utc::now().timestamp();
+
+        let due_id =
+            seed_pending_poll_job_row_with_priority(&infra.apalis_pool, offchain_order_id, now, 0)
+                .await;
+        seed_pending_poll_job_row_with_priority(
+            &infra.apalis_pool,
+            offchain_order_id,
+            now + 600,
+            1,
+        )
+        .await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, offchain_order_id).await,
+            vec![due_id],
+            "the survivor must be the due, lower-priority row -- apalis would never dispatch \
+             the not-yet-due higher-priority row first"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_survivor_selection_breaks_a_run_at_tie_by_id_asc() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let run_at = Utc::now().timestamp();
+
+        // Both rows share one run_at (pushed within the same second): apalis's
+        // fetch_next.sql breaks that tie deterministically by `id ASC`, unlike
+        // SQLite's otherwise-unspecified row order among ties.
+        let mut ids = [
+            seed_pending_poll_job_row_at(&infra.apalis_pool, offchain_order_id, run_at).await,
+            seed_pending_poll_job_row_at(&infra.apalis_pool, offchain_order_id, run_at).await,
+        ];
+        ids.sort();
+        let expected_survivor = ids[0].clone();
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, offchain_order_id).await,
+            vec![expected_survivor],
+            "rows tied on run_at must break the tie by id ASC, matching apalis's own dispatch \
+             order, not SQLite's unspecified row order among ties"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_skips_a_malformed_job_row_instead_of_erroring() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+
+        // A corrupt/foreign-codec `job` blob for this job type: not valid JSON,
+        // so `json_extract` would raise a hard "malformed JSON" SQL error
+        // without the `json_valid` guard -- and the order-id equality does not
+        // filter this row out first, so an unrelated order's guard query would
+        // fail too, not just this row's own (nonexistent) order.
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at) \
+             VALUES (?, ?, ?, 'Pending', 0, 25, strftime('%s', 'now'))",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(poll_order_status_job_type())
+        .bind(b"not json".to_vec())
+        .execute(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        let live =
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap();
+
+        assert!(
+            !live,
+            "a malformed job row (for a different, or no, order) must not fail the guard \
+             query for an unrelated order id"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_returns_int_conversion_when_stale_after_secs_exceeds_i64_max()
+    {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        // `Duration::checked_mul` (the STRANDED_POLL_JOB_INTERVAL_MULTIPLIER
+        // guard in `reconcile_and_check_live_poll_job`) can succeed here since u64 has roughly
+        // double i64's range, but `stale_after.as_secs()` itself still exceeds
+        // i64::MAX -- a narrower, deeper failure than `StaleAfterOverflow`,
+        // guarded separately by this function's own `i64::try_from`.
+        // `JobError::ApalisDatabase` (the other variant this function can
+        // return) is a bare `#[from]` passthrough of a library error and is
+        // deliberately left without a dedicated test.
+        let stale_after = Duration::from_secs(u64::try_from(i64::MAX).unwrap() + 1);
+
+        let error = reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, stale_after)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, JobError::IntConversion(_)),
+            "a stale_after whose as_secs() exceeds i64::MAX must fail fast with a typed \
+             conversion error instead of silently truncating or panicking"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_live_poll_jobs_does_not_collapse_pending_rows_while_a_fresh_running_row_exists()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        seed_poll_job_row(
+            &infra.apalis_pool,
+            offchain_order_id,
+            "Running",
+            0,
+            Some(Utc::now().timestamp()),
+        )
+        .await;
+        seed_pending_poll_job_row_at(
+            &infra.apalis_pool,
+            offchain_order_id,
+            Utc::now().timestamp(),
+        )
+        .await;
+
+        assert!(
+            reconcile_live_poll_jobs(&infra.apalis_pool, offchain_order_id, TEST_STALE_AFTER)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, offchain_order_id)
+                .await
+                .len(),
+            2,
+            "a fresh Running row and its Pending successor may briefly coexist for one \
+             legitimate chain; reconcile_live_poll_jobs must not collapse them (doing so could \
+             kill the successor instead of an actual duplicate, see doc comment)"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_submitted_offchain_orders_is_a_noop_when_a_live_poll_job_already_exists() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        seed_poll_job_row(&infra.apalis_pool, order_id, "Pending", 0, None).await;
+
+        let queue = infra.ctx.poll_status_queue.clone();
+        recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            1,
+            "recovery must not push a second job when a live poll job already exists"
+        );
+    }
+
+    /// Drives a real apalis fail/ack path, matching
+    /// `reconcile_live_poll_jobs_true_when_a_fresh_retryable_failed_row_exists_via_a_real_apalis_ack`:
+    /// a just-failed retryable row is a live, immediately re-dispatchable
+    /// chain head, so recovery must not fork a duplicate `Pending` chain
+    /// alongside it.
+    #[tokio::test]
+    async fn recover_submitted_offchain_orders_does_not_push_when_only_a_fresh_retryable_failed_row_exists()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        let mut queue = infra.ctx.poll_status_queue.clone();
+        queue
+            .push(PollOrderStatus {
+                offchain_order_id: order_id,
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, ?, 'test')",
+        )
+        .bind("test-worker")
+        .bind(poll_order_status_job_type())
+        .execute(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        let config = apalis_sqlite::Config::new(poll_order_status_job_type());
+        let worker = apalis_core::worker::context::WorkerContext::new::<()>("test-worker");
+        let fetched = apalis_sqlite::fetcher::fetch_next(infra.apalis_pool.clone(), config, worker)
+            .await
+            .unwrap();
+        let (_args, parts) = fetched.into_iter().next().unwrap().take();
+        let task_id = parts.task_id.unwrap().to_string();
+        let worker_id = parts.ctx.lock_by().clone().unwrap();
+
+        apalis_sqlite::queries::ack_task::ack_task(
+            &infra.apalis_pool,
+            &task_id,
+            &worker_id,
+            "simulated transient broker error",
+            &apalis_core::task::status::Status::Failed,
+            1,
+        )
+        .await
+        .unwrap();
+
+        recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            1,
+            "a just-failed retryable row counts as live, so recovery must not fork a second, \
+             duplicate chain alongside the one apalis is about to re-run"
+        );
+    }
+
+    /// The RAI-1495 decoupling half: once the retryable-Failed row has gone
+    /// stale (past `stale_after` without a fresh ack -- e.g. stuck behind a
+    /// latched worker), recovery must push a fresh row rather than staying
+    /// permanently suppressed.
+    #[tokio::test]
+    async fn recover_submitted_offchain_orders_re_pushes_once_the_only_retryable_failed_row_goes_stale()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        let stale_done_at =
+            Utc::now().timestamp() - i64::try_from(TEST_STALE_AFTER.as_secs()).unwrap() - 60;
+        seed_failed_poll_job_row_at(&infra.apalis_pool, order_id, stale_done_at).await;
+
+        let queue = infra.ctx.poll_status_queue.clone();
+        recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            2,
+            "a stale retryable-Failed row must not permanently suppress recovery: recovery \
+             must push a fresh Pending row alongside it, a bounded tradeoff (see \
+             reconcile_live_poll_jobs)"
+        );
+
+        // A second tick, with the stale retryable-Failed row still present
+        // untouched, must not push a third row: the Pending row pushed on
+        // the first tick is what now makes the order look live, not the
+        // Failed row -- proving the tradeoff is a single bounded extra row,
+        // not an unbounded backlog that keeps growing every tick.
+        recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            2,
+            "a second recovery tick with the stale retryable-Failed row still present must not \
+             push a third row: the first tick's freshly-pushed Pending row is what suppresses \
+             further pushes, so the tradeoff stays bounded across ticks, not unbounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_submitted_offchain_orders_re_pushes_when_the_only_row_is_a_stale_running_row()
+    {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        let stale_lock_at =
+            Utc::now().timestamp() - i64::try_from(TEST_STALE_AFTER.as_secs()).unwrap() - 60;
+        seed_poll_job_row(
+            &infra.apalis_pool,
+            order_id,
+            "Running",
+            0,
+            Some(stale_lock_at),
+        )
+        .await;
+
+        let queue = infra.ctx.poll_status_queue.clone();
+        recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            2,
+            "a stranded Running row must not permanently suppress recovery's re-push \
+             (RAI-1493): recovery must push a fresh Pending row alongside the stale one"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_submitted_offchain_orders_converges_pre_existing_duplicates_to_one_live_row() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+        let now = Utc::now().timestamp();
+        // Simulates the pre-fix incident: several independent forked chains
+        // already live for one order before this fix's guard ever ran.
+        seed_pending_poll_job_row_at(&infra.apalis_pool, order_id, now - 180).await;
+        seed_pending_poll_job_row_at(&infra.apalis_pool, order_id, now - 90).await;
+        seed_pending_poll_job_row_at(&infra.apalis_pool, order_id, now).await;
+
+        let queue = infra.ctx.poll_status_queue.clone();
+        recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, order_id).await.len(),
+            1,
+            "recovery must converge pre-existing duplicate live PollOrderStatus rows for one \
+             order down to exactly one instead of leaving each to self-perpetuate forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_submitted_offchain_orders_returns_stale_after_overflow_on_oversized_poll_interval()
+     {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        let queue = infra.ctx.poll_status_queue.clone();
+        let error = recover_submitted_offchain_orders(
+            &infra.ctx.offchain_order_projection,
+            &queue,
+            SupportedExecutor::DryRun,
+            Duration::from_secs(u64::MAX),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, JobError::StaleAfterOverflow),
+            "an oversized order_polling_interval must fail fast with a typed overflow error \
+             rather than panicking inside Duration's checked_mul"
         );
     }
 }

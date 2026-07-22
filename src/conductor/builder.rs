@@ -293,6 +293,7 @@ where
             BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => alpaca_ctx.counter_trade_slippage_bps,
             BrokerCtx::DryRun => st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         },
+        poll_interval,
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
@@ -309,6 +310,7 @@ where
         ctx: context.ctx.clone(),
         pool: context.pool.clone(),
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
+        poll_interval,
     });
 
     let trade_cqrs = super::TradeProcessingCqrs {
@@ -323,6 +325,7 @@ where
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
+        poll_interval,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();

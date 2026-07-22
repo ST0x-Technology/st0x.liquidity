@@ -1104,7 +1104,8 @@ mod tests {
     use crate::onchain::trade::RaindexTradeEvent;
     use crate::onchain_trade::{OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand};
     use crate::test_utils::{
-        OnchainTradeBuilder, get_test_order, positive_shares, setup_test_db, setup_test_pools,
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, positive_shares, setup_test_db,
+        setup_test_pools,
     };
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -2180,6 +2181,7 @@ mod tests {
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         // The trade_event payload is never accessed because process_queued_trade

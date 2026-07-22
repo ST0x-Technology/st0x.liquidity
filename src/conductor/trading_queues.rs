@@ -73,6 +73,7 @@ pub(super) async fn setup_trading_job_queues(
     equity_recovery: EquityRecoveryInputs,
     offchain_order_projection: &Arc<Projection<OffchainOrder>>,
     executor_type: SupportedExecutor,
+    poll_interval: Duration,
 ) -> anyhow::Result<TradingJobQueues> {
     let EquityRecoveryInputs {
         wrapped_store: wrapped_equity_recovery_store,
@@ -84,7 +85,7 @@ pub(super) async fn setup_trading_job_queues(
         inventory_poll_interval,
     } = equity_recovery;
     let hedge_queue: HedgeJobQueue = crate::conductor::job::JobQueue::new(apalis_pool);
-    let mut poll_status_queue = PollOrderStatusJobQueue::new(apalis_pool);
+    let poll_status_queue = PollOrderStatusJobQueue::new(apalis_pool);
     let reconcile_queue = ReconcileOrderFillJobQueue::new(apalis_pool);
     let rejection_queue = HandleOrderRejectionJobQueue::new(apalis_pool);
 
@@ -135,8 +136,9 @@ pub(super) async fn setup_trading_job_queues(
 
     recover_submitted_offchain_orders(
         offchain_order_projection,
-        &mut poll_status_queue,
+        &poll_status_queue,
         executor_type,
+        poll_interval,
     )
     .await?;
 

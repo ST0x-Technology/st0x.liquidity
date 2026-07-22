@@ -49,7 +49,9 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
-use crate::test_utils::{TestAnvilInstance, deploy_tofu_singleton, setup_test_pools, spawn_anvil};
+use crate::test_utils::{
+    TEST_POLL_INTERVAL, TestAnvilInstance, deploy_tofu_singleton, setup_test_pools, spawn_anvil,
+};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
@@ -872,6 +874,7 @@ async fn create_test_cqrs_with_assets(
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
         order_placer,
         hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
+        poll_interval: TEST_POLL_INTERVAL,
     };
 
     (

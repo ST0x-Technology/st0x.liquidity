@@ -5,6 +5,7 @@
 //! these; the apalis worker processes them with retry semantics.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::U256;
 use rain_math_float::Float;
@@ -20,10 +21,13 @@ use st0x_execution::{
 };
 
 use crate::conductor::job::{Job, JobQueue, Label};
+#[cfg(test)]
+use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
     CounterTradeOrderKind, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-    PollOrderStatus, PollOrderStatusJobQueue, client_order_id_for_placement,
+    PollOrderStatusJobQueue, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
+    push_poll_job_if_absent,
 };
 use crate::position::{Position, PositionCommand, PositionError};
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -116,6 +120,12 @@ pub(crate) struct HedgeCtx {
     /// is the backstop for that gap -- the rejected order lands as `Failed`
     /// and releases the position for a later re-hedge.
     pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
+    /// Fed to [`push_poll_job_if_absent`] before every
+    /// `PollOrderStatus` push in this module (`recover_pending_poll_status`'s
+    /// re-push and `route_placement_outcome`'s push), so a push against an
+    /// order that already has a live poll job is skipped instead of forking a
+    /// new self-perpetuating chain (RAI-1493).
+    pub(crate) poll_interval: Duration,
 }
 
 /// A durable job that places an offsetting broker order for an accumulated
@@ -228,8 +238,11 @@ async fn select_order_kind_for_current_session(
 /// - `Submitted`/`PartiallyFilled`: the order reached the broker but the prior
 ///   attempt may have failed to enqueue the `PollOrderStatus` job (e.g. the
 ///   queue push returned a transient error and apalis re-ran us), so re-enqueue
-///   it. Duplicate poll jobs are harmless -- `dispatch_for_order_state` drops
-///   jobs whose target order is already terminal.
+///   it, guarded by [`push_poll_job_if_absent`]: a retry against an
+///   order that already has a live poll job (the common case -- this path re-runs
+///   whenever `PendingExecution` is hit, not only after a lost push) must
+///   skip the push, or it forks a new independent, self-perpetuating poll
+///   chain for the same order every time it re-runs (RAI-1493).
 /// - `Pending`: the broker outcome was never committed -- the `MarkAccepted`/
 ///   `MarkFailed` write was lost after a successful broker call, or a crash hit
 ///   before the broker call. Re-drive the idempotent placement so the order
@@ -246,11 +259,7 @@ async fn recover_pending_poll_status(
     };
     match ctx.offchain_order.load(&pending_id).await? {
         Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
-            ctx.poll_status_queue
-                .clone()
-                .push(PollOrderStatus {
-                    offchain_order_id: pending_id,
-                })
+            push_poll_job_if_absent(ctx.poll_status_queue.clone(), pending_id, ctx.poll_interval)
                 .await?;
             Ok(())
         }
@@ -320,16 +329,22 @@ async fn recover_pending_poll_status(
 /// stranded:
 ///
 /// - `Failed`: roll the position back (clear the claim).
-/// - `Submitted`/`PartiallyFilled`: enqueue a `PollOrderStatus` job.
+/// - `Submitted`/`PartiallyFilled`/`Cancelling`: enqueue a `PollOrderStatus`
+///   job, guarded by [`push_poll_job_if_absent`] so a re-entrant call
+///   against an order that already has a live poll job is skipped instead of
+///   forking a new self-perpetuating chain (RAI-1493).
 /// - `None` (no order after a successful `Place`): clear the claim, since there
 ///   is nothing left to track.
 /// - `Pending`/`Filled`: surface a retryable error without clearing the claim,
 ///   since the order may be live at the broker.
 ///
-/// Shared by the primary placement path and the `Pending` re-drive in
-/// [`recover_pending_poll_status`], and kept in lockstep with the
-/// trade-processing path's `dispatch_post_place_state`, so the placement paths
-/// cannot diverge.
+/// Shared by the primary placement path (a genuinely fresh order, where the
+/// guard is always a no-op) and the `Pending` re-drive in
+/// [`recover_pending_poll_status`] (where a concurrent recovery attempt for
+/// the same `pending_id` may have already advanced the order to `Submitted`
+/// and pushed its poll job before this call observes it -- the guard is what
+/// makes that race safe), and kept in lockstep with the trade-processing
+/// path's `dispatch_post_place_state`, so the placement paths cannot diverge.
 async fn route_placement_outcome(
     ctx: &HedgeCtx,
     symbol: &Symbol,
@@ -353,10 +368,12 @@ async fn route_placement_outcome(
         }
 
         Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
-            ctx.poll_status_queue
-                .clone()
-                .push(PollOrderStatus { offchain_order_id })
-                .await?;
+            push_poll_job_if_absent(
+                ctx.poll_status_queue.clone(),
+                offchain_order_id,
+                ctx.poll_interval,
+            )
+            .await?;
         }
 
         // No order exists after a successful `Place` -- there is nothing to
@@ -578,6 +595,7 @@ mod tests {
         OffchainOrder, OffchainOrderCommand, OrderPlacementResult, OrderPlacer,
     };
     use crate::position::{Position, PositionCommand, TradeId};
+    use crate::test_utils::TEST_POLL_INTERVAL;
     use st0x_config::{EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode};
 
     /// Builds an [`AssetsConfig`] with a single equity whose extended-hours
@@ -726,6 +744,7 @@ mod tests {
             assets: extended_hours_assets("AAPL", true),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         TestInfra {
@@ -829,6 +848,71 @@ mod tests {
         };
         assert_eq!(returned, offchain_order_id);
         assert_eq!(state, pending);
+    }
+
+    /// RAI-1493: `route_placement_outcome`'s `Submitted`/`PartiallyFilled`/
+    /// `Cancelling` arm shares the same `push_poll_job_if_absent` guard as
+    /// `dispatch_post_place_state` and `recover_pending_poll_status`.
+    /// A re-entrant call against an order that already has a live poll job
+    /// (the shape of the race between `recover_pending_poll_status`'s `Pending`
+    /// re-drive and a concurrent recovery attempt for the same order) must
+    /// skip the push rather than forking a second independent,
+    /// self-perpetuating poll chain.
+    #[tokio::test]
+    async fn route_placement_outcome_skips_duplicate_push_when_poll_job_already_live() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+
+        let submitted = OffchainOrder::Submitted {
+            symbol: symbol.clone(),
+            shares: Positive::new(FractionalShares::new(float!(1.0))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("ORD_ROUTE_GUARD"),
+            placed_at: chrono::Utc::now(),
+            submitted_at: chrono::Utc::now(),
+            market_session: MarketSession::Regular,
+        };
+
+        // First call: no live poll job yet, so the guard is a no-op and the
+        // push goes through.
+        route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(submitted.clone()))
+            .await
+            .unwrap();
+
+        let poll_jobs_after_first: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll_jobs_after_first, 1,
+            "the first call must push exactly one PollOrderStatus job"
+        );
+
+        // Second call against the same order (simulating a concurrent recovery
+        // attempt observing the order already Submitted with its poll job
+        // already live) must skip the push rather than forking a duplicate
+        // chain.
+        route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(submitted))
+            .await
+            .unwrap();
+
+        let poll_jobs_after_second: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll_jobs_after_second, 1,
+            "a re-entrant call against an order with a still-live poll job must not push a \
+             duplicate"
+        );
     }
 
     #[tokio::test]
@@ -1185,6 +1269,7 @@ mod tests {
             assets: extended_hours_assets("AAPL", true),
             counter_trade_slippage_bps: 100,
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         TestInfra {
@@ -1927,6 +2012,7 @@ mod tests {
             assets,
             counter_trade_slippage_bps: 100,
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         TestInfra {
@@ -1938,7 +2024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_failed_poll_enqueue_re_enqueues_poll() {
+    async fn retry_against_a_still_live_poll_job_does_not_fork_a_duplicate() {
         let TestInfra {
             ctx, apalis_pool, ..
         } = create_hedge_ctx(succeeding_order_placer()).await;
@@ -1970,9 +2056,12 @@ mod tests {
         );
 
         // Retry the same job. Position rejects with PendingExecution because
-        // the first run set the pending id. The recovery path must observe
-        // that the offchain order is still `Submitted` and push another
-        // PollOrderStatus rather than silently returning Ok.
+        // the first run set the pending id, and the offchain order is still
+        // `Submitted` with its poll job still live. `recover_pending_poll_status`
+        // must observe that via `reconcile_and_check_live_poll_job` and skip
+        // the push -- every apalis retry of this same job would otherwise
+        // fork its own independent, self-perpetuating poll chain for the same
+        // order (RAI-1493).
         job.perform(&ctx).await.unwrap();
 
         let poll_jobs_after_retry: i64 =
@@ -1982,8 +2071,66 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            poll_jobs_after_retry, 2,
-            "Retry must re-enqueue PollOrderStatus when the order is still Submitted"
+            poll_jobs_after_retry, 1,
+            "retry must not re-enqueue PollOrderStatus while the first job for this order is \
+             still live"
+        );
+    }
+
+    /// Sibling of the test above, pinning the push branch of
+    /// `recover_pending_poll_status`'s `Submitted` arm: when the first poll job
+    /// is no longer live (its doc comment's motivating case is a lost enqueue,
+    /// but a completed/superseded row collapses to the same "not live" guard
+    /// outcome), a retry must re-enqueue a replacement rather than silently
+    /// returning `Ok(())` and leaving the order un-polled.
+    #[tokio::test]
+    async fn retry_against_no_longer_live_poll_job_re_enqueues_a_replacement() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // First run: drives the order to `Submitted` and enqueues
+        // PollOrderStatus exactly once.
+        job.perform(&ctx).await.unwrap();
+
+        // Simulate the pushed job no longer being live (e.g. it already ran
+        // to completion) so `reconcile_and_check_live_poll_job` observes no
+        // live row for the retry to skip against.
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now') WHERE job_type = ?",
+        )
+        .bind(type_name::<PollOrderStatus>())
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+
+        // Retry the same job. Position rejects with PendingExecution again,
+        // and this time `reconcile_and_check_live_poll_job` finds no live
+        // row, so `recover_pending_poll_status` must push a replacement.
+        job.perform(&ctx).await.unwrap();
+
+        let live_poll_jobs: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status IN ('Pending', 'Queued', \
+             'Running')",
+        )
+        .bind(type_name::<PollOrderStatus>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_poll_jobs, 1,
+            "retry against a no-longer-live poll job must re-enqueue exactly one replacement"
         );
     }
 
