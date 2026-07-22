@@ -606,10 +606,7 @@ pub(crate) struct InventoryView {
     /// Local-clock time, as above.
     #[serde(default)]
     offchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
-    /// Symbols with an open offchain (hedge) order. The broker bakes a fill
-    /// into its position the instant it executes, before we observe the fill,
-    /// so offchain snapshots are skipped for these symbols and the fill delta
-    /// owns the balance until the order reaches a terminal state.
+    /// Symbols with an open offchain (hedge) order.
     #[serde(default)]
     pending_offchain_order_symbols: HashSet<Symbol>,
     /// Local-clock time at which the most recent offchain fill was *applied to

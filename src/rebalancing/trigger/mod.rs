@@ -2182,10 +2182,12 @@ impl Reactor for RebalancingService {
                     }
                     OffChainOrderPlaced { .. } => {
                         // Also stops offchain snapshots from writing this
-                        // symbol's balance while the order is open: the broker
-                        // bakes a fill into its position the instant it
-                        // executes, which is before we observe the fill, so a
-                        // snapshot landing in that window already contains it.
+                        // symbol's balance while the order is open. The polled
+                        // figure is the broker's qty_available, which moves before
+                        // we observe anything: a sell's shares are held at
+                        // order acceptance and the fill lands at execution --
+                        // so a snapshot read anywhere in the window
+                        // is ambiguous and must be skipped.
                         self.inventory
                             .write_without_broadcast()
                             .await
