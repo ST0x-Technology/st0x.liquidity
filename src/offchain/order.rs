@@ -26,7 +26,8 @@ pub(crate) mod reconcile_fill;
 
 pub(crate) use handle_rejection::{HandleOrderRejection, HandleOrderRejectionJobQueue};
 pub(crate) use poll_status::{
-    PollOrderStatus, PollOrderStatusJobQueue, recover_submitted_offchain_orders,
+    PollOrderStatus, PollOrderStatusJobQueue, push_poll_job_if_absent,
+    recover_submitted_offchain_orders, recover_submitted_offchain_orders_at_startup,
 };
 pub(crate) use reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 
@@ -82,6 +83,12 @@ pub(crate) enum JobError {
     Enqueue(#[from] QueuePushError),
     #[error("Offchain order invariant violation: {0}")]
     OffchainOrder(#[from] OffchainOrderError),
+    #[error("Apalis database error: {0}")]
+    ApalisDatabase(#[from] apalis_sqlite::SqlxError),
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
+    #[error("Poll interval overflowed while computing the stranded-row staleness bound")]
+    StaleAfterOverflow,
 }
 
 #[derive(Debug, Clone)]

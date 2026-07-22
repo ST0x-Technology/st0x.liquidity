@@ -23,7 +23,7 @@ use crate::equity_redemption::EquityRedemption;
 use crate::inventory::BroadcastingInventory;
 use crate::offchain::order::{
     HandleOrderRejectionJobQueue, OffchainOrder, PollOrderStatusJobQueue,
-    ReconcileOrderFillJobQueue, recover_submitted_offchain_orders,
+    ReconcileOrderFillJobQueue, recover_submitted_offchain_orders_at_startup,
 };
 use crate::portfolio_snapshot::{PortfolioSnapshotJobQueue, bootstrap_portfolio_snapshot};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
@@ -78,6 +78,7 @@ pub(super) async fn setup_trading_job_queues(
     equity_recovery: EquityRecoveryInputs,
     offchain_order_projection: &Arc<Projection<OffchainOrder>>,
     executor_type: SupportedExecutor,
+    poll_interval: Duration,
 ) -> anyhow::Result<TradingJobQueues> {
     let EquityRecoveryInputs {
         wrapped_store: wrapped_equity_recovery_store,
@@ -89,7 +90,7 @@ pub(super) async fn setup_trading_job_queues(
         inventory_poll_interval,
     } = equity_recovery;
     let hedge_queue: HedgeJobQueue = crate::conductor::job::JobQueue::new(apalis_pool);
-    let mut poll_status_queue = PollOrderStatusJobQueue::new(apalis_pool);
+    let poll_status_queue = PollOrderStatusJobQueue::new(apalis_pool);
     let reconcile_queue = ReconcileOrderFillJobQueue::new(apalis_pool);
     let rejection_queue = HandleOrderRejectionJobQueue::new(apalis_pool);
 
@@ -138,10 +139,11 @@ pub(super) async fn setup_trading_job_queues(
 
     let check_positions_queue = CheckPositionsJobQueue::new(apalis_pool);
 
-    recover_submitted_offchain_orders(
+    recover_submitted_offchain_orders_at_startup(
         offchain_order_projection,
-        &mut poll_status_queue,
+        &poll_status_queue,
         executor_type,
+        poll_interval,
     )
     .await?;
 
