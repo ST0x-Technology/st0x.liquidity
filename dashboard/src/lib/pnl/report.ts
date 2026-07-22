@@ -226,6 +226,15 @@ export type PnlWindow = {
   symbols: PnlWindowSymbol[]
 }
 
+export type PnlCapitalSummary = {
+  averageDeployedCapitalUsd: string | null
+  annualizedReturnPct: string | null
+  coverageDays: number | null
+  sampleDays: number
+  firstSnapshotDay: string | null
+  lastSnapshotDay: string | null
+}
+
 export type PnlResponse = {
   attributionMethod: string
   asOfRowid?: number
@@ -234,6 +243,7 @@ export type PnlResponse = {
   sampleStats?: PnlSampleStats
   summary: PnlSummary
   costs: PnlCostSummary
+  capital: PnlCapitalSummary
   symbols: PnlSymbolSummary[]
   symbolUniverse?: string[]
   entries: PnlEntry[]

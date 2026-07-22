@@ -22,7 +22,8 @@
 //! The write side splits into [`write`] (the self-rescheduling job that
 //! resolves USD marks and issues the `Capture` command) and [`projection`]
 //! (the reactor that maintains the flat read-model table from the retained
-//! `Captured` events).
+//! `Captured` events). The [`read`] module computes the capital and return
+//! figures exposed by `/pnl` from that read model.
 
 use std::fmt;
 use std::str::FromStr;
@@ -40,13 +41,20 @@ use crate::inventory::PortfolioBalanceRow;
 use crate::position::option_float_eq;
 
 pub(crate) mod projection;
+pub(crate) mod read;
 pub(crate) mod write;
 
 pub(crate) use projection::PortfolioSnapshotProjection;
+pub(crate) use read::{EtDayRange, ReadError, capital_summary, load_portfolio_days};
 pub(crate) use write::{
     PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
     bootstrap_portfolio_snapshot,
 };
+// Only consumed by api.rs's `#[cfg(test)]` DST-boundary /pnl test, which
+// derives the same day a real capture would rather than assuming it;
+// `cfg(test)` only because that test module is not part of the e2e binary.
+#[cfg(test)]
+pub(crate) use write::et_day;
 
 /// Typed identifier for [`PortfolioSnapshot`] aggregates: one instance per
 /// Eastern Time calendar day. Using the day itself as the id gives
