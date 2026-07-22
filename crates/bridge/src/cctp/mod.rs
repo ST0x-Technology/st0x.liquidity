@@ -3912,9 +3912,11 @@ mod tests {
             cctp.base.message_transmitter,
             reverting_wallet,
         )
-        .with_node_sync_poll_interval(Duration::ZERO);
-
-        tokio::time::pause();
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: NonZeroU32::new(2).unwrap(),
+        });
 
         let recovered = reverting_endpoint
             .recover_already_minted::<NoOpErrorRegistry>(
@@ -3994,9 +3996,11 @@ mod tests {
             cctp.base.message_transmitter,
             flaky_wallet,
         )
-        .with_node_sync_poll_interval(Duration::ZERO);
-
-        tokio::time::pause();
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: NonZeroU32::new(2).unwrap(),
+        });
 
         let recovered = flaky_endpoint
             .recover_already_minted::<NoOpErrorRegistry>(
