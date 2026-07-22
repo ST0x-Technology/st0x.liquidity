@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::warn;
+
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::SupportedExecutor;
 
@@ -23,6 +25,7 @@ use crate::offchain::order::{
     HandleOrderRejectionJobQueue, OffchainOrder, PollOrderStatusJobQueue,
     ReconcileOrderFillJobQueue, recover_submitted_offchain_orders,
 };
+use crate::portfolio_snapshot::{PortfolioSnapshotJobQueue, bootstrap_portfolio_snapshot};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::RebalancingService;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -60,13 +63,14 @@ pub(super) struct TradingJobQueues {
     pub(super) wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     pub(super) unwrapped_equity_recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
     pub(super) check_positions_queue: CheckPositionsJobQueue,
+    pub(super) portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
 }
 
 /// Creates all trading-side and equity-recovery job queues, resets any orphaned
 /// `Running` rows left by a previous crash, recovers in-flight submitted orders,
-/// and bootstraps the position-check queue. Called once during conductor startup,
-/// before the apalis monitor spawns, so every `Running` row is orphaned by
-/// definition.
+/// and bootstraps the recurring position-check and portfolio-snapshot queues.
+/// Called once during conductor startup, before the apalis monitor spawns, so
+/// every `Running` row is orphaned by definition.
 pub(super) async fn setup_trading_job_queues(
     apalis_pool: &apalis_sqlite::SqlitePool,
     job_queue: &DexTradeAccountingJobQueue,
@@ -142,6 +146,9 @@ pub(super) async fn setup_trading_job_queues(
 
     bootstrap_check_positions(apalis_pool, &check_positions_queue).await?;
 
+    let portfolio_snapshot_queue = PortfolioSnapshotJobQueue::new(apalis_pool);
+    bootstrap_portfolio_snapshot_best_effort(apalis_pool, &portfolio_snapshot_queue).await;
+
     Ok(TradingJobQueues {
         hedge_queue,
         poll_status_queue,
@@ -152,5 +159,41 @@ pub(super) async fn setup_trading_job_queues(
         wrapped_equity_recovery_ctx,
         unwrapped_equity_recovery_ctx,
         check_positions_queue,
+        portfolio_snapshot_queue,
     })
+}
+
+/// Starts the reporting-only portfolio snapshot loop without making trading
+/// startup depend on it. Persistent failures remain observable in logs and on
+/// the next restart attempt.
+async fn bootstrap_portfolio_snapshot_best_effort(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    queue: &PortfolioSnapshotJobQueue,
+) {
+    if let Err(error) = bootstrap_portfolio_snapshot(apalis_pool, queue).await {
+        warn!(
+            ?error,
+            "Failed to bootstrap portfolio snapshot reporting; continuing trading startup"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn portfolio_snapshot_bootstrap_failure_does_not_fail_startup() {
+        let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
+            .await
+            .unwrap();
+        let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
+
+        bootstrap_portfolio_snapshot_best_effort(&apalis_pool, &queue).await;
+
+        assert!(logs_contain(
+            "Failed to bootstrap portfolio snapshot reporting; continuing trading startup"
+        ));
+    }
 }

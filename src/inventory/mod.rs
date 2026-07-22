@@ -23,5 +23,5 @@ pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::InventoryError;
 pub(crate) use view::{
     EquityImbalanceError, Imbalance, Inventory, InventoryView, InventoryViewError, Operator,
-    TransferOp, Venue,
+    PortfolioAsset, PortfolioBalanceRow, PortfolioLocation, TransferOp, Venue,
 };

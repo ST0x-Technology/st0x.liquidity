@@ -478,6 +478,7 @@ pub enum JobKind {
     TransferEquityToHedging,
     ResumeTokenizationAggregate,
     DashboardTradeDelivery,
+    PortfolioSnapshot,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -520,6 +521,7 @@ pub struct FailureInjector {
     transfer_equity_to_hedging: Arc<Mutex<InjectionState>>,
     resume_tokenization_aggregate: Arc<Mutex<InjectionState>>,
     dashboard_trade_delivery: Arc<Mutex<InjectionState>>,
+    portfolio_snapshot: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -560,6 +562,7 @@ impl FailureInjector {
             transfer_equity_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
             resume_tokenization_aggregate: Arc::new(Mutex::new(InjectionState::Idle)),
             dashboard_trade_delivery: Arc::new(Mutex::new(InjectionState::Idle)),
+            portfolio_snapshot: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -612,6 +615,7 @@ impl FailureInjector {
             JobKind::TransferEquityToHedging => &self.transfer_equity_to_hedging,
             JobKind::ResumeTokenizationAggregate => &self.resume_tokenization_aggregate,
             JobKind::DashboardTradeDelivery => &self.dashboard_trade_delivery,
+            JobKind::PortfolioSnapshot => &self.portfolio_snapshot,
         };
 
         match mutex.lock() {
