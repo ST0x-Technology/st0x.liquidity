@@ -9,7 +9,7 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -80,13 +80,6 @@ pub(crate) struct InventorySnapshot {
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
     #[serde(default)]
     pub(crate) offchain_equity_fetched_at: Option<DateTime<Utc>>,
-    /// Symbols whose cached offchain positions no longer count as delivered:
-    /// the view skipped them while a hedge order was open, so the next
-    /// `OffchainEquity` command emits even when the broker value is unchanged.
-    /// Cleared when that emission applies. The cached map itself is kept
-    /// intact so startup hydration still seeds the last-known balances.
-    #[serde(default)]
-    pub(crate) offchain_equity_forgotten: BTreeSet<Symbol>,
     /// Latest offchain USD balance in cents (post-reserve, available for trading)
     pub(crate) offchain_usd_cents: Option<i64>,
     #[serde(default)]
@@ -149,7 +142,6 @@ impl EventSourced for InventorySnapshot {
             onchain_usdc_fetched_at: None,
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
-            offchain_equity_forgotten: BTreeSet::new(),
             offchain_usd_cents: None,
             offchain_usd_fetched_at: None,
             offchain_gross_usd_cents: None,
@@ -250,9 +242,6 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }
             }
-            // Nothing is cached yet on an uninitialized aggregate, so there
-            // is nothing to forget.
-            ForgetOffchainEquity { .. } => return Ok(vec![]),
         }])
     }
 
@@ -287,23 +276,12 @@ impl EventSourced for InventorySnapshot {
                 positions,
                 fetched_at,
             } => {
-                if self.offchain_equity == positions && self.offchain_equity_forgotten.is_empty() {
+                if self.offchain_equity == positions {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainEquity {
                     positions,
                     fetched_at,
-                }])
-            }
-            ForgetOffchainEquity { symbol } => {
-                if !self.offchain_equity.contains_key(&symbol)
-                    || self.offchain_equity_forgotten.contains(&symbol)
-                {
-                    return Ok(vec![]);
-                }
-                Ok(vec![InventorySnapshotEvent::OffchainEquityForgotten {
-                    symbol,
-                    fetched_at: now,
                 }])
             }
             OffchainUsd {
@@ -587,10 +565,6 @@ impl InventorySnapshot {
             {
                 self.offchain_equity = positions.clone();
                 self.offchain_equity_fetched_at = Some(*fetched_at);
-                self.offchain_equity_forgotten.clear();
-            }
-            InventorySnapshotEvent::OffchainEquityForgotten { symbol, .. } => {
-                self.offchain_equity_forgotten.insert(symbol.clone());
             }
             InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
@@ -701,14 +675,6 @@ pub(crate) enum InventorySnapshotCommand {
         /// Time the provider pending-request response was observed.
         fetched_at: DateTime<Utc>,
     },
-    /// Mark `symbol`'s cached offchain positions as undelivered so the next
-    /// `OffchainEquity` poll emits even when the broker value is unchanged.
-    /// Sent when the offchain-order gate clears: a snapshot skipped during
-    /// the open order was recorded here but never applied to the view, and
-    /// without this the unchanged-value dedupe would suppress the retry.
-    ForgetOffchainEquity {
-        symbol: Symbol,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -771,13 +737,6 @@ pub(crate) enum InventorySnapshotEvent {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
-    /// `symbol`'s cached offchain positions no longer count as delivered;
-    /// the next `OffchainEquity` command emits even when unchanged. See
-    /// [`InventorySnapshotCommand::ForgetOffchainEquity`].
-    OffchainEquityForgotten {
-        symbol: Symbol,
-        fetched_at: DateTime<Utc>,
-    },
 }
 
 impl InventorySnapshotEvent {
@@ -794,8 +753,7 @@ impl InventorySnapshotEvent {
             | Self::BaseWalletUsdc { fetched_at, .. }
             | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
             | Self::BaseWalletWrappedEquity { fetched_at, .. }
-            | Self::InflightEquity { fetched_at, .. }
-            | Self::OffchainEquityForgotten { fetched_at, .. } => *fetched_at,
+            | Self::InflightEquity { fetched_at, .. } => *fetched_at,
         }
     }
 }
@@ -823,9 +781,6 @@ impl DomainEvent for InventorySnapshotEvent {
                 "InventorySnapshotEvent::BaseWalletWrappedEquity".to_string()
             }
             Self::InflightEquity { .. } => "InventorySnapshotEvent::InflightEquity".to_string(),
-            Self::OffchainEquityForgotten { .. } => {
-                "InventorySnapshotEvent::OffchainEquityForgotten".to_string()
-            }
         }
     }
 
@@ -989,147 +944,6 @@ mod tests {
             }
             _ => panic!("Expected OffchainEquity event"),
         }
-    }
-
-    #[tokio::test]
-    async fn forget_marks_cached_symbol_and_defeats_unchanged_dedupe() {
-        let mut positions = BTreeMap::new();
-        positions.insert(test_symbol("AAPL"), test_shares(85));
-        let recorded = InventorySnapshotEvent::OffchainEquity {
-            positions: positions.clone(),
-            fetched_at: Utc::now(),
-        };
-
-        let forget_events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![recorded.clone()])
-            .when(InventorySnapshotCommand::ForgetOffchainEquity {
-                symbol: test_symbol("AAPL"),
-            })
-            .await
-            .events();
-        assert_eq!(
-            forget_events.len(),
-            1,
-            "forgetting a cached symbol must emit"
-        );
-        assert!(
-            matches!(
-                &forget_events[0],
-                InventorySnapshotEvent::OffchainEquityForgotten { symbol, .. }
-                    if *symbol == test_symbol("AAPL")
-            ),
-            "expected OffchainEquityForgotten for AAPL, got {:?}",
-            forget_events[0]
-        );
-
-        // An unchanged poll would normally dedupe to nothing; after the
-        // forget it must re-emit so the skipped broker truth is retried.
-        let repoll_events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![recorded, forget_events[0].clone()])
-            .when(InventorySnapshotCommand::OffchainEquity {
-                positions: positions.clone(),
-                fetched_at: Utc::now(),
-            })
-            .await
-            .events();
-        assert_eq!(
-            repoll_events.len(),
-            1,
-            "an unchanged poll must re-emit after a forget"
-        );
-        assert!(
-            matches!(
-                &repoll_events[0],
-                InventorySnapshotEvent::OffchainEquity { positions: event_positions, .. }
-                    if *event_positions == positions
-            ),
-            "expected the unchanged positions re-emitted, got {:?}",
-            repoll_events[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn reemitted_poll_clears_forgotten_and_restores_dedupe() {
-        let mut positions = BTreeMap::new();
-        positions.insert(test_symbol("AAPL"), test_shares(85));
-        let fetched_at = Utc::now();
-        let history = vec![
-            InventorySnapshotEvent::OffchainEquity {
-                positions: positions.clone(),
-                fetched_at,
-            },
-            InventorySnapshotEvent::OffchainEquityForgotten {
-                symbol: test_symbol("AAPL"),
-                fetched_at,
-            },
-            // The re-emission triggered by the forget; applying it clears
-            // the forgotten set.
-            InventorySnapshotEvent::OffchainEquity {
-                positions: positions.clone(),
-                fetched_at,
-            },
-        ];
-
-        let events = TestHarness::<InventorySnapshot>::with(())
-            .given(history)
-            .when(InventorySnapshotCommand::OffchainEquity {
-                positions,
-                fetched_at: Utc::now(),
-            })
-            .await
-            .events();
-        assert!(
-            events.is_empty(),
-            "once the re-emission applied, unchanged polls must dedupe again"
-        );
-    }
-
-    #[tokio::test]
-    async fn forget_is_idempotent_and_ignores_unknown_symbols() {
-        let mut positions = BTreeMap::new();
-        positions.insert(test_symbol("AAPL"), test_shares(85));
-        let fetched_at = Utc::now();
-        let recorded = InventorySnapshotEvent::OffchainEquity {
-            positions,
-            fetched_at,
-        };
-        let forgotten = InventorySnapshotEvent::OffchainEquityForgotten {
-            symbol: test_symbol("AAPL"),
-            fetched_at,
-        };
-
-        let repeat = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![recorded.clone(), forgotten])
-            .when(InventorySnapshotCommand::ForgetOffchainEquity {
-                symbol: test_symbol("AAPL"),
-            })
-            .await
-            .events();
-        assert!(repeat.is_empty(), "forgetting twice must not emit again");
-
-        let unknown = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![recorded])
-            .when(InventorySnapshotCommand::ForgetOffchainEquity {
-                symbol: test_symbol("TSLA"),
-            })
-            .await
-            .events();
-        assert!(
-            unknown.is_empty(),
-            "forgetting a symbol that is not cached must not emit"
-        );
-
-        let uninitialized = TestHarness::<InventorySnapshot>::with(())
-            .given_no_previous_events()
-            .when(InventorySnapshotCommand::ForgetOffchainEquity {
-                symbol: test_symbol("AAPL"),
-            })
-            .await
-            .events();
-        assert!(
-            uninitialized.is_empty(),
-            "forgetting on an uninitialized aggregate must not emit"
-        );
     }
 
     #[tokio::test]
@@ -2049,7 +1863,6 @@ mod tests {
             onchain_usdc_fetched_at: None,
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
-            offchain_equity_forgotten: BTreeSet::new(),
             offchain_usd_cents: None,
             offchain_usd_fetched_at: None,
             offchain_gross_usd_cents: None,
@@ -2084,7 +1897,6 @@ mod tests {
             onchain_usdc_fetched_at: Some(now),
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
-            offchain_equity_forgotten: BTreeSet::new(),
             offchain_usd_cents: Some(42_00),
             offchain_usd_fetched_at: Some(now),
             offchain_gross_usd_cents: Some(50_00),

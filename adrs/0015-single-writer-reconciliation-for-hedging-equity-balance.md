@@ -36,8 +36,9 @@ Existing mechanisms this fix builds on:
   one symbol leaves the rest of the snapshot unaffected, and the watermark
   advances only for symbols that actually applied. A skipped symbol can heal on
   a later poll — but only if that poll _emits_: the `InventorySnapshot`
-  aggregate dedupes unchanged values, which the forget-on-clear mechanism below
-  exists to defeat.
+  aggregate dedupes unchanged values, so a skipped value is retried only once
+  the broker value changes or a restart re-hydrates. A dedupe-defeating retry
+  (forget-on-clear) was prototyped and descoped in review; see Follow-up work.
 - Commit
   [`1937c4b0`](https://github.com/ST0x-Technology/st0x.liquidity/commit/1937c4b0)
   ([PR #690](https://github.com/ST0x-Technology/st0x.liquidity/pull/690)) made
@@ -109,23 +110,6 @@ critical section, which no cross-struct copy could guarantee.
   balance itself is the corrupt entry, recovery preserves the corruption; the
   alternative (an uninitialized venue) is strictly worse and the wrong-balance
   case keeps its existing heal paths.
-- **Forget-on-clear** makes skipped snapshots retryable. The aggregate dedupes
-  unchanged positions, so a snapshot skipped during an open order would never
-  re-emit on its own — leaving the view stale until the position changed or a
-  restart, and silently breaking the "next snapshot heals" assumption both PR
-  #690 and the guards lean on. On gate clear the trigger sends
-  `ForgetOffchainEquity { symbol }`; the aggregate marks the symbol undelivered
-  (in a `offchain_equity_forgotten` set — the cached map stays intact so startup
-  hydration still seeds last-known balances) and the next poll re-emits broker
-  truth with a fresh local stamp, which passes guard 2 and heals within one poll
-  of the clear. The skipped value itself is never replayed — it is ambiguous
-  mid-order data; only fresh reads are ever applied. The forget must target the
-  stream the **poller** writes — keyed by `order_owner`, not the trigger's
-  vault-owner-keyed `registry_id` (the two differ under managed inventory, and a
-  command to any other stream no-ops silently on a virgin aggregate). The id has
-  a single construction site (`polling_snapshot_id`) and travels with the store
-  through `set_snapshot_store`, so the two cannot be wired from different
-  sources.
 - On a fill, the block is released inside the **same write-lock critical
   section** that applied the delta, so no snapshot can interleave. The recorded
   time is `Utc::now()`, not the event's `broker_timestamp` — it is compared
@@ -177,21 +161,17 @@ sustained starvation needs long-resting orders or a leaked flag. The residue:
 failed fill applications grow with volume, and each waits for an unblocked
 snapshot — what open question 1's staleness bound would cap.
 
-**Residual: a restart across an open order re-opens one double-count window.**
-The aggregate records every poll regardless of the view's gate (that is what
-makes forget-on-clear able to heal), so the persisted snapshot can hold the
-mid-order value the live view correctly refused. The guard state that refused it
-is in-memory and unrecoverable (`last_offchain_fill_applied_at` is a local clock
-reading), so hydration applies the ambiguous value, and the still-open order's
-fill then double-counts — for at most one poll, until the fill's forget defeats
-the dedupe and the next emission converges the view. Before this change the
-window was unbounded: the unchanged-value dedupe suppressed every subsequent
-poll, so the double-counted balance persisted until the position happened to
-change or the bot restarted again — this PR narrows it to at most one poll via
-forget-on-clear. Closing it entirely would require the snapshot to record which
-fills it absorbed — the same missing broker-side ordering as alternative C.
-Pinned by `restart_with_mid_order_snapshot_heals_within_one_poll`, which asserts
-the heal as the contract.
+**Residual: a restart across an open order re-opens the double-count window.**
+The aggregate records every poll regardless of the view's gate, so the persisted
+snapshot can hold the mid-order value the live view correctly refused. The guard
+state that refused it is in-memory and unrecoverable
+(`last_offchain_fill_applied_at` is a local clock reading), so hydration applies
+the ambiguous value and the still-open order's fill then double-counts. The
+unchanged-value dedupe suppresses subsequent polls, so the drift persists until
+the broker value changes or the next restart re-hydrates. Bounding this window
+needs the descoped retry mechanism (Follow-up work); closing it entirely would
+require the snapshot to record which fills it absorbed — the same missing
+broker-side ordering as alternative C.
 
 **It extends the lifetime of pre-existing drift.** The guard rejects the
 symbol's whole snapshot, not just the contested fill, so unrelated drift loses
@@ -260,12 +240,22 @@ To settle within the scope of this change.
 
 Out of scope here; each is its own change.
 
-1. **The cash leg is unguarded.** The fill applies a mirrored USDC delta at the
+1. **Skipped-snapshot retry (forget-on-clear) — descoped in review.** A
+   mechanism to defeat the aggregate's unchanged-value dedupe after a gate clear
+   (new `ForgetOffchainEquity` command + `OffchainEquityForgotten` event) was
+   implemented and then removed: review surfaced edge cases (the poller-stream
+   targeting under split owners among them) that need their own design pass.
+   Until it lands, a snapshot skipped during an open order is retried only when
+   the broker value changes or a restart re-hydrates. Prior art recoverable from
+   git history (commits `be897734`/`48346b7c` and descendants; tests
+   `skipped_offchain_snapshot_heals_after_gate_clears_despite_dedupe`,
+   `restart_with_mid_order_snapshot_heals_within_one_poll`).
+2. **The cash leg is unguarded.** The fill applies a mirrored USDC delta at the
    Hedging venue, and the `OffchainUsd` snapshot comes from the _same_
    `get_inventory()` call, so it is double-counted in exactly the same window.
    Only the equity leg is guarded here. The cash balance is venue-level rather
    than per-symbol, so it needs a different mechanism.
-2. **Parallel state elsewhere.** `InventoryView` and `RebalancingService` hold
+3. **Parallel state elsewhere.** `InventoryView` and `RebalancingService` hold
    several other overlapping representations: `active_mints` vs `mint_tracking`,
    `active_redemptions` vs `redemption_tracking`, and `active_usdc_rebalance` vs
    `usdc_tracking` vs `usdc_in_progress`. The USDC triple already caused a

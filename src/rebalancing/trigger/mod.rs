@@ -37,9 +37,7 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::inventory::projection::InventoryProjectionError;
-use crate::inventory::snapshot::{
-    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
-};
+use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
@@ -485,16 +483,6 @@ pub(crate) struct RebalancingService {
     /// config, mirroring `set_stores`); `None` only in tests that do not
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
-    /// Sends `ForgetOffchainEquity` when the offchain-order gate clears, so a
-    /// snapshot skipped during the open order is re-emitted by the next poll
-    /// despite the aggregate's unchanged-value dedupe. The store travels with
-    /// the id of the stream the POLLER writes (keyed by `order_owner`, not
-    /// this service's vault-owner-keyed `registry_id` — the two differ under
-    /// managed inventory, and a forget sent to any other stream silently
-    /// no-ops). Set after construction via `set_snapshot_store` (mirroring
-    /// `set_stores`); `None` only in tests that do not exercise snapshot
-    /// healing.
-    snapshot_store: RwLock<Option<(Arc<Store<InventorySnapshot>>, InventorySnapshotId)>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
@@ -645,7 +633,6 @@ impl RebalancingService {
             registry_id,
             inventory,
             freeze_status: RwLock::new(None),
-            snapshot_store: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             notifier,
@@ -697,59 +684,6 @@ impl RebalancingService {
     /// (the reader wraps the issuance client built from config).
     pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
         *self.freeze_status.write().await = Some(reader);
-    }
-
-    /// Wires the shared `InventorySnapshot` store (the single instance built
-    /// in `Conductor::start`) together with the id of the stream the poller
-    /// writes, so gate clears can defeat the aggregate's unchanged-value
-    /// dedupe. The id must come from `polling_snapshot_id` — the poller's
-    /// stream is keyed by `order_owner`, and a forget sent to any other
-    /// stream silently no-ops. Called by the conductor after construction.
-    pub(crate) async fn set_snapshot_store(
-        &self,
-        store: Arc<Store<InventorySnapshot>>,
-        snapshot_id: InventorySnapshotId,
-    ) {
-        *self.snapshot_store.write().await = Some((store, snapshot_id));
-    }
-
-    /// Ask the snapshot aggregate to forget its cached offchain positions for
-    /// `symbol`, so the next poll re-emits broker truth even if unchanged.
-    /// Called when the offchain-order gate clears: any snapshot polled while
-    /// the order was open was skipped by the view but recorded by the
-    /// aggregate, and would otherwise never be retried.
-    ///
-    /// Best-effort: on failure the balance stays stale until the broker value
-    /// changes or the bot restarts, which is the pre-forget status quo.
-    async fn forget_offchain_equity(&self, symbol: &Symbol) {
-        let wired = self.snapshot_store.read().await.clone();
-        let Some((store, snapshot_id)) = wired else {
-            warn!(
-                target: "rebalance",
-                %symbol,
-                "No snapshot store wired; a snapshot skipped during the open \
-                 order cannot be retried until the broker value changes"
-            );
-            return;
-        };
-
-        if let Err(error) = store
-            .send(
-                &snapshot_id,
-                InventorySnapshotCommand::ForgetOffchainEquity {
-                    symbol: symbol.clone(),
-                },
-            )
-            .await
-        {
-            warn!(
-                target: "rebalance",
-                %symbol,
-                ?error,
-                "Failed to forget cached offchain equity; the balance may stay \
-                 stale until the broker value changes"
-            );
-        }
     }
 
     /// Whether a freeze-status reader has been wired. Lets the conductor's
@@ -1711,8 +1645,7 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
-            | OffchainEquityForgotten { .. } => inventory.clone().apply_snapshot_event(&event, now),
+            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1825,8 +1758,7 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
-            | OffchainEquityForgotten { .. } => {
+            | BaseWalletWrappedEquity { .. } => {
                 inventory
                     .clone()
                     .force_apply_snapshot_event(&event, now, recovery_reason)
@@ -2053,9 +1985,7 @@ impl RebalancingService {
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
-            | InflightEquity { .. }
-            // Aggregate-cache bookkeeping; no balance changed.
-            | OffchainEquityForgotten { .. } => {}
+            | InflightEquity { .. } => {}
         }
     }
 
@@ -2204,7 +2134,6 @@ impl Reactor for RebalancingService {
                             .write_without_broadcast()
                             .await
                             .clear_offchain_order_pending(&symbol, None);
-                        self.forget_offchain_equity(&symbol).await;
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
@@ -2262,11 +2191,6 @@ impl Reactor for RebalancingService {
                             "Inventory update failed for offchain fill; clearing gate anyway and relying on next polling snapshot"
                         );
                     }
-                    // Defeat the aggregate's unchanged-value dedupe so the
-                    // "next polling snapshot" the gate design relies on
-                    // actually emits, even when the broker value is unchanged
-                    // since the poll the view skipped during the open order.
-                    self.forget_offchain_equity(&symbol).await;
                     self.equity_scheduler.enqueue_check(symbol).await;
                     // Only re-check USDC if the cash leg actually applied.
                     // With and_then chaining, inventory_result == Err means
@@ -22422,233 +22346,6 @@ mod tests {
             .collect()
     }
 
-    /// The aggregate dedupes unchanged offchain positions, so a snapshot the
-    /// view skipped during an open hedge order is never re-emitted on its
-    /// own: once the gate clears, an unchanged broker state produces no new
-    /// event and the view stays stale until the position changes or the bot
-    /// restarts. The skipped broker truth must still reach the view within
-    /// one poll of the gate clearing.
-    #[tokio::test]
-    async fn skipped_offchain_snapshot_heals_after_gate_clears_despite_dedupe() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-        // Mirror believes 100. Real broker balance during the hedge is 85:
-        // the post-fill 90 minus 5 shares of external drift the fill delta
-        // cannot know about.
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(20), shares(100))
-            .with_usdc(usdc(5000), usdc(5000));
-
-        let trigger = make_trigger_with_inventory(inventory).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
-        // The trigger's forget-on-clear command must land in the same event
-        // stream this test polls through, so wire a store on the same pool.
-        trigger
-            .set_snapshot_store(
-                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
-                InventorySnapshotId {
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )
-            .await;
-        let mut seen_sequence = 0i64;
-
-        harness
-            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
-            .await
-            .unwrap();
-
-        let snapshot_id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-        let positions = BTreeMap::from([(symbol.clone(), shares(85))]);
-
-        // Poll 1 lands while the order is open: the aggregate emits, the view
-        // skips the symbol (guard 1).
-        send_command::<InventorySnapshot>(
-            &pool,
-            &snapshot_id,
-            InventorySnapshotCommand::OffchainEquity {
-                positions: positions.clone(),
-                fetched_at: Utc::now(),
-            },
-            (),
-        )
-        .await
-        .unwrap();
-        let poll_one = drain_snapshot_events(&pool, &mut seen_sequence).await;
-        assert_eq!(poll_one.len(), 1, "first poll must emit an event");
-        for event in poll_one {
-            harness
-                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
-                .await
-                .unwrap();
-        }
-
-        // The hedge fills. The delta heals only its own 10 shares
-        // (100 -> 90), not the external drift, and clears the gate.
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                make_offchain_fill(shares(10), Direction::Sell),
-            )
-            .await
-            .unwrap();
-
-        // Poll 2 after the gate cleared: the broker still reports 85, so the
-        // aggregate's dedupe decides whether anything is emitted. Deliver
-        // whatever it produces.
-        send_command::<InventorySnapshot>(
-            &pool,
-            &snapshot_id,
-            InventorySnapshotCommand::OffchainEquity {
-                positions,
-                fetched_at: Utc::now(),
-            },
-            (),
-        )
-        .await
-        .unwrap();
-        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
-            harness
-                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
-                .await
-                .unwrap();
-        }
-
-        let hedging = trigger
-            .inventory
-            .read()
-            .await
-            .equity_available(&symbol, Venue::Hedging);
-        assert_eq!(
-            hedging,
-            Some(shares(85)),
-            "after the gate clears, the view must converge to the broker \
-             truth the skipped snapshot carried; 90 means the deduped \
-             snapshot was never retried"
-        );
-    }
-
-    /// Production splits the two owners: the vault registry is keyed by
-    /// `vault_owner` (the inventory contract under managed mode) while the
-    /// poller writes snapshots under `order_owner` (the signing EOA). The
-    /// forget-on-clear command must land on the stream the poller writes —
-    /// sent anywhere else it no-ops on a virgin aggregate with no event, no
-    /// error, and no log, and the skipped snapshot is never retried.
-    #[tokio::test]
-    async fn forget_on_clear_reaches_poller_stream_when_owners_differ() {
-        const TEST_VAULT_OWNER: Address = address!("0x0000000000000000000000000000000000000003");
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default()
-                .with_equity(symbol.clone(), shares(20), shares(100))
-                .with_usdc(usdc(5000), usdc(5000)),
-            event_sender,
-        ));
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            VaultRegistryId {
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_VAULT_OWNER,
-            },
-            inventory,
-            Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(NoopNotifier),
-        ));
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
-        trigger
-            .set_snapshot_store(
-                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
-                InventorySnapshotId {
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )
-            .await;
-        let mut seen_sequence = 0i64;
-
-        harness
-            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
-            .await
-            .unwrap();
-
-        // The poller's stream is keyed by the ORDER owner, not the vault
-        // owner the registry uses.
-        let poller_snapshot_id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-        let positions = BTreeMap::from([(symbol.clone(), shares(85))]);
-        send_command::<InventorySnapshot>(
-            &pool,
-            &poller_snapshot_id,
-            InventorySnapshotCommand::OffchainEquity {
-                positions: positions.clone(),
-                fetched_at: Utc::now(),
-            },
-            (),
-        )
-        .await
-        .unwrap();
-        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
-            harness
-                .receive::<InventorySnapshot>(poller_snapshot_id.clone(), event)
-                .await
-                .unwrap();
-        }
-
-        // Fill clears the gate; the forget must target the poller's stream.
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                make_offchain_fill(shares(10), Direction::Sell),
-            )
-            .await
-            .unwrap();
-
-        // Next poll, unchanged value: only a forget on the poller's stream
-        // defeats the dedupe here.
-        send_command::<InventorySnapshot>(
-            &pool,
-            &poller_snapshot_id,
-            InventorySnapshotCommand::OffchainEquity {
-                positions,
-                fetched_at: Utc::now(),
-            },
-            (),
-        )
-        .await
-        .unwrap();
-        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
-            harness
-                .receive::<InventorySnapshot>(poller_snapshot_id.clone(), event)
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            trigger
-                .inventory
-                .read()
-                .await
-                .equity_available(&symbol, Venue::Hedging),
-            Some(shares(85)),
-            "the forget must land on the stream the poller writes; 90 means \
-             it no-opped on a different stream and the dedupe swallowed the \
-             retry"
-        );
-    }
-
     /// The reverse race through the production stamping path. The aggregate
     /// stamps `fetched_at` when it handles the command -- after the broker
     /// read -- so a read taken before the fill can be stamped after the fill
@@ -22667,15 +22364,6 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
-        trigger
-            .set_snapshot_store(
-                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
-                InventorySnapshotId {
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )
-            .await;
         let mut seen_sequence = 0i64;
 
         harness
@@ -22885,138 +22573,6 @@ mod tests {
             "a symbol with an open hedge order must still hydrate its \
              offchain balance from the persisted snapshot; None means the \
              seeded gate blocked hydration"
-        );
-    }
-
-    /// Restart with a snapshot persisted while the hedge order was OPEN. The
-    /// persisted value is ambiguous mid-order data and the guard state that
-    /// refused it live did not survive the restart, so hydration applies it
-    /// and the fill's delta transiently double-counts -- an accepted,
-    /// bounded residual. The contract this test pins is the heal: the fill's
-    /// gate-clear forgets the cached positions, so the first post-fill poll
-    /// re-emits and converges the view to broker truth within one cycle.
-    #[tokio::test]
-    async fn restart_with_mid_order_snapshot_heals_within_one_poll() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
-        let pool = crate::test_utils::setup_test_db().await;
-        trigger
-            .set_snapshot_store(
-                Arc::new(test_store::<InventorySnapshot>(pool.clone(), ())),
-                InventorySnapshotId {
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )
-            .await;
-        let mut seen_sequence = 0i64;
-
-        // Previous run: order placed, then a poll captured the POST-FILL 90
-        // while the order was still open (the live view refused it; the
-        // aggregate recorded it), then the bot died before observing the fill.
-        let position_store = test_store::<Position>(pool.clone(), ());
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::AcknowledgeOnChainFill {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 1,
-                    },
-                    amount: shares(10),
-                    direction: Direction::Buy,
-                    price_usdc: float!(150),
-                    block_timestamp: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares: Positive::new(shares(10)).unwrap(),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-        let snapshot_id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-        send_command::<InventorySnapshot>(
-            &pool,
-            &snapshot_id,
-            InventorySnapshotCommand::OffchainEquity {
-                positions: BTreeMap::from([(symbol.clone(), shares(90))]),
-                fetched_at: Utc::now(),
-            },
-            (),
-        )
-        .await
-        .unwrap();
-        let projection = Projection::<Position>::sqlite(pool.clone());
-        projection.catch_up().await.unwrap();
-        drain_snapshot_events(&pool, &mut seen_sequence).await;
-
-        // Restart: hydrate applies the ambiguous 90, then recovery gates.
-        crate::conductor::restore_inventory_at_boot(
-            &pool,
-            &trigger.inventory,
-            Some(&trigger),
-            &projection,
-        )
-        .await
-        .unwrap();
-
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
-
-        // The still-open order's fill is observed post-restart. Its delta
-        // double-counts (90 - 10 = 80) because the hydrated 90 had already
-        // absorbed it; the gate-clear sends the forget.
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                make_offchain_fill(shares(10), Direction::Sell),
-            )
-            .await
-            .unwrap();
-
-        // Next poll: broker still reports 90; the forget defeats the dedupe
-        // so the aggregate re-emits and the view converges.
-        send_command::<InventorySnapshot>(
-            &pool,
-            &snapshot_id,
-            InventorySnapshotCommand::OffchainEquity {
-                positions: BTreeMap::from([(symbol.clone(), shares(90))]),
-                fetched_at: Utc::now(),
-            },
-            (),
-        )
-        .await
-        .unwrap();
-        for event in drain_snapshot_events(&pool, &mut seen_sequence).await {
-            harness
-                .receive::<InventorySnapshot>(snapshot_id.clone(), event)
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            trigger
-                .inventory
-                .read()
-                .await
-                .equity_available(&symbol, Venue::Hedging),
-            Some(shares(90)),
-            "the first post-fill poll must heal the restart double-count; 80 \
-             means the forgotten-cache re-emission never applied"
         );
     }
 
