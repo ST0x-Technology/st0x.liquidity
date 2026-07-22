@@ -22215,6 +22215,110 @@ mod tests {
         );
     }
 
+    /// Recovery must leave a gated symbol holding the balance the fill delta
+    /// owns. The reset wipes balances and the force path skips gated
+    /// symbols, so unless the delta-owned balance is carried across the
+    /// reset, the symbol ends recovery with no entry at all — imbalance
+    /// detection then sees an uninitialized venue and rebalancing silently
+    /// stops for that symbol. Mixed snapshot: the ungated symbol must still
+    /// be force-applied.
+    #[tokio::test]
+    async fn snapshot_recovery_keeps_delta_owned_balance_mixed_snapshot() {
+        let gated = Symbol::new("AAPL").unwrap();
+        let ungated = Symbol::new("TSLA").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(gated.clone(), shares(20), shares(100))
+            .with_equity(ungated.clone(), shares(10), shares(50));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .mark_offchain_order_pending(gated.clone());
+
+        let error = RebalancingServiceError::Inventory(InventoryViewError::Equity(
+            InventoryError::InsufficientAvailable {
+                requested: shares(1),
+                available: shares(0),
+            },
+        ));
+        trigger
+            .on_snapshot_recovery(
+                error,
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([
+                        (gated.clone(), shares(90)),
+                        (ungated.clone(), shares(45)),
+                    ]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (gated_balance, ungated_balance) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.equity_available(&gated, Venue::Hedging),
+                view.equity_available(&ungated, Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            gated_balance,
+            Some(shares(100)),
+            "a gated symbol must end recovery with its delta-owned balance; \
+             None means the reset wiped it and the force path skipped it"
+        );
+        assert_eq!(
+            ungated_balance,
+            Some(shares(45)),
+            "an ungated symbol must still be force-applied by recovery"
+        );
+    }
+
+    /// The all-gated variant: every symbol in the failed snapshot has an open
+    /// hedge order, so the force path applies nothing — recovery must still
+    /// end with the delta-owned balance intact, not an empty view.
+    #[tokio::test]
+    async fn snapshot_recovery_keeps_delta_owned_balance_all_gated_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .mark_offchain_order_pending(symbol.clone());
+
+        let error = RebalancingServiceError::Inventory(InventoryViewError::Equity(
+            InventoryError::InsufficientAvailable {
+                requested: shares(1),
+                available: shares(0),
+            },
+        ));
+        trigger
+            .on_snapshot_recovery(
+                error,
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(100)),
+            "an all-gated recovery must not leave the symbol uninitialized"
+        );
+    }
+
     /// Snapshot-error recovery resets the whole view before force-applying
     /// the failed snapshot. The open-hedge gate is fed by Position events,
     /// not snapshots, and nothing re-seeds it after startup — so a recovery
