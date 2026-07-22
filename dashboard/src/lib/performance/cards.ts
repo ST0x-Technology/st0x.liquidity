@@ -138,6 +138,15 @@ export const blockLagCard = (
 
   const { currentLagBlocks, currentLagSampledAt, poll } = report.monitor
 
+  if (currentLagBlocks === null && currentLagSampledAt !== null) {
+    return {
+      title: 'Block lag',
+      primary: '—',
+      secondary: 'cutoff unavailable — ingestion paused',
+      status: 'warning'
+    }
+  }
+
   if (currentLagBlocks === null || currentLagSampledAt === null) {
     return {
       title: 'Block lag',

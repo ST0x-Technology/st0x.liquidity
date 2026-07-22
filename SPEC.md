@@ -583,6 +583,10 @@ hedging decisions.
 Phase 2 adds instrumentation for signals not yet captured: chain tip vs backfill
 checkpoint (block lag), poll-cycle duration and skipped ticks, and RPC/broker
 API latency, persisted in a lightweight telemetry store outside the event store.
+An unavailable ingestion cutoff is recorded as unknown rather than synthesized
+as block zero. Its block lag is therefore absent, and the dashboard surfaces the
+latest unknown-cutoff sample as degraded instead of reporting a healthy zero
+lag.
 
 ### Risk Management
 
