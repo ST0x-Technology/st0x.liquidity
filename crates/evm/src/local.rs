@@ -18,8 +18,9 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
+use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
-use crate::submit::send_with_recovery;
+use crate::submit::{release_in_flight_after_wait, send_with_recovery};
 use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Secrets needed to construct a [`RawPrivateKeyWallet`].
@@ -70,6 +71,10 @@ pub struct RawPrivateKeyWallet<P: Provider> {
     /// `signing_provider` so we can call [`invalidate()`] on "nonce
     /// too low" errors without needing to traverse the filler chain.
     nonce_manager: ResettableNonceManager,
+    /// This wallet's own record of nonces it has assigned to transactions
+    /// not yet confirmed or proven dropped. Shared across clones, same as
+    /// `nonce_manager`.
+    in_flight: InFlightNonces,
     /// Serializes sends from this wallet so concurrent callers cannot
     /// build two transactions at the same nonce. Shared across clones so
     /// every handle to the same address contends on one lock.
@@ -112,6 +117,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
+            in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
             required_confirmations,
         })
@@ -156,6 +162,7 @@ where
         send_with_recovery(
             &self.signing_provider,
             &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.signing_provider.default_signer_address(),
             contract,
@@ -166,8 +173,19 @@ where
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-        let receipt =
-            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await?;
+        let result =
+            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
+
+        release_in_flight_after_wait(
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            tx_hash,
+            &result,
+        )
+        .await;
+
+        let receipt = result?;
 
         info!(target: "wallet", tx_hash = %receipt.transaction_hash, "Transaction confirmed");
 
@@ -204,11 +222,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::Transaction as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::U256;
     use alloy::sol;
 
     use crate::NoOpErrorRegistry;
+    use crate::inflight_nonces::NonceOwnership;
 
     use super::*;
 
@@ -352,6 +372,48 @@ mod tests {
         assert_ne!(
             receipt_a.transaction_hash, receipt_b.transaction_hash,
             "transactions must have different hashes (distinct nonces)"
+        );
+    }
+
+    /// Regression test threading the `in_flight` wiring through the
+    /// concrete wallet type, not just `submit.rs`'s own unit tests (which
+    /// construct an `InFlightNonces` directly and never touch
+    /// `RawPrivateKeyWallet`'s field). A wiring bug at either of
+    /// `send_pending`/`await_receipt`'s call sites into `submit.rs` -- e.g.
+    /// the wrong address, or a stale tx hash -- would compile fine and pass
+    /// every other test in this module, since none of them ever inspect
+    /// `wallet.in_flight`.
+    #[tokio::test]
+    async fn in_flight_tracks_a_real_send_and_releases_it_on_confirm() {
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+
+        let tx_hash = wallet
+            .send_pending(signer_address, Bytes::new(), "in-flight wiring")
+            .await
+            .unwrap();
+
+        let sent_nonce = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("the transaction must be visible immediately after submission")
+            .nonce();
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, sent_nonce),
+            NonceOwnership::Ours,
+            "send_pending must record its own send in in_flight, using this \
+             wallet's own address and the nonce it actually assigned"
+        );
+
+        wallet.await_receipt(tx_hash).await.unwrap();
+
+        assert_ne!(
+            wallet.in_flight.ownership(signer_address, sent_nonce),
+            NonceOwnership::Ours,
+            "await_receipt must release the entry once the wait resolves \
+             definitively, using the same tx hash the send returned"
         );
     }
 
