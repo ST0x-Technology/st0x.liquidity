@@ -121,7 +121,7 @@ use crate::wrapped_equity_recovery::{
 };
 
 pub(crate) use builder::CqrsFrameworks;
-use manifest::QueryManifest;
+use manifest::{BuiltFrameworks, QueryManifest};
 use trading_queues::{EquityRecoveryInputs, TradingJobQueues, setup_trading_job_queues};
 
 /// CQRS/event-store and apalis worker pools over the same SQLite database.
@@ -1445,6 +1445,34 @@ async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
     }
 }
 
+/// Builds the CQRS frameworks behind the query manifest: the dashboard
+/// broadcaster and the four query projections, with the stage-timing read
+/// models caught up to the event log before their reactors go live.
+async fn build_query_frameworks(
+    pool: &SqlitePool,
+    event_sender: broadcast::Sender<Statement>,
+    rebalancing_service: Arc<RebalancingService>,
+    equity_transfer_services: EquityTransferServices,
+) -> anyhow::Result<BuiltFrameworks> {
+    let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+    let hedge_latency = HedgeLatencyProjection::new(pool.clone());
+    let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
+    let equity_timing = EquityTimingProjection::new(pool.clone());
+    let lifecycle_failure = LifecycleFailureProjection::new(pool.clone());
+    catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
+
+    let manifest = QueryManifest::new(
+        rebalancing_service,
+        broadcaster,
+        hedge_latency,
+        rebalance_timing,
+        equity_timing,
+        lifecycle_failure,
+    );
+
+    manifest.build(pool.clone(), equity_transfer_services).await
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -1533,25 +1561,13 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
-        let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
-        let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
-        let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
-        let equity_timing = EquityTimingProjection::new(deps.pool.clone());
-        let lifecycle_failure = LifecycleFailureProjection::new(deps.pool.clone());
-        catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
-
-        let manifest = QueryManifest::new(
+        let built = build_query_frameworks(
+            &deps.pool,
+            deps.event_sender,
             rebalancing_service.clone(),
-            broadcaster,
-            hedge_latency,
-            rebalance_timing,
-            equity_timing,
-            lifecycle_failure,
-        );
-
-        let built = manifest
-            .build(deps.pool.clone(), equity_transfer_services)
-            .await?;
+            equity_transfer_services,
+        )
+        .await?;
 
         rebalancing_service
             .set_stores(
