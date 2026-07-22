@@ -43,25 +43,31 @@
 //! across entirely (no wake before the next boundary) is simply absent from
 //! the series -- coverage is sparse by design, not backfilled.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use apalis::prelude::Status;
 use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, warn};
 
-use st0x_event_sorcery::{AggregateError, LifecycleError, Projection, SendError, Store};
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_event_sorcery::{
+    AggregateError, LifecycleError, LoadAllIdsError, Projection, SendError, Store, load_all_ids,
+};
+use st0x_execution::{FractionalShares, HasZero, Symbol};
 use st0x_float_macro::float;
+use st0x_float_serde::format_float;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped, Wrapper, WrapperError};
 
+use super::read::is_stale_mark;
 use super::{
     PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand, PortfolioSnapshotId,
 };
+use crate::alerts::{Notifier, NotifierError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, InventoryViewError, PollFreshness, PortfolioAsset, PortfolioBalanceRow,
@@ -76,12 +82,23 @@ pub(crate) type PortfolioSnapshotJobQueue = JobQueue<PortfolioSnapshotJob>;
 const USDC_PAR: rain_math_float::Float = float!(1);
 
 /// Buffer added past ET midnight before capturing, so the last poll tick for
-/// the closing day has time to land in the read model.
-const CAPTURE_BUFFER: chrono::Duration = chrono::Duration::minutes(5);
+/// the closing day has time to land in the read model. `pub(crate)` because
+/// the /pnl capital report (`crate::dashboard::pnl`) anchors its
+/// latest-complete-day cutoff to the same boundary.
+pub(crate) const CAPTURE_BUFFER: chrono::Duration = chrono::Duration::minutes(5);
 
 /// Retry backoff when the completeness gate fails (an incomplete
 /// `InventoryView`, expected during startup hydration).
 const HYDRATION_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const ALERT_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// How many ET days back [`bootstrap_portfolio_snapshot`] reconstructs
+/// alert-only jobs for. The recovery exists to close the crash window between
+/// a committed capture and its original alert enqueue -- a window measured in
+/// seconds -- so a week is already generous. Without a bound, every restart
+/// would fan out one job per snapshot day ever captured, growing by one per
+/// day forever.
+const BOOTSTRAP_ALERT_WINDOW_DAYS: i64 = 7;
 
 /// Retry backoff when a job wakes before its own `target_et_day`'s boundary
 /// (a premature scheduler tick). Reuses the same short duration as
@@ -131,6 +148,7 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// what this process has actually polled -- closing the restart-stale
     /// hole [`hydration_gap`] alone cannot see (see that function's doc).
     pub(crate) poll_freshness: PollFreshness,
+    pub(crate) notifier: Arc<dyn Notifier>,
     pub(crate) queue: PortfolioSnapshotJobQueue,
 }
 
@@ -154,6 +172,16 @@ pub(crate) enum PortfolioSnapshotJobError {
     WrappedEquityConversion(#[from] RatioError),
     #[error("failed to read portfolio balances from inventory: {0}")]
     Inventory(#[from] InventoryViewError),
+    #[error("failed to evaluate portfolio snapshot mark usability: {0}")]
+    MarkEvaluation(#[from] rain_math_float::FloatError),
+    #[error("failed to load an already-captured portfolio snapshot: {0}")]
+    SnapshotLoad(#[source] SendError<PortfolioSnapshot>),
+    #[error("portfolio snapshot was already captured but its aggregate state is missing")]
+    MissingCapturedState,
+    #[error("failed to deliver portfolio snapshot alert: {0}")]
+    AlertDelivery(#[from] NotifierError),
+    #[error("failed to load portfolio-snapshot ids for alert recovery: {0}")]
+    SnapshotIds(#[from] LoadAllIdsError),
     #[error(
         "wrapped equity balance present for {symbol} at {location} but no wallet/Wrapper is \
          configured to resolve its vault ratio"
@@ -175,6 +203,8 @@ pub(crate) enum PortfolioSnapshotJobError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PortfolioSnapshotJob {
     pub(crate) target_et_day: NaiveDate,
+    #[serde(default)]
+    alert_only: bool,
 }
 
 impl Job<PortfolioSnapshotCtx> for PortfolioSnapshotJob {
@@ -197,6 +227,20 @@ impl Job<PortfolioSnapshotCtx> for PortfolioSnapshotJob {
 }
 
 impl PortfolioSnapshotJob {
+    fn capture(target_et_day: NaiveDate) -> Self {
+        Self {
+            target_et_day,
+            alert_only: false,
+        }
+    }
+
+    fn alert(target_et_day: NaiveDate) -> Self {
+        Self {
+            target_et_day,
+            alert_only: true,
+        }
+    }
+
     /// The full body of [`Job::perform`], with `now` taken as a parameter
     /// instead of read from the wall clock, so tests can deterministically
     /// exercise time-dependent branches (the freshness-defer escape hatch in
@@ -207,6 +251,10 @@ impl PortfolioSnapshotJob {
         ctx: &PortfolioSnapshotCtx,
         now: DateTime<Utc>,
     ) -> Result<(), PortfolioSnapshotJobError> {
+        if self.alert_only {
+            return self.retry_alert(ctx, now).await;
+        }
+
         let today = et_day(now);
 
         if self.target_et_day > today {
@@ -217,7 +265,7 @@ impl PortfolioSnapshotJob {
             let delay = et_midnight(self.target_et_day)
                 .and_then(|midnight| (midnight + CAPTURE_BUFFER - now).to_std().ok())
                 .unwrap_or(EARLY_WAKE_BACKOFF);
-            return ctx.reschedule(self.target_et_day, delay).await;
+            return ctx.reschedule_capture(self.target_et_day, delay).await;
         }
 
         if self.target_et_day < today {
@@ -258,7 +306,7 @@ impl PortfolioSnapshotJob {
                 target_et_day,
                 "capture-window wait",
             );
-            return ctx.reschedule(target_et_day, delay).await;
+            return ctx.reschedule_capture(target_et_day, delay).await;
         }
 
         // Upper bound: a tick landing more than MAX_FRESHNESS_DEFER past the
@@ -291,7 +339,7 @@ impl PortfolioSnapshotJob {
                 );
             }
             let (delay, next_target_et_day) = next_capture_delay(now);
-            return ctx.reschedule(next_target_et_day, delay).await;
+            return ctx.reschedule_capture(next_target_et_day, delay).await;
         }
 
         // Freshness is checked BEFORE the inventory view is read: the live
@@ -318,7 +366,7 @@ impl PortfolioSnapshotJob {
             // the day on the next tick even if freshness recovers in the
             // skipped interval).
             return ctx
-                .reschedule(target_et_day, capped_retry_backoff(boundary, now))
+                .reschedule_capture(target_et_day, capped_retry_backoff(boundary, now))
                 .await;
         }
 
@@ -340,7 +388,7 @@ impl PortfolioSnapshotJob {
             // passed. Capped the same way as the freshness-gap retry above,
             // for the same reason.
             return ctx
-                .reschedule(target_et_day, capped_retry_backoff(boundary, now))
+                .reschedule_capture(target_et_day, capped_retry_backoff(boundary, now))
                 .await;
         }
 
@@ -353,7 +401,7 @@ impl PortfolioSnapshotJob {
                 &PortfolioSnapshotId(target_et_day),
                 PortfolioSnapshotCommand::Capture {
                     captured_at: now,
-                    rows: marked_rows,
+                    rows: marked_rows.clone(),
                 },
             )
             .await
@@ -377,9 +425,172 @@ impl PortfolioSnapshotJob {
             Err(error) => return Err(PortfolioSnapshotJobError::Capture(error)),
         }
 
+        ctx.reschedule_alert(target_et_day, Duration::ZERO).await?;
         let (delay, next_target_et_day) = next_capture_delay(now);
-        ctx.reschedule(next_target_et_day, delay).await
+        ctx.reschedule_capture(next_target_et_day, delay).await
     }
+
+    /// Defers only failed notification sends ([`AlertDelivery`]): delivery is
+    /// at-least-once and a Telegram outage is expected to heal on its own, so
+    /// the job retries itself on a fixed backoff. Every other failure
+    /// (missing aggregate state, load/command errors, mark evaluation) is
+    /// propagated so apalis's bounded retry and dead-letter machinery sees it
+    /// instead of an unbounded self-reschedule loop.
+    ///
+    /// [`AlertDelivery`]: PortfolioSnapshotJobError::AlertDelivery
+    async fn retry_alert(
+        &self,
+        ctx: &PortfolioSnapshotCtx,
+        now: DateTime<Utc>,
+    ) -> Result<(), PortfolioSnapshotJobError> {
+        match self.deliver_alert(ctx, now).await {
+            Ok(()) => Ok(()),
+            Err(PortfolioSnapshotJobError::AlertDelivery(error)) => {
+                error!(
+                    %error,
+                    et_day = %self.target_et_day,
+                    "Portfolio snapshot alert delivery deferred"
+                );
+                ctx.reschedule_alert(self.target_et_day, ALERT_RETRY_BACKOFF)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn deliver_alert(
+        &self,
+        ctx: &PortfolioSnapshotCtx,
+        now: DateTime<Utc>,
+    ) -> Result<(), PortfolioSnapshotJobError> {
+        let id = PortfolioSnapshotId(self.target_et_day);
+        let snapshot = ctx
+            .portfolio_snapshot
+            .load(&id)
+            .await
+            .map_err(PortfolioSnapshotJobError::SnapshotLoad)?
+            .ok_or(PortfolioSnapshotJobError::MissingCapturedState)?;
+        alert_unusable_marks(ctx, &id, &snapshot, now).await
+    }
+}
+
+/// Why a captured equity row's USD mark cannot value the day. Mutually
+/// exclusive by construction; the metric label and the alert prose both
+/// derive from it, so neither can drift from the other.
+enum UnusableMark {
+    Missing,
+    Stale { observed_at: DateTime<Utc> },
+}
+
+impl UnusableMark {
+    const fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Stale { .. } => "stale",
+        }
+    }
+}
+
+impl std::fmt::Display for UnusableMark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(formatter, "missing"),
+            Self::Stale { observed_at } => {
+                write!(formatter, "stale (last observed {observed_at})")
+            }
+        }
+    }
+}
+
+async fn alert_unusable_marks(
+    ctx: &PortfolioSnapshotCtx,
+    id: &PortfolioSnapshotId,
+    snapshot: &PortfolioSnapshot,
+    now: DateTime<Utc>,
+) -> Result<(), PortfolioSnapshotJobError> {
+    let target_et_day = id.0;
+    let mut unusable = BTreeMap::<Symbol, (rain_math_float::Float, UnusableMark)>::new();
+    for row in &snapshot.captured_rows {
+        let PortfolioAsset::Equity(symbol) = &row.row.asset else {
+            continue;
+        };
+        let balance = (row.row.available + row.row.inflight)?;
+        if balance.is_zero()? {
+            continue;
+        }
+        if balance.is_negative()? {
+            warn!(
+                %target_et_day,
+                %symbol,
+                "Captured equity row has a negative aggregate balance; skipping mark evaluation"
+            );
+            continue;
+        }
+
+        let reason = match (row.usd_mark, row.mark_captured_at) {
+            (Some(_), Some(observed_at))
+                if is_stale_mark(&row.row.asset, observed_at, target_et_day) =>
+            {
+                UnusableMark::Stale { observed_at }
+            }
+            (Some(_), Some(_)) => continue,
+            _ => UnusableMark::Missing,
+        };
+
+        if let Some((total_balance, _)) = unusable.get_mut(symbol) {
+            *total_balance = (*total_balance + balance)?;
+        } else {
+            unusable.insert(symbol.clone(), (balance, reason));
+        }
+    }
+
+    for (symbol, (balance, reason)) in unusable {
+        if snapshot.alerted_symbols.contains(&symbol)
+            || snapshot.corrected_symbols.contains(&symbol)
+        {
+            continue;
+        }
+        let formatted_balance = format_float(&balance)?;
+        if !snapshot.detected_symbols.contains(&symbol) {
+            error!(
+                %target_et_day,
+                %symbol,
+                balance = %formatted_balance,
+                %reason,
+                "Portfolio snapshot captured nonzero equity with an unusable USD mark"
+            );
+            ctx.portfolio_snapshot
+                .send(
+                    id,
+                    PortfolioSnapshotCommand::RecordUnusableMarkDetected {
+                        symbol: symbol.clone(),
+                        detected_at: now,
+                    },
+                )
+                .await?;
+            counter!(
+                "portfolio_snapshot_unusable_mark_total",
+                "symbol" => symbol.to_string(),
+                "reason" => reason.metric_label()
+            )
+            .increment(1);
+        }
+        let message = format!(
+            "🚨 Portfolio snapshot mark {reason}\nET day: {target_et_day}\nSymbol: {symbol}\nTotal contributing balance: {formatted_balance}\nRepair: st0x-cli portfolio-snapshot set --day {target_et_day} --symbol {symbol} ..."
+        );
+        ctx.notifier.notify(&message).await?;
+        ctx.portfolio_snapshot
+            .send(
+                id,
+                PortfolioSnapshotCommand::RecordUnusableMarkAlerted {
+                    symbol: symbol.clone(),
+                    alerted_at: now,
+                },
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 impl PortfolioSnapshotCtx {
@@ -387,14 +598,26 @@ impl PortfolioSnapshotCtx {
     /// both for hydration retries (same `target_et_day`, short backoff) and
     /// for the next day's capture (the next `target_et_day`, computed by
     /// [`next_capture_delay`]).
-    async fn reschedule(
+    async fn reschedule_capture(
         &self,
         target_et_day: NaiveDate,
         delay: Duration,
     ) -> Result<(), PortfolioSnapshotJobError> {
         let mut queue = self.queue.clone();
         queue
-            .push_with_delay(PortfolioSnapshotJob { target_et_day }, delay)
+            .push_with_delay(PortfolioSnapshotJob::capture(target_et_day), delay)
+            .await?;
+        Ok(())
+    }
+
+    async fn reschedule_alert(
+        &self,
+        target_et_day: NaiveDate,
+        delay: Duration,
+    ) -> Result<(), PortfolioSnapshotJobError> {
+        let mut queue = self.queue.clone();
+        queue
+            .push_with_delay(PortfolioSnapshotJob::alert(target_et_day), delay)
             .await?;
         Ok(())
     }
@@ -768,11 +991,9 @@ async fn resolve_marks(
                     *mark
                 } else {
                     let mark = match position_projection.load(symbol).await? {
-                        Some(position) => {
-                            position.last_price.map_or((None, None), |observation| {
-                                (Some(observation.price), Some(observation.observed_at))
-                            })
-                        }
+                        Some(position) => position.last_price.map_or((None, None), |observation| {
+                            (Some(observation.price), Some(observation.observed_at))
+                        }),
                         None => (None, None),
                     };
                     equity_marks.insert(symbol.clone(), mark);
@@ -835,9 +1056,13 @@ fn first_capture(now: DateTime<Utc>) -> (Duration, NaiveDate) {
     (delay, today)
 }
 
-/// Removes any non-terminal [`PortfolioSnapshotJob`] rows and pushes a fresh
-/// one targeting today (via [`first_capture`]), so a restart never silently
-/// skips queuing an attempt at the current ET day. Whether that attempt
+/// Reconstructs alert-only work from retained snapshot aggregates captured
+/// within the last [`BOOTSTRAP_ALERT_WINDOW_DAYS`] ET days, removes stale
+/// capture-loop rows, and pushes a fresh capture targeting today (via
+/// [`first_capture`]). Reconstructing alerts closes the crash window between a
+/// committed capture and its original alert-job enqueue; older days are
+/// outside any plausible crash window and re-enqueuing the whole history
+/// would fan out one job per captured day on every restart. Whether today's attempt
 /// actually captures today depends on `perform_at`'s boundary-anchored
 /// lateness cap ([`exceeds_lateness_cap`]) -- a sufficiently late
 /// restart still leaves today a gap, by design (see this module's doc
@@ -847,19 +1072,50 @@ fn first_capture(now: DateTime<Utc>) -> (Duration, NaiveDate) {
 /// grow by one with every restart. Mirrors `bootstrap_check_positions`'s
 /// purge-then-push shape.
 pub(crate) async fn bootstrap_portfolio_snapshot(
+    cqrs_pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
     queue: &PortfolioSnapshotJobQueue,
 ) -> Result<(), PortfolioSnapshotJobError> {
     purge_pending_portfolio_snapshot_jobs(apalis_pool).await?;
+    purge_portfolio_snapshot_alert_jobs(apalis_pool).await?;
+    let today = et_day(Utc::now());
+    let snapshot_ids = load_all_ids::<PortfolioSnapshot>(cqrs_pool).await?;
+    for id in snapshot_ids {
+        if today.signed_duration_since(id.0).num_days() > BOOTSTRAP_ALERT_WINDOW_DAYS {
+            continue;
+        }
+        queue
+            .clone()
+            .push_with_delay(PortfolioSnapshotJob::alert(id.0), Duration::ZERO)
+            .await?;
+    }
     let (delay, target_et_day) = first_capture(Utc::now());
     queue
         .clone()
-        .push_with_delay(PortfolioSnapshotJob { target_et_day }, delay)
+        .push_with_delay(PortfolioSnapshotJob::capture(target_et_day), delay)
         .await?;
     Ok(())
 }
 
-/// Removes every non-terminal [`PortfolioSnapshotJob`] row: `Pending`,
+async fn purge_portfolio_snapshot_alert_jobs(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> Result<u64, sqlx_apalis::Error> {
+    let deleted = sqlx_apalis::query(
+        "DELETE FROM Jobs WHERE job_type = ? \
+         AND COALESCE(json_extract(CAST(job AS TEXT), '$.alert_only'), 0) = 1 \
+         AND status NOT IN (?, ?)",
+    )
+    .bind(std::any::type_name::<PortfolioSnapshotJob>())
+    .bind(Status::Done.to_string())
+    .bind(Status::Killed.to_string())
+    .execute(apalis_pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
+/// Removes every non-terminal capture-mode [`PortfolioSnapshotJob`] row:
+/// `Pending`,
 /// `Queued` (apalis reserved the row for a worker but no `Running` lock has
 /// landed yet -- reachable whenever the process crashes between
 /// `fetch_next` and `lock`), `Running`, and any `Failed` row still within
@@ -870,8 +1126,9 @@ async fn purge_pending_portfolio_snapshot_jobs(
 ) -> Result<u64, sqlx_apalis::Error> {
     let job_type = std::any::type_name::<PortfolioSnapshotJob>();
     let deleted = sqlx_apalis::query(
-        "DELETE FROM Jobs WHERE job_type = ? AND (status IN (?, ?, ?) \
-         OR (status = ? AND attempts < max_attempts))",
+        "DELETE FROM Jobs WHERE job_type = ? \
+         AND COALESCE(json_extract(CAST(job AS TEXT), '$.alert_only'), 0) = 0 \
+         AND (status IN (?, ?, ?) OR (status = ? AND attempts < max_attempts))",
     )
     .bind(job_type)
     .bind(Status::Pending.to_string())
@@ -888,6 +1145,7 @@ async fn purge_pending_portfolio_snapshot_jobs(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use alloy::primitives::{TxHash, U256};
     use chrono::TimeZone;
@@ -902,6 +1160,7 @@ mod tests {
     use st0x_finance::Usdc;
     use st0x_wrapper::MockWrapper;
 
+    use crate::alerts::CapturingNotifier;
     use crate::inventory::view::{InFlightCashLocation, InFlightEquityLocation};
     use crate::inventory::{Inventory, InventoryView, Operator, Venue};
     use crate::portfolio_snapshot::read::{DayCapital, DayExclusionReason};
@@ -913,6 +1172,26 @@ mod tests {
 
     fn aapl() -> Symbol {
         Symbol::new("AAPL").unwrap()
+    }
+
+    #[derive(Default)]
+    struct FailOnceNotifier {
+        attempts: AtomicUsize,
+        delivered: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Notifier for FailOnceNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(NotifierError::ApiError {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    body: "temporary outage".to_owned(),
+                });
+            }
+            self.delivered.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     fn broadcasting(inventory: InventoryView) -> Arc<BroadcastingInventory> {
@@ -955,6 +1234,7 @@ mod tests {
             // `mark_all_required_fresh` explicitly, the same way they mutate
             // `ctx.inventory` to simulate a poll landing.
             poll_freshness: PollFreshness::new(),
+            notifier: Arc::new(crate::alerts::NoopNotifier),
             queue,
         };
 
@@ -1041,9 +1321,7 @@ mod tests {
     /// A job targeting today's ET day -- the common case for tests that
     /// exercise the capture logic itself, not the day-scheduling logic.
     fn job_for_today() -> PortfolioSnapshotJob {
-        PortfolioSnapshotJob {
-            target_et_day: et_day(Utc::now()),
-        }
+        PortfolioSnapshotJob::capture(et_day(Utc::now()))
     }
 
     /// A deterministic instant just past today's capture boundary, safely
@@ -1093,16 +1371,17 @@ mod tests {
         let first_count = portfolio_snapshot_row_count(&pool, &et_day).await;
         assert_eq!(first_count, 4);
 
-        let run_at_count: i64 =
-            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-                .bind(std::any::type_name::<PortfolioSnapshotJob>())
-                .fetch_one(&apalis_pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            run_at_count, 2,
-            "each perform() call reschedules exactly one follow-up job"
-        );
+        let (capture_jobs, alert_jobs): (i64, i64) = sqlx_apalis::query_as(
+            "SELECT \
+             COUNT(CASE WHEN COALESCE(json_extract(CAST(job AS TEXT), '$.alert_only'), 0) = 0 THEN 1 END), \
+             COUNT(CASE WHEN json_extract(CAST(job AS TEXT), '$.alert_only') = 1 THEN 1 END) \
+             FROM Jobs WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<PortfolioSnapshotJob>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!((capture_jobs, alert_jobs), (2, 2));
     }
 
     /// The catch-all `Err(error) => return Err(...)` arm (write.rs, distinct
@@ -1543,9 +1822,15 @@ mod tests {
     #[tokio::test]
     async fn symbol_with_balance_but_no_price_yet_is_included_with_null_mark() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let (mut ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
 
         job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+        PortfolioSnapshotJob::alert(et_day(Utc::now()))
             .perform_at(&ctx, safe_capture_now())
             .await
             .unwrap();
@@ -1561,6 +1846,97 @@ mod tests {
         .unwrap();
 
         assert_eq!(stored, None, "AAPL has never filled, so no mark is known");
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("mark missing"));
+        assert!(alerts[0].contains("Symbol: AAPL"));
+    }
+
+    #[tokio::test]
+    async fn failed_alert_is_retried_from_the_captured_event_rows() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (mut ctx, _position) =
+            build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
+        let notifier = Arc::new(FailOnceNotifier::default());
+        ctx.notifier = notifier.clone();
+        let job = job_for_today();
+        let now = safe_capture_now();
+
+        job.perform_at(&ctx, now).await.unwrap();
+        assert_eq!(notifier.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(notifier.delivered.load(Ordering::SeqCst), 0);
+        let queued_jobs: Vec<Vec<u8>> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? ORDER BY run_at")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_all(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued_jobs.len(),
+            2,
+            "next capture and alert retry must both survive"
+        );
+        let alert_retry = queued_jobs
+            .iter()
+            .map(|job| serde_json::from_slice::<PortfolioSnapshotJob>(job).unwrap())
+            .find(|job| job.alert_only)
+            .expect("failed notification must enqueue an alert-only retry");
+
+        alert_retry.perform_at(&ctx, now).await.unwrap();
+        assert_eq!(notifier.attempts.load(Ordering::SeqCst), 1);
+        let detection_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'PortfolioSnapshot' \
+             AND event_type = 'PortfolioSnapshotEvent::UnusableMarkDetected'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            detection_count, 1,
+            "detection is persisted despite Telegram failure"
+        );
+
+        PortfolioSnapshotJob::alert(job.target_et_day)
+            .perform_at(&ctx, now)
+            .await
+            .unwrap();
+        assert_eq!(notifier.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(notifier.delivered.load(Ordering::SeqCst), 1);
+
+        PortfolioSnapshotJob::alert(job.target_et_day)
+            .perform_at(&ctx, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            notifier.attempts.load(Ordering::SeqCst),
+            2,
+            "delivery event deduplicates retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn alert_for_uncaptured_day_propagates_instead_of_rescheduling() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (ctx, _position) = build_fully_hydrated_ctx(pool, apalis_pool.clone()).await;
+
+        let error = PortfolioSnapshotJob::alert(et_day(Utc::now()))
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PortfolioSnapshotJobError::MissingCapturedState
+        ));
+        let queued: i64 = sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<PortfolioSnapshotJob>())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, 0,
+            "non-transient alert failures must reach apalis, not self-reschedule"
+        );
     }
 
     /// Distinct from the "never touched" case above: the Position aggregate
@@ -1693,7 +2069,9 @@ mod tests {
     #[tokio::test]
     async fn stale_price_with_recent_non_price_touch_excludes_the_day() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let (mut ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
 
         let block_timestamp = Utc::now() - chrono::Duration::days(10);
         position
@@ -1732,6 +2110,10 @@ mod tests {
             .perform_at(&ctx, safe_capture_now())
             .await
             .unwrap();
+        PortfolioSnapshotJob::alert(et_day(Utc::now()))
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
 
         let today = et_day(Utc::now());
         let days = load_portfolio_days(
@@ -1753,6 +2135,9 @@ mod tests {
             )),
             "a stale price must exclude the day even though the position was touched today"
         );
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("mark stale"));
     }
 
     /// `resolve_marks` must key staleness off `block_timestamp` (the
@@ -1828,12 +2213,14 @@ mod tests {
         let real_before = Utc::now();
         job_for_today().perform_at(&ctx, now).await.unwrap();
 
-        let (run_at, job_bytes): (i64, Vec<u8>) =
-            sqlx_apalis::query_as("SELECT run_at, job FROM Jobs WHERE job_type = ? LIMIT 1")
-                .bind(std::any::type_name::<PortfolioSnapshotJob>())
-                .fetch_one(&apalis_pool)
-                .await
-                .unwrap();
+        let (run_at, job_bytes): (i64, Vec<u8>) = sqlx_apalis::query_as(
+            "SELECT run_at, job FROM Jobs WHERE job_type = ? \
+                 AND COALESCE(json_extract(CAST(job AS TEXT), '$.alert_only'), 0) = 0 LIMIT 1",
+        )
+        .bind(std::any::type_name::<PortfolioSnapshotJob>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
 
         let tomorrow = et_day(now) + Days::new(1);
         let expected_boundary = et_midnight(tomorrow).unwrap() + CAPTURE_BUFFER;
@@ -1912,9 +2299,7 @@ mod tests {
         let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
 
         let today = et_day(Utc::now());
-        let stale_job = PortfolioSnapshotJob {
-            target_et_day: today - Days::new(1),
-        };
+        let stale_job = PortfolioSnapshotJob::capture(today - Days::new(1));
 
         stale_job
             .perform_at(&ctx, safe_capture_now())
@@ -1962,9 +2347,7 @@ mod tests {
         // this run.
 
         let today = et_day(Utc::now());
-        let stale_job = PortfolioSnapshotJob {
-            target_et_day: today - Days::new(1),
-        };
+        let stale_job = PortfolioSnapshotJob::capture(today - Days::new(1));
 
         stale_job
             .perform_at(&ctx, safe_capture_now())
@@ -1999,9 +2382,7 @@ mod tests {
         .await;
 
         let today = et_day(Utc::now());
-        let stale_job = PortfolioSnapshotJob {
-            target_et_day: today - Days::new(1),
-        };
+        let stale_job = PortfolioSnapshotJob::capture(today - Days::new(1));
 
         stale_job
             .perform_at(&ctx, safe_capture_now())
@@ -2042,9 +2423,7 @@ mod tests {
         let (ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool.clone()).await;
 
         let future_day = et_day(Utc::now()) + Days::new(1);
-        let early_job = PortfolioSnapshotJob {
-            target_et_day: future_day,
-        };
+        let early_job = PortfolioSnapshotJob::capture(future_day);
 
         // `reschedule` (via apalis's `push_with_delay`) anchors `run_at` to
         // the REAL wall clock at insertion time, not `now` -- only the
@@ -2079,7 +2458,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_purges_stale_pending_row_and_leaves_exactly_one() {
-        let (_pool, apalis_pool) = setup_test_pools().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
 
         sqlx_apalis::query(
@@ -2104,7 +2483,7 @@ mod tests {
         // to run within that capped window.
         let (expected_delay, _) = first_capture(before);
 
-        bootstrap_portfolio_snapshot(&apalis_pool, &queue)
+        bootstrap_portfolio_snapshot(&pool, &apalis_pool, &queue)
             .await
             .unwrap();
 
@@ -2149,6 +2528,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_recovers_alert_work_after_capture_commit() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
+        let now = Utc::now();
+        let recent_day = et_day(now);
+        let stale_day = recent_day - Days::new(30);
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(pool.clone())))
+            .build(())
+            .await
+            .unwrap();
+        let seeded_row = PortfolioBalanceRowWithMark {
+            row: PortfolioBalanceRow {
+                location: PortfolioLocation::MarketMaking,
+                asset: PortfolioAsset::Equity(aapl()),
+                available: float!(10),
+                inflight: float!(0),
+            },
+            usd_mark: None,
+            mark_captured_at: None,
+        };
+        for (day, captured_at) in [(recent_day, now), (stale_day, now - Days::new(30))] {
+            store
+                .send(
+                    &PortfolioSnapshotId(day),
+                    PortfolioSnapshotCommand::Capture {
+                        captured_at,
+                        rows: vec![seeded_row.clone()],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        bootstrap_portfolio_snapshot(&pool, &apalis_pool, &queue)
+            .await
+            .unwrap();
+
+        let jobs: Vec<Vec<u8>> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_all(&apalis_pool)
+                .await
+                .unwrap();
+        let jobs = jobs
+            .iter()
+            .map(|job| serde_json::from_slice::<PortfolioSnapshotJob>(job).unwrap())
+            .collect::<Vec<_>>();
+        let alert_days = jobs
+            .iter()
+            .filter(|job| job.alert_only)
+            .map(|job| job.target_et_day)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alert_days,
+            vec![recent_day],
+            "only days inside the bootstrap alert window get an alert job"
+        );
+        assert_eq!(jobs.iter().filter(|job| !job.alert_only).count(), 1);
+    }
+
+    #[tokio::test]
     async fn purge_removes_pending_queued_running_and_retryable_failed_but_keeps_terminal() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_type = std::any::type_name::<PortfolioSnapshotJob>();
@@ -2182,6 +2623,21 @@ mod tests {
             0,
         )
         .await;
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (job, id, job_type, status, attempts, max_attempts) \
+             VALUES (?, 'alert-pending', ?, ?, 0, 25)",
+        )
+        .bind(
+            serde_json::to_vec(&PortfolioSnapshotJob::alert(
+                NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .bind(job_type)
+        .bind(Status::Pending.to_string())
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
         insert(
             &apalis_pool,
             job_type,
@@ -2242,7 +2698,8 @@ mod tests {
                 .fetch_all(&apalis_pool)
                 .await
                 .unwrap();
-        assert_eq!(remaining.len(), 3);
+        assert_eq!(remaining.len(), 4);
+        assert!(remaining.contains(&"alert-pending".to_string()));
         assert!(remaining.contains(&"failed-exhausted".to_string()));
         assert!(remaining.contains(&"done-1".to_string()));
         assert!(remaining.contains(&"killed-1".to_string()));
@@ -2697,7 +3154,7 @@ mod tests {
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + chrono::Duration::minutes(1);
 
-        let job = PortfolioSnapshotJob { target_et_day };
+        let job = PortfolioSnapshotJob::capture(target_et_day);
         job.perform_at(&ctx, now).await.unwrap();
 
         assert_eq!(
@@ -2759,7 +3216,7 @@ mod tests {
         let first_tick_now = cap - chrono::Duration::minutes(2);
 
         let real_before = Utc::now();
-        let job = PortfolioSnapshotJob { target_et_day };
+        let job = PortfolioSnapshotJob::capture(target_et_day);
         job.perform_at(&ctx, first_tick_now).await.unwrap();
 
         assert_eq!(
@@ -2786,7 +3243,7 @@ mod tests {
         // have skipped over. The rescheduled job's second tick lands exactly
         // at the cap.
         mark_all_required_fresh(&ctx);
-        let rescheduled = PortfolioSnapshotJob { target_et_day };
+        let rescheduled = PortfolioSnapshotJob::capture(target_et_day);
         rescheduled.perform_at(&ctx, cap).await.unwrap();
 
         assert!(
@@ -2812,7 +3269,7 @@ mod tests {
         let now = boundary - chrono::Duration::seconds(1);
 
         let real_before = Utc::now();
-        let job = PortfolioSnapshotJob { target_et_day };
+        let job = PortfolioSnapshotJob::capture(target_et_day);
         job.perform_at(&ctx, now).await.unwrap();
 
         assert_eq!(
@@ -2861,7 +3318,7 @@ mod tests {
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let cap = boundary + MAX_FRESHNESS_DEFER;
 
-        let job = PortfolioSnapshotJob { target_et_day };
+        let job = PortfolioSnapshotJob::capture(target_et_day);
         job.perform_at(&ctx, cap).await.unwrap();
 
         assert!(
@@ -2887,7 +3344,7 @@ mod tests {
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::seconds(1);
 
-        let job = PortfolioSnapshotJob { target_et_day };
+        let job = PortfolioSnapshotJob::capture(target_et_day);
         job.perform_at(&ctx, now).await.unwrap();
 
         assert_eq!(
@@ -2943,7 +3400,7 @@ mod tests {
         let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
         let now = boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
 
-        let job = PortfolioSnapshotJob { target_et_day };
+        let job = PortfolioSnapshotJob::capture(target_et_day);
         // `reschedule` (via apalis's `push_with_delay`) anchors `run_at` to
         // the REAL wall clock at insertion time, not the fictitious injected
         // `now` -- only the delay's LENGTH is derived from `now`.
@@ -3012,9 +3469,7 @@ mod tests {
         let today_boundary = et_midnight(today).unwrap() + CAPTURE_BUFFER;
         let now = today_boundary + MAX_FRESHNESS_DEFER + chrono::Duration::minutes(1);
 
-        let stale_job = PortfolioSnapshotJob {
-            target_et_day: yesterday,
-        };
+        let stale_job = PortfolioSnapshotJob::capture(yesterday);
         stale_job.perform_at(&ctx, now).await.unwrap();
 
         assert_eq!(
@@ -3060,9 +3515,7 @@ mod tests {
         let today_boundary = et_midnight(today).unwrap() + CAPTURE_BUFFER;
         let now = today_boundary - chrono::Duration::seconds(1);
 
-        let stale_job = PortfolioSnapshotJob {
-            target_et_day: yesterday,
-        };
+        let stale_job = PortfolioSnapshotJob::capture(yesterday);
         stale_job.perform_at(&ctx, now).await.unwrap();
 
         assert_eq!(

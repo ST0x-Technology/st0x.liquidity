@@ -192,7 +192,7 @@ async fn pnl(
         Vec::new()
     };
 
-    build_pnl_report(&state.pool, &query, activities)
+    build_pnl_report(&state.pool, &query, activities, Utc::now())
         .await
         .map(Json)
         .map_err(pnl_error_response)

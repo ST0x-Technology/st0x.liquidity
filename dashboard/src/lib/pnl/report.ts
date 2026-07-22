@@ -233,6 +233,11 @@ export type PnlCapitalSummary = {
   sampleDays: number
   firstSnapshotDay: string | null
   lastSnapshotDay: string | null
+  excludedDays: Array<{
+    etDay: string
+    kind: 'missingSnapshot' | 'missingMark' | 'staleMark'
+    reason: string
+  }>
 }
 
 export type PnlResponse = {

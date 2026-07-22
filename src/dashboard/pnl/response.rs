@@ -81,6 +81,18 @@ pub(crate) struct PnlCapitalSummary {
     pub(crate) sample_days: usize,
     pub(crate) first_snapshot_day: Option<String>,
     pub(crate) last_snapshot_day: Option<String>,
+    pub(crate) excluded_days: Vec<PnlCapitalExcludedDay>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PnlCapitalExcludedDay {
+    pub(crate) et_day: String,
+    /// Stable discriminant ("missingSnapshot" | "missingMark" | "staleMark")
+    /// so consumers can group or badge exclusions without parsing the prose
+    /// `reason`.
+    pub(crate) kind: &'static str,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
