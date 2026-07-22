@@ -45,6 +45,9 @@ mod tokens;
 pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+mod inflight_nonces;
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
 mod submit;
 
 #[cfg(feature = "local-signer")]
