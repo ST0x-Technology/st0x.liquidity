@@ -588,6 +588,122 @@ as block zero. Its block lag is therefore absent, and the dashboard surfaces the
 latest unknown-cutoff sample as degraded instead of reporting a healthy zero
 lag.
 
+### Portfolio Capital and Return Tracking
+
+The `/pnl` report's realized-PnL figures say nothing about the capital deployed
+to earn them. To report a percentage return, the system needs a persisted daily
+snapshot of every balance under management, in USD terms.
+
+**Capture mechanism**: a `PortfolioSnapshot` aggregate, one instance per Eastern
+Time calendar day (`et_day`, `YYYY-MM-DD`), following the same event-sourced
+shape as the hedge-latency pipeline above: a `Captured` domain event (retained
+indefinitely, never compacted) is emitted through the CQRS framework by a
+self-rescheduling job, and a `PortfolioSnapshotProjection` reactor writes the
+flat `portfolio_snapshot` read-model table the `/pnl` capital calculation
+queries. The aggregate itself only tracks "has today been captured" -- routing a
+day's first `Capture` command through `initialize` (emits `Captured`) and any
+subsequent one through `transition` (rejected, idempotent by construction) -- so
+a scheduling bug that fires more than once a day cannot double-record it. Like
+the hedge-latency table above, `PortfolioSnapshotProjection` is forward-
+only/best-effort, not the rebuild-from-events invariant: a crash between the
+`Captured` event committing and this reactor's write can drop that day's
+read-model rows, and because the aggregate permanently rejects any further
+`Capture` for the same day, there is currently no automated path to recover a
+dropped row even though the event itself is retained forever. It must gain the
+same startup catch-up plus full rebuild described above before it can claim that
+invariant.
+
+**Capture scheduling**: the job wakes once per ET day, shortly after that day's
+`00:05` ET boundary, and labels the resulting snapshot with the ET day whose
+balances it is actually reading -- never a day other than the one just observed.
+In steady state this fires every day at the boundary. After a restart or a
+hydration retry that causes the job to wake up once its `target_et_day` has
+already passed (hydration stuck across a midnight boundary, or a late process
+wake), it CATCHES UP to a fresh reading for the CURRENT ET day rather than
+either back-dating a live read under the stale day's id or leaving that day's
+capital sample permanently absent: for a roughly delta-neutral book, deployed
+capital moves slowly and is dominated by deliberate flows, so a same-day reading
+remains a valid proxy for the missed day. A day the bot is down across entirely,
+with no wake before the next boundary, is simply absent from the series --
+coverage is sparse by design, not backfilled.
+
+**What is captured**: every balance the live in-memory inventory view has polled
+at least once that ET day, across both trading venues (onchain Raindex
+market-making, offchain Alpaca hedging) and the wallet-transit locations equity
+or cash may sit at in between (Ethereum wallet, Base wallet unwrapped, Base
+wallet wrapped). A venue never polled produces no row; a venue polled to a
+genuine zero balance still produces a `0` row. The capture only proceeds once
+every configured balance has been polled at least once that run -- a
+partially-hydrated view (e.g. equity seen onchain but not yet offchain) is
+skipped and retried shortly after, since a captured day can never be amended.
+This is a PRESENCE check, not a freshness check: a balance that is merely
+present (e.g. replayed from a persisted `InventorySnapshot` at startup, without
+ever being re-polled this run) still satisfies it. In steady state the capture
+job only wakes shortly after the `00:05` ET boundary, by which point the poller
+has already polled fresh this run, so the residual risk is narrow: a restart
+that hydrates stale data from a persisted snapshot and then captures before the
+poller gets a chance to poll again. A robust poll-driven freshness signal (an
+earlier attempt at a time-window freshness gate was reverted: the underlying
+`InventorySnapshot` suppresses events, and their watermarks, on unchanged
+balances, so the watermark freezes on a static book and the window would
+eventually block every future capture) is accepted as out of scope for v1 and
+tracked as a follow-up.
+
+**Deployed capital definition**: a day's total USD capital is the sum of cash
+(USDC) balances across every location (both trading venues plus every
+wallet-transit point) plus positive equity holdings across every location,
+including the current Alpaca position at the hedging venue. Counter-trades
+consume or replenish that single broker position; they do not create a second,
+separately tracked hedge leg beside the broker inventory. Excluding Alpaca
+equity would therefore make reported capital change merely because inventory
+moved between Alpaca and Raindex, even when total equity under management was
+unchanged. A negative broker position, if present, does not contribute equity
+capital under this long-inventory definition; the collateral or margin
+supporting shorts is not modeled. Hedging-venue USDC (cash) is included -- idle
+or reserved offchain cash is still capital under management.
+
+**USD marks**: USDC is treated as par (`1:1`), matching the reporting-currency
+assumption used elsewhere in `/pnl`. Equity balances are marked at the symbol's
+`last_price_usdc` (the same fill-derived price already tracked on the `Position`
+aggregate) as of capture time. A symbol with a balance but no observed price yet
+is recorded with `usd_mark = NULL` -- never a fabricated zero. Marks are fixed
+permanently at capture time as part of the immutable event payload: a later
+price correction does not retroactively change a previously reported day's
+capital. The persisted `mark_captured_at` is `Position.last_updated`, not a
+dedicated price-observation timestamp -- a precise one is a deferred follow-up.
+`last_updated` is the aggregate's last-touched time and is advanced by several
+non-price events too (offchain order placement/fill/cancel, threshold updates),
+so it is only an upper bound on how recently the price was actually observed:
+the staleness guard below reliably excludes a day once the _position_ has gone
+stale, but is not guaranteed to exclude every day with a genuinely stale price
+if that position was otherwise recently touched.
+
+**Derived `/pnl` fields**: for a queried date range, a day's total USD capital
+is computed only when every nonzero-balance row that day has a known, non-stale
+mark; a day with any missing or stale mark is excluded from the sample entirely
+(never partially), since per-row exclusion would understate capital and inflate
+the reported return. `average_deployed_capital_usd` is the mean of included
+days' totals; `annualized_return_pct` is the range's realized PnL divided by
+that average, annualized by `365 / coverage_days` -- reported only when at least
+two included days span at least two calendar days, AND snapshot coverage fully
+spans the queried date range (`first_snapshot_day` at or before the query's
+`fromDate`, `last_snapshot_day` at or after its `toDate`). The realized-PnL
+numerator is scoped to the whole query range, not to snapshot coverage, so a
+narrower coverage window annualizing a wider-range PnL figure would inflate the
+result -- exactly the dangerous direction this section's fail-fast rules exist
+to prevent. `average_deployed_capital_usd` is still reported (honestly labeled
+by `sample_days`) even when the annualized figure is omitted for this reason. A
+single included day still reports `average_deployed_capital_usd` and
+`coverage_days` (`1`), but `annualized_return_pct` stays `None`: extrapolating
+one day's return by `365x` is exactly the misleading-financial-number failure
+mode the fail-fast rules exist to prevent, so the system reports no annualized
+figure at all for that day rather than an unannualized raw return under the same
+field. Both capital fields are `None`, with an explicit warning, whenever no day
+qualifies, average capital is exactly zero, the query is symbol-filtered (a
+symbol-scoped slice of whole-portfolio capital is not a meaningful denominator),
+or an `as_of_rowid` in the past is requested (capital is always computed from
+the live snapshot table, not watermarked to a historical event position).
+
 ### Risk Management
 
 - Manual override capabilities for emergency situations with proper

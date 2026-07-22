@@ -1238,7 +1238,9 @@ impl PositionEvent {
 
 /// Compares two optional `Float` prices, treating both-absent as equal.
 /// `Float` has no `PartialEq`, so this routes through its fallible `eq`.
-fn option_float_eq(left: Option<Float>, right: Option<Float>) -> bool {
+/// `pub(crate)` so other modules with the same need (e.g.
+/// `portfolio_snapshot`) reuse this instead of redefining it.
+pub(crate) fn option_float_eq(left: Option<Float>, right: Option<Float>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => left.eq(right).unwrap_or(false),

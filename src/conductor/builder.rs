@@ -20,6 +20,7 @@ use st0x_finance::{HasZero, Positive, Usd};
 use st0x_raindex::RaindexService;
 use st0x_registry::SymbolCache;
 use st0x_tokenization::Tokenizer;
+use st0x_wrapper::Wrapper;
 
 use super::Conductor;
 use super::exit::MonitorTaskError;
@@ -35,7 +36,8 @@ use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use crate::alerts::TelegramNotifier;
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
+    BroadcastingInventory, InventoryPollingService, InventorySnapshot, InventorySnapshotId,
+    WalletPollingCtx,
 };
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
@@ -48,6 +50,9 @@ use crate::offchain::order::{
 use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain_trade::OnChainTrade;
+use crate::portfolio_snapshot::{
+    PortfolioSnapshot, PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
+};
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
 use crate::rebalancing::equity::{
@@ -86,6 +91,7 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) snapshot: Arc<Store<InventorySnapshot>>,
+    pub(crate) portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
 }
 
 /// Everything needed to construct a running [`Conductor`].
@@ -97,8 +103,18 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
+    /// The live cross-venue inventory view. Not carried by [`CqrsFrameworks`]
+    /// (that struct holds only CQRS stores/projections) -- the
+    /// [`PortfolioSnapshotCtx`] job context reads it directly each tick.
+    pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// `None` only when no wallet is configured (the bot can then never hold
+    /// onchain wrapped equity in the first place). Independent of whether
+    /// rebalancing itself is enabled -- a wallet can be configured for
+    /// trading alone (`TradingMode::Standalone`), and market making still
+    /// holds wrapped vault shares onchain in that mode.
+    pub(crate) wrapper: Option<Arc<dyn Wrapper>>,
     pub(crate) shutdown_token: CancellationToken,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) failure_injector: FailureInjector,
@@ -159,6 +175,7 @@ pub(crate) fn spawn<Prov, Exec>(
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
     check_positions_queue: CheckPositionsJobQueue,
+    portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
@@ -217,6 +234,11 @@ where
     } = configured_inventory_vaults(&context.ctx);
 
     let wallet_polling = context.wallet_polling;
+    // Captured before `wallet_polling` moves into `InventoryPollingService`
+    // below: `PortfolioSnapshotCtx`'s hydration gate needs to know whether
+    // wallet-transit locations are polled at all, from the same source the
+    // live poller itself reads.
+    let wallet_polling_enabled = wallet_polling.is_some();
     let tokenizer = context.tokenizer;
 
     let mut polling_service = InventoryPollingService::new(
@@ -230,7 +252,7 @@ where
         tokenizer,
         reserved_cash,
     )
-    .with_configured_equity_symbols(configured_equity_symbols)
+    .with_configured_equity_symbols(configured_equity_symbols.clone())
     .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults);
 
     if let Some(rebalancing_service) = &rebalancing_service {
@@ -311,6 +333,17 @@ where
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
     });
 
+    let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
+        inventory: context.inventory.clone(),
+        position_projection: context.frameworks.position_projection.clone(),
+        portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
+        wrapper: context.wrapper.clone(),
+        configured_equity_symbols,
+        usdc_tracking_enabled: context.ctx.assets.cash.is_some(),
+        wallet_polling_enabled,
+        queue: portfolio_snapshot_queue.clone(),
+    });
+
     let trade_cqrs = super::TradeProcessingCqrs {
         pool: context.pool.clone(),
         onchain_trade: context.frameworks.onchain_trade,
@@ -387,6 +420,7 @@ where
         reconcile_ctx,
         rejection_ctx,
         check_positions_ctx,
+        portfolio_snapshot_ctx,
         rebalancing_check_ctx: rebalancing_service,
         seed_vault_registry_ctx,
         job_queue,
@@ -396,6 +430,7 @@ where
         reconcile_queue,
         rejection_queue,
         check_positions_queue,
+        portfolio_snapshot_queue,
         wrapped_equity_recovery_queue,
         wrapped_equity_recovery_ctx,
         unwrapped_equity_recovery_queue,
@@ -446,6 +481,7 @@ where
     reconcile_ctx: Arc<ReconcileOrderFillCtx>,
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
     check_positions_ctx: Arc<CheckPositionsCtx<Exec>>,
+    portfolio_snapshot_ctx: Arc<PortfolioSnapshotCtx>,
     rebalancing_check_ctx: Option<Arc<RebalancingService>>,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
@@ -455,6 +491,7 @@ where
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
     check_positions_queue: CheckPositionsJobQueue,
+    portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
@@ -493,6 +530,7 @@ where
             reconcile_ctx,
             rejection_ctx,
             check_positions_ctx,
+            portfolio_snapshot_ctx,
             rebalancing_check_ctx,
             seed_vault_registry_ctx,
             job_queue,
@@ -502,6 +540,7 @@ where
             reconcile_queue,
             rejection_queue,
             check_positions_queue,
+            portfolio_snapshot_queue,
             wrapped_equity_recovery_queue,
             wrapped_equity_recovery_ctx,
             unwrapped_equity_recovery_queue,
@@ -546,6 +585,8 @@ where
         let failure_injector_for_unwrapped_equity_recovery = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_check_positions = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_portfolio_snapshot = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_transfer_usdc_to_hedging = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
@@ -687,6 +728,21 @@ where
                         failure_notify_for_check_positions.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_check_positions.clone(),
+                    )
+                })
+                .register(move |index| {
+                    // Best-effort, not supervised (RAI-1457 review fix): a
+                    // daily reporting job must never trip the conductor-wide
+                    // fail-stop and halt trading over a transient capture
+                    // failure. Mirrors `ResumeTokenizationAggregate`'s
+                    // registration below.
+                    build_best_effort_worker!(
+                        ::<PortfolioSnapshotCtx, PortfolioSnapshotJob>,
+                        index,
+                        portfolio_snapshot_queue.clone(),
+                        portfolio_snapshot_ctx.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_portfolio_snapshot.clone(),
                     )
                 });
 

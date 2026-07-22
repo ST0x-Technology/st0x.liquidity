@@ -50,7 +50,7 @@ use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::WrapperService;
+use st0x_wrapper::{Wrapper, WrapperService};
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
@@ -83,6 +83,7 @@ use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
+use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
 use crate::position::{Position, PositionCommand, PositionError, PositionEvent, TradeId};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
@@ -589,8 +590,10 @@ impl Conductor {
             position,
             position_projection,
             snapshot,
+            portfolio_snapshot,
             wallet_polling,
             tokenizer,
+            wrapper,
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
@@ -653,6 +656,7 @@ impl Conductor {
             offchain_order_projection,
             vault_registry,
             snapshot,
+            portfolio_snapshot,
         };
 
         let TradingJobQueues {
@@ -665,6 +669,7 @@ impl Conductor {
             wrapped_equity_recovery_ctx,
             unwrapped_equity_recovery_ctx,
             check_positions_queue,
+            portfolio_snapshot_queue,
         } = setup_trading_job_queues(
             &apalis_pool,
             &job_queue,
@@ -696,8 +701,10 @@ impl Conductor {
             execution_threshold: ctx.execution_threshold,
             frameworks,
             pool,
+            inventory: inventory.clone(),
             wallet_polling,
             tokenizer,
+            wrapper,
             shutdown_token: shutdown_token.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
@@ -735,6 +742,7 @@ impl Conductor {
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
             .check_positions_queue(check_positions_queue)
+            .portfolio_snapshot_queue(portfolio_snapshot_queue)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
@@ -1125,6 +1133,7 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
@@ -1159,8 +1168,17 @@ struct PositionAndRebalancing {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
+    portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// `None` only when no wallet is configured at all: without one, the bot
+    /// can never hold onchain (wrapped) equity in the first place, so the
+    /// portfolio-snapshot capture gate never actually needs to resolve a
+    /// vault ratio in that case (`crate::portfolio_snapshot::write`). `Some`
+    /// regardless of whether rebalancing itself is enabled -- a wallet can be
+    /// configured for trading alone (`TradingMode::Standalone`), and market
+    /// making still holds wrapped vault shares in that mode.
+    wrapper: Option<Arc<dyn Wrapper>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
@@ -1179,6 +1197,18 @@ impl PositionAndRebalancing {
         rebalancing: Option<RebalancingCtx>,
         deps: RebalancingDeps,
     ) -> anyhow::Result<Self> {
+        // Built exactly once, regardless of whether rebalancing is enabled:
+        // daily portfolio capture must happen independent of rebalancing
+        // mode, and the Single-Framework-Instance rule (docs/cqrs.md)
+        // forbids building a second Store<PortfolioSnapshot> in either
+        // branch below.
+        let portfolio_snapshot = StoreBuilder::<PortfolioSnapshot>::new(deps.pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(
+                deps.pool.clone(),
+            )))
+            .build(())
+            .await?;
+
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = deps.ctx.wallet()?;
             let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
@@ -1212,8 +1242,10 @@ impl PositionAndRebalancing {
                 position: infra.position,
                 position_projection: infra.position_projection,
                 snapshot: infra.snapshot,
+                portfolio_snapshot,
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
+                wrapper: Some(infra.wrapper),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
@@ -1231,6 +1263,7 @@ impl PositionAndRebalancing {
         } else {
             let RebalancingDeps {
                 pool,
+                ctx,
                 inventory,
                 event_sender,
                 ..
@@ -1247,12 +1280,28 @@ impl PositionAndRebalancing {
                 .build(())
                 .await?;
 
+            // Rebalancing itself may be disabled (`TradingMode::Standalone`)
+            // while a wallet is still configured for trading alone -- market
+            // making then still holds wrapped vault shares onchain, so the
+            // portfolio-snapshot job still needs a ratio source. Mirrors
+            // `grant_startup_token_approvals`'s wallet-presence check.
+            let wrapper: Option<Arc<dyn Wrapper>> = match ctx.wallet() {
+                Ok(wallet_ctx) => Some(Arc::new(WrapperService::new(
+                    wallet_ctx.base_wallet().clone(),
+                    to_wrapped_equities(&ctx.assets.equities.symbols),
+                ))),
+                Err(CtxError::WalletNotConfigured) => None,
+                Err(error) => return Err(error.into()),
+            };
+
             Ok(Self {
                 position,
                 position_projection,
                 snapshot,
+                portfolio_snapshot,
                 wallet_polling: None,
                 tokenizer: None,
+                wrapper,
                 service: None,
                 recovery_transfer: None,
                 wrapped_equity_recovery_store: None,
@@ -1643,6 +1692,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             tokenizer,
+            wrapper,
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
@@ -5434,6 +5484,12 @@ mod tests {
             .await
             .unwrap();
 
+        let portfolio_snapshot = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(pool.clone())))
+            .build(())
+            .await
+            .unwrap();
+
         (
             CqrsFrameworks {
                 onchain_trade,
@@ -5443,6 +5499,7 @@ mod tests {
                 offchain_order_projection: offchain_order_projection.clone(),
                 vault_registry,
                 snapshot,
+                portfolio_snapshot,
             },
             offchain_order_projection,
         )

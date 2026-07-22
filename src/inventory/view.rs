@@ -532,6 +532,94 @@ pub(crate) enum InFlightEquityLocation {
     BaseWalletWrapped,
 }
 
+/// A destination for USD-denominated balances tracked in a daily portfolio
+/// snapshot (RAI-1457): the two live trading venues, plus the wallet-transit
+/// points equity or cash may sit at in between.
+///
+/// USDC observed in wallet transit is never "wrapped" (no wrapped-USDC
+/// concept exists onchain), so [`InFlightCashLocation::BaseWallet`] maps to
+/// `BaseWalletUnwrapped` here. The primary key `(et_day, location, asset)`
+/// prevents this from colliding with unwrapped equity at the same location,
+/// since `asset` still distinguishes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum PortfolioLocation {
+    MarketMaking,
+    Hedging,
+    EthereumWallet,
+    BaseWalletUnwrapped,
+    BaseWalletWrapped,
+}
+
+impl std::fmt::Display for PortfolioLocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::MarketMaking => "market_making",
+            Self::Hedging => "hedging",
+            Self::EthereumWallet => "ethereum_wallet",
+            Self::BaseWalletUnwrapped => "base_wallet_unwrapped",
+            Self::BaseWalletWrapped => "base_wallet_wrapped",
+        };
+        write!(formatter, "{label}")
+    }
+}
+
+/// The asset held at a [`PortfolioLocation`] in a daily portfolio snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum PortfolioAsset {
+    Usdc,
+    Equity(Symbol),
+}
+
+impl std::fmt::Display for PortfolioAsset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usdc => write!(formatter, "USDC"),
+            Self::Equity(symbol) => write!(formatter, "{symbol}"),
+        }
+    }
+}
+
+/// A single observed balance at a `(location, asset)` pair, ready to be
+/// marked with a USD price and captured into the daily portfolio snapshot's
+/// `Captured` event. `available` and `inflight` are kept as independent
+/// observed facts (per "No Denormalized Columns") -- nothing computed from
+/// them is persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PortfolioBalanceRow {
+    pub(crate) location: PortfolioLocation,
+    pub(crate) asset: PortfolioAsset,
+    pub(crate) available: Float,
+    pub(crate) inflight: Float,
+}
+
+impl PartialEq for PortfolioBalanceRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location
+            && self.asset == other.asset
+            && self.available.eq(other.available).unwrap_or(false)
+            && self.inflight.eq(other.inflight).unwrap_or(false)
+    }
+}
+
+/// Venues paired with their [`PortfolioLocation`] counterpart, in the fixed
+/// order [`InventoryView::to_portfolio_snapshot_rows`] emits them.
+const PORTFOLIO_VENUES: [(Venue, PortfolioLocation); 2] = [
+    (Venue::MarketMaking, PortfolioLocation::MarketMaking),
+    (Venue::Hedging, PortfolioLocation::Hedging),
+];
+
+/// Wallet-transit cash locations in the fixed order rows are emitted.
+const PORTFOLIO_CASH_TRANSIT_LOCATIONS: [InFlightCashLocation; 2] = [
+    InFlightCashLocation::EthereumWallet,
+    InFlightCashLocation::BaseWallet,
+];
+
+/// Wallet-transit equity locations in the fixed order rows are emitted.
+const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [InFlightEquityLocation; 2] = [
+    InFlightEquityLocation::BaseWalletUnwrapped,
+    InFlightEquityLocation::BaseWalletWrapped,
+];
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
@@ -806,6 +894,113 @@ impl InventoryView {
                 inflight_cash,
             },
         }
+    }
+
+    /// Extracts a flat list of observed balances for the daily portfolio
+    /// snapshot (RAI-1457). Mirrors [`Self::to_dto`]'s per-venue iteration,
+    /// but never merges wrapped/unwrapped equity or wallet-transit balances
+    /// -- each remains its own row so a persisted snapshot cannot silently
+    /// misstate a balance.
+    ///
+    /// Only locations that have actually been polled at least once are
+    /// emitted: a venue that was never polled produces no row, while a venue
+    /// polled to a genuine zero balance still produces a `0` row.
+    /// Wallet-transit amounts (`inflight_cash`/`inflight_equity`) are
+    /// point-in-time balances observed via wallet polling, not a venue
+    /// split, so they are recorded on the row's `inflight` field with
+    /// `available` at zero.
+    ///
+    /// Deployed capital counts the FULL book, including any configured cash
+    /// reserve: reserved cash held at the broker is still money under
+    /// management, not capital that has left the portfolio. The Hedging USDC
+    /// row therefore uses `offchain_gross_usd_cents` (the pre-reserve broker
+    /// balance) when known, falling back to the venue's own (reserve-adjusted
+    /// where a reserve is configured) `available` balance only when no gross
+    /// reading exists yet -- matching
+    /// [`Self::check_usdc_imbalance_with_gross_offchain`]'s reasoning for why
+    /// gross, not net, is the right number here.
+    pub(crate) fn to_portfolio_snapshot_rows(&self) -> Vec<PortfolioBalanceRow> {
+        let mut rows = Vec::new();
+
+        for symbol in self.equities.keys().sorted() {
+            let inventory = &self.equities[symbol];
+            for (venue, location) in PORTFOLIO_VENUES {
+                if let Some(balance) = inventory.get_venue(venue) {
+                    rows.push(PortfolioBalanceRow {
+                        location,
+                        asset: PortfolioAsset::Equity(symbol.clone()),
+                        available: balance.available().into(),
+                        inflight: balance.inflight().into(),
+                    });
+                }
+            }
+        }
+
+        for (venue, location) in PORTFOLIO_VENUES {
+            if let Some(balance) = self.usdc.get_venue(venue) {
+                // Matches on `venue` (exactly 2 variants, `MarketMaking` and
+                // `Hedging`), not `location`: `PORTFOLIO_VENUES` can only ever
+                // produce those two `PortfolioLocation` values, so a wildcard
+                // over the 5-variant `PortfolioLocation` would silently cover
+                // wallet-transit variants this loop never actually sees.
+                let available = match venue {
+                    Venue::Hedging => self
+                        .offchain_gross_usd_cents
+                        .and_then(Usdc::from_cents)
+                        .map_or_else(|| balance.available().into(), Float::from),
+                    Venue::MarketMaking => balance.available().into(),
+                };
+                rows.push(PortfolioBalanceRow {
+                    location,
+                    asset: PortfolioAsset::Usdc,
+                    available,
+                    inflight: balance.inflight().into(),
+                });
+            }
+        }
+
+        for cash_location in PORTFOLIO_CASH_TRANSIT_LOCATIONS {
+            if let Some(entry) = self.inflight_cash.get(&cash_location) {
+                rows.push(PortfolioBalanceRow {
+                    location: match cash_location {
+                        InFlightCashLocation::EthereumWallet => PortfolioLocation::EthereumWallet,
+                        InFlightCashLocation::BaseWallet => PortfolioLocation::BaseWalletUnwrapped,
+                    },
+                    asset: PortfolioAsset::Usdc,
+                    available: Usdc::ZERO.into(),
+                    inflight: entry.amount.into(),
+                });
+            }
+        }
+
+        let inflight_equity_symbols: std::collections::BTreeSet<&Symbol> = self
+            .inflight_equity
+            .keys()
+            .map(|(symbol, _)| symbol)
+            .collect();
+        for symbol in inflight_equity_symbols {
+            for equity_location in PORTFOLIO_EQUITY_TRANSIT_LOCATIONS {
+                let Some(entry) = self.inflight_equity.get(&(symbol.clone(), equity_location))
+                else {
+                    continue;
+                };
+                rows.push(PortfolioBalanceRow {
+                    location: match equity_location {
+                        InFlightEquityLocation::BaseWalletUnwrapped => {
+                            PortfolioLocation::BaseWalletUnwrapped
+                        }
+                        InFlightEquityLocation::BaseWalletWrapped => {
+                            PortfolioLocation::BaseWalletWrapped
+                        }
+                    },
+                    asset: PortfolioAsset::Equity(symbol.clone()),
+                    available: FractionalShares::ZERO.into(),
+                    inflight: entry.amount.into(),
+                });
+            }
+        }
+
+        rows
     }
 }
 
@@ -3633,6 +3828,191 @@ mod tests {
             aapl.onchain_available,
             shares(40),
             "Available should reflect the transfer (50 - 10 moved to inflight)"
+        );
+    }
+
+    #[test]
+    fn to_portfolio_snapshot_rows_empty_view_produces_no_rows() {
+        let rows = InventoryView::default().to_portfolio_snapshot_rows();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn to_portfolio_snapshot_rows_populated_view_produces_correct_tuples() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(100), shares(50))
+            .with_usdc(Usdc::new(float!(10000)), Usdc::new(float!(5000)));
+
+        let rows = view.to_portfolio_snapshot_rows();
+
+        assert_eq!(rows.len(), 4);
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::MarketMaking,
+            asset: PortfolioAsset::Equity(aapl.clone()),
+            available: shares(100).into(),
+            inflight: FractionalShares::ZERO.into(),
+        }));
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::Hedging,
+            asset: PortfolioAsset::Equity(aapl),
+            available: shares(50).into(),
+            inflight: FractionalShares::ZERO.into(),
+        }));
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::MarketMaking,
+            asset: PortfolioAsset::Usdc,
+            available: Usdc::new(float!(10000)).into(),
+            inflight: Usdc::ZERO.into(),
+        }));
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::Hedging,
+            asset: PortfolioAsset::Usdc,
+            available: Usdc::new(float!(5000)).into(),
+            inflight: Usdc::ZERO.into(),
+        }));
+    }
+
+    /// A symbol polled to a genuine zero balance at a venue must still
+    /// produce a `0` row -- only a venue that was never polled (`None`) is
+    /// skipped.
+    #[test]
+    fn to_portfolio_snapshot_rows_genuinely_zero_balance_still_produces_a_row() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view =
+            InventoryView::default().with_equity(aapl.clone(), FractionalShares::ZERO, shares(10));
+
+        let rows = view.to_portfolio_snapshot_rows();
+
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::MarketMaking,
+            asset: PortfolioAsset::Equity(aapl),
+            available: FractionalShares::ZERO.into(),
+            inflight: FractionalShares::ZERO.into(),
+        }));
+    }
+
+    /// A venue that was never polled (`None`) must not appear as a row at
+    /// all -- distinct from a polled-to-zero balance.
+    #[test]
+    fn to_portfolio_snapshot_rows_never_polled_venue_produces_no_row() {
+        let spy = Symbol::new("SPY").unwrap();
+        let view = InventoryView {
+            equities: std::iter::once((
+                spy,
+                Inventory {
+                    onchain: Some(venue(75, 0)),
+                    offchain: None,
+                    last_rebalancing: None,
+                },
+            ))
+            .collect(),
+            ..InventoryView::default()
+        };
+
+        let rows = view.to_portfolio_snapshot_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].location, PortfolioLocation::MarketMaking);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.location == PortfolioLocation::Hedging)
+        );
+    }
+
+    /// Wrapped and unwrapped equity balances for the same symbol must never
+    /// collapse into one row -- they are different units until normalized by
+    /// the vault ratio.
+    #[test]
+    fn to_portfolio_snapshot_rows_wrapped_and_unwrapped_equity_never_collapse() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let fetched_at = Utc::now();
+        let mut unwrapped = BTreeMap::new();
+        unwrapped.insert(aapl.clone(), shares(5));
+        let mut wrapped = BTreeMap::new();
+        wrapped.insert(aapl.clone(), shares(7));
+
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                &unwrapped,
+                fetched_at,
+                fetched_at,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletWrapped,
+                &wrapped,
+                fetched_at,
+                fetched_at,
+            );
+
+        let rows = view.to_portfolio_snapshot_rows();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::BaseWalletUnwrapped,
+            asset: PortfolioAsset::Equity(aapl.clone()),
+            available: FractionalShares::ZERO.into(),
+            inflight: shares(5).into(),
+        }));
+        assert!(rows.contains(&PortfolioBalanceRow {
+            location: PortfolioLocation::BaseWalletWrapped,
+            asset: PortfolioAsset::Equity(aapl),
+            available: FractionalShares::ZERO.into(),
+            inflight: shares(7).into(),
+        }));
+    }
+
+    /// Wallet-transit USDC (`inflight_cash`) is emitted as its own row per
+    /// populated location, recorded on `inflight` with `available` at zero.
+    #[test]
+    fn to_portfolio_snapshot_rows_includes_inflight_cash() {
+        let fetched_at = Utc::now();
+        let view = InventoryView::default().set_inflight_cash(
+            InFlightCashLocation::EthereumWallet,
+            Usdc::new(float!(250)),
+            fetched_at,
+            fetched_at,
+        );
+
+        let rows = view.to_portfolio_snapshot_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].location, PortfolioLocation::EthereumWallet);
+        assert_eq!(rows[0].asset, PortfolioAsset::Usdc);
+        let expected_available: Float = Usdc::ZERO.into();
+        let expected_inflight: Float = Usdc::new(float!(250)).into();
+        assert!(rows[0].available.eq(expected_available).unwrap());
+        assert!(rows[0].inflight.eq(expected_inflight).unwrap());
+    }
+
+    /// A configured reserve makes `usdc.offchain.available` the
+    /// reserve-adjusted (net) balance -- deployed capital must still count
+    /// the full, pre-reserve broker cash, so the Hedging row uses
+    /// `offchain_gross_usd_cents`, not that net venue balance.
+    #[test]
+    fn to_portfolio_snapshot_rows_hedging_usdc_uses_gross_cash_not_reserve_adjusted() {
+        let view = InventoryView::default()
+            // The reserve-adjusted venue balance the poller stored after
+            // subtracting a configured reserve from the broker's real cash.
+            .with_usdc(Usdc::ZERO, Usdc::new(float!(800)))
+            .with_offchain_gross_usd_cents(100_000);
+
+        let rows = view.to_portfolio_snapshot_rows();
+
+        let hedging_row = rows
+            .iter()
+            .find(|row| {
+                row.location == PortfolioLocation::Hedging && row.asset == PortfolioAsset::Usdc
+            })
+            .expect("Hedging USDC row must be present");
+        let expected_gross: Float = Usdc::new(float!(1000)).into();
+        assert!(
+            hedging_row.available.eq(expected_gross).unwrap(),
+            "Hedging USDC capital must use gross broker cash (1000), not the \
+             reserve-adjusted venue balance (800)"
         );
     }
 
