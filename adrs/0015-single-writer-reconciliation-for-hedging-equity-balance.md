@@ -100,7 +100,15 @@ critical section, which no cross-struct copy could guarantee.
   state is fed by `Position` events and nothing re-seeds it after startup, so a
   plain `default()` reset would silently clear every open-hedge block and
   re-open the race. Preservation (not re-derivation) because the applied-fill
-  times are local-clock readings no projection stores.
+  times are local-clock readings no projection stores. The reset also carries
+  each gated symbol's **delta-owned Hedging available balance** (inflight
+  zeroed, onchain venue wiped): the force path skips gated symbols and live
+  snapshots are guard-blocked until the gate clears, so a wiped gated balance
+  would have no writer left — the symbol would exit recovery uninitialized and
+  imbalance detection would silently stop for it. Caveat accepted: if that
+  balance itself is the corrupt entry, recovery preserves the corruption; the
+  alternative (an uninitialized venue) is strictly worse and the wrong-balance
+  case keeps its existing heal paths.
 - **Forget-on-clear** makes skipped snapshots retryable. The aggregate dedupes
   unchanged positions, so a snapshot skipped during an open order would never
   re-emit on its own — leaving the view stale until the position changed or a

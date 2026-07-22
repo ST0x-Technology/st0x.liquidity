@@ -1790,10 +1790,13 @@ impl RebalancingService {
             _ => None,
         };
         let mut inventory = self.inventory.write().await;
-        // Reset everything except the offchain-order guard state: it is fed by
-        // Position events, not snapshots, and nothing re-seeds it after
-        // startup, so a plain default() here would clear the open-hedge block
-        // for every symbol and re-open the double-apply race.
+        // Reset everything except the offchain-order guard state and the
+        // delta-owned balances it guards: the state is fed by Position
+        // events, not snapshots, and nothing re-seeds it after startup, so a
+        // plain default() here would clear the open-hedge block for every
+        // symbol and re-open the double-apply race — and since the force
+        // path below skips gated symbols, a wiped gated balance would have
+        // no writer left to restore it.
         *inventory = inventory.reset_preserving_offchain_order_state();
 
         let updated = match &event {
@@ -22357,16 +22360,26 @@ mod tests {
             .await
             .unwrap();
 
-        let (gated, hedging_equity, market_making_usdc) = {
+        let (gated, hedging_equity, market_making_equity, market_making_usdc) = {
             let view = trigger.inventory.read().await;
             (
                 view.has_pending_offchain_order(&symbol),
                 view.equity_available(&symbol, Venue::Hedging),
+                view.equity_available(&symbol, Venue::MarketMaking),
                 view.usdc_available(Venue::MarketMaking),
             )
         };
         assert!(gated, "recovery reset must not clear the open-hedge gate");
-        assert_eq!(hedging_equity, None, "recovery must still reset balances");
+        assert_eq!(
+            hedging_equity,
+            Some(shares(100)),
+            "the gated symbol's delta-owned Hedging balance must survive \
+             recovery for an unrelated asset"
+        );
+        assert_eq!(
+            market_making_equity, None,
+            "recovery must still reset balances the gate does not own"
+        );
         assert_eq!(
             market_making_usdc,
             Some(usdc(500)),

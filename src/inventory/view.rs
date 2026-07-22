@@ -1131,18 +1131,48 @@ impl InventoryView {
     }
 
     /// A fresh default view retaining only the offchain-order guard state
-    /// (pending orders and applied-fill times).
+    /// (pending orders and applied-fill times) and, for each gated symbol,
+    /// the Hedging available balance that state guards.
     ///
     /// Snapshot-error recovery resets the view before force-applying the
     /// failed snapshot. The guard state must survive that reset: it is derived
     /// from the `Position` event stream, not from snapshots, and nothing
     /// re-seeds it after startup — wiping it would re-admit offchain snapshots
     /// for symbols whose hedge order is still open, re-opening the
-    /// double-apply race. Every other field is intentionally defaulted, which
-    /// is why this uses functional-update syntax rather than an exhaustive
-    /// literal: a future field should default here unless it is guard state.
+    /// double-apply race. The delta-owned balance must survive with it: while
+    /// the gate is held, snapshots are skipped, so nothing can repopulate a
+    /// wiped balance — the symbol would sit uninitialized and imbalance
+    /// detection would silently stop for it. Inflight is deliberately NOT
+    /// carried (stuck inflight is the wedge class recovery exists to clear)
+    /// and the onchain venue is left uninitialized (it is not delta-owned and
+    /// nothing blocks its repopulation). Every other field is intentionally
+    /// defaulted, which is why this uses functional-update syntax rather than
+    /// an exhaustive literal: a future field should default here unless it is
+    /// guard state.
     pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
+        let equities = self
+            .equities
+            .iter()
+            .filter(|(symbol, _)| self.pending_offchain_order_symbols.contains(*symbol))
+            .filter_map(|(symbol, inventory)| {
+                inventory.get_venue(Venue::Hedging).map(|balance| {
+                    (
+                        symbol.clone(),
+                        Inventory {
+                            onchain: None,
+                            offchain: Some(VenueBalance::new(
+                                balance.available(),
+                                FractionalShares::ZERO,
+                            )),
+                            last_rebalancing: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+
         Self {
+            equities,
             pending_offchain_order_symbols: self.pending_offchain_order_symbols.clone(),
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
             ..Self::default()
@@ -3295,11 +3325,14 @@ mod tests {
     }
 
     #[test]
-    fn reset_preserves_offchain_order_guard_state_only() {
+    fn reset_preserves_guard_state_and_delta_owned_balances_only() {
         let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
         let applied_at = Utc::now();
 
-        let mut view = InventoryView::default().with_equity(aapl.clone(), shares(20), shares(100));
+        let mut view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(100))
+            .with_equity(tsla.clone(), shares(10), shares(50));
         view.clear_offchain_order_pending(&aapl, Some(applied_at));
         view.mark_offchain_order_pending(aapl.clone());
 
@@ -3311,8 +3344,20 @@ mod tests {
         );
         assert_eq!(
             reset.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "the gated symbol's delta-owned Hedging balance must survive the \
+             reset — nothing can repopulate it while the gate is held"
+        );
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::MarketMaking),
             None,
-            "balances must not survive the reset"
+            "the gated symbol's onchain venue is not delta-owned and must be \
+             wiped like everything else"
+        );
+        assert_eq!(
+            reset.equity_available(&tsla, Venue::Hedging),
+            None,
+            "ungated balances must not survive the reset"
         );
 
         // Guard 2 state must survive too: with the pending flag cleared, a
@@ -3332,9 +3377,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             healed.equity_available(&aapl, Venue::Hedging),
-            None,
+            Some(shares(100)),
             "a snapshot predating the preserved applied-fill time must still \
-             be rejected after the reset"
+             be rejected after the reset — the preserved balance stays"
         );
     }
 
