@@ -5,13 +5,18 @@ on:
   push:
     branches-ignore:
       - 'graphite-base/**'
+      # `external-pr/**` mirrors a fork pull request head so CI can report on
+      # it (see external-pr-ci.yaml). That workflow starts this one through
+      # `workflow_dispatch`, which the branch filter here does not affect. The
+      # mirror push carries a GITHUB_TOKEN and starts nothing by itself, so
+      # this entry only keeps a future push from running CI twice on one SHA.
+      - 'external-pr/**'
 
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}
   cancel-in-progress: true
 
 permissions:
-  id-token: write
   contents: read
 
 # Nix is installed via nix-quick-install-action and both the shared
@@ -30,8 +35,21 @@ jobs:
       # gates all CI and holds the Graphite token, so the SHA freezes both the
       # supply chain and the `skip` output contract (set in dist/index.js but
       # undeclared in the action's action.yml).
+      #
+      # `external-pr/**` mirrors a fork commit that Graphite has never tracked
+      # as part of any stack (see external-pr-ci.yaml). The optimizer's `skip`
+      # contract is undocumented for a branch of that shape, and a `true` from
+      # it would skip the real jobs, which branch protection then reads as a
+      # pass. So do not ask the optimizer at all for a mirror branch.
+      #
+      # The STEP carries this condition, not the job, on purpose. The job still
+      # runs and still succeeds, so no dependent job can be cascade-skipped by
+      # a skipped dependency. `skip` is then simply empty, and every gate below
+      # tests `!= 'true'`, so all of them fall into the run-the-real-checks
+      # bucket.
       - name: Optimize CI
         id: check_skip
+        if: ${{ !startsWith(github.ref_name, 'external-pr/') }}
         uses: withgraphite/graphite-ci-action@9bc969adfd43bb790da3b64b543c78c75cef9689  # v0.0.9
         with:
           graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZATION_TOKEN }}
@@ -113,7 +131,8 @@ jobs:
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
           useDaemon: false
 
       - uses: nix-community/cache-nix-action@v7
@@ -188,7 +207,8 @@ jobs:
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
           useDaemon: false
 
       - uses: nix-community/cache-nix-action@v7
@@ -284,7 +304,8 @@ jobs:
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
           useDaemon: false
 
       - uses: nix-community/cache-nix-action@v7
@@ -352,7 +373,8 @@ jobs:
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
           useDaemon: false
 
       - uses: nix-community/cache-nix-action@v7
@@ -360,6 +382,9 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 8G
+
+      - name: external pull request CI scripts
+        run: ./scripts/test-external-pr-ci.sh
 
       - name: deploy migration invariants
         run: ./scripts/validate-deploy-migration.sh
