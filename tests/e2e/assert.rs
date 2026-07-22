@@ -539,17 +539,15 @@ async fn assert_position_view(
         expected_position.symbol
     );
 
-    let price = position.last_price_usdc.unwrap_or_else(|| {
-        panic!(
-            "last_price_usdc should be set for {}",
-            expected_position.symbol
-        )
-    });
+    let Some(observation) = position.last_price else {
+        panic!("last_price should be set for {}", expected_position.symbol);
+    };
+    let price = observation.price;
     let rounded_price = round_float(price, 2)?;
     let rounded_expected = round_float(expected_position.onchain_price, 2)?;
     assert!(
         rounded_price.eq(rounded_expected).unwrap(),
-        "last_price_usdc for {} should match onchain execution price",
+        "last_price for {} should match onchain execution price",
         expected_position.symbol
     );
 

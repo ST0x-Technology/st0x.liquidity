@@ -26,6 +26,26 @@ use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
 use crate::offchain::order::{CancellationReason, OffchainOrderId};
 
+/// A price economically observed at a specific point in time. Folds
+/// `last_price_usdc` and `last_price_observed_at` into one type so a price
+/// without an observation time (or vice versa) is unrepresentable -- the two
+/// previously had to move in lockstep by discipline alone.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct PriceObservation {
+    #[serde(with = "st0x_float_serde::float_string_serde")]
+    pub price: Float,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for PriceObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PriceObservation")
+            .field("price", &DebugFloat(&self.price))
+            .field("observed_at", &self.observed_at)
+            .finish()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: Symbol,
@@ -70,24 +90,17 @@ pub struct Position {
     #[serde(default)]
     pub pending_acknowledged_trade_ids: BTreeSet<TradeId>,
     pub threshold: ExecutionThreshold,
-    #[serde(
-        serialize_with = "st0x_float_serde::serialize_option_float",
-        deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
-    )]
-    pub last_price_usdc: Option<Float>,
     pub last_updated: Option<DateTime<Utc>>,
-    /// When `last_price_usdc` was economically observed -- set only by the
-    /// events that also set `last_price_usdc` (`OnChainOrderFilled`,
+    /// The most recently economically observed price, paired with when it was
+    /// observed. Set only by the events that carry a price (`OnChainOrderFilled`,
     /// `ManualPositionAdjusted` with a price), unlike `last_updated`, which
     /// advances on every event including price-less ones. Drives
     /// `resolve_marks`' `mark_captured_at` so mark staleness keys off price
     /// recency, not the aggregate's generic last-touched time. `#[serde(default)]`
     /// so legacy (pre-this-field) snapshots deserialize to `None`; the
-    /// `SCHEMA_VERSION` bump discards those snapshots before load, so the
-    /// `last_price_usdc.is_some() == last_price_observed_at.is_some()`
-    /// invariant holds for every aggregate actually reached by `resolve_marks`.
+    /// `SCHEMA_VERSION` bump discards those snapshots before load.
     #[serde(default)]
-    pub last_price_observed_at: Option<DateTime<Utc>>,
+    pub last_price: Option<PriceObservation>,
 }
 
 impl std::fmt::Debug for Position {
@@ -111,9 +124,8 @@ impl std::fmt::Debug for Position {
                 &self.pending_acknowledged_trade_ids,
             )
             .field("threshold", &self.threshold)
-            .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
-            .field("last_price_observed_at", &self.last_price_observed_at)
+            .field("last_price", &self.last_price)
             .finish()
     }
 }
@@ -161,7 +173,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 5;
+    const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -180,9 +192,8 @@ impl EventSourced for Position {
                 last_acknowledged_trade_id: None,
                 pending_acknowledged_trade_ids: BTreeSet::new(),
                 threshold: *threshold,
-                last_price_usdc: None,
                 last_updated: Some(*initialized_at),
-                last_price_observed_at: None,
+                last_price: None,
             }),
 
             _ => None,
@@ -210,13 +221,15 @@ impl EventSourced for Position {
                     net: new_net,
                     accumulated_long: new_accumulated_long,
                     last_acknowledged_trade_id: Some(trade_id.clone()),
-                    last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
                     // block_timestamp, NOT seen_at: the economic time the price
                     // was valid on-chain. seen_at can go fresh on a delayed
                     // catch-up backfill, which would make an old price look
                     // fresh and defeat the staleness gate this field exists for.
-                    last_price_observed_at: Some(*block_timestamp),
+                    last_price: Some(PriceObservation {
+                        price: *price_usdc,
+                        observed_at: *block_timestamp,
+                    }),
                     ..entity.clone()
                 }))
             }
@@ -237,9 +250,11 @@ impl EventSourced for Position {
                     net: new_net,
                     accumulated_short: new_accumulated_short,
                     last_acknowledged_trade_id: Some(trade_id.clone()),
-                    last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
-                    last_price_observed_at: Some(*block_timestamp),
+                    last_price: Some(PriceObservation {
+                        price: *price_usdc,
+                        observed_at: *block_timestamp,
+                    }),
                     ..entity.clone()
                 }))
             }
@@ -385,11 +400,13 @@ impl EventSourced for Position {
                 record_position_gauge(&entity.symbol, target_net);
                 Ok(Some(Self {
                     net: *target_net,
-                    last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
                     last_updated: Some(*adjusted_at),
-                    last_price_observed_at: price_usdc
-                        .map(|_| *adjusted_at)
-                        .or(entity.last_price_observed_at),
+                    last_price: price_usdc
+                        .map(|price| PriceObservation {
+                            price,
+                            observed_at: *adjusted_at,
+                        })
+                        .or(entity.last_price),
                     // A manual reconciliation supersedes any prior failed hedge,
                     // so clear the broker-idempotency anchor. Otherwise the next
                     // hedge could reuse the failed order's client_order_id and be
@@ -663,7 +680,7 @@ impl EventSourced for Position {
                     self.net,
                     target_net,
                     &self.threshold,
-                    self.last_price_usdc,
+                    self.last_price.map(|observation| observation.price),
                     price_usdc,
                 )?;
 
@@ -809,15 +826,16 @@ impl Position {
                 }))
             }
             ExecutionThreshold::DollarValue(threshold_dollars) => {
-                let Some(price) = self.last_price_usdc else {
+                let Some(observation) = self.last_price else {
                     debug!(
                         target: "hedge",
                         net_position = %self.net,
                         threshold_dollars = %threshold_dollars,
-                        "Cannot evaluate ExecutionThreshold::DollarValue: last_price_usdc is None"
+                        "Cannot evaluate ExecutionThreshold::DollarValue: last_price is None"
                     );
                     return Ok(None);
                 };
+                let price = observation.price;
 
                 let net_abs = self.net.abs()?;
                 let dollar_value = (Usdc::new(price) * net_abs.inner())?;
@@ -859,7 +877,7 @@ impl Position {
     /// Enforces optimistic concurrency (the live net must still match what the
     /// operator observed) and ensures a nonzero target under a dollar-value
     /// threshold has a usable price, so the adjusted exposure can actually be
-    /// hedged instead of stalling on a missing `last_price_usdc`.
+    /// hedged instead of stalling on a missing `last_price`.
     fn validate_manual_adjustment(
         expected_net: Option<FractionalShares>,
         current_net: FractionalShares,
@@ -3063,7 +3081,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            option_float_eq(position.last_price_usdc, Some(float!(200))),
+            option_float_eq(
+                position.last_price.map(|observation| observation.price),
+                Some(float!(200))
+            ),
             "manual adjustment should persist the supplied price"
         );
 
@@ -3573,8 +3594,16 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(option_float_eq(position.last_price_usdc, Some(float!(150))));
-        assert_eq!(position.last_price_observed_at, Some(block_timestamp));
+        assert!(option_float_eq(
+            position.last_price.map(|observation| observation.price),
+            Some(float!(150))
+        ));
+        assert_eq!(
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
+            Some(block_timestamp)
+        );
         assert_eq!(position.last_updated, Some(seen_at));
     }
 
@@ -3604,15 +3633,23 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(option_float_eq(position.last_price_usdc, Some(float!(150))));
-        assert_eq!(position.last_price_observed_at, Some(block_timestamp));
+        assert!(option_float_eq(
+            position.last_price.map(|observation| observation.price),
+            Some(float!(150))
+        ));
+        assert_eq!(
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
+            Some(block_timestamp)
+        );
         assert_eq!(position.last_updated, Some(seen_at));
     }
 
     /// Representative sample of the non-price arms (`ThresholdUpdated`,
     /// `OffChainOrderPlaced`, `OffChainOrderFilled`): each reconstructs
     /// `Position` via `..entity.clone()`, which auto-preserves
-    /// `last_price_observed_at` once it exists on the struct -- not a
+    /// `last_price` once it exists on the struct -- not a
     /// per-arm business rule worth asserting one-by-one, so this chains a
     /// few of them and checks the field survives to the end while
     /// `last_updated` keeps advancing.
@@ -3671,7 +3708,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            position.last_price_observed_at,
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
             Some(block_timestamp),
             "non-price events must not touch the price-observation timestamp"
         );
@@ -3700,8 +3739,16 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(option_float_eq(position.last_price_usdc, Some(float!(200))));
-        assert_eq!(position.last_price_observed_at, Some(adjusted_at));
+        assert!(option_float_eq(
+            position.last_price.map(|observation| observation.price),
+            Some(float!(200))
+        ));
+        assert_eq!(
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
+            Some(adjusted_at)
+        );
     }
 
     #[test]
@@ -3738,25 +3785,31 @@ mod tests {
         .unwrap();
 
         assert!(
-            option_float_eq(position.last_price_usdc, Some(float!(150))),
+            option_float_eq(
+                position.last_price.map(|observation| observation.price),
+                Some(float!(150))
+            ),
             "no price on the adjustment must preserve the prior known price"
         );
         assert_eq!(
-            position.last_price_observed_at,
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
             Some(block_timestamp),
             "no price on the adjustment must preserve the prior observation time"
         );
         assert_eq!(position.last_updated, Some(adjusted_at));
     }
 
-    /// The invariant the whole field exists to uphold: a price event followed
-    /// by an unrelated touch keeps `last_price_usdc` and
-    /// `last_price_observed_at` both present (never one without the other),
-    /// with the observation timestamp strictly older than the last-touched
+    /// The `PriceObservation` folding makes presence (`price` and
+    /// `observed_at` always Some/None together) compiler-enforced rather
+    /// than a runtime invariant to test. What remains worth asserting is
+    /// that a price event followed by an unrelated touch leaves the
+    /// observation timestamp strictly older than the last-touched
     /// timestamp -- proving the two have actually decoupled, not just that
     /// both happen to be `Some`.
     #[test]
-    fn price_observed_at_and_last_price_usdc_presence_invariant_holds_after_non_price_touch() {
+    fn price_observation_predates_later_non_price_touch() {
         let block_timestamp = Utc::now();
         let updated_at = block_timestamp + chrono::Duration::hours(1);
         let threshold = one_share_threshold();
@@ -3787,27 +3840,27 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(
-            position.last_price_usdc.is_some(),
-            position.last_price_observed_at.is_some(),
-            "last_price_usdc and last_price_observed_at must be present/absent together"
-        );
         assert!(
-            position.last_price_observed_at < position.last_updated,
+            position
+                .last_price
+                .map(|observation| observation.observed_at)
+                < position.last_updated,
             "the price observation must predate the later non-price touch: \
-             last_price_observed_at = {:?}, last_updated = {:?}",
-            position.last_price_observed_at,
+             last_price.observed_at = {:?}, last_updated = {:?}",
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
             position.last_updated
         );
     }
 
-    /// `#[serde(default)]` on `last_price_observed_at` is load-bearing only
-    /// for a legacy (pre-this-field) snapshot: the `SCHEMA_VERSION` bump
-    /// discards such snapshots before they are ever loaded (a full event
-    /// replay repopulates the field), so this documents *why* the fallback
-    /// exists rather than a path `resolve_marks` can actually reach.
+    /// `#[serde(default)]` on `last_price` is load-bearing only for a legacy
+    /// (pre-fold) snapshot: the `SCHEMA_VERSION` bump discards such
+    /// snapshots before they are ever loaded (a full event replay
+    /// repopulates the field), so this documents *why* the fallback exists
+    /// rather than a path `resolve_marks` can actually reach.
     #[test]
-    fn legacy_snapshot_json_without_price_observed_at_field_deserializes_to_none() {
+    fn legacy_snapshot_json_without_last_price_field_deserializes_to_none() {
         let block_timestamp = Utc::now();
 
         let position = replay::<Position>(vec![
@@ -3830,22 +3883,26 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(position.last_price_observed_at, Some(block_timestamp));
+        assert_eq!(
+            position
+                .last_price
+                .map(|observation| observation.observed_at),
+            Some(block_timestamp)
+        );
 
         let mut snapshot = serde_json::to_value(&position)
             .expect("Position must serialize for this legacy-snapshot fixture");
         snapshot
             .as_object_mut()
             .expect("Position serializes to a JSON object")
-            .remove("last_price_observed_at");
+            .remove("last_price");
 
         let legacy: Position = serde_json::from_value(snapshot)
-            .expect("a v4-shaped snapshot (missing the new field) must still deserialize");
+            .expect("a pre-fold snapshot (missing the new field) must still deserialize");
 
-        assert!(option_float_eq(legacy.last_price_usdc, Some(float!(150))));
-        assert_eq!(
-            legacy.last_price_observed_at, None,
-            "a legacy snapshot with no last_price_observed_at key must default to None"
+        assert!(
+            legacy.last_price.is_none(),
+            "a legacy snapshot with no last_price key must default to None"
         );
     }
 
@@ -3983,9 +4040,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let (direction, shares) = position
@@ -4013,9 +4072,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let (direction, shares) = position
@@ -4043,9 +4104,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -4076,9 +4139,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -4109,9 +4174,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50.7))).unwrap();
@@ -4141,9 +4208,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(7.5))).unwrap();
@@ -4174,9 +4243,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(5))).unwrap();
@@ -4196,7 +4267,7 @@ mod tests {
 
     #[test]
     fn operational_limits_cap_applies_without_price() {
-        // Shares cap works regardless of whether last_price_usdc is available
+        // Shares cap works regardless of whether last_price is available
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(float!(100)),
@@ -4207,9 +4278,8 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: None,
             last_updated: Some(Utc::now()),
-            last_price_observed_at: None,
+            last_price: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -4290,9 +4360,11 @@ mod tests {
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
-            last_price_observed_at: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
         };
 
         let (_, first_shares) = position

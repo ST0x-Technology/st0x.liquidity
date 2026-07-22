@@ -710,7 +710,7 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 /// underlying units and is left untouched.
 ///
 /// `evaluate_day` (`read.rs`) later multiplies each row's balance directly by
-/// `Position.last_price_usdc`, an UNDERLYING share price -- so a wrapped
+/// `Position.last_price`'s price, an UNDERLYING share price -- so a wrapped
 /// balance persisted without this conversion would be valued as if 1 wrapped
 /// share == 1 underlying share, silently wrong once a vault's ratio departs
 /// from 1:1 (dividends, splits, NAV accrual).
@@ -759,14 +759,14 @@ async fn convert_wrapped_equity_rows(
 }
 
 /// Resolves each row's USD mark (decision 7): USDC is par, equity is
-/// `Position.last_price_usdc` as of capture time. A symbol with a balance but
-/// no observed price yet gets `usd_mark: None, mark_captured_at: None` --
+/// `Position.last_price`'s price as of capture time. A symbol with a balance
+/// but no observed price yet gets `usd_mark: None, mark_captured_at: None` --
 /// never a fabricated zero.
 ///
-/// `mark_captured_at` for an equity row is `Position.last_price_observed_at`,
-/// a dedicated price-observation timestamp set only by the events that also
-/// set `last_price_usdc` (`OnChainOrderFilled`, priced `ManualPositionAdjusted`)
-/// -- unlike `last_updated`, which advances on every event including
+/// `mark_captured_at` for an equity row is `Position.last_price`'s
+/// `observed_at`, a dedicated price-observation timestamp set only by the
+/// events that also set the price (`OnChainOrderFilled`, priced
+/// `ManualPositionAdjusted`) -- unlike `last_updated`, which advances on every event including
 /// price-less ones (offchain order placement/fill/cancel, threshold updates).
 /// `read.rs`'s staleness guard (`is_stale_mark`) therefore keys off how
 /// recently the price itself was actually observed, not how recently the
@@ -783,10 +783,9 @@ async fn resolve_marks(
         let (usd_mark, mark_captured_at) = match &row.asset {
             PortfolioAsset::Usdc => (Some(USDC_PAR), Some(captured_at)),
             PortfolioAsset::Equity(symbol) => match position_projection.load(symbol).await? {
-                Some(position) => match position.last_price_usdc {
-                    Some(mark) => (Some(mark), position.last_price_observed_at),
-                    None => (None, None),
-                },
+                Some(position) => position.last_price.map_or((None, None), |observation| {
+                    (Some(observation.price), Some(observation.observed_at))
+                }),
                 None => (None, None),
             },
         };
@@ -1567,13 +1566,14 @@ mod tests {
     }
 
     /// The one branch of `resolve_marks` that reads a real fill-derived price
-    /// out of `Position` and pairs it with `position.last_price_observed_at`:
-    /// this must persist the position's price-observation time, never
-    /// `last_updated` (which a trailing non-price event advances) nor the
-    /// job's own `captured_at`. A trailing `UpdateThreshold` after the fill
-    /// diverges `last_updated` from `last_price_observed_at` so a regression
-    /// that reverted to `last_updated` would be caught, not accidentally pass
-    /// by coincidence of all three timestamps lining up.
+    /// out of `Position` and pairs it with `position.last_price`'s
+    /// `observed_at`: this must persist the position's price-observation
+    /// time, never `last_updated` (which a trailing non-price event
+    /// advances) nor the job's own `captured_at`. A trailing
+    /// `UpdateThreshold` after the fill diverges `last_updated` from the
+    /// price's `observed_at` so a regression that reverted to `last_updated`
+    /// would be caught, not accidentally pass by coincidence of all three
+    /// timestamps lining up.
     #[tokio::test]
     async fn equity_position_with_known_price_persists_its_price_observation_time() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -1605,7 +1605,7 @@ mod tests {
             .unwrap();
 
         // Trailing non-price event: advances last_updated to ~now without
-        // touching last_price_usdc/last_price_observed_at.
+        // touching last_price.
         position
             .send(
                 &aapl(),
@@ -1635,7 +1635,7 @@ mod tests {
         assert_eq!(
             mark_captured_at.as_deref(),
             Some(block_timestamp.to_rfc3339().as_str()),
-            "mark_captured_at must be Position.last_price_observed_at, not last_updated \
+            "mark_captured_at must be Position.last_price's observed_at, not last_updated \
              (which the trailing UpdateThreshold advanced past it)"
         );
     }
@@ -1674,7 +1674,7 @@ mod tests {
             .unwrap();
 
         // Recent, unrelated non-price touch: advances last_updated to ~now
-        // without touching last_price_usdc/last_price_observed_at.
+        // without touching last_price.
         position
             .send(
                 &aapl(),
