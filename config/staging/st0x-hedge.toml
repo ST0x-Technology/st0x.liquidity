@@ -37,20 +37,14 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # with bot-EOA-owned vaults) or "managed" (settle through the shared
 # RaindexInventory, which the bot must operate via OPERATOR_ROLE).
 #
-# Kept "legacy" until the RAI-1198 cutover: the bot's EOA does not hold
-# OPERATOR_ROLE on the shared inventory
-# (0x6b7B523fADd1677413AD92c9404C8F0796bACF6F) yet, so enabling "managed" now
-# would fail the startup preflight and block the whole bot. RAI-1198 should
-# give staging its own inventory redeploy; at that cutover switch this to
-# "managed", set `inventory` to the staging inventory, and flip `vault_owner`
-# below to that same address so a staging bug can't touch prod-owned vaults.
-inventory_mode = "legacy"
+# Staging settles through its dedicated shared inventory. The Turnkey wallet
+# holds OPERATOR_ROLE on this contract; startup fails closed if that changes.
+inventory_mode = "managed"
+inventory = "0x5FE36e6b6c320f8FD0B6109B2315253387DbdeF2"
 # REQUIRED. Owner of the Raindex orders/vaults on-chain (vaultBalance2 /
-# registry / fill match key). Currently the bot's Turnkey wallet
-# (= [wallet].address below) because the vaults are bot-EOA-owned
-# pre-migration; flip to the `inventory` address once RAI-1198 migrates the
-# vaults under it.
-vault_owner = "0x16ca08a5825612aAe805D172a81B1a52b43574bf"
+# registry / fill match key). Managed mode scopes all three to the inventory
+# contract, not the bot's Turnkey wallet.
+vault_owner = "0x5FE36e6b6c320f8FD0B6109B2315253387DbdeF2"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
 # Block confirmations required before a submitted transaction is treated as
@@ -137,7 +131,7 @@ rebalancing = "disabled"
 [assets.equities.RKLB]
 trading = "enabled"
 rebalancing = "enabled"
-wrapped_equity_recovery = "disabled"
+wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 # operational_limit = 1
 vault_id = "0xfab"
@@ -347,3 +341,57 @@ extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0x4DBA41f0feb390F208a85e96168fF5d8aC2b6F5c"
 tokenized_equity_derivative = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
+
+[assets.equities.MU]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x7d89a2DFfDaF9f48A64337C725D925381b431aE2"
+tokenized_equity_derivative = "0x89EcfE9E0728D6b3c5eb0EE7236f8C6F806C7B56"
+
+[assets.equities.AMD]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x50b5225409A55B873fD6C2Fd5880AF5a11acE9b1"
+tokenized_equity_derivative = "0x648042Acd8638E12fEfd51C2b25A9f993f21a612"
+
+[assets.equities.AVGO]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x6088F8ef741AE1f5A61882866f130631b41617E2"
+tokenized_equity_derivative = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
+
+[assets.equities.AMAT]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x98C02B58b7E65EF5a4262d9536162949e3B2E141"
+tokenized_equity_derivative = "0x522DC65c89C9Af4f410BAe01bbf53aF75854a9f9"
+
+[assets.equities.LRCX]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xDdE9346107609A05439A0B59Ab6eD4f7F81a1FBF"
+tokenized_equity_derivative = "0x328B9aFFa511fE26673edBb4fEa37eDaF908A3bc"
+
+[assets.equities.TTWO]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x1a29eD11DF8295D5F3B5F59849FD94caD615E024"
+tokenized_equity_derivative = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
