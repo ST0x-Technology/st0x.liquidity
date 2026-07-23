@@ -4157,6 +4157,13 @@ other, startup fails fast rather than running with a half-configured alert
 channel. A notification delivery failure is logged but never crashes the
 monitor.
 
+After a wrapper donation is confirmed, the bot sends a dividend NAV-bump
+completion notification containing the equity symbol and transaction hash, but
+no share quantity. Delivery is best-effort: a Telegram failure is logged without
+turning the confirmed on-chain operation into a CLI failure. Telegram errors
+never expose the bot-token URL or response body, and an HTTP-success response
+whose Bot API envelope reports `ok: false` is treated as failed delivery.
+
 ### BaseToAlpaca deposit send
 
 The CCTP mint on the BaseToAlpaca leg sets `mintRecipient` to the bot's own

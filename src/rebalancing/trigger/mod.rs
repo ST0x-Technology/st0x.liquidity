@@ -16305,7 +16305,6 @@ mod tests {
             if should_fail {
                 return Err(crate::alerts::NotifierError::ApiError {
                     status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                    body: "simulated transient failure".to_string(),
                 });
             }
 

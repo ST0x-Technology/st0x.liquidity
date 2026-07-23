@@ -1,5 +1,5 @@
-//! Operational alerting: out-of-band notifications for conditions an operator
-//! must react to (currently, a low native-gas balance on the bot wallet).
+//! Operational alerting: out-of-band notifications for conditions and completed
+//! lifecycle operations an operator needs to see.
 //!
 //! The [`Notifier`] trait abstracts the delivery channel; [`TelegramNotifier`]
 //! is the only implementation today. Monitors that raise alerts (see
@@ -17,6 +17,10 @@ pub(crate) use telegram::TelegramNotifier;
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
+use std::sync::Arc;
+use tracing::{debug, info};
+
+use st0x_config::AlertsCtx;
 
 /// Sends an operational alert over some channel.
 ///
@@ -27,14 +31,32 @@ pub(crate) trait Notifier: Send + Sync {
     async fn notify(&self, message: &str) -> Result<(), NotifierError>;
 }
 
+/// Builds the configured operational notification channel.
+///
+/// An absent `[alerts]` section is represented explicitly by [`NoopNotifier`].
+/// If the section is present, construction failures propagate so callers never
+/// silently discard notifications an operator configured.
+pub(crate) fn build_notifier(
+    alerts: Option<&AlertsCtx>,
+) -> Result<Arc<dyn Notifier>, NotifierError> {
+    let Some(alerts) = alerts else {
+        debug!("Operational alerting is not configured; using NoopNotifier");
+        return Ok(Arc::new(NoopNotifier));
+    };
+    let notifier =
+        TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
+    info!("Telegram operational notifier configured");
+    Ok(Arc::new(notifier))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NotifierError {
     #[error("failed to build Telegram HTTP client")]
     ClientBuild(#[source] reqwest::Error),
     #[error("Telegram sendMessage request failed")]
     Request(#[source] reqwest::Error),
-    #[error("Telegram API returned error status {status}: {body}")]
-    ApiError { status: StatusCode, body: String },
+    #[error("Telegram API reported failed delivery with HTTP status {status}")]
+    ApiError { status: StatusCode },
 }
 
 /// A [`Notifier`] that discards every message without error.
