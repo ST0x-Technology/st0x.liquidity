@@ -35,8 +35,9 @@ use turnkey_client::generated::{
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
+use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
-use crate::submit::send_with_recovery;
+use crate::submit::{release_in_flight_after_wait, send_with_recovery};
 use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
@@ -162,6 +163,10 @@ pub struct TurnkeyWallet<P: Provider> {
     /// `signing_provider` so we can call [`invalidate()`] on "nonce
     /// too low" errors without needing to traverse the filler chain.
     nonce_manager: ResettableNonceManager,
+    /// This wallet's own record of nonces it has assigned to transactions
+    /// not yet confirmed or proven dropped. Shared across clones, same as
+    /// `nonce_manager`.
+    in_flight: InFlightNonces,
     /// Serializes sends from this wallet so concurrent callers cannot
     /// build two transactions at the same nonce. Shared across clones so
     /// every handle to the same address contends on one lock.
@@ -229,6 +234,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
+            in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
             address,
             required_confirmations,
@@ -269,6 +275,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
+            in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
             address,
             required_confirmations,
@@ -668,6 +675,7 @@ where
         send_with_recovery(
             &self.signing_provider,
             &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address,
             contract,
@@ -678,8 +686,19 @@ where
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-        let receipt =
-            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await?;
+        let result =
+            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
+
+        release_in_flight_after_wait(
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            tx_hash,
+            &result,
+        )
+        .await;
+
+        let receipt = result?;
 
         info!(target: "wallet", tx_hash = %receipt.transaction_hash, "Transaction confirmed");
 
