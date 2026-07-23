@@ -7765,9 +7765,9 @@ dependencies = [
 
 [[package]]
 name = "turnkey_api_key_stamper"
-version = "0.4.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88ff3d11991690d61cc4c44fb12fa95656bf2a1480be8abbb44d05ee7b75177a"
+checksum = "98a037f2b10b32ddabc83ac250e8a64b08df416b73615eb46bf503e6f3ef06f5"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -7781,9 +7781,9 @@ dependencies = [
 
 [[package]]
 name = "turnkey_client"
-version = "0.4.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9846185545f447fd6ae7b19cc04623b8be9f430e2230950565ad0400b6a62b6"
+checksum = "764836e5d03f4b67127badba0d39bed5d046b50e896ae071b0dd47ce17c790ee"
 dependencies = [
  "mime",
  "prost 0.12.6",
