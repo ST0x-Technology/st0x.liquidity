@@ -121,7 +121,7 @@ use crate::wrapped_equity_recovery::{
 };
 
 pub(crate) use builder::CqrsFrameworks;
-use manifest::QueryManifest;
+use manifest::{BuiltFrameworks, QueryManifest};
 use trading_queues::{EquityRecoveryInputs, TradingJobQueues, setup_trading_job_queues};
 
 /// CQRS/event-store and apalis worker pools over the same SQLite database.
@@ -1273,17 +1273,21 @@ impl PositionAndRebalancing {
     }
 }
 
-/// Wires the dividend freeze guard onto the rebalancing service when enabled.
+/// Wires the dividend freeze guard onto the rebalancing service before its
+/// CQRS frameworks are built, so catch-up cannot observe an unwired fail-open
+/// trigger. Returns the shared reader for the redemption-resume gate, which is
+/// wired after the transfer service's stores exist.
 ///
-/// When disabled, the trigger's `freeze_status` stays `None` and the equity gate
-/// fails open -- an operator escape hatch for an issuance outage that would
-/// otherwise fail closed every equity cycle. Issuance secrets remain mandatory
-/// either way, so re-enabling is a pure plaintext-config change.
-async fn wire_freeze_guard(
+/// When disabled, both `freeze_status` readers stay `None` and the gates fail
+/// open -- an operator escape hatch for an issuance outage that would
+/// otherwise fail closed every equity cycle and hold every redemption resume.
+/// Issuance secrets remain mandatory either way, so re-enabling is a pure
+/// plaintext-config change.
+async fn wire_rebalancing_freeze_guard(
     rebalancing_service: &RebalancingService,
     freeze_check: OperationMode,
     issuance: &IssuanceStatusCtx,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Arc<IssuanceClient>>> {
     match freeze_check {
         OperationMode::Enabled => {
             let reader = Arc::new(IssuanceClient::new(
@@ -1291,18 +1295,20 @@ async fn wire_freeze_guard(
                 issuance.api_key.header_value(),
             )?);
 
-            rebalancing_service.set_freeze_status_reader(reader).await;
+            rebalancing_service
+                .set_freeze_status_reader(reader.clone())
+                .await;
+            Ok(Some(reader))
         }
         OperationMode::Disabled => {
             warn!(
                 target: "rebalance",
-                "Dividend freeze guard is disabled by config; equity rebalancing will \
-                 proceed without consulting issuance"
+                "Dividend freeze guard is disabled by config; equity rebalancing and \
+                 redemption resumes will proceed without consulting issuance"
             );
+            Ok(None)
         }
     }
-
-    Ok(())
 }
 
 /// Builds the rebalancing [`RaindexService`]: writes settle through the shared
@@ -1469,32 +1475,20 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             usdc_notifier.clone(),
         ));
 
-        wire_freeze_guard(
+        let freeze_status_reader = wire_rebalancing_freeze_guard(
             &rebalancing_service,
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
         )
         .await?;
 
-        let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
-        let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
-        let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
-        let equity_timing = EquityTimingProjection::new(deps.pool.clone());
-        let lifecycle_failure = LifecycleFailureProjection::new(deps.pool.clone());
-        catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
-
-        let manifest = QueryManifest::new(
+        let built = build_rebalancing_frameworks(
+            &deps.pool,
+            deps.event_sender,
             rebalancing_service.clone(),
-            broadcaster,
-            hedge_latency,
-            rebalance_timing,
-            equity_timing,
-            lifecycle_failure,
-        );
-
-        let built = manifest
-            .build(deps.pool.clone(), equity_transfer_services)
-            .await?;
+            equity_transfer_services,
+        )
+        .await?;
 
         rebalancing_service
             .recover_pending_offchain_order_symbols(&built.position_projection)
@@ -1517,6 +1511,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             built.mint.clone(),
             built.redemption.clone(),
         ));
+
+        if let Some(reader) = freeze_status_reader {
+            recovery_transfer.set_freeze_status_reader(reader).await;
+        }
 
         // Built outside `QueryManifest`: services depend on mint/redemption stores
         // that the manifest produces.
@@ -1638,6 +1636,34 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             resume_tokenization_queue,
         })
     })
+}
+
+/// Wires the rebalancing read models and builds the CQRS frameworks: catches
+/// the stage-timing projections up to the event log, then hands every query
+/// processor to [`QueryManifest`] so a new one cannot be forgotten.
+async fn build_rebalancing_frameworks(
+    pool: &SqlitePool,
+    event_sender: broadcast::Sender<Statement>,
+    rebalancing_service: Arc<RebalancingService>,
+    equity_transfer_services: EquityTransferServices,
+) -> anyhow::Result<BuiltFrameworks> {
+    let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+    let hedge_latency = HedgeLatencyProjection::new(pool.clone());
+    let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
+    let equity_timing = EquityTimingProjection::new(pool.clone());
+    let lifecycle_failure = LifecycleFailureProjection::new(pool.clone());
+    catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
+
+    let manifest = QueryManifest::new(
+        rebalancing_service,
+        broadcaster,
+        hedge_latency,
+        rebalance_timing,
+        equity_timing,
+        lifecycle_failure,
+    );
+
+    manifest.build(pool.clone(), equity_transfer_services).await
 }
 
 /// Catches the lifecycle-failure read model up to the event log before its
@@ -3683,33 +3709,74 @@ mod tests {
         ))
     }
 
+    async fn freeze_guard_test_transfer() -> CrossVenueEquityTransfer {
+        let (pool, _apalis_pool) = setup_test_pools().await;
+        let raindex: Arc<dyn Raindex> = Arc::new(crate::onchain::mock::MockRaindex::new());
+        let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(MockWrapper::new());
+        let tokenizer: Arc<dyn st0x_tokenization::Tokenizer> =
+            Arc::new(st0x_tokenization::mock::MockTokenizer::new());
+        let vault_lookup = Arc::new(crate::vault_lookup::MockVaultLookup::new());
+
+        let services = crate::rebalancing::equity::EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+
+        CrossVenueEquityTransfer::new(
+            raindex,
+            vault_lookup,
+            tokenizer,
+            wrapper,
+            Address::ZERO,
+            mint_store,
+            redemption_store,
+        )
+    }
+
     #[tokio::test]
-    async fn wire_freeze_guard_enabled_wires_the_reader() {
+    async fn wire_rebalancing_freeze_guard_enabled_returns_reader_for_resume_gate() {
         let service = freeze_guard_test_service().await;
+        let transfer = freeze_guard_test_transfer().await;
         let issuance = test_issuance_status_ctx(Url::parse("http://issuance.test:8000").unwrap());
 
-        wire_freeze_guard(&service, OperationMode::Enabled, &issuance)
+        let reader = wire_rebalancing_freeze_guard(&service, OperationMode::Enabled, &issuance)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("enabled guard must return the shared reader");
 
         assert!(
             service.has_freeze_status_reader().await,
-            "Enabled must wire the issuance freeze-status reader onto the rebalancing service"
+            "Enabled must wire the reader before rebalancing frameworks are built"
+        );
+        transfer.set_freeze_status_reader(reader).await;
+        assert!(
+            transfer.has_freeze_status_reader().await,
+            "The returned reader must wire the later-built redemption resume gate"
         );
     }
 
     #[tokio::test]
-    async fn wire_freeze_guard_disabled_leaves_the_reader_unset() {
+    async fn wire_rebalancing_freeze_guard_disabled_returns_no_reader() {
         let service = freeze_guard_test_service().await;
+        let transfer = freeze_guard_test_transfer().await;
         let issuance = test_issuance_status_ctx(Url::parse("http://issuance.test:8000").unwrap());
 
-        wire_freeze_guard(&service, OperationMode::Disabled, &issuance)
+        let reader = wire_rebalancing_freeze_guard(&service, OperationMode::Disabled, &issuance)
             .await
             .unwrap();
 
+        assert!(reader.is_none());
         assert!(
             !service.has_freeze_status_reader().await,
-            "Disabled must leave the freeze guard unwired so the equity gate fails open"
+            "Disabled must leave the equity trigger gate unwired"
+        );
+        assert!(
+            !transfer.has_freeze_status_reader().await,
+            "No reader must be available to wire the redemption resume gate"
         );
     }
 
