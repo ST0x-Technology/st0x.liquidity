@@ -82,7 +82,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dorny/paths-filter@v3
         id: filter
@@ -106,7 +106,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure Git fetch fail-fast
         run: |
@@ -127,7 +127,7 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         continue-on-error: true
         with:
           name: rainlanguage
@@ -162,13 +162,14 @@ jobs:
               -E "test(compile_fail_tests)"
           '
 
-      - name: Upload nextest archive
-        uses: actions/upload-artifact@v4
+      # Blacksmith transparently redirects the native Actions cache to
+      # colocated storage. GitHub artifacts still use remote Azure storage,
+      # which made each test shard spend ~20 minutes downloading this file.
+      - name: Save nextest archive
+        uses: actions/cache/save@v6
         with:
-          name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive.tar.zst
-          retention-days: 1
-          if-no-files-found: error
+          key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
 
   backend-test:
     name: backend test ${{ matrix.partition }} of 4
@@ -182,7 +183,7 @@ jobs:
       matrix:
         partition: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure Git fetch fail-fast
         run: |
@@ -203,7 +204,7 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         continue-on-error: true
         with:
           name: rainlanguage
@@ -217,11 +218,12 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 8G
 
-      - name: Download nextest archive
-        uses: actions/download-artifact@v4
+      - name: Restore nextest archive
+        uses: actions/cache/restore@v6
         with:
-          name: nextest-archive
-          path: ${{ runner.temp }}
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
 
       # Test binaries come from the archive built in backend-build; no recompile.
       - name: test ${{ matrix.partition }} of 4
@@ -275,7 +277,7 @@ jobs:
         if: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
         run: echo "Docs-only change; skipping dashboard build."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
 
       - name: Configure Git fetch fail-fast
@@ -299,7 +301,7 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         continue-on-error: true
         with:
@@ -348,7 +350,7 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure Git fetch fail-fast
         run: |
@@ -369,7 +371,7 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         continue-on-error: true
         with:
           name: rainlanguage
