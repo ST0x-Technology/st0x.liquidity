@@ -64,13 +64,12 @@ use crate::inventory::{
 };
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-    PollOrderStatus, PollOrderStatusJobQueue, TerminalPositionFinalization,
-    client_order_id_for_placement, finalize_cancelled_position_or_log_unpriced,
-    place_offchain_order_at_broker, position_command_for_finalization,
-    terminal_position_finalization,
+    PollOrderStatusJobQueue, TerminalPositionFinalization, client_order_id_for_placement,
+    finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
+    position_command_for_finalization, push_poll_job_if_absent, terminal_position_finalization,
 };
 #[cfg(test)]
-use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
+use crate::offchain::order::{OffchainOrderCommand, PollOrderStatus, noop_order_placer};
 use crate::onchain::OnchainTrade;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
@@ -228,6 +227,11 @@ pub(crate) struct TradeProcessingCqrs {
     /// the inline path cannot place itself (it has no `OrderPlacer` for the
     /// limit-order price lookup). `CheckPositions` is the backstop.
     pub(crate) hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
+    /// Fed to [`push_poll_job_if_absent`] before every `PollOrderStatus`
+    /// push this pipeline makes, so a re-push for an order that already has a
+    /// live poll job (e.g. per-fill reconciliation against a still-open order,
+    /// RAI-1493) is skipped instead of forking a new self-perpetuating chain.
+    pub(crate) poll_interval: Duration,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -679,6 +683,7 @@ impl Conductor {
             },
             &frameworks.offchain_order_projection,
             executor.to_supported_executor(),
+            ctx.order_polling_interval(),
         )
         .await?;
 
@@ -3121,20 +3126,20 @@ async fn recover_claimed_offchain_order(
 
     match order {
         Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
-            cqrs.poll_status_queue
-                .clone()
-                .push(PollOrderStatus {
-                    offchain_order_id: pending_id,
-                })
-                .await
-                .inspect_err(|error| {
-                    error!(
-                        offchain_order_id = %pending_id,
-                        symbol = %execution.symbol,
-                        %error,
-                        "Failed to re-enqueue PollOrderStatus for a claimed pending order"
-                    );
-                })?;
+            push_poll_job_if_absent(
+                cqrs.poll_status_queue.clone(),
+                pending_id,
+                cqrs.poll_interval,
+            )
+            .await
+            .inspect_err(|error| {
+                error!(
+                    offchain_order_id = %pending_id,
+                    symbol = %execution.symbol,
+                    %error,
+                    "Failed to re-enqueue PollOrderStatus for a claimed pending order"
+                );
+            })?;
             Ok(Some(pending_id))
         }
         Some(Pending {
@@ -3180,6 +3185,18 @@ async fn recover_claimed_offchain_order(
 
 /// Routes the freshly-loaded `OffchainOrder` post-`Place` to either the
 /// rejection-cleanup or poll-enqueue path.
+///
+/// Reached both by a genuine new placement (`place_offchain_order`) and by
+/// per-fill reconciliation against a still-open order
+/// (`reconcile_existing_pending_order`, run on every accounted onchain fill
+/// for a symbol with a live `pending_offchain_order_id`) -- the two are not
+/// distinguished at the call site, so the `Submitted`/`PartiallyFilled`/
+/// `Cancelling` arm gates the push on [`push_poll_job_if_absent`] rather than
+/// on which caller reached it. A fresh placement's
+/// `offchain_order_id` can never already have a poll job, so the guard is a
+/// no-op there; a per-fill reconciliation's `offchain_order_id` almost always
+/// does, so the guard is what stops each fill from forking its own
+/// independent, self-perpetuating poll chain for the same order (RAI-1493).
 async fn dispatch_post_place_state(
     loaded: Option<OffchainOrder>,
     symbol: &Symbol,
@@ -3206,19 +3223,20 @@ async fn dispatch_post_place_state(
         }
 
         Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
-            let mut queue = cqrs.poll_status_queue.clone();
-
-            queue
-                .push(PollOrderStatus { offchain_order_id })
-                .await
-                .inspect_err(|error| {
-                    error!(
-                        %offchain_order_id,
-                        %symbol,
-                        %error,
-                        "Failed to enqueue PollOrderStatus job for newly-submitted order"
-                    );
-                })?;
+            push_poll_job_if_absent(
+                cqrs.poll_status_queue.clone(),
+                offchain_order_id,
+                cqrs.poll_interval,
+            )
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %offchain_order_id,
+                    %symbol,
+                    %error,
+                    "Failed to enqueue PollOrderStatus job for newly-submitted order"
+                );
+            })?;
 
             Ok(PostPlaceOutcome::InFlight(offchain_order_id))
         }
@@ -3594,8 +3612,8 @@ mod tests {
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
-        OnchainTradeBuilder, get_test_log, get_test_order, rebalancing_enabled_equities,
-        setup_test_db, setup_test_pools,
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_log, get_test_order,
+        rebalancing_enabled_equities, setup_test_db, setup_test_pools,
     };
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::trading::onchain::inclusion::EmittedOnChain;
@@ -5485,6 +5503,7 @@ mod tests {
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
         }
     }
 
@@ -6843,6 +6862,7 @@ mod tests {
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         let trade_event = make_trade_event(77);
@@ -7261,6 +7281,56 @@ mod tests {
             position.pending_offchain_order_id,
             Some(first_order_id),
             "Only the first order should be pending"
+        );
+    }
+
+    /// RAI-1493: `reconcile_existing_pending_order` -> `dispatch_post_place_state`
+    /// runs on every accounted onchain fill for a symbol with a live
+    /// `pending_offchain_order_id`. Before the multi-call-site guard fix, each
+    /// additional fill against a still-open order pushed its own independent,
+    /// self-perpetuating `PollOrderStatus` chain on top of the one the initial
+    /// placement pushed -- a burst of fills against one stuck hedge order could
+    /// fork one new chain per fill. The guard must collapse every one of these
+    /// redundant per-fill pushes down to the single job the placement armed.
+    #[tokio::test]
+    async fn repeated_fills_against_one_open_order_do_not_fork_additional_poll_jobs() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let trade_event_1 = make_trade_event(90);
+        let trade_1 = test_trade_with_amount(float!(1.5), 90);
+
+        process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
+            .await
+            .unwrap()
+            .expect("first trade should place an order");
+
+        assert_eq!(
+            pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+            1,
+            "placing the order must arm exactly one PollOrderStatus job"
+        );
+
+        for log_index in 91..95 {
+            let trade_event = make_trade_event(log_index);
+            let trade = test_trade_with_amount(float!(0.1), log_index);
+
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+            1,
+            "per-fill reconciliation against the same still-open order must not fork \
+             additional PollOrderStatus chains"
         );
     }
 
@@ -10454,6 +10524,253 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "recovery must complete the position and clear the stale claim in-process"
+        );
+    }
+
+    /// RAI-1493: `recover_claimed_offchain_order`'s `Submitted`/`PartiallyFilled`/
+    /// `Cancelling` arm shares the same `push_poll_job_if_absent` guard as the
+    /// other four push sites. A `PendingExecution` retry against
+    /// an order that already has a live poll job must skip the push and
+    /// report the pending id, not fork a second independent,
+    /// self-perpetuating poll chain.
+    #[tokio::test]
+    async fn recover_claimed_offchain_order_submitted_with_live_poll_job_skips_duplicate_push() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::DryRun,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(
+                        offchain_order_id.as_uuid(),
+                    ),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("ORD_SUBMITTED"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A prior attempt already armed the live poll job this retry must not
+        // duplicate.
+        cqrs.poll_status_queue
+            .clone()
+            .push(PollOrderStatus { offchain_order_id })
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+            1,
+            "the seeded poll job must be live before the retry"
+        );
+
+        let execution = ExecutionCtx {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares,
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: st0x_execution::MarketSession::Regular,
+        };
+        let result = recover_claimed_offchain_order(&execution, &cqrs)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(offchain_order_id),
+            "a PendingExecution retry against a still-live poll job reports the pending id \
+             without pushing a duplicate"
+        );
+
+        assert_eq!(
+            pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+            1,
+            "the guard must skip the push while the seeded poll job is still live, not fork a \
+             second independent chain"
+        );
+    }
+
+    /// Sibling of the skip-branch test above: when no live poll job exists for
+    /// the `Submitted` order (the prior attempt's push was lost, or this is the
+    /// first recovery attempt to observe the broker outcome), the retry must
+    /// push one so the order does not sit un-polled until the next restart.
+    #[tokio::test]
+    async fn recover_claimed_offchain_order_submitted_without_live_poll_job_pushes_poll() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::DryRun,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(
+                        offchain_order_id.as_uuid(),
+                    ),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("ORD_SUBMITTED_NO_POLL"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+            0,
+            "no poll job has been pushed yet"
+        );
+
+        let execution = ExecutionCtx {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares,
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: st0x_execution::MarketSession::Regular,
+        };
+        let result = recover_claimed_offchain_order(&execution, &cqrs)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(offchain_order_id),
+            "the retry reports the pending id after re-enqueuing its poll"
+        );
+
+        assert_eq!(
+            pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+            1,
+            "the guard must push exactly one PollOrderStatus job when none was live"
+        );
+    }
+
+    /// Pins the `JobError` -> `TradeAccountingError::PollJobGuard` `#[from]`
+    /// conversion: an oversized `poll_interval` makes the guard's staleness
+    /// bound overflow ([`JobError::StaleAfterOverflow`]), and that error must
+    /// surface through `recover_claimed_offchain_order` as `PollJobGuard`,
+    /// not silently succeed or land in an unrelated variant.
+    #[tokio::test]
+    async fn recover_claimed_offchain_order_wraps_stale_after_overflow_as_poll_job_guard() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
+        let mut cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        cqrs.poll_interval = std::time::Duration::from_secs(u64::MAX);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::DryRun,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(
+                        offchain_order_id.as_uuid(),
+                    ),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        frameworks
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("ORD_OVERFLOW"),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let execution = ExecutionCtx {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares,
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: st0x_execution::MarketSession::Regular,
+        };
+        let error = recover_claimed_offchain_order(&execution, &cqrs)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TradeAccountingError::PollJobGuard(
+                    crate::offchain::order::JobError::StaleAfterOverflow
+                )
+            ),
+            "an oversized poll_interval must surface through the PollJobGuard conversion \
+             instead of succeeding or landing in an unrelated error variant"
         );
     }
 

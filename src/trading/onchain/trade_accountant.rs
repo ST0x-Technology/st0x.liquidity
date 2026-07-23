@@ -444,6 +444,8 @@ pub(crate) enum TradeAccountingError {
     LimitPriceUnavailable { symbol: st0x_execution::Symbol },
     #[error("Slippage calculation failed")]
     SlippageCalculation(#[from] crate::trading::offchain::hedge::SlippageError),
+    #[error("PollOrderStatus live-job guard failed: {0}")]
+    PollJobGuard(#[from] crate::offchain::order::JobError),
 }
 
 #[cfg(test)]
@@ -477,7 +479,9 @@ mod tests {
     use crate::onchain::trade::{INVENTORY_TOKEN_DECIMALS_MAX_RETRIES, InventoryTrade};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
-    use crate::test_utils::{get_test_log, get_test_order, panic_revert_payload, setup_test_pools};
+    use crate::test_utils::{
+        TEST_POLL_INTERVAL, get_test_log, get_test_order, panic_revert_payload, setup_test_pools,
+    };
 
     /// Builds the CQRS stores, job queue, and `AccountantCtx` shared by every
     /// `perform()` test in this module -- callers supply only what actually
@@ -531,6 +535,7 @@ mod tests {
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);

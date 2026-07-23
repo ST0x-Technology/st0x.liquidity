@@ -60,6 +60,10 @@ pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static>
     pub(crate) ctx: Ctx,
     pub(crate) pool: SqlitePool,
     pub(crate) check_interval: Duration,
+    /// Passed through to `recover_submitted_offchain_orders`'s dedup guard, so
+    /// its stranded-row staleness bound scales with the configured poll
+    /// cadence instead of a value hardcoded far from where it is configured.
+    pub(crate) poll_interval: Duration,
 }
 
 /// Errors surfaced by [`CheckPositions::perform`].
@@ -172,17 +176,22 @@ where
         // job died (a transient broker error exhausts the apalis retries ->
         // `Failed`, which `requeue_orphaned` deliberately skips) or was never
         // enqueued (crash window) is otherwise stuck until the next restart,
-        // leaving the hedge unreconciled. Re-enqueue is idempotent -- a duplicate
-        // poll for an order that already has a live one is harmless: the worker
-        // observes the terminal/again-pending state and exits. It does re-poll
-        // live orders too; a precise per-order dedup is tracked as a follow-up
-        // (apalis persists the job payload as an opaque blob, so the order id
-        // cannot be matched there to skip live polls).
-        let mut poll_status_queue = self.poll_status_queue.clone();
+        // leaving the hedge unreconciled. `recover_submitted_offchain_orders`
+        // dedupes per order before pushing: it queries the live apalis Jobs
+        // rows via `json_extract(CAST(job AS TEXT), '$.offchain_order_id')`
+        // (`reconcile_live_poll_jobs`) and skips the push when a live poll already
+        // exists for that order, so this tick is a no-op for orders already
+        // being polled and only arms polling for orders that have none
+        // (RAI-1493 -- an unconditional re-push here forked an independent,
+        // self-perpetuating poll chain on every tick an order stayed open).
+        // It also collapses any pre-existing duplicate live rows for one
+        // order down to one.
+        let poll_status_queue = self.poll_status_queue.clone();
         if let Err(error) = recover_submitted_offchain_orders(
             &self.offchain_order_projection,
-            &mut poll_status_queue,
+            &poll_status_queue,
             self.executor.to_supported_executor(),
+            self.poll_interval,
         )
         .await
         {
@@ -611,9 +620,13 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::offchain::order::{CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand};
+    use crate::offchain::order::poll_status::PollOrderStatusCtx;
+    use crate::offchain::order::{
+        CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
+        PollOrderStatus, ReconcileOrderFillJobQueue,
+    };
     use crate::position::{PositionCommand, TradeId};
-    use crate::test_utils::setup_test_pools;
+    use crate::test_utils::{TEST_POLL_INTERVAL, setup_test_pools};
 
     async fn build_ctx(
         pool: SqlitePool,
@@ -666,6 +679,7 @@ mod tests {
             ctx: ctx_cfg,
             pool,
             check_interval,
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         (ctx, position)
@@ -894,6 +908,7 @@ mod tests {
             ctx: cfg,
             pool: pool.clone(),
             check_interval: Duration::from_secs(60),
+            poll_interval: TEST_POLL_INTERVAL,
         };
 
         CheckPositions {}.perform(&ctx).await.unwrap();
@@ -1754,5 +1769,161 @@ mod tests {
         assert!(remaining.contains(&"failed-exhausted".to_string()));
         assert!(remaining.contains(&"done-1".to_string()));
         assert!(remaining.contains(&"killed-1".to_string()));
+    }
+
+    async fn live_poll_job_count(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        offchain_order_id: OffchainOrderId,
+    ) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? \
+               AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+               AND status IN ('Pending', 'Queued', 'Running')",
+        )
+        .bind(poll_status_job_type())
+        .bind(offchain_order_id.to_string())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
+    }
+
+    /// Simulates a single-concurrency apalis worker draining the oldest live
+    /// `PollOrderStatus` row for one order: dequeue, run `perform`, ack
+    /// (`Done`). Mirrors `drain_pending_equity_jobs`'s pattern
+    /// (`src/rebalancing/trigger/equity.rs`) rather than calling `perform`
+    /// with no row bookkeeping at all, so an unfixed
+    /// `recover_submitted_offchain_orders` forking an extra independent chain
+    /// each tick shows up as an extra never-drained row, exactly like the
+    /// single `concurrency(1)` worker in production under-draining a growing
+    /// backlog.
+    async fn drain_one_poll_job_for_order(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        poll_ctx: &PollOrderStatusCtx<MockExecutor>,
+        offchain_order_id: OffchainOrderId,
+    ) {
+        let row: Option<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE job_type = ? \
+               AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+               AND status IN ('Pending', 'Queued', 'Running') \
+             ORDER BY run_at ASC LIMIT 1",
+        )
+        .bind(poll_status_job_type())
+        .bind(offchain_order_id.to_string())
+        .fetch_optional(apalis_pool)
+        .await
+        .unwrap();
+
+        let Some((id, payload)) = row else {
+            return;
+        };
+
+        let job: PollOrderStatus =
+            serde_json::from_slice(&payload).expect("deserialize PollOrderStatus payload");
+        job.perform(poll_ctx).await.unwrap();
+
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(&id)
+            .execute(apalis_pool)
+            .await
+            .expect("mark drained PollOrderStatus job done");
+    }
+
+    /// Reproduces the RAI-1493 incident mechanism: `CheckPositions`'s
+    /// per-tick recovery unconditionally re-pushed a `PollOrderStatus` job
+    /// for every still-open order, forking an independent, self-perpetuating
+    /// poll chain on top of whatever chain(s) already existed for that order.
+    /// A single-concurrency worker (simulated here by draining exactly one
+    /// due row per tick) cannot keep up, so the live-row population grows
+    /// without bound the longer the order stays open.
+    #[tokio::test]
+    async fn check_positions_recovery_does_not_multiply_poll_jobs_for_a_long_open_order() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let executor = MockExecutor::new().with_order_status(OrderState::Pending);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor.clone(),
+        )
+        .await;
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("test-accept"),
+                    placed_shares: shares,
+                    submitted_at: chrono::Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let poll_ctx = PollOrderStatusCtx {
+            executor: executor.clone(),
+            offchain_order_projection: ctx.offchain_order_projection.clone(),
+            offchain_order_store: ctx.offchain_order.clone(),
+            position_store: position.clone(),
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            reconcile_queue: ReconcileOrderFillJobQueue::new(&apalis_pool),
+            rejection_queue: HandleOrderRejectionJobQueue::new(&apalis_pool),
+            poll_interval: Duration::from_secs(15),
+        };
+
+        for _ in 0..5 {
+            CheckPositions::default().perform(&ctx).await.unwrap();
+            drain_one_poll_job_for_order(&apalis_pool, &poll_ctx, offchain_order_id).await;
+        }
+
+        assert_eq!(
+            live_poll_job_count(&apalis_pool, offchain_order_id).await,
+            1,
+            "a long-open order must have exactly one live PollOrderStatus job \
+             regardless of how many CheckPositions ticks fire while it stays open"
+        );
     }
 }
