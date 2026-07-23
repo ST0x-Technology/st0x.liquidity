@@ -9,8 +9,7 @@ use super::costs::{
     build_cost_entries, summarize_cost_entries, with_costs,
 };
 use super::diagnostics::append_replay_diagnostics;
-use super::parsing::fmt_decimal;
-use super::parsing::{is_safe_symbol, ordered_position_events};
+use super::parsing::{fmt_decimal, is_safe_symbol, ordered_position_events};
 use super::query::{PnlError, PnlQuery};
 use super::replay::{
     add_summary, apply_manual_position_adjustment, apply_offchain_fill, apply_offchain_placement,
@@ -23,7 +22,9 @@ use super::samples::{build_available_range, build_sample_stats, parse_position_v
 use super::sessions::{
     date_key, matches_cost_date_filter, matches_cost_symbol_filter, matches_date_filter,
 };
-use super::state::{CostEventRow, PositionEventRow, PositionViewRow, SummaryAcc, SymbolBook};
+use super::state::{
+    BotGasCostRow, CostEventRow, PositionEventRow, PositionViewRow, SummaryAcc, SymbolBook,
+};
 use super::windows::build_windows;
 
 fn tokenization_fee_overlap_key(entry: &CostEntryInternal) -> Option<(Symbol, String, String)> {
@@ -82,6 +83,7 @@ pub(crate) fn build_pnl_response_from_rows(
     event_rows: Vec<PositionEventRow>,
     position_rows: &[PositionViewRow],
     cost_rows: &[CostEventRow],
+    bot_gas_rows: &[BotGasCostRow],
     alpaca_activities: &[AccountActivity],
     query: &PnlQuery,
     symbols: &BTreeSet<String>,
@@ -188,6 +190,9 @@ pub(crate) fn build_pnl_response_from_rows(
     let page_entries = filtered_entries[start..end].to_vec();
 
     let mut cost_replay = build_cost_entries(cost_rows, &mut warnings)?;
+    cost_replay
+        .entries
+        .extend(build_bot_gas_cost_entries(bot_gas_rows, &mut warnings)?);
     let alpaca_entries = build_alpaca_activity_cost_entries(alpaca_activities, &mut warnings)?;
     let alpaca_entries =
         remove_tokenization_fee_overlaps(&cost_replay.entries, alpaca_entries, &mut warnings);
@@ -260,4 +265,53 @@ pub(crate) fn build_pnl_response_from_rows(
         has_more: end < total,
         windows,
     })
+}
+
+fn build_bot_gas_cost_entries(
+    rows: &[BotGasCostRow],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CostEntryInternal>, PnlError> {
+    rows.iter()
+        .filter_map(|row| {
+            let symbol = match row.symbol.as_deref() {
+                Some(symbol) if is_safe_symbol(symbol) => {
+                    if let Ok(symbol) = Symbol::new(symbol.to_owned()) {
+                        Some(symbol)
+                    } else {
+                        warnings.push(format!(
+                            "Skipped invalid bot gas symbol in backend PnL response: {symbol}"
+                        ));
+                        return None;
+                    }
+                }
+                Some(symbol) => {
+                    warnings.push(format!(
+                        "Skipped unsafe bot gas symbol in backend PnL response: {symbol}"
+                    ));
+                    return None;
+                }
+                None => None,
+            };
+            let amount_usd = match super::parsing::parse_internal_decimal(
+                "bot_gas_cost.usd_cost",
+                &row.usd_cost,
+            ) {
+                Ok(amount_usd) => amount_usd,
+                Err(error) => return Some(Err(error)),
+            };
+
+            Some(Ok(CostEntryInternal {
+                category: CostCategory::BotGas,
+                accounting_bucket: super::costs::AccountingBucket::Generic,
+                effect: AccountingEffect::Cost,
+                amount_usd,
+                occurred_at: row.occurred_at.clone(),
+                aggregate_type: "BotGasCost".to_owned(),
+                aggregate_id: format!("{}:{}", row.chain, row.tx_hash),
+                event_rowid: row.rowid,
+                symbol,
+                detail: format!("Bot-paid {} gas on {}", row.operation_category, row.chain),
+            }))
+        })
+        .collect()
 }

@@ -38,6 +38,7 @@ fn malformed_cost_payload(row: &CostEventRow, reason: &'static str) -> PnlError 
 pub(crate) enum CostCategory {
     TokenizationFee,
     CctpFee,
+    BotGas,
     BrokerFee,
     MarginInterest,
     DividendIncome,
@@ -49,6 +50,7 @@ impl CostCategory {
         match self {
             Self::TokenizationFee => "tokenization_fee",
             Self::CctpFee => "cctp_fee",
+            Self::BotGas => "bot_gas",
             Self::BrokerFee => "broker_fee",
             Self::MarginInterest => "margin_interest",
             Self::DividendIncome => "dividend_income",
@@ -175,6 +177,7 @@ fn add_cost(
     match category {
         CostCategory::TokenizationFee => summary.tokenization_fees_usd += &signed_amount,
         CostCategory::CctpFee => summary.cctp_fees_usd += &signed_amount,
+        CostCategory::BotGas => summary.bot_gas_usd += amount,
         CostCategory::BrokerFee => {
             summary.broker_fees_usd += &signed_amount;
             summary.broker_fee_entry_count += 1;
@@ -331,9 +334,9 @@ fn cost_summary_to_dto(summary: &CostSummaryAcc, cost_entry_count: usize) -> Pnl
                 "Bot gas",
                 AccountingBucket::Generic,
                 AccountingEffect::Cost,
-                "not_ingested",
+                included_when_observed(usize::from(!summary.bot_gas_usd.is_zero())),
                 &summary.bot_gas_usd,
-                "Requires tx receipt ingestion, gas-payer classification, and ETH/USD valuation.",
+                "Read from persisted bot-paid transaction receipts after gas-payer classification and ETH/USD valuation.",
             ),
             coverage(
                 "Wallet transfer fees",

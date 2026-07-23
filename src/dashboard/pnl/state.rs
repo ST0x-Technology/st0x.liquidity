@@ -164,6 +164,17 @@ pub(crate) struct CostEventRow {
     pub(crate) payload: Value,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BotGasCostRow {
+    pub(crate) rowid: i64,
+    pub(crate) chain: String,
+    pub(crate) tx_hash: String,
+    pub(crate) usd_cost: String,
+    pub(crate) operation_category: String,
+    pub(crate) symbol: Option<String>,
+    pub(crate) occurred_at: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SampleStatsAcc {
     pub(crate) first_at: Option<String>,
