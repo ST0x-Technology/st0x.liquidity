@@ -690,14 +690,16 @@ aggregate) as of capture time. A symbol with a balance but no observed price yet
 is recorded with `usd_mark = NULL` -- never a fabricated zero. Marks are fixed
 permanently at capture time as part of the immutable event payload: a later
 price correction does not retroactively change a previously reported day's
-capital. The persisted `mark_captured_at` is `Position.last_updated`, not a
-dedicated price-observation timestamp -- a precise one is a deferred follow-up.
-`last_updated` is the aggregate's last-touched time and is advanced by several
-non-price events too (offchain order placement/fill/cancel, threshold updates),
-so it is only an upper bound on how recently the price was actually observed:
-the staleness guard below reliably excludes a day once the _position_ has gone
-stale, but is not guaranteed to exclude every day with a genuinely stale price
-if that position was otherwise recently touched.
+capital. The persisted `mark_captured_at` is `Position.last_price_observed_at`,
+a dedicated price-observation timestamp set only by the events that also set
+`last_price_usdc` (`OnChainOrderFilled`, using the fill's `block_timestamp`, and
+priced `ManualPositionAdjusted`, using `adjusted_at`). This is distinct from
+`last_updated`, the aggregate's last-touched time, which is also advanced by
+non-price events (offchain order placement/fill/cancel, threshold updates) that
+leave `last_price_observed_at` untouched. So the staleness guard below keys off
+how recently the price itself was actually observed, and does exclude a day with
+a genuinely stale price even when the position was otherwise recently touched by
+a non-price event.
 
 **Derived `/pnl` fields**: for a queried date range, a day's total USD capital
 is computed only when every nonzero-balance row that day has a known, non-stale
@@ -1398,6 +1400,9 @@ struct Position {
                                      // dollar-threshold hedging. None until a
                                      // priced fill or manual adjustment sets it.
     last_updated: Option<DateTime<Utc>>,
+    last_price_observed_at: Option<DateTime<Utc>>,  // When last_price_usdc was
+                                     // observed; set only by price-bearing
+                                     // events, paired with last_price_usdc.
 }
 
 enum ExecutionThreshold {

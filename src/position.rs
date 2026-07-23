@@ -76,6 +76,18 @@ pub struct Position {
     )]
     pub last_price_usdc: Option<Float>,
     pub last_updated: Option<DateTime<Utc>>,
+    /// When `last_price_usdc` was economically observed -- set only by the
+    /// events that also set `last_price_usdc` (`OnChainOrderFilled`,
+    /// `ManualPositionAdjusted` with a price), unlike `last_updated`, which
+    /// advances on every event including price-less ones. Drives
+    /// `resolve_marks`' `mark_captured_at` so mark staleness keys off price
+    /// recency, not the aggregate's generic last-touched time. `#[serde(default)]`
+    /// so legacy (pre-this-field) snapshots deserialize to `None`; the
+    /// `SCHEMA_VERSION` bump discards those snapshots before load, so the
+    /// `last_price_usdc.is_some() == last_price_observed_at.is_some()`
+    /// invariant holds for every aggregate actually reached by `resolve_marks`.
+    #[serde(default)]
+    pub last_price_observed_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for Position {
@@ -101,6 +113,7 @@ impl std::fmt::Debug for Position {
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
+            .field("last_price_observed_at", &self.last_price_observed_at)
             .finish()
     }
 }
@@ -148,7 +161,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 4;
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -169,6 +182,7 @@ impl EventSourced for Position {
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
+                last_price_observed_at: None,
             }),
 
             _ => None,
@@ -185,6 +199,7 @@ impl EventSourced for Position {
                 amount,
                 direction: Buy,
                 price_usdc,
+                block_timestamp,
                 seen_at,
                 ..
             } => {
@@ -197,6 +212,11 @@ impl EventSourced for Position {
                     last_acknowledged_trade_id: Some(trade_id.clone()),
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
+                    // block_timestamp, NOT seen_at: the economic time the price
+                    // was valid on-chain. seen_at can go fresh on a delayed
+                    // catch-up backfill, which would make an old price look
+                    // fresh and defeat the staleness gate this field exists for.
+                    last_price_observed_at: Some(*block_timestamp),
                     ..entity.clone()
                 }))
             }
@@ -206,6 +226,7 @@ impl EventSourced for Position {
                 direction: Sell,
                 amount,
                 price_usdc,
+                block_timestamp,
                 seen_at,
                 ..
             } => {
@@ -218,6 +239,7 @@ impl EventSourced for Position {
                     last_acknowledged_trade_id: Some(trade_id.clone()),
                     last_price_usdc: Some(*price_usdc),
                     last_updated: Some(*seen_at),
+                    last_price_observed_at: Some(*block_timestamp),
                     ..entity.clone()
                 }))
             }
@@ -365,6 +387,9 @@ impl EventSourced for Position {
                     net: *target_net,
                     last_price_usdc: (*price_usdc).or(entity.last_price_usdc),
                     last_updated: Some(*adjusted_at),
+                    last_price_observed_at: price_usdc
+                        .map(|_| *adjusted_at)
+                        .or(entity.last_price_observed_at),
                     // A manual reconciliation supersedes any prior failed hedge,
                     // so clear the broker-idempotency anchor. Otherwise the next
                     // hedge could reuse the failed order's client_order_id and be
@@ -3523,6 +3548,308 @@ mod tests {
     }
 
     #[test]
+    fn on_chain_order_filled_buy_sets_price_observed_at_to_block_timestamp_not_seen_at() {
+        let block_timestamp = Utc::now();
+        let seen_at = block_timestamp + chrono::Duration::hours(1);
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: block_timestamp,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp,
+                seen_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(option_float_eq(position.last_price_usdc, Some(float!(150))));
+        assert_eq!(position.last_price_observed_at, Some(block_timestamp));
+        assert_eq!(position.last_updated, Some(seen_at));
+    }
+
+    #[test]
+    fn on_chain_order_filled_sell_sets_price_observed_at_to_block_timestamp_not_seen_at() {
+        let block_timestamp = Utc::now();
+        let seen_at = block_timestamp + chrono::Duration::hours(1);
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: block_timestamp,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1)),
+                direction: Direction::Sell,
+                price_usdc: float!(150),
+                block_timestamp,
+                seen_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(option_float_eq(position.last_price_usdc, Some(float!(150))));
+        assert_eq!(position.last_price_observed_at, Some(block_timestamp));
+        assert_eq!(position.last_updated, Some(seen_at));
+    }
+
+    /// Representative sample of the non-price arms (`ThresholdUpdated`,
+    /// `OffChainOrderPlaced`, `OffChainOrderFilled`): each reconstructs
+    /// `Position` via `..entity.clone()`, which auto-preserves
+    /// `last_price_observed_at` once it exists on the struct -- not a
+    /// per-arm business rule worth asserting one-by-one, so this chains a
+    /// few of them and checks the field survives to the end while
+    /// `last_updated` keeps advancing.
+    #[test]
+    fn non_price_events_advance_last_updated_but_not_price_observed_at() {
+        let block_timestamp = Utc::now();
+        let updated_at = block_timestamp + chrono::Duration::hours(1);
+        let placed_at = block_timestamp + chrono::Duration::hours(2);
+        let broker_timestamp = block_timestamp + chrono::Duration::hours(3);
+        let offchain_order_id = OffchainOrderId::new();
+        let threshold = one_share_threshold();
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                initialized_at: block_timestamp,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp,
+                seen_at: block_timestamp,
+            },
+            PositionEvent::ThresholdUpdated {
+                old_threshold: threshold,
+                new_threshold: threshold,
+                updated_at,
+            },
+            PositionEvent::OffChainOrderPlaced {
+                offchain_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at,
+            },
+            PositionEvent::OffChainOrderFilled {
+                offchain_order_id,
+                shares_filled: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor_order_id: ExecutorOrderId::new("ORDER123"),
+                price: Usd::new(float!(151)),
+                broker_timestamp,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_price_observed_at,
+            Some(block_timestamp),
+            "non-price events must not touch the price-observation timestamp"
+        );
+        assert_eq!(position.last_updated, Some(broker_timestamp));
+    }
+
+    #[test]
+    fn manual_position_adjusted_with_price_sets_price_observed_at() {
+        let initialized_at = Utc::now();
+        let adjusted_at = initialized_at + chrono::Duration::hours(1);
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at,
+            },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: FractionalShares::ZERO,
+                target_net: FractionalShares::new(float!(3)),
+                reason: "operator seed".to_string(),
+                price_usdc: Some(float!(200)),
+                adjusted_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(option_float_eq(position.last_price_usdc, Some(float!(200))));
+        assert_eq!(position.last_price_observed_at, Some(adjusted_at));
+    }
+
+    #[test]
+    fn manual_position_adjusted_without_price_preserves_price_observed_at() {
+        let block_timestamp = Utc::now();
+        let adjusted_at = block_timestamp + chrono::Duration::hours(1);
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: block_timestamp,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp,
+                seen_at: block_timestamp,
+            },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: FractionalShares::new(float!(5)),
+                target_net: FractionalShares::new(float!(2)),
+                reason: "partial manual reconciliation".to_string(),
+                price_usdc: None,
+                adjusted_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            option_float_eq(position.last_price_usdc, Some(float!(150))),
+            "no price on the adjustment must preserve the prior known price"
+        );
+        assert_eq!(
+            position.last_price_observed_at,
+            Some(block_timestamp),
+            "no price on the adjustment must preserve the prior observation time"
+        );
+        assert_eq!(position.last_updated, Some(adjusted_at));
+    }
+
+    /// The invariant the whole field exists to uphold: a price event followed
+    /// by an unrelated touch keeps `last_price_usdc` and
+    /// `last_price_observed_at` both present (never one without the other),
+    /// with the observation timestamp strictly older than the last-touched
+    /// timestamp -- proving the two have actually decoupled, not just that
+    /// both happen to be `Some`.
+    #[test]
+    fn price_observed_at_and_last_price_usdc_presence_invariant_holds_after_non_price_touch() {
+        let block_timestamp = Utc::now();
+        let updated_at = block_timestamp + chrono::Duration::hours(1);
+        let threshold = one_share_threshold();
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                initialized_at: block_timestamp,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp,
+                seen_at: block_timestamp,
+            },
+            PositionEvent::ThresholdUpdated {
+                old_threshold: threshold,
+                new_threshold: threshold,
+                updated_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_price_usdc.is_some(),
+            position.last_price_observed_at.is_some(),
+            "last_price_usdc and last_price_observed_at must be present/absent together"
+        );
+        assert!(
+            position.last_price_observed_at < position.last_updated,
+            "the price observation must predate the later non-price touch: \
+             last_price_observed_at = {:?}, last_updated = {:?}",
+            position.last_price_observed_at,
+            position.last_updated
+        );
+    }
+
+    /// `#[serde(default)]` on `last_price_observed_at` is load-bearing only
+    /// for a legacy (pre-this-field) snapshot: the `SCHEMA_VERSION` bump
+    /// discards such snapshots before they are ever loaded (a full event
+    /// replay repopulates the field), so this documents *why* the fallback
+    /// exists rather than a path `resolve_marks` can actually reach.
+    #[test]
+    fn legacy_snapshot_json_without_price_observed_at_field_deserializes_to_none() {
+        let block_timestamp = Utc::now();
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: block_timestamp,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp,
+                seen_at: block_timestamp,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(position.last_price_observed_at, Some(block_timestamp));
+
+        let mut snapshot = serde_json::to_value(&position)
+            .expect("Position must serialize for this legacy-snapshot fixture");
+        snapshot
+            .as_object_mut()
+            .expect("Position serializes to a JSON object")
+            .remove("last_price_observed_at");
+
+        let legacy: Position = serde_json::from_value(snapshot)
+            .expect("a v4-shaped snapshot (missing the new field) must still deserialize");
+
+        assert!(option_float_eq(legacy.last_price_usdc, Some(float!(150))));
+        assert_eq!(
+            legacy.last_price_observed_at, None,
+            "a legacy snapshot with no last_price_observed_at key must default to None"
+        );
+    }
+
+    #[test]
     fn non_genesis_event_on_uninitialized_fails() {
         let error = replay::<Position>(vec![PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
@@ -3658,6 +3985,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let (direction, shares) = position
@@ -3687,6 +4015,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let (direction, shares) = position
@@ -3716,6 +4045,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -3748,6 +4078,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -3780,6 +4111,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50.7))).unwrap();
@@ -3811,6 +4143,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(7.5))).unwrap();
@@ -3843,6 +4176,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(5))).unwrap();
@@ -3875,6 +4209,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
+            last_price_observed_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -3957,6 +4292,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_price_observed_at: Some(Utc::now()),
         };
 
         let (_, first_shares) = position
