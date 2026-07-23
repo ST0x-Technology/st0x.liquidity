@@ -69,13 +69,17 @@ const parseDecimal = (
 
   const valid =
     decimal.value.isFinite() &&
-    (minimum === 'positive'
-      ? decimal.value.greaterThan(0)
-      : decimal.value.greaterThanOrEqualTo(0))
+    (minimum === 'positive' ? decimal.value.greaterThan(0) : decimal.value.greaterThanOrEqualTo(0))
   if (valid) return parsed
 
   return invalid(path, `a ${minimum} decimal string`)
 }
+
+const parseNullableDecimal = (
+  value: unknown,
+  path: string,
+  minimum: 'positive' | 'non-negative'
+): string | null => (value === null ? null : parseDecimal(value, path, minimum))
 
 const daysInMonth = (year: number, month: number): number => {
   if (month === 2) {
@@ -126,24 +130,76 @@ const parseOutcome = (value: unknown, path: string): TradeOutcome => {
   if (outcome['status'] === 'filled') return { status: 'filled' }
   if (outcome['status'] !== 'failed') return invalid(statusPath, 'a known terminal outcome')
 
+  const hasAcceptedShares = 'acceptedShares' in outcome
+  const acceptedShares = parseNullableDecimal(
+    outcome['acceptedShares'] ?? null,
+    fieldPath(path, 'acceptedShares'),
+    'positive'
+  )
+  let filledShares = hasAcceptedShares
+    ? parseNullableDecimal(outcome['filledShares'], fieldPath(path, 'filledShares'), 'non-negative')
+    : parseDecimal(outcome['filledShares'], fieldPath(path, 'filledShares'), 'non-negative')
+  let remainingShares = hasAcceptedShares
+    ? parseNullableDecimal(
+        outcome['remainingShares'],
+        fieldPath(path, 'remainingShares'),
+        'non-negative'
+      )
+    : parseDecimal(outcome['remainingShares'], fieldPath(path, 'remainingShares'), 'non-negative')
+  let excessShares = hasAcceptedShares
+    ? parseNullableDecimal(outcome['excessShares'], fieldPath(path, 'excessShares'), 'non-negative')
+    : parseDecimal(outcome['excessShares'], fieldPath(path, 'excessShares'), 'non-negative')
+
+  // terminal_outcomes_v1 originally omitted acceptedShares and derived these
+  // quantities from the request. It also split overfills between filledShares
+  // and excessShares, so reconstruct the complete observed fill before
+  // discarding request-derived values that are not broker evidence.
+  if (!hasAcceptedShares) {
+    if (filledShares === null || excessShares === null) {
+      return invalid(path, 'complete terminal_outcomes_v1 failure quantities')
+    }
+    const completeFill = new Decimal(filledShares).plus(excessShares)
+    // v1 synthesized zero when no fill evidence existed, so only a positive
+    // legacy total proves an actual broker fill.
+    filledShares = completeFill.isZero() ? null : completeFill.toString()
+    remainingShares = null
+    excessShares = null
+  }
+
+  if (acceptedShares === null || filledShares === null) {
+    if (remainingShares !== null) {
+      return invalid(fieldPath(path, 'remainingShares'), 'null when fill provenance is incomplete')
+    }
+    if (excessShares !== null) {
+      return invalid(fieldPath(path, 'excessShares'), 'null when fill provenance is incomplete')
+    }
+  } else {
+    if (remainingShares === null) {
+      return invalid(fieldPath(path, 'remainingShares'), 'a derived non-negative decimal string')
+    }
+    if (excessShares === null) {
+      return invalid(fieldPath(path, 'excessShares'), 'a derived non-negative decimal string')
+    }
+
+    const accepted = new Decimal(acceptedShares)
+    const filled = new Decimal(filledShares)
+    const expectedRemaining = Decimal.max(accepted.minus(filled), 0)
+    const expectedExcess = Decimal.max(filled.minus(accepted), 0)
+    if (!new Decimal(remainingShares).equals(expectedRemaining)) {
+      return invalid(fieldPath(path, 'remainingShares'), 'the accepted quantity minus the fill')
+    }
+    if (!new Decimal(excessShares).equals(expectedExcess)) {
+      return invalid(fieldPath(path, 'excessShares'), 'the fill beyond the accepted quantity')
+    }
+  }
+
   return {
     status: 'failed',
     error: parseString(outcome['error'], fieldPath(path, 'error')),
-    filledShares: parseDecimal(
-      outcome['filledShares'],
-      fieldPath(path, 'filledShares'),
-      'non-negative'
-    ),
-    remainingShares: parseDecimal(
-      outcome['remainingShares'],
-      fieldPath(path, 'remainingShares'),
-      'non-negative'
-    ),
-    excessShares: parseDecimal(
-      outcome['excessShares'],
-      fieldPath(path, 'excessShares'),
-      'non-negative'
-    )
+    acceptedShares,
+    filledShares,
+    remainingShares,
+    excessShares
   }
 }
 

@@ -1,8 +1,9 @@
 //! Trade fill DTOs for completed onchain and offchain trades.
 
 use chrono::{DateTime, Utc};
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::de::Error as _;
+use serde::ser::{Error as _, SerializeStruct};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ts_rs::TS;
 
 use st0x_finance::{FractionalShares, NonNegative, Positive, Symbol};
@@ -120,7 +121,7 @@ pub struct InvalidDirectionError {
 }
 
 /// Terminal outcome of a dashboard trade entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(
     tag = "status",
     rename_all = "snake_case",
@@ -130,16 +131,107 @@ pub enum TradeOutcome {
     Filled,
     Failed {
         error: String,
-        #[ts(type = "string")]
-        filled_shares: NonNegative<FractionalShares>,
-        #[ts(type = "string")]
-        remaining_shares: NonNegative<FractionalShares>,
+        #[serde(default)]
+        #[ts(type = "string | null")]
+        accepted_shares: Option<Positive<FractionalShares>>,
+        #[ts(type = "string | null")]
+        filled_shares: Option<NonNegative<FractionalShares>>,
+        #[ts(type = "string | null")]
+        remaining_shares: Option<NonNegative<FractionalShares>>,
         /// Shares filled beyond the broker-accepted order quantity. This is
         /// separate from remaining shares so anomalous broker state is never
         /// clamped away.
-        #[ts(type = "string")]
-        excess_shares: NonNegative<FractionalShares>,
+        #[ts(type = "string | null")]
+        excess_shares: Option<NonNegative<FractionalShares>>,
     },
+}
+
+#[derive(Default)]
+enum FieldPresence<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<FieldPresence<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(FieldPresence::Present)
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum TradeOutcomeWire {
+    Filled,
+    Failed {
+        error: String,
+        #[serde(default, deserialize_with = "deserialize_present")]
+        accepted_shares: FieldPresence<Option<Positive<FractionalShares>>>,
+        filled_shares: Option<NonNegative<FractionalShares>>,
+        remaining_shares: Option<NonNegative<FractionalShares>>,
+        excess_shares: Option<NonNegative<FractionalShares>>,
+    },
+}
+
+impl<'de> Deserialize<'de> for TradeOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match TradeOutcomeWire::deserialize(deserializer)? {
+            TradeOutcomeWire::Filled => Ok(Self::Filled),
+            TradeOutcomeWire::Failed {
+                error,
+                accepted_shares: FieldPresence::Present(accepted_shares),
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } => Ok(Self::Failed {
+                error,
+                accepted_shares,
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            }),
+            TradeOutcomeWire::Failed {
+                error,
+                accepted_shares: FieldPresence::Missing,
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } => {
+                // terminal_outcomes_v1 predates accepted-quantity provenance.
+                // It split an overfill between filledShares and excessShares,
+                // so reconstruct the complete broker fill before discarding the
+                // request-derived remaining/excess values.
+                let filled =
+                    filled_shares.ok_or_else(|| D::Error::missing_field("filledShares"))?;
+                remaining_shares.ok_or_else(|| D::Error::missing_field("remainingShares"))?;
+                let excess =
+                    excess_shares.ok_or_else(|| D::Error::missing_field("excessShares"))?;
+                let complete_fill = (filled.inner() + excess.inner()).map_err(D::Error::custom)?;
+                let filled_shares = if complete_fill.inner().is_zero().map_err(D::Error::custom)? {
+                    None
+                } else {
+                    Some(NonNegative::new(complete_fill).map_err(D::Error::custom)?)
+                };
+
+                Ok(Self::Failed {
+                    error,
+                    accepted_shares: None,
+                    filled_shares,
+                    remaining_shares: None,
+                    excess_shares: None,
+                })
+            }
+        }
+    }
 }
 
 /// A completed onchain fill or terminal offchain counter-trade.
@@ -155,10 +247,9 @@ pub struct Trade {
     pub direction: Direction,
     #[ts(type = "string")]
     pub symbol: Symbol,
-    /// Quantity submitted for this counter-trade. Before broker acceptance this
-    /// is the requested quantity; afterward it is the quantity the broker
-    /// accepted. Failed outcomes split this order quantity into filled and
-    /// remaining portions in [`TradeOutcome::Failed`].
+    /// Executed quantity for fills, or requested quantity for a failed
+    /// counter-trade. Failed outcomes carry broker-accepted and fill provenance
+    /// separately when those facts are known.
     #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
     pub outcome: TradeOutcome,
@@ -185,6 +276,90 @@ impl Serialize for Trade {
     }
 }
 
+/// Stable `terminal_outcomes_v1` representation.
+///
+/// Retained for older dashboard bundles. That contract cannot express unknown
+/// quantity provenance, so its
+/// failed outcome uses the legacy non-null split while v2 exposes the canonical
+/// nullable fields from [`TradeOutcome`].
+pub struct TerminalOutcomesV1Trade<'a> {
+    trade: &'a Trade,
+}
+
+#[derive(Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum TerminalOutcomesV1Outcome<'a> {
+    Failed {
+        error: &'a str,
+        filled_shares: NonNegative<FractionalShares>,
+        remaining_shares: NonNegative<FractionalShares>,
+        excess_shares: NonNegative<FractionalShares>,
+    },
+}
+
+impl Serialize for TerminalOutcomesV1Trade<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let TradeOutcome::Failed {
+            error,
+            accepted_shares,
+            filled_shares,
+            ..
+        } = &self.trade.outcome
+        else {
+            return self.trade.serialize(serializer);
+        };
+
+        let shares = accepted_shares.unwrap_or(self.trade.shares);
+        let accepted = shares.inner();
+        // v1 represented a failure observed before fill provenance existed as
+        // an unfilled order. Keep that historical wire contract only in this
+        // compatibility adapter; the canonical v2 outcome remains unknown.
+        let filled = filled_shares
+            .map(NonNegative::inner)
+            .unwrap_or(FractionalShares::ZERO);
+        let (filled_portion, remaining_shares, excess_shares) = if filled
+            .inner()
+            .gt(accepted.inner())
+            .map_err(S::Error::custom)?
+        {
+            (
+                accepted,
+                FractionalShares::ZERO,
+                (filled - accepted).map_err(S::Error::custom)?,
+            )
+        } else {
+            (
+                filled,
+                (accepted - filled).map_err(S::Error::custom)?,
+                FractionalShares::ZERO,
+            )
+        };
+        let outcome = TerminalOutcomesV1Outcome::Failed {
+            error,
+            filled_shares: NonNegative::new(filled_portion).map_err(S::Error::custom)?,
+            remaining_shares: NonNegative::new(remaining_shares).map_err(S::Error::custom)?,
+            excess_shares: NonNegative::new(excess_shares).map_err(S::Error::custom)?,
+        };
+
+        let mut trade = serializer.serialize_struct("Trade", 7)?;
+        trade.serialize_field("id", &self.trade.id)?;
+        trade.serialize_field("occurredAt", &self.trade.occurred_at)?;
+        trade.serialize_field("venue", &self.trade.venue)?;
+        trade.serialize_field("direction", &self.trade.direction)?;
+        trade.serialize_field("symbol", &self.trade.symbol)?;
+        trade.serialize_field("shares", &shares)?;
+        trade.serialize_field("outcome", &outcome)?;
+        trade.end()
+    }
+}
+
 /// Filled-trade wire shape consumed by dashboard versions before terminal
 /// outcomes were added to [`Trade`].
 #[derive(Debug, Clone, Serialize, TS)]
@@ -201,6 +376,12 @@ pub struct LegacyTrade {
 }
 
 impl Trade {
+    /// Returns the stable terminal-outcomes v1 wire representation.
+    #[must_use]
+    pub const fn terminal_outcomes_v1(&self) -> TerminalOutcomesV1Trade<'_> {
+        TerminalOutcomesV1Trade { trade: self }
+    }
+
     /// Returns the pre-terminal-outcome representation for filled trades.
     #[must_use]
     pub fn legacy_fill(&self) -> Option<LegacyTrade> {
@@ -357,9 +538,12 @@ mod tests {
             shares: positive_shares("1"),
             outcome: TradeOutcome::Failed {
                 error: "asset is not tradable".to_string(),
-                filled_shares: NonNegative::new(FractionalShares::new(float!(0.25))).unwrap(),
-                remaining_shares: NonNegative::new(FractionalShares::new(float!(0.75))).unwrap(),
-                excess_shares: NonNegative::new(FractionalShares::ZERO).unwrap(),
+                accepted_shares: Some(positive_shares("1")),
+                filled_shares: Some(NonNegative::new(FractionalShares::new(float!(0.25))).unwrap()),
+                remaining_shares: Some(
+                    NonNegative::new(FractionalShares::new(float!(0.75))).unwrap(),
+                ),
+                excess_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
             },
         };
 
@@ -369,6 +553,7 @@ mod tests {
             json!({
                 "status": "failed",
                 "error": "asset is not tradable",
+                "acceptedShares": "1",
                 "filledShares": "0.25",
                 "remainingShares": "0.75",
                 "excessShares": "0"
@@ -378,6 +563,148 @@ mod tests {
             json.get("filledAt").is_none(),
             "failed outcomes must not masquerade as legacy fills"
         );
+    }
+
+    #[test]
+    fn failed_trade_deserializes_legacy_outcome_without_accepted_shares() {
+        let legacy = json!({
+            "id": "failed-order-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": {
+                "status": "failed",
+                "error": "asset is not tradable",
+                "filledShares": "0.25",
+                "remainingShares": "0.75",
+                "excessShares": "0"
+            }
+        });
+
+        let trade: Trade = serde_json::from_value(legacy).expect("legacy trade should deserialize");
+        let TradeOutcome::Failed {
+            accepted_shares,
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("legacy failed trade must retain its outcome");
+        };
+
+        assert_eq!(accepted_shares, None);
+        assert_eq!(
+            filled_shares,
+            Some(NonNegative::new(FractionalShares::new(float!(0.25))).unwrap())
+        );
+        assert_eq!(remaining_shares, None);
+        assert_eq!(excess_shares, None);
+    }
+
+    #[test]
+    fn failed_trade_deserialization_reconstructs_legacy_overfill() {
+        let legacy = json!({
+            "id": "overfilled-order-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": {
+                "status": "failed",
+                "error": "broker failed after overfill",
+                "filledShares": "1",
+                "remainingShares": "0",
+                "excessShares": "0.25"
+            }
+        });
+
+        let trade: Trade = serde_json::from_value(legacy).expect("legacy trade should deserialize");
+        let TradeOutcome::Failed {
+            accepted_shares,
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("legacy failed trade must retain its outcome");
+        };
+
+        assert_eq!(accepted_shares, None);
+        assert_eq!(
+            filled_shares,
+            Some(NonNegative::new(FractionalShares::new(float!(1.25))).unwrap())
+        );
+        assert_eq!(remaining_shares, None);
+        assert_eq!(excess_shares, None);
+    }
+
+    #[test]
+    fn failed_trade_deserialization_keeps_legacy_zero_fill_unknown() {
+        let legacy = json!({
+            "id": "placement-failure-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": {
+                "status": "failed",
+                "error": "placement rejected",
+                "filledShares": "0",
+                "remainingShares": "1",
+                "excessShares": "0"
+            }
+        });
+
+        let trade: Trade = serde_json::from_value(legacy).expect("legacy trade should deserialize");
+        let TradeOutcome::Failed {
+            accepted_shares,
+            filled_shares,
+            remaining_shares,
+            excess_shares,
+            ..
+        } = trade.outcome
+        else {
+            panic!("legacy failed trade must retain its outcome");
+        };
+
+        assert_eq!(accepted_shares, None);
+        assert_eq!(filled_shares, None);
+        assert_eq!(remaining_shares, None);
+        assert_eq!(excess_shares, None);
+    }
+
+    #[test]
+    fn terminal_outcomes_v1_preserves_non_null_legacy_failure_shape() {
+        let trade = Trade {
+            id: "failed-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: positive_shares("2"),
+            outcome: TradeOutcome::Failed {
+                error: "broker failed after overfill".to_string(),
+                accepted_shares: Some(positive_shares("1")),
+                filled_shares: Some(NonNegative::new(FractionalShares::new(float!(1.25))).unwrap()),
+                remaining_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
+                excess_shares: Some(NonNegative::new(FractionalShares::new(float!(0.25))).unwrap()),
+            },
+        };
+
+        let wire = serde_json::to_value(trade.terminal_outcomes_v1())
+            .expect("v1 compatibility serialization should succeed");
+
+        assert_eq!(wire["shares"], "1");
+        assert_eq!(wire["outcome"]["filledShares"], "1");
+        assert_eq!(wire["outcome"]["remainingShares"], "0");
+        assert_eq!(wire["outcome"]["excessShares"], "0.25");
+        assert!(wire["outcome"].get("acceptedShares").is_none());
     }
 
     #[test]

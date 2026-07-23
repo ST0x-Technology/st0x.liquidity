@@ -198,7 +198,8 @@ impl Executor for AlpacaBrokerApi {
             // (the poll retries the same read forever and the position never
             // releases). A genuine partial fill on a failed order carries
             // filled_qty, which the retained-fill path records; an absent
-            // field on a rejection means no fill.
+            // field remains unknown downstream rather than being treated as
+            // proof of a zero fill.
             OrderStatus::Failed => Ok(OrderState::Failed {
                 failed_at: order_update.updated_at,
                 error_reason: None,

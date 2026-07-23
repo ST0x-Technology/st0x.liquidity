@@ -97,11 +97,15 @@
   const venueOptions = ALL_VENUES.map((venue) => ({ value: venue, label: venueLabel(venue) }))
   const symbolOptions = $derived(allSymbols.current.map((sym) => ({ value: sym, label: sym })))
 
-  const buildParams = (limit = PAGE_SIZE, requestOffset = offset.current): URLSearchParams => {
+  const buildParams = (
+    limit = PAGE_SIZE,
+    requestOffset = offset.current,
+    protocol: 'terminal_outcomes_v2' | 'terminal_outcomes_v1' = 'terminal_outcomes_v2'
+  ): URLSearchParams => {
     const params = new URLSearchParams({
       limit: String(limit),
       offset: String(requestOffset),
-      trade_protocol: 'terminal_outcomes_v1'
+      trade_protocol: protocol
     })
 
     if (selectedVenues.current.size > 0 && selectedVenues.current.size < ALL_VENUES.length) {
@@ -153,10 +157,7 @@
     })
   })
 
-  const fetchTrades = async (
-    mode: 'replace' | 'append',
-    requestOffset = offset.current
-  ) => {
+  const fetchTrades = async (mode: 'replace' | 'append', requestOffset = offset.current) => {
     if (selectedVenues.current.size === 0) {
       historyRequestVersion += 1
       entries.update(() => [])
@@ -179,9 +180,14 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const response = await fetch(`${baseUrl}/trades?${buildParams(PAGE_SIZE, requestOffset).toString()}`, {
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-      })
+      const fetchWithProtocol = (protocol: 'terminal_outcomes_v2' | 'terminal_outcomes_v1') =>
+        fetch(`${baseUrl}/trades?${buildParams(PAGE_SIZE, requestOffset, protocol).toString()}`, {
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        })
+      let response = await fetchWithProtocol('terminal_outcomes_v2')
+      if (response.status === 400) {
+        response = await fetchWithProtocol('terminal_outcomes_v1')
+      }
 
       if (!response.ok) {
         if (requestVersion === historyRequestVersion) {
@@ -303,7 +309,10 @@
   const fmtSize = (value: string): string => formatDecimal(value, 3)
 
   const shareTooltip = (trade: TradeEntry): string =>
-    equityUsdTooltip(trade.shares, positionPrices.get(trade.symbol) ?? null)
+    `${trade.outcome.status === 'failed' ? 'Order quantity. ' : ''}${equityUsdTooltip(
+      trade.shares,
+      positionPrices.get(trade.symbol) ?? null
+    )}`
 
   const isNumeric = (value: unknown): boolean =>
     typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))

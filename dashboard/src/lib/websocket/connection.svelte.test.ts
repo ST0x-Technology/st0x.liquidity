@@ -8,6 +8,7 @@ import type { TransferOperation } from '$lib/api/TransferOperation'
 
 class MockWebSocket {
   url: string
+  closeCalls = 0
   onopen: (() => void) | null = null
   onclose: ((event: CloseEvent) => void) | null = null
   onmessage: ((event: { data: string }) => void) | null = null
@@ -22,6 +23,7 @@ class MockWebSocket {
   }
 
   close() {
+    this.closeCalls += 1
     this.onclose?.({ code: 1000, reason: '' } as CloseEvent)
   }
 
@@ -191,6 +193,26 @@ describe('createWebSocket', () => {
 
       getInstance(0).simulateOpen()
       expect(ws.state).toBe('connected')
+    })
+
+    it('retries with v1 when the previous backend rejects v2', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      expect(getInstance(0).url).toContain('trade_protocol=terminal_outcomes_v2')
+
+      getInstance(0).simulateError()
+      vi.advanceTimersByTime(1000)
+
+      expect(getInstance(1).url).toContain('trade_protocol=terminal_outcomes_v1')
+
+      getInstance(1).simulateOpen()
+      getInstance(1).simulateClose()
+      vi.advanceTimersByTime(2000)
+
+      expect(getInstance(2).url).toContain('trade_protocol=terminal_outcomes_v2')
     })
 
     it('transitions to error on close from connected', () => {
@@ -402,6 +424,7 @@ describe('createWebSocket', () => {
       expect(queryClient.cache.get('["trades"]')).toEqual([knownGood])
       expect(ws.state).toBe('error')
       expect(ws.error?.message).toContain('Invalid trade payload')
+      expect(getInstance(0).closeCalls).toBe(1)
       expect(consoleError).toHaveBeenCalledWith(
         'Failed to parse WebSocket message:',
         expect.objectContaining({ message: expect.stringContaining('shares') }),
@@ -454,6 +477,7 @@ describe('createWebSocket', () => {
         outcome: {
           status: 'failed',
           error: 'asset is not tradable',
+          acceptedShares: '10',
           filledShares: '0',
           remainingShares: '10',
           excessShares: '0'
@@ -629,7 +653,7 @@ describe('createWebSocket', () => {
       expect(ws.error).toBeNull()
     })
 
-    it('backs off repeated invalid messages until a valid message arrives', () => {
+    it('caps exponential backoff for repeated invalid messages', () => {
       const { instances, getInstance } = setupWebSocketTest()
       const queryClient = createMockQueryClient()
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -653,7 +677,29 @@ describe('createWebSocket', () => {
       expect(instances).toHaveLength(2)
       vi.advanceTimersByTime(1000)
       expect(instances).toHaveLength(3)
-      expect(consoleError).toHaveBeenCalledTimes(2)
+      getInstance(2).simulateOpen()
+      getInstance(2).simulateRawMessage('{"not":"valid"}')
+      expect(ws.error?.attempts).toBe(3)
+      expect(ws.error?.nextRetryMs).toBe(4000)
+
+      vi.advanceTimersByTime(4000)
+      getInstance(3).simulateOpen()
+      getInstance(3).simulateRawMessage('{"not":"valid"}')
+      expect(ws.error?.attempts).toBe(4)
+      expect(ws.error?.nextRetryMs).toBe(8000)
+
+      vi.advanceTimersByTime(8000)
+      getInstance(4).simulateOpen()
+      getInstance(4).simulateRawMessage('{"not":"valid"}')
+      expect(ws.error?.attempts).toBe(5)
+      expect(ws.error?.nextRetryMs).toBe(10000)
+
+      vi.advanceTimersByTime(10000)
+      getInstance(5).simulateOpen()
+      getInstance(5).simulateRawMessage('{"not":"valid"}')
+      expect(ws.error?.attempts).toBe(6)
+      expect(ws.error?.nextRetryMs).toBe(10000)
+      expect(consoleError).toHaveBeenCalledTimes(6)
     })
   })
 })

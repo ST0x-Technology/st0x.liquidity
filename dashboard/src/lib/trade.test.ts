@@ -21,6 +21,7 @@ describe('trade outcome presentation', () => {
     const outcome = {
       status: 'failed',
       error: 'asset is not tradable',
+      acceptedShares: '1',
       filledShares: '0.25',
       remainingShares: '0.75',
       excessShares: '0'
@@ -30,6 +31,7 @@ describe('trade outcome presentation', () => {
     expect(tradeOutcomeClass(outcome)).toBe('text-destructive')
     expect(tradeFailureReason(outcome)).toBe('asset is not tradable')
     expect(tradeFailureShares(outcome)).toEqual({
+      accepted: '1',
       filled: '0.25',
       remaining: '0.75',
       excess: '0'
@@ -55,6 +57,7 @@ describe('live trade history', () => {
       outcome: {
         status: 'failed',
         error: 'broker rejected remainder',
+        acceptedShares: '1',
         filledShares: '0.25',
         remainingShares: '0.75',
         excessShares: '0'

@@ -852,6 +852,7 @@ mod tests {
     use crate::conductor::job::{
         FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, build_supervised_worker, build_worker_inner,
     };
+    use crate::dashboard::trade_loader::load_trades;
     use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_pools;
@@ -897,7 +898,11 @@ mod tests {
         }
     }
 
-    async fn persist_failed_offchain_order(pool: SqlitePool, id: OffchainOrderId) {
+    async fn persist_failed_offchain_order(
+        pool: SqlitePool,
+        id: OffchainOrderId,
+        filled_shares: Option<st0x_execution::FractionalShares>,
+    ) {
         let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool)
             .build(crate::offchain::order::noop_order_placer())
             .await
@@ -938,6 +943,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "broker unavailable".to_string(),
+                    filled_shares,
                     failed_at: chrono::Utc::now(),
                 },
             )
@@ -1158,6 +1164,7 @@ mod tests {
                 id,
                 OffchainOrderEvent::Failed {
                     error: "broker unavailable".to_string(),
+                    filled_shares: None,
                     failed_at: now,
                 },
             )
@@ -1239,7 +1246,7 @@ mod tests {
             .await
             .expect("the missing handoff must exhaust its immediate retry budget");
 
-        persist_failed_offchain_order(pool, id).await;
+        persist_failed_offchain_order(pool, id, None).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let pending: i64 = sqlx_apalis::query_scalar(
@@ -1822,6 +1829,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkFailed {
                     error: "asset is not tradable".to_string(),
+                    filled_shares: None,
                     failed_at: now,
                 },
             )
@@ -1830,6 +1838,7 @@ mod tests {
 
         let failed = OffchainOrderEvent::Failed {
             error: "asset is not tradable".to_string(),
+            filled_shares: None,
             failed_at: now,
         };
         harness.receive::<OffchainOrder>(id, failed).await.unwrap();
@@ -1838,34 +1847,45 @@ mod tests {
 
         let message = receiver.recv().await.expect("should receive failure");
         match message {
-            Statement::TradeUpdate(trade) => match trade.outcome {
-                st0x_dto::TradeOutcome::Failed {
-                    error,
-                    filled_shares,
-                    remaining_shares,
-                    excess_shares,
-                } => {
-                    assert_eq!(error, "asset is not tradable");
-                    assert!(
-                        filled_shares
-                            .inner()
-                            .inner()
-                            .eq(st0x_float_macro::float!(0.25))
-                            .unwrap()
-                    );
-                    assert!(
-                        remaining_shares
-                            .inner()
-                            .inner()
-                            .eq(st0x_float_macro::float!(0.75))
-                            .unwrap()
-                    );
-                    assert!(excess_shares.inner().inner().is_zero().unwrap());
+            Statement::TradeUpdate(trade) => {
+                let history = load_trades(&pool).await.unwrap();
+                assert_eq!(
+                    &trade.outcome, &history[0].outcome,
+                    "live and historical failure provenance must be identical"
+                );
+                match trade.outcome {
+                    st0x_dto::TradeOutcome::Failed {
+                        error,
+                        accepted_shares,
+                        filled_shares,
+                        remaining_shares,
+                        excess_shares,
+                    } => {
+                        assert_eq!(error, "asset is not tradable");
+                        assert!(accepted_shares.is_some());
+                        assert!(
+                            filled_shares
+                                .unwrap()
+                                .inner()
+                                .inner()
+                                .eq(st0x_float_macro::float!(0.25))
+                                .unwrap()
+                        );
+                        assert!(
+                            remaining_shares
+                                .unwrap()
+                                .inner()
+                                .inner()
+                                .eq(st0x_float_macro::float!(0.75))
+                                .unwrap()
+                        );
+                        assert!(excess_shares.unwrap().inner().inner().is_zero().unwrap());
+                    }
+                    st0x_dto::TradeOutcome::Filled => {
+                        panic!("failed order must broadcast a failure outcome")
+                    }
                 }
-                st0x_dto::TradeOutcome::Filled => {
-                    panic!("failed order must broadcast a failure outcome")
-                }
-            },
+            }
             other => panic!("expected TradeUpdate message, got {other:?}"),
         }
 

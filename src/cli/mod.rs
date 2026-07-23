@@ -2738,6 +2738,7 @@ mod tests {
         // genuine serialized OffchainOrderEvent, not a hand-written shape.
         let failed = OffchainOrderEvent::Failed {
             error: "rejected".to_string(),
+            filled_shares: None,
             failed_at: Utc::now(),
         };
         sqlx::query(
