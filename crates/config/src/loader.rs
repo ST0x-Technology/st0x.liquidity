@@ -36,6 +36,8 @@ static DRY_RUN_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(
     Positive::new(FractionalShares::new(float!(1))).unwrap_or_else(|_| unreachable!())
 });
 const MIN_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 1;
+const MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS: u64 =
+    chrono::TimeDelta::MAX.num_seconds().unsigned_abs();
 /// Slippage must be strictly less than 100%: 10_000 bps (exactly 100%) zeroes a
 /// sell-side limit price and fails `Positive::new` at runtime.
 ///
@@ -400,6 +402,7 @@ struct TokenizationConfig {
 #[serde(deny_unknown_fields)]
 struct BrokerConfig {
     counter_trade_slippage_bps: Option<u16>,
+    extended_hours_reprice_timeout_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
 }
 
@@ -449,6 +452,27 @@ impl BrokerConfig {
                 configured,
                 min: MIN_COUNTER_TRADE_SLIPPAGE_BPS,
                 max: MAX_COUNTER_TRADE_SLIPPAGE_BPS,
+            });
+        }
+
+        Ok(configured)
+    }
+
+    fn extended_hours_reprice_timeout_secs(&self) -> Result<u64, CtxError> {
+        let configured = self
+            .extended_hours_reprice_timeout_secs
+            .ok_or(CtxError::MissingExtendedHoursRepriceTimeout)?;
+
+        if configured == 0 {
+            return Err(CtxError::ZeroPollingInterval {
+                field: "broker.extended_hours_reprice_timeout_secs",
+            });
+        }
+
+        if configured > MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS {
+            return Err(CtxError::ExtendedHoursRepriceTimeoutOutOfRange {
+                configured,
+                max: MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS,
             });
         }
 
@@ -521,6 +545,9 @@ pub struct Ctx {
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
     /// (capped at the chain's latest finalized block).
     pub order_fill_poll_interval: u64,
+    /// Maximum age (seconds) for a live extended-hours limit hedge before it is
+    /// cancelled so the next scan can place a fresh marketable limit.
+    pub extended_hours_reprice_timeout_secs: u64,
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
@@ -620,6 +647,10 @@ impl std::fmt::Debug for Ctx {
             .field("inventory_poll_interval", &self.inventory_poll_interval)
             .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field(
+                "extended_hours_reprice_timeout_secs",
+                &self.extended_hours_reprice_timeout_secs,
+            )
+            .field(
                 "apalis_finished_job_cleanup_interval_secs",
                 &self.apalis_finished_job_cleanup_interval_secs,
             )
@@ -689,6 +720,7 @@ struct ValidatedParts {
     position_check_interval: u64,
     inventory_poll_interval: u64,
     order_fill_poll_interval: u64,
+    extended_hours_reprice_timeout_secs: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
@@ -893,6 +925,15 @@ fn parse_and_validate(
         });
     }
 
+    let extended_hours_reprice_timeout_secs = match &broker {
+        BrokerCtx::AlpacaBrokerApi(_) => config
+            .broker
+            .as_ref()
+            .ok_or(CtxError::MissingExtendedHoursRepriceTimeout)?
+            .extended_hours_reprice_timeout_secs()?,
+        BrokerCtx::DryRun => 0,
+    };
+
     let apalis_finished_job_cleanup_interval_secs =
         config.apalis_finished_job_cleanup_interval_secs;
     if apalis_finished_job_cleanup_interval_secs == 0 {
@@ -933,6 +974,7 @@ fn parse_and_validate(
         position_check_interval,
         inventory_poll_interval,
         order_fill_poll_interval,
+        extended_hours_reprice_timeout_secs,
         apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
@@ -1026,6 +1068,7 @@ impl Ctx {
             position_check_interval: parts.position_check_interval,
             inventory_poll_interval: parts.inventory_poll_interval,
             order_fill_poll_interval: parts.order_fill_poll_interval,
+            extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
             broker: parts.broker,
@@ -1294,6 +1337,7 @@ impl Ctx {
             position_check_interval: 2,
             inventory_poll_interval,
             order_fill_poll_interval: 1,
+            extended_hours_reprice_timeout_secs: 300,
             apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
@@ -1357,6 +1401,16 @@ pub enum CtxError {
          Trading API or Alpaca Broker API"
     )]
     MissingCounterTradeSlippageBps,
+    #[error(
+        "[broker] extended_hours_reprice_timeout_secs is required when using \
+         Alpaca Broker API"
+    )]
+    MissingExtendedHoursRepriceTimeout,
+    #[error(
+        "[broker] extended_hours_reprice_timeout_secs {configured} is out of range; \
+         expected 1..={max}"
+    )]
+    ExtendedHoursRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
         "[broker] counter_trade_slippage_bps {configured} is out of range; \
          expected {min}..={max}"
@@ -1438,6 +1492,10 @@ impl CtxError {
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
+            Self::MissingExtendedHoursRepriceTimeout => "missing extended hours reprice timeout",
+            Self::ExtendedHoursRepriceTimeoutOutOfRange { .. } => {
+                "extended hours reprice timeout out of range"
+            }
             Self::CounterTradeSlippageBpsOutOfRange { .. } => {
                 "counter trade slippage bps out of range"
             }
@@ -1568,6 +1626,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         position_check_interval: 60,
         inventory_poll_interval: 60,
         order_fill_poll_interval: 5,
+        extended_hours_reprice_timeout_secs: 300,
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
         telemetry: None,
@@ -1735,6 +1794,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
@@ -1768,6 +1828,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [wallet]
             kind = "private-key"
@@ -2567,6 +2628,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2847,6 +2909,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2911,6 +2974,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -2983,6 +3047,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3054,6 +3119,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3108,6 +3174,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3176,13 +3243,101 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingCounterTradeSlippageBps),
             "Expected MissingCounterTradeSlippageBps, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_requires_extended_hours_reprice_timeout_config() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::MissingExtendedHoursRepriceTimeout),
+            "Expected MissingExtendedHoursRepriceTimeout, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn extended_hours_reprice_timeout_rejects_values_chrono_cannot_represent() {
+        let broker = BrokerConfig {
+            counter_trade_slippage_bps: Some(100),
+            extended_hours_reprice_timeout_secs: Some(u64::MAX),
+            travel_rule: None,
+        };
+
+        let error = broker.extended_hours_reprice_timeout_secs().unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::ExtendedHoursRepriceTimeoutOutOfRange {
+                    configured: u64::MAX,
+                    ..
+                }
+            ),
+            "Expected ExtendedHoursRepriceTimeoutOutOfRange, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn extended_hours_reprice_timeout_accepts_chrono_maximum() {
+        let broker = BrokerConfig {
+            counter_trade_slippage_bps: Some(100),
+            extended_hours_reprice_timeout_secs: Some(MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS),
+            travel_rule: None,
+        };
+
+        assert_eq!(
+            broker.extended_hours_reprice_timeout_secs().unwrap(),
+            MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS
         );
     }
 
@@ -3266,6 +3421,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 10000
+            extended_hours_reprice_timeout_secs = 300
         "#,
         );
         let secrets = toml_file(
@@ -3322,6 +3478,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 9999
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
@@ -5412,6 +5569,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -5465,6 +5623,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"

@@ -638,6 +638,9 @@ pub enum CancellationReason {
     /// transition so the next monitor scan can place a market order
     /// instead.
     MarketOpenReplacement,
+    /// Extended-hours limit order stayed live beyond the configured timeout;
+    /// cancel it so the next scan can place a fresh marketable limit.
+    ExtendedHoursRepriceTimeout,
     /// The broker reported the order cancelled without a locally persisted
     /// cancel request: either an operator/broker-side cancellation (e.g. a
     /// manual Alpaca-dashboard cancel) or a crash that lost the
