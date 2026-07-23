@@ -124,8 +124,9 @@ async fn assert_position(
     assert_eq!(position.accumulated_short, accumulated_short);
     assert_eq!(position.pending_offchain_order_id, pending);
     let price = position
-        .last_price_usdc
-        .expect("last_price_usdc should be Some");
+        .last_price
+        .expect("last_price should be Some")
+        .price;
     assert!(price.eq(last_price_usdc).unwrap());
 }
 

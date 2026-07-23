@@ -286,7 +286,7 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
             Ok(Some(position)) => positions.push(st0x_dto::Position {
                 symbol: position.symbol,
                 net: position.net.inner(),
-                last_price_usdc: position.last_price_usdc,
+                last_price_usdc: position.last_price.map(|observation| observation.price),
             }),
             Ok(None) => {
                 warn!(target: "dashboard", %id, "Position disappeared while loading dashboard state");

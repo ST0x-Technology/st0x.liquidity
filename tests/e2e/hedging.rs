@@ -149,9 +149,7 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
         "Position should be fully hedged after offchain fill",
     );
     let last_price_rounded = crate::assert::round_float(
-        position
-            .last_price_usdc
-            .expect("last_price_usdc should be set"),
+        position.last_price.expect("last_price should be set").price,
         2,
     )?;
     assert!(

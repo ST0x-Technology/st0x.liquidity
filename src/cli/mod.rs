@@ -192,7 +192,7 @@ fn parse_float(input: &str) -> Result<Float, String> {
 }
 
 /// Parses a strictly-positive price. A zero or negative `--price` would poison
-/// `last_price_usdc` and make a dollar-value threshold never trigger a hedge --
+/// `last_price` and make a dollar-value threshold never trigger a hedge --
 /// the exact never-hedges state the price requirement exists to prevent.
 fn parse_positive_price(input: &str) -> Result<Float, String> {
     let value = Float::parse(input.to_string()).map_err(|err| format!("{err}"))?;
