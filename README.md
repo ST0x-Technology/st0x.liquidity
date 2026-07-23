@@ -128,6 +128,19 @@ repaired exposure could never be valued and would never hedge.
 `position set` is rejected while the symbol still has a pending offchain hedge
 order; resolve it first with `position release-hedge`, then retry.
 
+After verifying a missing daily snapshot mark against a historical-price source,
+set the preceding regular-session close through the audited CQRS repair command:
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml portfolio-snapshot set --day 2026-07-20 --symbol AAPL --usd-mark 211.18 --observed-at 2026-07-17T20:00:00Z --source "Nasdaq historical close" --reason "repair missing snapshot mark"
+```
+
+The repair updates every captured location for that symbol and day without
+changing the live position price. If the read model needs recovery, replay all
+captured balances and corrections with
+`st0x-cli view rebuild --aggregate
+portfolio-snapshot --all`.
+
 ### Brokerage Setup
 
 **Alpaca Broker API** (managed accounts, supports auto-rebalancing):

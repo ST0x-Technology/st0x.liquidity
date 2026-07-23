@@ -585,6 +585,7 @@ impl Conductor {
             Err(CtxError::NotRebalancing) => None,
             Err(error) => return Err(error.into()),
         };
+        let notifier = build_notifier(ctx.alerts.as_ref())?;
 
         let PositionAndRebalancing {
             position,
@@ -617,6 +618,7 @@ impl Conductor {
                 vault_registry_projection,
                 schedulers: schedulers.clone(),
                 telemetry: telemetry.clone(),
+                notifier: notifier.clone(),
             },
         )
         .await?;
@@ -671,6 +673,7 @@ impl Conductor {
             check_positions_queue,
             portfolio_snapshot_queue,
         } = setup_trading_job_queues(
+            &pool,
             &apalis_pool,
             &job_queue,
             EquityRecoveryInputs {
@@ -743,6 +746,7 @@ impl Conductor {
             .rejection_queue(rejection_queue)
             .check_positions_queue(check_positions_queue)
             .portfolio_snapshot_queue(portfolio_snapshot_queue)
+            .notifier(notifier)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
@@ -1158,6 +1162,7 @@ struct RebalancingDeps {
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     schedulers: RebalancingSchedulers,
     telemetry: TelemetrySender,
+    notifier: Arc<dyn crate::alerts::Notifier>,
 }
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
@@ -1202,10 +1207,12 @@ impl PositionAndRebalancing {
         // mode, and the Single-Framework-Instance rule (docs/cqrs.md)
         // forbids building a second Store<PortfolioSnapshot> in either
         // branch below.
+        let portfolio_snapshot_projection = PortfolioSnapshotProjection::new(deps.pool.clone());
+        portfolio_snapshot_projection.rebuild_all().await?;
         let portfolio_snapshot = StoreBuilder::<PortfolioSnapshot>::new(deps.pool.clone())
-            .with(Arc::new(PortfolioSnapshotProjection::new(
-                deps.pool.clone(),
-            )))
+            .with(Arc::new(RetryOnBusy {
+                inner: portfolio_snapshot_projection,
+            }))
             .build(())
             .await?;
 
@@ -1318,7 +1325,7 @@ impl PositionAndRebalancing {
     }
 }
 
-/// Builds the USDC alerting notifier.
+/// Builds the shared operational-alerting notifier.
 ///
 /// Returns `Ok(Arc<NoopNotifier>)` when `[alerts]` is absent — silence is
 /// the correct behaviour for an unconfigured optional channel.
@@ -1328,16 +1335,16 @@ impl PositionAndRebalancing {
 /// an operator who configured `[alerts]` believes alerts are active; silently
 /// falling back to Noop would suppress all redrive-limit and terminal-error
 /// pages with no runtime indication.
-fn build_usdc_notifier(
+fn build_notifier(
     alerts: Option<&st0x_config::AlertsCtx>,
 ) -> Result<Arc<dyn crate::alerts::Notifier>, NotifierError> {
     let Some(alerts) = alerts else {
-        debug!("USDC alerting: [alerts] section absent, using NoopNotifier");
+        debug!("Alerting: [alerts] section absent, using NoopNotifier");
         return Ok(Arc::new(NoopNotifier));
     };
     let notifier =
         TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
-    info!("USDC alerting: Telegram notifier configured");
+    info!("Telegram notifier configured");
     Ok(Arc::new(notifier))
 }
 
@@ -1520,7 +1527,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
 
-        let usdc_notifier = build_usdc_notifier(deps.ctx.alerts.as_ref())?;
+        let notifier = deps.notifier.clone();
 
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -1534,7 +1541,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.inventory.clone(),
             wrapper.clone(),
             deps.schedulers,
-            usdc_notifier.clone(),
+            notifier.clone(),
         ));
 
         wire_freeze_guard(
@@ -1665,7 +1672,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             transfer: usdc_handles.resume_alpaca_to_base,
             job_queue: transfer_usdc_to_market_making_queue,
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
-            notifier: usdc_notifier.clone(),
+            notifier: notifier.clone(),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -1673,7 +1680,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             timeout: rebalancing_ctx.transfer_attempt_timeout,
             job_queue: transfer_usdc_to_hedging_queue,
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
-            notifier: usdc_notifier,
+            notifier,
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
@@ -8463,6 +8470,7 @@ mod tests {
                 vault_registry_projection,
                 schedulers: RebalancingSchedulers::new(&apalis_pool),
                 telemetry: TelemetrySender::disabled(),
+                notifier: Arc::new(NoopNotifier),
             },
         )
         .await
@@ -10731,18 +10739,18 @@ mod tests {
         );
     }
 
-    /// When `[alerts]` is absent, `build_usdc_notifier` returns a `NoopNotifier`
+    /// When `[alerts]` is absent, `build_notifier` returns a `NoopNotifier`
     /// that silently discards notifications without error.
     #[tokio::test]
-    async fn build_usdc_notifier_returns_ok_noop_when_alerts_absent() {
-        let notifier = build_usdc_notifier(None).unwrap();
+    async fn build_notifier_returns_ok_noop_when_alerts_absent() {
+        let notifier = build_notifier(None).unwrap();
         notifier
             .notify("test message")
             .await
             .expect("NoopNotifier must not error on notify");
     }
 
-    /// When `[alerts]` IS present, `build_usdc_notifier` constructs a real
+    /// When `[alerts]` IS present, `build_notifier` constructs a real
     /// Telegram notifier and returns `Ok` -- it must NOT fail startup for a
     /// well-formed config, and it must NOT silently fall back to `NoopNotifier`
     /// (which would suppress every redrive-limit and terminal-error page).
@@ -10754,7 +10762,7 @@ mod tests {
     /// `notify()` is deliberately not exercised: the present-branch notifier posts
     /// to the live Telegram API, which a unit test must never reach.
     #[tokio::test]
-    async fn build_usdc_notifier_returns_ok_telegram_when_alerts_present() {
+    async fn build_notifier_returns_ok_telegram_when_alerts_present() {
         let alerts = st0x_config::AlertsCtx {
             chat_id: 123,
             bot_token: "test-bot-token".to_string(),
@@ -10764,7 +10772,7 @@ mod tests {
             message_thread_id: Some(42),
         };
 
-        build_usdc_notifier(Some(&alerts))
+        build_notifier(Some(&alerts))
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 }

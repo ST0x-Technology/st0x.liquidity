@@ -11,6 +11,7 @@ mod wrapper;
 
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::ProviderBuilder;
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
@@ -31,6 +32,7 @@ use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
+use crate::portfolio_snapshot::PortfolioSnapshotProjection;
 use crate::position::Position;
 use crate::vault_registry::VaultRegistry;
 
@@ -125,6 +127,9 @@ pub enum AggregateView {
     /// failure across all four subscribed streams through the reactor fold.
     /// Supports `--all` only.
     LifecycleFailure,
+    /// Daily portfolio snapshot read model. Replays captures and every audited
+    /// historical-mark correction. Supports `--all` only.
+    PortfolioSnapshot,
 }
 
 /// CCTP chain identifier for specifying source chain.
@@ -187,6 +192,31 @@ pub enum PositionRecoveryCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum PortfolioSnapshotRecoveryCommand {
+    /// Set the audited historical closing-price mark for one captured ET day.
+    Set {
+        /// ET day of the immutable balance snapshot (YYYY-MM-DD).
+        #[arg(long = "day")]
+        day: NaiveDate,
+        /// Equity symbol whose mark applies at every captured location.
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Strictly-positive historical USD closing price per share.
+        #[arg(long = "usd-mark", value_parser = parse_positive_mark)]
+        usd_mark: Positive<Float>,
+        /// Sourced economic timestamp; must be an earlier ET day and remain usable.
+        #[arg(long = "observed-at")]
+        observed_at: DateTime<Utc>,
+        /// Source used to verify the historical price.
+        #[arg(long = "source", value_parser = parse_non_empty_source)]
+        source: String,
+        /// Operator reason persisted with the correction event.
+        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
+        reason: String,
+    },
+}
+
 fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
@@ -201,6 +231,18 @@ fn parse_positive_price(input: &str) -> Result<Float, String> {
         return Err(format!("--price must be strictly positive, got {value:?}"));
     }
     Ok(value)
+}
+
+fn parse_positive_mark(input: &str) -> Result<Positive<Float>, String> {
+    Positive::new(parse_positive_price(input)?).map_err(|error| format!("{error}"))
+}
+
+fn parse_non_empty_source(input: &str) -> Result<String, String> {
+    if input.trim().is_empty() {
+        return Err("--source must not be blank; it is persisted as audit provenance".to_string());
+    }
+
+    Ok(input.to_string())
 }
 
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
@@ -656,6 +698,12 @@ pub enum Commands {
         command: PositionRecoveryCommand,
     },
 
+    /// Repair historical daily portfolio snapshot marks through CQRS events.
+    PortfolioSnapshot {
+        #[command(subcommand)]
+        command: PortfolioSnapshotRecoveryCommand,
+    },
+
     /// Recover stuck asset transfers (USDC rebalances, mints, redemptions).
     Transfer {
         #[command(subcommand)]
@@ -949,6 +997,9 @@ enum SimpleCommand {
     },
     Position {
         command: PositionRecoveryCommand,
+    },
+    PortfolioSnapshot {
+        command: PortfolioSnapshotRecoveryCommand,
     },
     FailTransfer {
         transfer_type: TransferType,
@@ -1323,6 +1374,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         }
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
         Commands::Position { command } => Ok(SimpleCommand::Position { command }),
+        Commands::PortfolioSnapshot { command } => Ok(SimpleCommand::PortfolioSnapshot { command }),
         Commands::FailUsdcTransfer { id, reason } => {
             Ok(SimpleCommand::FailUsdcTransfer { id, reason })
         }
@@ -1544,6 +1596,9 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::Position { command } => {
             run_position_command(stdout, pool, command, ctx.execution_threshold).await
         }
+        SimpleCommand::PortfolioSnapshot { command } => {
+            repair::set_portfolio_snapshot_mark_command(stdout, pool, command).await
+        }
         SimpleCommand::FailTransfer {
             transfer_type,
             id,
@@ -1681,6 +1736,27 @@ async fn rebuild_view<W: Write>(
             writeln!(
                 stdout,
                 "Rebuilt lifecycle-failure read model ({replayed} events replayed)"
+            )?;
+        }
+        AggregateView::PortfolioSnapshot => {
+            if id.is_some() {
+                anyhow::bail!(
+                    "portfolio-snapshot rebuild replays the whole read model; pass --all, not --id"
+                );
+            }
+
+            if !all {
+                anyhow::bail!(
+                    "portfolio-snapshot rebuild replays the whole read model; pass --all"
+                );
+            }
+
+            let replayed = PortfolioSnapshotProjection::new(pool.clone())
+                .rebuild_all()
+                .await?;
+            writeln!(
+                stdout,
+                "Rebuilt portfolio-snapshot read model ({replayed} events replayed)"
             )?;
         }
     }
@@ -2292,6 +2368,62 @@ mod tests {
             error.to_string().contains("must not be blank"),
             "unexpected error: {error}",
         );
+    }
+
+    #[test]
+    fn portfolio_snapshot_set_rejects_nonpositive_mark_and_blank_provenance() {
+        for (flag, value) in [("--usd-mark", "0"), ("--source", "   "), ("--reason", "")] {
+            let mut args = vec![
+                "st0x-cli",
+                "portfolio-snapshot",
+                "set",
+                "--day",
+                "2026-07-20",
+                "--symbol",
+                "AAPL",
+                "--usd-mark",
+                "150",
+                "--observed-at",
+                "2026-07-17T20:00:00Z",
+                "--source",
+                "Nasdaq historical close",
+                "--reason",
+                "repair missing mark",
+            ];
+            let value_index = args.iter().position(|arg| *arg == flag).unwrap() + 1;
+            args[value_index] = value;
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn portfolio_snapshot_set_parses_audited_historical_mark() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "portfolio-snapshot",
+            "set",
+            "--day",
+            "2026-07-20",
+            "--symbol",
+            "AAPL",
+            "--usd-mark",
+            "150.25",
+            "--observed-at",
+            "2026-07-17T20:00:00Z",
+            "--source",
+            "Nasdaq historical close",
+            "--reason",
+            "repair missing mark",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            classify_command(cli.command),
+            Ok(SimpleCommand::PortfolioSnapshot {
+                command: PortfolioSnapshotRecoveryCommand::Set { .. }
+            })
+        ));
     }
 
     #[test]

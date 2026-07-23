@@ -50,6 +50,10 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Inventory OperatorDeposit/OperatorWithdraw legs with no same-tx counterpart in the \
          batch, by leg"
     );
+    metrics::describe_counter!(
+        "portfolio_snapshot_unusable_mark_total",
+        "Nonzero equity balances captured with a missing or stale USD mark, by symbol and reason"
+    );
 
     let _ = HANDLE.set(handle.clone());
     Ok(handle)

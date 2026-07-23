@@ -2,22 +2,117 @@
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
+use chrono_tz::America::New_York;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 
 use st0x_config::ExecutionThreshold;
-use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
+use st0x_event_sorcery::{AggregateError, LifecycleError, RetryOnBusy, StoreBuilder, load_entity};
 use st0x_execution::{
     CancellationOutcome, ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, Symbol,
 };
+use st0x_float_serde::format_float;
 
 use crate::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
     OrderPlacer,
 };
+use crate::portfolio_snapshot::{
+    PortfolioSnapshot, PortfolioSnapshotCommand, PortfolioSnapshotId, PortfolioSnapshotProjection,
+};
 use crate::position::{Position, PositionCommand};
+
+use super::PortfolioSnapshotRecoveryCommand;
+
+pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
+    stdout: &mut W,
+    pool: &SqlitePool,
+    command: PortfolioSnapshotRecoveryCommand,
+) -> anyhow::Result<()> {
+    let PortfolioSnapshotRecoveryCommand::Set {
+        day,
+        symbol,
+        usd_mark,
+        observed_at,
+        source,
+        reason,
+    } = command;
+
+    let capture_boundary = New_York
+        .from_local_datetime(
+            &day.and_hms_opt(0, 5, 0)
+                .context("invalid ET capture time")?,
+        )
+        .single()
+        .context("ambiguous ET capture boundary")?
+        .with_timezone(&Utc);
+    if observed_at >= capture_boundary {
+        bail!(
+            "--observed-at must identify the regular-session close before the {day} 00:05 ET \
+             capture boundary ({capture_boundary})"
+        );
+    }
+
+    let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+        .with(Arc::new(RetryOnBusy {
+            inner: PortfolioSnapshotProjection::new(pool.clone()),
+        }))
+        .build(())
+        .await
+        .context("failed to build portfolio snapshot store")?;
+
+    store
+        .send(
+            &PortfolioSnapshotId(day),
+            PortfolioSnapshotCommand::SetEquityMark {
+                symbol: symbol.clone(),
+                usd_mark,
+                observed_at,
+                source: source.clone(),
+                reason: reason.clone(),
+                corrected_at: Utc::now(),
+            },
+        )
+        .await
+        .context("failed to set historical portfolio snapshot mark")?;
+
+    let formatted_mark = format_float(&usd_mark.inner()).context("failed to format USD mark")?;
+    let snapshot = load_entity::<PortfolioSnapshot>(pool, &PortfolioSnapshotId(day))
+        .await
+        .context("failed to reload corrected portfolio snapshot")?
+        .context("corrected portfolio snapshot aggregate is missing")?;
+    let expected_row_count = i64::try_from(snapshot.captured_equity_row_count(&symbol))
+        .context("captured equity row count exceeds SQLite integer range")?;
+    let (row_count, corrected_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(CASE WHEN usd_mark = ? AND mark_captured_at = ? THEN 1 END) \
+         FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
+    )
+    .bind(&formatted_mark)
+    .bind(observed_at.to_rfc3339())
+    .bind(day.to_string())
+    .bind(symbol.to_string())
+    .fetch_one(pool)
+    .await
+    .context("failed to verify historical portfolio snapshot mark")?;
+    if row_count != expected_row_count || corrected_count != expected_row_count {
+        bail!(
+            "historical mark event committed, but the portfolio-snapshot read model did not \
+             update every {day} {symbol} row; run `view rebuild --aggregate \
+             portfolio-snapshot --all` before retrying"
+        );
+    }
+
+    writeln!(
+        stdout,
+        "Set {day} {symbol} portfolio mark to ${formatted_mark} observed at {observed_at} from \
+         {source} because \"{reason}\""
+    )?;
+
+    Ok(())
+}
 
 /// An [`OrderPlacer`] for repair commands that must never place or cancel an
 /// order: `MarkFailed` is a pure terminal transition that never touches the
@@ -454,16 +549,137 @@ mod tests {
 
     use st0x_config::ExecutionThreshold;
     use st0x_execution::{ClientOrderId, Direction, ExecutorOrderId, FractionalShares};
-    use st0x_finance::Usd;
+    use st0x_finance::{Positive, Usd};
     use st0x_float_macro::float;
     use uuid::Uuid;
 
     use super::*;
+    use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use crate::portfolio_snapshot::{PortfolioBalanceRowWithMark, PortfolioSnapshotId};
     use crate::position::TradeId;
     use crate::test_utils::{positive_shares, setup_test_db};
 
     fn repair_order_placer() -> Arc<dyn OrderPlacer> {
         Arc::new(RepairOrderPlacer)
+    }
+
+    async fn seed_missing_portfolio_marks(
+        pool: &SqlitePool,
+        day: chrono::NaiveDate,
+        symbol: &Symbol,
+    ) {
+        let captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
+        let rows = [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging]
+            .into_iter()
+            .map(|location| PortfolioBalanceRowWithMark {
+                row: PortfolioBalanceRow {
+                    location,
+                    asset: PortfolioAsset::Equity(symbol.clone()),
+                    available: float!(10),
+                    inflight: float!(0),
+                },
+                usd_mark: None,
+                mark_captured_at: None,
+            })
+            .collect::<Vec<_>>();
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(pool.clone())))
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &PortfolioSnapshotId(day),
+                PortfolioSnapshotCommand::Capture { captured_at, rows },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_updates_all_symbol_rows_without_touching_position() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        seed_missing_portfolio_marks(&pool, day, &symbol).await;
+
+        let mut output = Vec::new();
+        set_portfolio_snapshot_mark_command(
+            &mut output,
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".to_owned(),
+                reason: "repair missing mark".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let marks: Vec<String> = sqlx::query_scalar(
+            "SELECT usd_mark FROM portfolio_snapshot WHERE et_day = ? AND asset = 'AAPL'",
+        )
+        .bind(day.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, vec!["150", "150"]);
+        assert!(
+            st0x_event_sorcery::load_entity::<Position>(&pool, &symbol)
+                .await
+                .unwrap()
+                .is_none(),
+            "historical repair must not create or update live Position state"
+        );
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'PortfolioSnapshot' \
+             AND aggregate_id = ? AND event_type = 'PortfolioSnapshotEvent::EquityMarkSet'",
+        )
+        .bind(day.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_rejects_partial_projection_rows() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        seed_missing_portfolio_marks(&pool, day, &symbol).await;
+        sqlx::query(
+            "DELETE FROM portfolio_snapshot WHERE et_day = ? AND asset = ? AND location = ?",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .bind(PortfolioLocation::Hedging.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol,
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".to_owned(),
+                reason: "repair missing mark".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not update every"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// Seeds a standalone OffchainOrder aggregate for `order_id` into the

@@ -712,48 +712,66 @@ short-sale proceeds would inflate the counted cash, and posted maintenance
 margin would become genuinely uncounted capital.
 
 **USD marks**: USDC is treated as par (`1:1`), matching the reporting-currency
-assumption used elsewhere in `/pnl`. Equity balances are marked at the symbol's
-`last_price_usdc` (the same fill-derived price already tracked on the `Position`
-aggregate) as of capture time. A symbol with a balance but no observed price yet
-is recorded with `usd_mark = NULL` -- never a fabricated zero. Marks are fixed
-permanently at capture time as part of the immutable event payload: a later
-price correction does not retroactively change a previously reported day's
-capital. The persisted `mark_captured_at` is `Position.last_price_observed_at`,
-a dedicated price-observation timestamp set only by the events that also set
-`last_price_usdc` (`OnChainOrderFilled`, using the fill's `block_timestamp`, and
-priced `ManualPositionAdjusted`, using `adjusted_at`). This is distinct from
-`last_updated`, the aggregate's last-touched time, which is also advanced by
-non-price events (offchain order placement/fill/cancel, threshold updates) that
-leave `last_price_observed_at` untouched. So the staleness guard below keys off
-how recently the price itself was actually observed, and does exclude a day with
-a genuinely stale price even when the position was otherwise recently touched by
-a non-price event.
+assumption used elsewhere in `/pnl`. Equity balances are marked from the
+symbol's `Position.last_price: Option<PriceObservation>` as of capture time. A
+`PriceObservation` carries the fill-derived USD price and the time that price
+was economically observed: `OnChainOrderFilled` uses the fill's
+`block_timestamp`, and a priced `ManualPositionAdjusted` uses `adjusted_at`.
+This is distinct from `last_updated`, which is also advanced by non-price
+events. A symbol with a balance but no observed price is recorded with
+`usd_mark = NULL` -- never a fabricated zero. A missing or stale mark does not
+block the immutable balance capture; it immediately emits an error, increments
+an operational counter, and begins sending an operator alert through the
+configured alerting channel. Alert delivery is at-least-once: successful
+per-symbol delivery is recorded as a retained aggregate event, while failures
+enqueue an alert-only retry without blocking the next day's capture. Alert
+retries survive process restarts; a crash in the narrow interval after Telegram
+accepts a message but before the delivery event commits may produce a duplicate
+rather than lose the incident.
+
+Captured marks are immutable facts, but operators may correct a missing or stale
+historical mark through the portfolio-snapshot `set` recovery command. The
+command requires the ET day, symbol, strictly-positive USD mark, economic
+observation timestamp, price source, and non-blank operator reason. The
+historical-price convention is the last regular-session closing price available
+before that ET day's `00:05` capture boundary (the preceding trading day's
+close, including across weekends and exchange holidays). The supplied economic
+timestamp names that close. The command enforces that the timestamp is from an
+earlier ET day and remains within the report's mark-usability window; the
+operator and recorded source attest the exchange-calendar close because the CLI
+does not independently fetch a historical market calendar. The correction is an
+append-only `PortfolioSnapshot` CQRS event and updates every location row for
+the symbol on that day in the read model; repeated corrections remain auditable
+and the most recent event wins. It never updates the live `Position.last_price`.
+The snapshot projection replays all retained capture and correction events at
+startup and can be rebuilt on demand, so a reactor failure cannot permanently
+discard a correction.
 
 **Derived `/pnl` fields**: for a queried date range, a day's total USD capital
 is computed only when every nonzero-balance row that day has a known, non-stale
-mark; a day with any missing or stale mark is excluded from the sample entirely
-(never partially), since per-row exclusion would understate capital and inflate
-the reported return. `average_deployed_capital_usd` is the mean of included
-days' totals; `annualized_return_pct` is the range's realized PnL divided by
-that average, annualized by `365 / coverage_days` -- reported only when at least
-two included days span at least two calendar days, AND snapshot coverage fully
-spans the queried date range (`first_snapshot_day` at or before the query's
-`fromDate`, `last_snapshot_day` at or after its `toDate`). The realized-PnL
-numerator is scoped to the whole query range, not to snapshot coverage, so a
-narrower coverage window annualizing a wider-range PnL figure would inflate the
-result -- exactly the dangerous direction this section's fail-fast rules exist
-to prevent. `average_deployed_capital_usd` is still reported (honestly labeled
-by `sample_days`) even when the annualized figure is omitted for this reason. A
-single included day still reports `average_deployed_capital_usd` and
-`coverage_days` (`1`), but `annualized_return_pct` stays `None`: extrapolating
-one day's return by `365x` is exactly the misleading-financial-number failure
-mode the fail-fast rules exist to prevent, so the system reports no annualized
-figure at all for that day rather than an unannualized raw return under the same
-field. Both capital fields are `None`, with an explicit warning, whenever no day
-qualifies, average capital is exactly zero, the query is symbol-filtered (a
-symbol-scoped slice of whole-portfolio capital is not a meaningful denominator),
-or an `as_of_rowid` in the past is requested (capital is always computed from
-the live snapshot table, not watermarked to a historical event position).
+mark; a day with any missing or stale mark is excluded entirely (never
+partially), since per-row exclusion would understate capital and inflate the
+reported return. The response lists each excluded ET day and its reason. The
+ordinary `/pnl` totals remain scoped to the full requested range.
+
+Return on capital uses only the usable ET days for both sides of the ratio.
+`average_deployed_capital_usd` is the mean of those days' capital. The return
+numerator is net realized PnL whose accounting date is one of those same days;
+PnL from an excluded or absent snapshot day remains in the ordinary report but
+does not enter return on capital. Each daily return is therefore weighted by
+that day's capital, equivalently:
+
+`annualized_return_pct = 100 * 365 * sum(usable-day net realized PnL) /
+sum(usable-day deployed capital)`.
+
+The annualized percentage is reported only when at least two usable days are
+available. A single included day still reports average capital but not an
+annualized percentage. Both capital fields are `None`, with an explicit warning,
+whenever no day qualifies, average capital is exactly zero, the query is
+symbol-filtered (a symbol-scoped slice of whole-portfolio capital is not a
+meaningful denominator), or an `as_of_rowid` in the past is requested (capital
+is always computed from the live snapshot table, not watermarked to a historical
+event position).
 
 ### Risk Management
 

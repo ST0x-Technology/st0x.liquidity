@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use num_decimal::Num;
 
@@ -80,11 +80,8 @@ fn remove_tokenization_fee_overlaps(
         .collect()
 }
 
-/// Builds the `/pnl` response from already-loaded rows. Returns the DTO
-/// alongside the internal numeric net realized PnL total for the queried
-/// range. Callers needing that total for the capital/return-on-capital
-/// computation read it from here rather than re-parsing
-/// `PnlResponse.summary.net_realized_pnl_usd`'s formatted string.
+/// Builds the `/pnl` response from already-loaded rows and returns net realized
+/// PnL bucketed by ET accounting day for the aligned capital calculation.
 pub(crate) fn build_pnl_response_from_rows(
     event_rows: Vec<PositionEventRow>,
     position_rows: &[PositionViewRow],
@@ -93,7 +90,7 @@ pub(crate) fn build_pnl_response_from_rows(
     query: &PnlQuery,
     symbols: &BTreeSet<String>,
     mut warnings: Vec<String>,
-) -> Result<(PnlResponse, Num), PnlError> {
+) -> Result<(PnlResponse, BTreeMap<String, Num>), PnlError> {
     let event_rows = if symbols.is_empty() {
         event_rows
     } else {
@@ -227,9 +224,25 @@ pub(crate) fn build_pnl_response_from_rows(
         &filtered_cost_entries,
         cost_replay.missing_cost_observation_count,
     );
+    let mut daily_net_realized_pnl_usd = BTreeMap::<String, Num>::new();
+    for entry in &filtered_entries {
+        *daily_net_realized_pnl_usd
+            .entry(date_key(&entry.closed_at))
+            .or_default() += &entry.realized_pnl_usd;
+    }
+    for entry in &filtered_cost_entries {
+        let amount = match entry.effect {
+            AccountingEffect::Cost => -entry.amount_usd.clone(),
+            AccountingEffect::Revenue => entry.amount_usd.clone(),
+            AccountingEffect::None => Num::default(),
+        };
+        *daily_net_realized_pnl_usd
+            .entry(date_key(&entry.occurred_at))
+            .or_default() += amount;
+    }
     let filtered = summary_from_entries(&filtered_entries);
     let replay_summary = summary_to_dto(&full_total);
-    let (summary, net_realized_pnl_usd) = with_costs(
+    let (summary, _net_realized_pnl_usd) = with_costs(
         with_replay_exposure(filtered.summary, replay_summary),
         &cost_summary,
     )?;
@@ -269,6 +282,6 @@ pub(crate) fn build_pnl_response_from_rows(
             has_more: end < total,
             windows,
         },
-        net_realized_pnl_usd,
+        daily_net_realized_pnl_usd,
     ))
 }
