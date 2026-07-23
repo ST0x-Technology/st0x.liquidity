@@ -412,9 +412,9 @@ pub async fn poll_for_hedge_completion(
 /// conflicts) may still be in-flight after higher-level conditions are met.
 /// Use this instead of an immediate done-count assertion.
 ///
-/// The self-rescheduling `CheckPositions` job is excluded from both totals,
-/// since it always leaves exactly one `Pending` row in the queue waiting for
-/// the next tick and is not "in-flight work".
+/// The self-rescheduling `CheckPositions` and `PortfolioSnapshot` jobs are
+/// excluded from both totals, since each always leaves exactly one non-`Done`
+/// row in the queue waiting for the next tick and is not "in-flight work".
 pub async fn poll_for_all_jobs_done(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
@@ -437,15 +437,19 @@ pub async fn poll_for_all_jobs_done(
         };
 
         let check_positions = st0x_hedge::check_positions_job_type();
-        let total = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE job_type != ?")
-            .bind(check_positions)
-            .fetch_one(&pool)
-            .await;
+        let portfolio_snapshot = st0x_hedge::portfolio_snapshot_job_type();
+        let total =
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE job_type NOT IN (?, ?)")
+                .bind(check_positions)
+                .bind(portfolio_snapshot)
+                .fetch_one(&pool)
+                .await;
 
         let done = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM Jobs WHERE status = 'Done' AND job_type != ?",
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Done' AND job_type NOT IN (?, ?)",
         )
         .bind(check_positions)
+        .bind(portfolio_snapshot)
         .fetch_one(&pool)
         .await;
 

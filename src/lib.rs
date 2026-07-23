@@ -54,6 +54,7 @@ mod offchain;
 mod onchain;
 mod onchain_trade;
 mod performance;
+mod portfolio_snapshot;
 mod position;
 mod position_check;
 mod rebalancing;
@@ -82,6 +83,17 @@ pub use position::Position;
 #[cfg(any(test, feature = "test-support"))]
 pub fn check_positions_job_type() -> &'static str {
     std::any::type_name::<position_check::CheckPositions>()
+}
+
+/// Returns the apalis job type identifier for the `PortfolioSnapshot` job.
+///
+/// For use in tests when querying or asserting against the persistent job
+/// queue (the `Jobs.job_type` column). Like `CheckPositions`, this job
+/// reschedules itself and never terminates, so job-completion assertions
+/// must exclude it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn portfolio_snapshot_job_type() -> &'static str {
+    std::any::type_name::<portfolio_snapshot::PortfolioSnapshotJob>()
 }
 #[cfg(any(test, feature = "test-support"))]
 pub use conductor::job::{FailureInjector, JobKind};
