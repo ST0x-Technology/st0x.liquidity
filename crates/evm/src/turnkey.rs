@@ -4,8 +4,11 @@
 //! enclaves for low-latency signing (50-100ms). Like
 //! [`RawPrivateKeyWallet`](super::local::RawPrivateKeyWallet), it wraps
 //! the base provider with a [`WalletFiller`] -- the only difference is
-//! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
+//! the signer: `TracingTurnkeySigner` (remote signing via Turnkey API) instead
 //! of `PrivateKeySigner` (local key).
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use alloy::consensus::{SignableTransaction, TxEnvelope};
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
@@ -24,8 +27,6 @@ use futures::lock::Mutex;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde::Serialize;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use tracing::{info, trace};
 use turnkey_api_key_stamper::{Stamp, StampHeader, TurnkeyP256ApiKey};
 use turnkey_client::generated::{
@@ -42,24 +43,70 @@ use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 /// Turnkey organization identifier (non-secret, lives in plaintext
 /// config).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 pub struct TurnkeyOrganizationId(String);
 
 impl TurnkeyOrganizationId {
+    /// Creates a validated Turnkey organization identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnkeyValueError::EmptyOrganizationId`] when `value`
+    /// contains only whitespace.
+    pub fn try_new(value: String) -> Result<Self, TurnkeyValueError> {
+        value.try_into()
+    }
+
+    #[deprecated(note = "use TurnkeyOrganizationId::try_new")]
     pub fn new(value: String) -> Self {
         Self(value)
+    }
+}
+
+impl TryFrom<String> for TurnkeyOrganizationId {
+    type Error = TurnkeyValueError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let organization_id = value.trim();
+        if organization_id.is_empty() {
+            return Err(TurnkeyValueError::EmptyOrganizationId);
+        }
+
+        Ok(Self(organization_id.to_string()))
     }
 }
 
 /// Hex-encoded P-256 API private key for Turnkey authentication
 /// (secret, lives in encrypted config).
 #[derive(Clone, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 pub struct TurnkeyApiPrivateKey(String);
 
 impl TurnkeyApiPrivateKey {
+    /// Creates a validated P-256 API private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnkeyValueError::InvalidApiPrivateKey`] when `value`
+    /// is not a valid P-256 private key.
+    pub fn try_new(value: String) -> Result<Self, TurnkeyValueError> {
+        value.try_into()
+    }
+
+    #[deprecated(note = "use TurnkeyApiPrivateKey::try_new")]
     pub fn new(value: String) -> Self {
         Self(value)
+    }
+}
+
+impl TryFrom<String> for TurnkeyApiPrivateKey {
+    type Error = TurnkeyValueError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        TurnkeyP256ApiKey::from_strings(&value, None)
+            .map_err(|_| TurnkeyValueError::InvalidApiPrivateKey)?;
+
+        Ok(Self(value))
     }
 }
 
@@ -67,6 +114,16 @@ impl std::fmt::Debug for TurnkeyApiPrivateKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("[REDACTED]")
     }
+}
+
+/// Invalid Turnkey configuration value.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TurnkeyValueError {
+    #[error("Turnkey organization ID must not be empty")]
+    EmptyOrganizationId,
+    #[error("Turnkey API private key must be a valid P-256 private key")]
+    InvalidApiPrivateKey,
 }
 
 /// Errors specific to the Turnkey signing backend.
@@ -184,7 +241,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
     /// Creates a new `TurnkeyWallet` from a context containing API
     /// credentials, wallet address, and base provider.
     ///
-    /// Constructs a `TurnkeySigner` using the P-256 API private key,
+    /// Constructs a `TracingTurnkeySigner` using the P-256 API private key,
     /// wraps it in an `EthereumWallet`, and builds the signing
     /// provider with standard fillers. The base provider is cloned
     /// and stored separately for read-only access.
@@ -730,6 +787,32 @@ mod tests {
         TurnkeyP256ApiKey::generate()
     }
 
+    #[test]
+    fn organization_id_trims_surrounding_whitespace() {
+        let TurnkeyOrganizationId(organization_id) =
+            TurnkeyOrganizationId::try_new("  org-test  ".to_string()).unwrap();
+
+        assert_eq!(organization_id, "org-test");
+    }
+
+    #[test]
+    fn organization_id_rejects_only_whitespace() {
+        let error = TurnkeyOrganizationId::try_new("   ".to_string()).unwrap_err();
+
+        assert!(matches!(error, TurnkeyValueError::EmptyOrganizationId));
+    }
+
+    #[test]
+    fn api_private_key_rejects_invalid_p256_hex() {
+        let error = TurnkeyApiPrivateKey::try_new("not-a-private-key".to_string()).unwrap_err();
+
+        assert!(matches!(error, TurnkeyValueError::InvalidApiPrivateKey));
+    }
+
+    fn test_organization_id() -> TurnkeyOrganizationId {
+        TurnkeyOrganizationId::try_new("org-test".to_string()).unwrap()
+    }
+
     /// Build a Turnkey client that sends requests to the mock server.
     fn mock_client(server: &MockServer) -> TracingTurnkeyClient {
         TracingTurnkeyClient::for_base_url(server.base_url(), test_api_key()).unwrap()
@@ -1027,7 +1110,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_organization_id(),
             address,
             Some(chain_id),
         );
@@ -1074,7 +1157,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_organization_id(),
             address,
             Some(chain_id),
         );
@@ -1102,7 +1185,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_organization_id(),
             Address::random(),
             Some(1),
         );
@@ -1138,7 +1221,7 @@ mod tests {
 
         let error = client
             .sign_transaction(
-                TurnkeyOrganizationId::new("org-test".to_string()),
+                test_organization_id(),
                 0,
                 SignTransactionIntentV2 {
                     sign_with: Address::random().to_string(),
@@ -1174,7 +1257,7 @@ mod tests {
 
         let wallet = TurnkeyWallet::from_client(
             client,
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_organization_id(),
             Address::random(),
             provider,
             1,
@@ -1327,7 +1410,7 @@ mod tests {
 
         let wallet = TurnkeyWallet::from_client(
             client,
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_organization_id(),
             expected_address,
             provider,
             1,
@@ -1383,10 +1466,12 @@ mod tests {
         let wallet = TurnkeyWallet::new(WalletCtx {
             settings: TurnkeySettings {
                 address,
-                organization_id: TurnkeyOrganizationId::new(org_id),
+                organization_id: TurnkeyOrganizationId::try_new(org_id)
+                    .expect("Turnkey organization ID must be non-empty"),
             },
             credentials: TurnkeyCredentials {
-                api_private_key: TurnkeyApiPrivateKey::new(api_key),
+                api_private_key: TurnkeyApiPrivateKey::try_new(api_key)
+                    .expect("Turnkey API private key must be valid P-256 hex"),
             },
             provider,
             required_confirmations: 1,
