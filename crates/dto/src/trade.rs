@@ -144,6 +144,16 @@ pub enum TradeOutcome {
         #[ts(type = "string | null")]
         excess_shares: Option<NonNegative<FractionalShares>>,
     },
+    Cancelled {
+        #[ts(type = "string | null")]
+        accepted_shares: Option<Positive<FractionalShares>>,
+        #[ts(type = "string | null")]
+        filled_shares: Option<NonNegative<FractionalShares>>,
+        #[ts(type = "string | null")]
+        remaining_shares: Option<NonNegative<FractionalShares>>,
+        #[ts(type = "string | null")]
+        excess_shares: Option<NonNegative<FractionalShares>>,
+    },
 }
 
 #[derive(Default)]
@@ -171,6 +181,13 @@ enum TradeOutcomeWire {
     Filled,
     Failed {
         error: String,
+        #[serde(default, deserialize_with = "deserialize_present")]
+        accepted_shares: FieldPresence<Option<Positive<FractionalShares>>>,
+        filled_shares: Option<NonNegative<FractionalShares>>,
+        remaining_shares: Option<NonNegative<FractionalShares>>,
+        excess_shares: Option<NonNegative<FractionalShares>>,
+    },
+    Cancelled {
         #[serde(default, deserialize_with = "deserialize_present")]
         accepted_shares: FieldPresence<Option<Positive<FractionalShares>>>,
         filled_shares: Option<NonNegative<FractionalShares>>,
@@ -230,6 +247,21 @@ impl<'de> Deserialize<'de> for TradeOutcome {
                     excess_shares: None,
                 })
             }
+            TradeOutcomeWire::Cancelled {
+                accepted_shares: FieldPresence::Present(accepted_shares),
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } => Ok(Self::Cancelled {
+                accepted_shares,
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            }),
+            TradeOutcomeWire::Cancelled {
+                accepted_shares: FieldPresence::Missing,
+                ..
+            } => Err(D::Error::missing_field("acceptedShares")),
         }
     }
 }
@@ -247,9 +279,10 @@ pub struct Trade {
     pub direction: Direction,
     #[ts(type = "string")]
     pub symbol: Symbol,
-    /// Executed quantity for fills, or requested quantity for a failed
-    /// counter-trade. Failed outcomes carry broker-accepted and fill provenance
-    /// separately when those facts are known.
+    /// Executed quantity for fills, or requested quantity for a failed or
+    /// cancelled counter-trade. Terminal non-fill outcomes carry
+    /// broker-accepted and fill provenance separately when those facts are
+    /// known.
     #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
     pub outcome: TradeOutcome,
@@ -602,6 +635,81 @@ mod tests {
         );
         assert_eq!(remaining_shares, None);
         assert_eq!(excess_shares, None);
+    }
+
+    #[test]
+    fn cancelled_trade_roundtrips_explicit_zero_fill() {
+        let trade = Trade {
+            id: "cancelled-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: positive_shares("1.5"),
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: Some(positive_shares("1")),
+                filled_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
+                remaining_shares: Some(NonNegative::new(FractionalShares::new(float!(1))).unwrap()),
+                excess_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
+            },
+        };
+
+        let wire = serde_json::to_value(&trade).unwrap();
+        assert_eq!(
+            wire["outcome"],
+            json!({
+                "status": "cancelled",
+                "acceptedShares": "1",
+                "filledShares": "0",
+                "remainingShares": "1",
+                "excessShares": "0"
+            })
+        );
+        let restored: Trade = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.outcome, trade.outcome);
+    }
+
+    #[test]
+    fn cancelled_trade_roundtrips_all_null_provenance_in_job_payload() {
+        let trade = Trade {
+            id: "legacy-cancelled-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: positive_shares("1"),
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+        };
+
+        let payload = serde_json::to_vec(&trade).unwrap();
+        let restored: Trade = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(restored.outcome, trade.outcome);
+    }
+
+    #[test]
+    fn cancelled_trade_rejects_missing_v2_acceptance_field() {
+        let wire = json!({
+            "id": "cancelled-order-id",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "SPCX",
+            "shares": "1",
+            "outcome": {
+                "status": "cancelled",
+                "filledShares": "0",
+                "remainingShares": "1",
+                "excessShares": "0"
+            }
+        });
+
+        let error = serde_json::from_value::<Trade>(wire).unwrap_err();
+        assert!(error.to_string().contains("acceptedShares"));
     }
 
     #[test]

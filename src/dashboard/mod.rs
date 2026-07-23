@@ -39,14 +39,20 @@ pub(crate) enum TradeProtocol {
 }
 
 impl TradeProtocol {
-    fn includes_trade(self, trade: &Trade) -> bool {
+    pub(crate) fn includes_trade(self, trade: &Trade) -> bool {
         match self {
             Self::LegacyFills => match trade.outcome {
                 TradeOutcome::Filled => true,
-                TradeOutcome::Failed { .. } => false,
+                TradeOutcome::Failed { .. } | TradeOutcome::Cancelled { .. } => false,
             },
-            Self::TerminalOutcomesV1 | Self::TerminalOutcomesV2 => match trade.outcome {
+            Self::TerminalOutcomesV1 => match trade.outcome {
                 TradeOutcome::Filled | TradeOutcome::Failed { .. } => true,
+                TradeOutcome::Cancelled { .. } => false,
+            },
+            Self::TerminalOutcomesV2 => match trade.outcome {
+                TradeOutcome::Filled
+                | TradeOutcome::Failed { .. }
+                | TradeOutcome::Cancelled { .. } => true,
             },
         }
     }
@@ -61,10 +67,25 @@ impl TradeProtocol {
                 | Statement::InventorySnapshot(_)
                 | Statement::TransferUpdate(_) => true,
             },
-            Self::TerminalOutcomesV1 | Self::TerminalOutcomesV2 => match statement {
+            Self::TerminalOutcomesV1 => match statement {
                 Statement::TradeFill(_) => false,
+                Statement::TradeUpdate(trade) => match trade.outcome {
+                    TradeOutcome::Filled | TradeOutcome::Failed { .. } => true,
+                    TradeOutcome::Cancelled { .. } => false,
+                },
                 Statement::CurrentState(_)
-                | Statement::TradeUpdate(_)
+                | Statement::PositionUpdate(_)
+                | Statement::InventorySnapshot(_)
+                | Statement::TransferUpdate(_) => true,
+            },
+            Self::TerminalOutcomesV2 => match statement {
+                Statement::TradeFill(_) => false,
+                Statement::TradeUpdate(trade) => match trade.outcome {
+                    TradeOutcome::Filled
+                    | TradeOutcome::Failed { .. }
+                    | TradeOutcome::Cancelled { .. } => true,
+                },
+                Statement::CurrentState(_)
                 | Statement::PositionUpdate(_)
                 | Statement::InventorySnapshot(_)
                 | Statement::TransferUpdate(_) => true,
@@ -183,14 +204,13 @@ async fn send_initial_state(
 ) -> bool {
     let inventory_dto = state.inventory.read().await.to_dto();
     let transfers = transfer_loader::load_transfers(&state.pool).await;
-    let mut trades = match trade_loader::load_trades(&state.pool).await {
+    let trades = match trade_loader::load_trades(&state.pool, trade_protocol).await {
         Ok(trades) => trades,
         Err(error) => {
             warn!(target: "dashboard", %error, "Failed to load initial trade history");
             return false;
         }
     };
-    trades.retain(|trade| trade_protocol.includes_trade(trade));
     let positions = load_positions(&state.pool).await;
 
     let initial = Statement::CurrentState(Box::new(CurrentState {
@@ -467,6 +487,38 @@ mod tests {
         assert!(!TradeProtocol::TerminalOutcomesV1.includes_statement(&legacy_fill));
         assert!(TradeProtocol::TerminalOutcomesV2.includes_statement(&trade_update));
         assert!(!TradeProtocol::TerminalOutcomesV2.includes_statement(&legacy_fill));
+    }
+
+    #[test]
+    fn cancelled_outcomes_are_v2_only() {
+        let trade = Trade {
+            id: "cancelled-order".to_string(),
+            occurred_at: chrono::Utc::now(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Sell,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
+                filled_shares: Some(
+                    st0x_finance::NonNegative::new(FractionalShares::ZERO).unwrap(),
+                ),
+                remaining_shares: Some(
+                    st0x_finance::NonNegative::new(FractionalShares::new(float!(1))).unwrap(),
+                ),
+                excess_shares: Some(
+                    st0x_finance::NonNegative::new(FractionalShares::ZERO).unwrap(),
+                ),
+            },
+        };
+        let update = Statement::TradeUpdate(trade.clone());
+
+        assert!(!TradeProtocol::LegacyFills.includes_trade(&trade));
+        assert!(!TradeProtocol::TerminalOutcomesV1.includes_trade(&trade));
+        assert!(TradeProtocol::TerminalOutcomesV2.includes_trade(&trade));
+        assert!(!TradeProtocol::LegacyFills.includes_statement(&update));
+        assert!(!TradeProtocol::TerminalOutcomesV1.includes_statement(&update));
+        assert!(TradeProtocol::TerminalOutcomesV2.includes_statement(&update));
     }
 
     fn empty_settings() -> st0x_dto::Settings {

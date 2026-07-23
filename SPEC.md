@@ -3999,16 +3999,23 @@ multiple broker-specific contexts.
 
 4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
    Onchain entries are completed fills. Offchain counter-trade entries include
-   both successful fills and terminal failures; each entry carries its terminal
-   outcome timestamp. Failed entries expose the broker or placement error and
-   keep the requested quantity distinct from the broker-accepted quantity. The
-   accepted and actually-filled quantities are nullable provenance: `null` means
-   the persisted history does not prove that fact, including legacy failures
-   that predate explicit fill evidence. Remaining and excess quantities are
-   derived only when both accepted and filled quantities are known. An overfill
-   reports the complete actual fill plus its excess rather than clamping the
-   fill to the accepted quantity. Terminal outcomes use the same provenance in
-   initial history and live dashboard updates.
+   successful fills, terminal failures, and terminal cancellations; each entry
+   carries its terminal outcome timestamp. Failed entries expose the broker or
+   placement error. Failed and cancelled entries keep the requested quantity
+   distinct from the broker-accepted quantity. The accepted and actually-filled
+   quantities are nullable provenance: `null` means the persisted history does
+   not prove that fact, including legacy outcomes that predate explicit fill
+   evidence. An explicit broker-reported zero therefore distinguishes a wholly
+   unfilled cancellation from an outcome whose fill remains unknown. Remaining
+   and excess quantities are derived only when both accepted and filled
+   quantities are known. An overfill reports the complete actual fill plus its
+   excess rather than clamping the fill to the accepted quantity. Non-terminal
+   submitted, partially-filled, and cancelling orders remain excluded. Terminal
+   outcomes use the same provenance in initial history and live dashboard
+   updates. A broker-terminal failure or cancellation with a positive fill but
+   no execution price is still persisted and surfaced; the owning position
+   remains pending for manual reconciliation so the unpriced fill cannot be
+   silently applied or discarded.
 
    Dashboard trade messages remain compatible during rolling deploys. The
    canonical protocol sends every terminal outcome as `trade_update`. Filled
@@ -4022,17 +4029,18 @@ multiple broker-specific contexts.
    by trade ID. The original `terminal_outcomes_v1` contract remains stable for
    older dashboards: its failed quantities are always non-null and retain the
    legacy split representation. Provenance-aware nullable failure quantities use
-   `trade_protocol=terminal_outcomes_v2`. A newer dashboard requests v2 and
-   retries both WebSocket and HTTP history with v1 when an older backend rejects
-   the unknown protocol value, while continuing to accept v1 responses and
-   reconstructing the complete fill as the legacy filled plus excess quantity. A
-   legacy zero fill remains unknown because v1 synthesized zero when no fill
-   evidence existed. A successful v1 WebSocket fallback probes v2 again after
-   its next disconnect so a transient restart cannot pin the client to v1.
-   Failed outcomes are sent only through a terminal-outcome protocol. Trade
-   ordering compares the complete RFC 3339 timestamp, including sub-millisecond
-   precision, then uses the same stable trade-ID tie-breaker for initial history
-   and live updates.
+   `trade_protocol=terminal_outcomes_v2`. Cancelled outcomes are also v2-only,
+   because adding a new tagged outcome to v1 would break older exhaustive
+   consumers. A newer dashboard requests v2 and retries both WebSocket and HTTP
+   history with v1 when an older backend rejects the unknown protocol value,
+   while continuing to accept v1 responses and reconstructing the complete fill
+   as the legacy filled plus excess quantity. A legacy zero fill remains unknown
+   because v1 synthesized zero when no fill evidence existed. A successful v1
+   WebSocket fallback probes v2 again after its next disconnect so a transient
+   restart cannot pin the client to v1. Failed outcomes are sent only through a
+   terminal-outcome protocol. Trade ordering compares the complete RFC 3339
+   timestamp, including sub-millisecond precision, then uses the same stable
+   trade-ID tie-breaker for initial history and live updates.
 
    Every dashboard transport validates trade payloads at runtime before they
    enter client state. Snapshot, live WebSocket, and paginated HTTP paths use

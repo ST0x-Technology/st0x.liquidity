@@ -2647,7 +2647,9 @@ mod tests {
         let cancelled_order = OffchainOrder::Cancelled {
             symbol: symbol.clone(),
             shares: positive_shares("1"),
+            requested_shares: Some(positive_shares("1")),
             retained_fill: None,
+            filled_shares: Some(FractionalShares::ZERO),
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("broker-order-id"),

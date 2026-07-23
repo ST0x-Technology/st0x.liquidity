@@ -7,6 +7,7 @@ use st0x_dto::{Trade, sort_trades_newest_first};
 use st0x_event_sorcery::{LoadAllIdsError, SendError, load_all_ids, load_entity};
 use st0x_finance::{FractionalShares, NotPositive};
 
+use super::TradeProtocol;
 use crate::offchain::order::{OffchainOrder, TradeConversionError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 
@@ -15,12 +16,20 @@ const MAX_TRADES: usize = 100;
 /// Load recent filled trades from both onchain and offchain sources.
 ///
 /// Returns up to [`MAX_TRADES`] trades sorted by fill time (newest first).
-pub(crate) async fn load_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
+pub(crate) async fn load_trades(
+    pool: &SqlitePool,
+    trade_protocol: TradeProtocol,
+) -> Result<Vec<Trade>, TradeHistoryError> {
     let mut trades = load_all_trades(pool).await?;
 
-    trades.truncate(MAX_TRADES);
+    retain_recent_trades(&mut trades, trade_protocol);
 
     Ok(trades)
+}
+
+fn retain_recent_trades(trades: &mut Vec<Trade>, trade_protocol: TradeProtocol) {
+    trades.retain(|trade| trade_protocol.includes_trade(trade));
+    trades.truncate(MAX_TRADES);
 }
 
 /// Loads every terminal trade for delivery-ledger reconciliation.
@@ -80,8 +89,7 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHist
                     TradeConversionError::Pending
                     | TradeConversionError::Submitted
                     | TradeConversionError::PartiallyFilled
-                    | TradeConversionError::Cancelling
-                    | TradeConversionError::Cancelled,
+                    | TradeConversionError::Cancelling,
                 ) => Ok(None),
                 Err(source) => Err(TradeHistoryError::OffchainConversion {
                     id: id.to_string(),
@@ -134,6 +142,7 @@ pub(crate) enum TradeHistoryError {
 mod tests {
     use chrono::Utc;
 
+    use st0x_dto::{TradeOutcome, TradingVenue};
     use st0x_execution::{
         ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketSession, Positive,
         Symbol,
@@ -146,10 +155,81 @@ mod tests {
     use crate::onchain_trade::{OnChainTradeCommand, OnChainTradeId};
     use crate::test_utils::setup_test_db;
 
+    async fn seed_cancelled_order(
+        store: &st0x_event_sorcery::Store<OffchainOrder>,
+        symbol: &str,
+        filled_shares: FractionalShares,
+    ) -> OffchainOrderId {
+        let id = OffchainOrderId::new();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new(symbol).unwrap(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: st0x_execution::ExecutorOrderId::new(symbol),
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        if filled_shares != FractionalShares::ZERO {
+            store
+                .send(
+                    &id,
+                    OffchainOrderCommand::UpdatePartialFill {
+                        shares_filled: filled_shares,
+                        avg_price: st0x_finance::Usd::new(float!(100)),
+                        partially_filled_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: crate::offchain::order::CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares,
+                    cancelled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        id
+    }
+
     #[tokio::test]
     async fn load_trades_empty_database() {
         let pool = setup_test_db().await;
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert!(trades.is_empty());
     }
 
@@ -183,7 +263,9 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, Symbol::new("AAPL").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Raindex));
@@ -242,7 +324,9 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, Symbol::new("TSLA").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Alpaca));
@@ -321,7 +405,9 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert_eq!(trades.len(), 3);
         assert_eq!(trades[0].id, newer_id.to_string());
         assert_eq!(trades[1].id, tied_id.to_string());
@@ -360,8 +446,40 @@ mod tests {
                 .unwrap();
         }
 
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert_eq!(trades.len(), MAX_TRADES, "should be capped at {MAX_TRADES}");
+    }
+
+    #[test]
+    fn protocol_filter_runs_before_history_limit() {
+        let cancelled = Trade {
+            id: "cancelled".to_string(),
+            occurred_at: Utc::now(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Sell,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+        };
+        let filled = Trade {
+            id: "older-fill".to_string(),
+            outcome: TradeOutcome::Filled,
+            ..cancelled.clone()
+        };
+        let mut trades = vec![cancelled; MAX_TRADES];
+        trades.push(filled);
+
+        retain_recent_trades(&mut trades, TradeProtocol::TerminalOutcomesV1);
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].id, "older-fill");
     }
 
     #[tokio::test]
@@ -401,7 +519,9 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert_eq!(trades.len(), 1, "failed orders should appear");
         assert!(matches!(
             &trades[0].outcome,
@@ -416,6 +536,47 @@ mod tests {
                 && filled_shares.is_none()
                 && remaining_shares.is_none()
                 && excess_shares.is_none()
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_trades_includes_zero_and_partial_fill_cancellations() {
+        let pool = setup_test_db().await;
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(crate::offchain::order::noop_order_placer())
+                .await
+                .unwrap();
+        let zero_id = seed_cancelled_order(&store, "ZERO", FractionalShares::ZERO).await;
+        let partial_id =
+            seed_cancelled_order(&store, "PARTIAL", FractionalShares::new(float!(0.25))).await;
+
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
+        let cancelled = |id: OffchainOrderId| {
+            trades
+                .iter()
+                .find(|trade| trade.id == id.to_string())
+                .expect("cancelled order should appear in history")
+        };
+        assert!(matches!(
+            cancelled(zero_id).outcome,
+            st0x_dto::TradeOutcome::Cancelled {
+                filled_shares: Some(filled),
+                remaining_shares: Some(remaining),
+                ..
+            } if filled.inner().inner().is_zero().unwrap()
+                && remaining.inner().inner().eq(float!(1)).unwrap()
+        ));
+        assert!(matches!(
+            cancelled(partial_id).outcome,
+            st0x_dto::TradeOutcome::Cancelled {
+                filled_shares: Some(filled),
+                remaining_shares: Some(remaining),
+                ..
+            } if filled.inner().inner().eq(float!(0.25)).unwrap()
+                && remaining.inner().inner().eq(float!(0.75)).unwrap()
         ));
     }
 
@@ -498,7 +659,9 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await.unwrap();
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
         assert!(trades.is_empty(), "nonterminal orders should not appear");
     }
 }
