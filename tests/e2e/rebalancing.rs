@@ -570,6 +570,14 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         Duration::from_secs(120),
     )
     .await;
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "OffchainOrderEvent::Filled",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
