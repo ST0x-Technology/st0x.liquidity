@@ -42,9 +42,10 @@ use uuid::Uuid;
 use st0x_dto::{Direction, Trade, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
-    AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, ExecutionError, Executor,
-    ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, MarketSession, OrderState,
-    PersistenceError, Positive, SupportedExecutor, Symbol,
+    AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, CounterTradePreflight,
+    ExecutionError, Executor, ExecutorOrderId, FractionalShares, LatestQuote, LimitOrder,
+    MarketOrder, MarketSession, MarketSessionStatus, OrderState, PersistenceError, Positive,
+    SupportedExecutor, Symbol,
 };
 use st0x_finance::Usd;
 
@@ -641,6 +642,10 @@ pub enum CancellationReason {
     /// Extended-hours limit order stayed live beyond the configured timeout;
     /// cancel it so the next scan can place a fresh marketable limit.
     ExtendedHoursRepriceTimeout,
+    /// Extended-hours limit order predates the long-gap close-flatten window;
+    /// cancel it so executable residual exposure can enter the repeated
+    /// quote-refresh cycle before the venue closes.
+    ExtendedHoursCloseFlatten,
     /// The broker reported the order cancelled without a locally persisted
     /// cancel request: either an operator/broker-side cancellation (e.g. a
     /// manual Alpaca-dashboard cancel) or a crash that lost the
@@ -2074,6 +2079,31 @@ pub trait OrderPlacer: Send + Sync {
         Ok(None)
     }
 
+    /// Fetches a validated latest bid/ask quote for close-flatten pricing.
+    async fn fetch_latest_quote(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    /// Re-checks buying power against a caller-supplied reference price
+    /// (the ask a close-flatten buy is about to be priced against), rather
+    /// than `Executor`'s own latest-trade-price reference. Used by
+    /// `select_order_kind_for_current_session` to re-validate a close-flatten
+    /// buy against the exact price it is about to submit, closing the gap
+    /// between the scan-time preflight (a separate, possibly stale quote) and
+    /// the perform-time submission. The default allows unconditionally
+    /// (no reservation), matching implementers (CLI/repair order placers)
+    /// that never reach the close-flatten placement path.
+    async fn preflight_counter_trade_at_price(
+        &self,
+        _order: MarketOrder,
+        _reference_price: Positive<Usd>,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(CounterTradePreflight::Allowed { reservation: None })
+    }
+
     /// Returns the current market session. Used by hedge jobs to re-check
     /// the session at execution time so a queued job does not submit the
     /// wrong order type across the 9:30/16:00 ET boundary. The default
@@ -2083,6 +2113,16 @@ pub trait OrderPlacer: Send + Sync {
         &self,
     ) -> Result<st0x_execution::MarketSession, Box<dyn std::error::Error + Send + Sync>> {
         Ok(st0x_execution::MarketSession::Regular)
+    }
+
+    /// Returns the current session plus close-gap metadata used by the shared
+    /// close-flatten policy.
+    async fn market_session_status(
+        &self,
+    ) -> Result<MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.market_session()
+            .await
+            .map(MarketSessionStatus::without_close_metadata)
     }
 
     /// Queries the broker for the current state of an order. Used by the
@@ -2153,10 +2193,34 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(self.0.fetch_latest_trade_price(symbol).await?)
     }
 
+    async fn fetch_latest_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.fetch_latest_quote(symbol).await?)
+    }
+
+    async fn preflight_counter_trade_at_price(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .preflight_counter_trade_at_price(order, reference_price)
+            .await?)
+    }
+
     async fn market_session(
         &self,
     ) -> Result<st0x_execution::MarketSession, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.0.market_session().await?)
+    }
+
+    async fn market_session_status(
+        &self,
+    ) -> Result<MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.market_session_status().await?)
     }
 
     async fn get_order_status(

@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use st0x_float_macro::float;
 use tracing::{debug, info};
@@ -15,9 +16,9 @@ static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 use crate::{
     CancellationOutcome, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor,
-    ExecutorOrderId, Inventory, InventoryResult, LimitOrder, MarketOrder, MarketSession,
-    OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor, Usd,
-    estimate_buffered_cost_cents,
+    ExecutorOrderId, Inventory, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
+    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, PostCloseGap,
+    SupportedExecutor, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -42,6 +43,11 @@ pub struct MockExecutor {
     order_status_override: Option<OrderState>,
     market_open: bool,
     market_session_override: Option<MarketSession>,
+    market_session_status_calls: Arc<AtomicU64>,
+    market_session_status_failure: Option<String>,
+    extended_session_closes_at_override: Option<DateTime<Utc>>,
+    post_close_gap_override: PostCloseGap,
+    latest_quote_override: Option<LatestQuote>,
     preflight_price: Float,
 }
 
@@ -54,6 +60,11 @@ impl MockExecutor {
             order_status_override: None,
             market_open: true,
             market_session_override: None,
+            market_session_status_calls: Arc::new(AtomicU64::new(0)),
+            market_session_status_failure: None,
+            extended_session_closes_at_override: None,
+            post_close_gap_override: PostCloseGap::Unknown,
+            latest_quote_override: None,
             preflight_price: *MOCK_FILL_PRICE,
         }
     }
@@ -98,6 +109,40 @@ impl MockExecutor {
         self
     }
 
+    #[must_use]
+    pub fn market_session_status_call_count(&self) -> u64 {
+        self.market_session_status_calls.load(Ordering::SeqCst)
+    }
+
+    /// Configures `market_session_status()` to fail with the given message,
+    /// independent of `market_session()` (which is left succeeding). This
+    /// mirrors the real executor issuing a separate calendar HTTP call for
+    /// close-flatten window status, letting tests prove that call is never
+    /// reached when it shouldn't be (e.g. outside the extended session).
+    #[must_use]
+    pub fn with_market_session_status_failure(mut self, message: impl Into<String>) -> Self {
+        self.market_session_status_failure = Some(message.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_extended_session_closes_at(mut self, closes_at: DateTime<Utc>) -> Self {
+        self.extended_session_closes_at_override = Some(closes_at);
+        self
+    }
+
+    #[must_use]
+    pub fn with_post_close_gap(mut self, post_close_gap: PostCloseGap) -> Self {
+        self.post_close_gap_override = post_close_gap;
+        self
+    }
+
+    #[must_use]
+    pub fn with_latest_quote(mut self, quote: LatestQuote) -> Self {
+        self.latest_quote_override = Some(quote);
+        self
+    }
+
     /// Returns the failure error when the executor is configured to
     /// fail, shared by every fallible operation.
     fn fail_if_unhealthy(&self) -> Result<(), ExecutionError> {
@@ -119,6 +164,61 @@ impl MockExecutor {
     fn generate_order_id(&self) -> String {
         let id = self.order_counter.fetch_add(1, Ordering::SeqCst);
         format!("TEST_{id}")
+    }
+
+    fn preflight_sell(&self, order: MarketOrder) -> Result<CounterTradePreflight, ExecutionError> {
+        let InventoryResult::Fetched(inventory) = &self.inventory_result else {
+            return Ok(CounterTradePreflight::Allowed { reservation: None });
+        };
+
+        let available = inventory
+            .positions
+            .iter()
+            .find(|position| position.symbol == order.symbol)
+            .map_or(crate::FractionalShares::ZERO, |position| position.quantity);
+
+        Ok(crate::resolve_sell_preflight(order, available)?)
+    }
+
+    /// Shared cash check for [`Executor::preflight_counter_trade`] and
+    /// [`Executor::preflight_counter_trade_at_price`]'s buy branches -- only
+    /// the reference price used to estimate cost differs between the two
+    /// callers (the configured `preflight_price` vs. a caller-supplied
+    /// price such as a close-flatten ask), mirroring `AlpacaBrokerApi`'s
+    /// real preflight split.
+    fn preflight_buy_cash(
+        &self,
+        order: &MarketOrder,
+        reference_price: crate::Positive<Usd>,
+    ) -> Result<CounterTradePreflight, ExecutionError> {
+        let InventoryResult::Fetched(inventory) = &self.inventory_result else {
+            return Ok(CounterTradePreflight::Allowed { reservation: None });
+        };
+
+        let estimated_cost_cents = estimate_buffered_cost_cents(
+            order.shares,
+            reference_price.inner().inner(),
+            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        )
+        .map_err(|error| ExecutionError::MockFailure {
+            message: error.to_string(),
+        })?;
+
+        if inventory.usd_balance_cents >= estimated_cost_cents {
+            Ok(CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    estimated_cost_cents,
+                    available_buying_power_cents: inventory.usd_balance_cents,
+                }),
+            })
+        } else {
+            Ok(CounterTradePreflight::Skipped(
+                CounterTradeSkipReason::InsufficientBuyingPower {
+                    estimated_cost_cents,
+                    available_buying_power_cents: inventory.usd_balance_cents,
+                },
+            ))
+        }
     }
 }
 
@@ -212,46 +312,29 @@ impl Executor for MockExecutor {
     ) -> Result<CounterTradePreflight, Self::Error> {
         self.fail_if_unhealthy()?;
 
-        let InventoryResult::Fetched(inventory) = &self.inventory_result else {
-            return Ok(CounterTradePreflight::Allowed { reservation: None });
-        };
+        match order.direction {
+            Direction::Sell => self.preflight_sell(order),
+            Direction::Buy => {
+                // `preflight_price` is a plain `Float` test knob (set via
+                // `with_preflight_price`), validated here rather than at
+                // construction so `MockExecutor::new()` stays infallible.
+                let reference_price = crate::Positive::new(Usd::new(self.preflight_price))?;
+                self.preflight_buy_cash(&order, reference_price)
+            }
+        }
+    }
+
+    async fn preflight_counter_trade_at_price(
+        &self,
+        order: MarketOrder,
+        reference_price: crate::Positive<Usd>,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        self.fail_if_unhealthy()?;
 
         match order.direction {
-            Direction::Sell => {
-                let available = inventory
-                    .positions
-                    .iter()
-                    .find(|position| position.symbol == order.symbol)
-                    .map_or(crate::FractionalShares::ZERO, |position| position.quantity);
-
-                Ok(crate::resolve_sell_preflight(order, available)?)
-            }
-            Direction::Buy => {
-                let estimated_cost_cents = estimate_buffered_cost_cents(
-                    order.shares,
-                    self.preflight_price,
-                    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-                )
-                .map_err(|error| ExecutionError::MockFailure {
-                    message: error.to_string(),
-                })?;
-
-                if inventory.usd_balance_cents >= estimated_cost_cents {
-                    Ok(CounterTradePreflight::Allowed {
-                        reservation: Some(CounterTradeReservation::BuyingPower {
-                            estimated_cost_cents,
-                            available_buying_power_cents: inventory.usd_balance_cents,
-                        }),
-                    })
-                } else {
-                    Ok(CounterTradePreflight::Skipped(
-                        CounterTradeSkipReason::InsufficientBuyingPower {
-                            estimated_cost_cents,
-                            available_buying_power_cents: inventory.usd_balance_cents,
-                        },
-                    ))
-                }
-            }
+            // Inventory availability doesn't depend on price.
+            Direction::Sell => self.preflight_sell(order),
+            Direction::Buy => self.preflight_buy_cash(&order, reference_price),
         }
     }
 
@@ -265,6 +348,31 @@ impl Executor for MockExecutor {
         } else {
             Ok(MarketSession::Closed)
         }
+    }
+
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        self.market_session_status_calls
+            .fetch_add(1, Ordering::SeqCst);
+
+        if let Some(message) = &self.market_session_status_failure {
+            return Err(ExecutionError::MockFailure {
+                message: message.clone(),
+            });
+        }
+
+        Ok(MarketSessionStatus {
+            session: self.market_session().await?,
+            extended_session_closes_at: self.extended_session_closes_at_override,
+            post_close_gap: self.post_close_gap_override,
+        })
+    }
+
+    async fn fetch_latest_quote(
+        &self,
+        _symbol: &crate::Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
+        self.fail_if_unhealthy()?;
+        Ok(self.latest_quote_override)
     }
 
     async fn place_limit_order(

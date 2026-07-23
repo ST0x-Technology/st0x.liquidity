@@ -756,7 +756,7 @@ impl Conductor {
             .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
-            .call();
+            .call()?;
 
         // Publish the recovery handle only after all startup work
         // (inventory hydration, orphan recovery, store builds) completes

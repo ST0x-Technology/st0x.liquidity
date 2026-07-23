@@ -146,6 +146,14 @@ spread between onchain and offchain prices.
 Direction logic: positive net position -> sell offchain; negative net position
 -> buy offchain.
 
+### Post-Close Gap
+
+The calendar-derived interval between the current extended-session close and the
+next trading session. `PostCloseGap` distinguishes an ordinary overnight (next
+session is the following calendar day), a multi-day closure (weekend or exchange
+holiday), and unknown next-session metadata. The distinction drives close
+flattening without hardcoding weekdays or holiday dates.
+
 ### Position
 
 A CQRS aggregate tracking a single symbol's accumulated exposure across both

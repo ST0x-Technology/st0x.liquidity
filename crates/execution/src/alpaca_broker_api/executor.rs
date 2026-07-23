@@ -19,9 +19,10 @@ use super::order::{
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
-    ExecutorOrderId, FractionalShares, InventoryResult, LimitOrder, MarketOrder, MarketSession,
-    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
-    Usd, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
+    ExecutorOrderId, FractionalShares, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
+    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, OrderStatus, Positive,
+    SupportedExecutor, Symbol, TryIntoExecutor, Usd, buying_power_counter_trade_preflight,
+    estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -244,31 +245,21 @@ impl Executor for AlpacaBrokerApi {
                     &order.symbol,
                 )
                 .await?;
-                let account_funds = super::positions::get_account_funds(&self.client).await?;
-                let estimated_cost_cents = estimate_buffered_cost_cents(
-                    order.shares,
-                    latest_trade_price.inner().inner(),
-                    self.counter_trade_slippage_bps,
-                )?;
-
-                let available_buying_power_cents = account_funds.buying_power;
-                let preflight = buying_power_counter_trade_preflight(
-                    estimated_cost_cents,
-                    available_buying_power_cents,
-                );
-
-                if matches!(preflight, CounterTradePreflight::Allowed { .. }) {
-                    debug!(
-                        target: "broker",
-                        symbol = %order.symbol,
-                        estimated_cost_cents,
-                        available_buying_power_cents,
-                        "Preflight passed: sufficient buying power for buy"
-                    );
-                }
-
-                Ok(preflight)
+                self.preflight_buy_cash(&order, latest_trade_price).await
             }
+        }
+    }
+
+    async fn preflight_counter_trade_at_price(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        match order.direction {
+            // Inventory availability doesn't depend on price; keep the
+            // ordinary preflight for sells.
+            Direction::Sell => self.preflight_counter_trade(order).await,
+            Direction::Buy => self.preflight_buy_cash(&order, reference_price).await,
         }
     }
 
@@ -285,8 +276,25 @@ impl Executor for AlpacaBrokerApi {
         Ok(Some(price))
     }
 
+    async fn fetch_latest_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
+        let quote = crate::alpaca_market_data::fetch_latest_quote(
+            self.client.market_data_http_client(),
+            self.client.market_data_base_url(),
+            symbol,
+        )
+        .await?;
+        Ok(Some(quote))
+    }
+
     async fn market_session(&self) -> Result<MarketSession, Self::Error> {
         super::market_hours::market_session(&self.client).await
+    }
+
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        super::market_hours::market_session_status(&self.client).await
     }
 
     async fn place_limit_order(
@@ -460,6 +468,42 @@ impl AlpacaBrokerApi {
         }
 
         Ok(())
+    }
+
+    /// Shared buying-power check for [`Executor::preflight_counter_trade`]
+    /// and [`Executor::preflight_counter_trade_at_price`]'s buy branches --
+    /// only the reference price used to estimate cost differs between the
+    /// two callers (latest trade price vs. a caller-supplied price such as
+    /// a close-flatten ask).
+    async fn preflight_buy_cash(
+        &self,
+        order: &MarketOrder,
+        reference_price: Positive<Usd>,
+    ) -> Result<CounterTradePreflight, AlpacaBrokerApiError> {
+        let account_funds = super::positions::get_account_funds(&self.client).await?;
+        let estimated_cost_cents = estimate_buffered_cost_cents(
+            order.shares,
+            reference_price.inner().inner(),
+            self.counter_trade_slippage_bps,
+        )?;
+
+        let available_buying_power_cents = account_funds.buying_power;
+        let preflight = buying_power_counter_trade_preflight(
+            estimated_cost_cents,
+            available_buying_power_cents,
+        );
+
+        if matches!(preflight, CounterTradePreflight::Allowed { .. }) {
+            debug!(
+                target: "broker",
+                symbol = %order.symbol,
+                estimated_cost_cents,
+                available_buying_power_cents,
+                "Preflight passed: sufficient buying power for buy"
+            );
+        }
+
+        Ok(preflight)
     }
 }
 
@@ -888,6 +932,105 @@ mod tests {
                     available_buying_power_cents,
                 }),
             } if estimated_cost_cents == 20_200 && available_buying_power_cents == 3_500_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_preflight_counter_trade_at_price_uses_given_price_not_latest_trade() {
+        // Close-flatten buys price their submitted limit off the current ask,
+        // not the latest trade -- so `preflight_counter_trade_at_price` must
+        // estimate cost from the caller-supplied reference price and must
+        // NOT hit the latest-trade endpoint at all. Here the latest trade
+        // price ($1.00) would pass easily; the caller-supplied ask ($100.00)
+        // must be what actually gets checked and rejected.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "100.00"
+                }));
+        });
+        let latest_trade_mock = create_latest_trade_mock(&server, "1.00");
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let preflight = executor
+            .preflight_counter_trade_at_price(
+                MarketOrder {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                    direction: Direction::Buy,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+                Positive::new(Usd::new(float!(100.00))).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        latest_trade_mock.assert_calls(0);
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
+                estimated_cost_cents,
+                available_buying_power_cents,
+            }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_preflight_counter_trade_at_price_defers_to_ordinary_preflight_for_sell() {
+        // Inventory availability doesn't depend on price, so a sell must
+        // still be checked against broker inventory, ignoring the supplied
+        // reference price entirely.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "100.00"
+                }));
+        });
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let preflight = executor
+            .preflight_counter_trade_at_price(
+                MarketOrder {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                    direction: Direction::Sell,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+                Positive::new(Usd::new(float!(100.00))).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        positions_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientEquity {
+                available,
+                ..
+            }) if available == FractionalShares::ZERO
         ));
     }
 

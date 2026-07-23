@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use st0x_execution::{
-    CancellationOutcome, CounterTradePreflight, Executor, InventoryResult, LimitOrder, MarketOrder,
-    MarketSession, OrderPlacement, OrderState, Positive, SupportedExecutor, Symbol, Usd,
+    CancellationOutcome, CounterTradePreflight, Executor, InventoryResult, LatestQuote, LimitOrder,
+    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive,
+    SupportedExecutor, Symbol, Usd,
 };
 
 use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
@@ -136,10 +137,31 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         result
     }
 
+    async fn preflight_counter_trade_at_price(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        let started = Instant::now();
+        let result = self
+            .inner
+            .preflight_counter_trade_at_price(order, reference_price)
+            .await;
+        self.record("preflight_counter_trade_at_price", started, &result);
+        result
+    }
+
     async fn market_session(&self) -> Result<MarketSession, Self::Error> {
         let started = Instant::now();
         let result = self.inner.market_session().await;
         self.record("market_session", started, &result);
+        result
+    }
+
+    async fn market_session_status(&self) -> Result<MarketSessionStatus, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.market_session_status().await;
+        self.record("market_session_status", started, &result);
         result
     }
 
@@ -150,6 +172,16 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         let started = Instant::now();
         let result = self.inner.fetch_latest_trade_price(symbol).await;
         self.record("fetch_latest_trade_price", started, &result);
+        result
+    }
+
+    async fn fetch_latest_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.fetch_latest_quote(symbol).await;
+        self.record("fetch_latest_quote", started, &result);
         result
     }
 
@@ -179,7 +211,8 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use st0x_execution::{
-        ClientOrderId, Direction, FractionalShares, MockExecutor, Positive, Symbol,
+        ClientOrderId, CounterTradeSkipReason, Direction, FractionalShares, Inventory,
+        MockExecutor, Positive, Symbol,
     };
     use st0x_float_macro::float;
 
@@ -291,6 +324,69 @@ mod tests {
             error.unwrap().contains("broker down"),
             "failure message must be recorded"
         );
+    }
+
+    /// Regression test for the close-flatten cash-safety fix: without
+    /// forwarding `reference_price`, the trait default for
+    /// `preflight_counter_trade_at_price` silently falls back to
+    /// `preflight_counter_trade`'s latest-trade-price reference, so a
+    /// widening extended-hours spread could pass this check while the order
+    /// actually submitted needs materially more buying power than was
+    /// checked. Funds the mock so the ordinary (mock-default $100/share)
+    /// preflight passes, then asserts the same order rejects once priced
+    /// against a materially higher supplied reference price -- proving the
+    /// wrapper does not discard `reference_price`.
+    #[tokio::test]
+    async fn preflight_counter_trade_at_price_forwards_reference_price() {
+        let pool = setup_test_db().await;
+        let (sender, receiver) = TelemetrySender::channel();
+        let writer = spawn_dependency_call_writer(pool.clone(), receiver);
+
+        // Exactly funds the buffered cost of `market_order()`'s 1 share at
+        // the mock's default $100 reference price (1 * $100 * 1.01 slippage
+        // buffer = $101.00), but not at the $200 reference price used below.
+        let inventory = Inventory {
+            positions: vec![],
+            alpaca_usdc: None,
+            usd_balance_cents: 10_100,
+            cash_buying_power_cents: Some(10_100),
+            cash_withdrawable_cents: None,
+        };
+        let executor = InstrumentedExecutor::new(
+            MockExecutor::new().with_inventory(inventory),
+            sender.clone(),
+        );
+        let order = market_order();
+
+        let ordinary = executor
+            .preflight_counter_trade(order.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(ordinary, CounterTradePreflight::Allowed { .. }),
+            "ordinary preflight must pass at the mock's default $100 reference price, \
+             got {ordinary:?}"
+        );
+
+        let reference_price = Positive::new(Usd::new(float!(200))).unwrap();
+        let at_price = executor
+            .preflight_counter_trade_at_price(order, reference_price)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                at_price,
+                CounterTradePreflight::Skipped(
+                    CounterTradeSkipReason::InsufficientBuyingPower { .. }
+                )
+            ),
+            "at-price preflight must reject using the supplied $200 reference price instead \
+             of falling back to the $100 ordinary reference, got {at_price:?}"
+        );
+
+        drop(executor);
+        drop(sender);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

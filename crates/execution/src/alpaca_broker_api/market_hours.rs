@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use serde::Deserialize;
 use tracing::{debug, warn};
@@ -8,7 +8,9 @@ use tracing::{debug, warn};
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
 
-use crate::MarketSession;
+use crate::{MarketSession, MarketSessionStatus, PostCloseGap};
+
+const NEXT_SESSION_LOOKAHEAD_DAYS: u64 = 14;
 
 /// Response from the Alpaca calendar endpoint
 /// (https://docs.alpaca.markets/reference/getcalendar-1).
@@ -69,11 +71,76 @@ pub(super) async fn market_session(
     market_session_at(client, Utc::now()).await
 }
 
+/// Returns the current market session with extended-session close metadata.
+pub(super) async fn market_session_status(
+    client: &AlpacaBrokerApiClient,
+) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
+    market_session_status_at(client, Utc::now()).await
+}
+
 /// Returns the market session at the given time.
+///
+/// Deliberately does NOT route through `market_session_status_at`: that
+/// function conditionally performs a second calendar HTTP round trip (the
+/// post-close-gap lookahead) whenever the session is Extended. Plain session
+/// callers -- `is_market_open`, and the per-symbol readiness/cancellation
+/// checks that only need Regular/Extended/Closed -- never consume that
+/// metadata, so routing them through the status path would pay for an
+/// avoidable broker call on every extended-hours tick. Only
+/// `market_session_status_at` (consumed by the close-flatten path) needs it.
 pub(super) async fn market_session_at(
     client: &AlpacaBrokerApiClient,
     now: DateTime<Utc>,
 ) -> Result<MarketSession, AlpacaBrokerApiError> {
+    Ok(session_and_close_at(client, now).await?.session)
+}
+
+/// Returns the market session and extended-session close at the given time.
+pub(super) async fn market_session_status_at(
+    client: &AlpacaBrokerApiClient,
+    now: DateTime<Utc>,
+) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
+    let SessionAndClose {
+        session,
+        extended_session_closes_at,
+        today,
+    } = session_and_close_at(client, now).await?;
+
+    // `post_close_gap` is only meaningful once the session is Extended (see
+    // `CloseFlattenPolicy::active_window`, which discards it otherwise), and
+    // computing it issues a full calendar HTTP round trip. Skip the network
+    // call entirely for the far more common Regular/Closed cases.
+    let post_close_gap = if session == MarketSession::Extended {
+        classify_post_close_gap(client, today).await
+    } else {
+        PostCloseGap::Unknown
+    };
+
+    Ok(MarketSessionStatus {
+        session,
+        extended_session_closes_at,
+        post_close_gap,
+    })
+}
+
+/// Session classification plus the extended-session close time, without the
+/// post-close-gap lookahead. Shared by the lightweight `market_session_at`
+/// path and `market_session_status_at`, which layers the lookahead on top
+/// only when the session is Extended.
+struct SessionAndClose {
+    session: MarketSession,
+    extended_session_closes_at: Option<DateTime<Utc>>,
+    /// The queried trading day, in Alpaca's calendar timezone. Threaded back
+    /// out so `market_session_status_at` can feed it to
+    /// `classify_post_close_gap` without recomputing the timezone
+    /// conversion.
+    today: NaiveDate,
+}
+
+async fn session_and_close_at(
+    client: &AlpacaBrokerApiClient,
+    now: DateTime<Utc>,
+) -> Result<SessionAndClose, AlpacaBrokerApiError> {
     let now_et = now.with_timezone(&New_York);
     let today = now_et.date_naive();
 
@@ -81,7 +148,11 @@ pub(super) async fn market_session_at(
 
     let Some(today_calendar) = calendar.into_iter().next() else {
         debug!("Today is not a trading day");
-        return Ok(MarketSession::Closed);
+        return Ok(SessionAndClose {
+            session: MarketSession::Closed,
+            extended_session_closes_at: None,
+            today,
+        });
     };
 
     // The broker may answer a non-trading-day query with the NEAREST trading
@@ -99,7 +170,11 @@ pub(super) async fn market_session_at(
                 returned = %today_calendar.date,
                 "Calendar returned a later trading day; queried day is not a trading day"
             );
-            return Ok(MarketSession::Closed);
+            return Ok(SessionAndClose {
+                session: MarketSession::Closed,
+                extended_session_closes_at: None,
+                today,
+            });
         }
         Ordering::Less => {
             return Err(AlpacaBrokerApiError::CalendarDateMismatch {
@@ -140,6 +215,7 @@ pub(super) async fn market_session_at(
     }
 
     let now_time = now_et.time();
+    let extended_session_closes_at = local_market_time_to_utc(today, today_calendar.session_close)?;
 
     let session = if now_time >= today_calendar.open && now_time < today_calendar.close {
         MarketSession::Regular
@@ -159,7 +235,69 @@ pub(super) async fn market_session_at(
         "Checked market session"
     );
 
-    Ok(session)
+    Ok(SessionAndClose {
+        session,
+        extended_session_closes_at: Some(extended_session_closes_at),
+        today,
+    })
+}
+
+async fn classify_post_close_gap(
+    client: &AlpacaBrokerApiClient,
+    current_trading_day: NaiveDate,
+) -> PostCloseGap {
+    let Some(start) = current_trading_day.checked_add_days(Days::new(1)) else {
+        warn!(%current_trading_day, "Could not compute next calendar day; treating post-close gap as unknown");
+        return PostCloseGap::Unknown;
+    };
+    let Some(end) = current_trading_day.checked_add_days(Days::new(NEXT_SESSION_LOOKAHEAD_DAYS))
+    else {
+        warn!(%current_trading_day, "Could not compute calendar lookahead; treating post-close gap as unknown");
+        return PostCloseGap::Unknown;
+    };
+
+    let calendar = match get_calendar(client, start, end).await {
+        Ok(calendar) => calendar,
+        Err(error) => {
+            warn!(
+                %error,
+                %current_trading_day,
+                "Failed to fetch next trading session; treating post-close gap as unknown"
+            );
+            return PostCloseGap::Unknown;
+        }
+    };
+
+    let Some(next_trading_day) = calendar
+        .into_iter()
+        .map(|day| day.date)
+        .filter(|date| *date > current_trading_day)
+        .min()
+    else {
+        warn!(
+            %current_trading_day,
+            lookahead_days = NEXT_SESSION_LOOKAHEAD_DAYS,
+            "Calendar did not identify the next trading session; treating post-close gap as unknown"
+        );
+        return PostCloseGap::Unknown;
+    };
+
+    if next_trading_day == start {
+        PostCloseGap::OrdinaryOvernight
+    } else {
+        PostCloseGap::MultiDayClosure
+    }
+}
+
+fn local_market_time_to_utc(
+    date: NaiveDate,
+    time: NaiveTime,
+) -> Result<DateTime<Utc>, AlpacaBrokerApiError> {
+    date.and_time(time)
+        .and_local_timezone(New_York)
+        .single()
+        .map(|date_time| date_time.with_timezone(&Utc))
+        .ok_or(AlpacaBrokerApiError::CalendarLocalTimeAmbiguous { date, time })
 }
 
 /// Returns true if the market is open for regular trading at the given time.
@@ -371,6 +509,35 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
+        });
+    }
+
+    fn mock_next_trading_day(
+        server: &MockServer,
+        range_start: &str,
+        range_end: &str,
+        next_trading_day: Option<&str>,
+    ) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", range_start)
+                .query_param("end", range_end);
+            let body = next_trading_day.map_or_else(
+                || json!([]),
+                |date| {
+                    json!([{
+                        "date": date,
+                        "open": "09:30",
+                        "close": "16:00",
+                        "session_open": "0400",
+                        "session_close": "2000"
+                    }])
+                },
+            );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(body);
         });
     }
 
@@ -626,6 +793,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn market_session_status_exposes_extended_session_close() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let after_hours = et_time_as_utc("2025-01-06", 18, 0);
+
+        let status = market_session_status_at(&client, after_hours)
+            .await
+            .unwrap();
+
+        assert_eq!(status.session, MarketSession::Extended);
+        assert_eq!(
+            status.extended_session_closes_at,
+            Some(et_time_as_utc("2025-01-06", 20, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_at_never_triggers_post_close_gap_lookahead_even_when_extended() {
+        // `market_session_at`/`market_session` only ever consume `.session`,
+        // never the close-gap metadata -- so unlike `market_session_status_at`,
+        // they must skip the lookahead call even while the session IS
+        // Extended (readiness/cancellation checks poll this every tick during
+        // extended hours). Asserting zero hits pins that the network call
+        // never fires on this path, not merely that a failure would be
+        // masked by `classify_post_close_gap`'s Unknown fallback.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+        let lookahead_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", "2025-01-07")
+                .query_param("end", "2025-01-20");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "date": "2025-01-07",
+                        "open": "09:30",
+                        "close": "16:00",
+                        "session_open": "0400",
+                        "session_close": "2000"
+                    }
+                ]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let after_hours = et_time_as_utc("2025-01-06", 18, 0);
+
+        let session = market_session_at(&client, after_hours).await.unwrap();
+
+        assert_eq!(session, MarketSession::Extended);
+        lookahead_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_skips_post_close_gap_lookahead_when_not_extended() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+        // The post-close-gap lookahead call must not fire outside the
+        // Extended session -- it's only meaningful for close-flatten, which
+        // only activates during Extended. Asserting zero hits pins that the
+        // network call is skipped, not merely that its (swallowed) failure
+        // is masked by `classify_post_close_gap`'s Unknown fallback.
+        let lookahead_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", "2025-01-07")
+                .query_param("end", "2025-01-20");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "date": "2025-01-07",
+                        "open": "09:30",
+                        "close": "16:00",
+                        "session_open": "0400",
+                        "session_close": "2000"
+                    }
+                ]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let midday = et_time_as_utc("2025-01-06", 12, 0);
+
+        let status = market_session_status_at(&client, midday).await.unwrap();
+
+        assert_eq!(status.session, MarketSession::Regular);
+        assert_eq!(status.post_close_gap, PostCloseGap::Unknown);
+        lookahead_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_classifies_ordinary_weekday_overnight() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+        mock_next_trading_day(&server, "2025-01-07", "2025-01-20", Some("2025-01-07"));
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let status = market_session_status_at(&client, et_time_as_utc("2025-01-06", 19, 50))
+            .await
+            .unwrap();
+
+        assert_eq!(status.post_close_gap, PostCloseGap::OrdinaryOvernight);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_classifies_friday_weekend_gap() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-10");
+        mock_next_trading_day(&server, "2025-01-11", "2025-01-24", Some("2025-01-13"));
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let status = market_session_status_at(&client, et_time_as_utc("2025-01-10", 19, 50))
+            .await
+            .unwrap();
+
+        assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_classifies_weekday_holiday_gap() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-07-03");
+        mock_next_trading_day(&server, "2025-07-04", "2025-07-17", Some("2025-07-07"));
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let status = market_session_status_at(&client, et_time_as_utc("2025-07-03", 16, 50))
+            .await
+            .unwrap();
+
+        assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_treats_missing_next_session_as_unknown() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+        mock_next_trading_day(&server, "2025-01-07", "2025-01-20", None);
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let status = market_session_status_at(&client, et_time_as_utc("2025-01-06", 19, 50))
+            .await
+            .unwrap();
+
+        assert_eq!(status.post_close_gap, PostCloseGap::Unknown);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_uses_early_close_session_close() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_calendar_day(&server, "2025-07-03", "09:30", "13:00", "0400", "1700");
+        mock_next_trading_day(&server, "2025-07-04", "2025-07-17", Some("2025-07-07"));
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let after_regular_close = et_time_as_utc("2025-07-03", 13, 30);
+
+        let status = market_session_status_at(&client, after_regular_close)
+            .await
+            .unwrap();
+
+        assert_eq!(status.session, MarketSession::Extended);
+        assert_eq!(
+            status.extended_session_closes_at,
+            Some(et_time_as_utc("2025-07-03", 17, 0))
+        );
+        assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
+    }
+
+    #[tokio::test]
     async fn market_session_closed_before_extended_session() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
@@ -761,5 +1107,39 @@ mod tests {
             MarketSession::Closed,
             "Exactly at session_close (20:00 ET) the extended session has ended -> Closed"
         );
+    }
+
+    #[test]
+    fn local_market_time_to_utc_rejects_ambiguous_dst_fallback_time() {
+        // 2025-11-02 is the DST fall-back date in America/New_York: clocks
+        // move from 02:00 EDT back to 01:00 EST, so every local time in
+        // [01:00, 02:00) occurs twice and cannot be resolved to a single
+        // UTC instant by `and_local_timezone(..).single()`.
+        let date = NaiveDate::from_ymd_opt(2025, 11, 2).unwrap();
+        let time = NaiveTime::from_hms_opt(1, 30, 0).unwrap();
+
+        let error = local_market_time_to_utc(date, time).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::CalendarLocalTimeAmbiguous {
+                date: error_date,
+                time: error_time,
+            } if error_date == date && error_time == time
+        ));
+    }
+
+    #[test]
+    fn local_market_time_to_utc_resolves_ordinary_session_close_time() {
+        // Companion to the ambiguous-time test above: an ordinary session
+        // close (20:00 ET, never ambiguous) must resolve to a single UTC
+        // instant rather than hitting the `CalendarLocalTimeAmbiguous`
+        // fallback.
+        let date = NaiveDate::from_ymd_opt(2025, 1, 6).unwrap();
+        let time = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+
+        let resolved = local_market_time_to_utc(date, time).unwrap();
+
+        assert_eq!(resolved, et_time_as_utc("2025-01-06", 20, 0));
     }
 }

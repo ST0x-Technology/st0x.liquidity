@@ -139,7 +139,11 @@ threshold-based).
 Add credentials to your TOML config file under the `[broker]` section (see
 `example.config.toml` and `example.secrets.toml`). Alpaca configs must also set
 `broker.counter_trade_slippage_bps`, which controls the buy-side preflight
-buffer in basis points.
+buffer and the protection bound on extended-hours limit orders. During the
+configured final close-flatten window before weekends, exchange holidays, or an
+unknown next session, those limits cross the current SIP bid/ask and are
+refreshed on the extended-hours reprice cycle. Ordinary weekday closes keep the
+normal latest-trade pricing path.
 
 ## Deployment
 
