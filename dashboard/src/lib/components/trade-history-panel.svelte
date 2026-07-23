@@ -6,6 +6,7 @@
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import CliCommandBlock from '$lib/components/cli-command-block.svelte'
   import type { Position } from '$lib/api/Position'
+  import type { LegacyTrade } from '$lib/api/LegacyTrade'
   import type { Trade } from '$lib/api/Trade'
   import type { TradingVenue } from '$lib/api/TradingVenue'
   import TradeOutcomeView from '$lib/components/trade-outcome.svelte'
@@ -21,7 +22,7 @@
   import { formatDecimal } from '$lib/decimal'
   import { equityUsdTooltip } from '$lib/inventory-value'
   import { tradeRecoveryCommands } from '$lib/transfer'
-  import { mergeTradeHistory, type TradeHistoryFilter } from '$lib/trade'
+  import { mergeTradeHistory, normalizeTrade, type TradeHistoryFilter } from '$lib/trade'
 
   type TradeEvent = {
     step: string
@@ -32,7 +33,7 @@
   type TradeEntry = Trade
 
   type TradeResponse = {
-    entries: TradeEntry[]
+    entries: Array<TradeEntry | LegacyTrade>
     total: number
     hasMore: boolean
   }
@@ -105,7 +106,8 @@
   const buildParams = (limit = PAGE_SIZE, requestOffset = offset.current): URLSearchParams => {
     const params = new URLSearchParams({
       limit: String(limit),
-      offset: String(requestOffset)
+      offset: String(requestOffset),
+      trade_protocol: 'terminal_outcomes_v1'
     })
 
     if (selectedVenues.current.size > 0 && selectedVenues.current.size < ALL_VENUES.length) {
@@ -191,7 +193,8 @@
         return
       }
 
-      const data: TradeResponse = (await response.json()) as TradeResponse
+      const wireData: TradeResponse = (await response.json()) as TradeResponse
+      const data = { ...wireData, entries: wireData.entries.map(normalizeTrade) }
       if (requestVersion !== historyRequestVersion) return
 
       const nextEntries = isLoadMore

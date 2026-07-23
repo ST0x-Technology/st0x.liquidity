@@ -1,7 +1,8 @@
 //! Trade fill DTOs for completed onchain and offchain trades.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 use ts_rs::TS;
 
 use st0x_finance::{FractionalShares, NonNegative, Symbol};
@@ -142,12 +143,12 @@ pub enum TradeOutcome {
 }
 
 /// A completed onchain fill or terminal offchain counter-trade.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, TS)]
 pub struct Trade {
     /// Unique identifier for deduplication on reconnect.
     /// Onchain: `"tx_hash:log_index"`. Offchain: offchain order aggregate ID.
     pub id: String,
+    #[ts(rename = "occurredAt")]
     pub occurred_at: DateTime<Utc>,
     pub venue: TradingVenue,
     pub direction: Direction,
@@ -160,6 +161,61 @@ pub struct Trade {
     #[ts(type = "string")]
     pub shares: FractionalShares,
     pub outcome: TradeOutcome,
+}
+
+impl Serialize for Trade {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let is_filled = matches!(self.outcome, TradeOutcome::Filled);
+        let mut trade = serializer.serialize_struct("Trade", 7 + usize::from(is_filled))?;
+        trade.serialize_field("id", &self.id)?;
+        trade.serialize_field("occurredAt", &self.occurred_at)?;
+        if is_filled {
+            trade.serialize_field("filledAt", &self.occurred_at)?;
+        }
+        trade.serialize_field("venue", &self.venue)?;
+        trade.serialize_field("direction", &self.direction)?;
+        trade.serialize_field("symbol", &self.symbol)?;
+        trade.serialize_field("shares", &self.shares)?;
+        trade.serialize_field("outcome", &self.outcome)?;
+        trade.end()
+    }
+}
+
+/// Filled-trade wire shape consumed by dashboard versions before terminal
+/// outcomes were added to [`Trade`].
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyTrade {
+    pub id: String,
+    pub filled_at: DateTime<Utc>,
+    pub venue: TradingVenue,
+    pub direction: Direction,
+    #[ts(type = "string")]
+    pub symbol: Symbol,
+    #[ts(type = "string")]
+    pub shares: FractionalShares,
+}
+
+impl Trade {
+    /// Returns the pre-terminal-outcome representation for filled trades.
+    #[must_use]
+    pub fn legacy_fill(&self) -> Option<LegacyTrade> {
+        if !matches!(self.outcome, TradeOutcome::Filled) {
+            return None;
+        }
+
+        Some(LegacyTrade {
+            id: self.id.clone(),
+            filled_at: self.occurred_at,
+            venue: self.venue,
+            direction: self.direction,
+            symbol: self.symbol.clone(),
+            shares: self.shares,
+        })
+    }
 }
 
 /// Sorts dashboard trades newest-first with a stable cross-loader tie-breaker.
@@ -233,6 +289,7 @@ mod tests {
         assert_eq!(json["symbol"], json!("TSLA"));
         assert_eq!(json["shares"], json!("5.5"));
         assert_eq!(json["occurredAt"], json!("2023-11-14T22:13:20Z"));
+        assert_eq!(json["filledAt"], json!("2023-11-14T22:13:20Z"));
         assert_eq!(json["outcome"], json!({ "status": "filled" }));
     }
 
@@ -263,6 +320,10 @@ mod tests {
                 "remainingShares": "0.75",
                 "excessShares": "0"
             })
+        );
+        assert!(
+            json.get("filledAt").is_none(),
+            "failed outcomes must not masquerade as legacy fills"
         );
     }
 
@@ -295,6 +356,33 @@ mod tests {
                 format!("{tx_hash}:10"),
                 "older".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn newest_first_sort_preserves_sub_millisecond_precision_and_fallback_ties() {
+        let earlier = DateTime::from_timestamp(1_700_000_000, 123_456_788).unwrap();
+        let later = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        let trade = |id: &str, occurred_at| Trade {
+            id: id.to_string(),
+            occurred_at,
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(float!(1)),
+            outcome: TradeOutcome::Filled,
+        };
+        let mut trades = vec![
+            trade("z-tied", earlier),
+            trade("later", later),
+            trade("a-tied", earlier),
+        ];
+
+        sort_trades_newest_first(&mut trades);
+
+        assert_eq!(
+            trades.into_iter().map(|trade| trade.id).collect::<Vec<_>>(),
+            ["later", "a-tied", "z-tied"]
         );
     }
 }

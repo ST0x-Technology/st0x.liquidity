@@ -26,6 +26,7 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
+use crate::dashboard::TradeProtocol;
 use crate::dashboard::pnl::{
     PnlError, PnlQuery, PnlResponse, build_pnl_report, validate_pnl_snapshot_rowid,
 };
@@ -545,6 +546,8 @@ struct TradesQuery {
     venue: Option<String>,
     since: Option<String>,
     until: Option<String>,
+    #[serde(default)]
+    trade_protocol: TradeProtocol,
 }
 
 /// Paginated trade history from both onchain and offchain fills.
@@ -573,6 +576,9 @@ async fn trades(
         .await
         .inspect_err(|error| warn!(target: "dashboard", ?error, "Failed to load trade history"))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if query.trade_protocol == TradeProtocol::LegacyFills {
+        all_trades.retain(|trade| matches!(trade.outcome, TradeOutcome::Filled));
+    }
     sort_trades_newest_first(&mut all_trades);
 
     let total = all_trades.len();
@@ -1936,6 +1942,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let filled_view_id = "00000000-0000-0000-0000-000000000140";
+        let filled_payload = r#"{"Live":{"Filled":{"symbol":"AAPL","shares":"2","direction":"Sell","executor":"AlpacaBrokerApi","executor_order_id":"broker-fill","price":"100","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:00Z","filled_at":"2026-01-01T00:00:00.123456789Z"}}}"#;
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(filled_view_id)
+            .bind(filled_payload)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let entries = load_offchain_trade_rows(
             &pool,
@@ -1949,10 +1963,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, view_id);
-        assert_eq!(entries[0].symbol, Symbol::new("SPCX").unwrap());
-        match &entries[0].outcome {
+        assert_eq!(entries.len(), 2);
+        let failed = entries
+            .iter()
+            .find(|trade| trade.id == view_id)
+            .expect("failed trade should be loaded");
+        assert_eq!(failed.symbol, Symbol::new("SPCX").unwrap());
+        match &failed.outcome {
             TradeOutcome::Failed {
                 error,
                 filled_shares,
@@ -1979,10 +1996,38 @@ mod tests {
             TradeOutcome::Filled => panic!("failed projection must remain failed"),
         }
 
-        let response = build_app(state)
+        let legacy_response = build_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/trades")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_response.status(), StatusCode::OK);
+        let legacy_body: serde_json::Value =
+            serde_json::from_str(&body_to_string(legacy_response).await).unwrap();
+        assert_eq!(legacy_body["total"], 1);
+        assert_eq!(legacy_body["entries"][0]["id"], filled_view_id);
+        assert_eq!(
+            legacy_body["entries"][0]["filledAt"],
+            "2026-01-01T00:00:00.123456789Z"
+        );
+        assert_eq!(legacy_body["entries"][0]["outcome"]["status"], "filled");
+        assert!(
+            legacy_body["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|trade| trade["id"] != view_id),
+            "legacy clients must not receive failed trades"
+        );
+
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/trades?trade_protocol=terminal_outcomes_v1")
                     .body(Body::empty())
                     .unwrap(),
             )
