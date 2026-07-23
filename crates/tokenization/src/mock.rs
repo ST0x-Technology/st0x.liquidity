@@ -270,6 +270,7 @@ impl Tokenizer for MockTokenizer {
                     message: AlpacaApiErrorMessage::from_response(
                         "mock mint request error".to_string(),
                     ),
+                    retry_after: None,
                 }))
             }
         }
@@ -358,6 +359,7 @@ impl Tokenizer for MockTokenizer {
                     message: AlpacaApiErrorMessage::from_response(
                         "mock send_for_redemption failure".to_string(),
                     ),
+                    retry_after: None,
                 }))
             }
             MockSendOutcome::Succeed => Ok(self.redemption_tx),
@@ -384,6 +386,7 @@ impl Tokenizer for MockTokenizer {
                     message: AlpacaApiErrorMessage::from_response(
                         "mock detection API error".to_string(),
                     ),
+                    retry_after: None,
                 }))
             }
         }
@@ -466,6 +469,7 @@ impl Tokenizer for MockTokenizer {
                     message: AlpacaApiErrorMessage::from_response(
                         "mock list_pending_requests failure".to_string(),
                     ),
+                    retry_after: None,
                 }));
             }
             MockListPendingOutcome::Succeed => {}

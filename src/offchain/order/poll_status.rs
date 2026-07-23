@@ -20,7 +20,10 @@ use st0x_execution::{
 };
 use st0x_finance::{NonNegative, Usd};
 
-use crate::conductor::job::{Job, JobQueue, Label};
+use crate::conductor::job::{
+    BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
+    advance_backpressure, apply_backpressure_step, find_backpressure,
+};
 use crate::offchain::order::handle_rejection::{
     HandleOrderRejection, HandleOrderRejectionJobQueue,
 };
@@ -81,6 +84,16 @@ pub(crate) struct PollOrderStatusCtx<E: Executor + Clone + Send + Sync + 'static
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PollOrderStatus {
     pub(crate) offchain_order_id: OffchainOrderId,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up
+    /// to this attempt (RAI-1494). `#[serde(default)]` so a row enqueued
+    /// under the pre-this-change payload shape (no field at all) still
+    /// deserializes -- to `0`, the correct "no streak yet" value -- instead
+    /// of crashing the poll stream's `sqlx::Decode` (see
+    /// `poll_order_status_payload_without_backpressure_streak_deserializes_to_zero`).
+    /// Reset to `0` on every non-backpressure reschedule (`reschedule_self`);
+    /// incremented by one on each backpressure reschedule's pushed successor.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl<E> Job<PollOrderStatusCtx<E>> for PollOrderStatus
@@ -157,10 +170,87 @@ impl PollOrderStatus {
         JobError: From<E::Error>,
     {
         let parsed_order_id = ctx.executor.parse_order_id(executor_order_id.as_ref())?;
-        let order_state = ctx.executor.get_order_status(&parsed_order_id).await?;
+
+        let order_state = match ctx.executor.get_order_status(&parsed_order_id).await {
+            Ok(order_state) => order_state,
+            Err(error) => return self.handle_get_order_status_error(ctx, error).await,
+        };
 
         self.dispatch_for_broker_state(ctx, order, &executor_order_id, order_state)
             .await
+    }
+
+    /// Handles a `get_order_status` failure: reschedules with a classified
+    /// delay on broker rate-limiting (429) instead of consuming the terminal
+    /// retry budget, or propagates any other error through the normal,
+    /// unmodified retry/circuit-breaker path.
+    ///
+    /// `get_order_status` is a pure read with no committed guard ahead of
+    /// it, so every rescheduled successor genuinely re-hits the broker --
+    /// this is the one "true retry" job RAI-1494's parent incident
+    /// (RAI-1492) actually exercised (see the RAI-1494 plan's per-job
+    /// classification table; contrast `AccountForDexTrade`/`PlaceHedge`,
+    /// whose committed guards make their own reschedules short-circuit
+    /// instead of re-driving the broker call).
+    async fn handle_get_order_status_error<E>(
+        &self,
+        ctx: &PollOrderStatusCtx<E>,
+        error: E::Error,
+    ) -> Result<(), JobError>
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+        JobError: From<E::Error>,
+    {
+        let Some(backpressure) = find_backpressure(&error) else {
+            return Err(error.into());
+        };
+
+        let step = advance_backpressure(&backpressure, self.backpressure_streak);
+        let mut queue = ctx.poll_status_queue.clone();
+        let outcome = apply_backpressure_step(step, &mut queue, |next_streak| Self {
+            offchain_order_id: self.offchain_order_id,
+            backpressure_streak: next_streak,
+        })
+        .await?;
+
+        match outcome {
+            BackpressureOutcome::DeadLettered => {
+                // Per the RAI-1494 plan's binding M2 decision: PollOrderStatus is
+                // a supervised worker, so propagating this as a bare `Err` would
+                // exhaust `RetryPolicy::retries(3)` and open the circuit breaker
+                // for a cause that is not a genuine bug -- reproducing RAI-1492's
+                // "hedging silently stops" outcome, just delayed by
+                // BACKPRESSURE_RESCHEDULE_LIMIT reschedules instead of happening
+                // immediately. Dead-letter instead: log loudly and ack `Done`.
+                let BackpressureStreak(streak) = self.backpressure_streak;
+                error!(
+                    target: "broker",
+                    offchain_order_id = %self.offchain_order_id,
+                    streak,
+                    limit = BACKPRESSURE_RESCHEDULE_LIMIT,
+                    "PollOrderStatus: broker rate-limiting exceeded the reschedule \
+                     budget; dead-lettering this poll instead of opening the \
+                     circuit breaker -- treat as a structurally-dead Alpaca \
+                     integration (suspended account, revoked key) needing manual \
+                     reconciliation"
+                );
+            }
+            BackpressureOutcome::Rescheduled {
+                next_streak: BackpressureStreak(streak),
+                visible,
+            } => {
+                if visible {
+                    error!(
+                        target: "broker",
+                        offchain_order_id = %self.offchain_order_id,
+                        streak,
+                        "PollOrderStatus: still rescheduling after sustained broker rate-limiting"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn dispatch_for_broker_state<E>(
@@ -971,7 +1061,13 @@ where
 {
     let mut queue = ctx.poll_status_queue.clone();
     queue
-        .push_with_delay(PollOrderStatus { offchain_order_id }, ctx.poll_interval)
+        .push_with_delay(
+            PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            },
+            ctx.poll_interval,
+        )
         .await?;
 
     Ok(())
@@ -1075,6 +1171,19 @@ const STRANDED_POLL_JOB_INTERVAL_MULTIPLIER: u32 = 5;
 /// `killed` counter (`status = 'Killed' AND attempts < max_attempts`) exists
 /// to surface the latter.
 ///
+/// The collapse also zeroes the loser's `backpressure_streak` (via
+/// `json_set`): [`has_exhausted_backpressure_marker`] reads any `Done` row
+/// with `backpressure_streak >= BACKPRESSURE_RESCHEDULE_LIMIT` as a
+/// deliberate dead-letter marker, and a collapsed `Pending` successor
+/// legitimately carrying the limit (pushed by a run one short of it) would
+/// otherwise become a permanent false marker -- no dead-letter ever happened,
+/// yet every future re-arm for the order would be silently blocked. Zeroing
+/// on collapse makes `Done` + streak-at-limit mean exactly one thing: a run
+/// that exhausted its budget and acked itself `Done` (apalis's `ack.sql`
+/// never rewrites the payload, so a genuine marker keeps its streak). Pinned
+/// by `collapsed_duplicate_carrying_the_streak_limit_does_not_become_a_dead_`
+/// `letter_marker`.
+///
 /// `json_extract` requires `CAST(job AS TEXT)` -- `Jobs.job` is a `BLOB`
 /// (apalis's `JsonCodec`), and a bare BLOB argument is not guaranteed to be
 /// read as JSON text on every SQLite build. `json_extract` also raises a hard
@@ -1093,7 +1202,8 @@ async fn reconcile_live_poll_jobs(
     let stale_after_secs = i64::try_from(stale_after.as_secs())?;
 
     let collapsed = sqlx_apalis::query(
-        "UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now') \
+        "UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now'), \
+             job = CAST(json_set(CAST(job AS TEXT), '$.backpressure_streak', 0) AS BLOB) \
          WHERE job_type = ? \
            AND json_valid(CAST(job AS TEXT)) \
            AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
@@ -1185,24 +1295,54 @@ async fn reconcile_and_check_live_poll_job(
 }
 
 /// Outcome of [`push_poll_job_if_absent`]: whether a new [`PollOrderStatus`]
-/// job was pushed, or one was already live and the push was skipped.
+/// job was pushed, one was already live, or a retained exhausted-budget marker
+/// made another push unsafe.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PollJobPushOutcome {
     AlreadyLive,
+    BackpressureExhausted,
     Pushed,
+}
+
+/// Returns whether this order has a retained, completed
+/// [`PollOrderStatus`] row whose durable backpressure budget is exhausted.
+///
+/// The finished-job cleanup deliberately retains these rows as dead-letter
+/// markers. Without consulting the marker here, the periodic submitted-order
+/// recovery would immediately replace the exhausted job with a fresh
+/// `backpressure_streak = 0` payload, making the finite budget unbounded.
+async fn has_exhausted_backpressure_marker(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    offchain_order_id: OffchainOrderId,
+) -> Result<bool, JobError> {
+    let exhausted: bool = sqlx_apalis::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM Jobs \
+         WHERE job_type = ? \
+           AND status = 'Done' \
+           AND json_valid(CAST(job AS TEXT)) \
+           AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+           AND json_extract(CAST(job AS TEXT), '$.backpressure_streak') >= ?)",
+    )
+    .bind(std::any::type_name::<PollOrderStatus>())
+    .bind(offchain_order_id.to_string())
+    .bind(i64::from(BACKPRESSURE_RESCHEDULE_LIMIT))
+    .fetch_one(apalis_pool)
+    .await?;
+
+    Ok(exhausted)
 }
 
 /// Pushes a [`PollOrderStatus`] job for `offchain_order_id` unless one is
 /// already live ([`reconcile_and_check_live_poll_job`], which may also
 /// collapse pre-existing duplicate `Pending` rows for this order to `Done`
-/// as a side effect first). Consolidates the check-then-push shape every
-/// `PollOrderStatus` push site shares so a future change to the push step (a
-/// metric, different logging, another guard condition) only needs to land
-/// once instead of being replicated by hand at every call site -- exactly
-/// the class of gap that originally left the fifth push site
-/// (`route_placement_outcome`) unguarded. The process-local lock covers both
-/// the check and push; without it, concurrent callers can all observe no live
-/// row before any caller's push commits and fork one chain each.
+/// as a side effect first) or a retained exhausted-budget marker proves that
+/// polling this order was deliberately dead-lettered. Consolidates every
+/// guard around the push so a future change only needs to land once instead
+/// of being replicated by hand at every call site -- exactly the class of gap
+/// that originally left the fifth push site (`route_placement_outcome`)
+/// unguarded. The process-local lock covers every guard and the push; without
+/// it, concurrent callers can all observe no live row before any caller's push
+/// commits and fork one chain each.
 pub(crate) async fn push_poll_job_if_absent(
     mut queue: PollOrderStatusJobQueue,
     offchain_order_id: OffchainOrderId,
@@ -1210,11 +1350,20 @@ pub(crate) async fn push_poll_job_if_absent(
 ) -> Result<PollJobPushOutcome, JobError> {
     let _push_guard = POLL_JOB_PUSH_LOCK.lock().await;
 
+    if has_exhausted_backpressure_marker(queue.pool(), offchain_order_id).await? {
+        return Ok(PollJobPushOutcome::BackpressureExhausted);
+    }
+
     if reconcile_and_check_live_poll_job(queue.pool(), offchain_order_id, poll_interval).await? {
         return Ok(PollJobPushOutcome::AlreadyLive);
     }
 
-    queue.push(PollOrderStatus { offchain_order_id }).await?;
+    queue
+        .push(PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .await?;
 
     Ok(PollJobPushOutcome::Pushed)
 }
@@ -1318,6 +1467,7 @@ async fn recover_submitted_offchain_orders_with_policy(
     let candidate_count = pending_poll.len();
     let mut pushed = 0usize;
     let mut skipped = 0usize;
+    let mut dead_lettered = 0usize;
     let mut failed = 0usize;
 
     for offchain_order_id in pending_poll {
@@ -1347,6 +1497,9 @@ async fn recover_submitted_offchain_orders_with_policy(
             PollJobPushOutcome::AlreadyLive => {
                 skipped += 1;
             }
+            PollJobPushOutcome::BackpressureExhausted => {
+                dead_lettered += 1;
+            }
             PollJobPushOutcome::Pushed => {
                 pushed += 1;
 
@@ -1363,6 +1516,7 @@ async fn recover_submitted_offchain_orders_with_policy(
         candidate_count,
         pushed,
         skipped,
+        dead_lettered,
         failed,
         "Periodic submitted-order poll recovery swept offchain orders awaiting broker fill"
     );
@@ -1375,19 +1529,28 @@ mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use apalis::prelude::Monitor;
+    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
     use chrono::Utc;
     use futures_util::future::join_all;
+    use httpmock::prelude::*;
     use sqlx_apalis::ConnectOptions;
     use tokio::sync::Barrier;
+    use uuid::uuid;
 
     use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        ClientOrderId, Direction, ExecutionError, FractionalShares, MockExecutor, Positive, Symbol,
+        AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, ClientOrderId,
+        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, FractionalShares,
+        MockExecutor, Positive, Symbol, TimeInForce,
     };
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::conductor::job::{
+        FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, build_supervised_worker, build_worker_inner,
+    };
     use crate::offchain::order::{
         NoFillOutcome, OffchainOrderCommand, TerminalPositionFinalization, noop_order_placer,
         terminal_position_finalization,
@@ -1439,6 +1602,47 @@ mod tests {
         }
     }
 
+    const TEST_ALPACA_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
+    fn mock_alpaca_account(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        })
+    }
+
+    /// Builds real `PollOrderStatusCtx<AlpacaBrokerApi>` test infra backed by
+    /// `httpmock` rather than `MockExecutor`, so a 429's `Retry-After` header
+    /// and status code flow through the real `AlpacaBrokerApiClient` --
+    /// `MockExecutor`'s `Error` type (`ExecutionError`) cannot carry a
+    /// classified `AlpacaBrokerApiError`.
+    async fn build_test_infra_alpaca(server: &MockServer) -> TestInfra<AlpacaBrokerApi> {
+        let _account_mock = mock_alpaca_account(server);
+
+        let auth = AlpacaBrokerApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: TEST_ALPACA_ACCOUNT_ID,
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        };
+
+        let executor = AlpacaBrokerApi::try_from_ctx(auth)
+            .await
+            .expect("failed to build test AlpacaBrokerApi executor");
+
+        build_test_infra(executor).await
+    }
+
     async fn submit_offchain_order<E: Executor + Clone + Send + Sync + 'static>(
         infra: &TestInfra<E>,
         symbol: &Symbol,
@@ -1464,6 +1668,35 @@ mod tests {
         shares: Positive<FractionalShares>,
         direction: Direction,
         order_executor: SupportedExecutor,
+    ) -> OffchainOrderId {
+        submit_offchain_order_with_executor_and_accepted_id(
+            infra,
+            symbol,
+            tokenized_symbol,
+            shares,
+            direction,
+            order_executor,
+            ExecutorOrderId::new("test-accept"),
+        )
+        .await
+    }
+
+    /// Like [`submit_offchain_order_with_executor`], but lets the caller pick
+    /// the broker order id `MarkAccepted` records. Needed for a real
+    /// [`st0x_execution::AlpacaBrokerApi`] executor, whose `parse_order_id`
+    /// requires a valid UUID string (unlike `MockExecutor`, which accepts any
+    /// string) -- the plain `"test-accept"` placeholder every other test uses
+    /// would fail to parse before `get_order_status` is ever called.
+    async fn submit_offchain_order_with_executor_and_accepted_id<
+        E: Executor + Clone + Send + Sync + 'static,
+    >(
+        infra: &TestInfra<E>,
+        symbol: &Symbol,
+        tokenized_symbol: &str,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        order_executor: SupportedExecutor,
+        accepted_executor_order_id: ExecutorOrderId,
     ) -> OffchainOrderId {
         let onchain = OnchainTradeBuilder::new()
             .with_symbol(tokenized_symbol)
@@ -1529,7 +1762,7 @@ mod tests {
             .send(
                 &offchain_order_id,
                 OffchainOrderCommand::MarkAccepted {
-                    executor_order_id: ExecutorOrderId::new("test-accept"),
+                    executor_order_id: accepted_executor_order_id,
                     placed_shares: shares,
                     submitted_at: Utc::now(),
                     market_session: st0x_execution::MarketSession::Regular,
@@ -1607,6 +1840,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -1647,6 +1881,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -1746,6 +1981,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -1793,6 +2029,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -1834,6 +2071,7 @@ mod tests {
 
         let error = PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -1892,6 +2130,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -1942,6 +2181,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2010,6 +2250,7 @@ mod tests {
         );
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2053,6 +2294,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2094,6 +2336,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2153,6 +2396,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2193,6 +2437,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2222,6 +2467,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2289,6 +2535,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2351,6 +2598,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2407,6 +2655,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2538,6 +2787,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2574,6 +2824,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2638,6 +2889,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2686,6 +2938,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2732,6 +2985,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -2875,6 +3129,7 @@ mod tests {
 
         let first_result = PollOrderStatus {
             offchain_order_id: failing_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await;
@@ -2888,6 +3143,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: succeeding_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -3250,6 +3506,7 @@ mod tests {
 
         PollOrderStatus {
             offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
         }
         .perform(&infra.ctx)
         .await
@@ -3278,7 +3535,10 @@ mod tests {
         let offchain_order_id = OffchainOrderId::new();
         let mut queue = infra.ctx.poll_status_queue.clone();
         queue
-            .push(PollOrderStatus { offchain_order_id })
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await
             .unwrap();
 
@@ -3313,7 +3573,10 @@ mod tests {
         let offchain_order_id = OffchainOrderId::new();
         let mut queue = infra.ctx.poll_status_queue.clone();
         queue
-            .push(PollOrderStatus { offchain_order_id })
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await
             .unwrap();
 
@@ -3371,8 +3634,11 @@ mod tests {
         lock_at: Option<i64>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
-            .expect("serialize PollOrderStatus payload");
+        let payload = serde_json::to_vec(&PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .expect("serialize PollOrderStatus payload");
         sqlx_apalis::query(
             "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at, lock_at) \
              VALUES (?, ?, ?, ?, ?, 25, strftime('%s', 'now'), ?)",
@@ -3398,8 +3664,11 @@ mod tests {
         run_at: i64,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
-            .expect("serialize PollOrderStatus payload");
+        let payload = serde_json::to_vec(&PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .expect("serialize PollOrderStatus payload");
         sqlx_apalis::query(
             "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at) \
              VALUES (?, ?, ?, 'Pending', 0, 25, ?)",
@@ -3429,8 +3698,11 @@ mod tests {
         done_at: i64,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
-            .expect("serialize PollOrderStatus payload");
+        let payload = serde_json::to_vec(&PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .expect("serialize PollOrderStatus payload");
         sqlx_apalis::query(
             "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at, done_at) \
              VALUES (?, ?, ?, 'Failed', 1, 25, strftime('%s', 'now'), ?)",
@@ -3457,8 +3729,11 @@ mod tests {
         priority: i64,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id })
-            .expect("serialize PollOrderStatus payload");
+        let payload = serde_json::to_vec(&PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .expect("serialize PollOrderStatus payload");
         sqlx_apalis::query(
             "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at, priority) \
              VALUES (?, ?, ?, 'Pending', 0, 25, ?, ?)",
@@ -3627,7 +3902,10 @@ mod tests {
         // point (apalis's re-dispatch contract), not because of it.
         let mut queue = infra.ctx.poll_status_queue.clone();
         queue
-            .push(PollOrderStatus { offchain_order_id })
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await
             .unwrap();
         sqlx_apalis::query("UPDATE Jobs SET status = 'Failed', attempts = 1 WHERE job_type = ?")
@@ -3674,7 +3952,10 @@ mod tests {
         let offchain_order_id = OffchainOrderId::new();
         let mut queue = infra.ctx.poll_status_queue.clone();
         queue
-            .push(PollOrderStatus { offchain_order_id })
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await
             .unwrap();
 
@@ -3856,7 +4137,11 @@ mod tests {
         // `reschedule_self`'s legitimate successor: not yet due, pushed one
         // poll interval in the future -- committed under the lock the
         // blocked collapse above is waiting to acquire.
-        let successor_payload = serde_json::to_vec(&PollOrderStatus { offchain_order_id }).unwrap();
+        let successor_payload = serde_json::to_vec(&PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .unwrap();
         sqlx_apalis::query(
             "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at) \
              VALUES (?, ?, ?, 'Pending', 0, 25, ?)",
@@ -4145,6 +4430,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_poll_job_if_absent_preserves_an_exhausted_backpressure_dead_letter() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let mut queue = infra.ctx.poll_status_queue.clone();
+        queue
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(poll_order_status_job_type())
+            .execute(&infra.apalis_pool)
+            .await
+            .unwrap();
+
+        let outcome = push_poll_job_if_absent(queue, offchain_order_id, TEST_POLL_INTERVAL)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PollJobPushOutcome::BackpressureExhausted);
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            1,
+            "recovery must retain the dead-letter marker without pushing a zero-streak successor"
+        );
+    }
+
+    /// A duplicate `Pending` successor legitimately carrying
+    /// `BACKPRESSURE_RESCHEDULE_LIMIT` (pushed by a run one short of the
+    /// limit) that loses the dedup collapse must not read back as a
+    /// dead-letter marker: the collapse zeroes the loser's
+    /// `backpressure_streak`, so a later re-arm for the order still pushes
+    /// instead of being silently blocked forever by a dead-letter that never
+    /// happened.
+    #[tokio::test]
+    async fn collapsed_duplicate_carrying_the_streak_limit_does_not_become_a_dead_letter_marker() {
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let offchain_order_id = OffchainOrderId::new();
+        let now = Utc::now().timestamp();
+
+        let survivor_id =
+            seed_pending_poll_job_row_at(&infra.apalis_pool, offchain_order_id, now - 10).await;
+
+        let loser_id = uuid::Uuid::new_v4().to_string();
+        let loser_payload = serde_json::to_vec(&PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        })
+        .unwrap();
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (id, job_type, job, status, attempts, max_attempts, run_at) \
+             VALUES (?, ?, ?, 'Pending', 0, 25, ?)",
+        )
+        .bind(&loser_id)
+        .bind(poll_order_status_job_type())
+        .bind(loser_payload)
+        .bind(now + 60)
+        .execute(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        let outcome = push_poll_job_if_absent(
+            infra.ctx.poll_status_queue.clone(),
+            offchain_order_id,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PollJobPushOutcome::AlreadyLive,
+            "the due survivor must keep the chain live while the duplicate collapses"
+        );
+
+        let loser_streak: i64 = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.backpressure_streak') \
+             FROM Jobs WHERE id = ?",
+        )
+        .bind(&loser_id)
+        .fetch_one(&infra.apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            loser_streak, 0,
+            "the collapse must zero the loser's streak so it cannot read as a dead-letter"
+        );
+
+        // Simulate the surviving chain finishing normally, then re-arm: the
+        // collapsed duplicate must not block the push as a false marker.
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(&survivor_id)
+            .execute(&infra.apalis_pool)
+            .await
+            .unwrap();
+
+        let outcome = push_poll_job_if_absent(
+            infra.ctx.poll_status_queue.clone(),
+            offchain_order_id,
+            TEST_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PollJobPushOutcome::Pushed,
+            "a collapsed duplicate must not mint a permanent BackpressureExhausted marker"
+        );
+    }
+
+    #[tokio::test]
     async fn recover_submitted_offchain_orders_is_a_noop_when_a_live_poll_job_already_exists() {
         let infra = build_test_infra(MockExecutor::new()).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -4188,6 +4585,7 @@ mod tests {
         queue
             .push(PollOrderStatus {
                 offchain_order_id: order_id,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -4387,5 +4785,537 @@ mod tests {
             "an oversized order_polling_interval must fail fast with a typed overflow error \
              rather than panicking inside Duration's checked_mul"
         );
+    }
+
+    // RAI-1494: a 429 from `get_order_status` reschedules instead of
+    // consuming the terminal retry budget. `MockExecutor`'s `Error`
+    // (`ExecutionError`) cannot carry a classified `AlpacaBrokerApiError`, so
+    // these tests drive a real `AlpacaBrokerApi` executor against
+    // `httpmock`.
+
+    fn current_unix_time_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .try_into()
+            .unwrap()
+    }
+
+    async fn successor_backpressure_streak(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        let streaks: Vec<i64> = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.backpressure_streak') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(poll_order_status_job_type())
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            streaks.len(),
+            1,
+            "a 429 must enqueue exactly one PollOrderStatus successor"
+        );
+        streaks.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn poll_with_429_broker_response_reschedules_with_the_classified_delay_and_does_not_fail()
+    {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111111");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "5")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let before_now = current_unix_time_secs();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        mock.assert();
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            1,
+            "a 429 must reschedule exactly one successor poll job rather than fail the job"
+        );
+        assert_eq!(
+            successor_backpressure_streak(&infra.apalis_pool).await,
+            1,
+            "the pushed successor must carry an incremented backpressure streak"
+        );
+
+        let scheduled_at = min_run_at(&infra.apalis_pool, poll_order_status_job_type()).await;
+        assert!(
+            scheduled_at >= before_now + 5,
+            "the reschedule must honour the broker's Retry-After (5s); got {scheduled_at}s, \
+             before_now={before_now}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_429_and_no_retry_after_uses_the_escalating_fallback() {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111112");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let before_now = current_unix_time_secs();
+
+        // Start at streak 3 so the escalating fallback (base 1s, doubling)
+        // produces a delay (8s) clearly distinct from the flooring/ceiling
+        // boundary values the other tests pin.
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak(3),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        mock.assert();
+        assert_eq!(
+            successor_backpressure_streak(&infra.apalis_pool).await,
+            4,
+            "the pushed successor must carry streak 3 + 1"
+        );
+
+        let scheduled_at = min_run_at(&infra.apalis_pool, poll_order_status_job_type()).await;
+        assert!(
+            scheduled_at >= before_now + 8,
+            "with no Retry-After header, streak 3 must escalate to an 8s fallback delay \
+             (1s * 2^3); got {scheduled_at}s, before_now={before_now}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_429_retry_after_zero_still_floors_the_delay() {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111113");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "0")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let before_now = current_unix_time_secs();
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        mock.assert();
+
+        let scheduled_at = min_run_at(&infra.apalis_pool, poll_order_status_job_type()).await;
+        assert!(
+            scheduled_at > before_now,
+            "a Retry-After: 0 must be floored to MIN_BACKPRESSURE_DELAY (1s), not honoured \
+             literally as an immediate re-dispatch; got {scheduled_at}s, before_now={before_now}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_429_reschedule_does_not_fork_a_duplicate_poll_chain() {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111114");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "30")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        // Simulates an external push site (e.g. the periodic recovery sweep)
+        // landing at the same moment as the backpressure reschedule's own
+        // pushed successor.
+        let outcome = push_poll_job_if_absent(
+            infra.ctx.poll_status_queue.clone(),
+            order_id,
+            infra.ctx.poll_interval,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, PollJobPushOutcome::AlreadyLive),
+            "an external push racing the backpressure reschedule's own future-run_at successor \
+             must see it as already live, not push a second chain"
+        );
+        assert_eq!(
+            live_poll_job_ids(&infra.apalis_pool, order_id).await.len(),
+            1,
+            "exactly one live PollOrderStatus row must exist for the order after the race"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_429_reschedule_push_failure_propagates_err_not_ok() {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111115");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "1")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        // Force the reschedule's own push to fail: the projection/aggregate
+        // pool is untouched, so only the queue write fails.
+        infra.ctx.poll_status_queue.pool().close().await;
+
+        let error = PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, JobError::Enqueue(_)),
+            "a reschedule push that itself fails must propagate as Err, never be swallowed \
+             into Ok(()); got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_429_past_the_reschedule_limit_dead_letters_without_opening_the_circuit_breaker()
+     {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111116");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "1")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        // Per the RAI-1494 plan's binding M2 decision, PollOrderStatus is one
+        // of the five supervised jobs whose exhaustion must dead-letter (loud
+        // log + `Ok(())`) rather than propagate `Err` -- a bare `Err` here
+        // would exhaust `RetryPolicy::retries(3)` and open the circuit
+        // breaker for a cause that is not a genuine bug, reproducing
+        // RAI-1492's outcome just delayed by the reschedule budget.
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        mock.assert();
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
+            0,
+            "exhaustion must dead-letter cleanly: no successor is pushed and the current row \
+             simply acks Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_order_status_payload_without_backpressure_streak_deserializes_to_zero() {
+        let offchain_order_id = OffchainOrderId::new();
+        let old_payload = serde_json::json!({
+            "offchain_order_id": offchain_order_id,
+        });
+
+        let job: PollOrderStatus =
+            serde_json::from_value(old_payload).expect("pre-field payload must still deserialize");
+
+        assert_eq!(job.offchain_order_id, offchain_order_id);
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
+    #[test]
+    fn poll_order_status_new_payload_deserializes_under_a_struct_lacking_the_field() {
+        #[derive(serde::Deserialize)]
+        struct PreRai1494PollOrderStatus {
+            offchain_order_id: OffchainOrderId,
+        }
+
+        let offchain_order_id = OffchainOrderId::new();
+        let new_payload = serde_json::to_value(PollOrderStatus {
+            offchain_order_id,
+            backpressure_streak: BackpressureStreak(3),
+        })
+        .unwrap();
+
+        let job: PreRai1494PollOrderStatus = serde_json::from_value(new_payload)
+            .expect("a rolled-back binary must ignore the new backpressure_streak field");
+
+        assert_eq!(job.offchain_order_id, offchain_order_id);
+    }
+
+    #[tokio::test]
+    async fn poll_with_repeated_429_never_reaches_terminal_failure_end_to_end() {
+        let server = MockServer::start();
+        let infra = build_test_infra_alpaca(&server).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let accepted_order_id = uuid!("11111111-1111-1111-1111-111111111117");
+        let order_id = submit_offchain_order_with_executor_and_accepted_id(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutorOrderId::new(&accepted_order_id),
+        )
+        .await;
+
+        let status_path = format!(
+            "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{accepted_order_id}"
+        );
+
+        let mut rate_limited_mock = server.mock(|when, then| {
+            when.method(GET).path(status_path.clone());
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "1")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = infra;
+
+        let mut push_queue = ctx.poll_status_queue.clone();
+        push_queue
+            .push(PollOrderStatus {
+                offchain_order_id: order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        let ctx = Arc::new(ctx);
+        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let fail_stop = CircuitBreakerConfig::default()
+            .with_failure_threshold(1)
+            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+
+        let monitor_handle = tokio::spawn({
+            let failure_notify = failure_notify.clone();
+            let ctx = ctx.clone();
+            let queue = ctx.poll_status_queue.clone();
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<PollOrderStatusCtx<AlpacaBrokerApi>, PollOrderStatus>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        fail_stop.clone(),
+                        failure_notify.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+
+            async move {
+                let _ = monitor.run().await;
+            }
+        });
+
+        // N > 3 (the old, no-longer-used retries(3) bound this reschedule
+        // mechanism replaces) rate-limited attempts before the broker
+        // reports a terminal fill.
+        let rate_limit_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while rate_limited_mock.calls() < 4 {
+            assert!(
+                tokio::time::Instant::now() < rate_limit_deadline,
+                "expected at least 4 rate-limited attempts within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        rate_limited_mock.delete();
+        server.mock(|when, then| {
+            when.method(GET).path(status_path.clone());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": accepted_order_id.to_string(),
+                    "symbol": "AAPL",
+                    "qty": "2",
+                    "side": "sell",
+                    "status": "filled",
+                    "filled_avg_price": "100.00",
+                    "updated_at": "2025-01-06T14:32:05.000000Z",
+                    "filled_at": "2025-01-06T14:32:01.111111Z"
+                }));
+        });
+
+        let reconcile_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if count_jobs(&apalis_pool, reconcile_order_fill_job_type()).await >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < reconcile_deadline,
+                "job should eventually reach terminal dispatch once backpressure clears; \
+                 job rows: {:?}",
+                sqlx_apalis::query_as::<_, (String, String, i64, i64)>(
+                    "SELECT id, status, attempts, max_attempts FROM Jobs WHERE job_type = ?"
+                )
+                .bind(poll_order_status_job_type())
+                .fetch_all(&apalis_pool)
+                .await
+                .unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(50), failure_notify.notified()).await,
+                Ok(())
+            ),
+            "repeated 429s must never open the circuit breaker or signal a terminal job failure"
+        );
+
+        let terminally_failed: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status IN ('Failed', 'Killed')",
+        )
+        .bind(poll_order_status_job_type())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            terminally_failed, 0,
+            "no PollOrderStatus row must ever land Failed/Killed behind a latched circuit \
+             breaker while backpressure was in play"
+        );
+
+        monitor_handle.abort();
     }
 }

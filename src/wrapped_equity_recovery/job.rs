@@ -43,7 +43,7 @@ use super::aggregate::{
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
@@ -151,6 +151,31 @@ pub(crate) enum WrappedEquityRecoveryJobError {
 pub(crate) struct WrappedEquityRecoveryJob {
     pub(crate) symbol: Symbol,
     pub(crate) recovery_id: WrappedEquityRecoveryId,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// NOT YET wired to a reschedule: `resume_mint`/`resume_redemption`
+    /// failures are caught inside the aggregate's command handler and
+    /// recorded as a terminal `RecoveryFailed` event with only a
+    /// Display-formatted `String` reason (see `resume_mint_or_fail` /
+    /// `resume_redemption_or_fail` in `aggregate.rs`) -- `ctx.store.send()`
+    /// therefore returns `Ok(())` regardless, so `perform()` never observes
+    /// an `Err` to classify for this failure class, and `find_backpressure`
+    /// cannot walk to a real Alpaca error type from any constructible
+    /// `WrappedEquityRecoveryJobError` today. This is pre-existing behavior,
+    /// not a regression: a 429 here has always immediately terminalized the
+    /// recovery with zero retries. Closing this gap needs the aggregate's
+    /// error type to preserve the classified error (not just its Display
+    /// string) and `transition()` to return `Err` instead of
+    /// `Ok(RecoveryFailed)` on a classified 429, plus threading this streak
+    /// into the `Command` (the aggregate has no visibility into the job's own
+    /// payload) -- a redesign of the aggregate's error contract, out of scope
+    /// for this task's per-job wiring. Field added now so the payload schema
+    /// is ready when that follow-up lands.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
@@ -571,6 +596,17 @@ mod tests {
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
+    #[test]
+    fn wrapped_equity_recovery_job_payload_without_backpressure_streak_deserializes_to_zero() {
+        let payload = serde_json::json!({
+            "symbol": Symbol::new("AAPL").unwrap(),
+            "recovery_id": WrappedEquityRecoveryId(Uuid::new_v4()),
+        });
+
+        let job: WrappedEquityRecoveryJob = serde_json::from_value(payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
     #[tokio::test]
     async fn guard_contention_reschedules_without_dropping_the_recovery() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -627,6 +663,7 @@ mod tests {
         let job = WrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: WrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx).await.unwrap();
@@ -658,6 +695,7 @@ mod tests {
             .push(WrappedEquityRecoveryJob {
                 symbol: Symbol::new("GOOGL").unwrap(),
                 recovery_id: WrappedEquityRecoveryId(Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -801,6 +839,7 @@ mod tests {
         let job = WrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)

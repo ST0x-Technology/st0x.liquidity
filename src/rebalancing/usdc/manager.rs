@@ -641,6 +641,20 @@ impl<
         {
             Ok(order) => order,
             Err(error) => {
+                // Conversion placement fails fast on ANY error (RAI-1494:
+                // deliberately NOT rescheduled, unlike the deposit/withdrawal
+                // polls) -- retrying a placement risks submitting the order
+                // twice against real money. A classified 429 must not reach
+                // the job's backpressure classifier though:
+                // `find_backpressure` walks the `.source()` chain, so
+                // returning `AlpacaBrokerApi` here would let it downcast into
+                // the underlying 429 and mistakenly reschedule an
+                // already-terminalized aggregate. Return the
+                // non-classifiable `ConversionPlacementFailed` only for that
+                // case; every other placement failure (e.g. a terminally
+                // rejected/canceled/expired order) keeps surfacing the
+                // original `AlpacaBrokerApi` variant so its specific reason
+                // is preserved for callers/tests that match on it.
                 warn!(target: "rebalance", "USD to USDC conversion failed: {error}");
                 self.cqrs
                     .send(
@@ -650,6 +664,9 @@ impl<
                         },
                     )
                     .await?;
+                if error.backpressure().is_some() {
+                    return Err(UsdcTransferError::ConversionPlacementFailed { id: id.clone() });
+                }
                 return Err(UsdcTransferError::AlpacaBrokerApi(error));
             }
         };
@@ -726,6 +743,11 @@ impl<
         {
             Ok(order) => order,
             Err(error) => {
+                // Conversion placement fails fast on ANY error (RAI-1494):
+                // same rationale as `execute_usd_to_usdc_conversion` above --
+                // only a classified 429 returns the non-classifiable
+                // `ConversionPlacementFailed`; every other placement failure
+                // keeps surfacing the original `AlpacaBrokerApi` variant.
                 warn!(target: "rebalance", "USDC to USD conversion failed: {error}");
                 self.cqrs
                     .send(
@@ -735,6 +757,9 @@ impl<
                         },
                     )
                     .await?;
+                if error.backpressure().is_some() {
+                    return Err(UsdcTransferError::ConversionPlacementFailed { id: id.clone() });
+                }
                 return Err(UsdcTransferError::AlpacaBrokerApi(error));
             }
         };
@@ -800,6 +825,11 @@ impl<
                 direction: AlpacaToBase,
                 ..
             }) => {
+                // Conversion placement fails fast unconditionally (RAI-1494:
+                // see `execute_usd_to_usdc_conversion`), so the aggregate
+                // never survives an error in `Converting` -- reaching this
+                // arm means a crash occurred between `InitiateConversion` and
+                // the terminal Fail/Confirm. Fails for manual reconciliation.
                 self.cqrs
                     .send(
                         id,
@@ -3973,6 +4003,25 @@ impl<
         let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&send_tx).await {
             Ok(transfer) => transfer,
             Err(error) => {
+                // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
+                // rate-limit (429) is not a determinate "deposit failed"
+                // signal, only a transient throttle on the polling request
+                // itself. Leave the aggregate in DepositInitiated so the
+                // job's backpressure reschedule can re-poll the same send_tx
+                // once the delay elapses, mirroring
+                // `poll_and_confirm_withdrawal`'s conservative fail-closed
+                // pattern for indeterminate poll errors.
+                if error.backpressure().is_some() {
+                    warn!(
+                        target: "rebalance",
+                        %error,
+                        "Alpaca deposit polling hit broker rate-limiting; keeping \
+                         DepositInitiated state for delayed reschedule (will re-poll \
+                         the same send_tx)"
+                    );
+                    return Err(UsdcTransferError::AlpacaWallet(error));
+                }
+
                 warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
                 self.cqrs
                     .send(
@@ -5956,6 +6005,172 @@ mod tests {
         );
     }
 
+    /// RAI-1494 (quarantined): a classified broker rate-limit (429) on the
+    /// conversion placement fails FAST, exactly like any other placement
+    /// error -- `FailConversion` fires and the aggregate terminalizes to
+    /// `ConversionFailed`, never staying in `Converting`. Retrying a
+    /// conversion placement risks submitting the order twice against real
+    /// money, so this leg intentionally does not participate in the
+    /// reschedule/backpressure machinery the deposit and withdrawal legs use.
+    /// Sibling of `test_usd_to_usdc_conversion_emits_fail_conversion_on_api_error`
+    /// (a non-429 API error), which already asserted this same fail-fast
+    /// shape -- this pins that a 429 gets no special treatment either.
+    #[tokio::test]
+    async fn test_usd_to_usdc_conversion_429_fails_fast_to_conversion_failed() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "5")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1000");
+
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::ConversionPlacementFailed { id: errored }
+                    if *errored == id
+            ),
+            "expected ConversionPlacementFailed (not a source-preserving \
+             AlpacaBrokerApi wrapper), got: {error:?}"
+        );
+
+        // CRITICAL contract: the job's backpressure classifier must not be
+        // able to downcast into this error, or an already-terminalized
+        // ConversionFailed aggregate would get rescheduled.
+        assert_eq!(
+            crate::conductor::job::find_backpressure(&error),
+            None,
+            "a conversion placement failure must never classify as \
+             backpressure at the job level, even when caused by a 429"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionFailed { .. }),
+            "a 429 on conversion placement must fail fast to ConversionFailed \
+             (not stay Converting); got: {state:?}"
+        );
+        assert_eq!(
+            order_mock.calls(),
+            1,
+            "the order must be placed exactly once"
+        );
+    }
+
+    /// RAI-1494 (quarantined): proves the fail-fast conversion path is safe
+    /// even if something external re-drives the transfer after a placement
+    /// 429 -- `resume_alpaca_to_base` must see the aggregate already
+    /// terminalized (`ConversionFailed`) and refuse to redrive rather than
+    /// re-placing the order, since a placement 429 no longer leaves the
+    /// aggregate in a resumable `Converting` state.
+    #[tokio::test]
+    async fn test_usd_to_usdc_conversion_429_resume_does_not_reattempt_placement() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "5")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1000");
+
+        manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap_err();
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionFailed { .. }),
+            "expected ConversionFailed after the 429, got {state:?}"
+        );
+
+        let resume_error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &resume_error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: errored }
+                    if *errored == id
+            ),
+            "resuming a fail-fast-terminated conversion must surface \
+             PreviouslyFailedAggregate, not redrive placement; got: {resume_error:?}"
+        );
+        assert_eq!(
+            order_mock.calls(),
+            1,
+            "resume must NOT place a second conversion order"
+        );
+    }
+
     /// AlpacaToBase workflow MUST call USD-to-USDC conversion before
     /// withdrawal.
     ///
@@ -6615,6 +6830,170 @@ mod tests {
             proceeds,
             usdc("998.3"),
             "Should return actual USD proceeds, not the USDC sold amount"
+        );
+    }
+
+    /// RAI-1494 (quarantined): a classified broker rate-limit (429) on the
+    /// post-deposit USDC->USD conversion placement fails FAST, same rationale
+    /// and shape as
+    /// `test_usd_to_usdc_conversion_429_fails_fast_to_conversion_failed`.
+    #[tokio::test]
+    async fn usdc_to_usd_conversion_429_fails_fast_to_conversion_failed() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let rebalance_amount = usdc("1000");
+        let deposited_amount = usdc("1000");
+
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, rebalance_amount, deposited_amount)
+            .await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "5")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let error = manager
+            .execute_usdc_to_usd_conversion(&id, deposited_amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::ConversionPlacementFailed { id: errored }
+                    if *errored == id
+            ),
+            "expected ConversionPlacementFailed (not a source-preserving \
+             AlpacaBrokerApi wrapper), got: {error:?}"
+        );
+
+        // CRITICAL contract: the job's backpressure classifier must not be
+        // able to downcast into this error.
+        assert_eq!(
+            crate::conductor::job::find_backpressure(&error),
+            None,
+            "a conversion placement failure must never classify as \
+             backpressure at the job level, even when caused by a 429"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionFailed { .. }),
+            "a 429 on conversion placement must fail fast to ConversionFailed \
+             (not stay Converting); got: {state:?}"
+        );
+        assert_eq!(
+            order_mock.calls(),
+            1,
+            "the order must be placed exactly once"
+        );
+    }
+
+    /// RAI-1494 (quarantined): mirrors
+    /// `test_usd_to_usdc_conversion_429_resume_does_not_reattempt_placement`
+    /// for the BaseToAlpaca post-deposit leg -- `resume_base_to_alpaca` must
+    /// see the aggregate already terminalized (`ConversionFailed`) and refuse
+    /// to redrive rather than re-placing the order.
+    #[tokio::test]
+    async fn usdc_to_usd_conversion_429_resume_does_not_reattempt_placement() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let rebalance_amount = usdc("1000");
+        let deposited_amount = usdc("1000");
+
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, rebalance_amount, deposited_amount)
+            .await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "5")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        manager
+            .execute_usdc_to_usd_conversion(&id, deposited_amount)
+            .await
+            .unwrap_err();
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionFailed { .. }),
+            "expected ConversionFailed after the 429, got {state:?}"
+        );
+
+        let resume_error = manager
+            .resume_base_to_alpaca(&id, rebalance_amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &resume_error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: errored }
+                    if *errored == id
+            ),
+            "resuming a fail-fast-terminated conversion must surface \
+             PreviouslyFailedAggregate, not redrive placement; got: {resume_error:?}"
+        );
+        assert_eq!(
+            order_mock.calls(),
+            1,
+            "resume must NOT place a second conversion order"
         );
     }
 
@@ -8096,6 +8475,66 @@ mod tests {
         assert!(
             matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
             "Expected ConversionComplete after resume from DepositInitiated, got: {final_state:?}"
+        );
+    }
+
+    /// RAI-1494: a classified broker rate-limit (429) on the deposit poll
+    /// must NOT emit `FailDeposit` -- the aggregate stays in
+    /// `DepositInitiated` so the job's backpressure reschedule can re-poll
+    /// the same `send_tx`. Sibling of
+    /// `resume_base_to_alpaca_from_deposit_initiated_polls_and_converts`
+    /// (the happy path), with the transfers-poll mocked to 429 instead of a
+    /// successful `COMPLETE` transfer.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_deposit_initiated_429_keeps_deposit_initiated_state() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("99.99");
+        let (_burn_tx, mint_tx) =
+            advance_to_bridged_base_to_alpaca(&cqrs, &id, amount, amount_received).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(mint_tx),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "5")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AlpacaWallet(AlpacaWalletError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    ..
+                })
+            ),
+            "expected a classified 429 to surface unchanged, got: {error:?}"
+        );
+
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::DepositInitiated { .. }),
+            "a classified 429 must leave the aggregate in DepositInitiated (not \
+             DepositFailed) so a backpressure reschedule can re-poll the same send_tx; \
+             got: {final_state:?}"
         );
     }
 

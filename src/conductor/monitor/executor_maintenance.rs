@@ -12,6 +12,15 @@
 //! aborted on shutdown but never restarted: if token refresh died, the
 //! executor silently stopped working. Wrapping the tick in a supervised
 //! task closes that gap.
+//!
+//! RAI-1494: a broker rate-limit (429) error from [`Executor::maintenance_tick`]
+//! needs no special handling here. This is a [`SupervisedTask`], not an apalis
+//! job or a synchronous call site -- every tick error, backpressure included,
+//! is already logged and swallowed unconditionally by the `loop` above, with
+//! no terminal retry budget to burn and no circuit breaker layer to
+//! interact with. A 429 today behaves exactly like the reschedule mechanism
+//! RAI-1494 adds elsewhere: wait, log, try again next tick. Pinned by
+//! `keeps_ticking_after_a_429_maintenance_tick_error` below.
 
 use std::time::Duration;
 use task_supervisor::{SupervisedTask, TaskResult};
@@ -60,8 +69,8 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
     use st0x_execution::{
-        CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, MarketOrder,
-        OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor,
+        AlpacaBrokerApiError, CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder,
+        MarketOrder, OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor,
     };
 
     use super::*;
@@ -188,6 +197,137 @@ mod tests {
                 .await
                 .unwrap_or_else(|| panic!("maintenance failed to tick on iteration {tick}"));
         }
+
+        handle.abort();
+    }
+
+    /// Executor whose `Error` is `AlpacaBrokerApiError` so its
+    /// `maintenance_tick` can return a genuine broker rate-limit (429)
+    /// error, letting `keeps_ticking_after_a_429_maintenance_tick_error`
+    /// pin the RAI-1494 "no special handling needed here" claim against a
+    /// real classified error type rather than only a generic one.
+    #[derive(Clone)]
+    struct NotifyingAlpacaExecutor {
+        tx: UnboundedSender<()>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct NotifyingAlpacaExecutorCtx;
+
+    #[async_trait]
+    impl TryIntoExecutor for NotifyingAlpacaExecutorCtx {
+        type Executor = NotifyingAlpacaExecutor;
+        async fn try_into_executor(
+            self,
+        ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
+            unreachable!("test executor is constructed directly")
+        }
+    }
+
+    #[async_trait]
+    impl Executor for NotifyingAlpacaExecutor {
+        type Error = AlpacaBrokerApiError;
+        type OrderId = String;
+        type Ctx = NotifyingAlpacaExecutorCtx;
+
+        async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+            unreachable!("test executor is constructed directly")
+        }
+
+        async fn is_market_open(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        async fn get_order_status(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<OrderState, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        fn to_supported_executor(&self) -> SupportedExecutor {
+            SupportedExecutor::AlpacaBrokerApi
+        }
+
+        fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+            Ok(order_id_str.to_string())
+        }
+
+        async fn maintenance_tick(&self) -> Result<(), Self::Error> {
+            self.tx.send(()).unwrap();
+
+            Err(AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: None,
+                message: "rate limited".to_string(),
+                retry_after: Some(Duration::from_millis(1)),
+            })
+        }
+
+        async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+            Ok(InventoryResult::Unimplemented)
+        }
+
+        async fn preflight_counter_trade(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<CounterTradePreflight, Self::Error> {
+            Ok(CounterTradePreflight::Allowed { reservation: None })
+        }
+
+        async fn preflight_counter_trade_at_price(
+            &self,
+            _order: MarketOrder,
+            _reference_price: st0x_execution::Positive<st0x_execution::Usd>,
+        ) -> Result<CounterTradePreflight, Self::Error> {
+            Ok(CounterTradePreflight::Allowed { reservation: None })
+        }
+    }
+
+    /// Pins the doc comment's claim above: a 429-shaped `AlpacaBrokerApiError`
+    /// from `maintenance_tick` is already handled correctly by the existing
+    /// "log and continue to the next tick" behavior, with no RAI-1494
+    /// reschedule/dead-letter machinery needed on this `SupervisedTask`.
+    #[tokio::test(start_paused = true)]
+    async fn keeps_ticking_after_a_429_maintenance_tick_error() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut maintenance =
+            ExecutorMaintenance::new(NotifyingAlpacaExecutor { tx }, Duration::from_secs(10));
+
+        let handle = tokio::spawn(async move { maintenance.run().await });
+
+        for tick in 0..3 {
+            rx.recv().await.unwrap_or_else(|| {
+                panic!("maintenance stopped ticking after a 429 error on tick {tick}")
+            });
+        }
+
+        assert!(
+            !handle.is_finished(),
+            "maintenance must keep running after a 429 tick error, exactly as it does for \
+             any other transient tick error"
+        );
 
         handle.abort();
     }

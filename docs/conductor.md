@@ -299,6 +299,244 @@ would fail the guard query -- and, on the boot path, propagate through
 `recover_submitted_offchain_orders` to fail `Conductor::run()` -- for every
 order sharing this job type, not just the corrupt row's own.
 
+### Broker rate-limit (429) backpressure: reschedule, don't retry in place (RAI-1494)
+
+**Problem this fixes**: before RAI-1494, a classified or unclassified error from
+an Alpaca call inside `Job::perform()` -- including an HTTP 429 -- went through
+the unmodified `RetryPolicy::retries(3)` path. Three quick in-place retries
+exhaust in seconds against a sustained rate-limit condition, tripping the
+supervised circuit breaker and reproducing RAI-1492's "hedging silently stops"
+incident. Retrying _in place_ for longer (a naive fix) is worse: it would hold
+the job's `concurrency(1)` worker slot for the whole backoff window, blocking
+every other pending item behind it -- the same "one item monopolizes the worker"
+failure shape, just invisible instead of a visible circuit-breaker trip.
+
+**Mechanism**: a 429 is intercepted _before_ `perform()` returns `Err` at all.
+The job classifies the error, computes a delay, pushes a fresh copy of itself
+onto its own queue after that delay via `push_with_delay`, and returns `Ok(())`.
+The row acks `Done` immediately and the worker is free on the very next poll
+tick to pick up any other pending item. The pushed successor is a brand-new
+`Pending` row apalis dispatches when its `run_at` arrives. Because the error
+never reaches `RetryPolicy`/`calculate_status`/the circuit breaker, a pure-429
+sequence can never produce apalis's `Event::Error` and can never open the
+circuit breaker -- RAI-1494 is fully decoupled from RAI-1495 (the
+circuit-breaker latch-with-no-wakeup bug) by construction, not by scoping
+discipline.
+
+**Shared building blocks** (`src/conductor/job.rs`, `crates/execution/src/`):
+
+- `st0x_execution::Backpressure { retry_after: Option<Duration> }` -- crate root
+  of `st0x-execution`, re-exported since `st0x-tokenization` also needs it.
+  `None` inside `retry_after` already means "429, no usable `Retry-After`
+  header"; there is no separate enum case for that.
+- An inherent `pub fn backpressure(&self) -> Option<Backpressure>` on each of
+  the four Alpaca error types (`AlpacaBrokerApiError`, `AlpacaMarketDataError`,
+  `AlpacaWalletError`, `st0x_tokenization::AlpacaTokenizationError`) --
+  exhaustive `match`, `Some` only for the `ApiError`-shaped variant with
+  `status == 429`. An inherent method per type, not a free classifier function:
+  these are already `pub` domain types call sites match on directly, so a free
+  function would only relocate the "know about these four types" fact, not
+  remove it.
+- `crate::rate_limit::parse_retry_after(header_value: &str, now: SystemTime)
+  -> Option<Duration>`
+  (`crates/execution/src/rate_limit.rs`, re-exported from that crate's root) --
+  the one parser every Alpaca client's response-handling path calls to capture
+  `Retry-After` **before** consuming the response body. Tries delay-seconds
+  first, falls back to the HTTP-date form. `"0"` parses to
+  `Some(Duration::ZERO)` -- a legitimate broker value; flooring a near-zero
+  delay is `decide_backpressure`'s job, not the parser's.
+- `crate::conductor::job::find_backpressure(error: &(dyn std::error::Error +
+  'static)) -> Option<Backpressure>`
+  -- walks the `.source()` chain, trying a `downcast_ref` against each of the
+  four error types in turn at every link, short-circuiting on the first `Some`.
+  This is the one place that "knows about" all four concrete types.
+- `crate::conductor::job::decide_backpressure(backpressure: &Backpressure,
+  streak: u32) -> BackpressureDecision { delay: Duration, exhausted: bool }`
+  -- pure, no apalis/tokio types. Honours `Retry-After` when present (clamped to
+  `[MIN_BACKPRESSURE_DELAY (1s), MAX_RETRY_AFTER (5min)]`); otherwise escalates
+  a fallback backoff (`BACKPRESSURE_FALLBACK_BASE` 1s up to
+  `BACKPRESSURE_FALLBACK_CAP` 60s) keyed off `streak`. `exhausted` is `true`
+  once `streak >= BACKPRESSURE_RESCHEDULE_LIMIT` (500) -- a persistently-429ing
+  item is eventually treated as a structurally-dead integration (suspended
+  account, revoked key), not endless transient rate-limiting. This function does
+  not log; each job logs its own every-10th-streak visibility line and its own
+  exhaustion line, mirroring
+  `PollOrderStatus::
+  handle_get_order_status_error`.
+
+**Per-job streak counter, not a stateful `Policy`**: because each reschedule is
+a brand-new apalis dispatch (a fresh `Pending` row), there is no live in-memory
+object to carry a retry count between attempts. Every participating job's
+payload gains a `backpressure_streak: u32` field, `#[serde(default)]` so an
+already-enqueued row under the pre-this-change shape still deserializes (to `0`,
+the correct "no streak yet" value) instead of crashing the poll stream's
+`sqlx::Decode` -- a decode failure there surfaces as `WorkerError::StreamError`,
+a worker-crashing fault, not a clean per-row dead-letter, so `#[serde(default)]`
+is mandatory on every one of these fields, not optional polish.
+
+**Reschedule reuses `reschedule_self`'s shape, not `push_poll_job_if_absent`'s
+guard**: the 429 reschedule is a single in-perform self-replacement point --
+exactly one `Running` row acking `Done` while pushing exactly one `Pending`
+successor -- the same invariant `reschedule_self` (above) already relies on for
+its own ordinary Pending/Submitted reschedule. It is not one of the five
+external push sites `push_poll_job_if_absent` exists to guard, so it does not
+need that guard. **A reschedule push's own failure must propagate as `Err`,
+never be swallowed into `Ok(())`**: `push_with_delay` returns
+`Result<(), QueuePushError>`; if that push itself fails (e.g. a transient SQLite
+write error), silently returning `Ok(())` anyway would ack the current row
+`Done` with no live successor, dropping the item. Every participating job's
+error enum has a `#[from] QueuePushError` arm precisely so `?` handles this
+correctly.
+
+**Crash-window duplicate risk: shared with, not introduced by, this mechanism.**
+If the process crashes between the reschedule push committing and the current
+job's `Ok(())` ack landing, both the old `Running` row (reset to `Pending` by
+`requeue_orphaned` at next boot) and the new `Pending` successor exist. This is
+`reschedule_self`'s existing pre-RAI-1494 characteristic, not a new one --
+RAI-1493's dedup guard covers the _external push site_ layer, not the in-perform
+self-replacement point, before or after this change. Also note: **orphan-reaping
+cannot reap or shorten a reschedule delay.** A rescheduled successor is inserted
+as a `Pending` row with a future `run_at`; it is never `Running` and holds no
+worker lock, and both `requeue_orphaned` (this repo) and apalis-core's own
+`reenqueue_orphaned_after` operate only on locked `Running` rows past a
+heartbeat timeout. Even the widest delay this mechanism produces
+(`MAX_RETRY_AFTER`, 5 minutes) cannot be shortened by orphan-reaping.
+
+**Terminal behavior at `BACKPRESSURE_RESCHEDULE_LIMIT` exhaustion depends on
+worker supervision.** For a job registered on a _supervised_ worker
+(`build_supervised_worker!`), propagating a bare `Err` at exhaustion would open
+the circuit breaker for a cause that is not a genuine bug -- reproducing the
+parent incident, just delayed by up to 500 reschedules instead of happening
+immediately. So a supervised job instead dead-letters at exhaustion: log a loud,
+distinct `error!` naming the item and the exhausted streak, then return
+`Ok(())`, so the row acks `Done` and the worker's shared circuit breaker never
+observes an `Event::Error` for this cause. A genuine _non-backpressure_ `Err` on
+these jobs is completely untouched by this decision and still fail-stops exactly
+as before. A best-effort-worker job (`build_best_effort_worker!`) is already
+log-only-and-continue on any terminal failure (RAI-1110), so exhaustion there
+needs no special case: the existing best-effort terminal handling already covers
+it.
+
+**True retry vs. reschedule-then-backstop -- not every job's reschedule
+re-drives the Alpaca call.** Whether a reschedule's successor attempt actually
+re-hits Alpaca, or instead short-circuits past it, depends on where the 429
+lands relative to that job's own committed idempotency guard:
+
+- **True retry**: no guard commits ahead of the Alpaca call, so every reschedule
+  genuinely re-attempts it. `PollOrderStatus`'s `get_order_status` is a pure
+  read with no committed state ahead of it -- the one job the parent RAI-1492
+  incident actually exercised. `PlaceHedge` also genuinely retries a
+  rate-limited broker placement: its position claim has committed, but the
+  durable offchain order remains `Pending`, so `recover_pending_poll_status`
+  re-drives the placement with the same deterministic `client_order_id`.
+- **Reschedule-then-backstop**: a guard commits _before_ the Alpaca touch, so
+  once that guard commits, a 429 later in the same attempt reschedules, but the
+  pushed successor short-circuits past the Alpaca call entirely.
+  `AccountForDexTrade` commits `account_for_onchain_fill` keyed on
+  `(tx_hash, log_index)` before any Alpaca call, so a rescheduled successor hits
+  `FillAccountingOutcome::AlreadyAcknowledged` and never re-attempts the hedge.
+  Its reschedule's value is narrower than for a true-retry job: it still
+  prevents burning the terminal retry budget and still frees the worker, but
+  actual completion is delegated to the existing `CheckPositions` backstop, not
+  the reschedule itself, and the streak structurally caps at 1 (a guard that
+  already committed cannot un-commit on a later attempt).
+
+This distinction matters for what a job's own tests can honestly claim: a test
+asserting "the reschedule completes the work" for a reschedule-then-backstop job
+would pass by coincidence of the short-circuit while proving nothing about the
+actual hedge/fill outcome.
+
+An exhausted `PollOrderStatus` row is acknowledged as `Done`, but it is not
+ordinary cleanup fodder: the finished-job cleanup retains rows whose serialized
+`backpressure_streak` reached the limit. `push_poll_job_if_absent` checks that
+durable marker before both periodic recovery and every other poll push site, so
+recovery cannot replace a finite dead letter with a fresh zero-streak chain.
+Once the broker order is reconciled to a terminal aggregate state, it naturally
+falls out of submitted-order recovery and the marker becomes inert.
+
+**Quarantined: USDC conversion order placement is not rescheduled at all.**
+`TransferUsdcToHedging`/`TransferUsdcToMarketMaking` are "true retry" jobs for
+their deposit-poll and withdrawal-poll sub-steps, but the conversion placement
+sub-step (`execute_usd_to_usdc_conversion`/`execute_usdc_to_usd_conversion`,
+called from inside `resume_alpaca_to_base`/`resume_base_to_alpaca`) is an
+explicit exception: a 429 (or any other placement error) still fails fast,
+exactly as before this mechanism existed. `InitiateConversion`/
+`InitiatePostDepositConversion` commits the aggregate to `Converting` before the
+broker call, but placement failure unconditionally sends `FailConversion` and
+returns `UsdcTransferError::ConversionPlacementFailed` -- a variant with no
+`#[source]`, so `find_backpressure` can never classify it and the job's generic
+terminal path (alert + propagate `Err`) runs instead of a reschedule. An earlier
+pass tried making a placement 429 reschedule-safe by leaving the aggregate in
+`Converting` and routing the redrive through the order-lookup resume path
+(`resume_converting`); that broke down because a 429 rejects the HTTP request,
+so the order was never created, the lookup 404s, and the redrive still ended in
+a terminal failure -- just one hop further away and harder to diagnose. Retrying
+a placement in place carries a real double-order risk against actual money, so
+this was reverted rather than iterated on further. Making it safe needs a
+place-then-commit reorder of the conversion aggregate (defer
+`InitiateConversion` until after a successful placement, or have the resume path
+re-place idempotently by `client_order_id` instead of only looking the order up)
+-- tracked as a follow-up, not part of this mechanism.
+
+**Known gap: several equity mint/redemption/recovery jobs cannot classify a 429
+at all today.** `WrappedEquityRecoveryJob`, `UnwrappedEquityRecoveryJob`,
+`TransferEquityToMarketMaking`, `TransferEquityToHedging`, and
+`ResumeTokenizationAggregate` all gained a `backpressure_streak` field (so their
+payload schema is ready), but none has a working reschedule wired to its actual
+Alpaca-touching failure path:
+
+- `WrappedEquityRecoveryJob`/`UnwrappedEquityRecoveryJob`: the aggregate's own
+  command handler (`resume_mint_or_fail`/`resume_redemption_or_fail` in each
+  `aggregate.rs`) catches a `resume_mint`/`resume_redemption` failure and
+  records it as a terminal `RecoveryFailed` **event** with only a
+  Display-formatted `String` reason -- `ctx.store.send()` returns `Ok(())`
+  regardless, so `perform()` never observes an `Err` to classify at all. A 429
+  here has always immediately terminalized the recovery with zero retries,
+  before and after RAI-1494.
+- `TransferEquityToMarketMaking`/`TransferEquityToHedging`/
+  `ResumeTokenizationAggregate`: these DO propagate a genuine `Err` (today's
+  `retries(3)` already applies), but
+  `TokenizedEquityMintError::RequestFailed
+  { error_message: String }`
+  (`error.to_string()` in `tokenized_equity_mint.rs`) and the mirrored
+  `EquityRedemption` error variants discard the original error type before it
+  ever reaches the job -- `find_backpressure`'s downcast-based classification
+  has nothing to walk to.
+
+Closing this needs the mint/redemption/recovery aggregates' error types to
+preserve the classified error (not just its `Display` string), and for the two
+recovery jobs, `transition()` to return `Err` instead of `Ok(RecoveryFailed)` on
+a classified 429 plus threading a streak into the `Command` (the aggregate has
+no visibility into the job's own payload today). This is a redesign of those
+aggregates' error-handling contracts, out of scope for RAI-1494's per-job wiring
+-- tracked as a follow-up, not silently left unaddressed.
+
+**Synchronous (CLI) call sites get bounded in-call retry, not the reschedule
+mechanism.** A CLI command is not a durable job: there is no queue row to
+reschedule and no sibling work waiting behind a shared `concurrency(1)` worker
+-- the "worker" is the one-shot process the operator is already waiting on, so
+retrying in place cannot reproduce the incident.
+`src/cli/backpressure_retry.rs`'s `retry_on_backpressure` reuses the same
+`find_backpressure`/`decide_backpressure` building blocks: on a classified 429
+within a small bounded attempt budget (`BACKPRESSURE_RETRY_MAX_ATTEMPTS`), it
+sleeps for the classified delay and retries in place; otherwise
+(non-backpressure error, or budget exhausted) it propagates to the CLI's
+existing `anyhow` error path unchanged. Wired into `cli/trading.rs`
+(market/limit order placement, order-status), `cli/alpaca_wallet.rs` (deposit
+address lookup, whitelist reads), and `cli/rebalancing.rs` (`transfer-usdc`).
+Not wired into `cli/repair.rs` (its commands never call the broker --
+`RepairOrderPlacer` always errors by design) or `transfer-equity` (same
+stringified-error gap as
+`TransferEquityToMarketMaking`/`TransferEquityToHedging` above).
+
+**`ExecutorMaintenance` (`src/conductor/monitor/executor_maintenance.rs`) needs
+no change.** It is a `SupervisedTask`, not a job or CLI command; its tick errors
+are already logged and swallowed unconditionally by the supervisor lifecycle --
+there is no retry budget to burn and no circuit breaker layer to interact with.
+A 429 there behaves today exactly like the reschedule mechanism this section
+documents: wait, log, try again next tick. Pinned by a regression test rather
+than left as an unverified assumption.
+
 ### Job trait
 
 Defined in `src/conductor/job.rs`. Wraps apalis's function-based handler API

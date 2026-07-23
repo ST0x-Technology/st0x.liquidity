@@ -22,10 +22,10 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use st0x_evm::EvmError;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::{Backpressure, FractionalShares, Symbol};
 
 pub use alpaca::{
-    AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
+    AlpacaApiErrorMessage, AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
     TokenizationRequestStatus, TokenizationRequestType,
 };
 
@@ -138,6 +138,27 @@ pub enum TokenizerError {
     Alpaca(#[from] AlpacaTokenizationError),
     #[error(transparent)]
     MintVerification(#[from] MintVerificationError),
+}
+
+impl TokenizerError {
+    /// Classifies this error as broker rate-limiting (HTTP 429), returning
+    /// its `Retry-After` hint when the broker sent one.
+    ///
+    /// Needed because `#[error(transparent)]` (used above so `TokenizerError`
+    /// forwards `Display`/`source()` straight through to the wrapped error)
+    /// makes `.source()` skip the wrapped `AlpacaTokenizationError` entirely
+    /// -- it forwards to the wrapped error's OWN source, not the wrapped
+    /// error itself. A generic `.source()`-chain walker (RAI-1494's
+    /// `find_backpressure`) can therefore never see the `AlpacaTokenizationError`
+    /// to classify it when it arrives wrapped in a `TokenizerError`; this
+    /// inherent method delegates directly instead of relying on the source
+    /// chain.
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::Alpaca(source) => source.backpressure(),
+            Self::MintVerification(_) => None,
+        }
+    }
 }
 
 /// Errors from verifying a mint transaction onchain.

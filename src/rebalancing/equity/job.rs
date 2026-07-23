@@ -37,7 +37,7 @@ use super::{CrossVenueEquityTransfer, MintTransferError, RedemptionError};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::trigger::GuardState;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -149,6 +149,28 @@ pub(crate) struct TransferEquityToMarketMaking {
     /// `GenerationMismatch -> Ok(())` rather than overwriting a new transfer's slot.
     #[serde(default)]
     pub(crate) generation: u64,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// NOT YET wired to a reschedule: `TokenizedEquityMint`'s command handler
+    /// converts a `request_mint`/tokenizer failure to
+    /// `TokenizedEquityMintError::RequestFailed { error_message: String }`
+    /// (`error.to_string()`), discarding the original error type before it
+    /// ever reaches this job -- `find_backpressure`'s downcast-based
+    /// classification has nothing to walk to. This is the same root cause as
+    /// `WrappedEquityRecoveryJob`'s gap (see its field doc), but one layer
+    /// removed: here the error DOES propagate as a genuine `Err` (apalis's
+    /// `retries(3)` already applies today), it is just untyped by the time it
+    /// arrives. Closing this needs `TokenizedEquityMintError` (and the
+    /// mirrored `EquityRedemption`/`RedemptionError` path for
+    /// `TransferEquityToHedging`) to preserve the classified error, not just
+    /// its `Display` string -- out of scope for this task's per-job wiring.
+    /// Field added now so the payload schema is ready when that follow-up
+    /// lands.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
@@ -468,6 +490,19 @@ pub(crate) struct TransferEquityToHedging {
     pub(crate) aggregate_id: RedemptionAggregateId,
     pub(crate) symbol: Symbol,
     pub(crate) quantity: FractionalShares,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// NOT YET wired to a reschedule: mirrors `TransferEquityToMarketMaking`'s
+    /// identical gap (see its field doc) -- `EquityRedemption`'s command
+    /// handlers convert tokenizer failures to `{ error_message: String }`
+    /// fields via `error.to_string()`, discarding the original error type
+    /// before it reaches this job. Field added now so the payload schema is
+    /// ready when that follow-up lands.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
@@ -665,6 +700,7 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity,
                     generation: 0,
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -699,6 +735,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -758,6 +795,7 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity,
                     generation: 0,
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -789,6 +827,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx)
@@ -817,6 +856,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -837,6 +878,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -865,6 +908,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -949,6 +994,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // TokensWrapped propagates Err: apalis retries resume_mint (idempotent
@@ -1009,6 +1056,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // VaultDepositSubmitted propagates Err so apalis retries the transfer job,
@@ -1075,6 +1124,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Must return Ok(()) — apalis does not retry; UnwrappedEquityRecovery takes over.
@@ -1138,6 +1189,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Must return Ok(()) — apalis does not retry; UnwrappedEquityRecovery takes over.
@@ -1200,6 +1253,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Must return Ok(()) so apalis marks the stale job Done -- no retry.
@@ -1258,6 +1313,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1333,6 +1390,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Terminal aggregate must propagate Err — it is not a recoverable state.
@@ -1396,6 +1455,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Idempotent: guard already held, state is recoverable -> still Ok(()).
@@ -1443,6 +1504,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: 0,
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1467,6 +1530,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(2.5)),
             generation: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let expected = json!({
@@ -1474,6 +1538,7 @@ mod tests {
             "symbol": "AAPL",
             "quantity": "2.5",
             "generation": 0_u64,
+            "backpressure_streak": 0_u32,
         });
 
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
@@ -1484,8 +1549,12 @@ mod tests {
         assert_eq!(roundtripped.symbol, job.symbol);
         assert_eq!(roundtripped.quantity, job.quantity);
         assert_eq!(roundtripped.generation, job.generation);
+        assert_eq!(roundtripped.backpressure_streak, job.backpressure_streak);
 
-        // Old rows without the generation field must deserialize to generation=0.
+        // Old rows without the generation/backpressure_streak fields must
+        // deserialize to 0 for both (RAI-1494's
+        // `transfer_equity_to_market_making_payload_without_backpressure_streak_
+        // deserializes_to_zero` mandate).
         let legacy_payload = json!({
             "issuer_request_id": issuer_request_id("mint-roundtrip").to_string(),
             "symbol": "AAPL",
@@ -1493,6 +1562,33 @@ mod tests {
         });
         let legacy: TransferEquityToMarketMaking = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(legacy.generation, 0, "missing generation must default to 0");
+        assert_eq!(
+            legacy.backpressure_streak,
+            BackpressureStreak::default(),
+            "missing backpressure_streak must default to 0"
+        );
+    }
+
+    #[test]
+    fn transfer_equity_to_market_making_payload_without_backpressure_streak_deserializes_to_zero() {
+        let legacy_payload = json!({
+            "issuer_request_id": issuer_request_id("legacy-mint").to_string(),
+            "symbol": "AAPL",
+            "quantity": "2.5",
+        });
+        let job: TransferEquityToMarketMaking = serde_json::from_value(legacy_payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
+    #[test]
+    fn transfer_equity_to_hedging_payload_without_backpressure_streak_deserializes_to_zero() {
+        let legacy_payload = json!({
+            "aggregate_id": redemption_aggregate_id("legacy-redemption").to_string(),
+            "symbol": "AAPL",
+            "quantity": "2.5",
+        });
+        let job: TransferEquityToHedging = serde_json::from_value(legacy_payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
     }
 
     /// Records the redemption resume call and returns a configurable outcome.
@@ -1565,6 +1661,7 @@ mod tests {
             aggregate_id: redemption_aggregate_id("redeem-bot-gas-enqueue-failure"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -1609,6 +1706,8 @@ mod tests {
             aggregate_id: redemption_aggregate_id("redeem-forward"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -1634,6 +1733,8 @@ mod tests {
             aggregate_id: redemption_aggregate_id("redeem-fail"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1656,6 +1757,8 @@ mod tests {
             aggregate_id: redemption_aggregate_id("redeem-roundtrip"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(2.5)),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let serialized = serde_json::to_vec(&job).unwrap();

@@ -51,7 +51,7 @@ use st0x_execution::{
 };
 use st0x_finance::{NonNegative, NotNonNegative, Usd};
 
-use crate::conductor::job::QueuePushError;
+use crate::conductor::job::{QueuePushError, find_backpressure};
 use crate::onchain::OnChainError;
 use crate::position::{Position, PositionCommand};
 
@@ -89,6 +89,23 @@ pub(crate) enum JobError {
     IntConversion(#[from] std::num::TryFromIntError),
     #[error("Poll interval overflowed while computing the stranded-row staleness bound")]
     StaleAfterOverflow,
+}
+
+/// Failures from the durable broker-placement boundary.
+///
+/// Aggregate persistence failures and classified broker backpressure must both
+/// retain their typed source chains. In particular, a 429 response leaves the
+/// order in [`OffchainOrder::Pending`] so the owning durable job can reschedule
+/// the idempotent placement with the same broker `client_order_id`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PlaceOffchainOrderError {
+    #[error("Offchain order command failed: {0}")]
+    Command(#[from] SendError<OffchainOrder>),
+    #[error("Broker placement was rate-limited")]
+    Backpressure {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +168,13 @@ impl OffchainOrderPlacement {
 /// so callers can react (roll the position back on `Failed`, poll on
 /// `Submitted`).
 ///
+/// A classified broker 429 is the exception to the ordinary placement-error
+/// outcome: it is returned with its typed source intact and the aggregate stays
+/// `Pending`. The owning durable job can then reschedule and re-drive the same
+/// `client_order_id`; stringifying it into `MarkPlacementFailed` would
+/// terminalize a retryable throttle and make job-level classification
+/// impossible.
+///
 /// **Concurrency invariant:** a placement-failure outcome is recorded via
 /// `MarkPlacementFailed`, which the aggregate honours only while the order is
 /// still `Pending`. A stale attempt whose broker call errored after a concurrent
@@ -165,7 +189,7 @@ pub(crate) async fn place_offchain_order_at_broker(
     order_placer: &dyn OrderPlacer,
     offchain_order_id: &OffchainOrderId,
     placement: OffchainOrderPlacement,
-) -> Result<Option<OffchainOrder>, SendError<OffchainOrder>> {
+) -> Result<Option<OffchainOrder>, PlaceOffchainOrderError> {
     let OffchainOrderPlacement {
         symbol,
         shares,
@@ -276,6 +300,10 @@ pub(crate) async fn place_offchain_order_at_broker(
             )
             .increment(1);
 
+            if find_backpressure(error.as_ref()).is_some() {
+                return Err(PlaceOffchainOrderError::Backpressure { source: error });
+            }
+
             OffchainOrderCommand::MarkPlacementFailed {
                 error: error.to_string(),
             }
@@ -283,7 +311,7 @@ pub(crate) async fn place_offchain_order_at_broker(
     };
 
     store.send(offchain_order_id, outcome).await?;
-    store.load(offchain_order_id).await
+    Ok(store.load(offchain_order_id).await?)
 }
 
 /// Derives the broker-side [`ClientOrderId`] for a placement attempt.
@@ -3034,6 +3062,43 @@ mod tests {
         Arc::new(Failing)
     }
 
+    fn rate_limited_order_placer() -> Arc<dyn OrderPlacer> {
+        struct RateLimited;
+
+        #[async_trait]
+        impl OrderPlacer for RateLimited {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err(Box::new(AlpacaBrokerApiError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    alpaca_code: None,
+                    message: "rate limited".to_string(),
+                    retry_after: Some(std::time::Duration::from_millis(1)),
+                }))
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                unimplemented!("test uses a market order")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+        }
+
+        Arc::new(RateLimited)
+    }
+
     fn limit_failing_order_placer() -> Arc<dyn OrderPlacer> {
         struct LimitFailing;
 
@@ -3904,6 +3969,38 @@ mod tests {
             ),
             "expected Failed with the broker error, got {order:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn place_at_broker_preserves_a_rate_limited_order_as_pending() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, _) = StoreBuilder::<OffchainOrder>::new(pool)
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let id = OffchainOrderId::new();
+        let placer = rate_limited_order_placer();
+
+        let error = place_offchain_order_at_broker(
+            &store,
+            placer.as_ref(),
+            &id,
+            OffchainOrderPlacement::market(
+                Symbol::new("AAPL").unwrap(),
+                Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                Direction::Buy,
+                SupportedExecutor::DryRun,
+                ClientOrderId::from_uuid(id.as_uuid()),
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(find_backpressure(&error).is_some());
+        assert!(matches!(
+            store.load(&id).await.unwrap(),
+            Some(OffchainOrder::Pending { .. })
+        ));
     }
 
     #[tokio::test]

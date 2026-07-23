@@ -1,6 +1,7 @@
 //! Authenticated HTTP transport for Alpaca Broker API wallet modules.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Method, Response, StatusCode};
@@ -9,14 +10,19 @@ use tracing::{trace, warn};
 
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
-use crate::AlpacaAccountId;
+use crate::rate_limit::retry_after_from_response_headers;
+use crate::{AlpacaAccountId, Backpressure};
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error("API error (status {status}): {message}")]
-    ApiError { status: StatusCode, message: String },
+    ApiError {
+        status: StatusCode,
+        message: String,
+        retry_after: Option<Duration>,
+    },
     #[error("Failed to parse response")]
     ParseError(#[from] serde_json::Error),
     #[error("response body was not valid UTF-8: {0}")]
@@ -63,6 +69,39 @@ pub enum AlpacaWalletError {
         previous: TransferStatus,
         next: TransferStatus,
     },
+}
+
+impl AlpacaWalletError {
+    /// Classifies this error as broker rate-limiting (HTTP 429), returning
+    /// its `Retry-After` hint when the broker sent one. Every other variant
+    /// returns `None` -- an exhaustive match so a new variant added later
+    /// forces a conscious decision here rather than silently classifying as
+    /// "not backpressure".
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::ApiError {
+                status,
+                retry_after,
+                ..
+            } if *status == StatusCode::TOO_MANY_REQUESTS => Some(Backpressure {
+                retry_after: *retry_after,
+            }),
+
+            Self::ApiError { .. }
+            | Self::Reqwest(_)
+            | Self::ParseError(_)
+            | Self::Utf8(_)
+            | Self::FromHex(_)
+            | Self::TransferNotFound { .. }
+            | Self::FailedTransferHasTx { .. }
+            | Self::TransferTimeout { .. }
+            | Self::InvalidStatusTransition { .. }
+            | Self::AddressNotWhitelisted { .. }
+            | Self::NoWhitelistEntries { .. }
+            | Self::DepositTimeout { .. }
+            | Self::InvalidDepositTransition { .. } => None,
+        }
+    }
 }
 
 pub struct AlpacaWalletClient {
@@ -277,6 +316,7 @@ async fn read_response_body(
 ) -> Result<String, AlpacaWalletError> {
     let status = response.status();
     let url = response.url().clone();
+    let retry_after = retry_after_from_response_headers(response.headers());
     // Read raw bytes and convert the success body with `String::from_utf8` so
     // invalid UTF-8 fails fast (matching the prior `response.json()` at the call
     // sites) instead of being silently replaced by `response.text()`'s lossy
@@ -291,6 +331,7 @@ async fn read_response_body(
             return Err(AlpacaWalletError::ApiError {
                 status,
                 message: "Unknown error".to_string(),
+                retry_after,
             });
         }
         Err(error) => return Err(error.into()),
@@ -312,6 +353,7 @@ async fn read_response_body(
         return Err(AlpacaWalletError::ApiError {
             status,
             message: redact_beneficiary_for_logging(&String::from_utf8_lossy(&bytes)).into_owned(),
+            retry_after,
         });
     }
 
@@ -484,6 +526,80 @@ mod tests {
         ));
 
         error_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn alpaca_wallet_backpressure_some_for_429_with_retry_after() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/rate_limited");
+            then.status(429)
+                .header("Retry-After", "25")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let error = client.get("/v1/rate_limited").await.unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(25))
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_wallet_backpressure_some_with_none_without_header() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/rate_limited");
+            then.status(429)
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let error = client.get("/v1/rate_limited").await.unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure { retry_after: None })
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_wallet_backpressure_none_for_non_429() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/server_error");
+            then.status(500).body("Internal Server Error");
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let error = client.get("/v1/server_error").await.unwrap_err();
+
+        assert_eq!(error.backpressure(), None);
     }
 
     #[tokio::test]
@@ -703,7 +819,9 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let AlpacaWalletError::ApiError { status, message } = client
+        let AlpacaWalletError::ApiError {
+            status, message, ..
+        } = client
             .post("/v1/whitelists", &json!({"any": "body"}))
             .await
             .unwrap_err()

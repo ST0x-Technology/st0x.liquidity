@@ -23,18 +23,28 @@ mod alpaca_wallet;
 pub mod error;
 pub mod mock;
 pub mod order;
+mod rate_limit;
 
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, ConversionDirection, CryptoOrderOutcome, JournalResponse, JournalStatus,
     TimeInForce,
 };
+// `AlpacaMarketDataError` is wrapped by `AlpacaBrokerApiError::LatestTrade`,
+// which delegates its own `backpressure()` classification straight to the
+// wrapped error (RAI-1494), so the parent app never needs to name or
+// downcast this type in production -- test-only, so tests can still
+// construct the exact wrapped shape (`LatestTrade(AlpacaMarketDataError::
+// ApiError { .. })`) that `fetch_latest_trade_price` produces.
+#[cfg(any(test, feature = "test-support"))]
+pub use alpaca_market_data::AlpacaMarketDataError;
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{
     CancellationOutcome, ClientOrderId, ClientOrderIdError, LimitOrder, MarketOrder,
     OrderPlacement, OrderState, OrderStatus, OrderUpdate,
 };
+pub use rate_limit::retry_after_from_response_headers;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use alpaca_wallet::AlpacaWalletClient;
@@ -162,6 +172,28 @@ pub enum LatestQuoteError {
         bid: Positive<Usd>,
         ask: Positive<Usd>,
     },
+}
+
+/// A classified rate-limit (HTTP 429) response from an Alpaca API, carrying
+/// the broker's `Retry-After` hint when it sent one.
+///
+/// Each Alpaca error type (`AlpacaBrokerApiError`, `AlpacaMarketDataError`,
+/// `AlpacaWalletError`, and `st0x-tokenization`'s `AlpacaTokenizationError`)
+/// exposes an inherent `.backpressure() -> Option<Backpressure>` method
+/// rather than a free classifier function: these error types are already
+/// `pub` domain types call sites match on directly, so a free function would
+/// only relocate the "know about these concrete types" fact, not remove it
+/// (see RAI-1494's plan). `None` inside `retry_after` already means "429, no
+/// usable `Retry-After` header" -- a caller does not need a separate
+/// enum case for that, only `Option`'s existing `None`.
+///
+/// Lives at this crate's root (rather than nested under `alpaca_broker_api`)
+/// because `AlpacaWalletError` and `st0x-tokenization`'s
+/// `AlpacaTokenizationError` (a downstream crate that already depends on
+/// `st0x-execution`) both need to return it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backpressure {
+    pub retry_after: Option<Duration>,
 }
 
 #[async_trait]
