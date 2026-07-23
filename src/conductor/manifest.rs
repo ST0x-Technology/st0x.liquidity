@@ -194,6 +194,7 @@ mod tests {
                 target: float!(0.6),
                 deviation: float!(0.15),
             }),
+            inventory_freshness_window: Duration::from_secs(60),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -392,7 +393,8 @@ mod tests {
                 ),
                 chrono::Utc::now(),
             )
-            .unwrap();
+            .unwrap()
+            .with_rebalancing_sources_observed_at(chrono::Utc::now());
         let inventory = Arc::new(BroadcastingInventory::new(
             initial_inventory,
             event_sender.clone(),
