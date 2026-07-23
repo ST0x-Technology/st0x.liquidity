@@ -20,6 +20,19 @@ use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, Never, Nil
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
+/// Independently scheduled external observations that feed inventory state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum InventoryObservationSource {
+    InflightEquity,
+    OnchainEquity,
+    OnchainUsdc,
+    EthereumWalletUsdc,
+    BaseWalletUsdc,
+    BaseWalletUnwrappedEquity,
+    BaseWalletWrappedEquity,
+    OffchainInventory,
+}
+
 /// Typed identifier for InventorySnapshot aggregates, keyed
 /// by orderbook and owner address pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +128,9 @@ pub(crate) struct InventorySnapshot {
     /// Time the current inflight equity provider snapshot was fetched.
     #[serde(default)]
     pub(crate) inflight_equity_fetched_at: Option<DateTime<Utc>>,
+    /// Latest completed external observation for every polling source.
+    #[serde(default)]
+    pub(crate) source_observed_at: BTreeMap<InventoryObservationSource, DateTime<Utc>>,
     /// When this snapshot was last updated
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -130,7 +146,7 @@ impl EventSourced for InventorySnapshot {
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 6;
+    const SCHEMA_VERSION: u64 = 7;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
     const SNAPSHOT_SIZE: usize = 1;
 
@@ -153,6 +169,7 @@ impl EventSourced for InventorySnapshot {
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
             inflight_equity_fetched_at: None,
+            source_observed_at: BTreeMap::new(),
             base_wallet_unwrapped_equity: BTreeMap::new(),
             base_wallet_wrapped_equity: BTreeMap::new(),
             last_updated: event.timestamp(),
@@ -239,6 +256,33 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }
             }
+            RecordOffchainObservation {
+                positions,
+                usd_balance_cents,
+                gross_usd_cents,
+                cash_buying_power_cents,
+                cash_withdrawable_cents,
+                alpaca_usdc,
+                observed_at,
+            } => {
+                return Ok(OffchainObservation {
+                    positions,
+                    usd_balance_cents,
+                    gross_usd_cents,
+                    cash_buying_power_cents,
+                    cash_withdrawable_cents,
+                    alpaca_usdc,
+                    observed_at,
+                }
+                .into_events(None));
+            }
+            RecordSourceObservation {
+                source,
+                observed_at,
+            } => InventorySnapshotEvent::SourceObserved {
+                source,
+                observed_at,
+            },
         }])
     }
 
@@ -387,6 +431,38 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }])
             }
+            RecordOffchainObservation {
+                positions,
+                usd_balance_cents,
+                gross_usd_cents,
+                cash_buying_power_cents,
+                cash_withdrawable_cents,
+                alpaca_usdc,
+                observed_at,
+            } => Ok(OffchainObservation {
+                positions,
+                usd_balance_cents,
+                gross_usd_cents,
+                cash_buying_power_cents,
+                cash_withdrawable_cents,
+                alpaca_usdc,
+                observed_at,
+            }
+            .into_events(Some(self))),
+            RecordSourceObservation {
+                source,
+                observed_at,
+            } if self
+                .source_observed_at
+                .get(&source)
+                .is_none_or(|current| observed_at > *current) =>
+            {
+                Ok(vec![InventorySnapshotEvent::SourceObserved {
+                    source,
+                    observed_at,
+                }])
+            }
+            RecordSourceObservation { .. } => Ok(vec![]),
         }
     }
 }
@@ -521,6 +597,13 @@ impl InventorySnapshot {
                 fetched_at,
             });
         }
+
+        for (&source, &observed_at) in &self.source_observed_at {
+            emit(InventorySnapshotEvent::SourceObserved {
+                source,
+                observed_at,
+            });
+        }
     }
 
     fn apply_event(&mut self, event: &InventorySnapshotEvent) {
@@ -572,10 +655,6 @@ impl InventorySnapshot {
                 self.offchain_gross_usd_cents = *gross_usd_cents;
                 self.offchain_usd_fetched_at = Some(*fetched_at);
             }
-            InventorySnapshotEvent::OnchainEquity { .. }
-            | InventorySnapshotEvent::OnchainUsdc { .. }
-            | InventorySnapshotEvent::OffchainEquity { .. }
-            | InventorySnapshotEvent::OffchainUsd { .. } => {}
             InventorySnapshotEvent::OffchainCashBuyingPower {
                 cash_buying_power_cents,
                 ..
@@ -612,6 +691,21 @@ impl InventorySnapshot {
             InventorySnapshotEvent::BaseWalletWrappedEquity { balances, .. } => {
                 self.base_wallet_wrapped_equity = balances.clone();
             }
+            InventorySnapshotEvent::SourceObserved {
+                source,
+                observed_at,
+            } if self
+                .source_observed_at
+                .get(source)
+                .is_none_or(|current| observed_at > current) =>
+            {
+                self.source_observed_at.insert(*source, *observed_at);
+            }
+            InventorySnapshotEvent::OnchainEquity { .. }
+            | InventorySnapshotEvent::OnchainUsdc { .. }
+            | InventorySnapshotEvent::OffchainEquity { .. }
+            | InventorySnapshotEvent::OffchainUsd { .. }
+            | InventorySnapshotEvent::SourceObserved { .. } => {}
         }
     }
 }
@@ -654,6 +748,15 @@ pub(crate) enum InventorySnapshotCommand {
     BaseWalletWrappedEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
     },
+    RecordOffchainObservation {
+        positions: BTreeMap<Symbol, FractionalShares>,
+        usd_balance_cents: i64,
+        gross_usd_cents: Option<i64>,
+        cash_buying_power_cents: Option<i64>,
+        cash_withdrawable_cents: Option<i64>,
+        alpaca_usdc: Option<Usdc>,
+        observed_at: DateTime<Utc>,
+    },
     /// Equity currently in-flight through Alpaca's tokenization pipeline.
     /// Fetched by polling Alpaca's `list_requests` endpoint for pending requests.
     InflightEquity {
@@ -663,6 +766,10 @@ pub(crate) enum InventorySnapshotCommand {
         redemptions: BTreeMap<Symbol, FractionalShares>,
         /// Time the provider pending-request response was observed.
         fetched_at: DateTime<Utc>,
+    },
+    RecordSourceObservation {
+        source: InventoryObservationSource,
+        observed_at: DateTime<Utc>,
     },
 }
 
@@ -726,6 +833,10 @@ pub(crate) enum InventorySnapshotEvent {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
+    SourceObserved {
+        source: InventoryObservationSource,
+        observed_at: DateTime<Utc>,
+    },
 }
 
 impl InventorySnapshotEvent {
@@ -743,6 +854,7 @@ impl InventorySnapshotEvent {
             | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
             | Self::BaseWalletWrappedEquity { fetched_at, .. }
             | Self::InflightEquity { fetched_at, .. } => *fetched_at,
+            Self::SourceObserved { observed_at, .. } => *observed_at,
         }
     }
 }
@@ -770,11 +882,91 @@ impl DomainEvent for InventorySnapshotEvent {
                 "InventorySnapshotEvent::BaseWalletWrappedEquity".to_string()
             }
             Self::InflightEquity { .. } => "InventorySnapshotEvent::InflightEquity".to_string(),
+            Self::SourceObserved { .. } => "InventorySnapshotEvent::SourceObserved".to_string(),
         }
     }
 
     fn event_version(&self) -> String {
         "1.0".to_string()
+    }
+}
+
+struct OffchainObservation {
+    positions: BTreeMap<Symbol, FractionalShares>,
+    usd_balance_cents: i64,
+    gross_usd_cents: Option<i64>,
+    cash_buying_power_cents: Option<i64>,
+    cash_withdrawable_cents: Option<i64>,
+    alpaca_usdc: Option<Usdc>,
+    observed_at: DateTime<Utc>,
+}
+
+impl OffchainObservation {
+    fn into_events(self, current: Option<&InventorySnapshot>) -> Vec<InventorySnapshotEvent> {
+        let Self {
+            positions,
+            usd_balance_cents,
+            gross_usd_cents,
+            cash_buying_power_cents,
+            cash_withdrawable_cents,
+            alpaca_usdc,
+            observed_at,
+        } = self;
+        let mut events = Vec::new();
+
+        if current.is_none_or(|snapshot| snapshot.offchain_equity != positions) {
+            events.push(InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at: observed_at,
+            });
+        }
+        if current.is_none_or(|snapshot| {
+            snapshot.offchain_usd_cents != Some(usd_balance_cents)
+                || snapshot.offchain_gross_usd_cents != gross_usd_cents
+        }) {
+            events.push(InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents,
+                gross_usd_cents,
+                fetched_at: observed_at,
+            });
+        }
+        if current.is_none_or(|snapshot| {
+            snapshot.offchain_cash_buying_power_cents != cash_buying_power_cents
+        }) {
+            events.push(InventorySnapshotEvent::OffchainCashBuyingPower {
+                cash_buying_power_cents,
+                fetched_at: observed_at,
+            });
+        }
+        if current.is_none_or(|snapshot| {
+            snapshot.offchain_cash_withdrawable_cents != cash_withdrawable_cents
+        }) {
+            events.push(InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents,
+                fetched_at: observed_at,
+            });
+        }
+        if let Some(usdc_balance) = alpaca_usdc
+            && current.is_none_or(|snapshot| snapshot.alpaca_usdc != Some(usdc_balance))
+        {
+            events.push(InventorySnapshotEvent::AlpacaUsdc {
+                usdc_balance,
+                fetched_at: observed_at,
+            });
+        }
+        if current.is_none_or(|snapshot| {
+            snapshot
+                .source_observed_at
+                .get(&InventoryObservationSource::OffchainInventory)
+                .is_none_or(|previous| observed_at > *previous)
+        }) {
+            events.push(InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OffchainInventory,
+                observed_at,
+            });
+        }
+
+        events
     }
 }
 
@@ -1034,6 +1226,164 @@ mod tests {
 
             assert!(events.is_empty(), "unchanged inventory field emitted event");
         }
+    }
+
+    #[tokio::test]
+    async fn successful_source_observation_emits_when_inventory_values_are_unchanged() {
+        let source = InventoryObservationSource::OffchainInventory;
+        let previous_observed_at = Utc::now();
+        let observed_at = previous_observed_at + chrono::Duration::seconds(1);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::SourceObserved {
+                source,
+                observed_at: previous_observed_at,
+            }])
+            .when(InventorySnapshotCommand::RecordSourceObservation {
+                source,
+                observed_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events,
+            vec![InventorySnapshotEvent::SourceObserved {
+                source,
+                observed_at,
+            }],
+            "a successful observation is freshness evidence even when no balance changed",
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_observation_records_values_and_freshness_atomically() {
+        let positions = BTreeMap::from([(test_symbol("AAPL"), test_shares(75))]);
+        let alpaca_usdc = Usdc::from_str("125").unwrap();
+        let observed_at = Utc::now();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::RecordOffchainObservation {
+                positions: positions.clone(),
+                usd_balance_cents: 42_00,
+                gross_usd_cents: Some(50_00),
+                cash_buying_power_cents: Some(10_000),
+                cash_withdrawable_cents: Some(38_00),
+                alpaca_usdc: Some(alpaca_usdc),
+                observed_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events,
+            vec![
+                InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: observed_at,
+                },
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 42_00,
+                    gross_usd_cents: Some(50_00),
+                    fetched_at: observed_at,
+                },
+                InventorySnapshotEvent::OffchainCashBuyingPower {
+                    cash_buying_power_cents: Some(10_000),
+                    fetched_at: observed_at,
+                },
+                InventorySnapshotEvent::OffchainCashWithdrawable {
+                    cash_withdrawable_cents: Some(38_00),
+                    fetched_at: observed_at,
+                },
+                InventorySnapshotEvent::AlpacaUsdc {
+                    usdc_balance: alpaca_usdc,
+                    fetched_at: observed_at,
+                },
+                InventorySnapshotEvent::SourceObserved {
+                    source: InventoryObservationSource::OffchainInventory,
+                    observed_at,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_offchain_observation_still_refreshes_freshness() {
+        let positions = BTreeMap::from([(test_symbol("AAPL"), test_shares(75))]);
+        let alpaca_usdc = Usdc::from_str("125").unwrap();
+        let previous_observed_at = Utc::now();
+        let observed_at = previous_observed_at + chrono::Duration::seconds(1);
+        let previous_events = vec![
+            InventorySnapshotEvent::OffchainEquity {
+                positions: positions.clone(),
+                fetched_at: previous_observed_at,
+            },
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 42_00,
+                gross_usd_cents: Some(50_00),
+                fetched_at: previous_observed_at,
+            },
+            InventorySnapshotEvent::OffchainCashBuyingPower {
+                cash_buying_power_cents: Some(10_000),
+                fetched_at: previous_observed_at,
+            },
+            InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents: Some(38_00),
+                fetched_at: previous_observed_at,
+            },
+            InventorySnapshotEvent::AlpacaUsdc {
+                usdc_balance: alpaca_usdc,
+                fetched_at: previous_observed_at,
+            },
+            InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OffchainInventory,
+                observed_at: previous_observed_at,
+            },
+        ];
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(previous_events)
+            .when(InventorySnapshotCommand::RecordOffchainObservation {
+                positions,
+                usd_balance_cents: 42_00,
+                gross_usd_cents: Some(50_00),
+                cash_buying_power_cents: Some(10_000),
+                cash_withdrawable_cents: Some(38_00),
+                alpaca_usdc: Some(alpaca_usdc),
+                observed_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events,
+            vec![InventorySnapshotEvent::SourceObserved {
+                source: InventoryObservationSource::OffchainInventory,
+                observed_at,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_observation_cannot_move_freshness_backward() {
+        let source = InventoryObservationSource::OnchainEquity;
+        let observed_at = Utc::now();
+        let stale_observed_at = observed_at - chrono::Duration::seconds(1);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::SourceObserved {
+                source,
+                observed_at,
+            }])
+            .when(InventorySnapshotCommand::RecordSourceObservation {
+                source,
+                observed_at: stale_observed_at,
+            })
+            .await
+            .events();
+
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1861,6 +2211,7 @@ mod tests {
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
             inflight_equity_fetched_at: None,
+            source_observed_at: BTreeMap::new(),
             last_updated: Utc::now(),
         };
 
@@ -1874,6 +2225,8 @@ mod tests {
         onchain_equity.insert(test_symbol("AAPL"), test_shares(100));
         let mut inflight_mints = BTreeMap::new();
         inflight_mints.insert(test_symbol("TSLA"), test_shares(50));
+        let source_observed_at =
+            BTreeMap::from([(InventoryObservationSource::OffchainInventory, now)]);
 
         let original = InventorySnapshot {
             onchain_equity: onchain_equity.clone(),
@@ -1895,6 +2248,7 @@ mod tests {
             inflight_mints: inflight_mints.clone(),
             inflight_redemptions: BTreeMap::new(),
             inflight_equity_fetched_at: Some(now),
+            source_observed_at: source_observed_at.clone(),
             last_updated: now,
         };
 
@@ -1916,6 +2270,7 @@ mod tests {
         );
         assert_eq!(reconstructed.alpaca_usdc, original.alpaca_usdc);
         assert_eq!(reconstructed.inflight_mints, original.inflight_mints);
+        assert_eq!(reconstructed.source_observed_at, source_observed_at);
     }
 
     #[test]

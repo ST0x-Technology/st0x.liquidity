@@ -266,8 +266,10 @@ All work flows through one of these patterns:
   exponential backoff on failure. Transient per-tick errors are logged and
   swallowed; the supervisor restarts only on a panic. Example: the DEX order
   fill monitor, which polls `eth_getLogs` and enqueues backfill ranges.
-- **Scheduled jobs** (apalis, future): Cron/interval-triggered work replacing
-  manual polling loops. Examples: inventory polling, executor maintenance.
+- **Scheduled jobs** (apalis): Durable interval-triggered work. Inventory
+  sources use one queue and worker per source; every run schedules exactly one
+  source-local successor after the configured interval, including after a read
+  or persistence failure. Executor maintenance remains future work.
 - **Lifecycle workflows** (apalis-workflow, future): Durable multi-step
   pipelines where each step is a checkpoint. Sequential or DAG-based.
 
@@ -3243,18 +3245,30 @@ balances and emitting them as events the system can react to:
   vault while retaining the retired vault in the registry for balance polling.
 - **InventorySnapshot** (CQRS aggregate): Records point-in-time snapshots of
   actual balances fetched from onchain vaults and the offchain broker.
-- **InventoryPollingService**: Periodically polls actual balances from both
-  venues, emitting InventorySnapshot events. InventoryView reacts to these
-  events to update tracked inventory. Offchain equity polling normalizes active
-  configured equities omitted by the broker positions response to explicit zero
-  balances, and ignores broker-only symbols that are not configured as active
-  assets. Onchain polling sums all registered vaults for each asset and warns
-  when a registered vault that is no longer present in current config still has
-  a positive balance, so stranded funds are visible without sending new
-  rebalancing transfers to the retired vault.
-- **Polling runs on a 60-second interval** during market hours as a background
-  conductor task. Onchain polling uses the `vaultBalance2` contract call;
-  offchain polling uses the `Executor::get_inventory()` trait method.
+- **InventoryPollingService**: Polls one independently scheduled source per job:
+  inflight equity, onchain equity, onchain USDC, Ethereum wallet USDC, Base
+  wallet USDC, Base unwrapped equity, Base wrapped equity, or offchain
+  inventory. Each source has its own durable apalis queue and worker, so a slow
+  or failing integration cannot delay unrelated observations. Startup purges
+  abandoned active rows and starts one immediate loop for every configured
+  source; tokenizer and wallet jobs are omitted when their integration or token
+  set is not configured. Each run schedules exactly one delayed successor even
+  when its read or snapshot persistence fails.
+- Successful reads persist a `SourceObserved` marker carrying the external-read
+  completion time. The marker is written only after that source's derived
+  snapshot events succeed. The multi-field offchain observation and its marker
+  are emitted by one aggregate command, so validation or persistence failure
+  cannot expose a partially updated broker snapshot as fresh. InventoryView
+  reacts to snapshot events to update tracked inventory. Offchain equity polling
+  normalizes active configured equities omitted by the broker positions response
+  to explicit zero balances, and ignores broker-only symbols that are not
+  configured as active assets. Onchain polling sums all registered vaults for
+  each asset and warns when a registered vault that is no longer present in
+  current config still has a positive balance, so stranded funds are visible
+  without sending new rebalancing transfers to the retired vault.
+- **Polling uses the configured inventory interval**. Onchain polling uses the
+  `vaultBalance2` contract call; offchain polling uses the
+  `Executor::get_inventory()` trait method.
 
 ### InventoryView
 
@@ -3676,14 +3690,14 @@ All work managed by the Conductor falls into one of these categories:
 | Order fill monitor  | Polls ClearV3/TakeOrderV3 and inventory OperatorDeposit/OperatorWithdraw settlements, pushes trade jobs |
 | Rebalancing trigger | Detects inventory imbalances, pushes rebalancing jobs                                                   |
 
-**Scheduled jobs** (periodic, future — currently long-running with sleep loops):
+**Scheduled jobs** (periodic):
 
-| Job                  | Interval | Description                                          |
-| -------------------- | -------- | ---------------------------------------------------- |
-| Inventory poll       | ~30s     | Poll vault + broker balances, broadcast to dashboard |
-| Order status poll    | ~10s     | Poll broker for pending order fills                  |
-| Position check       | ~60s     | Reconcile accumulated positions (safety net)         |
-| Executor maintenance | ~15m     | Refresh broker metadata, check asset availability    |
+| Job                        | Interval   | Description                                                                                  |
+| -------------------------- | ---------- | -------------------------------------------------------------------------------------------- |
+| Inventory source polls (8) | Configured | Independently poll inflight, vault, wallet, and broker inventory; each source self-schedules |
+| Order status poll          | ~10s       | Poll broker for pending order fills                                                          |
+| Position check             | ~60s       | Reconcile accumulated positions (safety net)                                                 |
+| Executor maintenance       | ~15m       | Refresh broker metadata, check asset availability                                            |
 
 **Lifecycle workflows** (stepped, durable, future):
 
