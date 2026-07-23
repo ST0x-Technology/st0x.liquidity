@@ -12,6 +12,10 @@ if ! grep -Fqx '  queue: max' <<< "$concurrency_block"; then
   echo "external PR CI concurrency must use the expanded queue with queue: max" >&2
   exit 1
 fi
+if grep -Fqx '  cancel-in-progress: true' <<< "$concurrency_block"; then
+  echo "queue: max cannot be combined with cancel-in-progress: true" >&2
+  exit 1
+fi
 
 fake_bin="$test_root/bin"
 mkdir "$fake_bin"
