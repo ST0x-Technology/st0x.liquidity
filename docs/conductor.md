@@ -188,8 +188,7 @@ WorkerBuilder::new(name)
     .data(ctx)
     .concurrency(1)                                          // sequential processing
     .retry(RetryPolicy::retries(3).with_backoff(backoff))    // 1 + 3 = 4 attempts, with backoff
-    .break_circuit_with(fail_stop_config)                    // halt on terminal failure
-    .on_event(|ctx, event| { ... })                          // observability + lifecycle
+    .on_event(recovering_circuit_event)                      // pause, alert, and recover
     .build(work::<MyCtx, MyJob>)
 ```
 
@@ -200,42 +199,33 @@ WorkerBuilder::new(name)
   the next job from starting.
 - **`.retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF))`** — retries
   failed jobs (replaces backon in the handler). `retries(3)` = 4 total attempts.
-  `RETRY_BACKOFF` is a deterministic exponential backoff (1s base, doubles each
-  attempt, capped at 30s) so transient failures (RPC blips, broker rate limits)
-  don't fast-fail into the circuit breaker. No jitter -- single-worker queues
-  don't thunder.
-- **`.break_circuit_with(config)`** — opens the circuit after
-  `failure_threshold` errors, returning `Poll::Pending` from `poll_ready` to
-  block new job pickup. Use `failure_threshold(1)` + very long
-  `recovery_timeout` for fail-stop. Do not install this layer on best-effort
-  workers: in apalis-core 1.0.0-rc.9, an open circuit can return `Poll::Pending`
-  without scheduling a wakeup, so a short `recovery_timeout` does not guarantee
-  the worker will resume.
-- **`.on_event()`** — fires on `Event::Error` (after retries exhaust),
-  `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging AND for
-  calling `ctx.stop()` on terminal failure. The circuit breaker alone only
-  pauses the worker (`Poll::Pending`); `ctx.stop()` is needed to actually make
-  the worker exit.
+  Every queued task carries the same four-attempt durable SQL limit, so one
+  exhausted job produces exactly one terminal worker event. `RETRY_BACKOFF` is a
+  deterministic exponential backoff (1s base, doubles each attempt, capped at
+  30s) so transient failures (RPC blips, broker rate limits) don't fast-fail
+  into the recovering circuit. No jitter -- single-worker queues don't thunder.
+- **`.on_event(recovering_circuit_event)`** — observes terminal `Event::Error`
+  and successful `Event::Success` outcomes. The first consecutive terminal
+  failure opens the local worker circuit, pauses that worker, emits a structured
+  transition, and sends an operator alert. After a five-minute production
+  cooldown, a scheduled task closes the circuit and resumes the same worker
+  without restarting the process. A success resets the consecutive-failure
+  count. Tests use a short cooldown.
 
-### Error propagation: handler failure -> bot shutdown
+Best-effort workers do not install the recovering circuit. Their terminal
+failures are logged and retained in the durable queue, but do not pause the
+worker.
+
+### Error propagation: handler failure -> isolated recovery
 
 1. `work()` returns `Err` -> retry layer retries
-2. Retries exhaust -> error reaches circuit breaker -> circuit opens
-3. Error becomes `Ok(Event::Error)` in apalis `poll_tasks`
-4. `on_event` catches `Event::Error`, fires the shared `failure_notify`
-   (`tokio::sync::Notify`), and calls `ctx.stop()`
-5. Worker exits cleanly (`Ok(())`)
-6. The spawned monitor task's biased `tokio::select!` observes the Notify and
-   returns `Err(MonitorTaskError::TerminalJobFailure)` immediately -- it does
-   not wait for `apalis_monitor.run()` to wind down. The conductor's
-   `wait_for_completion` sees the monitor task exit with that error and shuts
-   the bot down.
-
-**Critical:** the spawned monitor task must select on the shared Notify
-alongside `apalis_monitor.run()` and return the terminal error. Without the
-Notify branch, the conductor would only learn of the failure once apalis
-finished tearing down all workers; without returning the error, the conductor
-would never see the failure at all.
+2. Retries exhaust -> apalis persists the terminal job and emits `Event::Error`
+3. `on_event` opens the local circuit and pauses only that worker
+4. A structured `opened` transition and operator alert identify the worker and
+   failure
+5. The conductor and sibling workers remain running
+6. After the cooldown, the scheduled recovery resumes the worker and emits a
+   structured `recovered` transition
 
 ### Monitor configuration
 
@@ -246,8 +236,9 @@ Monitor::new()
     .run().await
 ```
 
-`should_restart(false)` — terminal job failure is fail-stop. The worker must not
-restart and process the next job with stale state.
+`should_restart(false)` prevents apalis from spawning a replacement worker after
+an unexpected worker exit. Terminal job failures do not exit the worker: the
+recovering event handler owns its pause and resume lifecycle.
 
 ### AccountForDexTrade
 

@@ -83,6 +83,16 @@ pub use position::Position;
 pub fn check_positions_job_type() -> &'static str {
     std::any::type_name::<position_check::CheckPositions>()
 }
+/// Returns the apalis job type identifier for the `PollOrderStatus` job.
+#[cfg(any(test, feature = "test-support"))]
+pub fn poll_order_status_job_type() -> &'static str {
+    std::any::type_name::<offchain::order::poll_status::PollOrderStatus>()
+}
+/// Returns the apalis job type identifier for the `AccountForDexTrade` job.
+#[cfg(any(test, feature = "test-support"))]
+pub fn account_for_dex_trade_job_type() -> &'static str {
+    std::any::type_name::<trading::onchain::trade_accountant::AccountForDexTrade>()
+}
 #[cfg(any(test, feature = "test-support"))]
 pub use conductor::job::{FailureInjector, JobKind};
 #[cfg(any(test, feature = "test-support"))]

@@ -310,6 +310,17 @@ configured `apalis_finished_job_cleanup_interval_secs` cadence so the durable
 queue cannot grow without bound during normal operation or repeated restarts.
 The cadence must be explicitly configured and non-zero.
 
+Supervised apalis workers isolate terminal failures with a local recovering
+circuit. The middleware and durable queue share a four-attempt limit, so a job
+produces one terminal transition after exhausting its bounded retries and
+remains visible as a terminal Jobs row. The first consecutive terminal failure
+then pauses only that worker, sends an operator alert, and records a structured
+circuit transition with the worker name, error, failure count, and cooldown. The
+process and sibling workers remain live. After a five-minute cooldown, the same
+worker resumes without a process restart and records a structured recovery
+transition. A successful job resets the consecutive-failure count. Best-effort
+workers retain and log terminal jobs without pausing.
+
 Deployed systemd services must use bounded restart loops with a restart delay
 long enough to avoid runaway RPC consumption. After the restart limit is hit,
 the service stays stopped until an operator investigates.
@@ -2436,10 +2447,11 @@ misses) so a still-pending tx is never misclassified as dropped.
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across
 restarts). Once the bound is reached, the job propagates a
-`BurnRevertLimitReached` error so the circuit opens and the operator is alerted.
-Genuinely ambiguous failures (where the burn may have landed and `is_revert()`
-returns false, e.g. `MessageSentEventNotFound`) are never reclassified and
-always halt for operator review.
+`BurnRevertLimitReached` error so its worker circuit opens and the operator is
+alerted. Genuinely ambiguous failures (where the burn may have landed and
+`is_revert()` returns false, e.g. `MessageSentEventNotFound`) are never
+reclassified and always pause their worker for operator review before automatic
+recovery.
 
 **Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
 redrives), at the limit, and before any terminal non-redriven error propagates.
@@ -4080,6 +4092,12 @@ requests to the backend.
 The bot raises out-of-band alerts for conditions an operator must react to
 quickly. Alerting is **optional**: when its configuration is absent the bot runs
 normally with no alert channel and the alert monitors are not spawned.
+
+Worker-circuit signals answer two bounded on-call questions. “Which worker
+paused and why?” is answered by the circuit-open transition and its operator
+alert. “Did it recover without a process restart?” is answered by the matching
+structured recovery transition. Worker names and transition names are bounded
+fields; errors remain event details rather than metric labels.
 
 ### Gas balance monitoring
 

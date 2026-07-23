@@ -273,7 +273,7 @@ pub(crate) const INVENTORY_TOKEN_DECIMALS_MAX_RETRIES: usize = 3;
 /// code, or returns malformed data) is a genuine defect in that token and
 /// must not surface as an opaque `OnChainError::Evm`: `perform()` doesn't
 /// catch that variant, so apalis retries would exhaust and trip the
-/// conductor-wide fail-stop over a single misbehaving third-party token.
+/// worker circuit over a single misbehaving third-party token.
 ///
 /// But `EvmError::Contract` is *also* produced for pure transport failures
 /// (connection reset, timeout) when no revert data could be decoded --
@@ -488,7 +488,7 @@ impl OnchainTrade {
         // extreme raw amount from a misbehaving venue). Reclassified into
         // `InvalidInventoryAmount` rather than the top-level
         // `OnChainError::FloatConversion` `?` would otherwise resolve to, so
-        // `perform()` can skip this fill instead of fail-stopping.
+        // `perform()` can skip this fill instead of opening the worker circuit.
         //
         // Unlike the ClearV3/TakeOrderV3 path's `Float::from_raw` above,
         // `OperatorDeposit`/`OperatorWithdraw` amounts are raw fixed-decimal
@@ -507,7 +507,7 @@ impl OnchainTrade {
         // (`try_from_order_and_fill_details` above, which calls it directly
         // and leaves its Float-conversion failures uncaught by `perform()` --
         // there they come from the bot's own trusted order config, so such a
-        // failure indicates a real bug worth fail-stopping on). Here the
+        // failure indicates a real bug worth opening the worker circuit on). Here the
         // amounts are externally supplied, so reclassify only the
         // Float-conversion failures into the caught `InvalidInventoryAmount`
         // variant; everything else (e.g. `InvalidSymbolConfiguration`) passes
@@ -691,7 +691,7 @@ struct InventoryRecoveryConfig<'config> {
 
 /// Reclassifies a Float-conversion failure surfaced by the shared
 /// `TradeDetails::try_from_io` into [`TradeValidationError::InvalidInventoryAmount`]
-/// so `perform()` can skip the fill instead of fail-stopping. Only called
+/// so `perform()` can skip the fill instead of opening the worker circuit. Only called
 /// from [`OnchainTrade::try_from_inventory_trade`] -- the ClearV3/TakeOrderV3
 /// path calls `try_from_io` directly and leaves these variants uncaught,
 /// since a Float-conversion failure there comes from the bot's own trusted
@@ -985,7 +985,7 @@ pub(crate) enum TradeValidationError {
     /// Unlike ClearV3/TakeOrderV3, whose token addresses come from the bot's
     /// own trusted order config, these addresses come from any `OPERATOR_ROLE`
     /// holder on the shared inventory -- a non-standard or misconfigured
-    /// third-party token must not trip the conductor-wide fail-stop.
+    /// third-party token must not open the worker circuit.
     #[error("Failed to introspect InventoryTrade token {token}: {source}")]
     TokenIntrospectionFailed {
         token: Address,
@@ -997,7 +997,7 @@ pub(crate) enum TradeValidationError {
     /// model as `TokenIntrospectionFailed`: `OperatorDeposit`/
     /// `OperatorWithdraw` amounts come from any `OPERATOR_ROLE` holder, not
     /// the bot's own trusted order config, so a malformed or extreme
-    /// amount/decimals pair must not trip the conductor-wide fail-stop.
+    /// amount/decimals pair must not open the worker circuit.
     #[error("Failed to convert InventoryTrade amount: {0}")]
     InvalidInventoryAmount(#[source] FloatError),
     /// An `InventoryTrade` leg's token address does not match the configured
@@ -1005,7 +1005,7 @@ pub(crate) enum TradeValidationError {
     /// ClearV3/TakeOrderV3, whose token addresses come from the bot's own
     /// trusted order config, these addresses come from any `OPERATOR_ROLE`
     /// holder on the shared inventory -- a spoofed or misconfigured token
-    /// must not trip the conductor-wide fail-stop.
+    /// must not open the worker circuit.
     #[error(
         "InventoryTrade token {token} claims symbol '{claimed_symbol}' but does not match \
          the configured canonical address for that symbol"
@@ -2429,7 +2429,7 @@ mod tests {
     /// A genuine revert (malformed/malicious token) on `decimals()` must
     /// still be classified as `TokenIntrospectionFailed` so the fill is
     /// caught and skipped, rather than retried forever and eventually
-    /// tripping the conductor-wide fail-stop.
+    /// opening the worker circuit.
     #[tokio::test]
     async fn fetch_inventory_token_decimals_classifies_genuine_revert_as_token_introspection_failed()
      {

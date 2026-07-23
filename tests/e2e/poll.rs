@@ -518,6 +518,51 @@ pub async fn poll_for_running_job(
     }
 }
 
+/// Polls until a job of the given concrete type reaches an apalis terminal
+/// state, panicking if the bot dies or the timeout passes first.
+pub async fn poll_for_terminal_job(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    job_type: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("terminal {job_type} job");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let terminal: Result<(i64,), _> = sqlx::query_as(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? AND (status = 'Killed' \
+             OR (status = 'Failed' AND attempts >= max_attempts))",
+        )
+        .bind(job_type)
+        .fetch_one(&pool)
+        .await;
+
+        pool.close().await;
+
+        if matches!(terminal, Ok((count,)) if count >= 1) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Polls until the backfill checkpoint has advanced to at least
 /// `block`, panicking if the bot dies or the timeout passes first. Once
 /// the checkpoint passes a fill's block, the fill's accounting job row

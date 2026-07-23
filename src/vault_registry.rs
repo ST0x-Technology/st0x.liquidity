@@ -733,13 +733,20 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
+    use apalis::layers::WorkerBuilderExt;
+    use apalis::layers::retry::RetryPolicy;
+    use apalis::prelude::{Monitor, WorkerBuilder};
+    use apalis_core::worker::event::Event;
+    use apalis_core::worker::ext::event_listener::EventListenerExt;
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
 
     use super::*;
+    use crate::conductor::job::{FailureInjector, JobQueue, work};
     use crate::test_utils::{setup_test_db, setup_test_pools};
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
@@ -1744,18 +1751,6 @@ mod tests {
     // happened.
     #[tokio::test]
     async fn enqueued_job_retries_on_aggregate_command_failure() {
-        use apalis::layers::WorkerBuilderExt;
-        use apalis::layers::retry::RetryPolicy;
-        use apalis::prelude::{Monitor, WorkerBuilder};
-        use apalis_core::worker::event::Event;
-        use apalis_core::worker::ext::circuit_breaker::{
-            CircuitBreaker, config::CircuitBreakerConfig,
-        };
-        use apalis_core::worker::ext::event_listener::EventListenerExt;
-        use std::time::Duration;
-
-        use crate::conductor::job::{FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, JobQueue, work};
-
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let ctx = ctx_with_seeded_assets();
@@ -1775,17 +1770,12 @@ mod tests {
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
-                    let fail_stop = CircuitBreakerConfig::default()
-                        .with_failure_threshold(1)
-                        .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-
                     WorkerBuilder::new(format!("seed-vault-registry-test-{index}"))
                         .backend(queue_for_worker.clone().into_storage())
                         .data(ctx_for_worker.clone())
                         .data(injector_for_worker.clone())
                         .concurrency(1)
                         .retry(RetryPolicy::retries(3))
-                        .break_circuit_with(fail_stop)
                         .on_event(|ctx, event| {
                             if let Event::Error(_) = event {
                                 let _ = ctx.stop();
