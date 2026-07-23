@@ -233,8 +233,9 @@ where
     .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults);
 
     if let Some(rebalancing_service) = &rebalancing_service {
-        polling_service =
-            polling_service.with_pending_request_ownership(rebalancing_service.clone());
+        polling_service = polling_service
+            .with_pending_request_ownership(rebalancing_service.clone())
+            .with_fresh_offchain_usd_observer(rebalancing_service.clone());
     }
 
     let polling_service = Arc::new(polling_service);
