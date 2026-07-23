@@ -21,10 +21,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, warn};
 
+use st0x_bridge::cctp::CctpError;
 use st0x_evm::Wallet;
 use st0x_execution::AlpacaWalletError;
 use st0x_finance::Usdc;
@@ -90,6 +92,27 @@ const WITHDRAWAL_POLL_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60
 /// so a slower post-deadline cadence is harmless for funds in transit.
 const WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
+/// Duration after which repeated `MintRecoveryInconclusive` redrives page the
+/// operator via the notifier. Mirrors `WITHDRAWAL_POLL_ALERT_DEADLINE`: the
+/// deadline is durable, derived from whichever durable aggregate state the
+/// transfer resumed from (`Bridging`, `AwaitingAttestation`, `Attested`, or a
+/// post-burn `BridgingFailed`, all of which persist `initiated_at`), so the
+/// countdown survives restarts.
+///
+/// 4 hours gives generous headroom above the ~2-minute internal probe window
+/// (`MINT_RECOVERY_PROBES` x `MINT_RECOVERY_PROBE_INTERVAL` in the
+/// `st0x-bridge` crate) that `recover_already_minted` runs per attempt, while
+/// ensuring a durably degraded RPC endpoint or a nonce that never resolves
+/// surfaces well before it becomes a multi-day silent outage.
+const MINT_RECOVERY_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Redrive delay used AFTER the mint-recovery alert deadline has elapsed.
+/// Mirrors `WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY`: slows the cadence
+/// from `SETTLEMENT_REDRIVE_DELAY` (30 s) to prevent alert fatigue on the
+/// shared Telegram channel, while the guard stays held and the re-probe --
+/// idempotent against the same CCTP nonce -- keeps running.
+const MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
+
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
@@ -106,8 +129,123 @@ fn warn_threshold(max_redrives: u32) -> Option<u32> {
     (threshold < max_redrives).then_some(threshold)
 }
 
-fn withdrawal_poll_deadline_elapsed(elapsed: Option<Duration>) -> Option<Duration> {
-    elapsed.filter(|elapsed| *elapsed >= WITHDRAWAL_POLL_ALERT_DEADLINE)
+/// Returns `elapsed` unchanged when it has reached or passed `deadline`, or
+/// `None` otherwise. Shared by both the withdrawal-poll and mint-recovery
+/// alert deadlines (`WITHDRAWAL_POLL_ALERT_DEADLINE` /
+/// `MINT_RECOVERY_ALERT_DEADLINE`): each call site passes its own deadline
+/// constant so the alert-triggering logic is written once.
+fn deadline_elapsed(elapsed: Option<Duration>, deadline: Duration) -> Option<Duration> {
+    elapsed.filter(|elapsed| *elapsed >= deadline)
+}
+
+/// Which cross-venue USDC transfer direction hit a post-burn CCTP mint
+/// recovery that stayed inconclusive. The deadline math, notifier message
+/// template, and redrive enqueue are identical between directions; only the
+/// log label and the `stox transfer resume --direction` hint differ, so this
+/// enum carries those two differences as data instead of duplicating the
+/// surrounding logic per direction.
+#[derive(Debug, Clone, Copy)]
+enum MintRecoveryDirection {
+    /// Base -> Alpaca (hedging).
+    BaseToAlpaca,
+    /// Alpaca -> Base (market making).
+    AlpacaToBase,
+}
+
+impl MintRecoveryDirection {
+    /// Human-readable label for the `warn!` log and operator alert, e.g.
+    /// "Base->Alpaca".
+    fn label(self) -> &'static str {
+        match self {
+            Self::BaseToAlpaca => "Base->Alpaca",
+            Self::AlpacaToBase => "Alpaca->Base",
+        }
+    }
+
+    /// The `stox transfer resume --direction` flag value naming this
+    /// direction, for the manual-intervention hint in the alert message.
+    fn cli_flag(self) -> &'static str {
+        match self {
+            Self::BaseToAlpaca => "to-alpaca",
+            Self::AlpacaToBase => "to-raindex",
+        }
+    }
+}
+
+/// Reschedules a post-burn CCTP mint recovery that stayed inconclusive:
+/// unbounded and budget-free, escalating to an operator alert once
+/// `initiated_at` is past `MINT_RECOVERY_ALERT_DEADLINE`. Shared by
+/// `TransferUsdcToHedging::handle_mint_recovery_inconclusive` and
+/// `TransferUsdcToMarketMaking::handle_mint_recovery_inconclusive`, whose
+/// logic was otherwise byte-for-byte identical between the two directions
+/// (see `MintRecoveryDirection`'s doc for what actually differs).
+///
+/// The alert message reports `elapsed` as the transfer's total age since
+/// `initiated_at`, NOT as "time the mint has been inconclusive": `initiated_at`
+/// is stamped once at transfer start and carried unchanged through every
+/// earlier phase (withdrawal, burn, attestation), so a transfer that spent
+/// hours in an earlier phase before ever reaching mint recovery would
+/// otherwise report a misleadingly large "inconclusive" duration on its very
+/// first inconclusive probe. Phrasing it as total transfer age (with mint
+/// recovery named as the CURRENT stuck stage) keeps the message honest while
+/// still using `initiated_at` as the alert deadline -- anchoring the deadline
+/// to when the mint phase itself began would need a new durable timestamp,
+/// which is out of scope here (see the finding this addresses).
+async fn schedule_mint_recovery_redrive<Task>(
+    notifier: &Arc<dyn Notifier>,
+    job_queue: &mut JobQueue<Task>,
+    redriven_job: Task,
+    direction: MintRecoveryDirection,
+    id: UsdcRebalanceId,
+    initiated_at: DateTime<Utc>,
+    source: Box<CctpError>,
+) -> Result<(), QueuePushError>
+where
+    Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    // Mirror the `.ok()` pattern used for the withdrawal-poll deadline: a
+    // future `initiated_at` (clock skew after restart) makes `to_std()`
+    // return `Err`, treated as `None` so no spurious alert fires.
+    let elapsed = Utc::now().signed_duration_since(initiated_at).to_std().ok();
+    let alert_deadline_elapsed = deadline_elapsed(elapsed, MINT_RECOVERY_ALERT_DEADLINE);
+    let redrive_delay = if alert_deadline_elapsed.is_some() {
+        MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY
+    } else {
+        SETTLEMENT_REDRIVE_DELAY
+    };
+
+    let label = direction.label();
+    warn!(
+        target: "rebalance",
+        %id,
+        %source,
+        ?elapsed,
+        delay = ?redrive_delay,
+        "{label} USDC transfer: CCTP mint recovery inconclusive; rescheduling \
+         (guard held, redrive continues)"
+    );
+
+    if let Some(elapsed) = alert_deadline_elapsed {
+        let cli_flag = direction.cli_flag();
+        let message = format!(
+            "USDC transfer {id} ({label}): running for {elapsed:?} since it started \
+             (>{MINT_RECOVERY_ALERT_DEADLINE:?}); currently stuck at CCTP mint recovery \
+             -- nonce state unknown or mint receipt unreconstructible ({source}), the \
+             mint may already have landed. Transfer stays mid-flight (guard held), \
+             automatic redrive continues. Verify on-chain nonce/mint status before \
+             acting; use `stox transfer resume --kind usdc --id {id} --direction \
+             {cli_flag}` if the automatic redrive appears stuck."
+        );
+        if let Err(notify_err) = notifier.notify(&message).await {
+            warn!(
+                target: "rebalance",
+                ?notify_err,
+                "Failed to deliver mint-recovery-deadline-elapsed alert"
+            );
+        }
+    }
+
+    job_queue.push_with_delay(redriven_job, redrive_delay).await
 }
 
 /// Apalis queue type for [`TransferUsdcToHedging`].
@@ -304,21 +442,12 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // for slow on-chain settlement would be wrong. Mirrors the
             // market-making settlement-wait arm.
             //
-            // When `source` wraps a `CctpError::MintRecoveryInconclusive` (see
-            // `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive` in
-            // manager.rs), this redrive is UNBOUNDED with NO operator alert: a
-            // durably degraded RPC endpoint redrives here forever at
-            // `SETTLEMENT_REDRIVE_DELAY`, holding the `usdc_in_progress` guard the
-            // whole time, with only this `warn!` (never `ctx.notifier.notify`) to
-            // observe it. A deadline-based alert mirroring
-            // `WithdrawalPollInconclusive` is a deliberate, tracked follow-up (see
-            // `redrive_on_mint_recovery_inconclusive`'s doc for why it is not
-            // included here), not an oversight.
+            // A post-burn CCTP mint recovery whose outcome could not be
+            // determined is a DIFFERENT, dedicated variant --
+            // `UsdcTransferError::MintRecoveryInconclusive` (see the arm below)
+            // -- not wrapped in this one, so it gets its own deadline-based
+            // operator alert instead of redriving here silently forever.
             Err(UsdcTransferError::SettlementCheckTransient { id, source }) => {
-                // `source` is logged (not just the generic reason) so an
-                // operator watching this redrive can see, e.g., a
-                // `CctpError::MintRecoveryInconclusive` probe error directly,
-                // rather than only "settlement-phase RPC check failed".
                 warn!(
                     target: "rebalance",
                     %id,
@@ -330,6 +459,23 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                 let mut job_queue = ctx.job_queue.clone();
                 job_queue
                     .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
+                    .await?;
+            }
+            // Post-burn CCTP mint recovery inconclusive: the nonce state is
+            // unknown or the mint receipt could not be reconstructed (see
+            // `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive` in
+            // manager.rs). The aggregate stays in whatever durable pre-mint
+            // state it was already in, so this redrives unbounded and
+            // budget-free BEFORE the deadline; at or after
+            // `MINT_RECOVERY_ALERT_DEADLINE` the operator is paged on every
+            // redrive while the guard stays held and redriving continues (at a
+            // slower cadence, to avoid alert fatigue).
+            Err(UsdcTransferError::MintRecoveryInconclusive {
+                id,
+                initiated_at,
+                source,
+            }) => {
+                self.handle_mint_recovery_inconclusive(ctx, id, initiated_at, source)
                     .await?;
             }
             // Revert-class burn failures: safe to redrive because
@@ -663,6 +809,30 @@ impl TransferUsdcToHedging {
             .await?;
         Ok(())
     }
+
+    /// Handles a post-burn CCTP mint recovery that stayed inconclusive: reschedule
+    /// unbounded and budget-free, escalating to an operator alert once
+    /// `initiated_at` is past `MINT_RECOVERY_ALERT_DEADLINE`. Symmetric to
+    /// [`TransferUsdcToMarketMaking::handle_mint_recovery_inconclusive`].
+    async fn handle_mint_recovery_inconclusive(
+        &self,
+        ctx: &TransferUsdcToHedgingCtx,
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        source: Box<CctpError>,
+    ) -> Result<(), TransferUsdcToHedgingJobError> {
+        schedule_mint_recovery_redrive(
+            &ctx.notifier,
+            &mut ctx.job_queue.clone(),
+            self.clone(),
+            MintRecoveryDirection::BaseToAlpaca,
+            id,
+            initiated_at,
+            source,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// Dependencies the Alpaca->Base job needs. Symmetric to
@@ -787,21 +957,16 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     // This arm is unreachable; it exists only to satisfy exhaustiveness.
                     _ => unreachable!("outer or-pattern limits to settlement variants"),
                 };
-                // `settlement_err` (which for `SettlementCheckTransient` carries
-                // the boxed `CctpError` source, e.g. a
-                // `MintRecoveryInconclusive` probe error) is logged in full so
-                // an operator watching this redrive sees the underlying cause,
-                // not just the generic `reason` string.
+                // `settlement_err` is logged in full (not just the generic
+                // `reason` string) so an operator watching this redrive sees
+                // the underlying cause.
                 //
-                // When that source is `CctpError::MintRecoveryInconclusive` (see
-                // `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive`
-                // in manager.rs), this redrive is UNBOUNDED with NO operator
-                // alert: a durably degraded RPC endpoint redrives here forever at
-                // `SETTLEMENT_REDRIVE_DELAY`, holding the `usdc_in_progress` guard
-                // the whole time, with only this `warn!` (never
-                // `ctx.notifier.notify`) to observe it. A deadline-based alert
-                // mirroring `WithdrawalPollInconclusive` is a deliberate, tracked
-                // follow-up, not an oversight.
+                // A post-burn CCTP mint recovery whose outcome could not be
+                // determined is a DIFFERENT, dedicated variant --
+                // `UsdcTransferError::MintRecoveryInconclusive` (see the arm
+                // below) -- not wrapped in this one, so it gets its own
+                // deadline-based operator alert instead of redriving here
+                // silently forever.
                 warn!(
                     target: "rebalance",
                     %id,
@@ -812,6 +977,23 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                 let mut job_queue = ctx.job_queue.clone();
                 job_queue
                     .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
+                    .await?;
+            }
+            // Post-burn CCTP mint recovery inconclusive: the nonce state is
+            // unknown or the mint receipt could not be reconstructed (see
+            // `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive` in
+            // manager.rs). The aggregate stays in whatever durable pre-mint
+            // state it was already in, so this redrives unbounded and
+            // budget-free BEFORE the deadline; at or after
+            // `MINT_RECOVERY_ALERT_DEADLINE` the operator is paged on every
+            // redrive while the guard stays held and redriving continues (at a
+            // slower cadence, to avoid alert fatigue).
+            Err(UsdcTransferError::MintRecoveryInconclusive {
+                id,
+                initiated_at,
+                source,
+            }) => {
+                self.handle_mint_recovery_inconclusive(ctx, id, initiated_at, source)
                     .await?;
             }
             Err(UsdcTransferError::AttestationRetryDeadlineElapsed { id }) => {
@@ -1001,8 +1183,8 @@ impl TransferUsdcToMarketMaking {
         // Once past the deadline, slow the redrive cadence from 30 s to 30 min
         // so the operator page repeats at ~2/hour rather than ~120/hour. The
         // re-poll is idempotent so a slower cadence is safe.
-        let deadline_elapsed = withdrawal_poll_deadline_elapsed(elapsed);
-        let redrive_delay = if deadline_elapsed.is_some() {
+        let alert_deadline_elapsed = deadline_elapsed(elapsed, WITHDRAWAL_POLL_ALERT_DEADLINE);
+        let redrive_delay = if alert_deadline_elapsed.is_some() {
             WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY
         } else {
             WITHDRAWAL_POLL_REDRIVE_DELAY
@@ -1018,7 +1200,7 @@ impl TransferUsdcToMarketMaking {
              (aggregate stays in Withdrawing, guard held)"
         );
 
-        if let Some(elapsed) = deadline_elapsed {
+        if let Some(elapsed) = alert_deadline_elapsed {
             let message = format!(
                 "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
                  for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
@@ -1040,6 +1222,30 @@ impl TransferUsdcToMarketMaking {
             .clone()
             .push_with_delay(self.clone(), redrive_delay)
             .await?;
+        Ok(())
+    }
+
+    /// Handles a post-burn CCTP mint recovery that stayed inconclusive: reschedule
+    /// unbounded and budget-free, escalating to an operator alert once
+    /// `initiated_at` is past `MINT_RECOVERY_ALERT_DEADLINE`. Symmetric to
+    /// [`TransferUsdcToHedging::handle_mint_recovery_inconclusive`].
+    async fn handle_mint_recovery_inconclusive(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        source: Box<CctpError>,
+    ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        schedule_mint_recovery_redrive(
+            &ctx.notifier,
+            &mut ctx.job_queue.clone(),
+            self.clone(),
+            MintRecoveryDirection::AlpacaToBase,
+            id,
+            initiated_at,
+            source,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1155,7 +1361,6 @@ mod tests {
     use reqwest::StatusCode;
     use uuid::Uuid;
 
-    use st0x_bridge::cctp::CctpError;
     use st0x_evm::EvmError;
     use st0x_execution::{AlpacaTransferId, AlpacaWalletError};
     use st0x_float_macro::float;
@@ -1169,9 +1374,29 @@ mod tests {
         let elapsed = Some(WITHDRAWAL_POLL_ALERT_DEADLINE);
 
         assert_eq!(
-            withdrawal_poll_deadline_elapsed(elapsed),
+            deadline_elapsed(elapsed, WITHDRAWAL_POLL_ALERT_DEADLINE),
             Some(WITHDRAWAL_POLL_ALERT_DEADLINE),
             "the alert deadline comparison must be inclusive"
+        );
+    }
+
+    #[test]
+    fn mint_recovery_deadline_elapsed_includes_exact_boundary() {
+        let elapsed = Some(MINT_RECOVERY_ALERT_DEADLINE);
+
+        assert_eq!(
+            deadline_elapsed(elapsed, MINT_RECOVERY_ALERT_DEADLINE),
+            Some(MINT_RECOVERY_ALERT_DEADLINE),
+            "the alert deadline comparison must be inclusive"
+        );
+    }
+
+    #[test]
+    fn mint_recovery_deadline_elapsed_none_input_stays_none() {
+        assert_eq!(
+            deadline_elapsed(None, MINT_RECOVERY_ALERT_DEADLINE),
+            None,
+            "a None elapsed (e.g. future initiated_at from clock skew) must not elapse"
         );
     }
 
@@ -1368,6 +1593,83 @@ mod tests {
                     transfer_id: AlpacaTransferId::from(Uuid::new_v4()),
                     elapsed: Duration::from_secs(1800),
                 },
+            })
+        }
+    }
+
+    /// Stub that returns `MintRecoveryInconclusive` for every resume call, on
+    /// the Alpaca->Base (market-making) direction. `initiated_at` controls
+    /// whether the deadline check in the job handler fires an operator alert
+    /// (past deadline) or only logs a warning (before).
+    struct MintRecoveryInconclusiveAlpacaToBase {
+        initiated_at: DateTime<Utc>,
+    }
+
+    impl MintRecoveryInconclusiveAlpacaToBase {
+        fn before_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now(),
+            }
+        }
+
+        fn after_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now()
+                    - chrono::Duration::from_std(MINT_RECOVERY_ALERT_DEADLINE).unwrap()
+                    - chrono::Duration::seconds(1),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for MintRecoveryInconclusiveAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::MintRecoveryInconclusive {
+                id: id.clone(),
+                initiated_at: self.initiated_at,
+                source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            })
+        }
+    }
+
+    /// Stub that returns `MintRecoveryInconclusive` for every resume call, on
+    /// the Base->Alpaca (hedging) direction. Mirrors
+    /// `MintRecoveryInconclusiveAlpacaToBase`.
+    struct MintRecoveryInconclusiveBaseToAlpaca {
+        initiated_at: DateTime<Utc>,
+    }
+
+    impl MintRecoveryInconclusiveBaseToAlpaca {
+        fn before_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now(),
+            }
+        }
+
+        fn after_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now()
+                    - chrono::Duration::from_std(MINT_RECOVERY_ALERT_DEADLINE).unwrap()
+                    - chrono::Duration::seconds(1),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for MintRecoveryInconclusiveBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::MintRecoveryInconclusive {
+                id: id.clone(),
+                initiated_at: self.initiated_at,
+                source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
             })
         }
     }
@@ -1672,7 +1974,7 @@ mod tests {
         let after = Utc::now().timestamp();
 
         assert_eq!(
-            withdrawal_poll_deadline_elapsed(None),
+            deadline_elapsed(None, WITHDRAWAL_POLL_ALERT_DEADLINE),
             None,
             "future initiated_at maps to elapsed=None, so the deadline is not elapsed"
         );
@@ -1822,6 +2124,272 @@ mod tests {
             1,
             "WithdrawalPollInconclusive at exact deadline boundary must fire the operator alert \
              (>= comparison); got: {messages:?}"
+        );
+    }
+
+    /// `MintRecoveryInconclusive` before the alert deadline must schedule a
+    /// delayed redrive (one Pending row with `SETTLEMENT_REDRIVE_DELAY`) and
+    /// return `Ok` so the apalis retry budget is not consumed -- warn log
+    /// only, no operator alert. `revert_redrive_attempts` must not be
+    /// incremented (the redrive is unbounded and independent of the
+    /// burn-revert budget). Market-making (Alpaca->Base) direction.
+    #[tokio::test]
+    async fn market_making_job_redrives_on_mint_recovery_inconclusive() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(MintRecoveryInconclusiveAlpacaToBase::before_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "MintRecoveryInconclusive must enqueue exactly one delayed redrive job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "MintRecoveryInconclusive before deadline must not fire an operator alert, got: {:?}",
+            notifier.messages()
+        );
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, 0,
+            "MintRecoveryInconclusive must not increment revert_redrive_attempts: the redrive \
+             is unbounded and independent of the burn-revert budget"
+        );
+    }
+
+    /// `MintRecoveryInconclusive` at or after the alert deadline must fire an
+    /// operator alert via the notifier while STILL scheduling the delayed
+    /// redrive (at the slower post-deadline cadence) and returning `Ok`. The
+    /// guard stays held and redriving continues -- funds are already burned,
+    /// so silently giving up is not an option. Market-making (Alpaca->Base)
+    /// direction.
+    #[tokio::test]
+    async fn market_making_job_fires_alert_on_mint_recovery_deadline_elapsed() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(MintRecoveryInconclusiveAlpacaToBase::after_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "deadline-elapsed must still enqueue a delayed redrive job (guard stays held, \
+             redriving does not stop)"
+        );
+        let (_payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        assert!(
+            run_at
+                >= before
+                    + i64::try_from(MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap()
+                    - 5
+                && run_at
+                    <= after
+                        + i64::try_from(MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                            .unwrap()
+                        + 5,
+            "post-deadline redrive must use the longer {MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY:?} \
+             delay to prevent alert fatigue -- run_at={run_at} before={before} after={after}"
+        );
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "MintRecoveryInconclusive past deadline must fire exactly one operator alert, \
+             got: {messages:?}"
+        );
+        let alert = &messages[0];
+        assert!(
+            alert.contains(&job.id.to_string()),
+            "alert must contain the transfer id so the operator can act on it; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("stox transfer resume"),
+            "alert must contain the recovery command; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("to-raindex"),
+            "alert must contain the --direction flag; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("burn scan inconclusive") && alert.contains("99"),
+            "alert must contain the underlying CctpError source; got: {alert:?}"
+        );
+        // `initiated_at` is the transfer's START, carried unchanged through every
+        // earlier phase, NOT the moment mint recovery became inconclusive -- mint
+        // recovery is the LAST phase, so `elapsed` can already exceed the alert
+        // deadline on the very first inconclusive probe. The message must report
+        // it honestly as total transfer age with mint recovery named as the
+        // current stuck stage, not as "mint recovery inconclusive for {elapsed}"
+        // (which would overstate how long the mint itself has been stuck).
+        assert!(
+            alert.contains("running for")
+                && alert.contains("currently stuck at CCTP mint recovery"),
+            "alert must report elapsed as total transfer age (mint recovery is the current \
+             stage), not as the duration the mint itself has been inconclusive; got: {alert:?}"
+        );
+    }
+
+    /// Mirrors `market_making_job_redrives_on_mint_recovery_inconclusive` for the
+    /// hedging (Base->Alpaca) direction: a `MintRecoveryInconclusive` before the
+    /// deadline must redrive budget-free with no alert.
+    #[tokio::test]
+    async fn hedging_job_redrives_on_mint_recovery_inconclusive() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(MintRecoveryInconclusiveBaseToAlpaca::before_deadline()),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            1,
+            "MintRecoveryInconclusive must enqueue exactly one delayed redrive job"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "MintRecoveryInconclusive before deadline must not fire an operator alert, got: {:?}",
+            notifier.messages()
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, 0,
+            "MintRecoveryInconclusive must not increment revert_redrive_attempts"
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Mirrors `market_making_job_fires_alert_on_mint_recovery_deadline_elapsed`
+    /// for the hedging (Base->Alpaca) direction.
+    #[tokio::test]
+    async fn hedging_job_fires_alert_on_mint_recovery_deadline_elapsed() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(MintRecoveryInconclusiveBaseToAlpaca::after_deadline()),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            1,
+            "deadline-elapsed must still enqueue a delayed redrive job (guard stays held, \
+             redriving does not stop)"
+        );
+        let (_payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        assert!(
+            run_at
+                >= before
+                    + i64::try_from(MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap()
+                    - 5
+                && run_at
+                    <= after
+                        + i64::try_from(MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                            .unwrap()
+                        + 5,
+            "post-deadline redrive must use the longer {MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY:?} \
+             delay -- run_at={run_at} before={before} after={after}"
+        );
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "MintRecoveryInconclusive past deadline must fire exactly one operator alert, \
+             got: {messages:?}"
+        );
+        let alert = &messages[0];
+        assert!(
+            alert.contains(&job.id.to_string()),
+            "alert must contain the transfer id so the operator can act on it; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("to-alpaca"),
+            "alert must contain the --direction flag; got: {alert:?}"
+        );
+        // See the matching assertion in
+        // `market_making_job_fires_alert_on_mint_recovery_deadline_elapsed` for why
+        // this must be phrased as total transfer age, not mint-inconclusive duration.
+        assert!(
+            alert.contains("running for")
+                && alert.contains("currently stuck at CCTP mint recovery"),
+            "alert must report elapsed as total transfer age (mint recovery is the current \
+             stage), not as the duration the mint itself has been inconclusive; got: {alert:?}"
         );
     }
 

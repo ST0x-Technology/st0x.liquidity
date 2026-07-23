@@ -2369,7 +2369,21 @@ enum BridgeStage { Burn, Attestation, Mint }
   again; or `BridgingFailed` when recovering an already-failed post-burn
   transfer, whose next redrive re-attempts the mint directly instead
   (idempotency there comes from CCTP's nonce being authoritative, not from that
-  bounded scan)
+  bounded scan). The job layer schedules an unbounded delayed redrive (like the
+  settlement-phase RPC-transient case above) rather than consuming the apalis
+  retry budget, since the mint may already have landed and re-probing is
+  idempotent. **Operator alert (deadline-based)**: at or after 4 hours of
+  inconclusive mint recovery (measured from the durable `initiated_at` carried
+  by whichever of `Bridging`/`AwaitingAttestation`/`Attested`/`BridgingFailed`
+  the transfer resumed from, so the countdown survives restarts) the job begins
+  paging the operator on every redrive, at a slower cadence (30 minutes instead
+  of 30 seconds, to avoid alert fatigue) while still keeping the guard held and
+  continuing to redrive -- the funds are already burned, so the redrive never
+  stops on its own; only manual `transfer resume`/`transfer reconcile` ends it.
+  The 4-hour threshold mirrors the withdrawal-poll alert deadline, giving
+  generous headroom above the ~2-minute internal probe window while surfacing a
+  durably degraded RPC endpoint or a permanently unresolved nonce well before it
+  becomes a multi-day silent outage
 - Destination deposit must be confirmed to complete rebalancing (for
   AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)
 - Can mark failed from any non-terminal state
