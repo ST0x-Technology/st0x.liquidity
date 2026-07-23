@@ -143,7 +143,8 @@ pub enum TradeOutcome {
 }
 
 /// A completed onchain fill or terminal offchain counter-trade.
-#[derive(Debug, Clone, TS)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct Trade {
     /// Unique identifier for deduplication on reconnect.
     /// Onchain: `"tx_hash:log_index"`. Offchain: offchain order aggregate ID.
@@ -291,6 +292,30 @@ mod tests {
         assert_eq!(json["occurredAt"], json!("2023-11-14T22:13:20Z"));
         assert_eq!(json["filledAt"], json!("2023-11-14T22:13:20Z"));
         assert_eq!(json["outcome"], json!({ "status": "filled" }));
+    }
+
+    #[test]
+    fn trade_roundtrips_through_persistent_job_payload() {
+        let trade = Trade {
+            id: "durable-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Sell,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: FractionalShares::new(float!(5.5)),
+            outcome: TradeOutcome::Filled,
+        };
+
+        let payload = serde_json::to_vec(&trade).unwrap();
+        let restored: Trade = serde_json::from_slice(&payload).unwrap();
+
+        assert_eq!(restored.id, trade.id);
+        assert_eq!(restored.occurred_at, trade.occurred_at);
+        assert_eq!(restored.venue, trade.venue);
+        assert_eq!(restored.direction, trade.direction);
+        assert_eq!(restored.symbol, trade.symbol);
+        assert_eq!(restored.shares, trade.shares);
+        assert_eq!(restored.outcome, trade.outcome);
     }
 
     #[test]

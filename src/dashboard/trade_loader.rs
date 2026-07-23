@@ -15,6 +15,15 @@ const MAX_TRADES: usize = 100;
 ///
 /// Returns up to [`MAX_TRADES`] trades sorted by fill time (newest first).
 pub(crate) async fn load_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
+    let mut trades = load_all_trades(pool).await?;
+
+    trades.truncate(MAX_TRADES);
+
+    Ok(trades)
+}
+
+/// Loads every terminal trade for delivery-ledger reconciliation.
+pub(crate) async fn load_all_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
     let mut trades: Vec<Trade> = load_onchain_trades(pool)
         .await?
         .into_iter()
@@ -22,7 +31,6 @@ pub(crate) async fn load_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHi
         .collect();
 
     sort_trades_newest_first(&mut trades);
-    trades.truncate(MAX_TRADES);
 
     Ok(trades)
 }

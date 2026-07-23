@@ -4021,6 +4021,23 @@ multiple broker-specific contexts.
    sub-millisecond precision, then uses the same stable trade-ID tie-breaker for
    initial history and live updates.
 
+   Terminal trade live updates are delivered through a persistent delivery
+   ledger and job queue, not directly from the CQRS reactor. The ledger is keyed
+   by trade ID. The reactor attempts to register the outcome and idempotently
+   enqueue its delivery job. A supervised handoff monitor retains and retries an
+   outcome when that durable insertion fails while the process remains alive;
+   startup also reconciles the complete authoritative trade history into the
+   ledger and queue, closing the remaining process-crash window between event
+   persistence and job insertion. Before workers start, unfinished and
+   retry-exhausted delivery jobs become pending again. A job records
+   `delivered_at` only after publishing; failure to read or update that durable
+   state uses the standard supervised-worker retry policy, and exhaustion is a
+   fail-stop condition reported through the conductor monitor. Re-delivery is
+   permitted: the dashboard merges trade updates by trade ID, making a retry or
+   crash replay idempotent from the operator's point of view. Publishing with no
+   connected WebSocket receivers is successful because the next connection
+   obtains the same terminal outcome from its initial-state snapshot.
+
 5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
    event type, timestamp). Starts empty, populates via WebSocket.
 
