@@ -1865,17 +1865,12 @@ mod tests {
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_float_macro::float;
-    use st0x_tokenization::IssuerRequestId;
-    use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::MockWrapper;
+    use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
 
     use super::*;
     use crate::offchain::order::OffchainOrderEvent;
-    use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::{positive_shares, setup_test_db};
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
-    use crate::vault_lookup::MockVaultLookup;
 
     fn create_test_ctx() -> Ctx {
         Ctx {
@@ -2657,28 +2652,23 @@ mod tests {
         let operation_id = Uuid::new_v4();
 
         // Seed a real TokenizedEquityMint event stream by sending the
-        // fixture-only `RequestMintAt` command through the aggregate's own
-        // store -- never a raw `events` INSERT -- so the replay path folds
-        // the exact event shapes/sequence the live system would produce.
-        // The default `MockTokenizer` accepts the request, so this emits
-        // both `MintRequested` and `MintAccepted`.
+        // fixture-only `RecordMintRequestedAt` command through the aggregate's
+        // own store -- never a raw `events` INSERT -- so the replay path folds
+        // the exact event shapes/sequence the live system would produce. It
+        // emits both `MintRequested` and `MintAccepted`.
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(EquityTransferServices {
-                raindex: Arc::new(MockRaindex::new()),
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                tokenizer: Arc::new(MockTokenizer::new()),
-                wrapper: Arc::new(MockWrapper::new()),
-            })
+            .build(())
             .await
             .unwrap();
         store
             .send(
                 &IssuerRequestId(operation_id),
-                TokenizedEquityMintCommand::RequestMintAt {
+                TokenizedEquityMintCommand::RecordMintRequestedAt {
                     issuer_request_id: IssuerRequestId(operation_id),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(5),
                     wallet: Address::repeat_byte(0x11),
+                    tokenization_request_id: tokenization_request_id("rebuild-view-tok"),
                     requested_at: Utc::now(),
                 },
             )

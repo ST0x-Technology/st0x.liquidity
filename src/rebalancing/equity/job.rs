@@ -438,17 +438,12 @@ mod tests {
     use st0x_config::{EquityAssetConfig, OperationMode};
     use st0x_event_sorcery::test_store;
     use st0x_float_macro::float;
-    use st0x_raindex::Raindex;
-    use st0x_tokenization::issuer_request_id;
-    use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::{MockWrapper, Wrapper};
+    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
 
     use super::*;
     use crate::equity_redemption::redemption_aggregate_id;
-    use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::equity::{EquityTransferServices, MintError};
+    use crate::rebalancing::equity::MintError;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
-    use crate::vault_lookup::MockVaultLookup;
 
     /// Builds a test ctx with recovery enabled for AAPL and an empty guard map.
     async fn test_ctx(
@@ -463,15 +458,7 @@ mod tests {
         recovery_mode: OperationMode,
     ) -> TransferEquityToMarketMakingCtx {
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let transfer_services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: wrapper.clone(),
-        };
-        let mint_store = Arc::new(test_store(pool, transfer_services));
+        let mint_store = Arc::new(test_store(pool, ()));
 
         let aapl_config = EquityAssetConfig {
             tokenized_equity: Address::ZERO,
@@ -650,20 +637,28 @@ mod tests {
         ctx.mint_store
             .send(
                 issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-wrapped"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         ctx.mint_store
             .send(
@@ -804,24 +799,33 @@ mod tests {
             .unwrap()
             .insert(symbol.clone(), GuardState::ActiveTransfer { generation: 0 });
 
-        // Drive the aggregate to TokensReceived (RequestMint + Poll) but do NOT wrap.
+        // Drive the aggregate to TokensReceived (RecordMintRequested +
+        // RecordTokensReceived) but do NOT wrap.
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_id.clone(),
@@ -861,20 +865,28 @@ mod tests {
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         ctx.mint_store
             .send(
@@ -926,20 +938,28 @@ mod tests {
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         // Simulate the timeout sweeper clearing this job's slot and a NEW
         // transfer reclaiming it with a fresh generation before PostReceipt runs.
@@ -991,20 +1011,28 @@ mod tests {
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_id.clone(),
@@ -1056,20 +1084,28 @@ mod tests {
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         ctx.mint_store
             .send(
@@ -1129,20 +1165,28 @@ mod tests {
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_id.clone(),
@@ -1176,20 +1220,28 @@ mod tests {
         ctx.mint_store
             .send(
                 &issuer_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("seed-tokens-received"),
                 },
             )
             .await
-            .expect("RequestMint must persist");
+            .expect("RecordMintRequested must persist and accept the mint");
 
         ctx.mint_store
-            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RecordTokensReceived {
+                    tx_hash: Some(TxHash::repeat_byte(0x11)),
+                    token_symbol: Some(format!("t{symbol}")),
+                    fees: None,
+                },
+            )
             .await
-            .expect("Poll must transition to TokensReceived");
+            .expect("RecordTokensReceived must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_id.clone(),

@@ -1140,20 +1140,15 @@ mod tests {
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
-    use st0x_raindex::Raindex;
     use st0x_tokenization::IssuerRequestId;
-    use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
     use crate::equity_redemption::RedemptionAggregateId;
-    use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{
-        EquityTransferServices, MintError, MintTransferError, RedemptionError,
-        ResumeEquityToHedging, ResumeEquityToMarketMaking,
+        MintError, MintTransferError, RedemptionError, ResumeEquityToHedging,
+        ResumeEquityToMarketMaking,
     };
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
-    use crate::vault_lookup::MockVaultLookup;
 
     struct PoisonThenHealthyRedemptionResume {
         poison_id: RedemptionAggregateId,
@@ -1230,19 +1225,10 @@ mod tests {
         transfer: Arc<dyn ResumeEquityToMarketMaking>,
         cqrs_pool: sqlx::SqlitePool,
     ) -> Arc<TransferEquityToMarketMakingCtx> {
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let services = EquityTransferServices {
-            raindex,
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper,
-        };
-
         Arc::new(TransferEquityToMarketMakingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            mint_store: Arc::new(test_store(cqrs_pool, services)),
+            mint_store: Arc::new(test_store(cqrs_pool, ())),
             equities_config: EquitiesConfig::default(),
         })
     }

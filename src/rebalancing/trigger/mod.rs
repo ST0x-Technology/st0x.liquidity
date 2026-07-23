@@ -5244,7 +5244,6 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
-    use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
 
@@ -5260,7 +5259,6 @@ mod tests {
     use crate::inventory::view::{InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
-    use crate::onchain::mock::MockRaindex;
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::rebalancing_enabled_equities;
@@ -5268,7 +5266,6 @@ mod tests {
     use crate::usdc_rebalance::{
         ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
-    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistryCommand;
 
     #[test]
@@ -13428,10 +13425,7 @@ mod tests {
     ) {
         service
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool,
                     EquityTransferServices::panicking(),
@@ -14022,26 +14016,19 @@ mod tests {
 
     /// Drives a `TokenizedEquityMint` aggregate to `Failed` state (terminal).
     ///
-    /// Uses `MockTokenizer` so `RequestMint` succeeds (returns `MintAccepted`),
-    /// then `FailAcceptance` drives it to `Failed` without calling any other service.
+    /// `RecordMintRequested` emits `MintRequested` + `MintAccepted` without
+    /// calling any service, then `FailAcceptance` drives it to `Failed`.
     async fn seed_terminal_mint_aggregate(pool: &SqlitePool, mint_id: &IssuerRequestId) {
-        let store = test_store::<TokenizedEquityMint>(
-            pool.clone(),
-            EquityTransferServices {
-                raindex: Arc::new(MockRaindex::new()),
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                tokenizer: Arc::new(MockTokenizer::new()),
-                wrapper: Arc::new(MockWrapper::new()),
-            },
-        );
+        let store = test_store::<TokenizedEquityMint>(pool.clone(), ());
         store
             .send(
                 mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("terminal-mint-tok"),
                 },
             )
             .await
@@ -14059,26 +14046,19 @@ mod tests {
 
     /// Drives a `TokenizedEquityMint` aggregate to `MintAccepted` state (non-terminal).
     ///
-    /// Same services as `seed_terminal_mint_aggregate`; stops before the failure
+    /// Same seeding as `seed_terminal_mint_aggregate`; stops before the failure
     /// so the aggregate is still live and holds the duplicate-protection guard.
     async fn seed_nonterminal_mint_aggregate(pool: &SqlitePool, mint_id: &IssuerRequestId) {
-        let store = test_store::<TokenizedEquityMint>(
-            pool.clone(),
-            EquityTransferServices {
-                raindex: Arc::new(MockRaindex::new()),
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                tokenizer: Arc::new(MockTokenizer::new()),
-                wrapper: Arc::new(MockWrapper::new()),
-            },
-        );
+        let store = test_store::<TokenizedEquityMint>(pool.clone(), ());
         store
             .send(
                 mint_id,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::RecordMintRequested {
                     issuer_request_id: mint_id.clone(),
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     wallet: Address::ZERO,
+                    tokenization_request_id: tokenization_request_id("nonterminal-mint-tok"),
                 },
             )
             .await
@@ -14260,7 +14240,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14318,7 +14298,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14376,7 +14356,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14430,7 +14410,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14523,7 +14503,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14584,7 +14564,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14636,7 +14616,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14688,7 +14668,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -14765,7 +14745,7 @@ mod tests {
         attach_equity_stores(
             &service,
             pool.clone(),
-            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<TokenizedEquityMint>(pool.clone(), ()),
             test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
         )
         .await;
@@ -15042,10 +15022,7 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -15168,10 +15145,7 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -15269,10 +15243,7 @@ mod tests {
 
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -15441,10 +15412,7 @@ mod tests {
         let store = Arc::new(store);
         trigger
             .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                Arc::new(test_store::<TokenizedEquityMint>(pool.clone(), ())),
                 Arc::new(test_store::<EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -15546,10 +15514,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    unmigrated_pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(unmigrated_pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     unmigrated_pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -15621,10 +15586,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    unmigrated_pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(unmigrated_pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     unmigrated_pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -15738,10 +15700,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -16088,10 +16047,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -16288,10 +16244,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -16442,10 +16395,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
@@ -17019,10 +16969,7 @@ mod tests {
             .set_stores(
                 Arc::new(test_store::<
                     crate::tokenized_equity_mint::TokenizedEquityMint,
-                >(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
+                >(pool.clone(), ())),
                 Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
                     pool.clone(),
                     crate::rebalancing::equity::EquityTransferServices::panicking(),
