@@ -226,6 +226,20 @@ fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
                 "Failed to build PnL report".to_string(),
             )
         }
+        PnlError::PortfolioSnapshot(error) => {
+            error!(%error, "Failed to load portfolio snapshot data for PnL report");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build PnL report".to_string(),
+            )
+        }
+        PnlError::CapitalFloat(error) => {
+            error!(%error, "Failed to convert a PnL total for capital/return computation");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build PnL report".to_string(),
+            )
+        }
     }
 }
 
@@ -1760,20 +1774,26 @@ pub(crate) fn routes() -> Router<AppState> {
 mod tests {
     use std::sync::Arc;
 
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, TxHash};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use chrono::{NaiveDate, TimeZone};
+    use chrono_tz::America::New_York;
     use httpmock::Method::GET;
     use tokio::sync::broadcast;
     use tower::ServiceExt;
     use uuid::uuid;
 
-    use st0x_config::{BrokerCtx, Ctx, RestApiCtx, create_test_ctx_with_order_owner};
-    use st0x_event_sorcery::ReactorHarness;
+    use st0x_config::{
+        BrokerCtx, Ctx, ExecutionThreshold, RestApiCtx, create_test_ctx_with_order_owner,
+    };
+    use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
-        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, TimeInForce,
+        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
+        SupportedExecutor, Symbol, TimeInForce,
     };
+    use st0x_finance::Usd;
     use st0x_float_macro::float;
     use st0x_tokenization::{
         MintVerificationError, TokenizerError, issuer_request_id, tokenization_request_id,
@@ -1781,10 +1801,17 @@ mod tests {
 
     use super::*;
     use crate::dashboard;
-    use crate::inventory::{self, BroadcastingInventory};
+    use crate::inventory::{
+        self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+    };
     use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
     use crate::performance::equity_timing::EquityTimingProjection;
     use crate::performance::reliability::LifecycleFailureProjection;
+    use crate::portfolio_snapshot::{
+        PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
+        PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
+    };
+    use crate::position::{Position, PositionCommand, TradeId};
     use crate::tokenized_equity_mint::TokenizedEquityMint;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
@@ -2318,6 +2345,228 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         account_activity_mock.assert_calls(0);
+    }
+
+    fn portfolio_snapshot_usdc_row(
+        amount: i64,
+        captured_at: chrono::DateTime<Utc>,
+    ) -> PortfolioBalanceRowWithMark {
+        PortfolioBalanceRowWithMark {
+            row: PortfolioBalanceRow {
+                location: PortfolioLocation::MarketMaking,
+                asset: PortfolioAsset::Usdc,
+                available: float!(&amount.to_string()),
+                inflight: float!(0),
+            },
+            usd_mark: Some(float!(1)),
+            mark_captured_at: Some(captured_at),
+        }
+    }
+
+    /// Seeds a real onchain-sell/offchain-buy hedge pair for `RKLB` through
+    /// the `Position` aggregate's own commands (`Store::send`, never a raw
+    /// `events` INSERT -- direct writes to that table are forbidden, see
+    /// docs/cqrs.md). Onchain sell at 10, offchain buy at 8: a 2-per-share
+    /// realized spread, matching this test's `grossRealizedPnlUsd` assertion.
+    async fn seed_position_pnl_fill(pool: &SqlitePool, symbol: &Symbol) {
+        let (position, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let threshold = ExecutionThreshold::whole_share();
+        let block_timestamp = Utc.with_ymd_and_hms(2026, 3, 8, 14, 0, 0).unwrap();
+        let broker_timestamp = Utc.with_ymd_and_hms(2026, 3, 8, 14, 1, 0).unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let one_share = Positive::new(FractionalShares::new(float!(1))).unwrap();
+
+        position
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: TxHash::with_last_byte(1),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Sell,
+                    price_usdc: float!(10),
+                    block_timestamp,
+                    seen_at: block_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                symbol,
+                PositionCommand::PlaceOffChainOrderAt {
+                    offchain_order_id,
+                    shares: one_share,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::DryRun,
+                    threshold,
+                    placed_at: block_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id,
+                    shares_filled: one_share,
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("test-fill"),
+                    price: Usd::new(float!(8)),
+                    broker_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// End-to-end `/pnl` coverage for capital/return-on-capital figures: three
+    /// portfolio_snapshot days are captured through the real
+    /// aggregate (`Store::send`, never raw SQL), each `captured_at` built
+    /// from the actual "just after ET midnight" local time (mirroring
+    /// `write.rs`'s `CAPTURE_BUFFER` scheme) across the actual 2026 US DST
+    /// spring-forward Sunday (March 8) -- so the UTC offset genuinely shifts
+    /// between the March 8 and March 9 captures -- and each row's aggregate
+    /// id is derived through the same DST-aware [`et_day`] the production
+    /// job uses, not assumed from the loop variable. The response is
+    /// asserted at the JSON boundary so camelCase field naming is verified
+    /// too.
+    #[tokio::test]
+    async fn pnl_endpoint_reports_capital_from_persisted_portfolio_snapshots() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let portfolio_snapshot_store = StoreBuilder::<PortfolioSnapshot>::new(state.pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(
+                state.pool.clone(),
+            )))
+            .build(())
+            .await
+            .unwrap();
+
+        for (year, month, day, amount) in
+            [(2026, 3, 7, 1000), (2026, 3, 8, 2000), (2026, 3, 9, 3000)]
+        {
+            let captured_at = New_York
+                .with_ymd_and_hms(year, month, day, 0, 5, 0)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc);
+            let target_et_day = et_day(captured_at);
+            assert_eq!(
+                target_et_day,
+                NaiveDate::from_ymd_opt(year, month, day).unwrap(),
+                "captured_at should round-trip to the same calendar day it was built from, \
+                 proving et_day resolves the correct EST/EDT offset either side of the \
+                 spring-forward transition"
+            );
+            portfolio_snapshot_store
+                .send(
+                    &PortfolioSnapshotId(target_et_day),
+                    PortfolioSnapshotCommand::Capture {
+                        captured_at,
+                        rows: vec![portfolio_snapshot_usdc_row(amount, captured_at)],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+
+        let app = build_app(state);
+
+        let inclusive_range = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/pnl?fromDate=2026-03-07&toDate=2026-03-09")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inclusive_range.status(), StatusCode::OK);
+        let body = body_to_string(inclusive_range).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["capital"]["sampleDays"], serde_json::json!(3));
+        assert_eq!(report["capital"]["coverageDays"], serde_json::json!(3));
+        assert_eq!(
+            report["capital"]["averageDeployedCapitalUsd"],
+            serde_json::json!("2000")
+        );
+        assert_eq!(
+            report["capital"]["firstSnapshotDay"],
+            serde_json::json!("2026-03-07")
+        );
+        assert_eq!(
+            report["capital"]["lastSnapshotDay"],
+            serde_json::json!("2026-03-09")
+        );
+        assert_eq!(
+            report["summary"]["gross_realized_pnl_usd"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["summary"]["grossRealizedPnlUsd"],
+            serde_json::json!("2")
+        );
+
+        let no_bounds = app
+            .clone()
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(no_bounds.status(), StatusCode::OK);
+        let body = body_to_string(no_bounds).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["capital"]["sampleDays"], serde_json::json!(3));
+        assert_eq!(
+            report["capital"]["averageDeployedCapitalUsd"],
+            serde_json::json!("2000")
+        );
+
+        let dst_day_only = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pnl?fromDate=2026-03-08&toDate=2026-03-08")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dst_day_only.status(), StatusCode::OK);
+        let body = body_to_string(dst_day_only).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["capital"]["sampleDays"], serde_json::json!(1));
+        assert_eq!(report["capital"]["coverageDays"], serde_json::json!(1));
+        assert_eq!(
+            report["capital"]["averageDeployedCapitalUsd"],
+            serde_json::json!("2000")
+        );
+        assert_eq!(
+            report["capital"]["annualizedReturnPct"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["capital"]["firstSnapshotDay"],
+            serde_json::json!("2026-03-08")
+        );
+        assert_eq!(
+            report["capital"]["lastSnapshotDay"],
+            serde_json::json!("2026-03-08")
+        );
     }
 
     fn write_test_logs(dir: &std::path::Path, filename: &str, content: &str) {

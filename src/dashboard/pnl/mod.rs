@@ -29,11 +29,24 @@ const ATTRIBUTION_WARNING: &str = "PnL source: realized gross replay from persis
      execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and \
      attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently \
      persisted.";
-const BASELINE_WARNING: &str = "Displayed PnL is realized by lot close date from persisted fills. Baseline drift, percentage \
-     return, and true period/NAV PnL require a persisted portfolio state vector, price vector, and \
-     cash-flow events; those are not currently persisted, so baseline drift and percentage return \
-     are not reported. Reconciliation diagnostics compare the replay against the current \
-     position_view, not a historical position_view snapshot.";
+// Percentage return is now sometimes available (see `capital`, backed by
+// persisted daily portfolio snapshots), so the unconditional "not currently
+// persisted" claim about it was split out into CAPITAL_AVAILABLE_NOTE /
+// CAPITAL_UNAVAILABLE_NOTE in source.rs, appended per-query.
+const BASELINE_WARNING: &str = "Displayed PnL is realized by lot close date from persisted fills. Baseline drift and true \
+     period/NAV PnL require a persisted portfolio state vector, price vector, and cash-flow \
+     events; those are not currently persisted, so baseline drift and true period/NAV PnL are not \
+     reported. Reconciliation diagnostics compare the replay against the current position_view, \
+     not a historical position_view snapshot.";
+const CAPITAL_AVAILABLE_NOTE: &str = "Average deployed capital is computed from persisted daily portfolio snapshots (see `capital`); \
+     annualized return on capital is computed only when the sample and full-range coverage \
+     requirements are met. Days with a missing or stale USD mark are excluded from the sample and \
+     named in the warnings above.";
+const CAPITAL_UNAVAILABLE_NOTE: &str = "Average deployed capital and annualized return on capital are not available for this query; \
+     see the warnings above for why (no snapshot coverage in range, every sampled day excluded, or \
+     average deployed capital is zero).";
+const SYMBOL_FILTERED_CAPITAL_WARNING: &str = "Capital and return on capital are not computed for symbol-filtered queries: a symbol-scoped \
+     slice of whole-portfolio capital is not a meaningful denominator.";
 const COST_WARNING: &str = "Tracked costs and revenues are built bottom-up by economic bucket. On-chain netting and raw \
      directional drift have no direct bot-paid execution cost. USD and USDC are treated as \
      equivalent reporting currency, so USD/USDC conversion basis is not modeled as PnL; only \
