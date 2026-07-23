@@ -72,7 +72,7 @@
       class="mx-2 mt-2 rounded-md border border-destructive bg-destructive/10
         px-4 py-2 text-sm text-destructive md:mx-4"
     >
-      Connection error. Reconnecting in {countdown}s (attempt {errorContext.attempts})...
+      {errorContext.message}. Reconnecting in {countdown}s (attempt {errorContext.attempts})...
     </div>
   {/if}
 

@@ -2,8 +2,9 @@ import { FiniteStateMachine } from 'runed'
 import type { QueryClient } from '@tanstack/svelte-query'
 import type { Statement } from '$lib/api/Statement'
 import { isStatement } from '$lib/api/StatementGuard'
-import { matcher } from '$lib/fp'
+import { matcher, tryCatch } from '$lib/fp'
 import { reactive } from '$lib/frp.svelte'
+import { parseCanonicalTrade, parseLegacyTrade, parseTradeEntries } from '$lib/trade-payload'
 import { seedTrades, appendTrade } from './trades'
 import { seedInventory, updateSnapshot, upsertPosition } from './inventory'
 import { seedTransfers, upsertTransfer } from './transfers'
@@ -28,32 +29,49 @@ const getReconnectDelay = (attempts: number): number =>
 export type ErrorContext = {
   attempts: number
   nextRetryMs: number
+  message: string
 }
 
 export const createWebSocket = (url: string, queryClient: QueryClient) => {
   const protocolUrl = withTradeProtocol(url)
   let socket: WebSocket | null = null
   let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
+  let failureMessage = 'WebSocket connection error'
   const reconnectAttempts = reactive(0)
   const error = reactive<ErrorContext | null>(null)
+
+  const markHealthy = () => {
+    reconnectAttempts.update(() => 0)
+    error.update(() => null)
+  }
 
   const handleMessage = (msg: Statement) => {
     matchMessage(msg, {
       current_state: ({ data }) => {
-        seedTrades(queryClient, data)
         seedInventory(queryClient, data)
         seedTransfers(queryClient, data)
+        seedTrades(queryClient, parseTradeEntries(data.trades))
       },
 
-      trade_update: ({ data }) => { appendTrade(queryClient, data); },
+      trade_update: ({ data }) => {
+        appendTrade(queryClient, parseCanonicalTrade(data))
+      },
 
-      trade_fill: ({ data }) => { appendTrade(queryClient, data); },
+      trade_fill: ({ data }) => {
+        appendTrade(queryClient, parseLegacyTrade(data))
+      },
 
-      position_update: ({ data }) => { upsertPosition(queryClient, data); },
+      position_update: ({ data }) => {
+        upsertPosition(queryClient, data)
+      },
 
-      inventory_snapshot: ({ data }) => { updateSnapshot(queryClient, data); },
+      inventory_snapshot: ({ data }) => {
+        updateSnapshot(queryClient, data)
+      },
 
-      transfer_update: ({ data }) => { upsertTransfer(queryClient, data); }
+      transfer_update: ({ data }) => {
+        upsertTransfer(queryClient, data)
+      }
     })
   }
 
@@ -66,30 +84,49 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     }
 
     socket.onmessage = (event) => {
-      try {
-        const parsed: unknown = JSON.parse(event.data as string)
-
-        if (!isStatement(parsed)) {
-          console.error('Invalid Statement structure:', parsed)
-          return
-        }
-
-        const { type } = parsed
-        if (import.meta.env.DEV) console.log(`[ws] received "${type}"`, parsed)
-
-        handleMessage(parsed)
-      } catch (parseError) {
-        console.error('Failed to parse WebSocket message:', parseError, 'Raw data:', event.data)
+      const parsed = tryCatch((): unknown => JSON.parse(event.data as string))
+      if (parsed.tag === 'err') {
+        failureMessage = 'Rejected malformed WebSocket message'
+        console.error('Failed to parse WebSocket message:', parsed.error, 'Raw data:', event.data)
+        fsm.send('error')
+        return
       }
+
+      if (!isStatement(parsed.value)) {
+        failureMessage = 'Rejected invalid WebSocket message'
+        console.error('Invalid Statement structure:', parsed.value)
+        fsm.send('error')
+        return
+      }
+
+      const statement = parsed.value
+      const { type } = statement
+      if (import.meta.env.DEV) console.log(`[ws] received "${type}"`, statement)
+
+      const handled = tryCatch(() => handleMessage(statement))
+      if (handled.tag === 'ok') {
+        markHealthy()
+        return
+      }
+
+      failureMessage =
+        handled.error instanceof Error
+          ? handled.error.message
+          : 'Rejected invalid WebSocket message'
+      console.error('Failed to parse WebSocket message:', handled.error, 'Raw data:', event.data)
+      fsm.send('error')
     }
 
     socket.onclose = (event) => {
-      if (import.meta.env.DEV) console.log(`[ws] closed (code=${String(event.code)}, reason="${event.reason}")`)
+      if (import.meta.env.DEV)
+        console.log(`[ws] closed (code=${String(event.code)}, reason="${event.reason}")`)
+      failureMessage = 'WebSocket connection closed'
       socket = null
       fsm.send('close')
     }
 
     socket.onerror = () => {
+      failureMessage = 'WebSocket connection error'
       fsm.send('error')
     }
   }
@@ -115,8 +152,12 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
   const scheduleReconnect = () => {
     cancelReconnect()
     const delay = getReconnectDelay(reconnectAttempts.current)
-    error.update(() => ({ attempts: reconnectAttempts.current + 1, nextRetryMs: delay }))
-    reconnectAttempts.update(attempts => attempts + 1)
+    error.update(() => ({
+      attempts: reconnectAttempts.current + 1,
+      nextRetryMs: delay,
+      message: failureMessage
+    }))
+    reconnectAttempts.update((attempts) => attempts + 1)
     reconnectTimeoutId = setTimeout(() => fsm.send('connect'), delay)
   }
 
@@ -144,11 +185,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     connected: {
       close: 'error',
       error: 'error',
-      disconnect: 'disconnected',
-      _enter: () => {
-        reconnectAttempts.update(() => 0)
-        error.update(() => null)
-      }
+      disconnect: 'disconnected'
     },
 
     error: {

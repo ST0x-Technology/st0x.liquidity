@@ -405,7 +405,10 @@ mod tests {
             venue: TradingVenue::Raindex,
             direction: Direction::Buy,
             symbol: st0x_finance::Symbol::new(symbol).unwrap(),
-            shares: st0x_finance::FractionalShares::new(st0x_float_macro::float!(1)),
+            shares: Positive::new(st0x_finance::FractionalShares::new(
+                st0x_float_macro::float!(1),
+            ))
+            .unwrap(),
             outcome: st0x_dto::TradeOutcome::Filled,
         })
     }
@@ -762,7 +765,7 @@ mod tests {
             venue: TradingVenue::Raindex,
             direction: Direction::Buy,
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: FractionalShares::new(float!(1)),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             outcome: TradeOutcome::Filled,
         };
         server

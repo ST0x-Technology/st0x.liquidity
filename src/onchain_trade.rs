@@ -18,7 +18,7 @@ use thiserror::Error;
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::Symbol;
-use st0x_finance::FractionalShares;
+use st0x_finance::{FractionalShares, NotPositive, Positive};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 
@@ -264,16 +264,19 @@ impl OnChainTrade {
         self.acknowledged_at.is_some()
     }
 
-    pub(crate) fn into_trade(self, id: &OnChainTradeId) -> Trade {
-        Trade {
+    pub(crate) fn try_into_trade(
+        self,
+        id: &OnChainTradeId,
+    ) -> Result<Trade, NotPositive<FractionalShares>> {
+        Ok(Trade {
             id: id.to_string(),
             occurred_at: self.block_timestamp,
             venue: TradingVenue::Raindex,
             direction: self.direction,
             symbol: self.symbol,
-            shares: FractionalShares::new(self.amount),
+            shares: Positive::new(FractionalShares::new(self.amount))?,
             outcome: TradeOutcome::Filled,
-        }
+        })
     }
 }
 
@@ -879,6 +882,31 @@ mod tests {
         assert!(trade.amount.eq(float!(10.5)).unwrap());
         assert_eq!(trade.direction, Direction::Buy);
         assert!(!trade.is_enriched());
+    }
+
+    #[test]
+    fn dashboard_trade_rejects_non_positive_fill_quantity() {
+        let now = Utc::now();
+        let id = OnChainTradeId {
+            tx_hash: TxHash::ZERO,
+            log_index: 0,
+        };
+
+        for amount in [float!(0), float!(-1)] {
+            let trade = replay::<OnChainTrade>(vec![OnChainTradeEvent::Filled {
+                symbol: Symbol::new("AAPL").unwrap(),
+                amount,
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_timestamp: now,
+                filled_at: now,
+            }])
+            .unwrap()
+            .unwrap();
+
+            trade.try_into_trade(&id).unwrap_err();
+        }
     }
 
     #[test]

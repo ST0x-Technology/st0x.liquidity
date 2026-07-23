@@ -6,7 +6,6 @@
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import CliCommandBlock from '$lib/components/cli-command-block.svelte'
   import type { Position } from '$lib/api/Position'
-  import type { LegacyTrade } from '$lib/api/LegacyTrade'
   import type { Trade } from '$lib/api/Trade'
   import type { TradingVenue } from '$lib/api/TradingVenue'
   import TradeOutcomeView from '$lib/components/trade-outcome.svelte'
@@ -23,6 +22,7 @@
   import { equityUsdTooltip } from '$lib/inventory-value'
   import { tradeRecoveryCommands } from '$lib/transfer'
   import { mergeTradeHistory, normalizeTrade, type TradeHistoryFilter } from '$lib/trade'
+  import { parseTradeResponse } from '$lib/trade-payload'
 
   type TradeEvent = {
     step: string
@@ -31,12 +31,6 @@
   }
 
   type TradeEntry = Trade
-
-  type TradeResponse = {
-    entries: Array<TradeEntry | LegacyTrade>
-    total: number
-    hasMore: boolean
-  }
 
   const PAGE_SIZE = 100
   const POLL_INTERVAL_MS = 10_000
@@ -159,7 +153,10 @@
     })
   })
 
-  const fetchTrades = async (mode: 'replace' | 'append') => {
+  const fetchTrades = async (
+    mode: 'replace' | 'append',
+    requestOffset = offset.current
+  ) => {
     if (selectedVenues.current.size === 0) {
       historyRequestVersion += 1
       entries.update(() => [])
@@ -182,7 +179,7 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const response = await fetch(`${baseUrl}/trades?${buildParams().toString()}`, {
+      const response = await fetch(`${baseUrl}/trades?${buildParams(PAGE_SIZE, requestOffset).toString()}`, {
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
       })
 
@@ -193,7 +190,7 @@
         return
       }
 
-      const wireData: TradeResponse = (await response.json()) as TradeResponse
+      const wireData = parseTradeResponse(await response.json())
       const data = { ...wireData, entries: wireData.entries.map(normalizeTrade) }
       if (requestVersion !== historyRequestVersion) return
 
@@ -201,6 +198,7 @@
         ? mergeLiveTrades([...entries.current, ...data.entries])
         : mergeLiveTrades(data.entries)
       const reconciledTotal = Math.max(total.current, data.total)
+      if (isLoadMore) offset.update(() => requestOffset)
       total.update(() => reconciledTotal)
       hasMore.update(() => data.hasMore || nextEntries.length < reconciledTotal)
       entries.update(() => nextEntries)
@@ -229,8 +227,7 @@
   }
 
   const loadMore = () => {
-    offset.update((current) => current + PAGE_SIZE)
-    void fetchTrades('append')
+    void fetchTrades('append', offset.current + PAGE_SIZE)
   }
 
   const applyPreset = (minutes: number) => () => {
@@ -265,7 +262,7 @@
   onMount(() => {
     void fetchTrades('replace')
     const interval = setInterval(() => {
-      if (offset.current === 0) void fetchTrades('replace')
+      if (offset.current === 0 && !loadingMore.current) void fetchTrades('replace')
     }, POLL_INTERVAL_MS)
     return () => {
       clearInterval(interval)
@@ -505,12 +502,16 @@
 
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-2">
     {#if error.current}
-      <div class="flex h-full items-center justify-center text-destructive">
+      <div
+        class="mb-2 rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-destructive"
+      >
         Failed to load trades: {error.current}
       </div>
-    {:else if entries.current.length === 0 && !loading.current}
+    {/if}
+
+    {#if entries.current.length === 0 && !loading.current && error.current === null}
       <div class="flex h-full items-center justify-center text-muted-foreground">No trades yet</div>
-    {:else}
+    {:else if entries.current.length > 0}
       <Table.Root>
         <Table.Header>
           <Table.Row>
