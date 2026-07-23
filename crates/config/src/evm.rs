@@ -148,6 +148,15 @@ pub struct EvmSecrets {
     pub rpc: Url,
     /// Base chain RPC URL for wallet operations. Required when `[wallet]`
     /// is configured.
+    ///
+    /// Also backs every historic block-pinned `eth_call` against Base (Pyth
+    /// equity-price enrichment at a trade's fill block, and bot-gas ETH/USD
+    /// valuation at a Base receipt's own block -- see ADR 0017). Both reads
+    /// assume this endpoint is an archive node (or otherwise retains state
+    /// back to the oldest block either path can pin to); a pruned/full node
+    /// fails those specific calls once the target block ages out of its
+    /// retained window, surfacing as a typed, logged RPC error rather than a
+    /// silent one.
     #[serde(rename = "base_rpc_url")]
     pub base: Option<Url>,
     /// Ethereum mainnet RPC URL for wallet operations. Required when

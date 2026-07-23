@@ -43,7 +43,7 @@ pub mod api;
 pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod bindings;
-pub mod bot_gas;
+mod bot_gas;
 pub mod cli;
 mod conductor;
 pub(crate) mod dashboard;
@@ -114,7 +114,9 @@ pub use st0x_config::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use st0x_config::{ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
+pub use st0x_config::{
+    BotGasValuationConfig, ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing,
+};
 #[cfg(feature = "test-support")]
 pub use trading::onchain::trade_accountant::AccountForDexTrade;
 

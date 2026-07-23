@@ -45,6 +45,7 @@ use super::{
     },
 };
 use crate::bindings::TestERC20;
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::Job;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
@@ -58,8 +59,9 @@ use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, TransferEquityToHedging,
-    TransferEquityToHedgingCtx, TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
-    TransferEquityToMarketMakingJobError,
+    TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
+    TransferEquityToMarketMakingCtx, TransferEquityToMarketMakingJobError,
+    TransferEquityToMarketMakingJobQueue,
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
@@ -467,6 +469,7 @@ fn build_equity_transfer_with_wrapper(
         vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -507,6 +510,7 @@ async fn build_equity_transfer_with_service(
         vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -681,6 +685,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
@@ -688,6 +693,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
         equities_config: EquitiesConfig::default(),
+        job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
 
@@ -913,6 +919,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 
     let ctx = TransferEquityToHedgingCtx {
         transfer: equity_transfer,
+        job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
 
@@ -1645,6 +1652,7 @@ async fn mint_api_failure_produces_rejected_event() {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
@@ -1652,6 +1660,7 @@ async fn mint_api_failure_produces_rejected_event() {
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
         equities_config: EquitiesConfig::default(),
+        job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
     assert!(
@@ -2227,17 +2236,20 @@ async fn mint_accepted_sets_offchain_inflight() {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
     let transfer_handle = tokio::spawn({
         let equity_transfer = Arc::clone(&equity_transfer);
         let mint_store = Arc::clone(&mint_store_for_spawn);
+        let apalis_pool = apalis_pool.clone();
         async move {
             let ctx = TransferEquityToMarketMakingCtx {
                 transfer: equity_transfer,
                 equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
                 mint_store,
                 equities_config: EquitiesConfig::default(),
+                job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
             let _ = Job::perform(&job, &ctx).await;
         }
@@ -2441,6 +2453,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
@@ -2448,6 +2461,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
         equities_config: EquitiesConfig::default(),
+        job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
 
@@ -2516,6 +2530,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         wrapper: Arc::new(MockWrapper::new()),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -2640,6 +2655,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2665,6 +2681,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
             vault_lookup,
             wrapper,
             transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
 
@@ -2758,6 +2775,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2783,6 +2801,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
             vault_lookup,
             wrapper,
             transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
 
@@ -2895,6 +2914,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2921,6 +2941,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
             wrapper,
             transfer,
             wallet: Address::ZERO,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
 
@@ -3024,6 +3045,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -3050,6 +3072,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
             wrapper,
             transfer,
             wallet: Address::ZERO,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
 

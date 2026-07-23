@@ -23,9 +23,9 @@ use tracing::{Level, warn};
 use url::Url;
 
 use crate::{
-    AlertsConfig, AlertsCtx, AlertsSecrets, EvmConfig, EvmCtx, EvmSecrets, ExecutionThreshold,
-    InvalidThresholdError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
-    TelemetryCtx,
+    AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, EvmConfig, EvmCtx, EvmSecrets,
+    ExecutionThreshold, InvalidThresholdError, RebalancingConfig, RebalancingCtx,
+    RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
 use st0x_float_macro::float;
 
@@ -240,6 +240,9 @@ struct Config {
     broker: Option<BrokerConfig>,
     assets: AssetsConfig,
     rest_api: Option<RestApiUrlConfig>,
+    /// ETH/USD valuation source for bot-gas cost recording. See
+    /// [`Ctx::bot_gas_valuation`] for when this is required.
+    bot_gas_valuation: Option<BotGasValuationConfig>,
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
@@ -596,6 +599,14 @@ pub struct Ctx {
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub redemption_wallet: Option<Address>,
+    /// ETH/USD valuation source for bot-gas cost recording (ADR 0017).
+    /// Bot-gas cost recording only runs on rebalancing paths (vault
+    /// deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC transfer), so this
+    /// is required (validated at startup) whenever `[rebalancing]` is
+    /// configured (`TradingMode::Rebalancing`) and otherwise optional --
+    /// including in Standalone mode, where an operator may still configure it
+    /// even though no rebalancing path will ever enqueue to it.
+    pub bot_gas_valuation: Option<BotGasValuationConfig>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -701,7 +712,8 @@ impl std::fmt::Debug for Ctx {
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
-            .field("issuance", &self.issuance);
+            .field("issuance", &self.issuance)
+            .field("bot_gas_valuation", &self.bot_gas_valuation);
 
         debug_struct.finish()
     }
@@ -769,6 +781,7 @@ struct ValidatedParts {
     rest_api: Option<RestApiCtx>,
     issuance: IssuanceStatusCtx,
     redemption_wallet: Option<Address>,
+    bot_gas_valuation: Option<BotGasValuationConfig>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
     /// returns `WalletNotConfigured` when both config and secrets lack
     /// a `[wallet]` section. Actual async wallet construction is deferred
@@ -932,6 +945,12 @@ fn parse_and_validate(
         return Err(CtxError::MissingTokenization);
     }
 
+    // See `Ctx::bot_gas_valuation` doc for why this is required only in
+    // Rebalancing mode.
+    if matches!(trading_mode, TradingMode::Rebalancing(_)) && config.bot_gas_valuation.is_none() {
+        return Err(CtxError::MissingBotGasValuation);
+    }
+
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
     let order_polling_interval = config.order_polling_interval.unwrap_or(15);
@@ -1042,6 +1061,7 @@ fn parse_and_validate(
                 .map_err(|source| CtxError::InvalidIssuanceApiKey { source })?,
         )?,
         redemption_wallet,
+        bot_gas_valuation: config.bot_gas_valuation,
         wallet_inputs,
         wallet_meta,
     })
@@ -1164,6 +1184,7 @@ impl Ctx {
             rest_api: parts.rest_api,
             issuance: parts.issuance,
             redemption_wallet: parts.redemption_wallet,
+            bot_gas_valuation: parts.bot_gas_valuation,
         })
     }
 
@@ -1373,6 +1394,7 @@ impl Ctx {
         rest_api: Option<RestApiCtx>,
         #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
+        bot_gas_valuation: Option<BotGasValuationConfig>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
@@ -1385,6 +1407,10 @@ impl Ctx {
 
         if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
             return Err(CtxError::MissingTokenization);
+        }
+
+        if matches!(trading_mode, TradingMode::Rebalancing(_)) && bot_gas_valuation.is_none() {
+            return Err(CtxError::MissingBotGasValuation);
         }
 
         // Legacy: tests simulate the pre-migration state where the bot owns
@@ -1436,6 +1462,7 @@ impl Ctx {
             rest_api,
             issuance,
             redemption_wallet,
+            bot_gas_valuation,
         })
     }
 }
@@ -1487,7 +1514,8 @@ pub enum CtxError {
     MissingCounterTradeSlippageBps,
     #[error(
         "[broker] extended_hours_reprice_timeout_secs is required when using \
-         Alpaca Broker API"
+         Alpaca Broker API, or when using DryRun with extended-hours \
+         counter-trading enabled for any asset"
     )]
     MissingExtendedHoursRepriceTimeout,
     #[error(
@@ -1497,7 +1525,8 @@ pub enum CtxError {
     ExtendedHoursRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
         "[broker] extended_hours_close_flatten_window_secs is required when \
-         using Alpaca Broker API"
+         using Alpaca Broker API, or when using DryRun with extended-hours \
+         counter-trading enabled for any asset"
     )]
     MissingExtendedHoursCloseFlattenWindow,
     #[error(
@@ -1521,6 +1550,11 @@ pub enum CtxError {
          with redemption_wallet"
     )]
     MissingTokenization,
+    #[error(
+        "[bot_gas_valuation] section is required when rebalancing is enabled \
+         (see ADR 0017)"
+    )]
+    MissingBotGasValuation,
     #[error(
         "operation requires a configured [wallet] section \
          (base_rpc_url and ethereum_rpc_url in [evm] secrets)"
@@ -1580,6 +1614,7 @@ impl CtxError {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::NotRebalancing => "operation requires rebalancing mode",
             Self::MissingTokenization => "operation requires tokenization config",
+            Self::MissingBotGasValuation => "missing bot gas valuation config",
             Self::ConfigIo { .. } => "failed to read config file",
             Self::SecretsIo { .. } => "failed to read secrets file",
             Self::ConfigToml { .. } => "failed to parse config",
@@ -1746,6 +1781,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         rest_api: None,
         issuance: create_test_issuance_ctx(),
         redemption_wallet: None,
+        bot_gas_valuation: None,
     }
 }
 
@@ -3306,6 +3342,196 @@ mod tests {
         );
     }
 
+    /// [`parse_and_validate`] never triggers the async wallet-key construction
+    /// gated by the `wallet-private-key`/`wallet-turnkey` cargo features (that
+    /// happens later, in `Ctx::load_files`), so it is used directly here
+    /// rather than `Ctx::load_files` to keep this test feature-independent.
+    fn rebalancing_toml_with_bot_gas_valuation(bot_gas_valuation_section: &str) -> String {
+        format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [tokenization]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            {bot_gas_valuation_section}
+
+            [rebalancing]
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+            "#
+        )
+    }
+
+    fn rebalancing_secrets_toml() -> NamedTempFile {
+        toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        "#,
+        )
+    }
+
+    #[test]
+    fn rebalancing_without_bot_gas_valuation_config_fails() {
+        let config_str = rebalancing_toml_with_bot_gas_valuation("");
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let result = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        );
+
+        assert!(
+            matches!(result, Err(CtxError::MissingBotGasValuation)),
+            "Expected MissingBotGasValuation error"
+        );
+    }
+
+    #[test]
+    fn rebalancing_accepts_configured_bot_gas_valuation() {
+        let config_str = rebalancing_toml_with_bot_gas_valuation(
+            r#"[bot_gas_valuation]
+            pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
+            eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace""#,
+        );
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let parts = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        )
+        .unwrap();
+
+        let bot_gas_valuation = parts
+            .bot_gas_valuation
+            .expect("bot_gas_valuation should be Some when configured");
+        assert_eq!(
+            bot_gas_valuation.pyth_contract,
+            address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a")
+        );
+        assert_eq!(
+            bot_gas_valuation.eth_usd_feed_id,
+            b256!("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace")
+        );
+    }
+
+    #[test]
+    fn standalone_mode_does_not_require_bot_gas_valuation() {
+        let config_str = r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "#;
+        let secrets_str = r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        "#;
+
+        let parts = parse_and_validate(
+            config_str,
+            Path::new("config.toml"),
+            secrets_str,
+            Path::new("secrets.toml"),
+        )
+        .unwrap();
+
+        assert!(
+            parts.bot_gas_valuation.is_none(),
+            "Standalone mode should not require [bot_gas_valuation]"
+        );
+    }
+
     #[tokio::test]
     async fn wallet_config_without_wallet_secrets_fails() {
         let config = toml_file(
@@ -4613,6 +4839,72 @@ mod tests {
             toml::from_str::<Config>(&contents).unwrap_or_else(|error| {
                 panic!("Invalid config {path:?}: {error}");
             });
+        }
+    }
+
+    /// `parse_and_validate` rejects a config with `[rebalancing]` but no
+    /// `[bot_gas_valuation]` (`CtxError::MissingBotGasValuation`). But
+    /// `all_repo_config_tomls_are_valid` only exercises `toml::from_str`,
+    /// a structural parse that succeeds either way since the field is
+    /// `Option` -- so a future edit that drops or renames
+    /// `[bot_gas_valuation]` from a checked-in `[rebalancing]` config would
+    /// stay green there and only fail at the `validate-config` deploy gate
+    /// or at bot startup. Guard the cross-field invariant here instead, the
+    /// same way `repo_config_vault_owner_matches_settlement_mode` guards its
+    /// own cross-field invariant.
+    #[test]
+    fn repo_config_rebalancing_requires_bot_gas_valuation() {
+        for path in repo_config_paths() {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let config: Config = toml::from_str(&contents).unwrap();
+
+            assert!(
+                config.rebalancing.is_none() || config.bot_gas_valuation.is_some(),
+                "{path:?}: [rebalancing] is configured but [bot_gas_valuation] is \
+                 missing -- parse_and_validate rejects this combination at startup"
+            );
+        }
+    }
+
+    /// Every checked-in config's `[bot_gas_valuation].pyth_contract` must be
+    /// the known-good Pyth EVM deployment on Base, not just a syntactically
+    /// valid address: `BotGasValuationConfig` accepts any `Address`, so a
+    /// typo or a copy of a non-Base Pyth deployment parses and passes
+    /// `repo_config_rebalancing_requires_bot_gas_valuation` cleanly, then
+    /// dead-letters every Base bot-gas cost fact as an opaque RPC failure at
+    /// runtime (ADR 0017 SS4: `PythError::Rpc` is classified transient, so a
+    /// wrong address burns the full redrive budget per receipt before
+    /// dead-lettering, rather than failing fast).
+    ///
+    /// This crate cannot import `st0x_hedge::onchain::pyth::
+    /// BASE_PYTH_CONTRACT_ADDRESS` (config is a dependency of the main
+    /// crate, not the reverse), so the known-good value is duplicated here
+    /// as a literal. If the deployment address ever changes, update BOTH
+    /// this constant and `BASE_PYTH_CONTRACT_ADDRESS` in
+    /// `src/onchain/pyth/mod.rs`.
+    ///
+    /// Source: Pyth's EVM contract-address registry,
+    /// https://docs.pyth.network/price-feeds/contract-addresses/evm (Base
+    /// mainnet).
+    const BASE_PYTH_CONTRACT_ADDRESS: Address =
+        address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
+
+    #[test]
+    fn repo_config_bot_gas_valuation_pyth_contract_matches_base_deployment() {
+        for path in repo_config_paths() {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let config: Config = toml::from_str(&contents).unwrap();
+
+            let Some(bot_gas_valuation) = config.bot_gas_valuation else {
+                continue;
+            };
+
+            assert_eq!(
+                bot_gas_valuation.pyth_contract, BASE_PYTH_CONTRACT_ADDRESS,
+                "{path:?}: [bot_gas_valuation].pyth_contract does not match the known-good \
+                 Pyth EVM deployment on Base -- a wrong address dead-letters every Base \
+                 bot-gas cost fact as an opaque RPC failure instead of a clear signal"
+            );
         }
     }
 

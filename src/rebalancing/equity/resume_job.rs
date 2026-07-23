@@ -16,6 +16,7 @@
 //! (idempotent).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,11 +24,21 @@ use thiserror::Error;
 use st0x_tokenization::IssuerRequestId;
 
 use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
+use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::equity_redemption::RedemptionAggregateId;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
 pub(crate) type ResumeTokenizationJobQueue = JobQueue<ResumeTokenizationAggregate>;
+
+/// Delay before re-enqueueing a resume job after a bot-gas receipt cost
+/// enqueue failure. Mirrors `BOT_GAS_ENQUEUE_REDRIVE_DELAY` in the equity
+/// transfer jobs: the preceding on-chain step already succeeded, so this
+/// only rides out a transient apalis/SQLite write failure before the resume
+/// re-derives the same enqueue call from state.
+const BOT_GAS_ENQUEUE_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 
 /// Which interrupted aggregate should be resumed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,6 +56,13 @@ pub(crate) struct ResumeTokenizationAggregate {
 /// Dependencies the job needs.
 pub(crate) struct ResumeTokenizationCtx {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
+    /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
+    /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
+    /// instead of consuming the apalis retry budget. This is the startup
+    /// crash-recovery job, running while SQLite write contention is at its
+    /// worst -- see `redrive_on_bot_gas_failure`'s doc for why every job
+    /// that can hit this failure must route through it.
+    pub(crate) job_queue: ResumeTokenizationJobQueue,
 }
 
 /// Errors emitted by [`ResumeTokenizationAggregate::perform`].
@@ -54,6 +72,15 @@ pub(crate) enum ResumeTokenizationJobError {
     Mint(#[from] MintError),
     #[error(transparent)]
     Redemption(#[from] RedemptionError),
+}
+
+impl BotGasFailureClassifier for ResumeTokenizationJobError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Mint(inner) => inner.is_bot_gas_enqueue_failure(),
+            Self::Redemption(inner) => inner.is_bot_gas_enqueue_failure(),
+        }
+    }
 }
 
 impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
@@ -80,15 +107,28 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     }
 
     async fn perform(&self, ctx: &ResumeTokenizationCtx) -> Result<Self::Output, Self::Error> {
-        match &self.target {
-            ResumeTokenizationTarget::Mint(issuer_request_id) => {
-                ctx.transfer.resume_mint(issuer_request_id).await?;
-            }
-            ResumeTokenizationTarget::Redemption(aggregate_id) => {
-                ctx.transfer.resume_redemption(aggregate_id).await?;
-            }
-        }
-        Ok(())
+        let result = match &self.target {
+            ResumeTokenizationTarget::Mint(issuer_request_id) => ctx
+                .transfer
+                .resume_mint(issuer_request_id)
+                .await
+                .map_err(ResumeTokenizationJobError::from),
+            ResumeTokenizationTarget::Redemption(aggregate_id) => ctx
+                .transfer
+                .resume_redemption(aggregate_id)
+                .await
+                .map_err(ResumeTokenizationJobError::from),
+        };
+
+        let Err(error) = result else {
+            return Ok(());
+        };
+
+        // Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
+        // doc, ADR 0017 SS4): redrive through the shared mechanism rather than
+        // consuming the apalis retry budget. See `ResumeTokenizationCtx::job_queue`'s
+        // doc for why this matters especially for this startup crash-recovery job.
+        redrive_on_bot_gas_failure(self, &ctx.job_queue, BOT_GAS_ENQUEUE_REDRIVE_DELAY, error).await
     }
 }
 
@@ -134,7 +174,7 @@ mod tests {
         Arc<st0x_event_sorcery::Store<EquityRedemption>>,
         Arc<MockTokenizer>,
     ) {
-        let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let vault_lookup =
@@ -145,6 +185,7 @@ mod tests {
             vault_lookup: vault_lookup.clone(),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
@@ -160,7 +201,10 @@ mod tests {
             redemption_store.clone(),
         ));
 
-        let ctx = ResumeTokenizationCtx { transfer };
+        let ctx = ResumeTokenizationCtx {
+            transfer,
+            job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+        };
         (ctx, mint_store, redemption_store, tokenizer)
     }
 
@@ -419,6 +463,115 @@ mod tests {
             ),
             "resume must drive the MintAccepted aggregate to DepositedIntoRaindex, \
              got {resumed:?}"
+        );
+    }
+
+    /// `ResumeTokenizationAggregate` is the startup crash-recovery job,
+    /// running while SQLite write contention is at its worst. A bot-gas
+    /// receipt cost enqueue failure hit during `resume_mint` must
+    /// delayed-redrive (return `Ok(())` and push a replacement job), never
+    /// dead-letter through apalis's tiny retry budget.
+    #[tokio::test]
+    async fn perform_mint_target_bot_gas_enqueue_failure_redrives_without_terminal_error() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let closed_apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        closed_apalis_pool.close().await;
+        let bot_gas_queue =
+            crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&closed_apalis_pool);
+
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let vault_lookup =
+            Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
+        let tokenizer = Arc::new(MockTokenizer::new());
+
+        let transfer_services = EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue.clone()),
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool, transfer_services));
+
+        let transfer = Arc::new(
+            CrossVenueEquityTransfer::new(
+                raindex,
+                vault_lookup,
+                tokenizer,
+                wrapper,
+                Address::ZERO,
+                mint_store.clone(),
+                redemption_store,
+            )
+            .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue)),
+        );
+
+        let id = issuer_request_id("resume-mint-bot-gas-failure");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+
+        // Seed the mint straight to VaultDepositSubmitted so resume_mint's
+        // confirm_tx + enqueue_bot_gas_cost is reached without needing the
+        // full wrap flow.
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1.0),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: TxHash::ZERO,
+                    wrapped_shares: U256::from(1u64),
+                    wrap_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitVaultDeposit {
+                    vault_deposit_tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = ResumeTokenizationCtx {
+            transfer,
+            job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+        };
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a bot-gas enqueue failure must not fail the resume job terminally");
+
+        let (rescheduled,): (i64,) =
+            sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rescheduled, 1,
+            "a bot-gas enqueue failure must re-enqueue a delayed replacement job"
         );
     }
 

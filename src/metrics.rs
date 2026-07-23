@@ -62,6 +62,11 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "portfolio_snapshot_unusable_mark_total",
         "Nonzero equity balances captured with a missing or stale USD mark, by symbol and reason"
     );
+    metrics::describe_counter!(
+        "bot_gas_redrive_total",
+        "Bot-gas receipt-cost enqueue failures redriven instead of failing the triggering \
+         job, by job"
+    );
 
     let _ = HANDLE.set(handle.clone());
     Ok(handle)

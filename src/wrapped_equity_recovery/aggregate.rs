@@ -45,6 +45,10 @@ use st0x_raindex::Raindex;
 use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::Wrapper;
 
+use crate::bot_gas::{
+    BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
+    enqueue_base_equity_cost,
+};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
 use crate::tokenized_equity_mint::TOKENIZED_EQUITY_DECIMALS;
@@ -78,12 +82,28 @@ pub(crate) struct WrappedEquityRecoveryServices {
     pub(crate) vault_lookup: Arc<dyn VaultLookup>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
+    /// Enqueues bot-gas cost recording for the orphan-deposit path (which
+    /// calls `raindex` directly rather than through `transfer`). See ADR 0017.
+    pub(crate) bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 }
 
 /// Domain errors returned from the aggregate's `initialize`/`transition`
-/// handlers. Service failures (raindex/wrapper/transfer) do NOT flow through
-/// this enum -- they are recorded as `RecoveryFailed` events instead, so
-/// failures remain first-class entries in the audit trail.
+/// handlers. Most service failures (raindex/wrapper/transfer) do NOT flow
+/// through this enum -- they are recorded as `RecoveryFailed` events instead,
+/// so failures remain first-class entries in the audit trail. The one
+/// exception is `BotGasEnqueueFailed`: a bot-gas cost-recording bookkeeping
+/// failure inside `confirm_orphan_deposit_or_fail` is deliberately propagated
+/// as `Err` rather than folded into `RecoveryFailed`, so the job's shared
+/// `redrive_on_bot_gas_failure` mechanism can redrive it instead of
+/// permanently failing the recovery over a best-effort accounting write.
+///
+/// NOTE: `resume_mint_or_fail`/`resume_redemption_or_fail` (the
+/// `DispatchToMint`/`DispatchToRedemption` handlers) deliberately do NOT
+/// propagate a bot-gas enqueue failure this way -- see the "Known gaps"
+/// entry in SPEC.md's bot-gas section. `WrappedEquityRecoveryJob` has no
+/// `Detected` resume arm, so redriving those commands would re-send
+/// `Detect` and hit `AlreadyInitialized`, stranding the aggregate
+/// non-terminal and permanently blocking rebalancing for the symbol.
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryError {
     #[error("recovery already initialized")]
@@ -94,6 +114,13 @@ pub(crate) enum WrappedEquityRecoveryError {
     InvalidTransition { state: Box<WrappedEquityRecovery> },
     #[error("recovery is already in terminal state")]
     Terminal,
+    /// Enqueueing the bot-gas receipt cost recording job failed after the
+    /// preceding on-chain confirm step already succeeded (a local SQLite
+    /// write, safe to retry since the aggregate has not advanced past the
+    /// confirmed state yet). See [`BotGasEnqueueFailure`] for why the
+    /// payload is a rendered `String` rather than a typed source.
+    #[error(transparent)]
+    BotGasEnqueueFailed(#[from] BotGasEnqueueFailure),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,12 +442,20 @@ impl EventSourced for WrappedEquityRecovery {
 
             (
                 Self::OrphanDepositSubmitted {
+                    symbol,
                     vault_deposit_tx_hash,
                     ..
                 },
                 ConfirmOrphanDeposit,
             ) => {
-                confirm_orphan_deposit_or_fail(&services.raindex, *vault_deposit_tx_hash, now).await
+                confirm_orphan_deposit_or_fail(
+                    &services.raindex,
+                    &services.bot_gas_enqueuer,
+                    symbol,
+                    *vault_deposit_tx_hash,
+                    now,
+                )
+                .await
             }
 
             (
@@ -551,12 +586,23 @@ async fn submit_orphan_deposit_or_fail(
 
 async fn confirm_orphan_deposit_or_fail(
     raindex: &Arc<dyn Raindex>,
+    bot_gas_enqueuer: &BotGasReceiptCostEnqueuer,
+    symbol: &Symbol,
     vault_deposit_tx_hash: TxHash,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
     match raindex.confirm_tx(vault_deposit_tx_hash).await {
         Ok(()) => {
             info!(target: "rebalance", %vault_deposit_tx_hash, "Wrapped equity recovery: confirm_tx succeeded");
+
+            enqueue_base_equity_cost(
+                bot_gas_enqueuer,
+                vault_deposit_tx_hash,
+                BotGasOperationCategory::VaultDeposit,
+                symbol,
+            )
+            .await?;
+
             Ok(vec![WrappedEquityRecoveryEvent::OrphanDeposited {
                 vault_deposit_tx_hash,
                 deposited_at: now,
@@ -586,6 +632,7 @@ mod tests {
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::MockWrapper;
 
+    use crate::bot_gas::{BotGasChain, pending_bot_gas_jobs};
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
@@ -629,6 +676,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
             pool.clone(),
@@ -649,6 +697,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper,
             transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
 
@@ -723,6 +772,74 @@ mod tests {
             ),
             "Expected single OrphanDeposited event, got {events:?}",
         );
+    }
+
+    /// Acceptance criterion: confirming an orphan deposit
+    /// enqueues exactly one `VaultDeposit` bot-gas job on Base with the
+    /// recovery's symbol.
+    #[tokio::test]
+    async fn confirm_orphan_deposit_enqueues_vault_deposit_bot_gas_job() {
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let mut services = test_services().await;
+        services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
+
+        let submitted = WrappedEquityRecovery::OrphanDepositSubmitted {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            vault_deposit_tx_hash: FAKE_TX_HASH,
+            submitted_at: Utc::now(),
+        };
+
+        submitted
+            .transition(
+                WrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
+                &services,
+            )
+            .await
+            .expect("ConfirmOrphanDeposit should succeed from OrphanDepositSubmitted");
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultDeposit);
+        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].tx_hash, FAKE_TX_HASH);
+        assert_eq!(jobs[0].symbol, Some(aapl()));
+    }
+
+    /// Acceptance criterion: an enqueue failure after a confirmed
+    /// orphan deposit propagates as a hard error rather than being folded
+    /// into `RecoveryFailed`.
+    #[tokio::test]
+    async fn confirm_orphan_deposit_enqueue_failure_propagates() {
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        apalis_pool.close().await;
+        let mut services = test_services().await;
+        services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
+
+        let submitted = WrappedEquityRecovery::OrphanDepositSubmitted {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            vault_deposit_tx_hash: FAKE_TX_HASH,
+            submitted_at: Utc::now(),
+        };
+
+        let error = submitted
+            .transition(
+                WrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
+                &services,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WrappedEquityRecoveryError::BotGasEnqueueFailed(BotGasEnqueueFailure { tx_hash, .. })
+                if tx_hash == FAKE_TX_HASH
+        ));
     }
 
     #[tokio::test]
@@ -825,6 +942,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
             pool.clone(),
@@ -845,6 +963,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper,
             transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let events = detected_state()

@@ -3,6 +3,7 @@
 //! resolution, price calculation, and Pyth oracle pricing. Also provides
 //! vault extraction utilities for the vault registry.
 
+use alloy::eips::BlockId;
 use alloy::primitives::ruint::FromUintError;
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
@@ -20,7 +21,7 @@ use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
 
-use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
+use super::pyth::{BASE_PYTH_CONTRACT_ADDRESS, extract_pyth_price_at, raw_price_to_pyth_price};
 use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
@@ -240,9 +241,14 @@ async fn enrich_with_pyth_price<P: Provider>(
         return None;
     };
 
-    match extract_pyth_price(provider, feed_id, block_number)
-        .await
-        .and_then(|raw_price| raw_price_to_pyth_price(&raw_price))
+    match extract_pyth_price_at(
+        provider,
+        BASE_PYTH_CONTRACT_ADDRESS,
+        feed_id,
+        BlockId::number(block_number),
+    )
+    .await
+    .and_then(|raw_price| raw_price_to_pyth_price(&raw_price))
     {
         Ok(pyth_price) => Some(pyth_price),
         Err(error) => {

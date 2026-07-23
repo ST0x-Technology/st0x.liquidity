@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -33,10 +34,20 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
 use super::{CrossVenueEquityTransfer, MintTransferError, RedemptionError};
-use crate::conductor::job::{Job, JobQueue, Label};
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
+use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
+use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::trigger::GuardState;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
+
+/// Delay before re-enqueueing an equity transfer job after a bot-gas receipt
+/// cost enqueue failure. Mirrors `SETTLEMENT_REDRIVE_DELAY` in the USDC
+/// transfer jobs: the preceding on-chain step already succeeded, so this
+/// only rides out a transient apalis/SQLite write failure before the resume
+/// path re-derives the same enqueue call from state.
+const BOT_GAS_ENQUEUE_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 
 /// Apalis queue type for [`TransferEquityToMarketMaking`].
 pub(crate) type TransferEquityToMarketMakingJobQueue = JobQueue<TransferEquityToMarketMaking>;
@@ -96,6 +107,11 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// Keeping the check here ensures the two paths cannot disagree: if recovery
     /// is disabled, `Err(PostReceipt)` is returned instead and apalis retries.
     pub(crate) equities_config: EquitiesConfig,
+    /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
+    /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
+    /// instead of consuming the apalis retry budget or handing the symbol
+    /// off to equity recovery.
+    pub(crate) job_queue: TransferEquityToMarketMakingJobQueue,
 }
 
 /// Errors emitted by [`TransferEquityToMarketMaking::perform`].
@@ -103,6 +119,17 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
 pub(crate) enum TransferEquityToMarketMakingJobError {
     #[error(transparent)]
     Transfer(#[from] MintTransferError),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
+}
+
+impl BotGasFailureClassifier for TransferEquityToMarketMakingJobError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
+            Self::Enqueue(_) => false,
+        }
+    }
 }
 
 /// Apalis job payload. The `issuer_request_id` is generated at enqueue time
@@ -155,6 +182,28 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         // any other transfer error propagates for apalis to retry.
         let Err(transfer_error) = result else {
             return Ok(());
+        };
+
+        // Bot-gas cost recording is a best-effort accounting write (ADR 0017
+        // SS4): classify and redrive it here, BEFORE the PostReceipt/PreReceipt
+        // recovery-handoff branching below, regardless of which
+        // `MintTransferError` wrapper the enqueue failure arrives in -- a
+        // concurrent mint-store read failure at the moment of classification
+        // (see `classify_mint_resume_error`) can fold a genuine `BotGasEnqueue`
+        // failure into `PreReceipt`, and that case must redrive exactly like
+        // the `PostReceipt` one rather than falling into the terminal
+        // catch-all arm or (worse) the recovery handoff.
+        let transfer_error = match redrive_on_bot_gas_failure(
+            self,
+            &ctx.job_queue,
+            BOT_GAS_ENQUEUE_REDRIVE_DELAY,
+            TransferEquityToMarketMakingJobError::from(transfer_error),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(TransferEquityToMarketMakingJobError::Transfer(transfer_error)) => transfer_error,
+            Err(other) => return Err(other),
         };
 
         match transfer_error {
@@ -388,13 +437,28 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
 /// [`TransferEquityToMarketMakingCtx`].
 pub(crate) struct TransferEquityToHedgingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToHedging>,
+    /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
+    /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
+    /// instead of consuming the apalis retry budget.
+    pub(crate) job_queue: TransferEquityToHedgingJobQueue,
 }
 
 /// Errors emitted by [`TransferEquityToHedging::perform`].
 #[derive(Debug, Error)]
 pub(crate) enum TransferEquityToHedgingJobError {
     #[error(transparent)]
-    Transfer(#[from] RedemptionError),
+    Transfer(#[from] Box<RedemptionError>),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
+}
+
+impl BotGasFailureClassifier for TransferEquityToHedgingJobError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
+            Self::Enqueue(_) => false,
+        }
+    }
 }
 
 /// Apalis job payload for the redemption direction. The `aggregate_id` is
@@ -421,11 +485,28 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     }
 
     async fn perform(&self, ctx: &TransferEquityToHedgingCtx) -> Result<Self::Output, Self::Error> {
-        ctx.transfer
+        let result = ctx
+            .transfer
             .resume_equity_to_hedging(&self.aggregate_id, &self.symbol, self.quantity)
-            .await?;
+            .await;
 
-        Ok(())
+        let Err(error) = result else {
+            return Ok(());
+        };
+
+        // Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
+        // doc, ADR 0017 SS4): classify and redrive through the shared
+        // mechanism rather than consuming the apalis retry budget. The
+        // confirm step this follows already succeeded onchain and the
+        // aggregate has not advanced past it, so redriving the same resume
+        // call is safe.
+        redrive_on_bot_gas_failure(
+            self,
+            &ctx.job_queue,
+            BOT_GAS_ENQUEUE_REDRIVE_DELAY,
+            TransferEquityToHedgingJobError::from(Box::new(error)),
+        )
+        .await
     }
 }
 
@@ -436,7 +517,7 @@ mod tests {
     use alloy::primitives::{Address, TxHash, U256};
     use serde_json::json;
     use st0x_config::{EquityAssetConfig, OperationMode};
-    use st0x_event_sorcery::test_store;
+    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
     use st0x_tokenization::issuer_request_id;
@@ -444,7 +525,7 @@ mod tests {
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
-    use crate::equity_redemption::redemption_aggregate_id;
+    use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -462,7 +543,7 @@ mod tests {
         transfer: Arc<dyn ResumeEquityToMarketMaking>,
         recovery_mode: OperationMode,
     ) -> TransferEquityToMarketMakingCtx {
-        let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let transfer_services = EquityTransferServices {
@@ -470,6 +551,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool, transfer_services));
 
@@ -494,6 +576,7 @@ mod tests {
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store,
             equities_config,
+            job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
     }
 
@@ -559,6 +642,170 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Stub for `MintError::BotGasEnqueue` wrapped in `PostReceipt`. Wraps a
+    /// genuine `QueuePushError` produced by pushing to a closed pool -- a
+    /// real push failure, not a synthesized enum variant -- so the test
+    /// exercises the same error shape production code hits.
+    struct BotGasEnqueueFailureMintResume(TransferEquityToMarketMakingJobQueue);
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for BotGasEnqueueFailureMintResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            symbol: &Symbol,
+            quantity: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            let mut queue = self.0.clone();
+            let error = queue
+                .push(TransferEquityToMarketMaking {
+                    issuer_request_id: issuer_request_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity,
+                    generation: 0,
+                })
+                .await
+                .expect_err("push to a closed pool must fail");
+            Err(MintTransferError::PostReceipt(MintError::BotGasEnqueue(
+                crate::bot_gas::BotGasEnqueueFailure::from_queue_push_error(TxHash::ZERO, &error),
+            )))
+        }
+    }
+
+    /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
+    /// failure must delayed-redrive rather than either consuming the apalis
+    /// retry budget or being misclassified as a post-receipt wrap/deposit
+    /// failure that hands the symbol off to equity recovery (the enqueue
+    /// failure must bypass `is_post_receipt_recoverable` entirely).
+    #[tokio::test]
+    async fn perform_bot_gas_enqueue_failure_redrives_without_recovery_handoff() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let closed_apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        closed_apalis_pool.close().await;
+        let closed_queue = TransferEquityToMarketMakingJobQueue::new(&closed_apalis_pool);
+
+        let mut ctx = test_ctx(Arc::new(BotGasEnqueueFailureMintResume(closed_queue))).await;
+        ctx.job_queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation: 0 });
+
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id("bot-gas-enqueue-failure"),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: 0,
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a bot-gas enqueue failure must not fail the job terminally");
+        let after = chrono::Utc::now().timestamp();
+
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation: 0 }),
+            "a bot-gas enqueue failure must NOT transition the guard to \
+             HeldForRecovery -- the wrap/deposit already succeeded onchain"
+        );
+
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs \
+             WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let rescheduled: TransferEquityToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.issuer_request_id, job.issuer_request_id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            run_at >= before + i64::try_from(BOT_GAS_ENQUEUE_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at
+                    <= after + i64::try_from(BOT_GAS_ENQUEUE_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{BOT_GAS_ENQUEUE_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Stub for `MintError::BotGasEnqueue` wrapped in `PreReceipt` --
+    /// reachable when `classify_mint_resume_error`'s mint-store read fails at
+    /// the exact moment a `BotGasEnqueue` failure is being classified (see
+    /// that function). Wraps a genuine `QueuePushError` from a closed pool,
+    /// same as the `PostReceipt` stub above.
+    struct PreReceiptBotGasEnqueueFailureMintResume(TransferEquityToMarketMakingJobQueue);
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for PreReceiptBotGasEnqueueFailureMintResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            symbol: &Symbol,
+            quantity: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            let mut queue = self.0.clone();
+            let error = queue
+                .push(TransferEquityToMarketMaking {
+                    issuer_request_id: issuer_request_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity,
+                    generation: 0,
+                })
+                .await
+                .expect_err("push to a closed pool must fail");
+            Err(MintTransferError::PreReceipt(MintError::BotGasEnqueue(
+                crate::bot_gas::BotGasEnqueueFailure::from_queue_push_error(TxHash::ZERO, &error),
+            )))
+        }
+    }
+
+    /// A `BotGasEnqueue` failure classified as `PreReceipt` (not just
+    /// `PostReceipt`) must still redrive rather than fall into the terminal
+    /// `PreReceipt` catch-all arm and burn the apalis retry budget.
+    #[tokio::test]
+    async fn perform_bot_gas_enqueue_failure_classified_as_pre_receipt_still_redrives() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let closed_apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        closed_apalis_pool.close().await;
+        let closed_queue = TransferEquityToMarketMakingJobQueue::new(&closed_apalis_pool);
+
+        let mut ctx = test_ctx(Arc::new(PreReceiptBotGasEnqueueFailureMintResume(
+            closed_queue,
+        )))
+        .await;
+        ctx.job_queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id("pre-receipt-bot-gas-enqueue-failure"),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: 0,
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a PreReceipt-classified bot-gas enqueue failure must not fail terminally");
+
+        let pending_count: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_count, 1,
+            "the enqueue failure must push exactly one redrive"
+        );
     }
 
     #[tokio::test]
@@ -1274,6 +1521,80 @@ mod tests {
         }
     }
 
+    /// Builds a fresh `TransferEquityToHedgingJobQueue` backed by an isolated
+    /// in-memory apalis pool, for tests that only need a queue handle (not
+    /// its enqueued contents).
+    async fn hedging_test_job_queue() -> TransferEquityToHedgingJobQueue {
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        TransferEquityToHedgingJobQueue::new(&apalis_pool)
+    }
+
+    /// Stub for `EquityRedemptionError::BotGasEnqueueFailed` propagated as
+    /// `RedemptionError::Send`, the exact shape `enqueue_bot_gas_cost`'s `?`
+    /// produces from `transition_confirm_withdraw` / `transition_confirm_unwrap`.
+    struct BotGasEnqueueFailureRedemptionResume;
+
+    #[async_trait]
+    impl ResumeEquityToHedging for BotGasEnqueueFailureRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::Send(AggregateError::UserError(
+                LifecycleError::Apply(EquityRedemptionError::BotGasEnqueueFailed(
+                    crate::bot_gas::test_bot_gas_enqueue_failure(alloy::primitives::TxHash::ZERO),
+                )),
+            )))
+        }
+    }
+
+    /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
+    /// failure on the redemption side must delayed-redrive rather than
+    /// consuming the apalis retry budget and dead-lettering a redemption
+    /// whose vault withdraw / unwrap already succeeded onchain.
+    #[tokio::test]
+    async fn redemption_perform_bot_gas_enqueue_failure_redrives_without_terminal_error() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let ctx = TransferEquityToHedgingCtx {
+            transfer: Arc::new(BotGasEnqueueFailureRedemptionResume),
+            job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        };
+        let job = TransferEquityToHedging {
+            aggregate_id: redemption_aggregate_id("redeem-bot-gas-enqueue-failure"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a bot-gas enqueue failure must not fail the job terminally");
+        let after = chrono::Utc::now().timestamp();
+
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs \
+             WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let rescheduled: TransferEquityToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.aggregate_id, job.aggregate_id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            run_at >= before + i64::try_from(BOT_GAS_ENQUEUE_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at
+                    <= after + i64::try_from(BOT_GAS_ENQUEUE_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{BOT_GAS_ENQUEUE_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
     #[tokio::test]
     async fn redemption_perform_forwards_id_symbol_and_quantity_to_resume() {
         let stub = Arc::new(RecordingRedemptionResume {
@@ -1282,6 +1603,7 @@ mod tests {
         });
         let ctx = TransferEquityToHedgingCtx {
             transfer: stub.clone(),
+            job_queue: hedging_test_job_queue().await,
         };
         let job = TransferEquityToHedging {
             aggregate_id: redemption_aggregate_id("redeem-forward"),
@@ -1306,6 +1628,7 @@ mod tests {
                 fail: true,
                 captured: Mutex::new(None),
             }),
+            job_queue: hedging_test_job_queue().await,
         };
         let job = TransferEquityToHedging {
             aggregate_id: redemption_aggregate_id("redeem-fail"),
@@ -1318,9 +1641,12 @@ mod tests {
         // The failure must propagate (not be swallowed) so apalis retries and
         // the event-driven `equity_in_progress` guard stays latched until the
         // aggregate reaches a terminal state.
+        let TransferEquityToHedgingJobError::Transfer(transfer_error) = error else {
+            panic!("expected a Transfer error, got {error:?}");
+        };
         assert!(matches!(
-            error,
-            TransferEquityToHedgingJobError::Transfer(RedemptionError::EntityNotFound { .. })
+            *transfer_error,
+            RedemptionError::EntityNotFound { .. }
         ));
     }
 

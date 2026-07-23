@@ -16,6 +16,7 @@ use st0x_wrapper::WrappedEquity;
 use super::usdc::{
     CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
 };
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -117,17 +118,21 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         market_maker_wallet: Address,
         usdc_vault_id: RaindexVaultId,
         usdc: Arc<Store<UsdcRebalance>>,
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     ) -> UsdcTransferResumeHandles {
-        let usdc = Arc::new(CrossVenueCashTransfer::new(
-            self.broker,
-            self.wallet,
-            self.cctp,
-            self.raindex,
-            usdc,
-            market_maker_wallet,
-            usdc_vault_id,
-            &self.settlement,
-        ));
+        let usdc = Arc::new(
+            CrossVenueCashTransfer::new(
+                self.broker,
+                self.wallet,
+                self.cctp,
+                self.raindex,
+                usdc,
+                market_maker_wallet,
+                usdc_vault_id,
+                &self.settlement,
+            )
+            .with_bot_gas_enqueuer(bot_gas_enqueuer),
+        );
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
         let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc;
@@ -383,6 +388,7 @@ mod tests {
             Address::random(),
             RaindexVaultId(B256::ZERO),
             usdc_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
     }
 }

@@ -28,6 +28,7 @@ use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::{TransferDirection, TransferType};
 use crate::api::ResumeResponse;
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
@@ -108,6 +109,7 @@ async fn build_equity_transfer_services(
         vault_lookup: vault_lookup.clone(),
         tokenizer: tokenization_service.clone(),
         wrapper: wrapper.clone(),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -2068,6 +2070,7 @@ mod tests {
             rest_api: None,
             issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
+            bot_gas_valuation: None,
         }
     }
 
@@ -2149,6 +2152,7 @@ mod tests {
             rest_api: None,
             issuance: create_test_issuance_ctx(),
             redemption_wallet: Some(Address::ZERO),
+            bot_gas_valuation: None,
         }
     }
 
@@ -3735,6 +3739,7 @@ mod tests {
             ),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
 

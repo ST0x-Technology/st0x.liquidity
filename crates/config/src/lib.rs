@@ -5,6 +5,7 @@
 //! shared-metadata, and domain crates must remain config-agnostic.
 
 mod alerts;
+mod bot_gas_valuation;
 mod evm;
 mod imbalance_threshold;
 mod loader;
@@ -15,6 +16,7 @@ mod threshold;
 mod wallet;
 
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets};
+pub use bot_gas_valuation::BotGasValuationConfig;
 pub use evm::{
     EvmConfig, EvmConfigError, EvmCtx, EvmSecrets, IngestionCutoff, InventoryMode, InventoryModeTag,
 };

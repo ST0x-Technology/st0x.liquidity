@@ -35,7 +35,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
 
-use st0x_event_sorcery::{SendError, Store};
+use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -50,8 +50,14 @@ use st0x_wrapper::{
 
 use super::RebalancingService;
 use super::trigger::RecoveryClaim;
+use crate::bot_gas::redrive::BotGasFailureClassifier;
+use crate::bot_gas::{
+    BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
+    RecordBotGasReceiptCost,
+};
 use crate::equity_redemption::{
-    DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
+    DetectionFailure, EquityRedemption, EquityRedemptionCommand, EquityRedemptionError,
+    RedemptionAggregateId,
 };
 use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
@@ -196,6 +202,11 @@ pub(crate) struct EquityTransferServices {
     pub(crate) vault_lookup: Arc<dyn VaultLookup>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
+    /// Enqueues bot-gas cost recording after `EquityRedemption`'s vault
+    /// withdraw / unwrap confirmations succeed (ADR 0017).
+    /// `TokenizedEquityMint`'s confirmations go through
+    /// `CrossVenueEquityTransfer`'s own field instead (see that struct).
+    pub(crate) bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 }
 
 impl EquityTransferServices {
@@ -212,6 +223,7 @@ impl EquityTransferServices {
             vault_lookup: Arc::new(PanickingVaultLookup),
             tokenizer: Arc::new(PanickingTokenizer),
             wrapper: Arc::new(PanickingWrapper),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
 }
@@ -448,6 +460,15 @@ pub(crate) enum MintError {
         expected_state: &'static str,
         entity: Box<TokenizedEquityMint>,
     },
+    /// Enqueueing the bot-gas receipt cost recording job failed after the
+    /// confirming step (wrap or vault deposit) already succeeded onchain --
+    /// a local SQLite write, safe to retry since the aggregate has not
+    /// advanced past the confirmed state yet. Carries a [`BotGasEnqueueFailure`]
+    /// (not a bare `QueuePushError`) so the tx hash the failed enqueue was
+    /// for survives into any wrapper (e.g. `WrappedEquityRecoveryError`) that
+    /// needs to re-surface it -- see [`crate::bot_gas::redrive`].
+    #[error("Failed to enqueue bot-gas receipt cost recording: {0}")]
+    BotGasEnqueue(BotGasEnqueueFailure),
 }
 
 /// Selector for `ERC20InsufficientBalance(address,uint256,uint256)`.
@@ -486,6 +507,21 @@ impl From<SendError<TokenizedEquityMint>> for MintError {
     }
 }
 
+impl BotGasFailureClassifier for MintError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::BotGasEnqueue(_) => true,
+            Self::Aggregate(_)
+            | Self::Wrapper(_)
+            | Self::Raindex(_)
+            | Self::VaultLookup(_)
+            | Self::Verification(_)
+            | Self::EntityNotFound { .. }
+            | Self::UnexpectedState { .. } => false,
+        }
+    }
+}
+
 /// Distinguishes mint failures before vs after tokens were received from
 /// Alpaca. Post-receipt failures must NOT clear the in-progress guard
 /// because real tokens exist in the wallet and startup recovery will
@@ -501,6 +537,16 @@ pub(crate) enum MintTransferError {
     /// Tokens exist in the wallet; guard must stay set for recovery.
     #[error(transparent)]
     PostReceipt(MintError),
+}
+
+impl BotGasFailureClassifier for MintTransferError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::PreReceipt(inner) | Self::PostReceipt(inner) => {
+                inner.is_bot_gas_enqueue_failure()
+            }
+        }
+    }
 }
 
 fn mint_reached_post_receipt(entity: &TokenizedEquityMint) -> bool {
@@ -550,6 +596,27 @@ pub(crate) enum RedemptionError {
     Rejected,
 }
 
+impl BotGasFailureClassifier for RedemptionError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                EquityRedemptionError::BotGasEnqueueFailed(_),
+            ))) => true,
+            Self::Send(_)
+            | Self::Raindex(_)
+            | Self::VaultLookup(_)
+            | Self::Alpaca(_)
+            | Self::Tokenizer(_)
+            | Self::SharesConversion(_)
+            | Self::EntityNotFound { .. }
+            | Self::SendFailed { .. }
+            | Self::UnexpectedEntity { .. }
+            | Self::UnexpectedPendingStatus
+            | Self::Rejected => false,
+        }
+    }
+}
+
 /// Result of wrapping received mint tokens into ERC-4626 shares.
 ///
 /// Returned by [`CrossVenueEquityTransfer::wrap_received_mint`] to give
@@ -578,6 +645,10 @@ pub(crate) struct CrossVenueEquityTransfer {
     wallet: Address,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    /// Enqueues bot-gas cost recording after vault deposit / wrap
+    /// confirmations succeed (ADR 0017). Defaults to `Disabled`;
+    /// production wiring opts in via [`Self::with_bot_gas_enqueuer`].
+    bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 }
 
 impl CrossVenueEquityTransfer {
@@ -598,7 +669,40 @@ impl CrossVenueEquityTransfer {
             wallet,
             mint_store,
             redemption_store,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
+    }
+
+    /// Opts this transfer into bot-gas cost recording. Called at the
+    /// production wiring site only; CLI and test construction leave the
+    /// `Disabled` default from [`Self::new`].
+    pub(crate) fn with_bot_gas_enqueuer(mut self, enqueuer: BotGasReceiptCostEnqueuer) -> Self {
+        self.bot_gas_enqueuer = enqueuer;
+        self
+    }
+
+    /// Enqueues bot-gas cost recording for a confirmed mint-side tx (vault
+    /// deposit or wrap, always on Base). Converts a push failure into
+    /// `MintError::BotGasEnqueue` carrying a `BotGasEnqueueFailure` -- built
+    /// here (not via `#[from]`) so the tx hash the failed enqueue was for is
+    /// captured while it's still in scope; `QueuePushError` alone can't
+    /// carry it back out through `MintError`.
+    async fn enqueue_bot_gas_cost(
+        &self,
+        tx_hash: TxHash,
+        category: BotGasOperationCategory,
+        symbol: Symbol,
+    ) -> Result<(), MintError> {
+        self.bot_gas_enqueuer
+            .enqueue(RecordBotGasReceiptCost::for_base_tx(
+                tx_hash, category, symbol,
+            ))
+            .await
+            .map_err(|error| {
+                MintError::BotGasEnqueue(BotGasEnqueueFailure::from_queue_push_error(
+                    tx_hash, &error,
+                ))
+            })
     }
 
     /// Loads the aggregate after Poll and extracts fields from the
@@ -704,6 +808,12 @@ impl CrossVenueEquityTransfer {
             .await?;
 
         self.raindex.confirm_tx(vault_deposit_tx_hash).await?;
+        self.enqueue_bot_gas_cost(
+            vault_deposit_tx_hash,
+            BotGasOperationCategory::VaultDeposit,
+            symbol.clone(),
+        )
+        .await?;
 
         self.mint_store
             .send(
@@ -755,6 +865,24 @@ impl CrossVenueEquityTransfer {
                     ?error,
                     "Vault deposit reverted on resume -- deposit likely \
                     already landed in a previous session; closing operation"
+                );
+
+                // The real deposit tx hash is unknown (see the TxHash::ZERO
+                // comment below), so its bot-gas cost can never be enqueued
+                // here -- there is no tx hash to enqueue a
+                // RecordBotGasReceiptCost job against. This is a real,
+                // narrow financial-data gap (a confirmed bot-signed tx whose
+                // gas cost will never be recorded), so it is logged loudly
+                // rather than silently skipped -- see AGENTS.md's "CRITICAL:
+                // Financial Data Integrity" and SPEC.md's bot-gas "Known
+                // gaps".
+                warn!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %symbol,
+                    "Bot-gas receipt cost: the real vault-deposit tx hash for this \
+                     crash-recovered mint is unknown (TxHash::ZERO sentinel); its gas \
+                     cost cannot be recorded and this cost fact is permanently lost"
                 );
 
                 // TxHash::ZERO signals that the real deposit TX hash is
@@ -824,6 +952,12 @@ impl CrossVenueEquityTransfer {
 
         let WrapConfirmation { shares, block } =
             self.wrapper.confirm_wrap(token, wrap_tx_hash).await?;
+        self.enqueue_bot_gas_cost(
+            wrap_tx_hash,
+            BotGasOperationCategory::Wrap,
+            tokens_received.symbol.clone(),
+        )
+        .await?;
 
         self.mint_store
             .send(
@@ -878,6 +1012,12 @@ impl CrossVenueEquityTransfer {
                         .wrapper
                         .confirm_wrap(wrapped_token, wrap_tx_hash)
                         .await?;
+                    self.enqueue_bot_gas_cost(
+                        wrap_tx_hash,
+                        BotGasOperationCategory::Wrap,
+                        symbol.clone(),
+                    )
+                    .await?;
 
                     self.mint_store
                         .send(
@@ -932,6 +1072,12 @@ impl CrossVenueEquityTransfer {
                 } => {
                     info!(%issuer_request_id, %vault_deposit_tx_hash, "Resuming submitted vault deposit");
                     self.raindex.confirm_tx(vault_deposit_tx_hash).await?;
+                    self.enqueue_bot_gas_cost(
+                        vault_deposit_tx_hash,
+                        BotGasOperationCategory::VaultDeposit,
+                        symbol.clone(),
+                    )
+                    .await?;
 
                     self.mint_store
                         .send(
@@ -1699,7 +1845,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
-    use st0x_event_sorcery::{StoreBuilder, test_store};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
@@ -1712,7 +1858,8 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::equity_redemption::redemption_aggregate_id;
+    use crate::bot_gas::{BotGasChain, RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs};
+    use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
@@ -1736,6 +1883,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
 
@@ -2452,6 +2600,204 @@ mod tests {
             .unwrap();
     }
 
+    /// Acceptance criterion: a full mint (RequestMint through
+    /// DepositToVault) enqueues exactly one `Wrap` and one `VaultDeposit`
+    /// bot-gas job, each carrying the symbol and Base chain.
+    #[tokio::test]
+    async fn mint_transfer_enqueues_wrap_and_vault_deposit_bot_gas_jobs() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = mock_services();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            Address::random(),
+            mint_store,
+            redemption_store,
+        )
+        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-BOT-GAS"),
+                &symbol,
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            2,
+            "expected exactly one Wrap and one VaultDeposit job"
+        );
+        let wrap_jobs: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.category == BotGasOperationCategory::Wrap)
+            .collect();
+        let deposit_jobs: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.category == BotGasOperationCategory::VaultDeposit)
+            .collect();
+        assert_eq!(wrap_jobs.len(), 1);
+        assert_eq!(deposit_jobs.len(), 1);
+        for job in [wrap_jobs[0], deposit_jobs[0]] {
+            assert_eq!(job.chain, BotGasChain::Base);
+            assert_eq!(job.symbol, Some(symbol.clone()));
+        }
+    }
+
+    /// Acceptance criterion: an enqueue failure after a confirmed
+    /// wrap propagates as a hard error rather than being swallowed. A fresh
+    /// mint reaches `wrap_received_mint`'s enqueue call (after `confirm_wrap`)
+    /// strictly before `deposit_wrapped_mint`'s, so this test exercises the
+    /// WRAP-side enqueue only; see `deposit_enqueue_failure_propagates` below
+    /// for the deposit side.
+    #[tokio::test]
+    async fn wrap_enqueue_failure_propagates() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = mock_services();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        apalis_pool.close().await;
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            Address::random(),
+            mint_store,
+            redemption_store,
+        )
+        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-BOT-GAS-FAIL"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, MintTransferError::PostReceipt(inner) if matches!(inner, MintError::BotGasEnqueue(_)))
+        );
+    }
+
+    /// Isolates the DEPOSIT-side enqueue call (`deposit_wrapped_mint`'s,
+    /// reached again on resume from `VaultDepositSubmitted`): seeds the
+    /// aggregate straight to `VaultDepositSubmitted` via direct commands (so
+    /// the wrap-side enqueue, which runs earlier in a fresh mint, never
+    /// fires), then resumes with a closed apalis pool. The failure must leave
+    /// the aggregate un-advanced -- still `VaultDepositSubmitted`, not
+    /// `DepositedIntoRaindex` -- so a retry re-attempts both `confirm_tx` and
+    /// the enqueue.
+    #[tokio::test]
+    async fn deposit_enqueue_failure_propagates() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = mock_services();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            Address::random(),
+            mint_store,
+            redemption_store,
+        )
+        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+
+        let id = issuer_request_id("ISS-BOT-GAS-DEPOSIT-FAIL");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        let wrap_tx = TxHash::random();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: wrap_tx,
+                    wrapped_shares: U256::from(10_000_000_000_000_000_000u128),
+                    wrap_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let vault_deposit_tx_hash = TxHash::random();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitVaultDeposit {
+                    vault_deposit_tx_hash,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::VaultDepositSubmitted { .. }),
+            "expected VaultDepositSubmitted, got: {entity:?}"
+        );
+
+        apalis_pool.close().await;
+
+        let error = transfer.resume_mint(&id).await.unwrap_err();
+
+        assert!(
+            matches!(error, MintError::BotGasEnqueue(_)),
+            "expected BotGasEnqueue, got: {error:?}"
+        );
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::VaultDepositSubmitted { .. }),
+            "aggregate must remain in VaultDepositSubmitted (un-advanced) so the retry \
+             re-attempts confirm_tx and the enqueue; got: {entity:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resume_mint_from_accepted_completes_workflow() {
         let transfer = create_equity_transfer(
@@ -2638,6 +2984,130 @@ mod tests {
         assert!(
             matches!(entity, EquityRedemption::Completed { .. }),
             "Expected completed redemption, got: {entity:?}"
+        );
+    }
+
+    /// Acceptance criterion: a full redemption (withdraw through the
+    /// redemption-wallet send) enqueues exactly one `VaultWithdraw`, one
+    /// `Unwrap`, and one `WalletTransfer` bot-gas job, each carrying the
+    /// symbol and Base chain.
+    #[tokio::test]
+    async fn redemption_transfer_enqueues_vault_withdraw_and_unwrap_bot_gas_jobs() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: tokenizer.clone(),
+            wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            tokenizer,
+            Arc::new(MockWrapper::new()),
+            Address::random(),
+            mint_store,
+            redemption_store,
+        );
+
+        let symbol = Symbol::new("TEST").unwrap();
+        let id = redemption_aggregate_id("redeem-bot-gas");
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, FractionalShares::new(float!(50)))
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            3,
+            "expected exactly one VaultWithdraw, one Unwrap, and one WalletTransfer job"
+        );
+        let withdraw_jobs: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.category == BotGasOperationCategory::VaultWithdraw)
+            .collect();
+        let unwrap_jobs: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.category == BotGasOperationCategory::Unwrap)
+            .collect();
+        let wallet_transfer_jobs: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.category == BotGasOperationCategory::WalletTransfer)
+            .collect();
+        assert_eq!(withdraw_jobs.len(), 1);
+        assert_eq!(unwrap_jobs.len(), 1);
+        assert_eq!(wallet_transfer_jobs.len(), 1);
+        for job in [withdraw_jobs[0], unwrap_jobs[0], wallet_transfer_jobs[0]] {
+            assert_eq!(job.chain, BotGasChain::Base);
+            assert_eq!(job.symbol, Some(symbol.clone()));
+        }
+    }
+
+    /// Acceptance criterion: an enqueue failure after a confirmed
+    /// vault withdraw propagates as a hard error rather than being swallowed.
+    #[tokio::test]
+    async fn withdraw_enqueue_failure_propagates() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        apalis_pool.close().await;
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+        };
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(pool, services));
+
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = mock_vault_lookup()
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
+        let id = redemption_aggregate_id("redeem-bot-gas-fail");
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    quantity: float!(50),
+                    token,
+                    amount,
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+
+        let error = redemption_store
+            .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::BotGasEnqueueFailed(_)
+                ))
+            ),
+            "expected BotGasEnqueueFailed, got: {error:?}"
         );
     }
 
