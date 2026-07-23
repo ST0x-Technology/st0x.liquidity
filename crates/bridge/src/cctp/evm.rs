@@ -17,8 +17,8 @@ use st0x_evm::{
 };
 
 use super::{
-    CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
-    parse_received_message,
+    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
+    TokenMessengerV2, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -73,6 +73,86 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// Blocks the chain head must be past `from_block` before an empty scan is
 /// trusted as a true absence (the burn lands at/after `from_block`).
 const SCAN_FINALITY_MARGIN: u64 = 2;
+
+/// Number of [`CCTP_RECOVERY_LOG_BLOCK_CHUNK`]-sized chunks
+/// [`CctpEndpoint::reconstruct_existing_mint`]'s retry scans backward from
+/// the current head before giving up, bounding a single scan attempt's cost.
+///
+/// This floor is safe specifically because `reconstruct_existing_mint` only
+/// runs after [`CctpEndpoint::recover_already_minted`]'s probe loop has
+/// itself just observed `usedNonces()` flip to consumed, within the current
+/// recovery window (production: ~2 minutes). The matching `MessageReceived`
+/// log is therefore necessarily within the last few chunks of the current
+/// head, not somewhere deep in chain history, so three chunks (60,000
+/// blocks -- many hours even on a fast chain like Base) is a wide margin
+/// over the sub-minute recency this bound relies on, while still cutting a
+/// worst-case scan from thousands of chunks to three.
+///
+/// [`CctpEndpoint::find_existing_mint`]'s own scan is NOT bounded by this:
+/// it is a proactive check run during crash-recovery resume, which may be
+/// re-checking a transfer that stalled for an arbitrary, unbounded amount of
+/// time (e.g. days, waiting on an operator) before this code ever runs, so
+/// the "the mint is recent" argument above does not hold there.
+const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
+
+/// Delay between the `usedNonces()` probes that
+/// [`CctpEvm::recover_already_minted`] runs after a failed `receiveMessage`.
+///
+/// This is the production default (see [`MintRecoveryConfig::defaults`]);
+/// tests override the cadence via
+/// [`CctpEndpoint::with_mint_recovery_config`] to pin behaviour against a
+/// short, deterministic interval instead of racing or pausing real time
+/// against this multi-minute production value.
+pub(super) const MINT_RECOVERY_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Number of `usedNonces()` probes after a failed `receiveMessage`. The first
+/// is immediate and the rest are spaced by [`MINT_RECOVERY_PROBE_INTERVAL`], so
+/// together they span ~2 minutes (production default; see
+/// [`MintRecoveryConfig`]).
+///
+/// How long [`CctpEvm::recover_already_minted`] keeps re-probing before it
+/// concludes an attested message was not minted by anyone is sized for a
+/// third-party relayer to deliver `receiveMessage` after our own submission
+/// failed: the burn is irreversible and the attestation is valid, so a mint
+/// can still land after our own submission fails. This bound is a **chosen**
+/// trade-off, not a measured one: the sole production data point behind it is
+/// a single incident where a third-party mint landed ~10 seconds after our
+/// submission failed, and two minutes is a 12x pad over that one observation,
+/// not a figure derived from Circle's CCTP V2 docs or a logged distribution of
+/// attestation-to-mint deltas.
+///
+/// The trade-off is asymmetric and deliberately erred toward the safer side:
+/// too short strands the rebalancing guard for hours (the original incident
+/// this window fixes -- an operator must reconcile by hand), while too long
+/// only delays a genuinely terminal failure by extra minutes on top of an
+/// already-failed transfer. If a relayer is ever observed delivering later
+/// than this window, widen it rather than assume the failure is terminal.
+const MINT_RECOVERY_PROBES: u32 = 13;
+
+/// Tuning knobs for [`CctpEndpoint::recover_already_minted`]'s probe cadence.
+/// Bundled into a struct, mirroring [`BurnDropConfig`], so tests can drive a
+/// short, deterministic cadence against real awaited state instead of racing
+/// or pausing the clock through production's multi-minute window (see
+/// [`MINT_RECOVERY_PROBES`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MintRecoveryConfig {
+    /// Delay between `usedNonces()` probes.
+    pub(super) probe_interval: Duration,
+    /// Number of probes; the first is immediate, the rest spaced by
+    /// `probe_interval`.
+    pub(super) probes: u32,
+}
+
+impl MintRecoveryConfig {
+    /// Production cadence: [`MINT_RECOVERY_PROBES`] probes spaced
+    /// [`MINT_RECOVERY_PROBE_INTERVAL`] apart.
+    const fn defaults() -> Self {
+        Self {
+            probe_interval: MINT_RECOVERY_PROBE_INTERVAL,
+            probes: MINT_RECOVERY_PROBES,
+        }
+    }
+}
 
 /// Grace period before [`CctpEndpoint::burn_status`] may conclude a broadcast
 /// burn tx was dropped from the mempool. Mirrors the wallet's `wait_for_receipt`
@@ -173,6 +253,13 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     /// [`with_burn_drop_config`](Self::with_burn_drop_config) so the drop grace
     /// resolves immediately instead of after the production 30 s window.
     burn_drop_config: BurnDropConfig,
+    /// Probe cadence for
+    /// [`recover_already_minted`](Self::recover_already_minted). Production
+    /// uses [`MintRecoveryConfig::defaults`]; tests override it via
+    /// [`with_mint_recovery_config`](Self::with_mint_recovery_config) to drive
+    /// a short cadence against real awaited state instead of racing or
+    /// pausing the production multi-minute window.
+    mint_recovery_config: MintRecoveryConfig,
 }
 
 impl<W: Wallet> CctpEndpoint<W> {
@@ -193,6 +280,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             wallet,
             node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
             burn_drop_config: BurnDropConfig::defaults(),
+            mint_recovery_config: MintRecoveryConfig::defaults(),
         }
     }
 
@@ -842,55 +930,90 @@ impl<W: Wallet> CctpEndpoint<W> {
         parse_mint_receipt(&receipt).ok_or(CctpError::MintAndWithdrawEventNotFound)
     }
 
-    /// Reconstructs the receipt of an already-executed mint for the attested
+    /// Returns the receipt of an already-executed mint for the attested
     /// `message`, or `None` if its nonce has not been consumed on this chain.
     ///
-    /// Confirms via `usedNonces()` (structural ground truth, not the
-    /// decoder/provider-dependent revert string) and matches the on-chain
-    /// `MessageReceived` log against the attested message's source domain and
-    /// body before trusting the recovered amounts. Used both proactively
-    /// (crash-recovery resume, before minting) and reactively (after a
-    /// `receiveMessage` revert, via `recover_already_minted`).
+    /// The zero-nonce and destination-domain checks run before the
+    /// `usedNonces()` read: both are structurally deterministic for the fixed
+    /// `message` bytes and independent of chain state, so a wrong-direction or
+    /// unattested message fails immediately instead of reading the nonce first
+    /// and reporting "not yet minted" for a message that could never mint
+    /// here. Used proactively by crash-recovery resume, before minting.
+    /// [`recover_already_minted`](Self::recover_already_minted) does not call
+    /// this directly -- see its own doc for why.
     pub(super) async fn find_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         message: &[u8],
     ) -> Result<Option<MintReceipt>, CctpError> {
-        let received_message = parse_received_message(message)?;
-
-        // CCTP V2 assigns the real nonce only at attestation; an unattested or
-        // invalid message still carries the reserved zero nonce, which the
-        // transmitter reports as used. Such a message was never minted.
-        if received_message.nonce == B256::ZERO {
-            return Ok(None);
-        }
+        let received_message = validate_message_shape(message, direction)?;
 
         // Authoritative gate: usedNonces() is non-zero once the nonce has been
         // consumed (the mint executed and emitted MintAndWithdraw below).
+        if !self
+            .is_nonce_used::<Registry>(received_message.nonce)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        // No lower bound: a crash-recovery resume may be re-checking a
+        // transfer that stalled for an unbounded amount of time before this
+        // runs, so the mint cannot be assumed recent here -- unlike
+        // `reconstruct_existing_mint`'s bounded retry (see
+        // `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`'s doc).
+        self.locate_mint_receipt(&received_message, None)
+            .await
+            .map(Some)
+    }
+
+    /// Cheap authoritative gate: `true` once `nonce` has been consumed on this
+    /// chain (the mint executed and emitted `MintAndWithdraw`).
+    ///
+    /// This is the only on-chain call
+    /// [`recover_already_minted`](Self::recover_already_minted)'s probe loop
+    /// makes on every probe -- the expensive log scan and receipt
+    /// reconstruction ([`locate_mint_receipt`](Self::locate_mint_receipt)) run
+    /// only once, after a probe confirms the nonce consumed, rather than on
+    /// every probe: repeating an unbounded backward log scan across the whole
+    /// multi-minute recovery window would multiply its cost by the probe
+    /// count for no benefit, since this cheap view call already gives an
+    /// authoritative answer.
+    async fn is_nonce_used<Registry: IntoErrorRegistry>(
+        &self,
+        nonce: B256,
+    ) -> Result<bool, EvmError> {
         let nonce_used = self
             .wallet
             .call::<Registry, _>(
                 self.message_transmitter_address,
-                MessageTransmitterV2::usedNoncesCall(received_message.nonce),
+                MessageTransmitterV2::usedNoncesCall(nonce),
             )
             .await?;
 
-        if nonce_used.is_zero() {
-            return Ok(None);
-        }
+        Ok(!nonce_used.is_zero())
+    }
 
-        if received_message.destination_domain != direction.dest_domain() {
-            return Err(CctpError::MessageDestinationDomainMismatch {
-                expected: direction.dest_domain(),
-                actual: received_message.destination_domain,
-            });
-        }
-
+    /// Locates and validates the mint receipt for a message whose nonce
+    /// [`is_nonce_used`](Self::is_nonce_used) already confirmed consumed.
+    /// Scans for the `MessageReceived` log matching the attested source
+    /// domain and body, then validates the mint tx did not revert and emitted
+    /// `MintAndWithdraw`.
+    ///
+    /// `min_block` floors the backward scan; passed straight through to
+    /// [`find_received_message_tx`](Self::find_received_message_tx), see its
+    /// doc for when a floor is (and is not) safe to pass.
+    async fn locate_mint_receipt(
+        &self,
+        received_message: &CctpReceivedMessage<'_>,
+        min_block: Option<u64>,
+    ) -> Result<MintReceipt, CctpError> {
         let (tx_hash, message_received_log_index) = self
             .find_received_message_tx(
                 received_message.source_domain,
                 received_message.nonce,
                 received_message.message_body,
+                min_block,
             )
             .await?;
 
@@ -916,52 +1039,277 @@ impl<W: Wallet> CctpEndpoint<W> {
             "Recovered already-minted CCTP transfer"
         );
 
-        Ok(Some(mint_receipt))
+        Ok(mint_receipt)
     }
 
-    /// Reactive recovery for a `receiveMessage` revert: if the nonce was already
-    /// minted, returns the existing receipt; otherwise (nonce not consumed, or
-    /// the recovery probe could not conclusively reconstruct our mint) it
-    /// re-surfaces the original `submit_error` rather than masking it with a
-    /// probe error.
+    /// Reconstructs the mint receipt once
+    /// [`recover_already_minted`](Self::recover_already_minted)'s probe loop
+    /// has confirmed the nonce consumed.
+    ///
+    /// Retries only [`CctpError::AlreadyMintedMessageNotFound`] -- the queried
+    /// node's log index lagging behind the state its own `usedNonces()` view
+    /// call already reflects -- up to `SCAN_ATTEMPTS` times spaced
+    /// `SCAN_RETRY_BACKOFF` apart, the same dRPC-lag tolerance
+    /// [`find_recent_burn`](Self::find_recent_burn) and
+    /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) already
+    /// apply to their own `get_logs` scans. This runs at most once per
+    /// `recover_already_minted` call (not once per probe). Each retry's scan
+    /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]
+    /// chunks behind the current head (falling back to an unbounded scan if
+    /// the head read itself fails), so `SCAN_ATTEMPTS` retries are genuinely
+    /// a handful of quick attempts instead of each one repeating a full
+    /// backward walk to genesis.
+    ///
+    /// Any other failure means the nonce is authoritatively consumed but the
+    /// receipt could not be validated (a reverted mint tx, a mismatched log, a
+    /// missing event): this is returned as-is, and the caller reports it as
+    /// [`CctpError::MintRecoveryInconclusive`] rather than a false "never
+    /// minted" terminal failure, since the authoritative nonce read already
+    /// proved the mint landed.
+    async fn reconstruct_existing_mint(
+        &self,
+        received_message: &CctpReceivedMessage<'_>,
+    ) -> Result<MintReceipt, CctpError> {
+        let min_block = match self.current_block().await {
+            Ok(head) => Some(head.saturating_sub(
+                CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
+            )),
+            Err(error) => {
+                warn!(
+                    target: "bridge",
+                    ?error,
+                    "Failed to read the chain head to floor the reconstruction scan; \
+                     falling back to an unbounded backward scan for this attempt"
+                );
+                None
+            }
+        };
+
+        let mut attempt = 1;
+
+        loop {
+            match self.locate_mint_receipt(received_message, min_block).await {
+                Ok(mint_receipt) => return Ok(mint_receipt),
+                Err(CctpError::AlreadyMintedMessageNotFound { nonce })
+                    if attempt < SCAN_ATTEMPTS =>
+                {
+                    warn!(
+                        target: "bridge",
+                        %nonce,
+                        attempt,
+                        max_attempts = SCAN_ATTEMPTS,
+                        "MessageReceived log not yet visible for a nonce confirmed \
+                         consumed; retrying (load-balanced RPC log-index lag)"
+                    );
+                    tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
+                    attempt += 1;
+                }
+                Err(other_error) => return Err(other_error),
+            }
+        }
+    }
+
+    /// Reactive recovery for a `receiveMessage` revert. Three outcomes:
+    ///
+    /// - the nonce was already minted: returns the existing receipt, via a
+    ///   single [`reconstruct_existing_mint`](Self::reconstruct_existing_mint)
+    ///   call once a probe confirms the nonce consumed;
+    /// - the last probe's read was a clean `usedNonces()` read of unconsumed:
+    ///   re-surfaces the original `submit_error` as a true terminal failure.
+    ///   Earlier probes may have errored transiently along the way -- that
+    ///   does not matter, since a consumed nonce is never un-consumed, so the
+    ///   last clean read is authoritative and conclusively means the mint had
+    ///   not landed as of that read -- a decided outcome, not a guess;
+    /// - the window expires without ever getting a conclusive read (every
+    ///   remaining probe itself errored transiently), OR the nonce is
+    ///   confirmed consumed but its receipt could not be reconstructed:
+    ///   returns [`CctpError::MintRecoveryInconclusive`] instead of masking an
+    ///   unknown state, or a state we know landed, as a decided "never
+    ///   minted" outcome. Declaring a terminal failure here would strand the
+    ///   caller (the USDC rebalancing guard) on a false negative; the caller
+    ///   should redrive instead.
+    ///
+    /// The zero-nonce and destination-domain fail-fast guards are shared with
+    /// [`find_existing_mint`](Self::find_existing_mint); this probe loop,
+    /// though, calls only [`is_nonce_used`](Self::is_nonce_used) on every
+    /// probe -- the expensive log scan and receipt reconstruction run at most
+    /// once, via [`reconstruct_existing_mint`](Self::reconstruct_existing_mint),
+    /// after a probe confirms the nonce consumed, not on every probe.
+    ///
+    /// The probe is repeated over the configured window (production: ~2
+    /// minutes, see [`MINT_RECOVERY_PROBES`] and [`MintRecoveryConfig`])
+    /// rather than run once. Our own submission failing does not mean the
+    /// mint will not happen: the burn is already irreversible and the
+    /// attestation is valid,
+    /// so **any** party -- a third-party relayer, or a later retry -- can
+    /// deliver `receiveMessage` seconds afterwards. A single instant probe
+    /// reports "not minted" for a message that is about to be minted, and the
+    /// caller then declares a post-burn failure that strands the USDC
+    /// rebalancing guard until an operator reconciles it by hand.
+    ///
+    /// Every probe error is retried, including one that is revert-shaped per
+    /// [`EvmError::is_revert`]. An earlier version of this loop fast-failed
+    /// on `is_revert()`, treating it as a deterministic on-chain outcome that
+    /// would recur identically on every remaining probe. That assumption
+    /// does not hold for the single call this loop makes,
+    /// [`is_nonce_used`](Self::is_nonce_used): `usedNonces(bytes32)` is a
+    /// plain public-mapping getter (see the vendored `MessageTransmitterV2`
+    /// ABI -- a `view` function with no `require`/branch logic), so it
+    /// cannot deterministically revert for a well-formed call. Any
+    /// revert-shaped response observed here is therefore necessarily a
+    /// provider/transport artifact (a misrouted or misbehaving RPC backend),
+    /// not a decided on-chain fact -- exactly the class of failure this
+    /// window exists to survive, so fast-failing on it risked reproducing
+    /// the original incident on a transient blip.
     pub(super) async fn recover_already_minted<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         message: &[u8],
         submit_error: EvmError,
     ) -> Result<MintReceipt, CctpError> {
-        match self
-            .find_existing_mint::<Registry>(direction, message)
-            .await
-        {
-            Ok(Some(mint_receipt)) => Ok(mint_receipt),
-            Ok(None) => Err(submit_error.into()),
-            Err(probe_error) => {
+        // A failure here (an unparseable envelope, the reserved placeholder
+        // nonce, or a destination-domain mismatch) is structurally
+        // deterministic for the fixed `message` bytes: none of these depend
+        // on chain state or RPC health, so all fail fast before any probe is
+        // spent instead of burning the whole recovery window re-checking the
+        // same bytes on every remaining probe. The caller's post-burn failure
+        // surfaces why `receiveMessage` itself failed (`submit_error`), not
+        // this internal check's own error, which is logged alongside it for
+        // diagnosis.
+        let received_message = match validate_message_shape(message, direction) {
+            Ok(received_message) => received_message,
+            Err(validation_error) => {
                 warn!(
                     target: "bridge",
-                    ?probe_error,
-                    "CCTP mint recovery probe failed; surfacing original submit error"
+                    ?validation_error,
+                    "CCTP mint recovery message failed structural validation; failing \
+                     fast and surfacing the original submit error"
                 );
-                Err(submit_error.into())
+                return Err(submit_error.into());
+            }
+        };
+
+        let config = self.mint_recovery_config;
+
+        // Tracks the last probe's outcome so the terminal handling below can
+        // distinguish "every probe read the nonce as genuinely unconsumed"
+        // from "the last probe errored, so the nonce state is unknown" --
+        // collapsing both into one outcome misleads a caller (and an operator
+        // reading a post-burn failure) into reconciling in the wrong
+        // direction.
+        let mut last_probe_error: Option<EvmError> = None;
+        let mut unconsumed_reads = 0u32;
+
+        let mut poll = interval(config.probe_interval);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        for probe in 1..=config.probes {
+            // First tick completes immediately, so probe 1 runs before any
+            // sleep; subsequent ticks pace the remaining probes.
+            poll.tick().await;
+
+            match self.is_nonce_used::<Registry>(received_message.nonce).await {
+                Ok(true) => {
+                    debug!(
+                        target: "bridge",
+                        probe,
+                        "CCTP mint nonce reads consumed; reconstructing the mint receipt"
+                    );
+                    // The nonce is authoritatively confirmed consumed, so ANY
+                    // reconstruction failure (a lagging log scan that outlasts
+                    // SCAN_ATTEMPTS, a mismatched log, a reverted mint tx, a
+                    // missing MintAndWithdraw event) is reported as
+                    // MintRecoveryInconclusive, never as the raw underlying
+                    // error: the mint is known to have landed, so declaring a
+                    // terminal failure here would strand the caller on a false
+                    // negative exactly like the case this function exists to
+                    // prevent.
+                    return self
+                        .reconstruct_existing_mint(&received_message)
+                        .await
+                        .map_err(|reconstruction_error| CctpError::MintRecoveryInconclusive {
+                            probe_error: Box::new(reconstruction_error),
+                        });
+                }
+                Ok(false) => {
+                    last_probe_error = None;
+                    unconsumed_reads += 1;
+                    debug!(
+                        target: "bridge",
+                        probe,
+                        "CCTP mint nonce still unconsumed after submit failure"
+                    );
+                }
+                Err(evm_error) => {
+                    // usedNonces() cannot deterministically revert (see this
+                    // function's doc comment), so every probe error -- even
+                    // one shaped like a revert -- is retried rather than
+                    // treated as a decided terminal outcome.
+                    warn!(
+                        target: "bridge",
+                        ?evm_error,
+                        probe,
+                        "CCTP mint recovery probe failed; retrying"
+                    );
+                    last_probe_error = Some(evm_error);
+                }
             }
         }
+
+        if let Some(last_probe_error) = last_probe_error {
+            warn!(
+                target: "bridge",
+                ?last_probe_error,
+                "CCTP mint recovery window expired with the nonce state UNKNOWN (the last \
+                 probe errored rather than reading the nonce as unconsumed); the mint may \
+                 still have landed. Returning a retryable error instead of declaring a \
+                 false terminal failure"
+            );
+            return Err(CctpError::MintRecoveryInconclusive {
+                probe_error: Box::new(last_probe_error.into()),
+            });
+        }
+
+        let window = config
+            .probe_interval
+            .saturating_mul(config.probes.saturating_sub(1));
+        let probes = config.probes;
+        warn!(
+            target: "bridge",
+            window_secs = window.as_secs(),
+            unconsumed_reads,
+            probes,
+            "CCTP mint nonce read unconsumed on every probe that completed cleanly \
+             ({unconsumed_reads} of {probes}); surfacing the original submit error"
+        );
+
+        Err(submit_error.into())
     }
 
     /// Locates the `receiveMessage` transaction that minted `nonce` and returns
     /// its hash alongside the matched `MessageReceived` log index (used to
     /// correlate the right `MintAndWithdraw` within a multicall transaction).
     ///
-    /// The backward scan has no upper bound and can in principle reach block 0,
-    /// but this is only invoked during crash recovery immediately after a
-    /// submit failure, so the matching mint is always recent and found in the
-    /// first few chunks. A hard scan limit is deliberately omitted to avoid
-    /// failing recovery when a deep reorg or lagging node pushes the log back.
+    /// `min_block` floors how far back the scan walks: `None` (used by
+    /// [`find_existing_mint`](Self::find_existing_mint)'s proactive
+    /// crash-recovery check) leaves it unbounded, walking all the way to
+    /// block 0 if needed, since that caller may be re-checking a transfer
+    /// that stalled for an unbounded amount of time. `Some(block)` (used by
+    /// [`reconstruct_existing_mint`](Self::reconstruct_existing_mint)'s
+    /// retry, see [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]) stops the walk
+    /// there instead, since that caller only runs immediately after this
+    /// same recovery attempt's own probe loop observed the nonce become
+    /// consumed, so the matching log cannot be older than the floor. A hard
+    /// limit is deliberately omitted in the unbounded case to avoid failing
+    /// recovery when a deep reorg or lagging node pushes the log back.
     async fn find_received_message_tx(
         &self,
         source_domain: u32,
         nonce: B256,
         message_body: &[u8],
+        min_block: Option<u64>,
     ) -> Result<(TxHash, u64), CctpError> {
+        let floor = min_block.unwrap_or(0);
         let latest = self
             .wallet
             .provider()
@@ -972,8 +1320,9 @@ impl<W: Wallet> CctpEndpoint<W> {
         let mut saw_nonce = false;
 
         loop {
-            let from_block =
-                to_block.saturating_sub(CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_sub(1));
+            let from_block = to_block
+                .saturating_sub(CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_sub(1))
+                .max(floor);
             let filter = Filter::new()
                 .address(self.message_transmitter_address)
                 .from_block(from_block)
@@ -1025,7 +1374,7 @@ impl<W: Wallet> CctpEndpoint<W> {
                 return Ok((tx_hash, log_index));
             }
 
-            if from_block == 0 {
+            if from_block <= floor {
                 break;
             }
 
@@ -1104,6 +1453,51 @@ impl<W: Wallet> CctpEndpoint<W> {
         self.burn_drop_config = config;
         self
     }
+
+    /// Overrides the [`recover_already_minted`](Self::recover_already_minted)
+    /// probe cadence. Test-only: lets recovery tests drive a short interval
+    /// and probe count against real awaited state instead of racing or
+    /// pausing the production multi-minute window.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn with_mint_recovery_config(mut self, config: MintRecoveryConfig) -> Self {
+        self.mint_recovery_config = config;
+        self
+    }
+}
+
+/// Parses `message` and validates it can structurally mint on `direction`'s
+/// chain: rejects an unparseable envelope, the reserved placeholder nonce
+/// (CCTP V2 assigns the real nonce only at attestation, so an unattested or
+/// malformed message still carries the reserved zero nonce), and a
+/// destination-domain mismatch (reconstructing a message attested for the
+/// other direction can never succeed here). All three checks are
+/// structurally deterministic for the fixed `message` bytes and independent
+/// of chain state, so they fail fast before any `usedNonces()` read.
+///
+/// Shared by [`CctpEndpoint::find_existing_mint`] and
+/// [`CctpEndpoint::recover_already_minted`], which apply different policies
+/// to a validation failure (a direct error vs. logging it and re-surfacing
+/// the original `receiveMessage` submit error) -- only the validation rule
+/// itself is shared here.
+fn validate_message_shape(
+    message: &[u8],
+    direction: BridgeDirection,
+) -> Result<CctpReceivedMessage<'_>, CctpError> {
+    let received_message = parse_received_message(message)?;
+
+    if received_message.nonce == B256::ZERO {
+        return Err(CctpError::PlaceholderNonce);
+    }
+
+    if received_message.destination_domain != direction.dest_domain() {
+        return Err(CctpError::MessageDestinationDomainMismatch {
+            expected: direction.dest_domain(),
+            actual: received_message.destination_domain,
+        });
+    }
+
+    Ok(received_message)
 }
 
 fn parse_mint_receipt(receipt: &TransactionReceipt) -> Option<MintReceipt> {

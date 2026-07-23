@@ -419,6 +419,19 @@ pub enum CctpError {
          filled in the real nonce yet or the response is malformed"
     )]
     PlaceholderNonce,
+    /// The mint recovery window expired without ever getting a conclusive
+    /// `usedNonces()` read: every remaining probe itself failed with a
+    /// transient, retryable error, so whether the mint landed is UNKNOWN --
+    /// not "definitely not minted". Distinct from the case where every probe
+    /// read the nonce as genuinely unconsumed (which re-surfaces the original
+    /// `receiveMessage` submission error as a true terminal failure). A
+    /// caller should redrive rather than declare a terminal failure on state
+    /// the probe loop never actually observed.
+    #[error("CCTP mint recovery window expired with the nonce state unknown: {probe_error}")]
+    MintRecoveryInconclusive {
+        #[source]
+        probe_error: Box<Self>,
+    },
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
     #[error("Float operation error: {0}")]
@@ -490,6 +503,7 @@ impl CctpError {
             | Self::RecoveredMintReceiptReverted { .. }
             | Self::RecoveredMintAndWithdrawEventNotFound { .. }
             | Self::PlaceholderNonce
+            | Self::MintRecoveryInconclusive { .. }
             | Self::FeeCalculationOverflow
             | Self::Float(_)
             | Self::AmountConversion(_)
@@ -972,6 +986,15 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// confirming event was not yet persisted. Passing the full message (not
     /// just the nonce) lets the reconstruction match the on-chain log against
     /// the attested source domain and body.
+    ///
+    /// A message still carrying the reserved zero nonce (unattested, or a
+    /// malformed attestation response) errors with
+    /// [`CctpError::PlaceholderNonce`] rather than reporting `None`: no party
+    /// could ever have delivered `receiveMessage` for it, so "unused" would
+    /// misrepresent a message that was never attested. A caller resuming from
+    /// a pre-attestation envelope must handle this case deliberately (e.g. by
+    /// re-polling the attestation) rather than treating it as "not yet
+    /// minted".
     pub async fn find_existing_mint(
         &self,
         direction: BridgeDirection,
@@ -1285,6 +1308,7 @@ mod tests {
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::rpc::types::TransactionReceipt;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
@@ -1295,13 +1319,17 @@ mod tests {
     use rand::Rng;
     use serde_json::value::to_raw_value;
     use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use st0x_evm::AbiDecodedErrorType;
+    use st0x_evm::Evm;
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 
+    use super::evm::MintRecoveryConfig;
     use super::*;
     use crate::{Attestation, Bridge};
 
@@ -1527,6 +1555,208 @@ mod tests {
         let endpoint = anvil.endpoint();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         (anvil, endpoint, private_key)
+    }
+
+    /// Test-only [`Provider`] wrapper that answers `get_logs` with an empty
+    /// result for the first `empty_scans` invocations before delegating to
+    /// `inner`. Simulates the dRPC read-after-write lag
+    /// `find_received_message_tx`'s backward log scan is exposed to:
+    /// `usedNonces()` already reports the nonce consumed but the
+    /// `MessageReceived` log has not yet been indexed by the queried node.
+    /// Wrapped by [`FlakyProbeWallet`], never constructed directly by tests.
+    #[derive(Clone)]
+    struct FlakyGetLogsProvider<InnerProvider> {
+        inner: InnerProvider,
+        remaining_empty_scans: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl<InnerProvider: Provider + Clone> Provider for FlakyGetLogsProvider<InnerProvider> {
+        fn root(&self) -> &alloy::providers::RootProvider {
+            self.inner.root()
+        }
+
+        async fn get_logs(
+            &self,
+            filter: &alloy::rpc::types::Filter,
+        ) -> alloy::transports::TransportResult<Vec<alloy::rpc::types::Log>> {
+            let should_return_empty = self
+                .remaining_empty_scans
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+
+            if should_return_empty {
+                return Ok(Vec::new());
+            }
+
+            self.inner.get_logs(filter).await
+        }
+    }
+
+    /// Test-only `Wallet` wrapper around `recover_already_minted`'s two probe
+    /// paths: the `usedNonces()` view call (`Evm::call`) and the
+    /// `MessageReceived` log scan (`Provider::get_logs`, reached through
+    /// `find_received_message_tx`). Fails the first `revert_failures`
+    /// invocations of the call path with a deterministic on-chain-revert
+    /// shape, then the next `call_failures` invocations with a transient
+    /// transport-shaped failure, and/or answers the first `empty_log_scans`
+    /// invocations of the log scan with no logs, before delegating to `inner`
+    /// for the rest. Counts every `call` invocation (successful or not) into
+    /// `call_count`, an externally-supplied `Arc` so a test can read it after
+    /// the wallet has been moved into a `CctpEndpoint`.
+    ///
+    /// Reused by the retry, fail-fast, log-lag, and recovery-window tests
+    /// below rather than one single-use wrapper per test.
+    struct FlakyProbeWallet<InnerWallet: Wallet> {
+        inner: InnerWallet,
+        provider: FlakyGetLogsProvider<InnerWallet::Provider>,
+        remaining_revert_failures: AtomicU32,
+        remaining_call_failures: AtomicU32,
+        call_count: Arc<AtomicU32>,
+    }
+
+    /// Named failure-injection counts for [`FlakyProbeWallet::new`], bundled
+    /// into a struct so the two same-typed `u32` counters -- which drive
+    /// genuinely different failure paths (transient `usedNonces()` call
+    /// errors vs. empty `get_logs` scans) -- cannot be silently transposed at
+    /// a call site, mirroring [`MintRecoveryConfig`]'s own named-field
+    /// bundling.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct FlakyProbeFailures {
+        /// Leading `usedNonces()` calls that fail with a transient
+        /// transport-shaped error before delegating to the real chain.
+        call_failures: u32,
+        /// Leading `get_logs` scans that answer empty before delegating to
+        /// the real chain.
+        empty_log_scans: u32,
+    }
+
+    impl<InnerWallet: Wallet> FlakyProbeWallet<InnerWallet> {
+        fn new(
+            inner: InnerWallet,
+            failures: FlakyProbeFailures,
+            call_count: Arc<AtomicU32>,
+        ) -> Self {
+            let provider = FlakyGetLogsProvider {
+                inner: inner.provider().clone(),
+                remaining_empty_scans: Arc::new(AtomicU32::new(failures.empty_log_scans)),
+            };
+            Self {
+                inner,
+                provider,
+                remaining_revert_failures: AtomicU32::new(0),
+                remaining_call_failures: AtomicU32::new(failures.call_failures),
+                call_count,
+            }
+        }
+
+        /// Injects `revert_failures` revert-shaped (`EvmError::DecodedRevert`)
+        /// failures on the first calls, checked before the transient
+        /// `call_failures` injected by [`Self::new`]. Used to prove
+        /// `recover_already_minted` retries a revert-shaped probe error the
+        /// same as any other transient one, since `usedNonces()` cannot
+        /// deterministically revert.
+        fn with_revert_failures(mut self, revert_failures: u32) -> Self {
+            self.remaining_revert_failures = AtomicU32::new(revert_failures);
+            self
+        }
+
+        /// Returns a handle to the remaining-empty-log-scans counter, so a
+        /// test can capture it before the wallet moves into a `CctpEndpoint`
+        /// and assert afterward that the injected empty scan was actually
+        /// consumed (not merely that recovery happened to succeed anyway).
+        fn remaining_empty_log_scans(&self) -> Arc<AtomicU32> {
+            Arc::clone(&self.provider.remaining_empty_scans)
+        }
+    }
+
+    #[async_trait]
+    impl<InnerWallet: Wallet> Evm for FlakyProbeWallet<InnerWallet> {
+        type Provider = FlakyGetLogsProvider<InnerWallet::Provider>;
+
+        fn provider(&self) -> &Self::Provider {
+            &self.provider
+        }
+
+        async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+            &self,
+            contract: Address,
+            call: Call,
+        ) -> Result<Call::Return, EvmError>
+        where
+            Self: Sized,
+        {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+
+            let should_revert = self
+                .remaining_revert_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+
+            if should_revert {
+                return Err(EvmError::DecodedRevert(AbiDecodedErrorType::Unknown(vec![
+                    0x12, 0x34, 0x56, 0x78,
+                ])));
+            }
+
+            let should_fail = self
+                .remaining_call_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+
+            if should_fail {
+                // `Evm::call`'s only implementation (`execute_call`) funnels every
+                // provider failure through `decode_rpc_revert`, which always wraps a
+                // non-decodable RPC failure as `alloy::contract::Error::TransportError`
+                // -- `EvmError::Transport` is never constructed on this path (only by
+                // the unrelated node-sync spin-poll and tx-submission paths). Inject
+                // the shape the real probe actually produces, not a synthetic one.
+                return Err(EvmError::Contract(ContractError::TransportError(
+                    RpcError::ErrorResp(ErrorPayload {
+                        code: -32000,
+                        message: Cow::Borrowed("connection reset (synthetic transient failure)"),
+                        data: None,
+                    }),
+                )));
+            }
+
+            self.inner.call::<Registry, Call>(contract, call).await
+        }
+    }
+
+    #[async_trait]
+    impl<InnerWallet: Wallet> Wallet for FlakyProbeWallet<InnerWallet> {
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+
+        async fn send_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.send_pending(contract, calldata, note).await
+        }
+
+        async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            self.inner.await_receipt(tx_hash).await
+        }
+
+        async fn send(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            self.inner.send(contract, calldata, note).await
+        }
     }
 
     async fn create_bridge(
@@ -3380,14 +3610,20 @@ mod tests {
         assert_eq!(recovered_mint.fee_collected, first_mint.fee_collected);
 
         // A revert whose nonce is NOT marked used on-chain is not an already-minted
-        // case: the reactive path must re-surface the original submit error rather
-        // than fabricate a recovery outcome. Mutating the nonce yields a
-        // never-minted nonce on a structurally valid message (usedNonces == 0).
+        // case: once the recovery window expires, the reactive path must re-surface
+        // the original submit error rather than fabricate a recovery outcome.
+        // Mutating the nonce yields a never-minted nonce on a structurally valid
+        // message (usedNonces == 0).
         let sentinel_error = || EvmError::Reverted {
             tx_hash: TxHash::repeat_byte(0xEE),
         };
         let mut unused_nonce_message = message_with_nonce.to_vec();
         unused_nonce_message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE].fill(0xAB);
+
+        // The window is minutes long by design; auto-advance the clock through it
+        // instead of sleeping. The probes themselves are I/O-bound, so they still
+        // run for real.
+        tokio::time::pause();
 
         let unused_nonce_error = bridge
             .base
@@ -3405,6 +3641,762 @@ mod tests {
                     if tx_hash == TxHash::repeat_byte(0xEE)
             ),
             "unused nonce must propagate the original submit error: {unused_nonce_error:?}"
+        );
+    }
+
+    /// Our own `receiveMessage` failing does not mean the mint will not happen:
+    /// the burn is irreversible and the attestation is valid, so any relayer can
+    /// deliver it moments later. Recovery must wait out its window and return
+    /// that mint, instead of reporting a post-burn failure that strands the
+    /// rebalancing guard.
+    ///
+    /// Does NOT pause the clock: `tokio::time::pause`'s paused-clock
+    /// auto-advance fires a sleeping timer as soon as the runtime has no other
+    /// *ready* work, even while an unrelated real I/O future (like
+    /// `mint_internal`'s sign/broadcast/confirm round trips) is still pending
+    /// on the network -- it is not a barrier against that concurrent I/O, only
+    /// against other timers. Relying on it here would make the "recovery must
+    /// not succeed on the very first probe" property a race, not a guarantee.
+    ///
+    /// Instead this injects a short, real probe cadence via
+    /// `with_mint_recovery_config` (an order of magnitude below how long a
+    /// mint against a local anvil chain takes) with a generous probe budget,
+    /// so the two concurrent futures race in real time with a wide safety
+    /// margin, and asserts on `call_count` (an observable probe count) rather
+    /// than on wall-clock elapsed time to prove recovery actually waited past
+    /// the first probe instead of asserting on race-prone timing.
+    #[tokio::test]
+    async fn mint_recovers_when_another_party_mints_inside_the_recovery_window() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(2_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // A second endpoint on the same chain/contracts, purely to count
+        // usedNonces() probes (no injected failures) and to drive a short
+        // recovery cadence.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counting_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: 0,
+            },
+            Arc::clone(&call_count),
+        );
+        let recovering_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            counting_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        // A large probe budget costs nothing on the passing path -- the loop
+        // returns as soon as `is_nonce_used` reads consumed -- and only
+        // widens how long a genuine failure would take to surface, so it is
+        // sized generously (~40 s ceiling) rather than tightly (~2 s) to
+        // avoid flaking under a loaded CI runner racing two anvil instances
+        // plus a full sign/broadcast/receipt round trip.
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(20),
+            probes: 2_000,
+        });
+
+        let (recovered, relayed_mint) = tokio::join!(
+            recovering_endpoint.recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            ),
+            bridge.mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation.clone(),
+            )
+        );
+
+        let relayed_mint = relayed_mint.unwrap();
+        let recovered = recovered.unwrap();
+
+        assert_eq!(
+            recovered.tx, relayed_mint.tx,
+            "recovery must return the mint that landed inside the window"
+        );
+        assert_eq!(recovered.amount, relayed_mint.amount);
+        assert_eq!(recovered.fee_collected, relayed_mint.fee_collected);
+
+        let probes = call_count.load(Ordering::SeqCst);
+        assert!(
+            probes >= 2,
+            "recovery must not have succeeded on the very first probe -- got {probes} \
+             usedNonces() calls"
+        );
+    }
+
+    /// A destination-domain mismatch is structurally deterministic: it only
+    /// depends on the fixed attested `message` bytes and the fixed
+    /// `direction` argument, neither of which change across probes. It must
+    /// fail fast with the original submit error, checked before the probe
+    /// loop even starts -- not merely on the first probe -- since a
+    /// wrong-direction message whose nonce was never consumed on this chain
+    /// would otherwise report the nonce "unconsumed" and burn the whole
+    /// recovery window before this error is ever reached.
+    #[tokio::test]
+    async fn recover_already_minted_fails_fast_on_destination_domain_mismatch_before_any_probe() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_500_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (_, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // The nonce is deliberately left unconsumed (no mint performed): a
+        // wrong-direction message can never mint here regardless of chain
+        // state, so the mismatch must fail fast without ever probing
+        // usedNonces().
+        let sentinel_error = EvmError::Reverted {
+            tx_hash: TxHash::repeat_byte(0xEE),
+        };
+
+        // Wrap the endpoint's wallet purely to count usedNonces() probes (no
+        // injected failures): the domain check must fail fast before any
+        // probe, so a zero call count is the observable proof -- not an
+        // elapsed-time guess, which can flake under CI load or a slow anvil
+        // round trip, or blow up to the full multi-minute window if the
+        // check ever moves back after the usedNonces() read.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counting_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: 0,
+            },
+            Arc::clone(&call_count),
+        );
+        let counting_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            counting_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        // The message was attested for Base (EthereumToBase); asking recovery
+        // to reconstruct it as BaseToEthereum is a destination-domain
+        // mismatch regardless of chain state.
+        let error = counting_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                &message_with_nonce,
+                sentinel_error,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::Evm(EvmError::Reverted { tx_hash })
+                    if tx_hash == TxHash::repeat_byte(0xEE)
+            ),
+            "a destination-domain mismatch must surface the original submit error: {error:?}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a destination-domain mismatch must fail fast before any usedNonces() probe"
+        );
+    }
+
+    /// A revert-shaped `usedNonces()` probe error (`EvmError::is_revert()` ==
+    /// `true`) must be retried, not treated as a decided terminal outcome.
+    /// `usedNonces(bytes32)` is a plain public-mapping getter with no
+    /// `require`/branch logic (see the vendored `MessageTransmitterV2` ABI),
+    /// so it cannot deterministically revert for a well-formed call; a
+    /// revert-shaped response here is necessarily a provider/transport
+    /// artifact, not an on-chain fact. An earlier version of this function
+    /// fast-failed on this shape -- this test proves the opposite: recovery
+    /// must survive it exactly like any other transient probe error and
+    /// still find the mint that had already landed.
+    #[tokio::test]
+    async fn recover_already_minted_retries_after_a_revert_shaped_probe_error() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_500_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Mint fully lands before recovery ever probes, so the only thing
+        // that could prevent recovery from returning it is the injected
+        // revert-shaped probe failure.
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let sentinel_error = EvmError::Reverted {
+            tx_hash: TxHash::repeat_byte(0xEE),
+        };
+
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let reverting_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: 0,
+            },
+            Arc::clone(&call_count),
+        )
+        .with_revert_failures(1);
+        let reverting_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            reverting_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        tokio::time::pause();
+
+        let recovered = reverting_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                sentinel_error,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered.tx, mint_receipt.tx,
+            "recovery must return the already-landed mint despite the revert-shaped probe error"
+        );
+        assert_eq!(recovered.amount, mint_receipt.amount);
+        assert_eq!(recovered.fee_collected, mint_receipt.fee_collected);
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "the revert-shaped probe error must be retried (probe 1), not fail fast, so a \
+             second probe (probe 2) is what actually observes the nonce consumed"
+        );
+    }
+
+    /// A transient probe error (an RPC/transport blip, not a structural
+    /// mismatch) must not surface the original submit error: `recover_already_minted`
+    /// retries and finds the mint that had already landed, instead of giving up
+    /// on the very first bad read.
+    #[tokio::test]
+    async fn recover_already_minted_retries_after_a_transient_probe_error() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_750_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Mint fully lands before recovery ever probes, so the only thing that
+        // can prevent recovery from returning it is the injected probe failure.
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // A second endpoint on the same chain/contracts, whose first `call` (the
+        // usedNonces() probe) fails once with a synthetic transient transport
+        // error before delegating to the real chain.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 1,
+                empty_log_scans: 0,
+            },
+            Arc::clone(&call_count),
+        );
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        tokio::time::pause();
+
+        let recovered = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered.tx, mint_receipt.tx,
+            "recovery must return the already-landed mint despite the first probe erroring"
+        );
+        assert_eq!(recovered.amount, mint_receipt.amount);
+        assert_eq!(recovered.fee_collected, mint_receipt.fee_collected);
+    }
+
+    /// Proves `last_probe_error` is reset to `None` on a later clean
+    /// `Ok(false)` read, not left "sticky" from an earlier transient probe
+    /// failure. `recover_already_minted`'s terminal branch decides between
+    /// the original `submit_error` and `MintRecoveryInconclusive` purely on
+    /// whether `last_probe_error` is `Some` once the window ends: injects one
+    /// transient probe failure (probe 1) against a nonce that is genuinely
+    /// never minted, with a 2-probe window so probe 2 gets a real clean
+    /// unconsumed read as the window closes. If a future refactor made
+    /// `last_probe_error` sticky (never reset on a clean read), this would
+    /// wrongly surface `MintRecoveryInconclusive` here instead of the
+    /// original submit error -- misclassifying a genuinely terminal outcome
+    /// as inconclusive and redriving forever.
+    #[tokio::test]
+    async fn recover_already_minted_resets_last_probe_error_after_transient_failure() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_650_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (_, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Deliberately never mint: the nonce is genuinely never consumed, so
+        // a correct implementation must surface the original submit error
+        // once the window ends, not MintRecoveryInconclusive.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 1,
+                empty_log_scans: 0,
+            },
+            Arc::clone(&call_count),
+        );
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: 2,
+        });
+
+        let error = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::Evm(EvmError::Reverted { tx_hash })
+                    if tx_hash == TxHash::repeat_byte(0xEE)
+            ),
+            "the clean unconsumed read on probe 2 must reset last_probe_error, surfacing the \
+             original submit error rather than MintRecoveryInconclusive: {error:?}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "both probes must have run: probe 1 failed transiently, probe 2 read cleanly"
+        );
+    }
+
+    /// The one production-analogous retry scenario: `usedNonces()` already
+    /// reports the nonce consumed, but the backward `MessageReceived` log scan
+    /// comes up empty because a load-balanced RPC node's log index lags
+    /// behind the state its own `usedNonces()` view call already reflects.
+    /// This is what actually produces `CctpError::AlreadyMintedMessageNotFound`
+    /// -- the variant `reconstruct_existing_mint` retries, bounded by
+    /// `SCAN_ATTEMPTS` -- and is distinct from
+    /// `recover_already_minted_retries_after_a_transient_probe_error`, which
+    /// only fails the `usedNonces()` call itself and never reaches the log
+    /// scan. The retry happens once, after the probe loop confirms the nonce
+    /// consumed, not once per `usedNonces()` probe: `call_count` (the
+    /// `usedNonces()` invocation count) therefore stays at 1 here, unlike the
+    /// old design this replaced.
+    #[tokio::test]
+    async fn recover_already_minted_retries_after_the_message_received_log_lags() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_250_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Mint fully lands before recovery ever probes, so usedNonces() reads
+        // true on the first probe; only the log scan needs to catch up.
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // A second endpoint on the same chain/contracts, whose first
+        // `get_logs` (the MessageReceived backward scan) answers empty before
+        // delegating to the real chain.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: 1,
+            },
+            Arc::clone(&call_count),
+        );
+        let remaining_empty_log_scans = flaky_wallet.remaining_empty_log_scans();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let recovered = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered.tx, mint_receipt.tx,
+            "recovery must return the already-landed mint despite the first log scan missing it"
+        );
+        assert_eq!(recovered.amount, mint_receipt.amount);
+        assert_eq!(recovered.fee_collected, mint_receipt.fee_collected);
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "the log-scan retry must not re-probe usedNonces(); it already read consumed"
+        );
+        assert_eq!(
+            remaining_empty_log_scans.load(Ordering::SeqCst),
+            0,
+            "the injected empty log scan must actually have been consumed by a retry, \
+             not bypassed"
+        );
+    }
+
+    /// A nonce confirmed consumed by `usedNonces()` but whose receipt can
+    /// never be reconstructed (the `MessageReceived` log scan stays empty
+    /// well past `SCAN_ATTEMPTS`) must still surface as
+    /// `CctpError::MintRecoveryInconclusive`, not the raw
+    /// `AlreadyMintedMessageNotFound` that `reconstruct_existing_mint`
+    /// produces once its own retries are exhausted. The mint is known to
+    /// have landed -- the authoritative `usedNonces()` read already proved
+    /// it -- so anything other than `MintRecoveryInconclusive` here would
+    /// strand the caller on a false "never minted" terminal failure.
+    #[tokio::test]
+    async fn recover_already_minted_reports_inconclusive_when_reconstruction_exhausts_retries() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_100_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Mint fully lands before recovery ever probes, so usedNonces() reads
+        // true on the first probe; the log scan must never catch up.
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // A second endpoint on the same chain/contracts whose `get_logs` (the
+        // MessageReceived backward scan) answers empty every time. 10 empty
+        // scans exceeds evm.rs's SCAN_ATTEMPTS (5), so
+        // reconstruct_existing_mint exhausts its own retries and returns
+        // AlreadyMintedMessageNotFound instead of ever finding the log.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: 10,
+            },
+            Arc::clone(&call_count),
+        );
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintRecoveryInconclusive { probe_error } = error else {
+            panic!(
+                "a nonce confirmed consumed whose receipt could not be reconstructed must \
+                 surface MintRecoveryInconclusive, not the raw error; got: {error:?}"
+            );
+        };
+        assert!(
+            matches!(*probe_error, CctpError::AlreadyMintedMessageNotFound { .. }),
+            "the wrapped probe_error must be the exhausted-retries \
+             AlreadyMintedMessageNotFound; got: {probe_error:?}"
+        );
+    }
+
+    /// The window-exhaustion branch of `recover_already_minted` -- every
+    /// probe from some point on fails with a transient (non-revert) error
+    /// all the way to the end of the configured window -- is the only
+    /// production code path that constructs `CctpError::MintRecoveryInconclusive`
+    /// from a run of transient probe failures, as opposed to a
+    /// reconstruction failure after a confirmed-consumed nonce (covered by
+    /// `recover_already_minted_reports_inconclusive_when_reconstruction_exhausts_retries`
+    /// above). This drives the real branch -- not a hand-fed error through a
+    /// stub -- and asserts the caller receives `MintRecoveryInconclusive`
+    /// wrapping the last transient error, not the original submit error.
+    #[tokio::test]
+    async fn recover_already_minted_reports_inconclusive_when_every_probe_errors_transiently() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(900_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (_, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Deliberately never mint: every usedNonces() probe must fail
+        // transiently instead, so the window expires without a single
+        // conclusive read.
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 10,
+                empty_log_scans: 0,
+            },
+            Arc::clone(&call_count),
+        );
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: 3,
+        });
+
+        let error = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintRecoveryInconclusive { probe_error } = error else {
+            panic!(
+                "a window that expires with every probe erroring transiently must surface \
+                 MintRecoveryInconclusive, not a decided outcome; got: {error:?}"
+            );
+        };
+        assert!(
+            matches!(*probe_error, CctpError::Evm(_)),
+            "the wrapped probe_error must be the last transient EvmError, not the original \
+             submit error; got: {probe_error:?}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "the window must have been exhausted (all 3 configured probes attempted)"
+        );
+    }
+
+    /// A message carrying the reserved zero nonce (unattested, or a malformed
+    /// attestation response) was never assigned a real nonce, so no party
+    /// could ever have delivered `receiveMessage` for it: this is structurally
+    /// deterministic for the fixed `message` bytes, and must fail fast with
+    /// `PlaceholderNonce` rather than reporting "not yet minted" -- which
+    /// would otherwise let `recover_already_minted` burn its whole recovery
+    /// window re-parsing the same bytes on every probe.
+    #[tokio::test]
+    async fn find_existing_mint_fails_fast_on_placeholder_nonce() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+
+        // Pre-attestation message: still carries the reserved zero nonce.
+        let raw_message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+
+        let error = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, &raw_message)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::PlaceholderNonce),
+            "a zero-nonce message must fail fast with PlaceholderNonce, got: {error:?}"
         );
     }
 
@@ -3429,6 +4421,11 @@ mod tests {
         let (_, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
+
+        // An invalid attestation still runs the full mint-recovery window before
+        // the failure is declared; auto-advance the clock through it rather than
+        // sleeping out its minutes.
+        tokio::time::pause();
 
         let err = bridge
             .mint_internal::<NoOpErrorRegistry>(
@@ -3469,6 +4466,10 @@ mod tests {
 
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
+        // `message` is the raw, pre-attestation envelope (still carrying the
+        // reserved zero nonce): recovery's zero-nonce check fails fast here
+        // instead of exhausting the recovery window, so no clock manipulation
+        // is needed.
         let err = bridge
             .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
