@@ -18,10 +18,11 @@ use tracing::{error, info, warn};
 
 use st0x_config::BrokerCtx;
 use st0x_dto::{
-    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
+    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
+    TradeOutcome, TradingVenue, sort_trades_newest_first,
 };
-use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
@@ -30,6 +31,8 @@ use crate::dashboard::pnl::{
 };
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::offchain::order::{OffchainOrder, OffchainOrderId, TradeConversionError};
+use crate::onchain_trade::{OnChainTradeEvent, OnChainTradeId, ParseOnChainTradeIdError};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -136,21 +139,10 @@ struct StuckTransferInfo {
     reason: StuckReason,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct TradeEntry {
-    id: String,
-    filled_at: String,
-    venue: String,
-    direction: String,
-    symbol: String,
-    shares: String,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TradeResponse {
-    entries: Vec<TradeEntry>,
+    entries: Vec<Trade>,
     total: usize,
     has_more: bool,
 }
@@ -561,40 +553,14 @@ struct TradesQuery {
 async fn trades(
     State(state): State<AppState>,
     Query(query): Query<TradesQuery>,
-) -> Json<TradeResponse> {
+) -> Result<Json<TradeResponse>, StatusCode> {
     let limit = query.limit.unwrap_or(100).min(500);
     let offset = query.offset.unwrap_or(0);
 
-    let since_dt = query.since.as_deref().and_then(|val| {
-        DateTime::parse_from_rfc3339(val)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    });
-    let until_dt = query.until.as_deref().and_then(|val| {
-        DateTime::parse_from_rfc3339(val)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    });
-
-    let venues = query
-        .venue
-        .as_deref()
-        .filter(|val| !val.is_empty())
-        .map(|val| {
-            val.split(',')
-                .map(|part| part.trim().to_string())
-                .collect::<Vec<_>>()
-        });
-
-    let symbols = query
-        .symbol
-        .as_deref()
-        .filter(|val| !val.is_empty())
-        .map(|val| {
-            val.split(',')
-                .map(|part| part.trim().to_string())
-                .collect::<Vec<_>>()
-        });
+    let since_dt = parse_trade_filter_time(query.since.as_deref(), "since")?;
+    let until_dt = parse_trade_filter_time(query.until.as_deref(), "until")?;
+    let venues = parse_trade_venues(query.venue.as_deref())?;
+    let symbols = parse_trade_symbols(query.symbol.as_deref())?;
 
     let trade_filter = TradeFilter {
         symbols,
@@ -603,33 +569,36 @@ async fn trades(
         until: until_dt,
     };
 
-    let mut all_trades = load_trade_rows(&state.pool, &trade_filter).await;
-    all_trades.sort_by(|lhs, rhs| rhs.filled_at.cmp(&lhs.filled_at));
+    let mut all_trades = load_trade_rows(&state.pool, &trade_filter)
+        .await
+        .inspect_err(|error| warn!(target: "dashboard", ?error, "Failed to load trade history"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sort_trades_newest_first(&mut all_trades);
 
     let total = all_trades.len();
-    let end = total.min(offset + limit);
+    let end = total.min(offset.saturating_add(limit));
     let entries = all_trades[offset.min(total)..end].to_vec();
     let has_more = end < total;
 
-    Json(TradeResponse {
+    Ok(Json(TradeResponse {
         entries,
         total,
         has_more,
-    })
+    }))
 }
 
 struct TradeFilter {
-    symbols: Option<Vec<String>>,
-    venues: Option<Vec<String>>,
+    symbols: Option<Vec<Symbol>>,
+    venues: Option<Vec<TradingVenue>>,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 }
 
 impl TradeFilter {
-    fn matches_symbol(&self, symbol: &str) -> bool {
+    fn matches_symbol(&self, symbol: &Symbol) -> bool {
         self.symbols
             .as_ref()
-            .is_none_or(|syms| syms.iter().any(|sym| sym == symbol))
+            .is_none_or(|symbols| symbols.contains(symbol))
     }
 
     fn matches_time(&self, timestamp: DateTime<Utc>) -> bool {
@@ -646,131 +615,224 @@ impl TradeFilter {
         true
     }
 
-    fn matches_venue(&self, venue: &str) -> bool {
+    fn matches_venue(&self, venue: TradingVenue) -> bool {
         self.venues
             .as_ref()
-            .is_none_or(|vals| vals.iter().any(|val| val == venue))
+            .is_none_or(|venues| venues.contains(&venue))
     }
 }
 
-async fn load_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Vec<TradeEntry> {
-    let include_onchain = filter.matches_venue("raindex");
-    let include_offchain = filter.matches_venue("alpaca")
-        || filter.matches_venue("dry_run")
-        || filter.venues.is_none();
+fn parse_trade_filter_time(
+    value: Option<&str>,
+    parameter: &'static str,
+) -> Result<Option<DateTime<Utc>>, StatusCode> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .inspect_err(|error| {
+                    warn!(target: "dashboard", %error, %parameter, %value, "Invalid trade-history timestamp filter");
+                })
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+fn parse_trade_venues(value: Option<&str>) -> Result<Option<Vec<TradingVenue>>, StatusCode> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(TradingVenue::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .inspect_err(|error| {
+                    warn!(target: "dashboard", %error, %value, "Invalid trade-history venue filter");
+                })
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+fn parse_trade_symbols(value: Option<&str>) -> Result<Option<Vec<Symbol>>, StatusCode> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(Symbol::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .inspect_err(|error| {
+                    warn!(target: "dashboard", %error, %value, "Invalid trade-history symbol filter");
+                })
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+async fn load_trade_rows(
+    pool: &SqlitePool,
+    filter: &TradeFilter,
+) -> Result<Vec<Trade>, TradeHistoryError> {
+    let include_onchain = filter.matches_venue(TradingVenue::Raindex);
+    let include_offchain =
+        filter.matches_venue(TradingVenue::Alpaca) || filter.matches_venue(TradingVenue::DryRun);
 
     let mut trades = Vec::new();
 
     if include_onchain {
-        trades.extend(load_onchain_trade_rows(pool, filter).await);
+        trades.extend(load_onchain_trade_rows(pool, filter).await?);
     }
 
     if include_offchain {
-        trades.extend(load_offchain_trade_rows(pool, filter).await);
+        trades.extend(load_offchain_trade_rows(pool, filter).await?);
     }
 
-    trades
+    Ok(trades)
 }
 
-async fn load_onchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Vec<TradeEntry> {
-    let rows: Vec<(String, String)> = match sqlx::query_as(
+async fn load_onchain_trade_rows(
+    pool: &SqlitePool,
+    filter: &TradeFilter,
+) -> Result<Vec<Trade>, TradeHistoryError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT aggregate_id, payload FROM events \
          WHERE event_type = 'OnChainTradeEvent::Filled' \
          ORDER BY rowid DESC",
     )
     .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, "Failed to load onchain trades");
-            return Vec::new();
-        }
-    };
+    .await?;
 
     rows.into_iter()
-        .filter_map(|(aggregate_id, payload_str)| {
-            let payload: serde_json::Value = serde_json::from_str(&payload_str).ok()?;
-            let filled = payload.get("Filled")?;
-
-            let trade_symbol = filled["symbol"].as_str()?;
-            let filled_at_str = filled["block_timestamp"].as_str()?;
-            let filled_at = DateTime::parse_from_rfc3339(filled_at_str)
-                .ok()?
-                .with_timezone(&Utc);
-
-            if !filter.matches_symbol(trade_symbol) || !filter.matches_time(filled_at) {
-                return None;
-            }
-
-            let direction = filled["direction"].as_str()?;
-            let amount = filled["amount"].as_str()?;
-
-            Some(TradeEntry {
-                id: aggregate_id,
-                filled_at: filled_at.to_rfc3339(),
-                venue: "raindex".to_string(),
-                direction: direction.to_string(),
-                symbol: trade_symbol.to_string(),
-                shares: amount.to_string(),
-            })
-        })
+        .map(|(aggregate_id, payload)| parse_onchain_trade_row(aggregate_id, &payload, filter))
+        .filter_map(Result::transpose)
         .collect()
 }
 
-async fn load_offchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Vec<TradeEntry> {
-    let rows: Vec<(String, String)> = match sqlx::query_as(
+fn parse_onchain_trade_row(
+    aggregate_id: String,
+    payload: &str,
+    filter: &TradeFilter,
+) -> Result<Option<Trade>, TradeHistoryError> {
+    let result = (|| -> Result<Trade, OnchainTradeRowError> {
+        let id = OnChainTradeId::from_str(&aggregate_id)?;
+        let event: OnChainTradeEvent = serde_json::from_str(payload)?;
+        let OnChainTradeEvent::Filled {
+            symbol,
+            amount,
+            direction,
+            block_timestamp,
+            ..
+        } = event
+        else {
+            return Err(OnchainTradeRowError::UnexpectedEvent);
+        };
+
+        Ok(Trade {
+            id: id.to_string(),
+            occurred_at: block_timestamp,
+            venue: TradingVenue::Raindex,
+            direction,
+            symbol,
+            shares: FractionalShares::new(amount),
+            outcome: TradeOutcome::Filled,
+        })
+    })()
+    .map_err(|source| TradeHistoryError::InvalidOnchainRow {
+        aggregate_id,
+        source,
+    })?;
+
+    if !filter.matches_symbol(&result.symbol) || !filter.matches_time(result.occurred_at) {
+        return Ok(None);
+    }
+
+    Ok(Some(result))
+}
+
+async fn load_offchain_trade_rows(
+    pool: &SqlitePool,
+    filter: &TradeFilter,
+) -> Result<Vec<Trade>, TradeHistoryError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT view_id, payload FROM offchain_order_view \
-         WHERE status = 'Filled'",
+         WHERE status IN ('Filled', 'Failed')",
     )
     .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, "Failed to load offchain trades");
-            return Vec::new();
-        }
-    };
+    .await?;
 
     rows.into_iter()
-        .filter_map(|(view_id, payload_str)| {
-            let payload: serde_json::Value = serde_json::from_str(&payload_str).ok()?;
-            let filled = payload.get("Live")?.get("Filled")?;
-
-            let trade_symbol = filled["symbol"].as_str()?;
-            let filled_at_str = filled["filled_at"].as_str()?;
-            let filled_at = DateTime::parse_from_rfc3339(filled_at_str)
-                .ok()?
-                .with_timezone(&Utc);
-
-            if !filter.matches_symbol(trade_symbol) || !filter.matches_time(filled_at) {
-                return None;
-            }
-
-            let executor = filled["executor"].as_str().unwrap_or("AlpacaBrokerApi");
-            let venue = match executor {
-                "DryRun" => "dry_run",
-                _ => "alpaca",
-            };
-
-            if !filter.matches_venue(venue) {
-                return None;
-            }
-
-            let direction = filled["direction"].as_str()?;
-            let shares = filled["shares"].as_str()?;
-
-            Some(TradeEntry {
-                id: view_id,
-                filled_at: filled_at.to_rfc3339(),
-                venue: venue.to_string(),
-                direction: direction.to_string(),
-                symbol: trade_symbol.to_string(),
-                shares: shares.to_string(),
-            })
-        })
+        .map(|(view_id, payload)| parse_offchain_trade_row(view_id, &payload, filter))
+        .filter_map(Result::transpose)
         .collect()
+}
+
+#[derive(Deserialize)]
+enum OffchainOrderProjectionPayload {
+    Live(OffchainOrder),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OffchainTradeRowError {
+    #[error("invalid offchain order projection payload: {0}")]
+    Payload(#[from] serde_json::Error),
+    #[error("invalid offchain order id: {0}")]
+    Id(#[from] uuid::Error),
+    #[error("offchain order cannot be represented in trade history: {0}")]
+    Conversion(#[from] TradeConversionError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OnchainTradeRowError {
+    #[error("invalid onchain trade id: {0}")]
+    Id(#[from] ParseOnChainTradeIdError),
+    #[error("invalid onchain trade event payload: {0}")]
+    Payload(#[from] serde_json::Error),
+    #[error("query returned a non-fill onchain event")]
+    UnexpectedEvent,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TradeHistoryError {
+    #[error("failed to query trade history: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("failed to parse onchain trade history row {aggregate_id}: {source}")]
+    InvalidOnchainRow {
+        aggregate_id: String,
+        #[source]
+        source: OnchainTradeRowError,
+    },
+    #[error("failed to parse offchain trade history row {view_id}: {source}")]
+    InvalidOffchainRow {
+        view_id: String,
+        #[source]
+        source: OffchainTradeRowError,
+    },
+}
+
+fn parse_offchain_trade_row(
+    view_id: String,
+    payload: &str,
+    filter: &TradeFilter,
+) -> Result<Option<Trade>, TradeHistoryError> {
+    let result = (|| -> Result<Trade, OffchainTradeRowError> {
+        let OffchainOrderProjectionPayload::Live(order) = serde_json::from_str(payload)?;
+        let id = OffchainOrderId::from_str(&view_id)?;
+        Ok(order.try_into_trade(&id)?)
+    })()
+    .map_err(|source| TradeHistoryError::InvalidOffchainRow { view_id, source })?;
+
+    if !filter.matches_symbol(&result.symbol)
+        || !filter.matches_time(result.occurred_at)
+        || !filter.matches_venue(result.venue)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(result))
 }
 
 #[derive(Deserialize, Default)]
@@ -1772,7 +1834,7 @@ mod tests {
     use st0x_event_sorcery::ReactorHarness;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
-        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, TimeInForce,
+        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Symbol, TimeInForce,
     };
     use st0x_float_macro::float;
     use st0x_tokenization::{
@@ -1860,6 +1922,236 @@ mod tests {
         assert_eq!(parsed.submitted_at.as_deref(), Some("2026-01-01T00:00:01Z"));
         assert_eq!(parsed.shares_filled.as_deref(), Some("0.5"));
         assert_eq!(parsed.avg_price.as_deref(), Some("195.25"));
+    }
+
+    #[tokio::test]
+    async fn offchain_trade_history_includes_failed_orders() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let pool = state.pool.clone();
+        let payload = r#"{"Live":{"Failed":{"symbol":"SPCX","shares":"1","direction":"Buy","executor":"AlpacaBrokerApi","retained_fill":{"Priced":{"shares_filled":"0.25","avg_price":"25","partially_filled_at":"2026-01-01T00:00:00Z"}},"executor_order_id":"broker-order","error":"asset is not tradable","placed_at":"2026-01-01T00:00:00Z","failed_at":"2026-01-01T00:00:01Z"}}}"#;
+        let view_id = "00000000-0000-0000-0000-000000000141";
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(view_id)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let entries = load_offchain_trade_rows(
+            &pool,
+            &TradeFilter {
+                symbols: None,
+                venues: None,
+                since: None,
+                until: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, view_id);
+        assert_eq!(entries[0].symbol, Symbol::new("SPCX").unwrap());
+        match &entries[0].outcome {
+            TradeOutcome::Failed {
+                error,
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } => {
+                assert_eq!(error, "asset is not tradable");
+                assert!(
+                    filled_shares
+                        .inner()
+                        .inner()
+                        .eq(st0x_float_macro::float!(0.25))
+                        .unwrap()
+                );
+                assert!(
+                    remaining_shares
+                        .inner()
+                        .inner()
+                        .eq(st0x_float_macro::float!(0.75))
+                        .unwrap()
+                );
+                assert!(excess_shares.inner().inner().is_zero().unwrap());
+            }
+            TradeOutcome::Filled => panic!("failed projection must remain failed"),
+        }
+
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/trades")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_to_string(response).await).unwrap();
+        assert_eq!(body["entries"][0]["occurredAt"], "2026-01-01T00:00:01Z");
+        assert_eq!(body["entries"][0]["outcome"]["status"], "failed");
+        assert_eq!(
+            body["entries"][0]["outcome"]["error"],
+            "asset is not tradable"
+        );
+        assert_eq!(body["entries"][0]["outcome"]["filledShares"], "0.25");
+        assert_eq!(body["entries"][0]["outcome"]["remainingShares"], "0.75");
+    }
+
+    #[tokio::test]
+    async fn offchain_trade_history_rejects_malformed_failed_orders() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let pool = state.pool.clone();
+        let payload = r#"{"Live":{"Failed":{"symbol":"SPCX"}}}"#;
+        let view_id = "00000000-0000-0000-0000-000000000142";
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(view_id)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = load_offchain_trade_rows(
+            &pool,
+            &TradeFilter {
+                symbols: None,
+                venues: None,
+                since: None,
+                until: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains(view_id));
+
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/trades")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn onchain_trade_history_rejects_malformed_aggregate_ids() {
+        let error = parse_onchain_trade_row(
+            "not-an-onchain-trade-id".to_string(),
+            "{}",
+            &TradeFilter {
+                symbols: None,
+                venues: None,
+                since: None,
+                until: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not-an-onchain-trade-id"));
+        assert!(matches!(
+            error,
+            TradeHistoryError::InvalidOnchainRow {
+                source: OnchainTradeRowError::Id(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_offchain_trade_history_respects_all_filters() {
+        let payload = r#"{"Live":{"Failed":{"symbol":"SPCX","shares":"1","direction":"Buy","executor":"AlpacaBrokerApi","retained_fill":null,"executor_order_id":null,"error":"asset is not tradable","placed_at":"2026-01-01T00:00:00Z","failed_at":"2026-01-01T00:00:01Z"}}}"#;
+        let view_id = "00000000-0000-0000-0000-000000000143";
+        let parse = |filter: TradeFilter| {
+            parse_offchain_trade_row(view_id.to_string(), payload, &filter)
+                .expect("valid failed trade should parse")
+        };
+
+        assert!(
+            parse(TradeFilter {
+                symbols: Some(vec![Symbol::new("SPCX").unwrap()]),
+                venues: Some(vec![TradingVenue::Alpaca]),
+                since: Some("2026-01-01T00:00:01Z".parse().unwrap()),
+                until: Some("2026-01-01T00:00:01Z".parse().unwrap()),
+            })
+            .is_some()
+        );
+
+        for filter in [
+            TradeFilter {
+                symbols: Some(vec![Symbol::new("AAPL").unwrap()]),
+                venues: None,
+                since: None,
+                until: None,
+            },
+            TradeFilter {
+                symbols: None,
+                venues: Some(vec![TradingVenue::DryRun]),
+                since: None,
+                until: None,
+            },
+            TradeFilter {
+                symbols: None,
+                venues: None,
+                since: Some("2026-01-01T00:00:02Z".parse().unwrap()),
+                until: None,
+            },
+            TradeFilter {
+                symbols: None,
+                venues: None,
+                since: None,
+                until: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            },
+        ] {
+            assert!(parse(filter).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_history_rejects_invalid_filters() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let app = build_app(state);
+
+        for uri in [
+            "/trades?venue=unknown",
+            "/trades?symbol=%20",
+            "/trades?since=not-a-timestamp",
+            "/trades?until=not-a-timestamp",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "URI: {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_history_saturates_an_overflowing_page_end() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/trades?offset={}", usize::MAX))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_to_string(response).await).unwrap();
+        assert_eq!(body["entries"], serde_json::json!([]));
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["hasMore"], false);
     }
 
     #[tokio::test]

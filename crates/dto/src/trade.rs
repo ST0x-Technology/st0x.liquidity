@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use st0x_finance::{FractionalShares, Symbol};
+use st0x_finance::{FractionalShares, NonNegative, Symbol};
 
 /// Where a trade was executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -118,20 +118,78 @@ pub struct InvalidDirectionError {
     direction_provided: String,
 }
 
-/// A completed trade fill.
+/// Terminal outcome of a dashboard trade entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum TradeOutcome {
+    Filled,
+    Failed {
+        error: String,
+        #[ts(type = "string")]
+        filled_shares: NonNegative<FractionalShares>,
+        #[ts(type = "string")]
+        remaining_shares: NonNegative<FractionalShares>,
+        /// Shares filled beyond the broker-accepted order quantity. This is
+        /// separate from remaining shares so anomalous broker state is never
+        /// clamped away.
+        #[ts(type = "string")]
+        excess_shares: NonNegative<FractionalShares>,
+    },
+}
+
+/// A completed onchain fill or terminal offchain counter-trade.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Trade {
     /// Unique identifier for deduplication on reconnect.
     /// Onchain: `"tx_hash:log_index"`. Offchain: offchain order aggregate ID.
     pub id: String,
-    pub filled_at: DateTime<Utc>,
+    pub occurred_at: DateTime<Utc>,
     pub venue: TradingVenue,
     pub direction: Direction,
     #[ts(type = "string")]
     pub symbol: Symbol,
+    /// Quantity submitted for this counter-trade. Before broker acceptance this
+    /// is the requested quantity; afterward it is the quantity the broker
+    /// accepted. Failed outcomes split this order quantity into filled and
+    /// remaining portions in [`TradeOutcome::Failed`].
     #[ts(type = "string")]
     pub shares: FractionalShares,
+    pub outcome: TradeOutcome,
+}
+
+/// Sorts dashboard trades newest-first with a stable cross-loader tie-breaker.
+pub fn sort_trades_newest_first(trades: &mut [Trade]) {
+    trades.sort_by(|left, right| {
+        right
+            .occurred_at
+            .cmp(&left.occurred_at)
+            .then_with(|| compare_trade_ids(left, right))
+    });
+}
+
+fn compare_trade_ids(left: &Trade, right: &Trade) -> std::cmp::Ordering {
+    if left.venue == TradingVenue::Raindex
+        && right.venue == TradingVenue::Raindex
+        && let (Some((left_hash, left_index)), Some((right_hash, right_index))) = (
+            parse_onchain_trade_id(&left.id),
+            parse_onchain_trade_id(&right.id),
+        )
+        && left_hash == right_hash
+    {
+        return left_index.cmp(&right_index);
+    }
+
+    left.id.cmp(&right.id)
+}
+
+fn parse_onchain_trade_id(id: &str) -> Option<(&str, u64)> {
+    let (tx_hash, log_index) = id.rsplit_once(':')?;
+    Some((tx_hash, log_index.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -158,14 +216,15 @@ mod tests {
     }
 
     #[test]
-    fn trade_serializes_all_fields() {
+    fn filled_trade_serializes_all_fields() {
         let trade = Trade {
             id: "test-order-id".to_string(),
-            filled_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: FractionalShares::new(float!(5.5)),
+            outcome: TradeOutcome::Filled,
         };
         let json = serde_json::to_value(&trade).expect("serialization should succeed");
         assert_eq!(json["id"], json!("test-order-id"));
@@ -173,6 +232,69 @@ mod tests {
         assert_eq!(json["direction"], json!("sell"));
         assert_eq!(json["symbol"], json!("TSLA"));
         assert_eq!(json["shares"], json!("5.5"));
-        assert_eq!(json["filledAt"], json!("2023-11-14T22:13:20Z"));
+        assert_eq!(json["occurredAt"], json!("2023-11-14T22:13:20Z"));
+        assert_eq!(json["outcome"], json!({ "status": "filled" }));
+    }
+
+    #[test]
+    fn failed_trade_serializes_error() {
+        let trade = Trade {
+            id: "failed-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: FractionalShares::new(float!(1)),
+            outcome: TradeOutcome::Failed {
+                error: "asset is not tradable".to_string(),
+                filled_shares: NonNegative::new(FractionalShares::new(float!(0.25))).unwrap(),
+                remaining_shares: NonNegative::new(FractionalShares::new(float!(0.75))).unwrap(),
+                excess_shares: NonNegative::new(FractionalShares::ZERO).unwrap(),
+            },
+        };
+
+        let json = serde_json::to_value(&trade).expect("serialization should succeed");
+        assert_eq!(
+            json["outcome"],
+            json!({
+                "status": "failed",
+                "error": "asset is not tradable",
+                "filledShares": "0.25",
+                "remainingShares": "0.75",
+                "excessShares": "0"
+            })
+        );
+    }
+
+    #[test]
+    fn newest_first_sort_uses_numeric_log_index_for_tied_onchain_trades() {
+        let timestamp = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+        let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let trade = |id: &str, occurred_at| Trade {
+            id: id.to_string(),
+            occurred_at,
+            venue: TradingVenue::Raindex,
+            direction: Direction::Buy,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(float!(1)),
+            outcome: TradeOutcome::Filled,
+        };
+        let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let mut trades = vec![
+            trade(&format!("{tx_hash}:2"), timestamp),
+            trade("older", older),
+            trade(&format!("{tx_hash}:10"), timestamp),
+        ];
+
+        sort_trades_newest_first(&mut trades);
+
+        assert_eq!(
+            trades.into_iter().map(|trade| trade.id).collect::<Vec<_>>(),
+            [
+                format!("{tx_hash}:2"),
+                format!("{tx_hash}:10"),
+                "older".to_string()
+            ]
+        );
     }
 }

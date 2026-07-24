@@ -160,11 +160,22 @@ pub(crate) async fn setup_apalis_tables(
     Ok(())
 }
 
+async fn setup_onchain_trade_store(
+    pool: &SqlitePool,
+    broadcaster: Arc<Broadcaster>,
+) -> anyhow::Result<Arc<Store<OnChainTrade>>> {
+    Ok(StoreBuilder::<OnChainTrade>::new(pool.clone())
+        .with(broadcaster)
+        .build(())
+        .await?)
+}
+
 async fn setup_offchain_order_store<E>(
     pool: &SqlitePool,
     executor: &E,
     position: &Arc<Store<Position>>,
     position_projection: &Arc<Projection<Position>>,
+    broadcaster: Arc<Broadcaster>,
 ) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Arc<Projection<OffchainOrder>>)>
 where
     E: Executor + Clone + Send + Sync + 'static,
@@ -180,6 +191,7 @@ where
     let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .with(broadcaster)
             .with(Arc::new(RetryOnBusy {
                 inner: HedgeLatencyProjection::new(pool.clone()),
             }))
@@ -549,10 +561,9 @@ impl Conductor {
         let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
+        let broadcaster = Arc::new(Broadcaster::new(event_sender.clone(), pool.clone()));
 
-        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
-            .await?;
+        let onchain_trade = setup_onchain_trade_store(&pool, broadcaster.clone()).await?;
 
         let (vault_registry, vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -609,7 +620,7 @@ impl Conductor {
                 apalis_pool: apalis_pool.clone(),
                 ctx: ctx.clone(),
                 inventory: inventory.clone(),
-                event_sender,
+                event_sender: event_sender.clone(),
                 vault_registry: vault_registry.clone(),
                 vault_registry_projection,
                 schedulers: schedulers.clone(),
@@ -642,8 +653,14 @@ impl Conductor {
         // OffchainOrder reactor (registered below) goes live, in both modes.
         catch_up_lifecycle_failures(&pool).await?;
 
-        let (offchain_order, offchain_order_projection) =
-            setup_offchain_order_store(&pool, &executor, &position, &position_projection).await?;
+        let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
+            &pool,
+            &executor,
+            &position,
+            &position_projection,
+            broadcaster,
+        )
+        .await?;
 
         let frameworks = CqrsFrameworks {
             onchain_trade,
@@ -3567,7 +3584,7 @@ mod tests {
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
         Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
-        MockExecutor, Positive, Symbol,
+        MockExecutor, Positive, SupportedExecutor, Symbol,
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
@@ -3748,6 +3765,101 @@ mod tests {
     fn test_broadcaster(pool: &SqlitePool) -> (Arc<Broadcaster>, broadcast::Receiver<Statement>) {
         let (sender, receiver) = broadcast::channel(16);
         (Arc::new(Broadcaster::new(sender, pool.clone())), receiver)
+    }
+
+    #[tokio::test]
+    async fn onchain_trade_store_broadcasts_filled_trades() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (broadcaster, mut receiver) = test_broadcaster(&pool);
+        let store = setup_onchain_trade_store(&pool, broadcaster).await.unwrap();
+        let id = crate::onchain_trade::OnChainTradeId {
+            tx_hash: TxHash::ZERO,
+            log_index: 0,
+        };
+
+        store
+            .send(
+                &id,
+                crate::onchain_trade::OnChainTradeCommand::Witness {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: float!(1),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_number: 1,
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let message = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("wired store should broadcast the onchain fill")
+            .expect("dashboard receiver should remain connected");
+        assert!(matches!(
+            message,
+            Statement::TradeUpdate(st0x_dto::Trade {
+                venue: st0x_dto::TradingVenue::Raindex,
+                outcome: st0x_dto::TradeOutcome::Filled,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn offchain_order_store_broadcasts_failed_counter_trades() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (broadcaster, mut receiver) = test_broadcaster(&pool);
+        let (offchain_order, _) = setup_offchain_order_store(
+            &pool,
+            &MockExecutor::new(),
+            &position,
+            &position_projection,
+            broadcaster,
+        )
+        .await
+        .unwrap();
+        let id = OffchainOrderId::new();
+
+        offchain_order
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        offchain_order
+            .send(
+                &id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "asset is not tradable".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let message = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("wired store should broadcast the terminal failure")
+            .expect("dashboard receiver should remain connected");
+        assert!(matches!(
+            message,
+            Statement::TradeUpdate(st0x_dto::Trade {
+                outcome: st0x_dto::TradeOutcome::Failed { error, .. },
+                ..
+            }) if error == "asset is not tradable"
+        ));
     }
 
     async fn insert_finished_job(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) {
