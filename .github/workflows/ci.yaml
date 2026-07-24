@@ -3,21 +3,31 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches-ignore:
-      - 'graphite-base/**'
-      # `external-pr/**` mirrors a fork pull request head so CI can report on
-      # it (see external-pr-ci.yaml). That workflow starts this one through
-      # `workflow_dispatch`, which the branch filter here does not affect. The
-      # mirror push carries a GITHUB_TOKEN and starts nothing by itself, so
-      # this entry only keeps a future push from running CI twice on one SHA.
-      - 'external-pr/**'
+    branches: [master]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 
+# Metadata-only pull request edits (title/body, see `optimize_ci`) get their
+# own group. They skip the real checks, so sharing the group would let a title
+# edit cancel a live run and then report every required check as skipped --
+# which branch protection reads as a pass on code that was never tested.
 concurrency:
-  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'edited' && !github.event.changes.base && 'metadata-edit' || '' }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}
   cancel-in-progress: true
 
+# CI validates untrusted pull request code, so its repository access stays
+# read-only at the workflow level.
 permissions:
   contents: read
+  pull-requests: read
+
+env:
+  # GitHub holds fork pull_request runs for maintainer approval, removes every
+  # repository secret, and limits GITHUB_TOKEN to read access. Dependabot runs
+  # have the same restrictions despite using a branch in this repository. Keep
+  # an explicit flag as well, so no authenticated optimizer or cache publisher
+  # is even invoked for untrusted code.
+  UNTRUSTED_PR: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]') }}
 
 # Nix is installed via nix-quick-install-action and both the shared
 # `rainlanguage` Cachix (cachix-action) and the per-runner nix store
@@ -28,19 +38,32 @@ permissions:
 jobs:
   optimize_ci:
     runs-on: "blacksmith-2vcpu-ubuntu-2404"
+    timeout-minutes: 5
     outputs:
-      skip: ${{ steps.check_skip.outputs.skip }}
+      skip: ${{ steps.metadata_edit.outputs.skip == 'true' && 'true' || steps.check_skip.outputs.skip }}
     steps:
+      # `edited` is in the trigger list for base retargets: a stacked pull
+      # request keeps its head commit when its parent merges, so only the
+      # retarget event tells CI the diff under test changed. GitHub fires the
+      # same event for title and body edits, which change no code at all, and
+      # `/pr-description` edits both right after submit. `github.event.changes`
+      # carries `base` only on a retarget, so its absence marks the edit as
+      # metadata-only and reuses the optimizer's `skip` contract to stand every
+      # real job down.
+      - name: Detect metadata-only pull request edit
+        id: metadata_edit
+        if: ${{ github.event.action == 'edited' && !github.event.changes.base }}
+        run: echo "skip=true" >> "$GITHUB_OUTPUT"
+
       # Pinned to the v0.0.9 release commit, not a mutable ref: this action
       # gates all CI and holds the Graphite token, so the SHA freezes both the
       # supply chain and the `skip` output contract (set in dist/index.js but
       # undeclared in the action's action.yml).
       #
-      # `external-pr/**` mirrors a fork commit that Graphite has never tracked
-      # as part of any stack (see external-pr-ci.yaml). The optimizer's `skip`
-      # contract is undocumented for a branch of that shape, and a `true` from
-      # it would skip the real jobs, which branch protection then reads as a
-      # pass. So do not ask the optimizer at all for a mirror branch.
+      # Fork pull requests are not Graphite stacks. The optimizer's `skip`
+      # contract is not defined for them, and a `true` would skip the real
+      # jobs, which branch protection then reads as a pass. Do not invoke the
+      # optimizer or expose its token for untrusted code.
       #
       # The STEP carries this condition, not the job, on purpose. The job still
       # runs and still succeeds, so no dependent job can be cascade-skipped by
@@ -49,7 +72,7 @@ jobs:
       # bucket.
       - name: Optimize CI
         id: check_skip
-        if: ${{ !startsWith(github.ref_name, 'external-pr/') }}
+        if: ${{ env.UNTRUSTED_PR != 'true' && steps.metadata_edit.outputs.skip != 'true' }}
         uses: withgraphite/graphite-ci-action@9bc969adfd43bb790da3b64b543c78c75cef9689  # v0.0.9
         with:
           graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZATION_TOKEN }}
@@ -71,8 +94,9 @@ jobs:
   # including when `optimize_ci` itself failed (empty skip) -- so a broken
   # optimizer falls into the run-CI bucket, never the skip bucket.
   #
-  # NOTE: paths-filter needs the repo checked out for push/workflow_dispatch git
-  # change detection (this workflow is not pull_request-triggered).
+  # NOTE: paths-filter uses the Pull Requests API for pull_request runs and git
+  # change detection for push/workflow_dispatch, so the checkout is needed for
+  # the latter two events.
   changes:
     name: changes
     needs: optimize_ci
@@ -80,11 +104,16 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      # GitHub's pull request files API returns at most 3,000 files. At that
+      # limit the filter may have received a truncated list, so fail into full
+      # CI instead of accepting a possible docs-only false negative.
+      code: ${{ github.event_name == 'pull_request' && github.event.pull_request.changed_files >= 3000 && 'true' || steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
 
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3
         id: filter
         with:
           predicate-quantifier: 'every'
@@ -106,14 +135,16 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
 
       - name: Configure Git fetch fail-fast
         run: |
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: nixbuild/nix-quick-install-action@v34
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         with:
           # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
           # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
@@ -127,46 +158,48 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
-          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
           useDaemon: false
 
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           prefix-key: rust-${{ github.workflow }}
           workspaces: ". -> target/test"
+          save-if: ${{ env.UNTRUSTED_PR != 'true' }}
 
       # Build the test binaries once into a nextest archive shared by all four
       # partitions, and run clippy here since this is the single full compile.
       - name: Build nextest archive and run clippy
         run: |
-          nix develop .#ci-backend -c bash -c '
+          nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             cargo nextest archive --workspace --all-features --profile ci \
-              --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+              --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\"
             cargo clippy --workspace --all-targets --all-features
             # compile_fail_tests (trybuild) shells out to cargo at run time, so
             # run it here where the workspace build cache is warm. The archive
             # partitions only carry prebuilt binaries and would compile it cold.
             cargo nextest run --workspace --all-features --profile ci \
-              -E "test(compile_fail_tests)"
-          '
+              -E 'test(compile_fail_tests)'
+          "
 
       # Blacksmith transparently redirects the native Actions cache to
       # colocated storage. GitHub artifacts still use remote Azure storage,
       # which made each test shard spend ~20 minutes downloading this file.
       - name: Save nextest archive
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -183,14 +216,16 @@ jobs:
       matrix:
         partition: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
 
       - name: Configure Git fetch fail-fast
         run: |
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: nixbuild/nix-quick-install-action@v34
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         with:
           # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
           # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
@@ -204,22 +239,23 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
-          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
           useDaemon: false
 
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
 
       - name: Restore nextest archive
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -228,13 +264,13 @@ jobs:
       # Test binaries come from the archive built in backend-build; no recompile.
       - name: test ${{ matrix.partition }} of 4
         run: |
-          nix develop .#ci-backend -c bash -c '
+          nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
-            cargo nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
+            cargo nextest run --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\" \
               --workspace-remap . --profile ci \
-              -E "not test(compile_fail_tests)" \
+              -E 'not test(compile_fail_tests)' \
               --partition hash:${{ matrix.partition }}/4
-          '
+          "
 
   backend:
     name: backend
@@ -277,8 +313,10 @@ jobs:
         if: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
         run: echo "Docs-only change; skipping dashboard build."
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+        with:
+          persist-credentials: false
 
       - name: Configure Git fetch fail-fast
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
@@ -286,7 +324,7 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: nixbuild/nix-quick-install-action@v34
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         with:
           # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
@@ -301,21 +339,22 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
-          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
           useDaemon: false
 
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
 
       - name: Check bun.nix is up to date
         if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
@@ -350,14 +389,16 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
 
       - name: Configure Git fetch fail-fast
         run: |
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: nixbuild/nix-quick-install-action@v34
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         with:
           # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
           # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
@@ -371,22 +412,23 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
         continue-on-error: true
         with:
           name: rainlanguage
-          authToken: ${{ !startsWith(github.ref_name, 'external-pr/') && secrets.CACHIX_AUTH_TOKEN || '' }}
-          skipPush: ${{ startsWith(github.ref_name, 'external-pr/') }}
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
           useDaemon: false
 
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
 
-      - name: external pull request CI scripts
-        run: ./scripts/test-external-pr-ci.sh
+      - name: fork pull request CI invariants
+        run: ./scripts/test-fork-pr-ci.sh
 
       - name: deploy migration invariants
         run: ./scripts/validate-deploy-migration.sh
