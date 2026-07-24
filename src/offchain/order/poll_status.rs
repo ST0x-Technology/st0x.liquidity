@@ -1530,7 +1530,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use apalis::prelude::Monitor;
-    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
     use chrono::Utc;
     use futures_util::future::join_all;
     use httpmock::prelude::*;
@@ -1549,7 +1548,7 @@ mod tests {
 
     use super::*;
     use crate::conductor::job::{
-        FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, build_supervised_worker, build_worker_inner,
+        FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
     use crate::offchain::order::{
         NoFillOutcome, OffchainOrderCommand, TerminalPositionFinalization, noop_order_placer,
@@ -5218,10 +5217,7 @@ mod tests {
             .unwrap();
 
         let ctx = Arc::new(ctx);
-        let failure_notify = Arc::new(tokio::sync::Notify::new());
-        let fail_stop = CircuitBreakerConfig::default()
-            .with_failure_threshold(1)
-            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
 
         let monitor_handle = tokio::spawn({
             let failure_notify = failure_notify.clone();
@@ -5235,7 +5231,6 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
-                        fail_stop.clone(),
                         failure_notify.clone(),
                         FailureInjector::new(),
                     )
@@ -5295,13 +5290,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(50), failure_notify.notified()).await,
-                Ok(())
-            ),
-            "repeated 429s must never open the circuit breaker or signal a terminal job failure"
-        );
+        if let Ok(info) =
+            tokio::time::timeout(Duration::from_millis(50), failure_notify.notified()).await
+        {
+            panic!(
+                "repeated 429s must never open the circuit breaker or signal a terminal job \
+                 failure; got: {info:?}"
+            );
+        }
 
         let terminally_failed: i64 = sqlx_apalis::query_scalar(
             "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status IN ('Failed', 'Killed')",

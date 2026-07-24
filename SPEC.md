@@ -4120,7 +4120,7 @@ chain.
 ##### Broker rate-limit (429) backpressure
 
 A `429 Too Many Requests` from Alpaca is not a bug and must not consume a job's
-terminal retry budget or open its circuit breaker. Three call-site shapes, each
+terminal retry budget or fail-stop its worker. Three call-site shapes, each
 handled differently:
 
 - **Apalis jobs**: on a classified 429, the job's `perform()` catches the error
@@ -4135,17 +4135,17 @@ handled differently:
   dispatches) and bounds this to a large but finite reschedule budget; once
   exhausted, a supervised job (e.g. `Order status
   poll`) logs loudly and
-  dead-letters cleanly (`Ok(())`, not `Err`) rather than opening its circuit
-  breaker, since a persistent 429 there signals a structurally-dead integration
-  (suspended account, revoked key), not a process fault. An exhausted
-  `Order status poll` retains its completed queue row as a durable dead-letter
-  marker so periodic submitted-order recovery cannot reset the budget and
-  immediately re-arm it. `Order status poll` reads and idempotent hedge-order
-  placement are the jobs whose successors genuinely re-drive the broker call;
-  other jobs' 429s can land after their own idempotency guard already committed,
-  in which case the reschedule still frees the worker and preserves the retry
-  budget but the guard itself (not the reschedule) is what makes the eventual
-  retry safe.
+  dead-letters cleanly (`Ok(())`, not `Err`) rather than emitting a
+  terminal-failure signal, since a persistent 429 there signals a
+  structurally-dead integration (suspended account, revoked key), not a process
+  fault. An exhausted `Order status poll` retains its completed queue row as a
+  durable dead-letter marker so periodic submitted-order recovery cannot reset
+  the budget and immediately re-arm it. `Order status poll` reads and idempotent
+  hedge-order placement are the jobs whose successors genuinely re-drive the
+  broker call; other jobs' 429s can land after their own idempotency guard
+  already committed, in which case the reschedule still frees the worker and
+  preserves the retry budget but the guard itself (not the reschedule) is what
+  makes the eventual retry safe.
   - **Exception -- equity recovery jobs**: wrapped/unwrapped equity recovery
     currently records provider failures as terminal aggregate events carrying
     display text, so the job never receives a typed 429 to classify or
