@@ -508,6 +508,11 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        // Captured before the broker read: the stamp must lower-bound the
+        // broker's as-of time so a pre-fill read can never be stamped after
+        // the fill was applied to the view (guard 2's comparison). Stamping
+        // at command-handling time would leave that window open.
+        let fetched_at = Utc::now();
         let inventory_result = self
             .executor
             .get_inventory()
@@ -524,7 +529,10 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OffchainEquity { positions },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions,
+                    fetched_at,
+                },
             )
             .await?;
 
