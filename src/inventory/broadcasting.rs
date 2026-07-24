@@ -39,6 +39,17 @@ impl BroadcastingInventory {
             sender: &self.sender,
         }
     }
+
+    /// Write access that skips the dashboard broadcast on drop.
+    ///
+    /// For mutations of state `to_dto()` does not expose (the offchain-order
+    /// gate): broadcasting those would push a byte-identical snapshot per
+    /// order placement and termination, and the DTO is built on every guard
+    /// drop even with no dashboard clients connected. Any mutation the
+    /// dashboard can observe must use [`Self::write`] instead.
+    pub(crate) async fn write_without_broadcast(&self) -> RwLockWriteGuard<'_, InventoryView> {
+        self.view.write().await
+    }
 }
 
 /// Write guard that broadcasts the current inventory snapshot on drop.
@@ -123,6 +134,32 @@ mod tests {
         assert_eq!(dto.per_symbol[0].symbol, symbol);
         assert_eq!(dto.per_symbol[0].onchain_available, onchain);
         assert_eq!(dto.per_symbol[0].offchain_available, offchain);
+    }
+
+    #[tokio::test]
+    async fn write_without_broadcast_stays_silent() {
+        let (inventory, mut receiver) = create_broadcasting_inventory();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        {
+            let mut guard = inventory.write_without_broadcast().await;
+            guard.mark_offchain_order_pending(symbol.clone());
+        }
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a gate-only mutation must not broadcast a dashboard snapshot"
+        );
+
+        // The broadcasting path still fires for observable mutations.
+        drop(inventory.write().await);
+        let statement = receiver.try_recv().unwrap();
+        assert!(
+            matches!(statement, Statement::InventorySnapshot(_)),
+            "the broadcasting write path must emit a snapshot on drop"
+        );
     }
 
     #[tokio::test]

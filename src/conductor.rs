@@ -36,8 +36,8 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, LifecycleError, Projection, RetryOnBusy, SendError, Store,
-    StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
+    AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
+    SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
@@ -121,7 +121,7 @@ use crate::wrapped_equity_recovery::{
 };
 
 pub(crate) use builder::CqrsFrameworks;
-use manifest::QueryManifest;
+use manifest::{BuiltFrameworks, QueryManifest};
 use trading_queues::{EquityRecoveryInputs, TradingJobQueues, setup_trading_job_queues};
 
 /// CQRS/event-store and apalis worker pools over the same SQLite database.
@@ -579,6 +579,15 @@ impl Conductor {
         // without one the bot cannot submit on-chain transactions at all.
         grant_startup_token_approvals(&ctx).await?;
 
+        // Catch the lifecycle-failure read model up to the event log before
+        // its OffchainOrder reactor (registered below) goes live, in both
+        // modes. Must run BEFORE `PositionAndRebalancing::setup`: setup spawns
+        // resume workers that write the event store concurrently, and this
+        // catch-up's deferred read-then-write transaction surfaces
+        // SQLITE_BUSY_SNAPSHOT immediately (busy_timeout does not apply to
+        // deferred-upgrade conflicts), failing the whole boot.
+        catch_up_lifecycle_failures(&pool).await?;
+
         let rebalancing = match ctx.rebalancing_ctx() {
             Ok(ctx) => Some(ctx.clone()),
             Err(CtxError::NotRebalancing) => None,
@@ -628,19 +637,21 @@ impl Conductor {
         )
         .await?;
 
-        // Hydrate the in-memory InventoryView from persisted snapshot
-        // state so the runtime projection has the same data as the
-        // database. Without this, the first post-restart poll may emit
-        // no events (unchanged values are deduplicated), leaving the
-        // view empty and potentially causing incorrect rebalancing.
-        hydrate_inventory_from_snapshot(&pool, &inventory).await;
+        // Restore the in-memory InventoryView from persisted snapshot state
+        // and seed the open-hedge gate. Without hydration, the first
+        // post-restart poll may emit no events (unchanged values are
+        // deduplicated), leaving the view empty and potentially causing
+        // incorrect rebalancing.
+        restore_inventory_at_boot(
+            &pool,
+            &inventory,
+            rebalancing_service.as_ref(),
+            &position_projection,
+        )
+        .await?;
         if let Some(service) = &rebalancing_service {
             service.enqueue_recovery_for_current_wallet_balances().await;
         }
-
-        // Catch the lifecycle-failure read model up to the event log before its
-        // OffchainOrder reactor (registered below) goes live, in both modes.
-        catch_up_lifecycle_failures(&pool).await?;
 
         let (offchain_order, offchain_order_projection) =
             setup_offchain_order_store(&pool, &executor, &position, &position_projection).await?;
@@ -1086,6 +1097,33 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 
 /// Replay persisted [`InventorySnapshot`] state into the in-memory
 /// [`BroadcastingInventory`] so the runtime view starts warm.
+/// Restore the in-memory inventory picture at boot: hydrate the view from
+/// persisted `InventorySnapshot` state, then seed the open-hedge gate from
+/// the `Position` projection. The single seam owning the relative order of
+/// the two steps.
+///
+/// Hydration MUST run first: it replays offchain equity snapshots through
+/// the pending-offchain-order guards, which are inert only while the gate is
+/// still empty. Seeding the gate first would skip hydration for every symbol
+/// with an open hedge order, booting it with an uninitialized offchain
+/// balance that imbalance detection could then misread.
+pub(crate) async fn restore_inventory_at_boot(
+    pool: &SqlitePool,
+    inventory: &Arc<BroadcastingInventory>,
+    rebalancing_service: Option<&Arc<RebalancingService>>,
+    position_projection: &Projection<Position>,
+) -> Result<(), ProjectionError<Position>> {
+    hydrate_inventory_from_snapshot(pool, inventory).await;
+
+    if let Some(service) = rebalancing_service {
+        service
+            .recover_pending_offchain_order_symbols(position_projection)
+            .await?;
+    }
+
+    Ok(())
+}
+
 async fn hydrate_inventory_from_snapshot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
@@ -1407,6 +1445,34 @@ async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
     }
 }
 
+/// Builds the CQRS frameworks behind the query manifest: the dashboard
+/// broadcaster and the four query projections, with the stage-timing read
+/// models caught up to the event log before their reactors go live.
+async fn build_query_frameworks(
+    pool: &SqlitePool,
+    event_sender: broadcast::Sender<Statement>,
+    rebalancing_service: Arc<RebalancingService>,
+    equity_transfer_services: EquityTransferServices,
+) -> anyhow::Result<BuiltFrameworks> {
+    let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+    let hedge_latency = HedgeLatencyProjection::new(pool.clone());
+    let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
+    let equity_timing = EquityTimingProjection::new(pool.clone());
+    let lifecycle_failure = LifecycleFailureProjection::new(pool.clone());
+    catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
+
+    let manifest = QueryManifest::new(
+        rebalancing_service,
+        broadcaster,
+        hedge_latency,
+        rebalance_timing,
+        equity_timing,
+        lifecycle_failure,
+    );
+
+    manifest.build(pool.clone(), equity_transfer_services).await
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -1495,29 +1561,13 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
-        let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
-        let hedge_latency = HedgeLatencyProjection::new(deps.pool.clone());
-        let rebalance_timing = RebalanceTimingProjection::new(deps.pool.clone());
-        let equity_timing = EquityTimingProjection::new(deps.pool.clone());
-        let lifecycle_failure = LifecycleFailureProjection::new(deps.pool.clone());
-        catch_up_stage_timing_projections(&rebalance_timing, &equity_timing).await?;
-
-        let manifest = QueryManifest::new(
+        let built = build_query_frameworks(
+            &deps.pool,
+            deps.event_sender,
             rebalancing_service.clone(),
-            broadcaster,
-            hedge_latency,
-            rebalance_timing,
-            equity_timing,
-            lifecycle_failure,
-        );
-
-        let built = manifest
-            .build(deps.pool.clone(), equity_transfer_services)
-            .await?;
-
-        rebalancing_service
-            .recover_pending_offchain_order_symbols(&built.position_projection)
-            .await?;
+            equity_transfer_services,
+        )
+        .await?;
 
         rebalancing_service
             .set_stores(

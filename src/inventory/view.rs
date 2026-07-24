@@ -598,11 +598,25 @@ pub(crate) struct InventoryView {
     #[serde(default)]
     previous_inflight_redemption_symbols: HashSet<Symbol>,
     /// Latest absolute equity snapshot timestamp by symbol for the onchain venue.
+    /// Local-clock time: the snapshot aggregate stamps `fetched_at` itself, so
+    /// this is never the chain's or the broker's clock.
     #[serde(default)]
     onchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
     /// Latest absolute equity snapshot timestamp by symbol for the offchain venue.
+    /// Local-clock time, as above.
     #[serde(default)]
     offchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
+    /// Symbols with an open offchain (hedge) order.
+    #[serde(default)]
+    pending_offchain_order_symbols: HashSet<Symbol>,
+    /// Local-clock time at which the most recent offchain fill was *applied to
+    /// this view*, by symbol -- not when the broker executed it, which is
+    /// earlier by the observation lag. It is compared against snapshot
+    /// `fetched_at`, so it must be read from the same clock that stamps it.
+    /// Stops a poll issued before the fill from landing after it and
+    /// overwriting a correctly decremented balance with a pre-fill number.
+    #[serde(default)]
+    last_offchain_fill_applied_at: HashMap<Symbol, DateTime<Utc>>,
 }
 
 impl InventoryView {
@@ -841,6 +855,8 @@ impl Default for InventoryView {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
+            pending_offchain_order_symbols: HashSet::new(),
+            last_offchain_fill_applied_at: HashMap::new(),
         }
     }
 }
@@ -1013,6 +1029,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
+            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
         })
     }
 
@@ -1040,6 +1058,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
+            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
         })
     }
 
@@ -1064,6 +1084,98 @@ impl InventoryView {
         self
     }
 
+    /// Marks a symbol as having an open offchain order, so offchain equity
+    /// snapshots stop applying to it until the order reaches a terminal state.
+    pub(crate) fn mark_offchain_order_pending(&mut self, symbol: Symbol) {
+        self.pending_offchain_order_symbols.insert(symbol);
+    }
+
+    /// Whether a symbol has an open offchain order.
+    ///
+    /// Single source of truth for that state: it gates offchain equity
+    /// snapshots here and equity rebalancing dispatch in the rebalancing
+    /// trigger. One copy under one lock keeps the two from disagreeing.
+    pub(crate) fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
+        self.pending_offchain_order_symbols.contains(symbol)
+    }
+
+    /// Replaces the set of symbols with an open offchain order, for rebuilding
+    /// it from the `Position` projection at startup.
+    pub(crate) fn set_pending_offchain_order_symbols(&mut self, symbols: HashSet<Symbol>) {
+        self.pending_offchain_order_symbols = symbols;
+    }
+
+    /// Releases the snapshot block for a symbol whose offchain order reached a
+    /// terminal state.
+    ///
+    /// `applied_fill_at` carries the local-clock time of a fill whose delta was
+    /// applied to the mirror, and is `None` when nothing was applied (a failed
+    /// or cancelled order, or a fill whose update errored). It must be a local
+    /// reading, never the event's `broker_timestamp`: it is compared against
+    /// snapshot `fetched_at`, which the snapshot aggregate stamps from this
+    /// host's clock, so mixing the two would compare two unsynchronized clocks.
+    pub(crate) fn clear_offchain_order_pending(
+        &mut self,
+        symbol: &Symbol,
+        applied_fill_at: Option<DateTime<Utc>>,
+    ) {
+        self.pending_offchain_order_symbols.remove(symbol);
+
+        if let Some(applied_fill_at) = applied_fill_at {
+            self.last_offchain_fill_applied_at
+                .insert(symbol.clone(), applied_fill_at);
+        }
+    }
+
+    /// A fresh default view retaining only the offchain-order guard state
+    /// (pending orders and applied-fill times) and, for each gated symbol,
+    /// the Hedging available balance that state guards.
+    ///
+    /// Snapshot-error recovery resets the view before force-applying the
+    /// failed snapshot. The guard state must survive that reset: it is derived
+    /// from the `Position` event stream, not from snapshots, and nothing
+    /// re-seeds it after startup — wiping it would re-admit offchain snapshots
+    /// for symbols whose hedge order is still open, re-opening the
+    /// double-apply race. The delta-owned balance must survive with it: while
+    /// the gate is held, snapshots are skipped, so nothing can repopulate a
+    /// wiped balance — the symbol would sit uninitialized and imbalance
+    /// detection would silently stop for it. Inflight is deliberately NOT
+    /// carried (stuck inflight is the wedge class recovery exists to clear)
+    /// and the onchain venue is left uninitialized (it is not delta-owned and
+    /// nothing blocks its repopulation). Every other field is intentionally
+    /// defaulted, which is why this uses functional-update syntax rather than
+    /// an exhaustive literal: a future field should default here unless it is
+    /// guard state.
+    pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
+        let equities = self
+            .equities
+            .iter()
+            .filter(|(symbol, _)| self.pending_offchain_order_symbols.contains(*symbol))
+            .filter_map(|(symbol, inventory)| {
+                inventory.get_venue(Venue::Hedging).map(|balance| {
+                    (
+                        symbol.clone(),
+                        Inventory {
+                            onchain: None,
+                            offchain: Some(VenueBalance::new(
+                                balance.available(),
+                                FractionalShares::ZERO,
+                            )),
+                            last_rebalancing: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        Self {
+            equities,
+            pending_offchain_order_symbols: self.pending_offchain_order_symbols.clone(),
+            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
+            ..Self::default()
+        }
+    }
+
     fn equity_snapshot_watermark(&self, symbol: &Symbol, venue: Venue) -> Option<DateTime<Utc>> {
         let watermarks = match venue {
             Venue::MarketMaking => &self.onchain_equity_snapshot_watermarks,
@@ -1084,6 +1196,39 @@ impl InventoryView {
             .is_some_and(|watermark| fetched_at <= watermark)
         {
             return Ok(false);
+        }
+
+        // The offchain venue has a second writer (the fill delta) that the
+        // onchain venue does not; yield to it while it owns the balance.
+        // Exhaustive so a new venue forces a decision on whether it has a
+        // second writer of its own.
+        match venue {
+            Venue::MarketMaking => {}
+            Venue::Hedging => {
+                if self.pending_offchain_order_symbols.contains(symbol) {
+                    debug!(
+                        target: "inventory",
+                        %symbol,
+                        ?fetched_at,
+                        "Skipping offchain equity snapshot: hedge order still open",
+                    );
+                    return Ok(false);
+                }
+
+                if self
+                    .last_offchain_fill_applied_at
+                    .get(symbol)
+                    .is_some_and(|filled_at| fetched_at < *filled_at)
+                {
+                    debug!(
+                        target: "inventory",
+                        %symbol,
+                        ?fetched_at,
+                        "Skipping offchain equity snapshot: predates last applied fill",
+                    );
+                    return Ok(false);
+                }
+            }
         }
 
         let Some(inventory) = self.equities.get(symbol) else {
@@ -1279,6 +1424,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
+            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
         })
     }
 
@@ -1307,6 +1454,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
+            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
         })
     }
 
@@ -1714,6 +1863,16 @@ impl InventoryView {
             } => positions
                 .iter()
                 .try_fold(self, |view, (symbol, snapshot_balance)| {
+                    // The force path bypasses the staleness guards, not the
+                    // ownership one: a symbol with an open hedge order keeps
+                    // its delta-owned balance, or the recovery path re-opens
+                    // the snapshot-vs-fill double-count. Skipped symbols also
+                    // keep their watermark un-advanced below, so the
+                    // post-clear healing emission still applies.
+                    if view.has_pending_offchain_order(symbol) {
+                        return Ok(view);
+                    }
+
                     view.update_equity(
                         symbol,
                         Inventory::force_on_snapshot(
@@ -1725,11 +1884,11 @@ impl InventoryView {
                     )
                 })
                 .map(|view| {
-                    view.record_equity_snapshot_watermarks(
-                        Venue::Hedging,
-                        positions.keys(),
-                        *fetched_at,
-                    )
+                    let applied: Vec<&Symbol> = positions
+                        .keys()
+                        .filter(|symbol| !view.has_pending_offchain_order(symbol))
+                        .collect();
+                    view.record_equity_snapshot_watermarks(Venue::Hedging, applied, *fetched_at)
                 }),
 
             OffchainUsd {
@@ -1926,6 +2085,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
+            pending_offchain_order_symbols: HashSet::new(),
+            last_offchain_fill_applied_at: HashMap::new(),
         }
     }
 
@@ -1957,6 +2118,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
+            pending_offchain_order_symbols: HashSet::new(),
+            last_offchain_fill_applied_at: HashMap::new(),
         }
     }
 
@@ -2986,6 +3149,231 @@ mod tests {
     }
 
     #[test]
+    fn pending_offchain_order_skips_hedging_snapshot_without_advancing_watermark() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_equity(aapl.clone(), shares(20), shares(100));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(90));
+        let snapshot = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: now,
+        };
+
+        let mut view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "snapshot must not apply while a hedge order is open",
+        );
+
+        // Re-delivering the *same* snapshot after the order terminates must
+        // apply: the skip must not advance the watermark, or `fetched_at <=
+        // watermark` would reject the retry. (Whether the aggregate re-emits
+        // an unchanged value at all is a separate, currently-open concern —
+        // its dedupe suppresses it; this pins the view-side precondition.)
+        view.clear_offchain_order_pending(&aapl, None);
+        let view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(90)),
+            "the first snapshot after the order terminates must heal the balance",
+        );
+    }
+
+    #[test]
+    fn snapshot_predating_last_applied_fill_is_skipped() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let applied_at = Utc::now();
+
+        // A 10-share sell was already applied to the mirror (100 -> 90).
+        let mut view = InventoryView::default().with_equity(aapl.clone(), shares(20), shares(90));
+        view.clear_offchain_order_pending(&aapl, Some(applied_at));
+
+        // A poll read before the fill executed reports the pre-fill 100; its
+        // event lands after the fill was applied. Applying it would resurrect
+        // the pre-fill balance.
+        let mut stale_positions = BTreeMap::new();
+        stale_positions.insert(aapl.clone(), shares(100));
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: stale_positions,
+                    fetched_at: applied_at - Duration::seconds(1),
+                },
+                applied_at,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(90)),
+            "a snapshot fetched before the applied fill must not overwrite it",
+        );
+
+        // Boundary: the guard is strict (`fetched_at < applied_at`), so a
+        // snapshot stamped at exactly the applied time is fresh and applies.
+        // 85 is deliberately distinct from both 90 and 100 so application is
+        // observable.
+        let mut boundary_positions = BTreeMap::new();
+        boundary_positions.insert(aapl.clone(), shares(85));
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: boundary_positions,
+                    fetched_at: applied_at,
+                },
+                applied_at,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(85)),
+            "a snapshot stamped exactly at the applied-fill time must apply",
+        );
+    }
+
+    #[test]
+    fn marketmaking_snapshot_unaffected_by_offchain_order_guards() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Populate both guard fields: an applied-fill time, then a re-opened
+        // pending order.
+        let mut view = InventoryView::default().with_equity(aapl.clone(), shares(50), shares(100));
+        view.clear_offchain_order_pending(&aapl, Some(now));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        // An onchain snapshot older than the applied fill, arriving while the
+        // hedge order is open, must still apply: both guards are scoped to the
+        // Hedging venue.
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(60));
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: now - Duration::seconds(1),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(60)),
+            "MarketMaking snapshots must ignore the offchain-order guards",
+        );
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "the offchain balance is untouched by an onchain snapshot",
+        );
+    }
+
+    /// The recovery force path bypasses the staleness guards by design, but
+    /// it must not bypass the open-hedge gate: a symbol with an open order
+    /// owns its balance via the fill delta, and force-writing the ambiguous
+    /// mid-order snapshot value re-opens the double-count the gate exists to
+    /// prevent -- on the recovery path, which exists precisely for when
+    /// things already went wrong.
+    #[test]
+    fn force_apply_offchain_snapshot_respects_open_hedge_gate() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(100))
+            .with_equity(tsla.clone(), shares(10), shares(50));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        let positions = BTreeMap::from([(aapl.clone(), shares(90)), (tsla.clone(), shares(45))]);
+        let forced = view
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: now,
+                },
+                now,
+                Arc::new(InventoryViewError::UsdBalanceConversion(0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            forced.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "a symbol with an open hedge order owns its balance via the fill \
+             delta; even the force path must not overwrite it"
+        );
+        assert_eq!(
+            forced.equity_available(&tsla, Venue::Hedging),
+            Some(shares(45)),
+            "ungated symbols must still force-apply"
+        );
+    }
+
+    #[test]
+    fn reset_preserves_guard_state_and_delta_owned_balances_only() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let applied_at = Utc::now();
+
+        let mut view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(100))
+            .with_equity(tsla.clone(), shares(10), shares(50));
+        view.clear_offchain_order_pending(&aapl, Some(applied_at));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        let mut reset = view.reset_preserving_offchain_order_state();
+
+        assert!(
+            reset.has_pending_offchain_order(&aapl),
+            "the pending-order set must survive the reset"
+        );
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "the gated symbol's delta-owned Hedging balance must survive the \
+             reset — nothing can repopulate it while the gate is held"
+        );
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::MarketMaking),
+            None,
+            "the gated symbol's onchain venue is not delta-owned and must be \
+             wiped like everything else"
+        );
+        assert_eq!(
+            reset.equity_available(&tsla, Venue::Hedging),
+            None,
+            "ungated balances must not survive the reset"
+        );
+
+        // Guard 2 state must survive too: with the pending flag cleared, a
+        // snapshot predating the preserved applied-fill time is still
+        // rejected. Had the reset dropped it, this snapshot would apply.
+        reset.clear_offchain_order_pending(&aapl, None);
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(50));
+        let healed = reset
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: applied_at - Duration::seconds(1),
+                },
+                applied_at,
+            )
+            .unwrap();
+        assert_eq!(
+            healed.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "a snapshot predating the preserved applied-fill time must still \
+             be rejected after the reset — the preserved balance stays"
+        );
+    }
+
+    #[test]
     fn onchain_snapshot_zeroes_symbol_absent_from_complete_snapshot() {
         // The same complete-snapshot semantics apply to the onchain venue: a
         // symbol tracked onchain but absent from a fresh OnchainEquity snapshot
@@ -3323,6 +3711,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
+            pending_offchain_order_symbols: HashSet::new(),
+            last_offchain_fill_applied_at: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -3376,6 +3766,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
+            pending_offchain_order_symbols: HashSet::new(),
+            last_offchain_fill_applied_at: HashMap::new(),
         };
 
         let dto = view.to_dto();

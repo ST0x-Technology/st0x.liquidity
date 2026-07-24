@@ -182,9 +182,12 @@ impl EventSourced for InventorySnapshot {
                 usdc_balance,
                 fetched_at: now,
             },
-            OffchainEquity { positions } => InventorySnapshotEvent::OffchainEquity {
+            OffchainEquity {
                 positions,
-                fetched_at: now,
+                fetched_at,
+            } => InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at,
             },
             OffchainUsd {
                 usd_balance_cents,
@@ -269,13 +272,16 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }])
             }
-            OffchainEquity { positions } => {
+            OffchainEquity {
+                positions,
+                fetched_at,
+            } => {
                 if self.offchain_equity == positions {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainEquity {
                     positions,
-                    fetched_at: now,
+                    fetched_at,
                 }])
             }
             OffchainUsd {
@@ -626,6 +632,11 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainEquity {
         positions: BTreeMap<Symbol, FractionalShares>,
+        /// Captured by the poller before issuing the broker read, so the
+        /// event's stamp lower-bounds the broker's as-of time. Stamping at
+        /// command-handling time would let a pre-fill read outrun a fill
+        /// applied in between, defeating the view's applied-fill guard.
+        fetched_at: DateTime<Utc>,
     },
     OffchainUsd {
         usd_balance_cents: i64,
@@ -918,6 +929,7 @@ mod tests {
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OffchainEquity {
                 positions: positions.clone(),
+                fetched_at: Utc::now(),
             })
             .await
             .events();
@@ -1010,7 +1022,10 @@ mod tests {
                     positions: positions.clone(),
                     fetched_at,
                 }],
-                InventorySnapshotCommand::OffchainEquity { positions },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions,
+                    fetched_at,
+                },
             ),
             (
                 vec![InventorySnapshotEvent::OffchainUsd {
