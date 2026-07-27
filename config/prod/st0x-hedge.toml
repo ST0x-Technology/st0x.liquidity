@@ -74,7 +74,7 @@ organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 # Also needed for CLI commands: alpaca-redeem and transfer-equity.
 # Not needed for alpaca-tokenize or alpaca-tokenization-requests.
 [tokenization]
-redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 
 [rebalancing]
 transfer_timeout_secs = 1800
@@ -156,7 +156,7 @@ tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
 [assets.equities.SGOV]
 pyth_feed_id = "0x8d6a29bb5ed522931d711bb12c4bbf92af986936e52af582032913b5ffcbf4d5"
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -165,7 +165,7 @@ tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
 [assets.equities.SPYM]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -175,7 +175,7 @@ tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
 [assets.equities.TSLA]
 pyth_feed_id = "0x2a797e196973b72447e0ab8e841d9f5706c37dc581fe66a0bd21bcd256cdb9b9"
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -184,7 +184,7 @@ tokenized_equity_derivative = "0x219a8d384a10bf19b9f24cb5cc53f79dd0e5a03d"
 
 [assets.equities.AMZN]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -193,7 +193,7 @@ tokenized_equity_derivative = "0x997bae3ec193a249596d3708c3fab7c501bb8a53"
 
 [assets.equities.NVDA]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -203,7 +203,7 @@ tokenized_equity_derivative = "0xfb5b41acdba20a3230f84be995173cfb98b8d6e7"
 [assets.equities.MSTR]
 pyth_feed_id = "0xe1e80251e5f5184f2195008382538e847fafc36f751896889dd3d1b1f6111f09"
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -221,7 +221,7 @@ tokenized_equity_derivative = "0x849e389982209f901b7b9ffca57ae4c9eeb11c0d"
 
 [assets.equities.IAU]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -231,7 +231,7 @@ tokenized_equity_derivative = "0x1e46d7efef64a833afb1cd49299a7ad5b439f4d8"
 [assets.equities.COIN]
 pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -240,7 +240,7 @@ tokenized_equity_derivative = "0x5cda0e1ca4ce2af96315f7f8963c85399c172204"
 
 [assets.equities.SIVR]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -250,7 +250,7 @@ tokenized_equity_derivative = "0xeb7f3e4093c9d68253b6104fbbff561f3ec0442f"
 [assets.equities.CRCL]
 pyth_feed_id = "0x92b8527aabe59ea2b12230f7b532769b133ffb118dfbd48ff676f14b273f1365"
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -259,7 +259,7 @@ tokenized_equity_derivative = "0x8afba81dec38de0a18e2df5e1967a7493651eebf"
 
 [assets.equities.PPLT]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -268,7 +268,7 @@ tokenized_equity_derivative = "0x82f5baee1076334357a34a19e04f7c282d51ce47"
 
 [assets.equities.BMNR]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -278,7 +278,7 @@ tokenized_equity_derivative = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
 [assets.equities.QQQM]
 pyth_feed_id = "0x433b196b3b026f46f76b5e901c84c575a7280dcba0f4272edefe0529b599ad64"
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -287,7 +287,7 @@ tokenized_equity_derivative = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
 
 [assets.equities.VWO]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -296,7 +296,7 @@ tokenized_equity_derivative = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
 
 [assets.equities.ARKK]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -305,7 +305,7 @@ tokenized_equity_derivative = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
 
 [assets.equities.SPCX]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -314,7 +314,7 @@ tokenized_equity_derivative = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
 
 [assets.equities.CEG]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -323,7 +323,7 @@ tokenized_equity_derivative = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
 
 [assets.equities.DRAM]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -332,7 +332,7 @@ tokenized_equity_derivative = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
 
 [assets.equities.TSM]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -341,7 +341,7 @@ tokenized_equity_derivative = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
 
 [assets.equities.ASML]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -350,7 +350,7 @@ tokenized_equity_derivative = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
 
 [assets.equities.SKHY]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -359,7 +359,7 @@ tokenized_equity_derivative = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
 
 [assets.equities.MU]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -368,7 +368,7 @@ tokenized_equity_derivative = "0x89EcfE9E0728D6b3c5eb0EE7236f8C6F806C7B56"
 
 [assets.equities.AMD]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -377,7 +377,7 @@ tokenized_equity_derivative = "0x648042Acd8638E12fEfd51C2b25A9f993f21a612"
 
 [assets.equities.AVGO]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -386,10 +386,7 @@ tokenized_equity_derivative = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
 
 [assets.equities.AMAT]
 trading = "enabled"
-# Paused for the receipt-custody migration (Fireblocks -> Turnkey): rebalancing
-# drives issuance mint/redeem traffic, which must be quiescent while AMAT's
-# receipts move. Re-enable only after the custody cutover completes.
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -398,7 +395,7 @@ tokenized_equity_derivative = "0x522DC65c89C9Af4f410BAe01bbf53aF75854a9f9"
 
 [assets.equities.LRCX]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
@@ -407,7 +404,7 @@ tokenized_equity_derivative = "0x328B9aFFa511fE26673edBb4fEa37eDaF908A3bc"
 
 [assets.equities.TTWO]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
