@@ -386,7 +386,10 @@ tokenized_equity_derivative = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
 
 [assets.equities.AMAT]
 trading = "enabled"
-rebalancing = "enabled"
+# Paused for the receipt-custody migration (Fireblocks -> Turnkey): rebalancing
+# drives issuance mint/redeem traffic, which must be quiescent while AMAT's
+# receipts move. Re-enable only after the custody cutover completes.
+rebalancing = "disabled"
 wrapped_equity_recovery = "enabled"
 extended_hours_counter_trading = "enabled"
 vault_id = "0xfab"
