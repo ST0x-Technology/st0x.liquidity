@@ -4164,3 +4164,234 @@ a fresh direct send and `InitiateDeposit` re-enters the leg from `Bridged`,
 where the scan finds the already-submitted transfer and adopts it instead of
 forwarding the minted USDC twice. Once `InitiateDeposit` is recorded, resume
 re-polls by the recorded send tx without sending again.
+
+## Multi-chain
+
+A **network** here is one EVM chain the bot acts on, carrying its own chain id,
+endpoints, contract addresses, and confirmation semantics, and identified by a
+wire name (`base`, `ethereum`) chosen to match the name the issuer and the
+broker use for the same chain in tokenization requests. It is the unit the chain
+registry below is keyed by.
+
+The bot operates on a configured set of networks rather than on Base
+specifically. Today Base is not merely the default but the only expressible
+choice: the chain-dependent values are single-valued in configuration and the
+USDC transport's endpoints are compile-time constants, so a second network
+cannot be described at all. Two capabilities follow from removing that, and they
+are worth separating because they have different consumers:
+
+- The same underlying can be traded on more than one network at once, with a
+  single hedge against the combined exposure.
+- The whole stack can run on a network that is not Base — including one where
+  the broker also settles cash, which is what makes a test-network environment
+  reachable without a bridge.
+
+What stays singular: one bot process, one database, one broker account, and one
+`Position` per symbol.
+
+Earlier sections of this spec name Base and Ethereum concretely — the
+rebalancing aggregates, the broker deposit-send leg, and the position aggregate.
+Read against this section, those describe the two-network topology as one case
+of the model below rather than as the only possible deployment; where they
+conflict, this section governs.
+
+### Chain registry
+
+The single-chain `EvmCtx` becomes a registry keyed by network. Each entry
+carries everything the bot needs to act on that chain: RPC endpoint, orderbook
+address, inventory mode and inventory address, vault owner, deployment block,
+required confirmations, ingestion cutoff, the cash (USDC) token address on that
+chain, and — where a transport is present — that chain's transport endpoints and
+domain identifier. The entry is the sole source of those addresses; no
+chain-specific constant remains in code. Entries are constructed once at startup
+and are immutable for the process lifetime.
+
+These are per-network values because the tradeoff each encodes has to be made
+against a particular chain. `required_confirmations` reflects one chain's reorg
+behaviour. `ingestion_cutoff` chooses between two block tags whose meaning is
+per-chain: on an OP-Stack rollup `safe` is the latest block whose sequencer
+batch has been posted to L1, while on Ethereum it is the justified-checkpoint
+head under Casper FFG. Both tags are well defined on both, so the choice is not
+about which one a chain understands — it is that the reorg risk each tag accepts
+and the hedging latency it costs differ per chain, and that balance must be
+struck per network rather than once globally.
+
+A registry entry is validated before the network is used: its RPC must report
+the chain id the entry names and must resolve the block tag the entry selects,
+and its configured cash-token address must be a contract with the expected
+symbol and decimals. A network failing validation fails startup rather than
+being skipped, matching how the inventory-access preflight already gates
+rebalancing.
+
+### Settlement topology
+
+Rebalancing's domain concern is holding the target mix of equity and cash where
+trading needs it. Cash settlement runs between two endpoints: the **trading
+network**, where the bot's orders and vaults live, and the **broker deposit
+network**, the chain the broker credits deposits on. Whether those two are the
+same network is a property of a deployment, so it is what configuration
+describes.
+
+When the endpoints are the same network, settlement is a transfer on that
+network and no bridging is involved. When they differ, a transport moves value
+between them, and CCTP is one implementation of such a transport. CCTP is
+therefore a transport, not a domain concept: it is selected by the topology, and
+it does not appear at all in a deployment whose endpoints coincide.
+
+Today the topology is baked into the type system rather than configured.
+`BridgeDirection` is a closed enum of `EthereumToBase` and `BaseToEthereum`, the
+CCTP domains are compile-time constants for Ethereum mainnet and Base, and the
+wallet requires both a Base and an Ethereum RPC endpoint whenever it is
+configured at all. A single-network deployment cannot be expressed in those
+terms, which is the reason the bot cannot currently run anywhere the broker also
+settles cash.
+
+The persisted rebalance direction is part of that baking: it names chains
+(`AlpacaToBase`, `BaseToAlpaca`) in the domain event rather than naming the
+movement. It becomes chain-neutral — a direction between the broker and a named
+trading network — so the transport's identity stops leaking into stored history,
+and existing events keep deserializing by mapping to the Base network.
+
+A same-network deployment performs no bridge operation: the transport is absent
+from the settlement path rather than invoked with matching endpoints.
+
+That absence is a structural property, not a safety check. It removes only the
+benign failure — a transport invoked where none was wanted. Routing funds to the
+wrong network is prevented by validating the topology at startup, not by the
+type system: each registry entry's RPC must report the chain id the entry names,
+the broker deposit network must be one the broker will actually issue a deposit
+address for, and a transport's destination must be derived from that same
+validated entry. A topology that fails those checks fails startup, before any
+funds move.
+
+That startup check is about the topology being coherent. It does not change when
+the deposit address is fetched on an individual settlement: the address is
+resolved on the leg that uses it, and no fund-moving send to the broker happens
+until an address for the destination network is in hand.
+
+Collapsing the transport also collapses the crash-safety state machine built
+around it. The cross-chain path anchors recovery on the bridge: a burn, an
+attestation, a mint, and then an explicit transfer to the broker's deposit
+address, with the mint's transaction bounding the resume scan for an
+already-submitted send. A same-network settlement has no burn and no mint, so it
+enters the deposit-send phase directly, its bridging-phase anchors are absent
+rather than empty, and the resume scan is bounded by the transfer's own
+submission point. The two topologies therefore have different state machines,
+and the spec treats the same-network one as a first-class path rather than the
+cross-chain machine with fields left unset.
+
+### Position and hedging
+
+`Position` stays keyed by `Symbol` with no network dimension, and fills from
+every configured network feed the same `Position`.
+
+This is a consequence of what a hedge is for, not a convenience. There is one
+broker account, and equity _exposure_ is fungible across networks: a long fill
+on one network and an offsetting short fill on another leave no net exposure to
+hedge. A `Position` per network would treat them as two independent exposures
+and place two broker orders, paying spread twice to end up flat. Netting at the
+symbol is what makes the hedge match the exposure the business actually carries.
+
+Inventory is not fungible, and netting must not be extended to it. Tokens sit on
+one chain and can only be sold there, so a symbol that is net flat across
+networks can still be untradeable on each of them — long on one, short on the
+other, with no ability to deliver on either. Exposure is therefore netted at the
+symbol for hedge sizing, while inventory targets, imbalance triggers, and
+operational limits are evaluated per `(symbol, network)`. The in-flight transfer
+guard is keyed the same way, so inventory can be moved on two networks
+concurrently rather than one blocking the other.
+
+The same distinction applies to cash. Cash inventory is held per network and
+sized against the trading that network carries. A single global figure evaluated
+independently on each network would let every network hold or move up to it, so
+the aggregate reaches N times the intended cash exposure; sizing per network
+against that network's own trading is what keeps the total bounded.
+
+### Fill identity and ingestion
+
+A fill is identified by `(network, tx_hash, log_index)`. A transaction hash is
+unique only within a chain, so the network is part of the identity rather than
+metadata attached to it.
+
+Identity governs idempotency, so the widening reaches every surface keyed on a
+fill — including the event-sourced ones, which are the ones that matter most.
+The `OnChainTrade` aggregate id and the trade id carried inside `Position`'s
+fill events are both fill identities, and `Position`'s exactly-once dedupe state
+is keyed by the latter. Widening only the derived read models would leave that
+dedupe keyed on `(tx_hash, log_index)`, so by this section's own argument two
+fills sharing a hash across networks would collide and the second would be
+rejected as a duplicate — an unhedged fill, silently, which is the same failure
+category invariant 7 exists to prevent. So this is an event-store identity
+change: it carries a schema-version bump, legacy events must continue to
+deserialize, and existing identities are read as Base.
+
+Each configured network has its own fill monitor and its own ingestion
+checkpoint, so networks make progress independently and one lagging chain does
+not hold back the others. Independent progress must not become silent loss: a
+network whose fills cannot be ingested is surfaced as a failure rather than
+skipped, since an un-ingested fill is unhedged exposure.
+
+### Assets
+
+An asset's tokenized equity address, its wrapper, and its vault ids are
+per-network properties: the same underlying listed on two networks is two sets
+of addresses under one symbol. Symbol resolution and vault discovery are
+therefore scoped by network: a token address resolves to a symbol only within
+the network it was seen on, so the symbol cache and the vault registry are keyed
+by `(network, address)` rather than by address alone.
+
+Freeze status is not. Issuance keys freeze on the underlying, so a frozen
+underlying is frozen everywhere it is listed, and the rebalancing freeze guard's
+decision applies across every network carrying that underlying.
+
+Equity settlement carries the network end to end: minting and redeeming through
+issuance name the network the tokens live on, and wrapping and unwrapping target
+that network's wrapper.
+
+### Operational surfaces
+
+Gas is held per network, so gas monitoring and its alerts are per network and
+name the network that is low. The low-balance threshold is per network too: a
+single global figure would be simultaneously too low on an expensive chain and
+too high on a cheap one. Because settlement spans several transactions, a
+network can also exhaust gas partway through one; that leaves the settlement
+resumable rather than failed, and the operator alert names the network blocking
+it.
+
+Anything an operator reads to attribute behaviour — trades, vault balances,
+inventory — is attributed by network, while the position an operator reads to
+understand exposure stays netted per symbol.
+
+**Invariants:**
+
+1. Every on-chain action uses the network registry entry for the network it acts
+   on; there is no fallback to Base, and no chain-specific address is held
+   anywhere but that entry.
+2. A registry entry is used only after its RPC has confirmed the chain id it
+   names and resolved its selected block tag, and its cash-token address has
+   been confirmed on chain.
+3. A fill's identity includes its network, in the event store as well as in
+   derived read models, and a fill is never treated as a duplicate of a fill on
+   a different network.
+4. One `Position` per symbol, fed by fills from all networks, hedged once
+   against the net exposure. Netting governs hedge sizing only; inventory
+   targets, imbalance triggers, and operational limits are per
+   `(symbol, network)`.
+5. A deployment whose trading network and broker deposit network are the same
+   performs no bridge operation.
+6. Funds move to the broker deposit network only after the broker has issued a
+   deposit address for that network.
+7. A network that cannot be ingested from raises a failure rather than
+   proceeding without its fills.
+
+**Alternatives considered:**
+
+| Alternative                                                | Rejected because                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One bot process per network                                | Duplicates the database and the broker account, so neither exposure netting nor a single hedge per symbol is expressible                                                                                                                                                              |
+| `Position` per network                                     | Offsetting fills on different networks would be hedged twice, paying spread to end up flat                                                                                                                                                                                            |
+| Keep `(tx_hash, log_index)` as fill identity               | A hash is unique only within a chain, and per-network checkpointing and reconciliation have nothing to attribute a fill to                                                                                                                                                            |
+| Extend `BridgeDirection` with a variant per network pair   | Grows quadratically in networks and still cannot express "no transport"; the topology, not the pair, is what varies                                                                                                                                                                   |
+| Model same-network settlement as a bridge whose ends match | Imposes the cross-chain crash-safety machine — burn, attestation, and mint anchors — on a path that has none, so same-network settlement would be modelled as the bridged one with fields left unset                                                                                  |
+| Global `required_confirmations` and `ingestion_cutoff`     | `required_confirmations` gates settlement of the bot's own transactions and `ingestion_cutoff` trades reorg risk against hedging latency on fill ingestion; both are calibrated to one chain's reorg behaviour, so a single global value cannot be right for every configured network |
+| Net inventory across networks as well as exposure          | Tokens are deliverable only on the chain holding them, so a net-flat symbol can be untradeable on every network it trades on                                                                                                                                                          |
