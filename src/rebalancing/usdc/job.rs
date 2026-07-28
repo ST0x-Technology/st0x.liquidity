@@ -303,11 +303,27 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // condition resolves as the chain advances, and failing a transfer
             // for slow on-chain settlement would be wrong. Mirrors the
             // market-making settlement-wait arm.
-            Err(UsdcTransferError::SettlementCheckTransient { id, .. }) => {
+            //
+            // When `source` wraps a `CctpError::MintRecoveryInconclusive` (see
+            // `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive` in
+            // manager.rs), this redrive is UNBOUNDED with NO operator alert: a
+            // durably degraded RPC endpoint redrives here forever at
+            // `SETTLEMENT_REDRIVE_DELAY`, holding the `usdc_in_progress` guard the
+            // whole time, with only this `warn!` (never `ctx.notifier.notify`) to
+            // observe it. A deadline-based alert mirroring
+            // `WithdrawalPollInconclusive` is a deliberate, tracked follow-up (see
+            // `redrive_on_mint_recovery_inconclusive`'s doc for why it is not
+            // included here), not an oversight.
+            Err(UsdcTransferError::SettlementCheckTransient { id, source }) => {
+                // `source` is logged (not just the generic reason) so an
+                // operator watching this redrive can see, e.g., a
+                // `CctpError::MintRecoveryInconclusive` probe error directly,
+                // rather than only "settlement-phase RPC check failed".
                 warn!(
                     target: "rebalance",
                     %id,
                     delay = ?SETTLEMENT_REDRIVE_DELAY,
+                    ?source,
                     "Rescheduling Base->Alpaca USDC transfer: settlement-phase RPC check \
                      failed transiently or burn scan inconclusive"
                 );
@@ -771,10 +787,26 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     // This arm is unreachable; it exists only to satisfy exhaustiveness.
                     _ => unreachable!("outer or-pattern limits to settlement variants"),
                 };
+                // `settlement_err` (which for `SettlementCheckTransient` carries
+                // the boxed `CctpError` source, e.g. a
+                // `MintRecoveryInconclusive` probe error) is logged in full so
+                // an operator watching this redrive sees the underlying cause,
+                // not just the generic `reason` string.
+                //
+                // When that source is `CctpError::MintRecoveryInconclusive` (see
+                // `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive`
+                // in manager.rs), this redrive is UNBOUNDED with NO operator
+                // alert: a durably degraded RPC endpoint redrives here forever at
+                // `SETTLEMENT_REDRIVE_DELAY`, holding the `usdc_in_progress` guard
+                // the whole time, with only this `warn!` (never
+                // `ctx.notifier.notify`) to observe it. A deadline-based alert
+                // mirroring `WithdrawalPollInconclusive` is a deliberate, tracked
+                // follow-up, not an oversight.
                 warn!(
                     target: "rebalance",
                     %id,
                     delay = ?SETTLEMENT_REDRIVE_DELAY,
+                    ?settlement_err,
                     "Rescheduling Alpaca->Base USDC transfer: {reason}"
                 );
                 let mut job_queue = ctx.job_queue.clone();
