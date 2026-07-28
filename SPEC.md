@@ -2369,13 +2369,26 @@ enum BridgeStage { Burn, Attestation, Mint }
   again; or `BridgingFailed` when recovering an already-failed post-burn
   transfer, whose next redrive re-attempts the mint directly instead
   (idempotency there comes from CCTP's nonce being authoritative, not from that
-  bounded scan). That redrive is deliberately unbounded and pages no operator:
-  each attempt re-reads authoritative on-chain state before minting, so
-  repeating it is harmless, whereas a false terminal failure strands the
-  rebalancing guard until an operator reconciles by hand. The cost is that a
-  PERSISTENTLY inconclusive recovery (a durably degraded RPC endpoint, not a
-  one-off blip) holds the guard with no alert. Bounding the redrive and alerting
-  on the bound is a tracked follow-up, not part of this rule
+  bounded scan).
+- **Inconclusive mint recovery: redrive and operator alert**: the job layer
+  schedules an unbounded delayed redrive (like the settlement-phase
+  RPC-transient case above) rather than consuming the apalis retry budget, since
+  the mint may already have landed and re-probing is idempotent. Once the
+  transfer's total age reaches 4 hours -- measured from the durable
+  `initiated_at` carried by whichever of
+  `Bridging`/`AwaitingAttestation`/`Attested`/`BridgingFailed` the transfer
+  resumed from, so the countdown survives restarts, and not from when mint
+  recovery itself became inconclusive -- the job begins paging the operator on
+  every redrive. A transfer that already exceeds the threshold can therefore
+  page on its first inconclusive mint-recovery probe. The redrive uses a slower
+  cadence after the deadline (30 minutes instead of 30 seconds, to avoid alert
+  fatigue) while still keeping the guard held and continuing to redrive -- the
+  funds are already burned, so the redrive never stops on its own; only manual
+  `transfer resume`/`transfer reconcile` ends it. The 4-hour threshold mirrors
+  the withdrawal-poll alert deadline, giving generous headroom above the
+  ~2-minute internal probe window while surfacing a durably degraded RPC
+  endpoint or a permanently unresolved nonce well before it becomes a multi-day
+  silent outage
 - Destination deposit must be confirmed to complete rebalancing (for
   AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)
 - Can mark failed from any non-terminal state
