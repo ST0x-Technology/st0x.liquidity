@@ -330,6 +330,19 @@ Phase 3: setup_rebalancing (optional) | requeue_orphaned jobs | hydrate inventor
 Phase 4: builder::spawn() starts supervisor + apalis workers
 ```
 
+After Phase 4 completes, Conductor acknowledges its startup token. The session
+reports startup readiness only after Conductor, both HTTP servers, the apalis
+monitor, finished-job cleanup, and every configured task-supervisor loop have
+all reached pending run states. Disabled optional supervisor tasks acknowledge
+their slots during assembly. The deployed server writes its PID to a
+systemd-managed runtime-directory file, and activation fails if that PID does
+not match the live unit before the configured startup timeout. Non-deployment
+sessions use the same barrier with a no-op notifier. On the first rollout, the
+system profile that supplies the readiness environment must be deployed before
+the service profile. A service-only deploy checks that prerequisite before
+stopping the current bot and fails immediately when the installed unit is still
+from before the handshake.
+
 There is no WebSocket and no pre-runtime backfill pass. `Conductor::run()`
 creates a single HTTP provider before spawn; `OrderFillMonitor` clones it and
 uses it for each poll tick.

@@ -163,6 +163,16 @@ NixOS host (DigitalOcean droplet)
 Services are deployed as independent nix profiles, allowing per-service updates
 and rollbacks without affecting other services.
 
+The bot unit exposes a PID-scoped startup signal in its systemd runtime
+directory. A bot deployment succeeds only after Conductor finishes startup
+initialization and every essential runtime task has entered its run loop; an
+early exit or a missing readiness signal fails within five minutes, emits unit
+status and recent journal output in the deploy log, and triggers deploy-rs
+rollback. The first rollout requires deploying the system profile before the
+service profile; service-only deploys verify that prerequisite before stopping
+the current bot. Local server runs omit the systemd ready-file environment and
+use a no-op notifier.
+
 ### Key Files
 
 | File                | Purpose                                                |
