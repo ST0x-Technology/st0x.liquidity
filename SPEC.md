@@ -3287,6 +3287,57 @@ balances and emitting them as events the system can react to:
   conductor task. Onchain polling uses the `vaultBalance2` contract call;
   offchain polling uses the `Executor::get_inventory()` trait method.
 
+##### Broker Divergence Recovery
+
+The snapshot pipeline can wedge into a self-sustaining divergence: the
+InventorySnapshot aggregate suppresses events for polls equal to its stored
+state, InventoryView's staleness guards (watermark, inflight, open hedge order,
+applied-fill recency, `last_rebalancing`) can skip the events that do arrive,
+and every failed equity-transfer cleanup stamps a fresh `last_rebalancing` that
+re-arms those guards. The view then carries a balance the broker does not hold,
+and no ordinary poll corrects it until a restart re-hydrates the view from the
+aggregate.
+
+The recovery mechanism self-heals that state within a bounded number of poll
+intervals:
+
+- **Detection at the poll boundary**: after emitting the offchain equity
+  snapshot, the poller compares each fetched broker position against the view's
+  Hedging available balance. Busy symbols (inflight transfer at either venue,
+  active mint/redemption, open hedge order, or a reading fetched before the last
+  applied hedge fill) are skipped with their counter frozen, not reset. A
+  mismatch increments an in-memory per-symbol counter; a match resets it.
+  Restart resets the counters, which is safe because startup hydration heals the
+  view anyway.
+- **N-confirmation escalation**: when a symbol's counter reaches the configured
+  `inventory_divergence_threshold` (required, positive; no default), the poller
+  sends `ReconcileOffchainEquity` on the InventorySnapshot aggregate carrying
+  the broker position, the view's diverging ledger value, and the consecutive
+  poll count. Unlike ordinary snapshot commands, this command always emits its
+  `OffchainEquityReconciled` event -- the stored value being already correct is
+  exactly the wedge -- and the event folds into the aggregate's offchain equity
+  state so post-heal startup hydration matches.
+- **Forced reconcile on apply**: both feeder topologies (RebalancingService
+  reactor and the standalone InventoryProjection) apply the event through the
+  force path, clearing inflight, setting the broker value, and advancing the
+  symbol's snapshot watermark -- without stamping `last_rebalancing`. Under the
+  view write lock the apply re-validates that the symbol is still not busy: if
+  an inflight transfer, active mint/redemption, or open hedge order appeared
+  between escalation and apply, a hedge fill was applied to the view after the
+  escalation's reading was fetched, or a fresher snapshot already advanced the
+  symbol's watermark past the reading, the heal aborts unapplied. The poller
+  verifies the heal by reading the view back after the send: an aborted apply
+  keeps the gate engaged and the counter at the threshold, so the next quiet
+  diverging poll re-escalates immediately instead of paying a fresh N-poll
+  cycle.
+- **Transfer gating**: from the first diverging poll until the counter resets on
+  a matching poll or an escalation verifiably heals the view, the symbol is held
+  in a gate shared with the equity rebalancing trigger, which skips firing mints
+  and redemptions for gated symbols. This stops doomed transfers -- sized off a
+  suspect balance -- from marking the symbol busy and freezing the counter
+  across cycles. The cost on a transient mismatch is at most one poll interval
+  of delayed rebalancing.
+
 ### InventoryView
 
 `InventoryView` aggregates inventory across onchain and offchain venues and

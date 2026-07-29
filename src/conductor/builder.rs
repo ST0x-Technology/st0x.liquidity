@@ -35,7 +35,8 @@ use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use crate::alerts::TelegramNotifier;
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
+    BroadcastingInventory, InventoryDivergenceRecoveryCtx, InventoryPollingService,
+    InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
@@ -98,6 +99,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
+    pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
     pub(crate) shutdown_token: CancellationToken,
     #[cfg(any(test, feature = "test-support"))]
@@ -231,7 +233,17 @@ where
         reserved_cash,
     )
     .with_configured_equity_symbols(configured_equity_symbols)
-    .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults);
+    .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults)
+    .with_divergence_recovery(InventoryDivergenceRecoveryCtx {
+        inventory: context.inventory.clone(),
+        threshold: context.ctx.inventory_divergence_threshold,
+        // Share the trigger's gate so transfer suppression and detection
+        // agree; without rebalancing there is no transfer to gate, so a
+        // private gate serves as the counter's bookkeeping only.
+        gate: rebalancing_service
+            .as_ref()
+            .map_or_else(Arc::default, |service| service.divergence_gate()),
+    });
 
     if let Some(rebalancing_service) = &rebalancing_service {
         polling_service =

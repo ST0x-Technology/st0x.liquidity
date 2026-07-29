@@ -22,6 +22,7 @@ board_port = 8012
 # Separate DB so CLI runs never touch the market-making bot's event store.
 database_url = "sqlite:///mnt/data/s01-issuer.db"
 apalis_finished_job_cleanup_interval_secs = 3600
+inventory_divergence_threshold = 10
 
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
 [raindex]

@@ -40,8 +40,9 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
-    Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryView,
+    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
+    TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
@@ -484,6 +485,12 @@ pub(crate) struct RebalancingService {
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
+    /// Symbols the inventory poller flagged with a pending snapshot
+    /// divergence. Read here to suppress new equity transfers so a mint or
+    /// redemption that would fail at the broker cannot mark the symbol busy
+    /// and freeze the poller's divergence counter. Shared with the poller via
+    /// [`Self::divergence_gate`].
+    divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     wrapper: Arc<dyn Wrapper>,
@@ -634,6 +641,7 @@ impl RebalancingService {
             inventory,
             freeze_status: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             notifier,
             wrapper,
@@ -684,6 +692,13 @@ impl RebalancingService {
     /// (the reader wraps the issuance client built from config).
     pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
         *self.freeze_status.write().await = Some(reader);
+    }
+
+    /// The divergence gate shared with the inventory poller. The poller
+    /// writes (engage on detection, release on match or escalation); the
+    /// equity trigger reads it before dispatching transfers.
+    pub(crate) fn divergence_gate(&self) -> Arc<InventoryDivergenceGate> {
+        Arc::clone(&self.divergence_gate)
     }
 
     /// Whether a freeze-status reader has been wired. Lets the conductor's
@@ -1638,7 +1653,11 @@ impl RebalancingService {
                 now,
             ),
 
-            OffchainUsd { .. }
+            // `reconcile_offchain_equity` validates busyness and the hedge
+            // gate under the write lock, so the generic apply path is the
+            // correct route here too.
+            OffchainEquityReconciled { .. }
+            | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
             | AlpacaUsdc { .. }
@@ -1701,6 +1720,21 @@ impl RebalancingService {
             }
         };
 
+        // The recovery reset below drops the active mints/redemptions and
+        // inflight state that `reconcile_offchain_equity` revalidates, so a
+        // forced retry would pass vacuously against empty state. Drop the
+        // event instead: the poller's read-back keeps the gate and counter,
+        // and the next quiet poll re-escalates with a fresh reading.
+        if let OffchainEquityReconciled { symbol, .. } = &event {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                ?inventory_error,
+                "Skipping force-apply recovery for a reconcile event"
+            );
+            return Ok(());
+        }
+
         warn!(
             target: "rebalance",
             ?inventory_error,
@@ -1751,6 +1785,7 @@ impl RebalancingService {
 
             OnchainEquity { .. }
             | OffchainEquity { .. }
+            | OffchainEquityReconciled { .. }
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
@@ -1812,6 +1847,13 @@ impl RebalancingService {
                 for symbol in positions.keys() {
                     self.equity_scheduler.enqueue_check(symbol.clone()).await;
                 }
+            }
+            // A successful reconcile changed the symbol's tradeable Hedging
+            // balance, so evaluate rebalancing against the updated view. An
+            // aborted reconcile enqueues a check that reads the unchanged
+            // view and triggers nothing.
+            OffchainEquityReconciled { symbol, .. } => {
+                self.equity_scheduler.enqueue_check(symbol.clone()).await;
             }
             // Global USDC snapshots: one USDC check.
             //
@@ -2645,6 +2687,22 @@ impl RebalancingService {
             return Ok(());
         }
 
+        // A pending snapshot divergence means the view's balance for this
+        // symbol is suspect: a transfer sized off it would likely fail, and
+        // a failed attempt arms the guards again and marks the symbol busy,
+        // freezing the very counter that resolves the divergence. Skip
+        // until the poller clears it (a matching poll or a forced reconcile
+        // lifts the gate).
+        if self.divergence_gate.is_engaged(symbol) {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger: unresolved snapshot divergence \
+                 pending reconciliation"
+            );
+            return Ok(());
+        }
+
         let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
@@ -2686,6 +2744,16 @@ impl RebalancingService {
                 target: "rebalance",
                 %symbol,
                 "Skipped equity trigger before dispatch: offchain hedge order became pending"
+            );
+            return Ok(());
+        }
+
+        if self.divergence_gate.is_engaged(symbol) {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger before dispatch: snapshot divergence \
+                 detected during operation sizing"
             );
             return Ok(());
         }
@@ -5011,7 +5079,7 @@ mod tests {
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
     };
-    use crate::inventory::view::{InFlightEquityLocation, Operator};
+    use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
@@ -21616,6 +21684,189 @@ mod tests {
             panic!("Expected exactly one mint job, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    /// A symbol held by the divergence gate must not dispatch equity
+    /// transfers: the view balance backing the imbalance is suspect, and a
+    /// failed transfer would mark the symbol busy and freeze the poller's
+    /// divergence counter. Releasing the gate (what a matching poll or a
+    /// sent escalation does) restores dispatch.
+    #[tokio::test]
+    async fn divergence_gate_suppresses_equity_transfer_dispatch() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        trigger.divergence_gate().engage(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "a gated symbol must not dispatch an equity transfer"
+        );
+
+        trigger.divergence_gate().release(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        let dispatched = take_pending_equity_mint_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one mint job after release, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// With rebalancing enabled, `OffchainEquityReconciled` reaches the view
+    /// through the reactor's `on_snapshot` arm, not `InventoryProjection`.
+    /// The stuck incident state must recover through that route and enqueue
+    /// one follow-up equity check for the symbol.
+    #[tokio::test]
+    async fn reconcile_event_via_reactor_heals_stuck_view() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        // Phantom at Hedging with last_rebalancing stamped: ordinary
+        // snapshots fetched before the stamp are rejected.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(136))
+            .clear_equity_inflight(&symbol, Venue::Hedging, now)
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Precondition: the ordinary arm stays rejected through the reactor.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(0))]),
+                fetched_at: now - chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(136)),
+            "precondition: the ordinary snapshot must still be rejected"
+        );
+        // Clear the checks the ordinary snapshot enqueued so the reconcile's
+        // own enqueue can be asserted in isolation.
+        equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id,
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(0),
+                fetched_at: now + chrono::Duration::seconds(1),
+                ledger_position: Some(shares(136)),
+                consecutive_polls: 3,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (available, inflight) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.equity_available(&symbol, Venue::Hedging),
+                view.equity_inflight(&symbol, Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            available,
+            Some(shares(0)),
+            "the reconcile must apply the broker value through the reactor route"
+        );
+        assert_eq!(
+            inflight,
+            Some(FractionalShares::ZERO),
+            "the reconcile clears Hedging inflight"
+        );
+
+        let processed = equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+        assert_eq!(
+            processed, 1,
+            "a reconcile must enqueue exactly one equity check for the symbol"
+        );
+    }
+
+    /// The force-apply recovery resets the view, which drops exactly the
+    /// busy state `reconcile_offchain_equity` revalidates, so recovering a
+    /// reconcile event would force-write against vacuously empty checks.
+    /// Recovery must skip the event and leave the view untouched; the
+    /// poller re-escalates on its own.
+    #[tokio::test]
+    async fn snapshot_recovery_skips_reconcile_event_leaving_view_untouched() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(136))
+            .set_active_mint(
+                symbol.clone(),
+                st0x_tokenization::issuer_request_id("recovery-mint"),
+            );
+
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::UsdBalanceConversion(
+                    i64::MAX,
+                )),
+                InventorySnapshotEvent::OffchainEquityReconciled {
+                    symbol: symbol.clone(),
+                    position: shares(0),
+                    fetched_at: Utc::now(),
+                    ledger_position: Some(shares(136)),
+                    consecutive_polls: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (available, busy) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.equity_available(&symbol, Venue::Hedging),
+                view.equity_reconciliation_busy(&symbol, Utc::now())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            available,
+            Some(shares(136)),
+            "recovery must not force-apply a reconcile against the reset view"
+        );
+        assert_eq!(
+            busy,
+            Some(EquityReconcileBusy::Transfer),
+            "the active mint must survive the skipped recovery"
+        );
     }
 
     /// A crash between `queue.push` and the first persisted mint event leaves

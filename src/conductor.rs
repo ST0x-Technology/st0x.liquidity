@@ -708,6 +708,7 @@ impl Conductor {
             frameworks,
             pool,
             wallet_polling,
+            inventory: inventory.clone(),
             tokenizer,
             shutdown_token: shutdown_token.clone(),
             #[cfg(any(test, feature = "test-support"))]

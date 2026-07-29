@@ -15,6 +15,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{Level, warn};
@@ -220,6 +221,7 @@ struct Config {
     order_polling_max_jitter: Option<u64>,
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
+    inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
     telemetry: Option<TelemetryConfig>,
@@ -517,6 +519,11 @@ pub struct Ctx {
     pub order_polling_max_jitter: u64,
     pub position_check_interval: u64,
     pub inventory_poll_interval: u64,
+    /// Consecutive offchain polls that must diverge from the inventory view's
+    /// Hedging balance for a symbol before the poller escalates a forced
+    /// snapshot reconciliation. Required and nonzero: a missing value must
+    /// fail config parsing rather than silently defaulting.
+    pub inventory_divergence_threshold: NonZeroU32,
     /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
     /// (capped at the chain's latest finalized block).
@@ -618,6 +625,10 @@ impl std::fmt::Debug for Ctx {
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("position_check_interval", &self.position_check_interval)
             .field("inventory_poll_interval", &self.inventory_poll_interval)
+            .field(
+                "inventory_divergence_threshold",
+                &self.inventory_divergence_threshold,
+            )
             .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field(
                 "apalis_finished_job_cleanup_interval_secs",
@@ -688,6 +699,7 @@ struct ValidatedParts {
     order_polling_max_jitter: u64,
     position_check_interval: u64,
     inventory_poll_interval: u64,
+    inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
@@ -932,6 +944,7 @@ fn parse_and_validate(
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval,
         inventory_poll_interval,
+        inventory_divergence_threshold: config.inventory_divergence_threshold,
         order_fill_poll_interval,
         apalis_finished_job_cleanup_interval_secs,
         broker,
@@ -1025,6 +1038,7 @@ impl Ctx {
             order_polling_max_jitter: parts.order_polling_max_jitter,
             position_check_interval: parts.position_check_interval,
             inventory_poll_interval: parts.inventory_poll_interval,
+            inventory_divergence_threshold: parts.inventory_divergence_threshold,
             order_fill_poll_interval: parts.order_fill_poll_interval,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
@@ -1240,6 +1254,8 @@ impl Ctx {
         inventory_mode: InventoryMode,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
+        #[builder(default = const { NonZeroU32::new(10).unwrap() })]
+        inventory_divergence_threshold: NonZeroU32,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
         #[builder(default = 0)] server_port: u16,
         #[builder(default = 0)] board_port: u16,
@@ -1293,6 +1309,7 @@ impl Ctx {
             order_polling_max_jitter: 0,
             position_check_interval: 2,
             inventory_poll_interval,
+            inventory_divergence_threshold,
             order_fill_poll_interval: 1,
             apalis_finished_job_cleanup_interval_secs,
             broker,
@@ -1567,6 +1584,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         order_polling_max_jitter: 5,
         position_check_interval: 60,
         inventory_poll_interval: 60,
+        inventory_divergence_threshold: NonZeroU32::MIN,
         order_fill_poll_interval: 5,
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
@@ -1689,6 +1707,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -1720,6 +1739,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -1753,6 +1773,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -1891,6 +1912,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -1932,6 +1954,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -1981,6 +2004,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2027,6 +2051,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2073,6 +2098,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2155,6 +2181,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2245,6 +2272,7 @@ mod tests {
             database_url = ":memory:"
             server_port = 8080
             board_port = 8081
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2278,12 +2306,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_divergence_threshold_is_required() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing divergence threshold, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("inventory_divergence_threshold"),
+            "expected parse error to mention the threshold field, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_inventory_divergence_threshold_is_rejected() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 0
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for zero divergence threshold, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("nonzero"),
+            "expected parse error to reject the zero value, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
     async fn server_port_is_required() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2323,6 +2431,7 @@ mod tests {
             database_url = ":memory:"
             server_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2363,6 +2472,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2408,6 +2518,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2450,6 +2561,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
             order_fill_poll_interval = 0
 
             [assets.equities]
@@ -2493,6 +2605,7 @@ mod tests {
             server_port = 8080
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2549,6 +2662,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2613,6 +2727,7 @@ mod tests {
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
             log_level = "warn"
             server_port = 9090
             order_polling_interval = 30
@@ -2676,6 +2791,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2772,6 +2888,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2833,6 +2950,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2897,6 +3015,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -2965,6 +3084,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3039,6 +3159,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3093,6 +3214,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3194,6 +3316,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3251,6 +3374,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3307,6 +3431,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3689,6 +3814,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -3849,6 +3975,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -3915,6 +4042,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -4125,6 +4253,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
             bogus_field = "should fail"
 
             [raindex]
@@ -4157,6 +4286,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets]
             bogus_field = "should fail"
@@ -4193,6 +4323,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -4233,6 +4364,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.cash]
             rebalancing = "disabled"
@@ -4324,6 +4456,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
             bogus_field = "should fail"
 
             [raindex]
@@ -5231,6 +5364,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -5274,6 +5408,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -5359,6 +5494,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -5397,6 +5533,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -5450,6 +5587,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -5539,6 +5677,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
             [assets.equities]
 
@@ -5583,6 +5722,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
             position_check_interval = 0
 
             [assets.equities]

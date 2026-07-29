@@ -3,6 +3,10 @@ board_port = 8081
 log_level = "debug"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
+# Consecutive offchain polls that must diverge from the inventory view's
+# Hedging balance for a symbol before the poller escalates a forced snapshot
+# reconciliation. Required; must be a positive integer.
+inventory_divergence_threshold = 10
 # Interval (seconds) between continuous eth_getLogs polls for orderbook fills.
 # Each tick enqueues a backfill range over the unprocessed blocks, capped at the
 # configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
