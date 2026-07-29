@@ -2748,6 +2748,16 @@ impl RebalancingService {
             return Ok(());
         }
 
+        if self.divergence_gate.is_engaged(symbol) {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger before dispatch: snapshot divergence \
+                 detected during operation sizing"
+            );
+            return Ok(());
+        }
+
         let dispatched = match operation {
             TriggeredOperation::Mint { symbol, quantity } => {
                 self.enqueue_transfer_equity_to_market_making(symbol, quantity, guard.generation())
