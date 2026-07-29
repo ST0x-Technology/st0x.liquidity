@@ -896,11 +896,22 @@ impl InventoryView {
     }
 
     /// Whether divergence recovery must leave this symbol alone: any
-    /// inflight balance or an active mint/redemption makes the comparison
-    /// between broker and ledger ambiguous, so the poller freezes the
-    /// divergence counter instead of counting or resetting it.
-    pub(crate) fn equity_reconciliation_busy(&self, symbol: &Symbol) -> Result<bool, FloatError> {
-        Ok(self.equity_transfer_busy(symbol)? || self.has_pending_offchain_order(symbol))
+    /// inflight balance, an active mint/redemption, an open hedge order,
+    /// or a fill applied after `fetched_at` makes the comparison between
+    /// broker and ledger ambiguous, so the poller freezes the divergence
+    /// counter instead of counting or resetting it. Same staleness rule the
+    /// forced apply enforces in [`Self::reconcile_offchain_equity`].
+    pub(crate) fn equity_reconciliation_busy(
+        &self,
+        symbol: &Symbol,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<bool, FloatError> {
+        Ok(self.equity_transfer_busy(symbol)?
+            || self.has_pending_offchain_order(symbol)
+            || self
+                .last_offchain_fill_applied_at
+                .get(symbol)
+                .is_some_and(|filled_at| fetched_at < *filled_at))
     }
 
     /// Inflight at either venue, or an active mint/redemption owning the
@@ -4588,7 +4599,7 @@ mod tests {
         let now = Utc::now();
 
         let not_busy = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
-        assert!(!not_busy.equity_reconciliation_busy(&spym).unwrap());
+        assert!(!not_busy.equity_reconciliation_busy(&spym, now).unwrap());
 
         let inflight = not_busy
             .clone()
@@ -4598,20 +4609,34 @@ mod tests {
                 now,
             )
             .unwrap();
-        assert!(inflight.equity_reconciliation_busy(&spym).unwrap());
+        assert!(inflight.equity_reconciliation_busy(&spym, now).unwrap());
 
         let minting = not_busy
             .clone()
             .set_active_mint(spym.clone(), st0x_tokenization::issuer_request_id("mint"));
-        assert!(minting.equity_reconciliation_busy(&spym).unwrap());
+        assert!(minting.equity_reconciliation_busy(&spym, now).unwrap());
 
         let redeeming = not_busy
             .clone()
             .set_active_redemption(spym.clone(), RedemptionAggregateId(Uuid::new_v4()));
-        assert!(redeeming.equity_reconciliation_busy(&spym).unwrap());
+        assert!(redeeming.equity_reconciliation_busy(&spym, now).unwrap());
 
-        let mut hedging = not_busy;
+        let mut hedging = not_busy.clone();
         hedging.mark_offchain_order_pending(spym.clone());
-        assert!(hedging.equity_reconciliation_busy(&spym).unwrap());
+        assert!(hedging.equity_reconciliation_busy(&spym, now).unwrap());
+
+        let mut fill_applied_after_reading = not_busy;
+        fill_applied_after_reading
+            .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
+        assert!(
+            fill_applied_after_reading
+                .equity_reconciliation_busy(&spym, now)
+                .unwrap()
+        );
+        assert!(
+            !fill_applied_after_reading
+                .equity_reconciliation_busy(&spym, now + Duration::seconds(2))
+                .unwrap()
+        );
     }
 }

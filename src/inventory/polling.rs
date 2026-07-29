@@ -660,7 +660,7 @@ where
             positions
                 .iter()
                 .map(|(symbol, fetched)| {
-                    let state = if view.equity_reconciliation_busy(symbol)? {
+                    let state = if view.equity_reconciliation_busy(symbol, fetched_at)? {
                         ObservedLedgerState::Busy
                     } else {
                         let ledger = view.equity_available(symbol, Venue::Hedging);
@@ -4603,6 +4603,31 @@ mod tests {
             },
             |mut view, symbol| {
                 view.clear_offchain_order_pending(symbol, None);
+                view
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn divergence_counter_frozen_while_fill_applied_after_reading() {
+        // A fill stamp in the future stands in for a fill that applied
+        // between the broker read and the comparison: every poll's
+        // fetched_at predates it, so the reading is stale and must freeze
+        // the counter. Moving the stamp into the past releases it.
+        assert_counter_frozen_while_busy(
+            |mut view, symbol| {
+                view.clear_offchain_order_pending(
+                    symbol,
+                    Some(Utc::now() + chrono::Duration::hours(1)),
+                );
+                view
+            },
+            |mut view, symbol| {
+                view.clear_offchain_order_pending(
+                    symbol,
+                    Some(Utc::now() - chrono::Duration::hours(1)),
+                );
                 view
             },
         )
