@@ -84,7 +84,9 @@ The application uses TOML configuration files split into plaintext config and
 encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
 available options. Operational intervals such as
 `apalis_finished_job_cleanup_interval_secs` must be explicitly configured and
-non-zero.
+non-zero, as must `inventory_divergence_threshold` (the number of
+consecutive offchain polls that must diverge from the inventory view before the
+poller escalates a forced snapshot reconciliation).
 
 The `[raindex]` section requires an explicit `inventory_mode` (`"legacy"` or
 `"managed"`) and a `vault_owner` address (the on-chain owner the vaults are

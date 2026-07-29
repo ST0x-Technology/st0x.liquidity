@@ -15,6 +15,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{Level, warn};
@@ -220,6 +221,7 @@ struct Config {
     order_polling_max_jitter: Option<u64>,
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
+    inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
     telemetry: Option<TelemetryConfig>,
@@ -517,6 +519,11 @@ pub struct Ctx {
     pub order_polling_max_jitter: u64,
     pub position_check_interval: u64,
     pub inventory_poll_interval: u64,
+    /// Consecutive offchain polls that must diverge from the inventory view's
+    /// Hedging balance for a symbol before the poller escalates a forced
+    /// snapshot reconciliation. Required and nonzero: a missing value must
+    /// fail config parsing rather than silently defaulting.
+    pub inventory_divergence_threshold: NonZeroU32,
     /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
     /// (capped at the chain's latest finalized block).
@@ -618,6 +625,10 @@ impl std::fmt::Debug for Ctx {
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("position_check_interval", &self.position_check_interval)
             .field("inventory_poll_interval", &self.inventory_poll_interval)
+            .field(
+                "inventory_divergence_threshold",
+                &self.inventory_divergence_threshold,
+            )
             .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field(
                 "apalis_finished_job_cleanup_interval_secs",
@@ -688,6 +699,7 @@ struct ValidatedParts {
     order_polling_max_jitter: u64,
     position_check_interval: u64,
     inventory_poll_interval: u64,
+    inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
@@ -932,6 +944,7 @@ fn parse_and_validate(
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval,
         inventory_poll_interval,
+        inventory_divergence_threshold: config.inventory_divergence_threshold,
         order_fill_poll_interval,
         apalis_finished_job_cleanup_interval_secs,
         broker,
@@ -1025,6 +1038,7 @@ impl Ctx {
             order_polling_max_jitter: parts.order_polling_max_jitter,
             position_check_interval: parts.position_check_interval,
             inventory_poll_interval: parts.inventory_poll_interval,
+            inventory_divergence_threshold: parts.inventory_divergence_threshold,
             order_fill_poll_interval: parts.order_fill_poll_interval,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
@@ -1240,6 +1254,8 @@ impl Ctx {
         inventory_mode: InventoryMode,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
+        #[builder(default = const { NonZeroU32::new(3).unwrap() })]
+        inventory_divergence_threshold: NonZeroU32,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
         #[builder(default = 0)] server_port: u16,
         #[builder(default = 0)] board_port: u16,
@@ -1293,6 +1309,7 @@ impl Ctx {
             order_polling_max_jitter: 0,
             position_check_interval: 2,
             inventory_poll_interval,
+            inventory_divergence_threshold,
             order_fill_poll_interval: 1,
             apalis_finished_job_cleanup_interval_secs,
             broker,
@@ -1567,6 +1584,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         order_polling_max_jitter: 5,
         position_check_interval: 60,
         inventory_poll_interval: 60,
+        inventory_divergence_threshold: NonZeroU32::MIN,
         order_fill_poll_interval: 5,
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
