@@ -665,7 +665,10 @@ where
             positions
                 .iter()
                 .map(|(symbol, fetched)| {
-                    let state = if view.equity_reconciliation_busy(symbol, fetched_at)? {
+                    let state = if view
+                        .equity_reconciliation_busy(symbol, fetched_at)?
+                        .is_some()
+                    {
                         ObservedLedgerState::Busy
                     } else {
                         let ledger = view.equity_available(symbol, Venue::Hedging);

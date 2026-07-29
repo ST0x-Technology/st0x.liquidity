@@ -5079,7 +5079,7 @@ mod tests {
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
     };
-    use crate::inventory::view::{InFlightEquityLocation, Operator};
+    use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
@@ -21851,9 +21851,10 @@ mod tests {
             Some(shares(136)),
             "recovery must not force-apply a reconcile against the reset view"
         );
-        assert!(
+        assert_eq!(
             view.equity_reconciliation_busy(&symbol, Utc::now())
                 .unwrap(),
+            Some(EquityReconcileBusy::Transfer),
             "the active mint must survive the skipped recovery"
         );
     }

@@ -114,6 +114,21 @@ pub(crate) enum TransferOp {
     Cancel,
 }
 
+/// Why divergence recovery must leave a symbol alone this poll. Shared by
+/// detection (freezes the counter) and the forced apply (aborts), so the
+/// two can never disagree on what counts as busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EquityReconcileBusy {
+    /// Inflight at either venue, or an active mint/redemption owning the
+    /// symbol's inflight slot.
+    Transfer,
+    /// An open hedge order's fill delta owns the balance.
+    PendingHedgeOrder,
+    /// A fill was applied to the view after the reading was fetched, so
+    /// the reading is stale.
+    FillAfterFetch,
+}
+
 /// Inventory at a pair of venues (onchain/offchain).
 ///
 /// Venues are `Option` to distinguish "not yet polled" from "polled with zero balance".
@@ -895,28 +910,37 @@ impl InventoryView {
         inventory.get_venue(venue).map(VenueBalance::available)
     }
 
-    /// Whether divergence recovery must leave this symbol alone: any
-    /// inflight balance, an active mint/redemption, an open hedge order,
-    /// or a fill applied after `fetched_at` makes the comparison between
-    /// broker and ledger ambiguous, so the poller freezes the divergence
-    /// counter instead of counting or resetting it. Same staleness rule the
-    /// forced apply enforces in [`Self::reconcile_offchain_equity`].
+    /// Whether divergence recovery must leave this symbol alone, and why.
+    /// `None` means the symbol is quiet and the broker reading is
+    /// comparable. The poller freezes the divergence counter on `Some`;
+    /// the forced apply aborts on `Some`. Single predicate for both so
+    /// detection and apply can never disagree on what counts as busy.
     pub(crate) fn equity_reconciliation_busy(
         &self,
         symbol: &Symbol,
         fetched_at: DateTime<Utc>,
-    ) -> Result<bool, FloatError> {
-        Ok(self.equity_transfer_busy(symbol)?
-            || self.has_pending_offchain_order(symbol)
-            || self
-                .last_offchain_fill_applied_at
-                .get(symbol)
-                .is_some_and(|filled_at| fetched_at < *filled_at))
+    ) -> Result<Option<EquityReconcileBusy>, FloatError> {
+        if self.equity_transfer_busy(symbol)? {
+            return Ok(Some(EquityReconcileBusy::Transfer));
+        }
+
+        if self.has_pending_offchain_order(symbol) {
+            return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
+        }
+
+        if self
+            .last_offchain_fill_applied_at
+            .get(symbol)
+            .is_some_and(|filled_at| fetched_at < *filled_at)
+        {
+            return Ok(Some(EquityReconcileBusy::FillAfterFetch));
+        }
+
+        Ok(None)
     }
 
     /// Inflight at either venue, or an active mint/redemption owning the
-    /// symbol's inflight slot. The hedge order gate is checked separately
-    /// so the reconcile path can log a distinct abort reason for it.
+    /// symbol's inflight slot.
     fn equity_transfer_busy(&self, symbol: &Symbol) -> Result<bool, FloatError> {
         let has_inflight = self
             .equities
@@ -1737,39 +1761,13 @@ impl InventoryView {
         fetched_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        if self.equity_transfer_busy(symbol)? {
+        if let Some(reason) = self.equity_reconciliation_busy(symbol, fetched_at)? {
             warn!(
                 target: "inventory",
                 %symbol,
-                "Aborting offchain equity reconcile: symbol acquired an \
-                 inflight transfer between escalation and apply; the poller \
-                 will detect the divergence again"
-            );
-            return Ok(self);
-        }
-
-        if self.has_pending_offchain_order(symbol) {
-            warn!(
-                target: "inventory",
-                %symbol,
-                "Aborting offchain equity reconcile: hedge order open, the \
-                 fill delta owns the balance; the poller will detect the \
-                 divergence again"
-            );
-            return Ok(self);
-        }
-
-        if self
-            .last_offchain_fill_applied_at
-            .get(symbol)
-            .is_some_and(|filled_at| fetched_at < *filled_at)
-        {
-            warn!(
-                target: "inventory",
-                %symbol,
-                "Aborting offchain equity reconcile: a fill applied after \
-                 this reading was fetched; the poller will detect the \
-                 divergence again"
+                ?reason,
+                "Aborting offchain equity reconcile; the poller will \
+                 re-escalate once the symbol is quiet"
             );
             return Ok(self);
         }
@@ -4600,7 +4598,10 @@ mod tests {
         let now = Utc::now();
 
         let not_busy = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
-        assert!(!not_busy.equity_reconciliation_busy(&spym, now).unwrap());
+        assert_eq!(
+            not_busy.equity_reconciliation_busy(&spym, now).unwrap(),
+            None
+        );
 
         let inflight = not_busy
             .clone()
@@ -4610,34 +4611,48 @@ mod tests {
                 now,
             )
             .unwrap();
-        assert!(inflight.equity_reconciliation_busy(&spym, now).unwrap());
+        assert_eq!(
+            inflight.equity_reconciliation_busy(&spym, now).unwrap(),
+            Some(EquityReconcileBusy::Transfer)
+        );
 
         let minting = not_busy
             .clone()
             .set_active_mint(spym.clone(), st0x_tokenization::issuer_request_id("mint"));
-        assert!(minting.equity_reconciliation_busy(&spym, now).unwrap());
+        assert_eq!(
+            minting.equity_reconciliation_busy(&spym, now).unwrap(),
+            Some(EquityReconcileBusy::Transfer)
+        );
 
         let redeeming = not_busy
             .clone()
             .set_active_redemption(spym.clone(), RedemptionAggregateId(Uuid::new_v4()));
-        assert!(redeeming.equity_reconciliation_busy(&spym, now).unwrap());
+        assert_eq!(
+            redeeming.equity_reconciliation_busy(&spym, now).unwrap(),
+            Some(EquityReconcileBusy::Transfer)
+        );
 
         let mut hedging = not_busy.clone();
         hedging.mark_offchain_order_pending(spym.clone());
-        assert!(hedging.equity_reconciliation_busy(&spym, now).unwrap());
+        assert_eq!(
+            hedging.equity_reconciliation_busy(&spym, now).unwrap(),
+            Some(EquityReconcileBusy::PendingHedgeOrder)
+        );
 
         let mut fill_applied_after_reading = not_busy;
         fill_applied_after_reading
             .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
-        assert!(
+        assert_eq!(
             fill_applied_after_reading
                 .equity_reconciliation_busy(&spym, now)
-                .unwrap()
+                .unwrap(),
+            Some(EquityReconcileBusy::FillAfterFetch)
         );
-        assert!(
-            !fill_applied_after_reading
+        assert_eq!(
+            fill_applied_after_reading
                 .equity_reconciliation_busy(&spym, now + Duration::seconds(2))
-                .unwrap()
+                .unwrap(),
+            None
         );
     }
 }
