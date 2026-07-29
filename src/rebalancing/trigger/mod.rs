@@ -21730,6 +21730,88 @@ mod tests {
         assert_eq!(job.symbol, symbol);
     }
 
+    /// With rebalancing enabled, `OffchainEquityReconciled` reaches the view
+    /// through the reactor's `on_snapshot` arm, not `InventoryProjection`.
+    /// The stuck incident state must recover through that route and enqueue
+    /// one follow-up equity check for the symbol.
+    #[tokio::test]
+    async fn reconcile_event_via_reactor_heals_stuck_view() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        // Phantom at Hedging with last_rebalancing stamped: ordinary
+        // snapshots fetched before the stamp are rejected.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(136))
+            .clear_equity_inflight(&symbol, Venue::Hedging, now)
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Precondition: the ordinary arm stays rejected through the reactor.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(0))]),
+                fetched_at: now - chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(136)),
+            "precondition: the ordinary snapshot must still be rejected"
+        );
+        // Clear the checks the ordinary snapshot enqueued so the reconcile's
+        // own enqueue can be asserted in isolation.
+        equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id,
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(0),
+                fetched_at: now + chrono::Duration::seconds(1),
+                ledger_position: Some(shares(136)),
+                consecutive_polls: 3,
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let view = trigger.inventory.read().await;
+            assert_eq!(
+                view.equity_available(&symbol, Venue::Hedging),
+                Some(shares(0)),
+                "the reconcile must apply the broker value through the reactor route"
+            );
+            assert_eq!(
+                view.equity_inflight(&symbol, Venue::Hedging),
+                Some(FractionalShares::ZERO),
+                "the reconcile clears Hedging inflight"
+            );
+        }
+
+        let processed = equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+        assert_eq!(
+            processed, 1,
+            "a reconcile must enqueue exactly one equity check for the symbol"
+        );
+    }
+
     /// The force-apply recovery resets the view, which drops exactly the
     /// busy state `reconcile_offchain_equity` revalidates, so recovering a
     /// reconcile event would force-write against vacuously empty checks.
