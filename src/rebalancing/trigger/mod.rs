@@ -1720,6 +1720,21 @@ impl RebalancingService {
             }
         };
 
+        // The recovery reset below drops the active mints/redemptions and
+        // inflight state that `reconcile_offchain_equity` revalidates, so a
+        // forced retry would pass vacuously against empty state. Drop the
+        // event instead: the poller's read-back keeps the gate and counter,
+        // and the next quiet poll re-escalates with a fresh reading.
+        if let OffchainEquityReconciled { symbol, .. } = &event {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                ?inventory_error,
+                "Skipping force-apply recovery for a reconcile event"
+            );
+            return Ok(());
+        }
+
         warn!(
             target: "rebalance",
             ?inventory_error,
@@ -21703,6 +21718,52 @@ mod tests {
             panic!("Expected exactly one mint job after release, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    /// The force-apply recovery resets the view, which drops exactly the
+    /// busy state `reconcile_offchain_equity` revalidates, so recovering a
+    /// reconcile event would force-write against vacuously empty checks.
+    /// Recovery must skip the event and leave the view untouched; the
+    /// poller re-escalates on its own.
+    #[tokio::test]
+    async fn snapshot_recovery_skips_reconcile_event_leaving_view_untouched() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(136))
+            .set_active_mint(
+                symbol.clone(),
+                st0x_tokenization::issuer_request_id("recovery-mint"),
+            );
+
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::UsdBalanceConversion(
+                    i64::MAX,
+                )),
+                InventorySnapshotEvent::OffchainEquityReconciled {
+                    symbol: symbol.clone(),
+                    position: shares(0),
+                    fetched_at: Utc::now(),
+                    ledger_position: Some(shares(136)),
+                    consecutive_polls: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(136)),
+            "recovery must not force-apply a reconcile against the reset view"
+        );
+        assert!(
+            view.equity_reconciliation_busy(&symbol, Utc::now())
+                .unwrap(),
+            "the active mint must survive the skipped recovery"
+        );
     }
 
     /// A crash between `queue.push` and the first persisted mint event leaves
