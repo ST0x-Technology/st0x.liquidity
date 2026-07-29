@@ -676,7 +676,10 @@ where
                             Some(ledger_value) => {
                                 Float::from(ledger_value).eq(Float::from(*fetched))?
                             }
-                            None => false,
+                            // Nothing in the view and nothing at the broker
+                            // is agreement; a nonzero broker reading against
+                            // an uninitialized venue counts.
+                            None => Float::from(*fetched).is_zero()?,
                         };
 
                         if matches {
@@ -4669,6 +4672,39 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn uninitialized_venue_with_zero_broker_reading_does_not_diverge() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        // Configured symbol with no entry in the view and no position at
+        // the broker: the comparison must read as a match, not count
+        // toward escalation.
+        let inventory = broadcasting_inventory(InventoryView::default());
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory,
+            gate.clone(),
+            1,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "an uninitialized venue with a zero broker reading must not escalate"
+        );
+        assert!(
+            !gate.is_engaged(&spym),
+            "an uninitialized venue with a zero broker reading must not engage the gate"
+        );
     }
 
     /// Recreates the full divergence loop end to end: a transfer reported
