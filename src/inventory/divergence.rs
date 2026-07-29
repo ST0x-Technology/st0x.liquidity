@@ -30,11 +30,11 @@ use super::BroadcastingInventory;
 /// counter. The cost on a transient mismatch is at most one poll interval
 /// of delayed rebalancing.
 #[derive(Debug, Default)]
-pub(crate) struct DivergenceGate {
+pub(crate) struct InventoryDivergenceGate {
     symbols: RwLock<HashSet<Symbol>>,
 }
 
-impl DivergenceGate {
+impl InventoryDivergenceGate {
     pub(crate) fn engage(&self, symbol: &Symbol) {
         self.write_symbols().insert(symbol.clone());
     }
@@ -74,7 +74,7 @@ impl DivergenceGate {
 pub(crate) struct InventoryDivergenceRecoveryCtx {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) threshold: NonZeroU32,
-    pub(crate) gate: Arc<DivergenceGate>,
+    pub(crate) gate: Arc<InventoryDivergenceGate>,
 }
 
 /// Witness for forcing a broker snapshot over the view's balance.
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn gate_engages_and_releases_symbols_independently() {
-        let gate = DivergenceGate::default();
+        let gate = InventoryDivergenceGate::default();
         let aapl = symbol("AAPL");
         let tsla = symbol("TSLA");
 
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn gate_engage_is_idempotent() {
-        let gate = DivergenceGate::default();
+        let gate = InventoryDivergenceGate::default();
         let aapl = symbol("AAPL");
 
         gate.engage(&aapl);

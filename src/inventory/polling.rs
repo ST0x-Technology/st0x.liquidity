@@ -104,7 +104,7 @@ pub(crate) struct WalletPollingCtx {
 }
 
 /// Comparison of one symbol's broker reading against the view, per poll.
-struct DivergenceObservation {
+struct InventoryDivergenceObservation {
     symbol: Symbol,
     /// Position the broker reported, normalized (explicit zero when absent).
     fetched: FractionalShares,
@@ -125,7 +125,7 @@ enum ObservedLedgerState {
 }
 
 /// A symbol whose divergence counter reached the configured threshold.
-struct DivergenceEscalation {
+struct InventoryDivergenceEscalation {
     symbol: Symbol,
     fetched: FractionalShares,
     ledger: Option<FractionalShares>,
@@ -655,7 +655,7 @@ where
             return Ok(());
         };
 
-        let observations: Vec<DivergenceObservation> = {
+        let observations: Vec<InventoryDivergenceObservation> = {
             let view = recovery.inventory.read().await;
             positions
                 .iter()
@@ -678,7 +678,7 @@ where
                         }
                     };
 
-                    Ok(DivergenceObservation {
+                    Ok(InventoryDivergenceObservation {
                         symbol: symbol.clone(),
                         fetched: *fetched,
                         state,
@@ -717,13 +717,13 @@ where
     fn record_divergence_observations(
         &self,
         recovery: &InventoryDivergenceRecoveryCtx,
-        observations: Vec<DivergenceObservation>,
-    ) -> Vec<DivergenceEscalation> {
+        observations: Vec<InventoryDivergenceObservation>,
+    ) -> Vec<InventoryDivergenceEscalation> {
         let mut escalations = Vec::new();
         let mut counters = self.lock_divergence_counters();
 
         for observation in observations {
-            let DivergenceObservation {
+            let InventoryDivergenceObservation {
                 symbol,
                 fetched,
                 state,
@@ -752,7 +752,7 @@ where
                     );
 
                     if *count >= recovery.threshold.get() {
-                        escalations.push(DivergenceEscalation {
+                        escalations.push(InventoryDivergenceEscalation {
                             symbol,
                             fetched,
                             ledger,
@@ -1198,7 +1198,7 @@ mod tests {
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::{
-        BroadcastingInventory, DivergenceGate, InventoryProjection, InventoryView,
+        BroadcastingInventory, InventoryDivergenceGate, InventoryProjection, InventoryView,
     };
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
@@ -4296,7 +4296,7 @@ mod tests {
         pool: &SqlitePool,
         snapshot: Arc<Store<InventorySnapshot>>,
         inventory: Arc<BroadcastingInventory>,
-        gate: Arc<DivergenceGate>,
+        gate: Arc<InventoryDivergenceGate>,
         threshold: u32,
     ) -> InventoryPollingService<ReadOnlyEvm<impl Provider + Clone + 'static>, MockExecutor> {
         let provider = mock_provider();
@@ -4356,7 +4356,7 @@ mod tests {
             test_shares(0),
             test_shares(136),
         ));
-        let gate = Arc::new(DivergenceGate::default());
+        let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(
             &pool,
             Arc::new(test_store(pool.clone(), ())),
@@ -4428,7 +4428,7 @@ mod tests {
             test_shares(0),
             test_shares(136),
         ));
-        let gate = Arc::new(DivergenceGate::default());
+        let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(
             &pool,
             Arc::new(test_store(pool.clone(), ())),
@@ -4499,7 +4499,7 @@ mod tests {
             test_shares(0),
             test_shares(136),
         ));
-        let gate = Arc::new(DivergenceGate::default());
+        let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(
             &pool,
             Arc::new(test_store(pool.clone(), ())),
@@ -4609,13 +4609,13 @@ mod tests {
         .await;
     }
 
-    /// Recreates the production incident end to end: a redemption's cleanup
-    /// credited a phantom 136.87 SPYM at Hedging and stamped
-    /// `last_rebalancing`; the aggregate already stores the true zero, so
-    /// every identical poll dedups to no event; repeated failed cleanups
-    /// keep stamping the guard between polls. The view must converge to
-    /// the broker's zero within the configured number of polls, with the
-    /// transfer gate engaged until the divergence resolves.
+    /// Recreates the full divergence loop end to end: a transfer reported
+    /// completed credited shares at Hedging that the broker never received
+    /// and stamped `last_rebalancing`; the aggregate already stores the
+    /// true zero, so every identical poll dedups to no event; repeated
+    /// failed cleanups keep stamping the guard between polls. The view
+    /// must converge to the broker's zero within the configured number of
+    /// polls, with the transfer gate engaged until the divergence resolves.
     #[tokio::test]
     async fn phantom_hedging_credit_self_heals_within_threshold_polls() {
         let pool = setup_test_db().await;
@@ -4630,7 +4630,7 @@ mod tests {
             .clear_equity_inflight(&spym, Venue::Hedging, now)
             .unwrap();
         let inventory = broadcasting_inventory(view);
-        let gate = Arc::new(DivergenceGate::default());
+        let gate = Arc::new(InventoryDivergenceGate::default());
 
         // Snapshot store wired to the projection, matching the topology
         // with rebalancing disabled (the reactor topology routes the event

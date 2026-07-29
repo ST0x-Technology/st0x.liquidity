@@ -1713,8 +1713,8 @@ impl InventoryView {
     /// reconcile aborts unapplied and the poller detects it again on the
     /// next cycle. Advances the symbol's Hedging watermark on success and
     /// deliberately does NOT stamp `last_rebalancing`: stamping it on
-    /// every failed cleanup is what kept the guards armed in the incident
-    /// this path exists to repair.
+    /// every failed cleanup is what keeps the guards armed and the
+    /// divergence unresolvable through ordinary snapshots.
     pub(crate) fn reconcile_offchain_equity(
         self,
         symbol: &Symbol,
@@ -4307,8 +4307,8 @@ mod tests {
         }
     }
 
-    /// The incident shape: a phantom Hedging credit protected by a freshly
-    /// stamped `last_rebalancing` that ordinary snapshots cannot pierce. The
+    /// A phantom Hedging credit protected by a freshly stamped
+    /// `last_rebalancing` that ordinary snapshots cannot pierce. The
     /// reconcile event must force the broker value through, clear inflight,
     /// and advance the watermark.
     #[test]
@@ -4317,8 +4317,7 @@ mod tests {
         let now = Utc::now();
 
         // Phantom 136 at Hedging; clear_equity_inflight stamps
-        // last_rebalancing = now, the guard that wedged the view in the
-        // incident.
+        // last_rebalancing = now, the guard that wedges the view.
         let view = InventoryView::default()
             .with_equity(spym.clone(), shares(0), shares(136))
             .clear_equity_inflight(&spym, Venue::Hedging, now)

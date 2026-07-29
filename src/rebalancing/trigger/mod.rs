@@ -40,7 +40,7 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, DivergenceGate, ImbalanceThreshold, Inventory, InventoryView,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryView,
     InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
     TransferOp, Venue,
 };
@@ -490,7 +490,7 @@ pub(crate) struct RebalancingService {
     /// redemption that would fail at the broker cannot mark the symbol busy
     /// and freeze the poller's divergence counter. Shared with the poller via
     /// [`Self::divergence_gate`].
-    divergence_gate: Arc<DivergenceGate>,
+    divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     wrapper: Arc<dyn Wrapper>,
@@ -697,7 +697,7 @@ impl RebalancingService {
     /// The divergence gate shared with the inventory poller. The poller
     /// writes (engage on detection, release on match or escalation); the
     /// equity trigger reads it before dispatching transfers.
-    pub(crate) fn divergence_gate(&self) -> Arc<DivergenceGate> {
+    pub(crate) fn divergence_gate(&self) -> Arc<InventoryDivergenceGate> {
         Arc::clone(&self.divergence_gate)
     }
 
