@@ -21791,19 +21791,23 @@ mod tests {
         .await
         .unwrap();
 
-        {
+        let (available, inflight) = {
             let view = trigger.inventory.read().await;
-            assert_eq!(
+            (
                 view.equity_available(&symbol, Venue::Hedging),
-                Some(shares(0)),
-                "the reconcile must apply the broker value through the reactor route"
-            );
-            assert_eq!(
                 view.equity_inflight(&symbol, Venue::Hedging),
-                Some(FractionalShares::ZERO),
-                "the reconcile clears Hedging inflight"
-            );
-        }
+            )
+        };
+        assert_eq!(
+            available,
+            Some(shares(0)),
+            "the reconcile must apply the broker value through the reactor route"
+        );
+        assert_eq!(
+            inflight,
+            Some(FractionalShares::ZERO),
+            "the reconcile clears Hedging inflight"
+        );
 
         let processed = equity::drain_pending_equity_jobs(&trigger).await.unwrap();
         assert_eq!(
@@ -21845,15 +21849,21 @@ mod tests {
             .await
             .unwrap();
 
-        let view = trigger.inventory.read().await;
+        let (available, busy) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.equity_available(&symbol, Venue::Hedging),
+                view.equity_reconciliation_busy(&symbol, Utc::now())
+                    .unwrap(),
+            )
+        };
         assert_eq!(
-            view.equity_available(&symbol, Venue::Hedging),
+            available,
             Some(shares(136)),
             "recovery must not force-apply a reconcile against the reset view"
         );
         assert_eq!(
-            view.equity_reconciliation_busy(&symbol, Utc::now())
-                .unwrap(),
+            busy,
             Some(EquityReconcileBusy::Transfer),
             "the active mint must survive the skipped recovery"
         );

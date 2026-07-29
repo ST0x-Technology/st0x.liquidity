@@ -726,10 +726,7 @@ where
             }
         }
 
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Sends one `ReconcileOffchainEquity` escalation and settles its
