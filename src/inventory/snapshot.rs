@@ -130,6 +130,11 @@ impl EventSourced for InventorySnapshot {
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
     const PROJECTION: Nil = Nil;
+    // Adding `OffchainEquityReconciled` (an additive event variant, no
+    // change to state shape) deliberately did NOT bump this: old events and
+    // the persisted snapshot deserialize unchanged, and a bump on a
+    // CompactAfterSnapshot aggregate fails startup with
+    // `ReconcileError::CompactedSnapshotClear`.
     const SCHEMA_VERSION: u64 = 6;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
     const SNAPSHOT_SIZE: usize = 1;
@@ -188,6 +193,19 @@ impl EventSourced for InventorySnapshot {
             } => InventorySnapshotEvent::OffchainEquity {
                 positions,
                 fetched_at,
+            },
+            ReconcileOffchainEquity {
+                symbol,
+                position,
+                fetched_at,
+                ledger_position,
+                consecutive_polls,
+            } => InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol,
+                position,
+                fetched_at,
+                ledger_position,
+                consecutive_polls,
             },
             OffchainUsd {
                 usd_balance_cents,
@@ -284,6 +302,23 @@ impl EventSourced for InventorySnapshot {
                     fetched_at,
                 }])
             }
+            // Always emits, even when `position` equals the stored value:
+            // the escalation exists precisely because the stored value is
+            // already correct while the view never received it, so equality
+            // dedup here would suppress the reconcile event.
+            ReconcileOffchainEquity {
+                symbol,
+                position,
+                fetched_at,
+                ledger_position,
+                consecutive_polls,
+            } => Ok(vec![InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol,
+                position,
+                fetched_at,
+                ledger_position,
+                consecutive_polls,
+            }]),
             OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
@@ -566,6 +601,21 @@ impl InventorySnapshot {
                 self.offchain_equity = positions.clone();
                 self.offchain_equity_fetched_at = Some(*fetched_at);
             }
+            // Folds like `OffchainEquity`, scoped to one symbol: same map
+            // entry, same monotonic `fetched_at` guard, so startup hydration
+            // replays the reconciled value.
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol,
+                position,
+                fetched_at,
+                ..
+            } if self
+                .offchain_equity_fetched_at
+                .is_none_or(|current| *fetched_at >= current) =>
+            {
+                self.offchain_equity.insert(symbol.clone(), *position);
+                self.offchain_equity_fetched_at = Some(*fetched_at);
+            }
             InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
@@ -581,6 +631,7 @@ impl InventorySnapshot {
             InventorySnapshotEvent::OnchainEquity { .. }
             | InventorySnapshotEvent::OnchainUsdc { .. }
             | InventorySnapshotEvent::OffchainEquity { .. }
+            | InventorySnapshotEvent::OffchainEquityReconciled { .. }
             | InventorySnapshotEvent::OffchainUsd { .. } => {}
             InventorySnapshotEvent::OffchainCashBuyingPower {
                 cash_buying_power_cents,
@@ -638,6 +689,25 @@ pub(crate) enum InventorySnapshotCommand {
         /// applied in between, defeating the view's applied-fill guard.
         fetched_at: DateTime<Utc>,
     },
+    /// Force record the position the broker reported for one symbol after
+    /// the poller confirmed a persistent divergence between the broker and
+    /// the inventory view. Unlike `OffchainEquity`, handling this command
+    /// always emits its event: the state it corrects is precisely "stored
+    /// value already correct, view never received it", which the equality
+    /// dedup would otherwise suppress.
+    ReconcileOffchainEquity {
+        symbol: Symbol,
+        /// Position the broker reported for `symbol`.
+        position: FractionalShares,
+        /// Stamped by the poller before the broker read.
+        fetched_at: DateTime<Utc>,
+        /// Available balance the view held at the Hedging venue when the
+        /// divergence was detected; `None` when the venue was never
+        /// initialized in the view.
+        ledger_position: Option<FractionalShares>,
+        /// Consecutive polls that observed the divergence.
+        consecutive_polls: u32,
+    },
     OffchainUsd {
         usd_balance_cents: i64,
         /// Gross USD balance before reserve subtraction. `None` when no
@@ -692,6 +762,20 @@ pub(crate) enum InventorySnapshotEvent {
         positions: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
+    /// Forced offchain equity reconciliation for one symbol, emitted after
+    /// the poller confirmed a persistent divergence between the broker and
+    /// the view. Folds into `offchain_equity` the same way `OffchainEquity`
+    /// does for that symbol.
+    OffchainEquityReconciled {
+        symbol: Symbol,
+        position: FractionalShares,
+        fetched_at: DateTime<Utc>,
+        /// Available balance the view held at the Hedging venue when the
+        /// divergence was detected.
+        ledger_position: Option<FractionalShares>,
+        /// Consecutive polls that observed the divergence.
+        consecutive_polls: u32,
+    },
     #[serde(alias = "OffchainCash")]
     OffchainUsd {
         #[serde(alias = "cash_balance_cents")]
@@ -745,6 +829,7 @@ impl InventorySnapshotEvent {
             Self::OnchainEquity { fetched_at, .. }
             | Self::OnchainUsdc { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
+            | Self::OffchainEquityReconciled { fetched_at, .. }
             | Self::OffchainUsd { fetched_at, .. }
             | Self::OffchainCashBuyingPower { fetched_at, .. }
             | Self::OffchainCashWithdrawable { fetched_at, .. }
@@ -764,6 +849,9 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OnchainEquity { .. } => "InventorySnapshotEvent::OnchainEquity".to_string(),
             Self::OnchainUsdc { .. } => "InventorySnapshotEvent::OnchainUsdc".to_string(),
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
+            Self::OffchainEquityReconciled { .. } => {
+                "InventorySnapshotEvent::OffchainEquityReconciled".to_string()
+            }
             Self::OffchainUsd { .. } => "InventorySnapshotEvent::OffchainUsd".to_string(),
             Self::OffchainCashBuyingPower { .. } => {
                 "InventorySnapshotEvent::OffchainCashBuyingPower".to_string()

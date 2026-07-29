@@ -9,9 +9,9 @@
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::RootProvider;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::future::try_join_all;
-use rain_math_float::FloatError;
+use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
@@ -24,6 +24,8 @@ use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
+use super::divergence::InventoryDivergenceRecoveryCtx;
+use super::view::Venue;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
@@ -101,6 +103,35 @@ pub(crate) struct WalletPollingCtx {
     pub(crate) wrapped_equity_token_addresses: HashMap<Symbol, Address>,
 }
 
+/// Comparison of one symbol's broker reading against the view, per poll.
+struct DivergenceObservation {
+    symbol: Symbol,
+    /// Position the broker reported, normalized (explicit zero when absent).
+    fetched: FractionalShares,
+    state: ObservedLedgerState,
+}
+
+/// How the view's Hedging balance relates to the broker reading.
+enum ObservedLedgerState {
+    /// Inflight transfer, active mint/redemption, or open hedge order:
+    /// the comparison is ambiguous, freeze the counter.
+    Busy,
+    Match,
+    Divergence {
+        /// The view's Hedging available balance; `None` when the venue was
+        /// never initialized.
+        ledger: Option<FractionalShares>,
+    },
+}
+
+/// A symbol whose divergence counter reached the configured threshold.
+struct DivergenceEscalation {
+    symbol: Symbol,
+    fetched: FractionalShares,
+    ledger: Option<FractionalShares>,
+    consecutive_polls: u32,
+}
+
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
 pub(crate) struct InventoryPollingService<Chain, Exe>
 where
@@ -128,6 +159,13 @@ where
     configured_equity_vaults: Option<BTreeMap<Address, BTreeSet<B256>>>,
     configured_usdc_vaults: Option<BTreeSet<B256>>,
     reserved_cash: Usd,
+    /// Divergence detection wiring; `None` in tests that do not exercise
+    /// divergence recovery. Production always wires it in the conductor
+    /// builder.
+    divergence_recovery: Option<InventoryDivergenceRecoveryCtx>,
+    /// Consecutive diverging polls per symbol. Kept in memory on purpose: a
+    /// restart resets the count, and restart hydration restores the view.
+    divergence_counters: Mutex<HashMap<Symbol, u32>>,
 }
 
 impl<Chain, Exe> InventoryPollingService<Chain, Exe>
@@ -165,6 +203,8 @@ where
             configured_equity_vaults: None,
             configured_usdc_vaults: None,
             reserved_cash,
+            divergence_recovery: None,
+            divergence_counters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -191,6 +231,14 @@ where
         pending_request_ownership: Arc<dyn PendingRequestOwnership>,
     ) -> Self {
         self.pending_request_ownership = Some(pending_request_ownership);
+        self
+    }
+
+    pub(crate) fn with_divergence_recovery(
+        mut self,
+        recovery: InventoryDivergenceRecoveryCtx,
+    ) -> Self {
+        self.divergence_recovery = Some(recovery);
         self
     }
 
@@ -530,7 +578,7 @@ where
             .send(
                 snapshot_id,
                 InventorySnapshotCommand::OffchainEquity {
-                    positions,
+                    positions: positions.clone(),
                     fetched_at,
                 },
             )
@@ -576,7 +624,157 @@ where
                 .await?;
         }
 
+        // After the OffchainEquity send: reactors run inline within `send`,
+        // so a poll the pipeline accepted has already reached the view here
+        // and reads back as a match. Whatever still diverges from the view at
+        // this point was suppressed or skipped.
+        self.detect_offchain_divergences(snapshot_id, &positions, fetched_at)
+            .await?;
+
         Ok(())
+    }
+
+    /// Compare each fetched broker position against the view's Hedging
+    /// available balance and drive the divergence counter of each symbol.
+    ///
+    /// Busy symbols (inflight transfer, active mint/redemption, or open
+    /// hedge order) freeze their counter: the comparison is ambiguous while
+    /// balances are legitimately in motion, and resetting would discard the
+    /// diverging polls already counted. A matching poll resets the counter
+    /// and releases the transfer gate; a diverging poll increments it and
+    /// engages the gate; at the configured threshold the symbol escalates
+    /// via `ReconcileOffchainEquity` and resets only after the command was
+    /// sent, so a failed send escalates again on the next poll.
+    async fn detect_offchain_divergences(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+        positions: &BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(recovery) = &self.divergence_recovery else {
+            return Ok(());
+        };
+
+        let observations: Vec<DivergenceObservation> = {
+            let view = recovery.inventory.read().await;
+            positions
+                .iter()
+                .map(|(symbol, fetched)| {
+                    let state = if view.equity_reconciliation_busy(symbol)? {
+                        ObservedLedgerState::Busy
+                    } else {
+                        let ledger = view.equity_available(symbol, Venue::Hedging);
+                        let matches = match ledger {
+                            Some(ledger_value) => {
+                                Float::from(ledger_value).eq(Float::from(*fetched))?
+                            }
+                            None => false,
+                        };
+
+                        if matches {
+                            ObservedLedgerState::Match
+                        } else {
+                            ObservedLedgerState::Divergence { ledger }
+                        }
+                    };
+
+                    Ok(DivergenceObservation {
+                        symbol: symbol.clone(),
+                        fetched: *fetched,
+                        state,
+                    })
+                })
+                .collect::<Result<_, FloatError>>()?
+        };
+
+        let escalations = self.record_divergence_observations(recovery, observations);
+
+        for escalation in escalations {
+            self.snapshot
+                .send(
+                    snapshot_id,
+                    InventorySnapshotCommand::ReconcileOffchainEquity {
+                        symbol: escalation.symbol.clone(),
+                        position: escalation.fetched,
+                        fetched_at,
+                        ledger_position: escalation.ledger,
+                        consecutive_polls: escalation.consecutive_polls,
+                    },
+                )
+                .await?;
+
+            self.lock_divergence_counters().remove(&escalation.symbol);
+            recovery.gate.release(&escalation.symbol);
+        }
+
+        Ok(())
+    }
+
+    /// Folds one poll's observations into the counters and the transfer
+    /// gate, returning the symbols whose count reached the threshold.
+    /// Synchronous on purpose: the counter guard must never be held across
+    /// an await.
+    fn record_divergence_observations(
+        &self,
+        recovery: &InventoryDivergenceRecoveryCtx,
+        observations: Vec<DivergenceObservation>,
+    ) -> Vec<DivergenceEscalation> {
+        let mut escalations = Vec::new();
+        let mut counters = self.lock_divergence_counters();
+
+        for observation in observations {
+            let DivergenceObservation {
+                symbol,
+                fetched,
+                state,
+            } = observation;
+
+            match state {
+                ObservedLedgerState::Busy => {}
+                ObservedLedgerState::Match => {
+                    if counters.remove(&symbol).is_some() {
+                        recovery.gate.release(&symbol);
+                    }
+                }
+                ObservedLedgerState::Divergence { ledger } => {
+                    let count = counters.entry(symbol.clone()).or_insert(0);
+                    *count += 1;
+                    recovery.gate.engage(&symbol);
+
+                    warn!(
+                        target: "inventory",
+                        %symbol,
+                        ?ledger,
+                        broker = %fetched,
+                        consecutive_polls = *count,
+                        threshold = recovery.threshold.get(),
+                        "Offchain snapshot diverges from the inventory view"
+                    );
+
+                    if *count >= recovery.threshold.get() {
+                        escalations.push(DivergenceEscalation {
+                            symbol,
+                            fetched,
+                            ledger,
+                            consecutive_polls: *count,
+                        });
+                    }
+                }
+            }
+        }
+        drop(counters);
+
+        escalations
+    }
+
+    fn lock_divergence_counters(&self) -> MutexGuard<'_, HashMap<Symbol, u32>> {
+        self.divergence_counters.lock().unwrap_or_else(|poisoned| {
+            warn!(
+                target: "inventory",
+                "Divergence counter tracker was poisoned; recovering state"
+            );
+            poisoned.into_inner()
+        })
     }
 
     fn normalize_offchain_positions(

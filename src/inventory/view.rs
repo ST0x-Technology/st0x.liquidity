@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
@@ -17,6 +17,7 @@ use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
+use super::divergence::PersistentBrokerDivergence;
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
@@ -885,7 +886,6 @@ impl InventoryView {
     }
 
     /// Returns the equity available balance at the given venue for a symbol.
-    #[cfg(test)]
     pub(crate) fn equity_available(
         &self,
         symbol: &Symbol,
@@ -893,6 +893,30 @@ impl InventoryView {
     ) -> Option<FractionalShares> {
         let inventory = self.equities.get(symbol)?;
         inventory.get_venue(venue).map(VenueBalance::available)
+    }
+
+    /// Whether divergence recovery must leave this symbol alone: any
+    /// inflight balance or an active mint/redemption makes the comparison
+    /// between broker and ledger ambiguous, so the poller freezes the
+    /// divergence counter instead of counting or resetting it.
+    pub(crate) fn equity_reconciliation_busy(&self, symbol: &Symbol) -> Result<bool, FloatError> {
+        Ok(self.equity_transfer_busy(symbol)? || self.has_pending_offchain_order(symbol))
+    }
+
+    /// Inflight at either venue, or an active mint/redemption owning the
+    /// symbol's inflight slot. The hedge order gate is checked separately
+    /// so the reconcile path can log a distinct abort reason for it.
+    fn equity_transfer_busy(&self, symbol: &Symbol) -> Result<bool, FloatError> {
+        let has_inflight = self
+            .equities
+            .get(symbol)
+            .map(Inventory::has_inflight)
+            .transpose()?
+            .unwrap_or(false);
+
+        Ok(has_inflight
+            || self.active_mints.contains_key(symbol)
+            || self.active_redemptions.contains_key(symbol))
     }
 
     /// Returns the equity inflight balance at the given venue for a symbol.
@@ -1678,6 +1702,76 @@ impl InventoryView {
         self
     }
 
+    /// Force apply a broker confirmed offchain equity value after the
+    /// poller escalated a persistent snapshot divergence.
+    ///
+    /// Bypasses the staleness guards (watermark, `last_rebalancing`,
+    /// inflight) that wedged the symbol, but validates again, under the
+    /// caller's write lock at apply time, that the symbol is still
+    /// quiescent: a transfer or hedge order that started between escalation
+    /// and apply makes the broker reading ambiguous again, so the
+    /// reconcile aborts unapplied and the poller detects it again on the
+    /// next cycle. Advances the symbol's Hedging watermark on success and
+    /// deliberately does NOT stamp `last_rebalancing`: stamping it on
+    /// every failed cleanup is what kept the guards armed in the incident
+    /// this path exists to repair.
+    pub(crate) fn reconcile_offchain_equity(
+        self,
+        symbol: &Symbol,
+        broker_position: FractionalShares,
+        ledger_position: Option<FractionalShares>,
+        consecutive_polls: u32,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        if self.equity_transfer_busy(symbol)? {
+            warn!(
+                target: "inventory",
+                %symbol,
+                "Aborting offchain equity reconcile: symbol acquired an \
+                 inflight transfer between escalation and apply; the poller \
+                 will detect the divergence again"
+            );
+            return Ok(self);
+        }
+
+        if self.has_pending_offchain_order(symbol) {
+            warn!(
+                target: "inventory",
+                %symbol,
+                "Aborting offchain equity reconcile: hedge order open, the \
+                 fill delta owns the balance; the poller will detect the \
+                 divergence again"
+            );
+            return Ok(self);
+        }
+
+        error!(
+            target: "inventory",
+            %symbol,
+            ledger = ?ledger_position,
+            broker = %broker_position,
+            polls = consecutive_polls,
+            "Force-reconciling offchain equity after persistent snapshot \
+             divergence"
+        );
+
+        let witness = PersistentBrokerDivergence {
+            symbol: symbol.clone(),
+            ledger_value: ledger_position,
+            broker_value: broker_position,
+            polls: consecutive_polls,
+        };
+
+        let view = self.update_equity(
+            symbol,
+            Inventory::force_on_snapshot(Venue::Hedging, broker_position, witness),
+            now,
+        )?;
+
+        Ok(view.record_equity_snapshot_watermarks(Venue::Hedging, [symbol], fetched_at))
+    }
+
     /// Fold an [`InventorySnapshotEvent`] into this view under normal
     /// operation. Uses [`Inventory::on_snapshot`], which silently
     /// ignores stale snapshots (fetched before the last rebalancing)
@@ -1710,6 +1804,21 @@ impl InventoryView {
             OffchainEquity { positions, .. } => {
                 self.apply_equity_snapshot(Venue::Hedging, positions.iter(), fetched_at, now)
             }
+
+            OffchainEquityReconciled {
+                symbol,
+                position,
+                ledger_position,
+                consecutive_polls,
+                ..
+            } => self.reconcile_offchain_equity(
+                symbol,
+                *position,
+                *ledger_position,
+                *consecutive_polls,
+                fetched_at,
+                now,
+            ),
 
             OffchainUsd {
                 usd_balance_cents,
@@ -1890,6 +1999,24 @@ impl InventoryView {
                         .collect();
                     view.record_equity_snapshot_watermarks(Venue::Hedging, applied, *fetched_at)
                 }),
+
+            // `reconcile_offchain_equity` validates busyness and the hedge
+            // gate itself, so the recovery path routes through the same
+            // logic instead of a second force write.
+            OffchainEquityReconciled {
+                symbol,
+                position,
+                ledger_position,
+                consecutive_polls,
+                fetched_at,
+            } => self.reconcile_offchain_equity(
+                symbol,
+                *position,
+                *ledger_position,
+                *consecutive_polls,
+                *fetched_at,
+                now,
+            ),
 
             OffchainUsd {
                 usd_balance_cents,

@@ -40,8 +40,9 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
-    Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
+    BroadcastingInventory, DivergenceGate, ImbalanceThreshold, Inventory, InventoryView,
+    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
+    TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
@@ -484,6 +485,12 @@ pub(crate) struct RebalancingService {
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
+    /// Symbols the inventory poller flagged with a pending snapshot
+    /// divergence. Read here to suppress new equity transfers so a mint or
+    /// redemption that would fail at the broker cannot mark the symbol busy
+    /// and freeze the poller's divergence counter. Shared with the poller via
+    /// [`Self::divergence_gate`].
+    divergence_gate: Arc<DivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     wrapper: Arc<dyn Wrapper>,
@@ -634,6 +641,7 @@ impl RebalancingService {
             inventory,
             freeze_status: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             notifier,
             wrapper,
@@ -684,6 +692,13 @@ impl RebalancingService {
     /// (the reader wraps the issuance client built from config).
     pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
         *self.freeze_status.write().await = Some(reader);
+    }
+
+    /// The divergence gate shared with the inventory poller. The poller
+    /// writes (engage on detection, release on match or escalation); the
+    /// equity trigger reads it before dispatching transfers.
+    pub(crate) fn divergence_gate(&self) -> Arc<DivergenceGate> {
+        Arc::clone(&self.divergence_gate)
     }
 
     /// Whether a freeze-status reader has been wired. Lets the conductor's
@@ -1638,7 +1653,11 @@ impl RebalancingService {
                 now,
             ),
 
-            OffchainUsd { .. }
+            // `reconcile_offchain_equity` validates busyness and the hedge
+            // gate under the write lock, so the generic apply path is the
+            // correct route here too.
+            OffchainEquityReconciled { .. }
+            | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
             | AlpacaUsdc { .. }
@@ -1751,6 +1770,7 @@ impl RebalancingService {
 
             OnchainEquity { .. }
             | OffchainEquity { .. }
+            | OffchainEquityReconciled { .. }
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
@@ -1812,6 +1832,13 @@ impl RebalancingService {
                 for symbol in positions.keys() {
                     self.equity_scheduler.enqueue_check(symbol.clone()).await;
                 }
+            }
+            // A successful reconcile changed the symbol's tradeable Hedging
+            // balance, so evaluate rebalancing against the updated view. An
+            // aborted reconcile enqueues a check that reads the unchanged
+            // view and triggers nothing.
+            OffchainEquityReconciled { symbol, .. } => {
+                self.equity_scheduler.enqueue_check(symbol.clone()).await;
             }
             // Global USDC snapshots: one USDC check.
             //
@@ -2642,6 +2669,22 @@ impl RebalancingService {
 
         if self.has_pending_offchain_order(symbol).await {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: offchain hedge order pending");
+            return Ok(());
+        }
+
+        // A pending snapshot divergence means the view's balance for this
+        // symbol is suspect: a transfer sized off it would likely fail, and
+        // a failed attempt arms the guards again and marks the symbol busy,
+        // freezing the very counter that resolves the divergence. Skip
+        // until the poller clears it (a matching poll or a forced reconcile
+        // lifts the gate).
+        if self.divergence_gate.is_engaged(symbol) {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger: unresolved snapshot divergence \
+                 pending reconciliation"
+            );
             return Ok(());
         }
 
