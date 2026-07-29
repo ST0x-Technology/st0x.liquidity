@@ -81,15 +81,11 @@ pub(crate) struct InventoryDivergenceRecoveryCtx {
 ///
 /// [`Inventory::force_on_snapshot`] takes the triggering error as a witness
 /// to prevent blind usage; this type records what the poller observed
-/// before the escalation fired.
+/// before the escalation fired. Only `Debug` is needed: the force path
+/// logs the witness with debug formatting and never propagates it.
 ///
 /// [`Inventory::force_on_snapshot`]: super::Inventory::force_on_snapshot
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "offchain snapshot diverged from the inventory view for {polls} \
-     consecutive polls: symbol {symbol}, ledger {ledger_value:?}, \
-     broker {broker_value}"
-)]
+#[derive(Debug)]
 pub(crate) struct PersistentBrokerDivergence {
     pub(crate) symbol: Symbol,
     /// Available balance the view held at the Hedging venue; `None` when
