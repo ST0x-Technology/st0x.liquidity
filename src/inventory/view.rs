@@ -1707,11 +1707,12 @@ impl InventoryView {
     ///
     /// Bypasses the staleness guards (watermark, `last_rebalancing`,
     /// inflight) that wedged the symbol, but validates again, under the
-    /// caller's write lock at apply time, that the symbol is still
-    /// quiescent: a transfer or hedge order that started between escalation
-    /// and apply makes the broker reading ambiguous again, so the
-    /// reconcile aborts unapplied and the poller detects it again on the
-    /// next cycle. Advances the symbol's Hedging watermark on success and
+    /// caller's write lock at apply time, that the symbol is still not
+    /// busy: a transfer or hedge order that started, or a fill that
+    /// applied, between escalation and apply makes the broker reading stale
+    /// or ambiguous, so the reconcile aborts unapplied and the poller
+    /// detects it again on the next cycle.
+    /// Advances the symbol's Hedging watermark on success and
     /// deliberately does NOT stamp `last_rebalancing`: stamping it on
     /// every failed cleanup is what keeps the guards armed and the
     /// divergence unresolvable through ordinary snapshots.
@@ -1741,6 +1742,21 @@ impl InventoryView {
                 %symbol,
                 "Aborting offchain equity reconcile: hedge order open, the \
                  fill delta owns the balance; the poller will detect the \
+                 divergence again"
+            );
+            return Ok(self);
+        }
+
+        if self
+            .last_offchain_fill_applied_at
+            .get(symbol)
+            .is_some_and(|filled_at| fetched_at < *filled_at)
+        {
+            warn!(
+                target: "inventory",
+                %symbol,
+                "Aborting offchain equity reconcile: a fill applied after \
+                 this reading was fetched; the poller will detect the \
                  divergence again"
             );
             return Ok(self);
@@ -4466,6 +4482,32 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_aborts_when_reading_predates_last_applied_fill() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let fetched_at = Utc::now();
+        let fill_applied_at = fetched_at + Duration::seconds(1);
+
+        // A fill applied after the escalation's reading was fetched: the
+        // reconcile would overwrite the fill's delta with a stale value.
+        let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(126));
+        view.clear_offchain_order_pending(&spym, Some(fill_applied_at));
+
+        let result = view
+            .apply_snapshot_event(
+                &reconciled_event(&spym, shares(0), Some(shares(136)), fetched_at),
+                fill_applied_at,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&spym, Venue::Hedging),
+            Some(shares(126)),
+            "the reconcile must abort when a fill applied after the reading \
+             was fetched"
+        );
+    }
+
+    #[test]
     fn reconcile_aborts_when_symbol_acquired_active_mint_between_escalation_and_apply() {
         let spym = Symbol::new("SPYM").unwrap();
         let now = Utc::now();
@@ -4545,10 +4587,10 @@ mod tests {
         let spym = Symbol::new("SPYM").unwrap();
         let now = Utc::now();
 
-        let quiescent = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
-        assert!(!quiescent.equity_reconciliation_busy(&spym).unwrap());
+        let not_busy = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
+        assert!(!not_busy.equity_reconciliation_busy(&spym).unwrap());
 
-        let inflight = quiescent
+        let inflight = not_busy
             .clone()
             .update_equity(
                 &spym,
@@ -4558,17 +4600,17 @@ mod tests {
             .unwrap();
         assert!(inflight.equity_reconciliation_busy(&spym).unwrap());
 
-        let minting = quiescent
+        let minting = not_busy
             .clone()
             .set_active_mint(spym.clone(), st0x_tokenization::issuer_request_id("mint"));
         assert!(minting.equity_reconciliation_busy(&spym).unwrap());
 
-        let redeeming = quiescent
+        let redeeming = not_busy
             .clone()
             .set_active_redemption(spym.clone(), RedemptionAggregateId(Uuid::new_v4()));
         assert!(redeeming.equity_reconciliation_busy(&spym).unwrap());
 
-        let mut hedging = quiescent;
+        let mut hedging = not_busy;
         hedging.mark_offchain_order_pending(spym.clone());
         assert!(hedging.equity_reconciliation_busy(&spym).unwrap());
     }

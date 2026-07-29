@@ -4205,7 +4205,7 @@ mod tests {
                 (InventoryModeTag::Legacy, Some(inventory)) => {
                     // EvmCtx::new rejects this combination at startup
                     // (LegacyWithInventory); asserting it here fails the
-                    // conflict in CI instead of at the deploy gate.
+                    // contradiction in CI instead of at the deploy gate.
                     panic!(
                         "{path:?}: inventory_mode = \"legacy\" forbids an inventory address, \
                          found {inventory}"
