@@ -643,8 +643,13 @@ where
     /// diverging polls already counted. A matching poll resets the counter
     /// and releases the transfer gate; a diverging poll increments it and
     /// engages the gate; at the configured threshold the symbol escalates
-    /// via `ReconcileOffchainEquity` and resets only after the command was
-    /// sent, so a failed send escalates again on the next poll.
+    /// via `ReconcileOffchainEquity`. The counter and gate clear only after
+    /// the view reads back at the broker's value: a sent command proves the
+    /// event was emitted, not that the view healed (the apply aborts
+    /// unapplied when the symbol turned busy between escalation and apply),
+    /// so an unhealed escalation or a failed send keeps both, and the next
+    /// quiet diverging poll re-escalates immediately instead of paying a
+    /// fresh N-poll cycle.
     async fn detect_offchain_divergences(
         &self,
         snapshot_id: &InventorySnapshotId,
@@ -703,8 +708,26 @@ where
                 )
                 .await?;
 
-            self.lock_divergence_counters().remove(&escalation.symbol);
-            recovery.gate.release(&escalation.symbol);
+            let healed = {
+                let view = recovery.inventory.read().await;
+                match view.equity_available(&escalation.symbol, Venue::Hedging) {
+                    Some(ledger) => Float::from(ledger).eq(Float::from(escalation.fetched))?,
+                    None => false,
+                }
+            };
+
+            if healed {
+                self.lock_divergence_counters().remove(&escalation.symbol);
+                recovery.gate.release(&escalation.symbol);
+            } else {
+                warn!(
+                    target: "inventory",
+                    symbol = %escalation.symbol,
+                    broker = %escalation.fetched,
+                    "Reconcile escalation did not heal the view; keeping the \
+                     divergence gate engaged and the counter at the threshold"
+                );
+            }
         }
 
         Ok(())
@@ -4399,21 +4422,32 @@ mod tests {
         assert_eq!(ledger_position, &Some(test_shares(136)));
         assert_eq!(*consecutive_polls, 3);
         assert!(
-            !gate.is_engaged(&spym),
-            "a sent escalation must release the gate"
+            gate.is_engaged(&spym),
+            "an escalation that did not heal the view must keep the gate engaged"
         );
 
-        // Counter was reset by the escalation: the next diverging poll
-        // starts a fresh count instead of escalating immediately.
+        // The counter survives an unhealed escalation: the next diverging
+        // poll re-escalates immediately instead of starting a fresh count.
         service.poll_and_record().await.unwrap();
+        let events = reconciled_events(&pool, orderbook, order_owner).await;
         assert_eq!(
-            reconciled_events(&pool, orderbook, order_owner).await.len(),
-            1,
-            "a fresh count must not escalate again on the next poll"
+            events.len(),
+            2,
+            "an unhealed escalation must re-escalate on the next diverging poll"
+        );
+        let InventorySnapshotEvent::OffchainEquityReconciled {
+            consecutive_polls, ..
+        } = &events[1]
+        else {
+            panic!("Expected OffchainEquityReconciled, got {:?}", events[1]);
+        };
+        assert_eq!(
+            *consecutive_polls, 4,
+            "the kept counter must keep counting, not restart from one"
         );
         assert!(
             gate.is_engaged(&spym),
-            "a fresh divergence after the reset engages the gate again"
+            "the gate must stay engaged while the view remains diverged"
         );
     }
 

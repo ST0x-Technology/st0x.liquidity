@@ -3304,10 +3304,11 @@ intervals:
 - **Detection at the poll boundary**: after emitting the offchain equity
   snapshot, the poller compares each fetched broker position against the view's
   Hedging available balance. Busy symbols (inflight transfer at either venue,
-  active mint/redemption, or open hedge order) are skipped with their counter
-  frozen, not reset. A mismatch increments an in-memory per-symbol counter; a
-  match resets it. Restart resets the counters, which is safe because startup
-  hydration heals the view anyway.
+  active mint/redemption, open hedge order, or a reading fetched before the last
+  applied hedge fill) are skipped with their counter frozen, not reset. A
+  mismatch increments an in-memory per-symbol counter; a match resets it.
+  Restart resets the counters, which is safe because startup hydration heals the
+  view anyway.
 - **N-confirmation escalation**: when a symbol's counter reaches the configured
   `inventory_divergence_threshold` (required, positive; no default), the poller
   sends `ReconcileOffchainEquity` on the InventorySnapshot aggregate carrying
@@ -3323,14 +3324,18 @@ intervals:
   view write lock the apply re-validates that the symbol is still not busy: if
   an inflight transfer, active mint/redemption, or open hedge order appeared
   between escalation and apply, or a hedge fill was applied to the view after
-  the escalation's reading was fetched, the heal aborts and the poller
-  re-detects on the next cycle.
-- **Transfer gating**: from the first diverging poll until the counter resets or
-  the escalation is sent, the symbol is held in a gate shared with the equity
-  rebalancing trigger, which skips firing mints and redemptions for gated
-  symbols. This stops doomed transfers -- sized off a suspect balance -- from
-  marking the symbol busy and freezing the counter across cycles. The cost on a
-  transient mismatch is at most one poll interval of delayed rebalancing.
+  the escalation's reading was fetched, the heal aborts unapplied. The poller
+  verifies the heal by reading the view back after the send: an aborted apply
+  keeps the gate engaged and the counter at the threshold, so the next quiet
+  diverging poll re-escalates immediately instead of paying a fresh N-poll
+  cycle.
+- **Transfer gating**: from the first diverging poll until the counter resets on
+  a matching poll or an escalation verifiably heals the view, the symbol is held
+  in a gate shared with the equity rebalancing trigger, which skips firing mints
+  and redemptions for gated symbols. This stops doomed transfers -- sized off a
+  suspect balance -- from marking the symbol busy and freezing the counter
+  across cycles. The cost on a transient mismatch is at most one poll interval
+  of delayed rebalancing.
 
 ### InventoryView
 

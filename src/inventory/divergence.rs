@@ -22,13 +22,13 @@ use super::BroadcastingInventory;
 /// Symbols with a detected but unresolved offchain snapshot divergence.
 ///
 /// The inventory poller writes: it engages a symbol on the first confirmed
-/// divergence and releases it when a poll matches again or the escalation
-/// command was sent. The equity rebalancing trigger reads: it skips firing
-/// mints and redemptions for engaged symbols. Gating starts at the first
-/// diverging poll because a transfer sized off a diverged balance fails at
-/// the broker and marks the symbol busy, which freezes the divergence
-/// counter. The cost on a transient mismatch is at most one poll interval
-/// of delayed rebalancing.
+/// divergence and releases it when a poll matches again or an escalation
+/// verifiably healed the view. The equity rebalancing trigger reads: it
+/// skips firing mints and redemptions for engaged symbols. Gating starts
+/// at the first diverging poll because a transfer sized off a diverged
+/// balance fails at the broker and marks the symbol busy, which freezes
+/// the divergence counter. The cost on a transient mismatch is at most
+/// one poll interval of delayed rebalancing.
 #[derive(Debug, Default)]
 pub(crate) struct InventoryDivergenceGate {
     symbols: RwLock<HashSet<Symbol>>,

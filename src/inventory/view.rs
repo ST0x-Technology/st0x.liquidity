@@ -1721,8 +1721,9 @@ impl InventoryView {
     /// caller's write lock at apply time, that the symbol is still not
     /// busy: a transfer or hedge order that started, or a fill that
     /// applied, between escalation and apply makes the broker reading stale
-    /// or ambiguous, so the reconcile aborts unapplied and the poller
-    /// detects it again on the next cycle.
+    /// or ambiguous, so the reconcile aborts unapplied; the poller reads
+    /// the view back after the send and re-escalates once the symbol is
+    /// quiet again.
     /// Advances the symbol's Hedging watermark on success and
     /// deliberately does NOT stamp `last_rebalancing`: stamping it on
     /// every failed cleanup is what keeps the guards armed and the
