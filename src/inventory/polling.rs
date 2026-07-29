@@ -14,7 +14,7 @@ use futures_util::future::try_join_all;
 use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
@@ -761,6 +761,17 @@ where
         if healed {
             self.lock_divergence_counters().remove(&escalation.symbol);
             recovery.gate.release(&escalation.symbol);
+        } else if escalation.consecutive_polls >= recovery.threshold.get().saturating_mul(2) {
+            // A full extra threshold window of escalations has failed to
+            // heal: past transient busyness, and every failed attempt
+            // appends another reconcile event. Needs an operator.
+            error!(
+                target: "inventory",
+                symbol = %escalation.symbol,
+                broker = %escalation.fetched,
+                consecutive_polls = escalation.consecutive_polls,
+                "Reconcile escalations persistently fail to heal the view"
+            );
         } else {
             warn!(
                 target: "inventory",
