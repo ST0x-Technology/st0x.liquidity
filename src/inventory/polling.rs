@@ -657,6 +657,11 @@ where
         fetched_at: DateTime<Utc>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(recovery) = &self.divergence_recovery else {
+            warn!(
+                target: "inventory",
+                "No divergence recovery configured; skipping offchain \
+                 divergence detection"
+            );
             return Ok(());
         };
 
