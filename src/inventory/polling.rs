@@ -4684,6 +4684,7 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
         let spym = test_symbol("SPYM");
         let phantom = FractionalShares::new(float!("136.87"));
+        let threshold = 3u32;
         let now = Utc::now();
 
         // Phantom credit at Hedging, guard armed by clear_equity_inflight.
@@ -4705,7 +4706,7 @@ mod tests {
 
         // The aggregate already stores the true zero, recorded by a poll
         // that predates the guard stamp (the view skipped it as stale), so
-        // every later identical poll dedups to no event: the wedge.
+        // every later identical poll dedups to no event.
         snapshot_store
             .send(
                 &InventorySnapshotId {
@@ -4728,12 +4729,15 @@ mod tests {
             "precondition: the staleness guard must keep the phantom credit in the view"
         );
 
-        let service =
-            reconciling_service(&pool, snapshot_store, inventory.clone(), gate.clone(), 3);
+        let service = reconciling_service(
+            &pool,
+            snapshot_store,
+            inventory.clone(),
+            gate.clone(),
+            threshold,
+        );
 
-        // Polls 1 and 2: aggregate dedups, view stays wedged, gate engaged
-        // (so no new equity transfer can fire for the symbol); a failed
-        // cleanup stamps last_rebalancing again between polls.
+        // A failed cleanup stamps last_rebalancing again between polls.
         service.poll_and_record().await.unwrap();
         assert_eq!(
             inventory
@@ -4767,8 +4771,7 @@ mod tests {
         );
         assert!(gate.is_engaged(&spym));
 
-        // Poll 3 reaches the threshold: escalation, an event that always
-        // emits, forced reconcile through the projection.
+        // The final poll reaches the threshold and escalates.
         service.poll_and_record().await.unwrap();
 
         assert_eq!(
