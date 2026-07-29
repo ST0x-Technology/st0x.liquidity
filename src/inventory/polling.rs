@@ -700,40 +700,75 @@ where
 
         let escalations = self.record_divergence_observations(recovery, observations);
 
+        // Attempt every escalation: an early return on the first failed
+        // send would drop the remaining symbols' escalations this cycle
+        // even though their counters reached the threshold.
+        let mut first_error = None;
+
         for escalation in escalations {
-            self.snapshot
-                .send(
-                    snapshot_id,
-                    InventorySnapshotCommand::ReconcileOffchainEquity {
-                        symbol: escalation.symbol.clone(),
-                        position: escalation.fetched,
-                        fetched_at,
-                        ledger_position: escalation.ledger,
-                        consecutive_polls: escalation.consecutive_polls,
-                    },
-                )
-                .await?;
-
-            let healed = {
-                let view = recovery.inventory.read().await;
-                match view.equity_available(&escalation.symbol, Venue::Hedging) {
-                    Some(ledger) => Float::from(ledger).eq(Float::from(escalation.fetched))?,
-                    None => false,
-                }
-            };
-
-            if healed {
-                self.lock_divergence_counters().remove(&escalation.symbol);
-                recovery.gate.release(&escalation.symbol);
-            } else {
+            if let Err(error) = self
+                .escalate_divergence(recovery, snapshot_id, &escalation, fetched_at)
+                .await
+            {
                 warn!(
                     target: "inventory",
                     symbol = %escalation.symbol,
-                    broker = %escalation.fetched,
-                    "Reconcile escalation did not heal the view; keeping the \
-                     divergence gate engaged and the counter at the threshold"
+                    ?error,
+                    "Failed to escalate divergence; the counter re-escalates \
+                     on the next poll"
                 );
+                first_error.get_or_insert(error);
             }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Sends one `ReconcileOffchainEquity` escalation and settles its
+    /// counter and gate: released when the view reads back the broker
+    /// value, kept engaged when the apply aborted.
+    async fn escalate_divergence(
+        &self,
+        recovery: &InventoryDivergenceRecoveryCtx,
+        snapshot_id: &InventorySnapshotId,
+        escalation: &InventoryDivergenceEscalation,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::ReconcileOffchainEquity {
+                    symbol: escalation.symbol.clone(),
+                    position: escalation.fetched,
+                    fetched_at,
+                    ledger_position: escalation.ledger,
+                    consecutive_polls: escalation.consecutive_polls,
+                },
+            )
+            .await?;
+
+        let healed = {
+            let view = recovery.inventory.read().await;
+            match view.equity_available(&escalation.symbol, Venue::Hedging) {
+                Some(ledger) => Float::from(ledger).eq(Float::from(escalation.fetched))?,
+                None => false,
+            }
+        };
+
+        if healed {
+            self.lock_divergence_counters().remove(&escalation.symbol);
+            recovery.gate.release(&escalation.symbol);
+        } else {
+            warn!(
+                target: "inventory",
+                symbol = %escalation.symbol,
+                broker = %escalation.fetched,
+                "Reconcile escalation did not heal the view; keeping the \
+                 divergence gate engaged and the counter at the threshold"
+            );
         }
 
         Ok(())
