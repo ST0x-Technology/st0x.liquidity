@@ -3323,8 +3323,9 @@ intervals:
   symbol's snapshot watermark -- without stamping `last_rebalancing`. Under the
   view write lock the apply re-validates that the symbol is still not busy: if
   an inflight transfer, active mint/redemption, or open hedge order appeared
-  between escalation and apply, or a hedge fill was applied to the view after
-  the escalation's reading was fetched, the heal aborts unapplied. The poller
+  between escalation and apply, a hedge fill was applied to the view after the
+  escalation's reading was fetched, or a fresher snapshot already advanced the
+  symbol's watermark past the reading, the heal aborts unapplied. The poller
   verifies the heal by reading the view back after the send: an aborted apply
   keeps the gate engaged and the counter at the threshold, so the next quiet
   diverging poll re-escalates immediately instead of paying a fresh N-poll

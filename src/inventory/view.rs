@@ -1740,14 +1740,12 @@ impl InventoryView {
     /// Force apply a broker confirmed offchain equity value after the
     /// poller escalated a persistent snapshot divergence.
     ///
-    /// Bypasses the staleness guards (watermark, `last_rebalancing`,
-    /// inflight) that wedged the symbol, but validates again, under the
-    /// caller's write lock at apply time, that the symbol is still not
-    /// busy: a transfer or hedge order that started, or a fill that
-    /// applied, between escalation and apply makes the broker reading stale
-    /// or ambiguous, so the reconcile aborts unapplied; the poller reads
-    /// the view back after the send and re-escalates once the symbol is
-    /// quiet again.
+    /// Bypasses the `last_rebalancing` and inflight staleness guards that
+    /// wedged the symbol, but validates again, under the caller's write
+    /// lock at apply time, that the symbol is still not busy and that no
+    /// fresher snapshot applied since the escalation's reading was
+    /// fetched. Either condition aborts unapplied; the poller reads the
+    /// view back after the send and re-escalates once the symbol is quiet.
     /// Advances the symbol's Hedging watermark on success and
     /// deliberately does NOT stamp `last_rebalancing`: stamping it on
     /// every failed cleanup is what keeps the guards armed and the
@@ -1761,6 +1759,19 @@ impl InventoryView {
         fetched_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        if self
+            .equity_snapshot_watermark(symbol, Venue::Hedging)
+            .is_some_and(|watermark| fetched_at <= watermark)
+        {
+            warn!(
+                target: "inventory",
+                %symbol,
+                "Aborting offchain equity reconcile: a fresher snapshot \
+                 already applied for this symbol"
+            );
+            return Ok(self);
+        }
+
         if let Some(reason) = self.equity_reconciliation_busy(symbol, fetched_at)? {
             warn!(
                 target: "inventory",
@@ -4458,6 +4469,57 @@ mod tests {
             Some(shares(5)),
             "a snapshot after the reconcile must apply; the reconcile must \
              not stamp last_rebalancing"
+        );
+    }
+
+    /// A fresher ordinary snapshot that applied between the escalation
+    /// send and the reconcile apply owns the balance: the reconcile's
+    /// older reading must not overwrite it, at or below the watermark.
+    #[test]
+    fn reconcile_aborts_when_watermark_is_newer_than_reading() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), shares(5))]),
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        let older = view
+            .clone()
+            .apply_snapshot_event(
+                &reconciled_event(
+                    &spym,
+                    shares(0),
+                    Some(shares(5)),
+                    now - Duration::seconds(1),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            older.equity_available(&spym, Venue::Hedging),
+            Some(shares(5)),
+            "a reconcile older than the watermark must not overwrite the \
+             fresher snapshot"
+        );
+
+        let at_watermark = view
+            .apply_snapshot_event(
+                &reconciled_event(&spym, shares(0), Some(shares(5)), now),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            at_watermark.equity_available(&spym, Venue::Hedging),
+            Some(shares(5)),
+            "a reconcile at the watermark must be rejected like the \
+             ordinary path"
         );
     }
 

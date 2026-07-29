@@ -85,7 +85,6 @@ pub(crate) struct InventoryDivergenceRecoveryCtx {
 /// logs the witness with debug formatting and never propagates it.
 ///
 /// [`Inventory::force_on_snapshot`]: super::Inventory::force_on_snapshot
-#[derive(Debug)]
 pub(crate) struct PersistentBrokerDivergence {
     pub(crate) symbol: Symbol,
     /// Available balance the view held at the Hedging venue; `None` when
@@ -93,4 +92,26 @@ pub(crate) struct PersistentBrokerDivergence {
     pub(crate) ledger_value: Option<FractionalShares>,
     pub(crate) broker_value: FractionalShares,
     pub(crate) polls: u32,
+}
+
+// Hand-written: the fields are read only through `Debug` logging, and a
+// derived impl is exempt from liveness analysis, so `derive(Debug)` would
+// flag every field as dead code.
+impl std::fmt::Debug for PersistentBrokerDivergence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            symbol,
+            ledger_value,
+            broker_value,
+            polls,
+        } = self;
+
+        formatter
+            .debug_struct("PersistentBrokerDivergence")
+            .field("symbol", symbol)
+            .field("ledger_value", ledger_value)
+            .field("broker_value", broker_value)
+            .field("polls", polls)
+            .finish()
+    }
 }
