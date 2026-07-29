@@ -2336,6 +2336,59 @@ enum BridgeStage { Burn, Attestation, Mint }
   success is implicit since reverted transactions emit no logs. Any source
   domain or message body mismatch, or absence of the expected `MintAndWithdraw`,
   means the revert remains a bridge mint failure
+- A failed `receiveMessage()` submission is only declared a bridge mint failure
+  after the nonce has stayed unconsumed for a bounded recovery window (two
+  minutes). Two checks run once, before any recovery probe, and fail immediately
+  without waiting out the window: the attested message must carry a real
+  (non-placeholder) nonce, and its destination domain must match the expected
+  direction -- both are structurally deterministic for the fixed attested
+  message and independent of chain state, so checking them first avoids
+  reporting "not yet minted" for a message that could never mint here. Within
+  the window, recovery repeatedly re-reads only the cheap, authoritative
+  `usedNonces()` view call; every probe error is retried, including one shaped
+  like an on-chain revert -- that view call is a plain public-mapping getter
+  with no branch logic and cannot deterministically revert, so a revert-shaped
+  response is a provider/transport artifact, not a decided outcome. The
+  expensive log scan and receipt reconstruction described above run only once
+  per recovery attempt, after a read confirms the nonce consumed, not on every
+  probe, and are themselves bounded to a handful of recent chunks rather than a
+  full-chain walk back to genesis. The burn is irreversible and the attestation
+  is valid, so any party -- including a third-party relayer -- may deliver the
+  mint moments after our own submission failed; a mint that lands inside the
+  window is recovered per the log checks above and the transfer proceeds to the
+  destination deposit. If the window expires WITHOUT ever getting a conclusive
+  `usedNonces()` read (every remaining probe itself failed transiently), OR the
+  nonce is confirmed consumed but its receipt could not be reconstructed (a
+  lagging log scan, a mismatched log, a reverted mint transaction), the transfer
+  is NOT marked `BridgingFailed` -- declaring a terminal failure on unobserved
+  state, or on funds already known to have moved, would strand the rebalancing
+  guard on a false negative. The transfer instead stays in whatever
+  non-terminal-for-this-purpose state it was already in when recovery ran:
+  `Attested` (or the Ethereum-direction equivalent) for a first mint attempt,
+  whose resume adopts an already-landed mint via a bounded scan before minting
+  again; or `BridgingFailed` when recovering an already-failed post-burn
+  transfer, whose next redrive re-attempts the mint directly instead
+  (idempotency there comes from CCTP's nonce being authoritative, not from that
+  bounded scan).
+- **Inconclusive mint recovery: redrive and operator alert**: the job layer
+  schedules an unbounded delayed redrive (like the settlement-phase
+  RPC-transient case above) rather than consuming the apalis retry budget, since
+  the mint may already have landed and re-probing is idempotent. Once the
+  transfer's total age reaches 4 hours -- measured from the durable
+  `initiated_at` carried by whichever of
+  `Bridging`/`AwaitingAttestation`/`Attested`/`BridgingFailed` the transfer
+  resumed from, so the countdown survives restarts, and not from when mint
+  recovery itself became inconclusive -- the job begins paging the operator on
+  every redrive. A transfer that already exceeds the threshold can therefore
+  page on its first inconclusive mint-recovery probe. The redrive uses a slower
+  cadence after the deadline (30 minutes instead of 30 seconds, to avoid alert
+  fatigue) while still keeping the guard held and continuing to redrive -- the
+  funds are already burned, so the redrive never stops on its own; only manual
+  `transfer resume`/`transfer reconcile` ends it. The 4-hour threshold mirrors
+  the withdrawal-poll alert deadline, giving generous headroom above the
+  ~2-minute internal probe window while surfacing a durably degraded RPC
+  endpoint or a permanently unresolved nonce well before it becomes a multi-day
+  silent outage
 - Destination deposit must be confirmed to complete rebalancing (for
   AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)
 - Can mark failed from any non-terminal state

@@ -399,3 +399,57 @@ extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0x1a29eD11DF8295D5F3B5F59849FD94caD615E024"
 tokenized_equity_derivative = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
+
+[assets.equities.GOOGL]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x15De944Cd020A18C8E5626fB0F81b36e73956199"
+tokenized_equity_derivative = "0x6a2357Df4975C667B171bE53dA6FFe6deBf7030c"
+
+[assets.equities.INTC]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xBDC237Aa3B67cC3088adAf117913F30Bf08157a3"
+tokenized_equity_derivative = "0xf567652fC2d7Db8D5469fD06AEbe8C9c4372d722"
+
+[assets.equities.AAPL]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xD36056a4a03707D3743fCE4e9C08852820ADcfdC"
+tokenized_equity_derivative = "0x1020EC8Aa3f709a1f3D8705cdBa89b950451bd88"
+
+[assets.equities.MSFT]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x6a071E25fa25653cF15d1ee320eA3df771926Aa0"
+tokenized_equity_derivative = "0x515A3Ac2a6aB590bDFa970caFFFd7fAdC680886E"
+
+[assets.equities.LLY]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xA41Ce7B8255A01062ED1AF23ea5E8137B9300554"
+tokenized_equity_derivative = "0x892CcF5E75f4a7Ee6402971a1587F65BEE4d52bd"
+
+[assets.equities.PTY]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xb6021810971714cD48572af527307Acc324ecF61"
+tokenized_equity_derivative = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"

@@ -171,6 +171,17 @@ fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
     }
 }
 
+/// The two durable timestamps carried by `AwaitingAttestation`: when the
+/// attestation retry gives up, and when the transfer originally started.
+/// Both are `DateTime<Utc>`, so passing them as adjacent positional
+/// parameters would let a call site swap the retry deadline for the
+/// transfer's start time without a compile error; bundling them as named
+/// fields removes that risk.
+struct AwaitingAttestationTimestamps {
+    retry_deadline_at: DateTime<Utc>,
+    initiated_at: DateTime<Utc>,
+}
+
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
 /// # Type Parameters
@@ -192,6 +203,48 @@ pub(crate) struct CrossVenueCashTransfer<Chain: Wallet, B = CctpBridge<Chain, Ch
 enum AttestationPollOutcome {
     Received(AttestationResponse),
     TimedOut,
+}
+
+/// Identifies which of the three `Bridge::mint` call sites is redriving a
+/// `CctpError::MintRecoveryInconclusive`, so
+/// `CrossVenueCashTransfer::redrive_on_mint_recovery_inconclusive`'s `warn!`
+/// log names the call site without a hand-maintained string fragment that a
+/// copy-paste or a new call site could get wrong with no compiler feedback.
+/// Emitted as a structured `Debug` tracing field rather than interpolated into
+/// the message, so the message stays static and every variant names itself.
+#[derive(Debug, Clone, Copy)]
+enum MintCallSite {
+    /// `execute_cctp_mint`, reached from `Attested`.
+    ExecuteCctpMint,
+    /// `execute_cctp_mint_on_ethereum`, reached from the Ethereum-direction
+    /// equivalent of `Attested`.
+    ExecuteCctpMintOnEthereum,
+    /// `recover_from_bridging_failed`, reached from an already-terminal
+    /// `BridgingFailed`.
+    RecoverFromBridgingFailed,
+}
+
+/// Identifies which of the two `Bridge::find_recent_mint` scan call sites hit
+/// a transport-class failure while resuming from `Attested`, so
+/// `CrossVenueCashTransfer::redrive_on_mint_scan_failure`'s `warn!` log names
+/// the direction without a hand-maintained string fragment.
+#[derive(Debug, Clone, Copy)]
+enum MintScanCallSite {
+    /// `continue_alpaca_to_base_from_attested`, scanning Base for an
+    /// already-submitted mint.
+    AlpacaToBase,
+    /// `continue_from_attested`, scanning Ethereum for an already-submitted
+    /// mint.
+    BaseToAlpaca,
+}
+
+impl std::fmt::Display for MintScanCallSite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlpacaToBase => write!(formatter, "Alpaca->Base"),
+            Self::BaseToAlpaca => write!(formatter, "Base->Alpaca"),
+        }
+    }
 }
 
 impl<
@@ -714,11 +767,13 @@ impl<
             Some(ConversionComplete {
                 direction: AlpacaToBase,
                 conversion,
+                initiated_at,
                 ..
             }) => {
                 self.continue_alpaca_to_base_from_conversion_complete(
                     id,
                     conversion.received_amount,
+                    initiated_at,
                 )
                 .await
             }
@@ -739,26 +794,38 @@ impl<
                     .await?;
                 // Thread the confirmed withdrawal_tx so the burn-scan lower bound
                 // is derived from the withdrawal tx block (not the raw chain head).
-                self.continue_alpaca_to_base_from_withdrawal_complete(id, amount, withdrawal_tx)
-                    .await
+                self.continue_alpaca_to_base_from_withdrawal_complete(
+                    id,
+                    amount,
+                    withdrawal_tx,
+                    initiated_at,
+                )
+                .await
             }
 
             Some(WithdrawalComplete {
                 direction: AlpacaToBase,
                 amount,
                 withdrawal_tx,
+                initiated_at,
                 ..
             }) => {
                 // Thread the persisted withdrawal_tx so the durable re-check fires
                 // on apalis redrive (primary gate does not re-run from this arm).
-                self.continue_alpaca_to_base_from_withdrawal_complete(id, amount, withdrawal_tx)
-                    .await
+                self.continue_alpaca_to_base_from_withdrawal_complete(
+                    id,
+                    amount,
+                    withdrawal_tx,
+                    initiated_at,
+                )
+                .await
             }
 
             Some(Bridging {
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash,
+                initiated_at,
                 ..
             }) => {
                 // The `Bridging` state carries only the nominal `amount`; it does
@@ -768,8 +835,13 @@ impl<
                 // `continue_alpaca_to_base_from_bridging` only uses `burn_amount`
                 // for `BurnReceipt`; the actual minted amount comes from the
                 // on-chain mint receipt, so supplying the nominal here is harmless.
-                self.continue_alpaca_to_base_from_bridging(id, usdc_to_u256(amount)?, burn_tx_hash)
-                    .await
+                self.continue_alpaca_to_base_from_bridging(
+                    id,
+                    usdc_to_u256(amount)?,
+                    burn_tx_hash,
+                    initiated_at,
+                )
+                .await
             }
 
             Some(UsdcRebalance::AwaitingAttestation {
@@ -777,13 +849,17 @@ impl<
                 amount,
                 burn_tx_hash,
                 retry_deadline_at,
+                initiated_at,
                 ..
             }) => {
                 self.continue_alpaca_to_base_from_awaiting_attestation(
                     id,
                     amount,
                     burn_tx_hash,
-                    retry_deadline_at,
+                    AwaitingAttestationTimestamps {
+                        retry_deadline_at,
+                        initiated_at,
+                    },
                 )
                 .await
             }
@@ -800,6 +876,7 @@ impl<
                 attestation,
                 message,
                 mint_scan_from_block,
+                initiated_at,
                 ..
             }) => {
                 self.continue_alpaca_to_base_from_attested(
@@ -809,6 +886,7 @@ impl<
                     cctp_nonce,
                     message,
                     mint_scan_from_block,
+                    initiated_at,
                 )
                 .await
             }
@@ -937,6 +1015,7 @@ impl<
                 from_block,
                 burn_amount,
                 pending_burn_tx,
+                initiated_at,
                 ..
             }) => {
                 let nominal_u256 = usdc_to_u256(amount)?;
@@ -962,8 +1041,13 @@ impl<
                     .await?;
                 // Pass burn_receipt.amount (what was actually burned, per the scan)
                 // so BurnReceipt records the real amount, not the nominal.
-                self.continue_alpaca_to_base_from_bridging(id, burn_receipt.amount, burn_receipt.tx)
-                    .await
+                self.continue_alpaca_to_base_from_bridging(
+                    id,
+                    burn_receipt.amount,
+                    burn_receipt.tx,
+                    initiated_at,
+                )
+                .await
             }
 
             // `WithdrawalSubmitting` is produced only by the BaseToAlpaca flow
@@ -997,21 +1081,30 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         filled_amount: Usdc,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let transfer = self.initiate_alpaca_withdrawal(id, filled_amount).await?;
 
-        // Approximate initiated_at: the aggregate's initiated_at was just set
-        // moments ago by the Initiate command handler. Reading it back from the
-        // aggregate is not worth an extra DB round-trip; on any re-poll redrive,
-        // resume_alpaca_to_base reads the exact aggregate value anyway. The
-        // 4-hour operator-alert deadline absorbs any sub-second discrepancy here.
+        // Approximate initiated_at for the withdrawal poll: the aggregate's
+        // initiated_at was just set moments ago by the Initiate command handler.
+        // Reading it back from the aggregate is not worth an extra DB round-trip;
+        // on any re-poll redrive, resume_alpaca_to_base reads the exact aggregate
+        // value anyway. The 4-hour operator-alert deadline absorbs any sub-second
+        // discrepancy here. The mint-recovery deadline below uses the REAL
+        // `initiated_at` threaded in from the caller's aggregate state, since it
+        // is already available with no extra round-trip.
         let withdrawal_tx = self
             .poll_and_confirm_withdrawal(id, &transfer.id, Utc::now())
             .await?;
         // Thread the confirmed withdrawal_tx so the burn-scan lower bound
         // is derived from the withdrawal tx block (not the raw chain head).
-        self.continue_alpaca_to_base_from_withdrawal_complete(id, filled_amount, withdrawal_tx)
-            .await
+        self.continue_alpaca_to_base_from_withdrawal_complete(
+            id,
+            filled_amount,
+            withdrawal_tx,
+            initiated_at,
+        )
+        .await
     }
 
     /// Drives an Alpaca->Base transfer from `WithdrawalComplete` through to
@@ -1021,6 +1114,7 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
         withdrawal_tx: Option<TxHash>,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         // DURABLE confirmation re-check: fires on the redrive path
         // (`WithdrawalComplete` -> resume) when the primary gate in
@@ -1221,8 +1315,13 @@ impl<
 
         // Pass the actual (capped) burn amount through so BurnReceipt records
         // what was truly burned, not the nominal requested amount.
-        self.continue_alpaca_to_base_from_bridging(id, burn_receipt.amount, burn_receipt.tx)
-            .await
+        self.continue_alpaca_to_base_from_bridging(
+            id,
+            burn_receipt.amount,
+            burn_receipt.tx,
+            initiated_at,
+        )
+        .await
     }
 
     /// Drives an Alpaca->Base transfer from `Bridging`/`Attested` through to
@@ -1240,6 +1339,7 @@ impl<
         // or usdc_to_u256 output) so no conversion is needed here.
         burn_amount: U256,
         burn_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let burn_receipt = BurnReceipt {
             tx: burn_tx_hash,
@@ -1261,7 +1361,9 @@ impl<
             }
         };
 
-        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
+        let mint_receipt = self
+            .execute_cctp_mint(id, attestation_response, initiated_at)
+            .await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
             .await
@@ -1275,8 +1377,12 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        retry_deadline_at: DateTime<Utc>,
+        timestamps: AwaitingAttestationTimestamps,
     ) -> Result<(), UsdcTransferError> {
+        let AwaitingAttestationTimestamps {
+            retry_deadline_at,
+            initiated_at,
+        } = timestamps;
         let burn_receipt = BurnReceipt {
             tx: burn_tx_hash,
             amount: usdc_to_u256(amount)?,
@@ -1301,7 +1407,9 @@ impl<
             }
         };
 
-        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
+        let mint_receipt = self
+            .execute_cctp_mint(id, attestation_response, initiated_at)
+            .await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
             .await
@@ -1327,6 +1435,7 @@ impl<
         cctp_nonce: B256,
         message: Option<Vec<u8>>,
         mint_scan_from_block: Option<u64>,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         // Events persisted before crash-safe resume carry no scan bound. Scanning
         // from genesis could adopt an unrelated mint to the same wallet, so refuse
@@ -1344,7 +1453,14 @@ impl<
                 mint_scan_from_block,
             )
             .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?
+            .map_err(|error| {
+                Self::redrive_on_mint_scan_failure(
+                    id,
+                    error,
+                    MintScanCallSite::AlpacaToBase,
+                    initiated_at,
+                )
+            })?
         {
             let amount_received = u256_to_usdc(mint_receipt.amount)?;
 
@@ -1381,7 +1497,9 @@ impl<
                 message,
             )
             .await?;
-        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
+        let mint_receipt = self
+            .execute_cctp_mint(id, attestation_response, initiated_at)
+            .await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
             .await
@@ -1417,15 +1535,21 @@ impl<
         // Approximate initiated_at: same reasoning as
         // continue_alpaca_to_base_from_conversion_complete -- the aggregate's value
         // was set moments ago; resume_alpaca_to_base uses the exact stored value on
-        // any re-poll redrive.
+        // any re-poll redrive. Reused below for the mint-recovery deadline too.
+        let initiated_at = Utc::now();
         let withdrawal_tx = self
-            .poll_and_confirm_withdrawal(id, &transfer.id, Utc::now())
+            .poll_and_confirm_withdrawal(id, &transfer.id, initiated_at)
             .await?;
 
         // Thread the confirmed withdrawal_tx so the burn-scan lower bound is
         // derived from the withdrawal tx block (not the raw chain head).
-        self.continue_alpaca_to_base_from_withdrawal_complete(id, usdc_amount, withdrawal_tx)
-            .await?;
+        self.continue_alpaca_to_base_from_withdrawal_complete(
+            id,
+            usdc_amount,
+            withdrawal_tx,
+            initiated_at,
+        )
+        .await?;
 
         info!(target: "rebalance", "Alpaca to Base rebalance completed successfully");
         Ok(())
@@ -1679,11 +1803,124 @@ impl<
             })
     }
 
+    /// Converts a `CctpError::MintRecoveryInconclusive` into the redrive
+    /// error the job layer expects, logging the occurrence at `warn` level.
+    /// Shared by the three `Bridge::mint` call sites (`execute_cctp_mint`,
+    /// `execute_cctp_mint_on_ethereum`, `recover_from_bridging_failed`),
+    /// which otherwise duplicated this exact match arm with only the log
+    /// message's context differing.
+    ///
+    /// This variant is also reached when `usedNonces()` already confirmed
+    /// the nonce consumed but exact receipt reconstruction failed (a
+    /// mismatched or missing `MessageReceived`/`MintAndWithdraw` log), not
+    /// only when the nonce state itself is unknown. Both cases redrive into
+    /// the SAME generic resume path (`continue_from_attested` /
+    /// `recover_from_bridging_failed`'s own next attempt), whose mint
+    /// adoption (`find_recent_mint`) matches by recipient and block window,
+    /// not by the specific CCTP nonce/message that just failed exact
+    /// reconstruction -- a looser proof than `recover_already_minted`'s own
+    /// nonce-scoped check. This is believed safe today only because the
+    /// single-USDC-rebalance-in-flight invariant means no other mint to this
+    /// wallet should land inside that window; it is NOT an independent proof
+    /// that the adopted mint is this transfer's. A guard-latch bug (this
+    /// codebase has a documented history of them) or a manual/external mint
+    /// landing in the window would let a redrive adopt the wrong mint.
+    ///
+    /// BOUNDED BY A DEADLINE, mirroring `WithdrawalPollInconclusive`: every call
+    /// site redrives via `UsdcTransferError::MintRecoveryInconclusive` for as
+    /// long as `CctpEndpoint::recover_already_minted`'s probe loop keeps
+    /// returning `MintRecoveryInconclusive` (e.g. a durably degraded RPC
+    /// endpoint). The redrive itself stays unbounded and budget-free -- the
+    /// `usdc_in_progress` rebalancing guard stays held exactly as it would for
+    /// a genuine in-flight transfer, since declaring a terminal failure on
+    /// unobserved state (or on funds that may have already moved) would be
+    /// wrong. What bounds it is the alert: `initiated_at`, threaded here from
+    /// whichever of the four durable states (`Bridging`, `AwaitingAttestation`,
+    /// `Attested`, `BridgingFailed`) the caller resumed from, lets the job
+    /// layer (`job.rs`'s `handle_mint_recovery_inconclusive`) compute elapsed
+    /// time since the transfer started. Before the deadline only a warn log
+    /// fires; at or after it the operator is paged on every redrive via
+    /// `ctx.notifier.notify`, while the guard stays held and redriving
+    /// continues at a slower cadence to avoid alert fatigue.
+    fn redrive_on_mint_recovery_inconclusive(
+        id: &UsdcRebalanceId,
+        error: CctpError,
+        call_site: MintCallSite,
+        initiated_at: DateTime<Utc>,
+    ) -> UsdcTransferError {
+        warn!(
+            target: "rebalance",
+            %id,
+            ?call_site,
+            "CCTP mint recovery inconclusive: the nonce state is unknown, or the nonce read \
+             consumed but its receipt could not be reconstructed; will retry: {error}"
+        );
+        UsdcTransferError::MintRecoveryInconclusive {
+            id: id.clone(),
+            initiated_at,
+            source: Box::new(error),
+        }
+    }
+
+    /// Classifies a `Bridge::find_recent_mint` scan failure hit while resuming
+    /// from `Attested` (`continue_alpaca_to_base_from_attested` /
+    /// `continue_from_attested`), BEFORE any mint is attempted.
+    ///
+    /// `find_recent_mint` never submits a transaction -- it only reads
+    /// `MintAndWithdraw` logs via `eth_getLogs` -- so it structurally cannot
+    /// fail with a revert-class error; every failure it can actually produce
+    /// (`RpcTransport`, `SolType` decode) is a transport/RPC hiccup on the
+    /// destination chain. That is exactly the "durably degraded RPC endpoint"
+    /// case `MintRecoveryInconclusive` exists to tolerate: the USDC is already
+    /// burned, so declaring this terminal via `UsdcTransferError::Cctp` would
+    /// consume the apalis retry budget and open the circuit instead of
+    /// continuing the unbounded, deadline-gated redrive, stranding the
+    /// transfer on exactly the incident this feature was built to survive.
+    ///
+    /// Reuses `CctpError::is_revert()` (rather than a parallel hand-maintained
+    /// variant list) to draw the line: a non-revert error redrives via
+    /// `MintRecoveryInconclusive` carrying `initiated_at` unchanged, so the job
+    /// layer's deadline-gated alert (`handle_mint_recovery_inconclusive`) still
+    /// applies. A revert-class error would mean this scan somehow observed a
+    /// reverted transaction -- not reachable through `find_recent_mint` today,
+    /// but classified as structurally terminal for defense in depth should the
+    /// scan's implementation ever change.
+    fn redrive_on_mint_scan_failure(
+        id: &UsdcRebalanceId,
+        error: CctpError,
+        call_site: MintScanCallSite,
+        initiated_at: DateTime<Utc>,
+    ) -> UsdcTransferError {
+        if error.is_revert() {
+            warn!(
+                target: "rebalance",
+                %id,
+                %call_site,
+                "CCTP mint scan reverted while resuming from Attested: {error}"
+            );
+            return UsdcTransferError::Cctp(Box::new(error));
+        }
+
+        warn!(
+            target: "rebalance",
+            %id,
+            %call_site,
+            "CCTP mint scan failed transiently while resuming from Attested; \
+             nonce state unknown, will retry: {error}"
+        );
+        UsdcTransferError::MintRecoveryInconclusive {
+            id: id.clone(),
+            initiated_at,
+            source: Box::new(error),
+        }
+    }
+
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
     async fn execute_cctp_mint(
         &self,
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
+        initiated_at: DateTime<Utc>,
     ) -> Result<MintReceipt, UsdcTransferError> {
         let mint_receipt = match self
             .cctp_bridge
@@ -1691,6 +1928,29 @@ impl<
             .await
         {
             Ok(receipt) => receipt,
+            // Either the recovery window expired without ever getting a
+            // conclusive usedNonces() read (every remaining probe itself
+            // errored), or the nonce was confirmed consumed but its receipt
+            // could not be reconstructed (a lagging log scan, a mismatched
+            // log, a reverted mint tx) -- in both cases whether/how the mint
+            // landed is UNKNOWN or already-landed-but-unconfirmed, not
+            // "definitely not minted". Declaring FailBridging here would
+            // strand the rebalancing guard on state we never actually
+            // observed, or on funds we already know moved; redriving instead
+            // is safe -- the aggregate stays in `Attested`, whose resume
+            // adopts an already-landed mint via a bounded scan before minting
+            // again, so a redrive cannot double-mint.
+            //
+            // See `redrive_on_mint_recovery_inconclusive`'s doc for the
+            // deadline-based operator alert bounding this redrive.
+            Err(error @ CctpError::MintRecoveryInconclusive { .. }) => {
+                return Err(Self::redrive_on_mint_recovery_inconclusive(
+                    id,
+                    error,
+                    MintCallSite::ExecuteCctpMint,
+                    initiated_at,
+                ));
+            }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP mint failed: {error}");
                 self.cqrs
@@ -1814,13 +2074,20 @@ impl<
 
         let amount_u256 = usdc_to_u256(amount)?;
 
+        // Approximate initiated_at: captured before the vault withdrawal and
+        // CCTP burn. The aggregate records its durable value after withdrawal
+        // succeeds, so this can err early by the withdrawal duration but never
+        // delays paging by the two on-chain operations. Any redrive reads the
+        // exact aggregate value via resume_base_to_alpaca.
+        let initiated_at = Utc::now();
+
         self.withdraw_from_vault(id, amount, amount_u256).await?;
 
         let burn_receipt = self.execute_cctp_burn_on_base(id, amount_u256).await?;
 
         // From Bridging onward the fresh-start and resume paths are identical:
         // poll Circle, record the attestation, mint, deposit, and convert.
-        self.continue_from_bridging(id, amount, burn_receipt.tx)
+        self.continue_from_bridging(id, amount, burn_receipt.tx, initiated_at)
             .await?;
 
         info!(target: "rebalance", "Base to Alpaca rebalance completed successfully");
@@ -1860,17 +2127,22 @@ impl<
                 direction,
                 amount,
                 from_block,
+                initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
                 let amount_u256 = usdc_to_u256(amount)?;
                 self.resume_withdrawal_submitting(id, amount, amount_u256, from_block)
                     .await?;
-                self.continue_from_withdrawal_complete(id, amount).await
+                self.continue_from_withdrawal_complete(id, amount, initiated_at)
+                    .await
             }
 
             Some(UsdcRebalance::Withdrawing {
-                direction, amount, ..
+                direction,
+                amount,
+                initiated_at,
+                ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
                 self.cqrs
@@ -1881,14 +2153,19 @@ impl<
                         },
                     )
                     .await?;
-                self.continue_from_withdrawal_complete(id, amount).await
+                self.continue_from_withdrawal_complete(id, amount, initiated_at)
+                    .await
             }
 
             Some(UsdcRebalance::WithdrawalComplete {
-                direction, amount, ..
+                direction,
+                amount,
+                initiated_at,
+                ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                self.continue_from_withdrawal_complete(id, amount).await
+                self.continue_from_withdrawal_complete(id, amount, initiated_at)
+                    .await
             }
 
             Some(UsdcRebalance::BridgingSubmitting {
@@ -1896,6 +2173,7 @@ impl<
                 amount,
                 from_block,
                 pending_burn_tx,
+                initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
@@ -1903,7 +2181,7 @@ impl<
                 let burn_receipt = self
                     .resume_bridging_submitting(id, amount_u256, from_block, pending_burn_tx)
                     .await?;
-                self.continue_from_bridging(id, amount, burn_receipt.tx)
+                self.continue_from_bridging(id, amount, burn_receipt.tx, initiated_at)
                     .await
             }
 
@@ -1911,10 +2189,12 @@ impl<
                 direction,
                 amount,
                 burn_tx_hash,
+                initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                self.continue_from_bridging(id, amount, burn_tx_hash).await
+                self.continue_from_bridging(id, amount, burn_tx_hash, initiated_at)
+                    .await
             }
 
             Some(UsdcRebalance::AwaitingAttestation {
@@ -1922,11 +2202,20 @@ impl<
                 amount,
                 burn_tx_hash,
                 retry_deadline_at,
+                initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                self.continue_from_awaiting_attestation(id, amount, burn_tx_hash, retry_deadline_at)
-                    .await
+                self.continue_from_awaiting_attestation(
+                    id,
+                    amount,
+                    burn_tx_hash,
+                    AwaitingAttestationTimestamps {
+                        retry_deadline_at,
+                        initiated_at,
+                    },
+                )
+                .await
             }
 
             Some(UsdcRebalance::Attested {
@@ -1936,17 +2225,18 @@ impl<
                 attestation,
                 message,
                 mint_scan_from_block,
+                initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
                 self.continue_from_attested(
                     id,
-                    direction,
                     burn_tx_hash,
                     attestation,
                     cctp_nonce,
                     message,
                     mint_scan_from_block,
+                    initiated_at,
                 )
                 .await
             }
@@ -2024,10 +2314,12 @@ impl<
             Some(UsdcRebalance::BridgingFailed {
                 direction,
                 burn_tx_hash,
+                initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                self.recover_from_bridging_failed(id, burn_tx_hash).await
+                self.recover_from_bridging_failed(id, burn_tx_hash, initiated_at)
+                    .await
             }
 
             Some(
@@ -2055,6 +2347,7 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         burn_tx_hash: Option<TxHash>,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let Some(burn_tx_hash) = burn_tx_hash else {
             warn!(
@@ -2102,11 +2395,39 @@ impl<
 
         // Idempotent: if the nonce was already consumed, `mint` returns the
         // existing receipt via `recover_already_minted` instead of re-minting.
-        let mint_receipt = self
+        let mint_receipt = match self
             .cctp_bridge
             .mint(BridgeDirection::BaseToEthereum, &attestation)
             .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+        {
+            Ok(receipt) => receipt,
+            // Mirrors the same arm in `execute_cctp_mint`/
+            // `execute_cctp_mint_on_ethereum`: whether/how the mint landed is
+            // UNKNOWN or already-landed-but-unconfirmed, not "definitely not
+            // minted". Blanket-mapping this to `UsdcTransferError::Cctp` would
+            // land in the job's generic terminal arm, alerting and opening
+            // the circuit on a transfer whose USDC already burned -- exactly
+            // the multi-hour stranding this recovery path exists to fix.
+            // Redriving is safe: the aggregate stays `BridgingFailed` (already
+            // terminal), and the next redrive re-polls the attestation and
+            // re-attempts the mint. Idempotency here does NOT come from a
+            // bounded scan (this path never calls `find_recent_mint` -- that
+            // is `continue_from_attested`'s mechanism, not this one's): it
+            // comes from CCTP's nonce being authoritative (`receiveMessage`
+            // reverts on an already-consumed nonce) plus
+            // `recover_already_minted`'s own reconstruction, whose backward
+            // scan is bounded (not unbounded) by
+            // `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS` on the bridge side.
+            Err(error @ CctpError::MintRecoveryInconclusive { .. }) => {
+                return Err(Self::redrive_on_mint_recovery_inconclusive(
+                    id,
+                    error,
+                    MintCallSite::RecoverFromBridgingFailed,
+                    initiated_at,
+                ));
+            }
+            Err(error) => return Err(UsdcTransferError::Cctp(Box::new(error))),
+        };
 
         let amount_received = u256_to_usdc(mint_receipt.amount)?;
 
@@ -2240,10 +2561,11 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let amount_u256 = usdc_to_u256(amount)?;
         let burn_receipt = self.execute_cctp_burn_on_base(id, amount_u256).await?;
-        self.continue_from_bridging(id, amount, burn_receipt.tx)
+        self.continue_from_bridging(id, amount, burn_receipt.tx, initiated_at)
             .await
     }
 
@@ -2254,6 +2576,7 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
         burn_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let burn_receipt = BurnReceipt {
             tx: burn_tx_hash,
@@ -2275,7 +2598,8 @@ impl<
         };
 
         info!(target: "rebalance", "Circle attestation received for Base burn");
-        self.mint_and_continue(id, attestation_response).await
+        self.mint_and_continue(id, attestation_response, initiated_at)
+            .await
     }
 
     /// Drives the transfer from `AwaitingAttestation`: re-poll Circle until the
@@ -2286,8 +2610,12 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        retry_deadline_at: DateTime<Utc>,
+        timestamps: AwaitingAttestationTimestamps,
     ) -> Result<(), UsdcTransferError> {
+        let AwaitingAttestationTimestamps {
+            retry_deadline_at,
+            initiated_at,
+        } = timestamps;
         let burn_receipt = BurnReceipt {
             tx: burn_tx_hash,
             amount: usdc_to_u256(amount)?,
@@ -2312,7 +2640,8 @@ impl<
             }
         };
 
-        self.mint_and_continue(id, attestation_response).await
+        self.mint_and_continue(id, attestation_response, initiated_at)
+            .await
     }
 
     /// Drives the transfer from `Attested` through to terminal.
@@ -2337,12 +2666,12 @@ impl<
     async fn continue_from_attested(
         &self,
         id: &UsdcRebalanceId,
-        direction: RebalanceDirection,
         burn_tx_hash: TxHash,
         attestation: Vec<u8>,
         cctp_nonce: B256,
         message: Option<Vec<u8>>,
         mint_scan_from_block: Option<u64>,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         // Events persisted before crash-safe resume carry no scan bound. Scanning
         // from genesis could adopt an unrelated mint to the same wallet, so refuse
@@ -2352,13 +2681,13 @@ impl<
             return Err(UsdcTransferError::ResumeWithoutMintScanBound { id: id.clone() });
         };
 
-        // The mint lands on the destination chain of `direction`; scanning the
-        // wrong chain would miss the already-submitted mint and fall through to a
-        // double-mint that reverts on the used CCTP nonce.
-        let mint_direction = match direction {
-            RebalanceDirection::BaseToAlpaca => BridgeDirection::BaseToEthereum,
-            RebalanceDirection::AlpacaToBase => BridgeDirection::EthereumToBase,
-        };
+        // This function is only reached via `resume_base_to_alpaca`'s `Attested`
+        // arm, which already validated the direction through
+        // `require_base_to_alpaca`, so the mint direction (destination chain)
+        // is always Base->Ethereum here. There is no `AlpacaToBase` equivalent
+        // to make this generic over: `continue_alpaca_to_base_from_attested`
+        // is the separate, dedicated function for that direction.
+        let mint_direction = BridgeDirection::BaseToEthereum;
 
         if let Some(mint_receipt) = self
             .cctp_bridge
@@ -2368,7 +2697,14 @@ impl<
                 mint_scan_from_block,
             )
             .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?
+            .map_err(|error| {
+                Self::redrive_on_mint_scan_failure(
+                    id,
+                    error,
+                    MintScanCallSite::BaseToAlpaca,
+                    initiated_at,
+                )
+            })?
         {
             let amount_received = u256_to_usdc(mint_receipt.amount)?;
 
@@ -2400,7 +2736,8 @@ impl<
                 message,
             )
             .await?;
-        self.mint_and_continue(id, attestation_response).await
+        self.mint_and_continue(id, attestation_response, initiated_at)
+            .await
     }
 
     /// Mints on the destination chain from a fresh attestation and continues to
@@ -2409,9 +2746,10 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let mint_receipt = self
-            .execute_cctp_mint_on_ethereum(id, attestation_response)
+            .execute_cctp_mint_on_ethereum(id, attestation_response, initiated_at)
             .await?;
         self.continue_from_bridged_fresh(id, u256_to_usdc(mint_receipt.amount)?)
             .await
@@ -3372,22 +3710,34 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
+        initiated_at: DateTime<Utc>,
     ) -> Result<MintReceipt, UsdcTransferError> {
-        // This `Err` arm records a durable, terminal `FailBridging`. What it
-        // implies about the CCTP nonce depends on which `mint()` error landed:
+        // The final `Err` arm below records a durable, terminal `FailBridging`.
+        // What it implies about the CCTP nonce depends on which `mint()` error
+        // landed:
         //
         // - A `receiveMessage` SUBMISSION error (e.g. a dropped/timed-out
         //   receipt on a load-balanced RPC) is routed through
         //   `recover_already_minted`, which probes `usedNonces()` and returns
-        //   the real receipt if the mint landed. Reaching this arm that way
-        //   means recovery found no receipt: the nonce read UNUSED, or the probe
-        //   was inconclusive (the `usedNonces()` read or log scan failed, or the
-        //   receipt could not be reconstructed). Both re-surface the submit
-        //   error, so "definitely unused" and "unknown" are indistinguishable.
+        //   the real receipt if the mint landed. Reaching the terminal arm
+        //   that way means the LAST probe's `usedNonces()` read confirmed the
+        //   nonce still unconsumed -- and since a consumed nonce is never
+        //   un-consumed, that single conclusive read is a decided outcome, not
+        //   a guess, even if earlier probes errored transiently along the way.
         // - Other `mint()` errors skip recovery entirely: notably a SUCCESSFUL
         //   `receiveMessage` whose receipt lacks the `MintAndWithdraw` event
         //   returns `MintAndWithdrawEventNotFound` with no `usedNonces()` probe,
         //   and there the nonce may already be consumed.
+        //
+        // A THIRD case -- the window expired without ever getting a
+        // conclusive `usedNonces()` read (every remaining probe itself
+        // errored), OR the nonce was confirmed consumed but its receipt could
+        // not be reconstructed (a lagging log scan, a mismatched log, a
+        // reverted mint tx) -- is distinguished by
+        // `CctpError::MintRecoveryInconclusive` and handled by the first
+        // match arm: it redrives via `MintRecoveryInconclusive` instead of
+        // declaring a false terminal failure on unobserved state, or on funds
+        // we already know moved.
         //
         // Do not re-probe synchronously here -- a re-check cannot observe a mint
         // that confirms after this decision, and recovery is deferred, not lost:
@@ -3402,6 +3752,22 @@ impl<
             .await
         {
             Ok(receipt) => receipt,
+            // See "A THIRD case" above: redrive rather than strand the guard
+            // on state the probe loop never actually observed, or on funds we
+            // already know moved. The aggregate stays in `Attested`, whose
+            // resume adopts an already-landed mint via a bounded scan before
+            // minting again, so a redrive cannot double-mint.
+            //
+            // See `redrive_on_mint_recovery_inconclusive`'s doc for the
+            // deadline-based operator alert bounding this redrive.
+            Err(error @ CctpError::MintRecoveryInconclusive { .. }) => {
+                return Err(Self::redrive_on_mint_recovery_inconclusive(
+                    id,
+                    error,
+                    MintCallSite::ExecuteCctpMintOnEthereum,
+                    initiated_at,
+                ));
+            }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP mint on Ethereum failed: {error}");
                 self.cqrs
@@ -3761,6 +4127,322 @@ mod tests {
             _from_block: u64,
         ) -> Result<Option<TxHash>, CctpError> {
             unimplemented!("MockBridge: find_recent_usdc_transfer not used in this test")
+        }
+    }
+
+    /// A `Bridge` decorator whose `mint()` always returns
+    /// `CctpError::MintRecoveryInconclusive`, forwarding every other `Bridge`
+    /// and `UsdcBridgeHelper` method to a wrapped real bridge. Used to test
+    /// that `execute_cctp_mint`/`execute_cctp_mint_on_ethereum`/
+    /// `recover_from_bridging_failed` redrive via
+    /// `UsdcTransferError::MintRecoveryInconclusive` instead of declaring
+    /// `FailBridging` on that error class.
+    ///
+    /// Generic over `InnerBridge` (rather than a unit struct with
+    /// `unimplemented!()` methods) because `recover_from_bridging_failed`
+    /// calls `poll_attestation` before `mint`, and constructing a real
+    /// `AttestationResponse` requires `AttestationResponse::from_parts`,
+    /// which is intentionally module-private to `st0x-bridge` -- the only
+    /// sanctioned way this crate's tests can produce one is through a real
+    /// bridge's `Bridge::reconstruct_attestation`/`poll_attestation`.
+    struct MintErrorBridge<InnerBridge> {
+        inner: InnerBridge,
+    }
+
+    #[async_trait::async_trait]
+    impl<InnerBridge> st0x_bridge::Bridge for MintErrorBridge<InnerBridge>
+    where
+        InnerBridge: st0x_bridge::Bridge<Error = CctpError, Attestation = AttestationResponse>,
+    {
+        type Error = CctpError;
+        type Attestation = AttestationResponse;
+
+        async fn burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+        ) -> Result<BurnReceipt, CctpError> {
+            self.inner.burn(direction, amount, recipient).await
+        }
+
+        async fn submit_burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+        ) -> Result<TxHash, CctpError> {
+            self.inner.submit_burn(direction, amount, recipient).await
+        }
+
+        async fn confirm_burn(
+            &self,
+            direction: BridgeDirection,
+            tx_hash: TxHash,
+            amount: U256,
+        ) -> Result<BurnReceipt, CctpError> {
+            self.inner.confirm_burn(direction, tx_hash, amount).await
+        }
+
+        async fn burn_status(
+            &self,
+            direction: BridgeDirection,
+            tx_hash: TxHash,
+        ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
+            self.inner.burn_status(direction, tx_hash).await
+        }
+
+        async fn poll_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.poll_attestation(direction, burn_tx).await
+        }
+
+        async fn mint(
+            &self,
+            _direction: BridgeDirection,
+            _attestation: &AttestationResponse,
+        ) -> Result<st0x_bridge::MintReceipt, CctpError> {
+            Err(CctpError::MintRecoveryInconclusive {
+                recovery_error: Box::new(CctpError::ScanInconclusive { from_block: 0 }),
+            })
+        }
+
+        fn reconstruct_attestation(
+            &self,
+            message: Vec<u8>,
+            attestation: Vec<u8>,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.reconstruct_attestation(message, attestation)
+        }
+
+        async fn find_recent_burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+            from_block: u64,
+        ) -> Result<Option<TxHash>, CctpError> {
+            self.inner
+                .find_recent_burn(direction, amount, recipient, from_block)
+                .await
+        }
+
+        async fn find_recent_mint(
+            &self,
+            direction: BridgeDirection,
+            recipient: Address,
+            from_block: u64,
+        ) -> Result<Option<st0x_bridge::MintReceipt>, CctpError> {
+            self.inner
+                .find_recent_mint(direction, recipient, from_block)
+                .await
+        }
+
+        async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
+            self.inner.destination_block(direction).await
+        }
+
+        async fn source_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
+            self.inner.source_block(direction).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<InnerBridge> UsdcBridgeHelper for MintErrorBridge<InnerBridge>
+    where
+        InnerBridge: UsdcBridgeHelper,
+    {
+        async fn ethereum_tx_confirmations(
+            &self,
+            tx_hash: TxHash,
+        ) -> Result<Option<u64>, CctpError> {
+            self.inner.ethereum_tx_confirmations(tx_hash).await
+        }
+
+        async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+            self.inner.ethereum_tx_block(tx_hash).await
+        }
+
+        async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+            self.inner.ethereum_usdc_balance(holder).await
+        }
+
+        async fn send_usdc_on_ethereum(
+            &self,
+            to: Address,
+            amount: U256,
+        ) -> Result<TxHash, CctpError> {
+            self.inner.send_usdc_on_ethereum(to, amount).await
+        }
+
+        async fn find_recent_usdc_transfer(
+            &self,
+            from: Address,
+            to: Address,
+            amount: U256,
+            from_block: u64,
+        ) -> Result<Option<TxHash>, CctpError> {
+            self.inner
+                .find_recent_usdc_transfer(from, to, amount, from_block)
+                .await
+        }
+    }
+
+    /// A `Bridge` decorator whose `find_recent_mint` always returns a canned
+    /// non-revert `CctpError`, forwarding every other `Bridge` and
+    /// `UsdcBridgeHelper` method to a wrapped real bridge. Used to test that
+    /// `continue_alpaca_to_base_from_attested`/`continue_from_attested`
+    /// redrive via `UsdcTransferError::MintRecoveryInconclusive` on a
+    /// transport-class pre-mint scan failure instead of declaring the
+    /// transfer terminally `Cctp`-failed -- the exact "durably degraded RPC"
+    /// case this redrive path exists to tolerate.
+    struct FindRecentMintErrorBridge<InnerBridge> {
+        inner: InnerBridge,
+    }
+
+    #[async_trait::async_trait]
+    impl<InnerBridge> st0x_bridge::Bridge for FindRecentMintErrorBridge<InnerBridge>
+    where
+        InnerBridge: st0x_bridge::Bridge<Error = CctpError, Attestation = AttestationResponse>,
+    {
+        type Error = CctpError;
+        type Attestation = AttestationResponse;
+
+        async fn burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+        ) -> Result<BurnReceipt, CctpError> {
+            self.inner.burn(direction, amount, recipient).await
+        }
+
+        async fn submit_burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+        ) -> Result<TxHash, CctpError> {
+            self.inner.submit_burn(direction, amount, recipient).await
+        }
+
+        async fn confirm_burn(
+            &self,
+            direction: BridgeDirection,
+            tx_hash: TxHash,
+            amount: U256,
+        ) -> Result<BurnReceipt, CctpError> {
+            self.inner.confirm_burn(direction, tx_hash, amount).await
+        }
+
+        async fn burn_status(
+            &self,
+            direction: BridgeDirection,
+            tx_hash: TxHash,
+        ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
+            self.inner.burn_status(direction, tx_hash).await
+        }
+
+        async fn poll_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.poll_attestation(direction, burn_tx).await
+        }
+
+        async fn mint(
+            &self,
+            direction: BridgeDirection,
+            attestation: &AttestationResponse,
+        ) -> Result<st0x_bridge::MintReceipt, CctpError> {
+            self.inner.mint(direction, attestation).await
+        }
+
+        fn reconstruct_attestation(
+            &self,
+            message: Vec<u8>,
+            attestation: Vec<u8>,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.reconstruct_attestation(message, attestation)
+        }
+
+        async fn find_recent_burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+            from_block: u64,
+        ) -> Result<Option<TxHash>, CctpError> {
+            self.inner
+                .find_recent_burn(direction, amount, recipient, from_block)
+                .await
+        }
+
+        // The method under test: a canned non-revert error, regardless of
+        // direction/recipient/from_block. `ScanInconclusive` is a
+        // representative non-revert `CctpError` (mirrors the sentinel used by
+        // `CctpError::is_revert()`'s own unit tests); the specific variant is
+        // not what's under test, only that `is_revert()` classifies it `false`.
+        async fn find_recent_mint(
+            &self,
+            _direction: BridgeDirection,
+            _recipient: Address,
+            _from_block: u64,
+        ) -> Result<Option<st0x_bridge::MintReceipt>, CctpError> {
+            Err(CctpError::ScanInconclusive { from_block: 0 })
+        }
+
+        async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
+            self.inner.destination_block(direction).await
+        }
+
+        async fn source_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
+            self.inner.source_block(direction).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<InnerBridge> UsdcBridgeHelper for FindRecentMintErrorBridge<InnerBridge>
+    where
+        InnerBridge: UsdcBridgeHelper,
+    {
+        async fn ethereum_tx_confirmations(
+            &self,
+            tx_hash: TxHash,
+        ) -> Result<Option<u64>, CctpError> {
+            self.inner.ethereum_tx_confirmations(tx_hash).await
+        }
+
+        async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+            self.inner.ethereum_tx_block(tx_hash).await
+        }
+
+        async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+            self.inner.ethereum_usdc_balance(holder).await
+        }
+
+        async fn send_usdc_on_ethereum(
+            &self,
+            to: Address,
+            amount: U256,
+        ) -> Result<TxHash, CctpError> {
+            self.inner.send_usdc_on_ethereum(to, amount).await
+        }
+
+        async fn find_recent_usdc_transfer(
+            &self,
+            from: Address,
+            to: Address,
+            amount: U256,
+            from_block: u64,
+        ) -> Result<Option<TxHash>, CctpError> {
+            self.inner
+                .find_recent_usdc_transfer(from, to, amount, from_block)
+                .await
         }
     }
 
@@ -8899,7 +9581,7 @@ mod tests {
         // The burn attempt fails (Cctp error from the fee query or the REVERT
         // contract). Either way the error must not be a balance-gate wedge.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -8958,7 +9640,7 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -9037,7 +9719,7 @@ mod tests {
         // tx-confirmation endpoint registered), producing SettlementCheckTransient.
         // A BurnRevert error proves the gate was skipped and the burn was attempted.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -9089,7 +9771,7 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -9161,7 +9843,12 @@ mod tests {
         // the balance read returns zero (RPC node lag).
         let confirmed_tx = chain.mint_tx;
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, Some(confirmed_tx))
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(confirmed_tx),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -9239,7 +9926,7 @@ mod tests {
         // emitted before the burn attempt; the REVERT leaves the aggregate at
         // BridgingSubmitting with no FailBridging.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -9798,7 +10485,7 @@ mod tests {
         // zero USDC. No FailBridging is emitted; the aggregate stays in
         // WithdrawalComplete for the next delayed-redrive attempt.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -10541,7 +11228,7 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -10961,7 +11648,12 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, Some(under_confirmed_tx))
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(under_confirmed_tx),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -11014,7 +11706,7 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
             .await
             .unwrap_err();
 
@@ -11174,7 +11866,12 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, Some(withdrawal_tx))
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(withdrawal_tx),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -11530,6 +12227,440 @@ mod tests {
         assert_eq!(
             last_burn_tx, expected_second_hash,
             "last PendingBurnRecorded must carry the second-attempt hash"
+        );
+    }
+
+    /// A `mint()` failure classified `CctpError::MintRecoveryInconclusive` (the
+    /// recovery window expired without ever getting a conclusive `usedNonces()`
+    /// read) must NOT be treated the same as a decided mint failure: declaring
+    /// `FailBridging` would strand the rebalancing guard on state the probe
+    /// loop never actually observed. `execute_cctp_mint` must instead return
+    /// `MintRecoveryInconclusive` so the job delayed-redrives, leaving the
+    /// aggregate at `Attested` (whose resume adopts an already-landed mint via
+    /// a bounded scan before minting again, so the redrive is safe). The
+    /// `initiated_at` passed in must be threaded through unchanged so the job
+    /// layer can compute the alert deadline from it.
+    #[tokio::test]
+    async fn mint_recovery_inconclusive_redrives_instead_of_failing_bridging() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+
+        // The message/attestation bytes are irrelevant to this test:
+        // MintErrorBridge's `mint()` ignores its argument and always returns
+        // the same canned error. `reconstruct_attestation` only needs a
+        // byte-valid envelope to construct one.
+        let attestation_response = real_cctp_bridge
+            .reconstruct_attestation(valid_cctp_message(), vec![0x01])
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_attested_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(MintErrorBridge {
+                inner: real_cctp_bridge,
+            }),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            address!("0x2222222222222222222222222222222222222222"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let initiated_at = Utc::now() - chrono::Duration::minutes(30);
+        let error = manager
+            .execute_cctp_mint(&id, attestation_response, initiated_at)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!(
+                "a mint recovery window that expired inconclusively must redrive via \
+                 MintRecoveryInconclusive, not fail the bridge; got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(
+            err_initiated_at, initiated_at,
+            "initiated_at must be threaded through unchanged so the job layer can \
+             compute the alert deadline from it"
+        );
+
+        // No FailBridging must have been emitted: the aggregate stays at
+        // Attested so the next redrive can adopt a late mint or retry cleanly.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
+        );
+    }
+
+    /// Mirrors `mint_recovery_inconclusive_redrives_instead_of_failing_bridging`
+    /// for the BaseToAlpaca (Ethereum-side) mint direction: a `mint()` failure
+    /// classified `CctpError::MintRecoveryInconclusive` must redrive via
+    /// `MintRecoveryInconclusive` from `execute_cctp_mint_on_ethereum` too, not
+    /// just from the AlpacaToBase `execute_cctp_mint`. This is the direction
+    /// described as the actual production incident (a stranded post-burn
+    /// `BridgingFailed` blocking USDC rebalancing for hours), so it needs its
+    /// own direct coverage rather than relying on the AlpacaToBase test alone.
+    #[tokio::test]
+    async fn mint_recovery_inconclusive_redrives_instead_of_failing_bridging_on_ethereum() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+
+        // The message/attestation bytes are irrelevant to this test:
+        // MintErrorBridge's `mint()` ignores its argument and always returns
+        // the same canned error. `reconstruct_attestation` only needs a
+        // byte-valid envelope to construct one.
+        let attestation_response = real_cctp_bridge
+            .reconstruct_attestation(valid_cctp_message(), vec![0x01])
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_attested_base_to_alpaca(&cqrs, &id, amount).await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(MintErrorBridge {
+                inner: real_cctp_bridge,
+            }),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            address!("0x2222222222222222222222222222222222222222"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let initiated_at = Utc::now() - chrono::Duration::minutes(30);
+        let error = manager
+            .execute_cctp_mint_on_ethereum(&id, attestation_response, initiated_at)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!(
+                "a mint recovery window that expired inconclusively must redrive via \
+                 MintRecoveryInconclusive, not fail the bridge; got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(
+            err_initiated_at, initiated_at,
+            "initiated_at must be threaded through unchanged so the job layer can \
+             compute the alert deadline from it"
+        );
+
+        // No FailBridging must have been emitted: the aggregate stays at
+        // Attested so the next redrive can adopt a late mint or retry cleanly.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
+        );
+    }
+
+    /// The third `Bridge::mint` call site, `recover_from_bridging_failed` (the
+    /// post-burn `BridgingFailed` recovery path), must also redrive on
+    /// `CctpError::MintRecoveryInconclusive` rather than blanket-mapping every
+    /// mint error to `UsdcTransferError::Cctp`, which would land in the job's
+    /// generic terminal arm and open the circuit on a transfer whose USDC
+    /// already burned -- the exact multi-hour stranding this recovery path
+    /// exists to fix.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_redrives_on_mint_recovery_inconclusive() {
+        let server = MockServer::start();
+        // `recover_from_bridging_failed` polls the attestation before minting;
+        // mock it complete so the test reaches `mint()` (MintErrorBridge's
+        // canned failure) instead of retrying Circle's real API for minutes.
+        let _attestation_mock = mock_complete_attestation(&server);
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, vault_service) =
+            create_test_onchain_services_with_circle_api(wallet, server.base_url());
+
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        // Drive to a POST-burn BridgingFailed (carries burn_tx_hash): the only
+        // shape `recover_from_bridging_failed` attempts to recover.
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000003");
+        // Bracket the Initiate handler's `Utc::now()` stamp so the durable
+        // initiated_at threaded through to MintRecoveryInconclusive can be
+        // pinned to a tight window, not merely bounded above.
+        let before_initiate = Utc::now();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+        )
+        .await
+        .unwrap();
+        let after_initiate = Utc::now();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: "transient receipt error while the mint may have landed".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(MintErrorBridge {
+                inner: real_cctp_bridge,
+            }),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            address!("0x2222222222222222222222222222222222222222"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!(
+                "a post-burn BridgingFailed recovery whose mint recovery window expired \
+                 inconclusively must redrive via MintRecoveryInconclusive, not stay \
+                 terminally mapped to Cctp; got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        // `BridgingFailed` carries its own durable `initiated_at`, stamped by the
+        // aggregate's `Initiate` handler at `before_initiate..after_initiate`, not
+        // a fresh `Utc::now()` taken at recovery time. Bracketing the Initiate
+        // send pins the exact expected window rather than only bounding above.
+        assert!(
+            err_initiated_at >= before_initiate && err_initiated_at <= after_initiate,
+            "initiated_at must be the durable timestamp recorded when the transfer began \
+             ({before_initiate:?}..={after_initiate:?}), not a fresh Utc::now() call at \
+             recovery time; got {err_initiated_at:?}"
+        );
+
+        // The aggregate must remain BridgingFailed (no further command
+        // emitted): the next redrive re-polls the attestation and idempotently
+        // adopts an already-landed mint via a bounded scan.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "aggregate must remain BridgingFailed (no re-fail, no false recovery); got: {state:?}"
+        );
+    }
+
+    /// A transport-class `find_recent_mint` failure hit while scanning for an
+    /// already-submitted mint on `Attested` resume (BEFORE any mint is even
+    /// attempted) must NOT be blanket-mapped to `UsdcTransferError::Cctp`: that
+    /// lands in the job's generic terminal arm, consuming the apalis retry
+    /// budget and opening the circuit on exactly the "durably degraded
+    /// destination RPC" case the mint-recovery redrive exists to survive, even
+    /// though the USDC is already burned. `continue_alpaca_to_base_from_attested`
+    /// must instead redrive via `MintRecoveryInconclusive`, carrying
+    /// `initiated_at` unchanged, exactly like a `Bridge::mint` recovery-probe
+    /// failure.
+    #[tokio::test]
+    async fn find_recent_mint_scan_transport_failure_redrives_alpaca_to_base() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_attested_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let expected_initiated_at = match cqrs.load(&id).await.unwrap().expect("aggregate exists") {
+            UsdcRebalance::Attested { initiated_at, .. } => initiated_at,
+            other => panic!("expected Attested state, got: {other:?}"),
+        };
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(FindRecentMintErrorBridge {
+                inner: real_cctp_bridge,
+            }),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            address!("0x2222222222222222222222222222222222222222"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!(
+                "a transport-class find_recent_mint scan failure must redrive via \
+                 MintRecoveryInconclusive, not terminally fail via Cctp; got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(
+            err_initiated_at, expected_initiated_at,
+            "initiated_at must be threaded through unchanged so the job layer can \
+             compute the alert deadline from it"
+        );
+
+        // No FailBridging must have been emitted: the aggregate stays at
+        // Attested so the next redrive can retry the scan or adopt a late mint.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
+        );
+    }
+
+    /// Mirrors `find_recent_mint_scan_transport_failure_redrives_alpaca_to_base`
+    /// for the BaseToAlpaca (Ethereum-side) mint direction: a transport-class
+    /// `find_recent_mint` failure during `continue_from_attested`'s pre-mint
+    /// scan must also redrive via `MintRecoveryInconclusive`, not `Cctp`.
+    #[tokio::test]
+    async fn find_recent_mint_scan_transport_failure_redrives_base_to_alpaca() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_attested_base_to_alpaca(&cqrs, &id, amount).await;
+
+        let expected_initiated_at = match cqrs.load(&id).await.unwrap().expect("aggregate exists") {
+            UsdcRebalance::Attested { initiated_at, .. } => initiated_at,
+            other => panic!("expected Attested state, got: {other:?}"),
+        };
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(FindRecentMintErrorBridge {
+                inner: real_cctp_bridge,
+            }),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            address!("0x2222222222222222222222222222222222222222"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!(
+                "a transport-class find_recent_mint scan failure must redrive via \
+                 MintRecoveryInconclusive, not terminally fail via Cctp; got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(
+            err_initiated_at, expected_initiated_at,
+            "initiated_at must be threaded through unchanged so the job layer can \
+             compute the alert deadline from it"
+        );
+
+        // No FailBridging must have been emitted: the aggregate stays at
+        // Attested so the next redrive can retry the scan or adopt a late mint.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
         );
     }
 
@@ -13477,7 +14608,12 @@ mod tests {
         let fake_tx = TxHash::from_slice(&[0xabu8; 32]);
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, Some(fake_tx))
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(fake_tx),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
