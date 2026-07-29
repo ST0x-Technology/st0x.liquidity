@@ -13,7 +13,7 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Consecutive offchain polls that must diverge from the inventory view's
 # Hedging balance for a symbol before the poller escalates a forced snapshot
 # reconciliation.
-inventory_divergence_threshold = 3
+inventory_divergence_threshold = 10
 [telemetry]
 service_name = "st0x-liquidity"
 environment = "staging"
