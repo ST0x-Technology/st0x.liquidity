@@ -1182,16 +1182,24 @@ mod tests {
     use chrono::Utc;
     use httpmock::prelude::*;
     use sqlx::{Row, SqlitePool};
-    use st0x_event_sorcery::test_store;
+    use st0x_dto::Statement;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_raindex::RaindexContracts;
     use st0x_tokenization::issuer_request_id;
+    use std::num::NonZeroU32;
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::snapshot::InventorySnapshotEvent;
+    use crate::inventory::{
+        BroadcastingInventory, DivergenceGate, InventoryProjection, InventoryView,
+    };
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
@@ -4265,5 +4273,461 @@ mod tests {
             "Duplicate provider rows should only count once"
         );
         assert!(redemptions.is_empty());
+    }
+
+    fn zero_broker_inventory() -> Inventory {
+        Inventory {
+            positions: vec![],
+            usd_balance_cents: 0,
+            cash_buying_power_cents: None,
+            alpaca_usdc: None,
+            cash_withdrawable_cents: None,
+        }
+    }
+
+    fn broadcasting_inventory(view: InventoryView) -> Arc<BroadcastingInventory> {
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        Arc::new(BroadcastingInventory::new(view, event_sender))
+    }
+
+    /// Poller over a broker holding zero positions, with divergence
+    /// recovery wired against `inventory`/`gate` at `threshold`.
+    fn reconciling_service(
+        pool: &SqlitePool,
+        snapshot: Arc<Store<InventorySnapshot>>,
+        inventory: Arc<BroadcastingInventory>,
+        gate: Arc<DivergenceGate>,
+        threshold: u32,
+    ) -> InventoryPollingService<ReadOnlyEvm<impl Provider + Clone + 'static>, MockExecutor> {
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider);
+        let (orderbook, order_owner) = test_addresses();
+        let executor = MockExecutor::new().with_inventory(zero_broker_inventory());
+
+        InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            snapshot,
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_equity_symbols(configured_symbols(&["SPYM"]))
+        .with_divergence_recovery(InventoryDivergenceRecoveryCtx {
+            inventory,
+            threshold: NonZeroU32::new(threshold).unwrap(),
+            gate,
+        })
+    }
+
+    async fn reconciled_events(
+        pool: &SqlitePool,
+        orderbook: Address,
+        order_owner: Address,
+    ) -> Vec<InventorySnapshotEvent> {
+        load_snapshot_events(pool, orderbook, order_owner)
+            .await
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    InventorySnapshotEvent::OffchainEquityReconciled { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn divergence_escalates_at_exactly_threshold_polls() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        // Phantom 136 at Hedging while the broker reports zero. No reactor
+        // is wired, so the view never changes and every poll diverges.
+        let inventory = broadcasting_inventory(InventoryView::default().with_equity(
+            spym.clone(),
+            test_shares(0),
+            test_shares(136),
+        ));
+        let gate = Arc::new(DivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(
+            gate.is_engaged(&spym),
+            "the first diverging poll must engage the transfer gate"
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(
+            reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "below the threshold no escalation may fire"
+        );
+
+        service.poll_and_record().await.unwrap();
+        let events = reconciled_events(&pool, orderbook, order_owner).await;
+        let [event] = events.as_slice() else {
+            panic!("Expected exactly one reconcile escalation, got {events:?}");
+        };
+        let InventorySnapshotEvent::OffchainEquityReconciled {
+            symbol,
+            position,
+            ledger_position,
+            consecutive_polls,
+            ..
+        } = event
+        else {
+            panic!("Expected OffchainEquityReconciled, got {event:?}");
+        };
+        assert_eq!(symbol, &spym);
+        assert_eq!(position, &test_shares(0));
+        assert_eq!(ledger_position, &Some(test_shares(136)));
+        assert_eq!(*consecutive_polls, 3);
+        assert!(
+            !gate.is_engaged(&spym),
+            "a sent escalation must release the gate"
+        );
+
+        // Counter was reset by the escalation: the next diverging poll
+        // starts a fresh count instead of escalating immediately.
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            reconciled_events(&pool, orderbook, order_owner).await.len(),
+            1,
+            "a fresh count must not escalate again on the next poll"
+        );
+        assert!(
+            gate.is_engaged(&spym),
+            "a fresh divergence after the reset engages the gate again"
+        );
+    }
+
+    #[tokio::test]
+    async fn divergence_counter_resets_on_matching_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let inventory = broadcasting_inventory(InventoryView::default().with_equity(
+            spym.clone(),
+            test_shares(0),
+            test_shares(136),
+        ));
+        let gate = Arc::new(DivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            2,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(gate.is_engaged(&spym));
+
+        // The view catches up to the broker (as a reconciled projection
+        // would): the next poll matches, resetting the counter and lifting
+        // the gate.
+        {
+            let mut view = inventory.write().await;
+            *view =
+                InventoryView::default().with_equity(spym.clone(), test_shares(0), test_shares(0));
+        }
+        service.poll_and_record().await.unwrap();
+        assert!(
+            !gate.is_engaged(&spym),
+            "a matching poll must reset the counter and lift the gate"
+        );
+
+        // The phantom returns: with the counter reset, the next poll is
+        // count 1 (no escalation at threshold 2) and only the one after
+        // escalates.
+        {
+            let mut view = inventory.write().await;
+            *view = InventoryView::default().with_equity(
+                spym.clone(),
+                test_shares(0),
+                test_shares(136),
+            );
+        }
+        service.poll_and_record().await.unwrap();
+        assert!(
+            reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "the reset counter must restart from one, not resume at two"
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            reconciled_events(&pool, orderbook, order_owner).await.len(),
+            1,
+            "the second consecutive divergence after the reset escalates"
+        );
+    }
+
+    /// Drives the freeze scenario for one busy source: one diverging
+    /// poll (count 1), busy polls that must neither count nor escalate while
+    /// keeping the gate engaged, then release and a final diverging poll
+    /// that escalates with `consecutive_polls == 2`, proving the busy
+    /// window froze the counter instead of resetting it.
+    async fn assert_counter_frozen_while_busy(
+        make_busy: impl Fn(InventoryView, &Symbol) -> InventoryView,
+        clear_busy: impl Fn(InventoryView, &Symbol) -> InventoryView,
+    ) {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let inventory = broadcasting_inventory(InventoryView::default().with_equity(
+            spym.clone(),
+            test_shares(0),
+            test_shares(136),
+        ));
+        let gate = Arc::new(DivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            2,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(gate.is_engaged(&spym));
+
+        {
+            let mut view = inventory.write().await;
+            *view = make_busy(view.clone(), &spym);
+        }
+        service.poll_and_record().await.unwrap();
+        service.poll_and_record().await.unwrap();
+        assert!(
+            reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "busy polls must not count toward the threshold"
+        );
+        assert!(
+            gate.is_engaged(&spym),
+            "the gate must stay engaged while the counter is frozen"
+        );
+
+        {
+            let mut view = inventory.write().await;
+            *view = clear_busy(view.clone(), &spym);
+        }
+        service.poll_and_record().await.unwrap();
+        let events = reconciled_events(&pool, orderbook, order_owner).await;
+        let [
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                consecutive_polls, ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected exactly one reconcile escalation, got {events:?}");
+        };
+        assert_eq!(
+            *consecutive_polls, 2,
+            "the busy window must freeze the counter, not reset it"
+        );
+    }
+
+    #[tokio::test]
+    async fn divergence_counter_frozen_while_inflight() {
+        assert_counter_frozen_while_busy(
+            |view, symbol| {
+                view.update_equity(
+                    symbol,
+                    crate::inventory::Inventory::set_inflight(Venue::Hedging, test_shares(10)),
+                    Utc::now(),
+                )
+                .unwrap()
+            },
+            |view, symbol| {
+                view.update_equity(
+                    symbol,
+                    crate::inventory::Inventory::set_inflight(
+                        Venue::Hedging,
+                        FractionalShares::ZERO,
+                    ),
+                    Utc::now(),
+                )
+                .unwrap()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn divergence_counter_frozen_while_mint_active() {
+        assert_counter_frozen_while_busy(
+            |view, symbol| view.set_active_mint(symbol.clone(), issuer_request_id("frozen")),
+            InventoryView::clear_active_mint,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn divergence_counter_frozen_while_redemption_active() {
+        assert_counter_frozen_while_busy(
+            |view, symbol| {
+                view.set_active_redemption(symbol.clone(), RedemptionAggregateId(Uuid::new_v4()))
+            },
+            InventoryView::clear_active_redemption,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn divergence_counter_frozen_while_hedge_order_pending() {
+        assert_counter_frozen_while_busy(
+            |mut view, symbol| {
+                view.mark_offchain_order_pending(symbol.clone());
+                view
+            },
+            |mut view, symbol| {
+                view.clear_offchain_order_pending(symbol, None);
+                view
+            },
+        )
+        .await;
+    }
+
+    /// Recreates the production incident end to end: a redemption's cleanup
+    /// credited a phantom 136.87 SPYM at Hedging and stamped
+    /// `last_rebalancing`; the aggregate already stores the true zero, so
+    /// every identical poll dedups to no event; repeated failed cleanups
+    /// keep stamping the guard between polls. The view must converge to
+    /// the broker's zero within the configured number of polls, with the
+    /// transfer gate engaged until the divergence resolves.
+    #[tokio::test]
+    async fn phantom_hedging_credit_self_heals_within_threshold_polls() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+        let phantom = FractionalShares::new(float!("136.87"));
+        let now = Utc::now();
+
+        // Phantom credit at Hedging, guard armed by clear_equity_inflight.
+        let view = InventoryView::default()
+            .with_equity(spym.clone(), FractionalShares::ZERO, phantom)
+            .clear_equity_inflight(&spym, Venue::Hedging, now)
+            .unwrap();
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(DivergenceGate::default());
+
+        // Snapshot store wired to the projection, matching the topology
+        // with rebalancing disabled (the reactor topology routes the event
+        // through the same `apply_snapshot_event` arm).
+        let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .with(Arc::new(InventoryProjection::new(inventory.clone())))
+            .build(())
+            .await
+            .unwrap();
+
+        // The aggregate already stores the true zero, recorded by a poll
+        // that predates the guard stamp (the view skipped it as stale), so
+        // every later identical poll dedups to no event: the wedge.
+        snapshot_store
+            .send(
+                &InventorySnapshotId {
+                    orderbook,
+                    owner: order_owner,
+                },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), FractionalShares::ZERO)]),
+                    fetched_at: now - chrono::Duration::seconds(60),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .equity_available(&spym, Venue::Hedging),
+            Some(phantom),
+            "precondition: the staleness guard must keep the phantom credit in the view"
+        );
+
+        let service =
+            reconciling_service(&pool, snapshot_store, inventory.clone(), gate.clone(), 3);
+
+        // Polls 1 and 2: aggregate dedups, view stays wedged, gate engaged
+        // (so no new equity transfer can fire for the symbol); a failed
+        // cleanup stamps last_rebalancing again between polls.
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .equity_available(&spym, Venue::Hedging),
+            Some(phantom),
+            "one diverging poll must not yet reconcile"
+        );
+        assert!(
+            gate.is_engaged(&spym),
+            "an unresolved divergence must gate transfers"
+        );
+
+        {
+            let mut view = inventory.write().await;
+            *view = view
+                .clone()
+                .clear_equity_inflight(&spym, Venue::Hedging, Utc::now())
+                .unwrap();
+        }
+
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .equity_available(&spym, Venue::Hedging),
+            Some(phantom),
+            "two diverging polls must not yet reconcile"
+        );
+        assert!(gate.is_engaged(&spym));
+
+        // Poll 3 reaches the threshold: escalation, an event that always
+        // emits, forced reconcile through the projection.
+        service.poll_and_record().await.unwrap();
+
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .equity_available(&spym, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "the view must converge to the broker value within threshold polls"
+        );
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .equity_inflight(&spym, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "the reconcile leaves no residual inflight"
+        );
+        assert!(
+            !gate.is_engaged(&spym),
+            "the sent escalation must lift the transfer gate"
+        );
     }
 }

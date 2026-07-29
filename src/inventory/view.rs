@@ -2111,6 +2111,7 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use proptest::prelude::*;
     use rain_math_float::Float;
+    use uuid::Uuid;
 
     use st0x_finance::Usdc;
     use st0x_wrapper::RATIO_ONE;
@@ -4289,5 +4290,287 @@ mod tests {
                 prop_assert_eq!(dto_slot(&dto, location), view.inflight_cash_at(location));
             }
         }
+    }
+
+    fn reconciled_event(
+        symbol: &Symbol,
+        broker: FractionalShares,
+        ledger: Option<FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    ) -> InventorySnapshotEvent {
+        InventorySnapshotEvent::OffchainEquityReconciled {
+            symbol: symbol.clone(),
+            position: broker,
+            fetched_at,
+            ledger_position: ledger,
+            consecutive_polls: 3,
+        }
+    }
+
+    /// The incident shape: a phantom Hedging credit protected by a freshly
+    /// stamped `last_rebalancing` that ordinary snapshots cannot pierce. The
+    /// reconcile event must force the broker value through, clear inflight,
+    /// and advance the watermark.
+    #[test]
+    fn reconcile_event_force_applies_over_stale_rebalancing_guard() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        // Phantom 136 at Hedging; clear_equity_inflight stamps
+        // last_rebalancing = now, the guard that wedged the view in the
+        // incident.
+        let view = InventoryView::default()
+            .with_equity(spym.clone(), shares(0), shares(136))
+            .clear_equity_inflight(&spym, Venue::Hedging, now)
+            .unwrap();
+
+        // An ordinary snapshot fetched before the stamp stays rejected.
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), shares(0))]),
+                    fetched_at: now - Duration::seconds(1),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_available(&spym, Venue::Hedging),
+            Some(shares(136)),
+            "precondition: the ordinary snapshot path must stay wedged"
+        );
+
+        let reconcile_fetched_at = now + Duration::seconds(1);
+        let healed = view
+            .apply_snapshot_event(
+                &reconciled_event(&spym, shares(0), Some(shares(136)), reconcile_fetched_at),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            healed.equity_available(&spym, Venue::Hedging),
+            Some(shares(0)),
+            "the reconcile must force the broker value through the guard"
+        );
+        assert_eq!(
+            healed.equity_inflight(&spym, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "the force path clears Hedging inflight"
+        );
+
+        // Watermark advanced to the reconcile's fetched_at: a snapshot
+        // stamped at or before it must not apply...
+        let replayed = healed
+            .clone()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), shares(99))]),
+                    fetched_at: reconcile_fetched_at,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            replayed.equity_available(&spym, Venue::Hedging),
+            Some(shares(0)),
+            "a snapshot at the reconcile watermark must be rejected"
+        );
+
+        // ...while a strictly newer one applies.
+        let fresher = healed
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), shares(2))]),
+                    fetched_at: reconcile_fetched_at + Duration::seconds(1),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            fresher.equity_available(&spym, Venue::Hedging),
+            Some(shares(2)),
+            "a strictly newer snapshot must apply after the reconcile"
+        );
+    }
+
+    /// The reconcile must not stamp `last_rebalancing`: a snapshot fetched
+    /// after the reconcile but before its apply time must still apply.
+    /// Stamping (as `clear_equity_inflight` does) would reject that
+    /// snapshot and recreate the wedge the reconcile just cleared.
+    #[test]
+    fn reconcile_does_not_stamp_last_rebalancing() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let fetched_at = Utc::now();
+        let heal_applied_at = fetched_at + Duration::seconds(10);
+
+        let view = InventoryView::default()
+            .with_equity(spym.clone(), shares(0), shares(136))
+            .reconcile_offchain_equity(
+                &spym,
+                shares(0),
+                Some(shares(136)),
+                3,
+                fetched_at,
+                heal_applied_at,
+            )
+            .unwrap();
+
+        // Fetched after the reconcile's watermark but before the
+        // reconcile's apply time: rejected iff last_rebalancing was stamped.
+        let updated = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), shares(5))]),
+                    fetched_at: fetched_at + Duration::seconds(1),
+                },
+                heal_applied_at,
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.equity_available(&spym, Venue::Hedging),
+            Some(shares(5)),
+            "a snapshot after the reconcile must apply; the reconcile must \
+             not stamp last_rebalancing"
+        );
+    }
+
+    #[test]
+    fn reconcile_aborts_when_symbol_acquired_inflight_between_escalation_and_apply() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(spym.clone(), shares(50), shares(136))
+            .update_equity(
+                &spym,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+
+        let result = view
+            .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&spym, Venue::Hedging),
+            Some(shares(126)),
+            "the reconcile must abort while an inflight transfer owns the balance"
+        );
+        assert_eq!(
+            result.equity_inflight(&spym, Venue::Hedging),
+            Some(shares(10)),
+            "the aborted reconcile must not clear the live inflight"
+        );
+    }
+
+    #[test]
+    fn reconcile_aborts_when_symbol_acquired_active_mint_between_escalation_and_apply() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(spym.clone(), shares(0), shares(136))
+            .set_active_mint(spym.clone(), st0x_tokenization::issuer_request_id("mint"));
+
+        let result = view
+            .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&spym, Venue::Hedging),
+            Some(shares(136)),
+            "the reconcile must abort while a mint owns the symbol's inflight slot"
+        );
+    }
+
+    #[test]
+    fn reconcile_aborts_when_symbol_acquired_active_redemption_between_escalation_and_apply() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(spym.clone(), shares(0), shares(136))
+            .set_active_redemption(spym.clone(), RedemptionAggregateId(Uuid::new_v4()));
+
+        let result = view
+            .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&spym, Venue::Hedging),
+            Some(shares(136)),
+            "the reconcile must abort while a redemption owns the symbol's \
+             inflight slot"
+        );
+    }
+
+    /// Mirror of `force_apply_offchain_snapshot_respects_open_hedge_gate`:
+    /// even the reconcile force path must not overwrite a balance owned by
+    /// an open hedge order's fill delta.
+    #[test]
+    fn reconcile_respects_open_hedge_gate() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(136));
+        view.mark_offchain_order_pending(spym.clone());
+
+        let gated = view
+            .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
+            .unwrap();
+        assert_eq!(
+            gated.equity_available(&spym, Venue::Hedging),
+            Some(shares(136)),
+            "an open hedge order owns the balance; the reconcile must abort"
+        );
+
+        // The aborted reconcile must not burn the watermark: once the order
+        // terminates, delivering the same reconcile event again applies it.
+        let mut released = gated;
+        released.clear_offchain_order_pending(&spym, None);
+        let healed = released
+            .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
+            .unwrap();
+        assert_eq!(
+            healed.equity_available(&spym, Venue::Hedging),
+            Some(shares(0)),
+            "the reconcile must apply once the hedge order terminated"
+        );
+    }
+
+    #[test]
+    fn equity_reconciliation_busy_covers_each_busy_source() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let quiescent = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
+        assert!(!quiescent.equity_reconciliation_busy(&spym).unwrap());
+
+        let inflight = quiescent
+            .clone()
+            .update_equity(
+                &spym,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(5)),
+                now,
+            )
+            .unwrap();
+        assert!(inflight.equity_reconciliation_busy(&spym).unwrap());
+
+        let minting = quiescent
+            .clone()
+            .set_active_mint(spym.clone(), st0x_tokenization::issuer_request_id("mint"));
+        assert!(minting.equity_reconciliation_busy(&spym).unwrap());
+
+        let redeeming = quiescent
+            .clone()
+            .set_active_redemption(spym.clone(), RedemptionAggregateId(Uuid::new_v4()));
+        assert!(redeeming.equity_reconciliation_busy(&spym).unwrap());
+
+        let mut hedging = quiescent;
+        hedging.mark_offchain_order_pending(spym.clone());
+        assert!(hedging.equity_reconciliation_busy(&spym).unwrap());
     }
 }

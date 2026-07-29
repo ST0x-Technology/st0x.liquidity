@@ -2051,4 +2051,129 @@ mod tests {
 
         assert_eq!(fetched_at, inflight_fetched_at);
     }
+
+    #[tokio::test]
+    async fn reconcile_offchain_equity_emits_even_when_position_matches_stored_state() {
+        let symbol = test_symbol("SPYM");
+        let stored_at = Utc::now();
+        let fetched_at = stored_at + chrono::Duration::seconds(60);
+        let positions = BTreeMap::from([(symbol.clone(), test_shares(0))]);
+
+        // The stored state already holds the correct zero, the case where
+        // the OffchainEquity dedup would emit no event.
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at: stored_at,
+            }])
+            .when(InventorySnapshotCommand::ReconcileOffchainEquity {
+                symbol: symbol.clone(),
+                position: test_shares(0),
+                fetched_at,
+                ledger_position: Some(test_shares(136)),
+                consecutive_polls: 3,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1, "reconcile must always emit");
+        let InventorySnapshotEvent::OffchainEquityReconciled {
+            symbol: event_symbol,
+            position,
+            fetched_at: event_fetched_at,
+            ledger_position,
+            consecutive_polls,
+        } = &events[0]
+        else {
+            panic!(
+                "Expected OffchainEquityReconciled event, got {:?}",
+                events[0]
+            );
+        };
+        assert_eq!(event_symbol, &symbol);
+        assert_eq!(position, &test_shares(0));
+        assert_eq!(event_fetched_at, &fetched_at);
+        assert_eq!(ledger_position, &Some(test_shares(136)));
+        assert_eq!(*consecutive_polls, 3);
+    }
+
+    #[test]
+    fn reconciled_event_folds_into_offchain_equity_for_hydration() {
+        let aapl = test_symbol("AAPL");
+        let spym = test_symbol("SPYM");
+        let stored_at = Utc::now();
+        let reconciled_at = stored_at + chrono::Duration::seconds(60);
+
+        let state = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([
+                    (aapl.clone(), test_shares(5)),
+                    (spym.clone(), test_shares(136)),
+                ]),
+                fetched_at: stored_at,
+            },
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: spym.clone(),
+                position: test_shares(0),
+                fetched_at: reconciled_at,
+                ledger_position: Some(test_shares(136)),
+                consecutive_polls: 3,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            state.offchain_equity.get(&spym),
+            Some(&test_shares(0)),
+            "the reconciled symbol must fold to the broker value"
+        );
+        assert_eq!(
+            state.offchain_equity.get(&aapl),
+            Some(&test_shares(5)),
+            "other symbols keep their stored positions"
+        );
+        assert_eq!(state.offchain_equity_fetched_at, Some(reconciled_at));
+
+        // Startup hydration replays the reconciled value, not the diverged one.
+        let hydrated = state
+            .hydration_events()
+            .into_iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }))
+            .expect("expected offchain equity hydration event");
+        let InventorySnapshotEvent::OffchainEquity { positions, .. } = hydrated else {
+            panic!("Expected OffchainEquity event");
+        };
+        assert_eq!(positions.get(&spym), Some(&test_shares(0)));
+    }
+
+    #[test]
+    fn stale_reconciled_event_does_not_regress_offchain_equity() {
+        let spym = test_symbol("SPYM");
+        let stored_at = Utc::now();
+        let stale_at = stored_at - chrono::Duration::seconds(60);
+
+        let state = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(spym.clone(), test_shares(7))]),
+                fetched_at: stored_at,
+            },
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: spym.clone(),
+                position: test_shares(0),
+                fetched_at: stale_at,
+                ledger_position: None,
+                consecutive_polls: 3,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            state.offchain_equity.get(&spym),
+            Some(&test_shares(7)),
+            "a reconcile fetched before the stored snapshot must not fold"
+        );
+        assert_eq!(state.offchain_equity_fetched_at, Some(stored_at));
+    }
 }

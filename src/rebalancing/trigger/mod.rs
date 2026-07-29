@@ -21661,6 +21661,50 @@ mod tests {
         assert_eq!(job.symbol, symbol);
     }
 
+    /// A symbol held by the divergence gate must not dispatch equity
+    /// transfers: the view balance backing the imbalance is suspect, and a
+    /// failed transfer would mark the symbol busy and freeze the poller's
+    /// divergence counter. Releasing the gate (what a matching poll or a
+    /// sent escalation does) restores dispatch.
+    #[tokio::test]
+    async fn divergence_gate_suppresses_equity_transfer_dispatch() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        trigger.divergence_gate().engage(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "a gated symbol must not dispatch an equity transfer"
+        );
+
+        trigger.divergence_gate().release(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        let dispatched = take_pending_equity_mint_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one mint job after release, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
     /// A crash between `queue.push` and the first persisted mint event leaves
     /// a pending job row while the in-memory guard resets. The Jobs-table
     /// dedupe must suppress a second enqueue for the same symbol while

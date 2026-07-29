@@ -1871,6 +1871,7 @@ mod tests {
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
@@ -3445,6 +3446,7 @@ mod tests {
                 server_port = 8080
                 board_port = 8081
                 apalis_finished_job_cleanup_interval_secs = 3600
+                inventory_divergence_threshold = 3
 
                 [assets.equities]
 

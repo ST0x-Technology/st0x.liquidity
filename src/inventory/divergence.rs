@@ -98,3 +98,40 @@ pub(crate) struct PersistentBrokerDivergence {
     pub(crate) broker_value: FractionalShares,
     pub(crate) polls: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(ticker: &str) -> Symbol {
+        Symbol::new(ticker).unwrap()
+    }
+
+    #[test]
+    fn gate_engages_and_releases_symbols_independently() {
+        let gate = DivergenceGate::default();
+        let aapl = symbol("AAPL");
+        let tsla = symbol("TSLA");
+
+        gate.engage(&aapl);
+
+        assert!(gate.is_engaged(&aapl));
+        assert!(!gate.is_engaged(&tsla));
+
+        gate.release(&aapl);
+
+        assert!(!gate.is_engaged(&aapl));
+    }
+
+    #[test]
+    fn gate_engage_is_idempotent() {
+        let gate = DivergenceGate::default();
+        let aapl = symbol("AAPL");
+
+        gate.engage(&aapl);
+        gate.engage(&aapl);
+        gate.release(&aapl);
+
+        assert!(!gate.is_engaged(&aapl));
+    }
+}
