@@ -16,6 +16,12 @@ type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 10000
 
+const withTradeProtocol = (url: string): string => {
+  const protocolUrl = new URL(url)
+  protocolUrl.searchParams.set('trade_protocol', 'terminal_outcomes_v1')
+  return protocolUrl.toString()
+}
+
 const getReconnectDelay = (attempts: number): number =>
   Math.min(RECONNECT_DELAY_MS * Math.pow(2, attempts), MAX_RECONNECT_DELAY_MS)
 
@@ -25,6 +31,7 @@ export type ErrorContext = {
 }
 
 export const createWebSocket = (url: string, queryClient: QueryClient) => {
+  const protocolUrl = withTradeProtocol(url)
   let socket: WebSocket | null = null
   let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
   const reconnectAttempts = reactive(0)
@@ -40,6 +47,8 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
       trade_update: ({ data }) => { appendTrade(queryClient, data); },
 
+      trade_fill: ({ data }) => { appendTrade(queryClient, data); },
+
       position_update: ({ data }) => { upsertPosition(queryClient, data); },
 
       inventory_snapshot: ({ data }) => { updateSnapshot(queryClient, data); },
@@ -49,10 +58,10 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
   }
 
   const createSocket = () => {
-    socket = new WebSocket(url)
+    socket = new WebSocket(protocolUrl)
 
     socket.onopen = () => {
-      if (import.meta.env.DEV) console.log(`[ws] connected to ${url}`)
+      if (import.meta.env.DEV) console.log(`[ws] connected to ${protocolUrl}`)
       fsm.send('open')
     }
 

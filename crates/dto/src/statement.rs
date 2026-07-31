@@ -10,7 +10,7 @@ use ts_rs::TS;
 
 use crate::inventory::InventorySnapshot;
 use crate::transfer::TransferOperation;
-use crate::{CurrentState, Position, Trade};
+use crate::{CurrentState, LegacyTrade, Position, Trade};
 
 /// Server-to-client WebSocket statements.
 ///
@@ -29,6 +29,7 @@ use crate::{CurrentState, Position, Trade};
 pub enum Statement {
     CurrentState(Box<CurrentState>),
     TradeUpdate(Trade),
+    TradeFill(LegacyTrade),
     PositionUpdate(Position),
     InventorySnapshot(Box<InventorySnapshot>),
     TransferUpdate(TransferOperation),
@@ -102,6 +103,7 @@ mod tests {
             &[
                 "current_state",
                 "trade_update",
+                "trade_fill",
                 "position_update",
                 "inventory_snapshot",
                 "transfer_update"

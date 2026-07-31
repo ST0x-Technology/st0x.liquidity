@@ -271,6 +271,96 @@ describe('createWebSocket', () => {
       expect(trades[1]?.symbol).toBe('TSLA')
     })
 
+    it('normalizes legacy fills from an old server snapshot', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(
+        JSON.stringify({
+          type: 'current_state',
+          data: {
+            trades: [
+              {
+                id: 'legacy-snapshot',
+                filledAt: '2024-01-01T12:00:00.123456789Z',
+                venue: 'alpaca',
+                direction: 'sell',
+                symbol: 'TSLA',
+                shares: '2'
+              }
+            ],
+            inventory: {
+              perSymbol: [],
+              usdc: {
+                onchainAvailable: '0',
+                onchainInflight: '0',
+                offchainAvailable: '0',
+                offchainInflight: '0',
+                offchainGross: null,
+                withdrawableCash: null,
+                alpacaUsdc: null,
+                inflightCash: { ethereumWallet: null, baseWallet: null }
+              }
+            },
+            positions: [],
+            settings: {},
+            activeTransfers: [],
+            recentTransfers: [],
+            warnings: []
+          }
+        })
+      )
+
+      expect(queryClient.cache.get('["trades"]')).toEqual([
+        {
+          id: 'legacy-snapshot',
+          occurredAt: '2024-01-01T12:00:00.123456789Z',
+          venue: 'alpaca',
+          direction: 'sell',
+          symbol: 'TSLA',
+          shares: '2',
+          outcome: { status: 'filled' }
+        }
+      ])
+    })
+
+    it('accepts legacy live fills from an old server', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(
+        JSON.stringify({
+          type: 'trade_fill',
+          data: {
+            id: 'legacy-live',
+            filledAt: '2024-01-01T12:00:00.123456789Z',
+            venue: 'raindex',
+            direction: 'buy',
+            symbol: 'AAPL',
+            shares: '1'
+          }
+        })
+      )
+
+      expect(queryClient.cache.get('["trades"]')).toEqual([
+        {
+          id: 'legacy-live',
+          occurredAt: '2024-01-01T12:00:00.123456789Z',
+          venue: 'raindex',
+          direction: 'buy',
+          symbol: 'AAPL',
+          shares: '1',
+          outcome: { status: 'filled' }
+        }
+      ])
+    })
+
     it('replaces a matching initial trade with its live update', () => {
       const { getInstance } = setupWebSocketTest()
       const queryClient = new QueryClient({
@@ -311,7 +401,10 @@ describe('createWebSocket', () => {
       )
       queryClient.cache.set('["trades"]', existing)
 
-      const newTrade = makeTrade({ symbol: 'NEW' })
+      const newTrade = makeTrade({
+        symbol: 'NEW',
+        occurredAt: '2024-01-01T12:00:01Z'
+      })
       getInstance(0).simulateMessage({ type: 'trade_update', data: newTrade })
 
       const trades = queryClient.cache.get('["trades"]') as Trade[]
