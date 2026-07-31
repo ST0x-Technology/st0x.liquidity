@@ -60,5 +60,6 @@ changes the behavior. If you delete a feature, delete or revise the doc.
 | [how-to-add-new-asset.md](how-to-add-new-asset.md) | Procedure for onboarding a new tokenized equity                            |
 | [observability.md](observability.md)               | Tracing, metrics, logging conventions                                      |
 | [sqlx.md](sqlx.md)                                 | sqlx usage notes and pitfalls                                              |
+| [staging-smoke-tests.md](staging-smoke-tests.md)   | Proposed on-demand smoke test against live staging (not implemented yet)   |
 | [ttdd.md](ttdd.md)                                 | Type-driven TDD workflow                                                   |
 | [wrapper-nav-bump.md](wrapper-nav-bump.md)         | How the wtStock ERC-4626 wrapper NAV is bumped (bare ERC-20 transfer)      |
