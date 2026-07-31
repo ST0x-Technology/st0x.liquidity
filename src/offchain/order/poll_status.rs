@@ -2105,6 +2105,16 @@ mod tests {
                 self.inner.place_limit_order(order).await
             }
 
+            async fn preflight_counter_trade_at_price(
+                &self,
+                order: st0x_execution::MarketOrder,
+                reference_price: Positive<Usd>,
+            ) -> Result<st0x_execution::CounterTradePreflight, Self::Error> {
+                self.inner
+                    .preflight_counter_trade_at_price(order, reference_price)
+                    .await
+            }
+
             async fn cancel_order(
                 &self,
                 order_id: &Self::OrderId,
@@ -2456,6 +2466,16 @@ mod tests {
                 order: st0x_execution::MarketOrder,
             ) -> Result<st0x_execution::CounterTradePreflight, Self::Error> {
                 self.inner.preflight_counter_trade(order).await
+            }
+
+            async fn preflight_counter_trade_at_price(
+                &self,
+                order: st0x_execution::MarketOrder,
+                reference_price: st0x_execution::Positive<st0x_execution::Usd>,
+            ) -> Result<st0x_execution::CounterTradePreflight, Self::Error> {
+                self.inner
+                    .preflight_counter_trade_at_price(order, reference_price)
+                    .await
             }
 
             async fn place_limit_order(

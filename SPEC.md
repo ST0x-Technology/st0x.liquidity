@@ -387,11 +387,11 @@ the broker calendar:
 
 - **Regular** — standard hours; counter-trades place market orders.
 - **Extended** — pre-market or after-hours; the broker accepts only limit orders
-  flagged `extended_hours = true`. Counter-trades place a limit order priced
-  from the latest trade price plus a configured slippage buffer
-  (`counter_trade_slippage_bps`). Rounding favors fill probability (buys round
-  up, sells round down) and honors the broker's minimum price variance (penny
-  increments at or above $1.00, sub-penny below).
+  flagged `extended_hours = true`. Outside close-flatten mode, counter-trades
+  place a limit order priced from the latest trade price plus a configured
+  slippage buffer (`counter_trade_slippage_bps`). Rounding favors fill
+  probability (buys round up, sells round down) and honors the broker's minimum
+  price variance (penny increments at or above $1.00, sub-penny below).
 - **Closed** — outside all sessions (overnight, weekends, holidays); no order is
   placed. The exposure is left for the next scan to hedge once the venue
   reopens, rather than failing a durable job against a multi-hour closure.
@@ -414,6 +414,55 @@ The session is re-checked at execution time, immediately before placement, so a
 hedge job that was enqueued in one session but runs after a 9:30/16:00 boundary
 places the order type appropriate to the _current_ session, not the stale
 enqueue-time one.
+
+##### Long-gap close flattening
+
+During the configured final `extended_hours_close_flatten_window_secs` of an
+extended session, the bot enters **close-flatten mode** only when the next
+trading session is more than one calendar day away. The broker calendar, not a
+hardcoded weekday or holiday list, classifies the post-close gap as one of:
+
+- **Ordinary overnight** — the next trading session is on the following calendar
+  day. Close-flatten mode does not activate; ordinary weekday exposure handling
+  is unchanged in preparation for planned 24/5 trading.
+- **Multi-day closure** — the next trading session is more than one calendar day
+  away, including weekends and exchange holidays. Close-flatten mode activates.
+- **Unknown** — the current trading day is valid but the broker did not provide
+  enough next-session metadata. Close-flatten mode activates conservatively. A
+  complete calendar request failure remains an error because even the current
+  session boundary is then untrusted.
+
+Close-flatten mode is one shared policy used by both position scanning and hedge
+placement:
+
+- On the first scan inside the window, any live extended-hours hedge placed
+  before the window is cancelled so an aggressive replacement can start
+  promptly. Partial fills are reconciled before cancellation; after the broker
+  confirms the cancellation, every remaining broker-executable amount is
+  released back to the position for retry.
+- Every hedge placed while the mode is active crosses the current NBBO and
+  applies the configured protection bound: buys use the current ask plus
+  `counter_trade_slippage_bps`, while sells use the current bid minus that
+  buffer. Buy prices round up and sell prices round down to Alpaca's allowed
+  tick. Quote requests explicitly select Alpaca's SIP feed so a
+  subscription-dependent default cannot silently substitute an IEX-only quote.
+  Missing SIP access and missing, non-positive, or crossed quotes are retryable
+  errors; the bot never falls back to a latest-trade or stale position price.
+- The existing `extended_hours_reprice_timeout_secs` remains active. With the
+  configured 300-second timeout and 900-second flatten window, an unfilled
+  aggressive hedge is cancelled, reconciled, and repriced from a fresh quote
+  approximately three times before close.
+- New onchain fills received while close-flatten mode is active use the same
+  quote-crossing placement path automatically.
+- If the extended session closes before a queued attempt runs, the session
+  re-check prevents submitting an invalid extended-hours order.
+
+Close flattening changes price urgency, not risk limits. Buying-power checks,
+equity-inventory checks, operational share limits, and Alpaca's $1 minimum
+remain enforced. The bot never uses margin or creates short broker inventory to
+flatten. Broker-minimum dust and exposure blocked by cash or inventory remain
+visible and unsubmitted. Close-flatten attempts and blocks are counted by symbol
+and stable reason, and blocked attempts are logged at error level.
 
 ##### Cancel-and-replace at the regular open
 

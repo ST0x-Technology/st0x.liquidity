@@ -442,8 +442,24 @@ pub(crate) enum TradeAccountingError {
     },
     #[error("Executor does not support fetching trade prices for {symbol}")]
     LimitPriceUnavailable { symbol: st0x_execution::Symbol },
+    #[error("Failed to fetch latest bid/ask quote for {symbol}")]
+    LimitQuoteFetch {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("Executor does not support fetching bid/ask quotes for {symbol}")]
+    LimitQuoteUnavailable { symbol: st0x_execution::Symbol },
     #[error("Slippage calculation failed")]
     SlippageCalculation(#[from] crate::trading::offchain::hedge::SlippageError),
+    #[error(
+        "Failed to re-preflight close-flatten buy against its submitted ask price for {symbol}"
+    )]
+    CloseFlattenPreflightAtPrice {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 #[cfg(test)]

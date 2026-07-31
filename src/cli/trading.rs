@@ -1091,7 +1091,8 @@ mod tests {
     };
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
-        ExecutionError, InventoryResult, LimitOrder, SupportedExecutor,
+        CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, Positive,
+        SupportedExecutor, Usd,
     };
 
     use super::*;
@@ -1272,6 +1273,14 @@ mod tests {
         ) -> Result<CancellationOutcome, Self::Error> {
             Ok(CancellationOutcome::Requested)
         }
+
+        async fn preflight_counter_trade_at_price(
+            &self,
+            order: MarketOrder,
+            _reference_price: Positive<Usd>,
+        ) -> Result<CounterTradePreflight, Self::Error> {
+            self.preflight_counter_trade(order).await
+        }
     }
 
     fn create_base_test_ctx() -> Ctx {
@@ -1299,6 +1308,7 @@ mod tests {
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: 300,
+            extended_hours_close_flatten_window_secs: 900,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,

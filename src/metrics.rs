@@ -41,6 +41,14 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Broker API errors, by symbol and kind"
     );
     metrics::describe_counter!(
+        "close_flatten_attempts_total",
+        "Close-flatten hedge pricing attempts, by symbol, direction, and post-close gap reason"
+    );
+    metrics::describe_counter!(
+        "close_flatten_blocked_total",
+        "Close-flatten attempts blocked before submission, by symbol and stable reason"
+    );
+    metrics::describe_counter!(
         "inventory_ambiguous_settlement_total",
         "Inventory settlements quarantined because a tx emitted multiple \
          OperatorDeposits or multiple OperatorWithdraws and could not be safely paired"
