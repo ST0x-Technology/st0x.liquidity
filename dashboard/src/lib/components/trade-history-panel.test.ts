@@ -304,10 +304,18 @@ describe('TradeHistoryPanel', () => {
 
     const { queryClient, target } = mountPanel()
 
+    // Rows carry the outcome label alone -- the reason and the share
+    // breakdown belong to the detail panel -- so every row stays one line
+    // tall regardless of outcome.
+    const outcomeCells = () =>
+      Array.from(target.querySelectorAll('tbody tr'))
+        .map((row) => row.lastElementChild?.textContent.trim())
+        .sort()
+
     await vi.waitFor(() => {
-      expect(target.textContent).toContain('initial broker failure')
-      expect(target.textContent).toContain('Failed')
+      expect(outcomeCells()).toEqual(['Failed', 'Filled'])
     })
+    expect(target.textContent).not.toContain('initial broker failure')
 
     const connection = createWebSocket('ws://localhost/api/ws', queryClient)
     connection.connect()
@@ -329,14 +337,14 @@ describe('TradeHistoryPanel', () => {
     }
     await tick()
 
+    // The live update for `counter-trade-1` replaces the initially filled row
+    // with its failed outcome, so no filled row survives.
     await vi.waitFor(() => {
-      expect(target.textContent).toContain('broker rejected remainder')
-      expect(target.textContent).toContain('Filled 0.25')
-      expect(target.textContent).toContain('Unfilled 0.75')
-      expect(target.textContent).toContain('broker overfilled before rejecting')
-      expect(target.textContent).toContain('Excess fill 0.5')
+      expect(outcomeCells()).toEqual(['Failed', 'Failed', 'Failed'])
       expect(target.textContent).toContain('3 of 151')
     })
+    expect(target.textContent).not.toContain('broker overfilled before rejecting')
+    expect(target.textContent).not.toContain('Excess fill 0.5')
 
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('limit=100'), expect.any(Object))
     expect(fetchMock).toHaveBeenCalledWith(

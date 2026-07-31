@@ -1075,6 +1075,98 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies that a broker cancellation the bot never requested lands the
+/// offchain order in `Cancelled` -- retaining the partial fill the broker
+/// executed before cancelling -- instead of `Failed`. The two outcomes carry
+/// different meaning downstream (the dashboard renders them apart, and only
+/// `Failed` reports an error), so a cancellation must not collapse into a
+/// failure.
+#[test_log::test(tokio::test)]
+async fn broker_order_cancelled_after_partial_fill() -> anyhow::Result<()> {
+    let onchain_price = float!(150.00);
+    let broker_fill_price = float!(150.00);
+    let sell_amount = float!(5.25);
+    let expected_partial_fill = float!(2.625);
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+
+    infra
+        .broker_service
+        .set_mode(st0x_execution::alpaca_broker_api::MockMode::PartialFillThenCancel);
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    infra
+        .base_chain
+        .take_order()
+        .symbol("AAPL")
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    poll_for_aggregate_events_containing(&mut bot, &infra.db_path, "OffchainOrder", "Cancelled", 1)
+        .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+
+    // The position checker re-hedges the unfilled remainder each cycle, so
+    // several cancelled orders can accumulate; every one of them must carry
+    // the partial fill the broker reported at cancellation.
+    let offchain_orders = Projection::<OffchainOrder>::sqlite(pool.clone())
+        .load_all()
+        .await?;
+    let cancelled: Vec<_> = offchain_orders
+        .iter()
+        .filter_map(|(order_id, order)| match order {
+            OffchainOrder::Cancelled {
+                shares,
+                filled_shares,
+                ..
+            } => Some((order_id, *shares, *filled_shares)),
+            _ => None,
+        })
+        .collect();
+
+    let (order_id, _, filled_shares) = cancelled
+        .iter()
+        .find(|(_, shares, _)| shares.inner() == FractionalShares::new(sell_amount))
+        .expect("The hedge for the full onchain amount should be Cancelled");
+    assert_eq!(
+        *filled_shares,
+        Some(FractionalShares::new(expected_partial_fill)),
+        "Cancelled order {order_id} should retain the partial fill the broker executed"
+    );
+
+    // A re-hedge placed after the cancellation can still be in flight here,
+    // so assert on the cancelled one rather than on every broker order.
+    let broker_statuses: Vec<_> = infra
+        .broker_service
+        .orders()
+        .into_iter()
+        .map(|order| order.status)
+        .collect();
+    assert!(
+        broker_statuses.contains(&OrderStatus::Canceled),
+        "The broker should report the hedge as cancelled, got: {broker_statuses:?}"
+    );
+
+    pool.close().await;
+    bot.abort();
+    Ok(())
+}
+
 /// Verifies that the bot correctly handles orders that take multiple poll
 /// cycles to fill (simulating real broker latency). The order stays in
 /// "new" status for 3 polls before transitioning to "filled".

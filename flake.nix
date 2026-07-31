@@ -418,6 +418,16 @@
                 backendEnv = "SIMULATE_LATENCY_FIXTURE_DAYS=14";
               };
 
+              # Same live dashboard stack as `simulate-market`, but rotates each
+              # counter-trade through filled, rejected, and
+              # partially-filled-then-cancelled so the trade history shows every
+              # outcome the dashboard renders.
+              "simulate-trade-outcomes" = mkSimulation {
+                name = "simulate-trade-outcomes";
+                testFilter = "simulate";
+                backendEnv = "SIMULATE_BROKER_OUTCOME_ROTATION=1";
+              };
+
               # Same live dashboard stack as `simulate-market`, but first creates
               # stuck mint and redemption rebalances whose Alpaca mock
               # provider later completes. The backend logs the

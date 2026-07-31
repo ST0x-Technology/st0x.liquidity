@@ -95,6 +95,45 @@ describe('trade payload validation', () => {
     expect(parseTrade(failed)).toEqual(failed)
   })
 
+  it('accepts zero-fill and partial-fill cancellations', () => {
+    const zeroFill = validTrade({
+      outcome: {
+        status: 'cancelled',
+        acceptedShares: '1.25',
+        filledShares: '0',
+        remainingShares: '1.25',
+        excessShares: '0'
+      }
+    })
+    const partialFill = validTrade({
+      outcome: {
+        status: 'cancelled',
+        acceptedShares: '1.25',
+        filledShares: '0.5',
+        remainingShares: '0.75',
+        excessShares: '0'
+      }
+    })
+
+    expect(parseTrade(zeroFill)).toEqual(zeroFill)
+    expect(parseTrade(partialFill)).toEqual(partialFill)
+  })
+
+  it('rejects a cancelled outcome without explicit v2 acceptance provenance', () => {
+    expect(() =>
+      parseTrade(
+        validTrade({
+          outcome: {
+            status: 'cancelled',
+            filledShares: '0',
+            remainingShares: '1.25',
+            excessShares: '0'
+          }
+        })
+      )
+    ).toThrow('Invalid trade payload at outcome.acceptedShares')
+  })
+
   it('normalizes the v1 failure shape without accepted quantity to unknown', () => {
     const legacy = validTrade({
       outcome: {
@@ -165,6 +204,20 @@ describe('trade payload validation', () => {
         excessShares: null
       }
     })
+  })
+
+  it('accepts a cancelled trade with explicit unknown provenance', () => {
+    const trade = validTrade({
+      outcome: {
+        status: 'cancelled',
+        acceptedShares: null,
+        filledShares: null,
+        remainingShares: null,
+        excessShares: null
+      }
+    })
+
+    expect(parseTrade(trade)).toEqual(trade)
   })
 
   it.each(['filledShares', 'remainingShares', 'excessShares'] as const)(

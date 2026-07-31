@@ -124,13 +124,22 @@ const parseDirection = (value: unknown, path: string): Direction => {
   return invalid(path, 'a known trade direction')
 }
 
-const parseOutcome = (value: unknown, path: string): TradeOutcome => {
-  const outcome = parseRecord(value, path)
-  const statusPath = fieldPath(path, 'status')
-  if (outcome['status'] === 'filled') return { status: 'filled' }
-  if (outcome['status'] !== 'failed') return invalid(statusPath, 'a known terminal outcome')
+type OutcomeQuantities = {
+  acceptedShares: string | null
+  filledShares: string | null
+  remainingShares: string | null
+  excessShares: string | null
+}
 
+const parseOutcomeQuantities = (
+  outcome: Record<string, unknown>,
+  path: string,
+  allowLegacyFailure: boolean
+): OutcomeQuantities => {
   const hasAcceptedShares = 'acceptedShares' in outcome
+  if (!hasAcceptedShares && !allowLegacyFailure) {
+    return invalid(fieldPath(path, 'acceptedShares'), 'an explicit nullable quantity')
+  }
   const acceptedShares = parseNullableDecimal(
     outcome['acceptedShares'] ?? null,
     fieldPath(path, 'acceptedShares'),
@@ -217,13 +226,32 @@ const parseOutcome = (value: unknown, path: string): TradeOutcome => {
   }
 
   return {
-    status: 'failed',
-    error: parseString(outcome['error'], fieldPath(path, 'error')),
     acceptedShares,
     filledShares,
     remainingShares,
     excessShares
   }
+}
+
+const parseOutcome = (value: unknown, path: string): TradeOutcome => {
+  const outcome = parseRecord(value, path)
+  const statusPath = fieldPath(path, 'status')
+  if (outcome['status'] === 'filled') return { status: 'filled' }
+  if (outcome['status'] === 'failed') {
+    return {
+      status: 'failed',
+      error: parseString(outcome['error'], fieldPath(path, 'error')),
+      ...parseOutcomeQuantities(outcome, path, true)
+    }
+  }
+  if (outcome['status'] === 'cancelled') {
+    return {
+      status: 'cancelled',
+      ...parseOutcomeQuantities(outcome, path, false)
+    }
+  }
+
+  return invalid(statusPath, 'a known terminal outcome')
 }
 
 const parseCommonTradeFields = (trade: JsonRecord, path: string): CommonTradeFields => ({

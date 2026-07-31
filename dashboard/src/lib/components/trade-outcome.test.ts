@@ -13,9 +13,30 @@ describe('TradeOutcome', () => {
     expect(body).not.toContain('Unfilled')
   })
 
+  it('renders only the label in a trade-history row, keeping every row one line tall', () => {
+    const { body } = render(TradeOutcome, {
+      props: {
+        outcome: {
+          status: 'failed',
+          error: 'broker rejected remainder',
+          acceptedShares: '1',
+          filledShares: '0.25',
+          remainingShares: '0.75',
+          excessShares: '0'
+        }
+      }
+    })
+
+    expect(body).toContain('Failed')
+    expect(body).not.toContain('broker rejected remainder')
+    expect(body).not.toContain('Accepted')
+    expect(body).not.toContain('Unfilled')
+  })
+
   it('renders a failed counter-trade error and partial-fill quantities', () => {
     const { body } = render(TradeOutcome, {
       props: {
+        compact: false,
         outcome: {
           status: 'failed',
           error: 'broker rejected remainder',
@@ -37,6 +58,7 @@ describe('TradeOutcome', () => {
   it('does not render a nonzero partial fill as zero', () => {
     const { body } = render(TradeOutcome, {
       props: {
+        compact: false,
         outcome: {
           status: 'failed',
           error: 'broker rejected remainder',
@@ -55,6 +77,7 @@ describe('TradeOutcome', () => {
   it('renders broker fills beyond the accepted order quantity', () => {
     const { body } = render(TradeOutcome, {
       props: {
+        compact: false,
         outcome: {
           status: 'failed',
           error: 'broker overfilled before rejecting',
@@ -74,6 +97,7 @@ describe('TradeOutcome', () => {
   it('renders missing provenance as unknown instead of zero', () => {
     const { body } = render(TradeOutcome, {
       props: {
+        compact: false,
         outcome: {
           status: 'failed',
           error: 'placement failed before acceptance',
@@ -88,5 +112,44 @@ describe('TradeOutcome', () => {
     expect(body).toContain('Accepted unknown')
     expect(body).toContain('Filled unknown')
     expect(body).not.toContain('Unfilled 0')
+  })
+
+  it('renders a partially-filled cancellation distinctly', () => {
+    const { body } = render(TradeOutcome, {
+      props: {
+        compact: false,
+        outcome: {
+          status: 'cancelled',
+          acceptedShares: '1',
+          filledShares: '0.25',
+          remainingShares: '0.75',
+          excessShares: '0'
+        }
+      }
+    })
+
+    expect(body).toContain('Cancelled')
+    expect(body).toContain('text-amber-500')
+    expect(body).toContain('Filled 0.25')
+    expect(body).toContain('Unfilled 0.75')
+  })
+
+  it('renders an explicit zero-fill cancellation as wholly unfilled', () => {
+    const { body } = render(TradeOutcome, {
+      props: {
+        compact: false,
+        outcome: {
+          status: 'cancelled',
+          acceptedShares: '1',
+          filledShares: '0',
+          remainingShares: '1',
+          excessShares: '0'
+        }
+      }
+    })
+
+    expect(body).toContain('Filled 0')
+    expect(body).toContain('Unfilled 1')
+    expect(body).not.toContain('Filled unknown')
   })
 })
