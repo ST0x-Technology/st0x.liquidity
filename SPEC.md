@@ -542,6 +542,14 @@ migration files in `migrations/`.
 
 - Calculate profit/loss for each trade pair using actual executed amounts
 - Generate running totals and performance reports over time
+- Include bot-paid gas only from immutable receipt-cost events with a verified
+  payer, strictly positive gas and valuation inputs, and a persisted ETH/USD
+  valuation source
+- Apply the report's `asOfRowid` boundary to bot-gas events exactly as it is
+  applied to other CQRS facts, so later receipt ingestion cannot change a
+  historical report
+- Treat an identical receipt-cost retry as idempotent and reject conflicting
+  facts for the same chain and transaction hash
 - Track inventory positions across both venues
 - Push aggregated metrics to external logging system using structured logging
 - Identify unprofitable trades for strategy optimization
