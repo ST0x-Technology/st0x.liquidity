@@ -1,4 +1,4 @@
--- Forward-only read model for the daily portfolio snapshot (RAI-1457).
+-- Replayable read model for the daily portfolio snapshot (RAI-1457).
 --
 -- Maintained exclusively by the PortfolioSnapshotProjection reactor from the
 -- PortfolioSnapshot aggregate's retained Captured events (one aggregate

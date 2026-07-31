@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{Datelike, Timelike, Weekday};
+use chrono::{Datelike, NaiveDate, Timelike, Weekday};
 use chrono_tz::America::New_York;
 
 use super::costs::CostEntryInternal;
@@ -30,10 +30,22 @@ impl MarketSession {
 }
 
 pub(crate) fn date_key(iso: &str) -> String {
-    parse_timestamp(iso).map_or_else(
+    et_day_key(iso).map_or_else(
         || iso.get(..10).unwrap_or(iso).to_owned(),
-        |parsed| parsed.with_timezone(&New_York).date_naive().to_string(),
+        |day| day.to_string(),
     )
+}
+
+/// The ET accounting day of an ISO timestamp, as a typed date. Date-only
+/// values (e.g. Alpaca account activities stamped `2026-05-15`) are taken as
+/// already naming their accounting day. `None` when the value is neither --
+/// callers joining on accounting days must treat that as an error rather
+/// than falling back to a prefix of the raw string (see [`date_key`] for the
+/// display-oriented fallback).
+pub(crate) fn et_day_key(iso: &str) -> Option<NaiveDate> {
+    parse_timestamp(iso)
+        .map(|parsed| parsed.with_timezone(&New_York).date_naive())
+        .or_else(|| NaiveDate::parse_from_str(iso, "%Y-%m-%d").ok())
 }
 
 pub(crate) fn market_session_for_iso(iso: &str) -> MarketSession {

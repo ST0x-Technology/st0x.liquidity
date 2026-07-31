@@ -72,6 +72,7 @@ pub(super) struct TradingJobQueues {
 /// Called once during conductor startup, before the apalis monitor spawns, so
 /// every `Running` row is orphaned by definition.
 pub(super) async fn setup_trading_job_queues(
+    cqrs_pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
     job_queue: &DexTradeAccountingJobQueue,
     equity_recovery: EquityRecoveryInputs,
@@ -147,7 +148,8 @@ pub(super) async fn setup_trading_job_queues(
     bootstrap_check_positions(apalis_pool, &check_positions_queue).await?;
 
     let portfolio_snapshot_queue = PortfolioSnapshotJobQueue::new(apalis_pool);
-    bootstrap_portfolio_snapshot_best_effort(apalis_pool, &portfolio_snapshot_queue).await;
+    bootstrap_portfolio_snapshot_best_effort(cqrs_pool, apalis_pool, &portfolio_snapshot_queue)
+        .await;
 
     Ok(TradingJobQueues {
         hedge_queue,
@@ -167,10 +169,11 @@ pub(super) async fn setup_trading_job_queues(
 /// startup depend on it. Persistent failures remain observable in logs and on
 /// the next restart attempt.
 async fn bootstrap_portfolio_snapshot_best_effort(
+    cqrs_pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
     queue: &PortfolioSnapshotJobQueue,
 ) {
-    if let Err(error) = bootstrap_portfolio_snapshot(apalis_pool, queue).await {
+    if let Err(error) = bootstrap_portfolio_snapshot(cqrs_pool, apalis_pool, queue).await {
         warn!(
             ?error,
             "Failed to bootstrap portfolio snapshot reporting; continuing trading startup"
@@ -185,12 +188,13 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn portfolio_snapshot_bootstrap_failure_does_not_fail_startup() {
+        let cqrs_pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
             .await
             .unwrap();
         let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
 
-        bootstrap_portfolio_snapshot_best_effort(&apalis_pool, &queue).await;
+        bootstrap_portfolio_snapshot_best_effort(&cqrs_pool, &apalis_pool, &queue).await;
 
         assert!(logs_contain(
             "Failed to bootstrap portfolio snapshot reporting; continuing trading startup"
