@@ -6,7 +6,7 @@ mod usdc;
 
 #[cfg(test)]
 pub(crate) use equity::InProgressGuard;
-pub(crate) use equity::{GuardState, claim_guard_for_recovery_or_orphan};
+pub(crate) use equity::{GuardState, RecoveryGuard, claim_guard_for_recovery_or_orphan};
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
@@ -32,6 +32,8 @@ use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
@@ -1783,6 +1785,9 @@ impl RebalancingService {
                 now,
             ),
 
+            // `OffchainEquityReconciled` never reaches here at runtime -- the
+            // early return above drops it before this match. It is listed only
+            // to keep the match exhaustive.
             OnchainEquity { .. }
             | OffchainEquity { .. }
             | OffchainEquityReconciled { .. }
@@ -13595,6 +13600,7 @@ mod tests {
                 vault_lookup: Arc::new(MockVaultLookup::new()),
                 tokenizer: Arc::new(MockTokenizer::new()),
                 wrapper: Arc::new(MockWrapper::new()),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             },
         );
         store
@@ -13632,6 +13638,7 @@ mod tests {
                 vault_lookup: Arc::new(MockVaultLookup::new()),
                 tokenizer: Arc::new(MockTokenizer::new()),
                 wrapper: Arc::new(MockWrapper::new()),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             },
         );
         store

@@ -126,3 +126,4 @@ decision.
 | [0014](0014-runtime-stuck-pending-recovery-and-serialized-placement.md) | Recover stuck Pending placements at runtime, and serialize broker-placement attempts | Accepted |
 | [0015](0015-bot-gas-pnl-requires-explicit-receipt-cost-ledger.md)       | Require an explicit receipt cost ledger for bot gas PnL                              | Proposed |
 | [0016](0016-store-bot-gas-costs-in-the-event-stream.md)                 | Store bot-gas costs in the event stream                                              | Proposed |
+| [0017](0017-eth-usd-valuation-via-pyth-base-block-pinned.md)            | Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned                     | Proposed |

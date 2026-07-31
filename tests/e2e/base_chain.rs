@@ -115,6 +115,18 @@ sol!(
     TestVault, "tests/e2e/TestVault.json"
 );
 
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    MockPyth, "tests/e2e/MockPyth.json"
+);
+
+/// Fixed ETH/USD price the e2e `MockPyth` returns for every feed id: $2000.00
+/// (Pyth encodes `price * 10^expo`, so `200_000_000_000 * 10^-8`).
+pub const MOCK_PYTH_ETH_USD_PRICE: i64 = 200_000_000_000;
+pub const MOCK_PYTH_ETH_USD_CONF: u64 = 1_000_000;
+pub const MOCK_PYTH_ETH_USD_EXPO: i32 = -8;
+
 /// OpenZeppelin ERC20 `_balances` mapping storage slot.
 ///
 /// When USDC is deployed fresh via `DeployableERC20` bytecode (not forked
@@ -196,6 +208,10 @@ pub struct BaseChain<P> {
     interpreter: Address,
     store: Address,
     equity_tokens: HashMap<String, Address>,
+    /// Minimal `getPriceUnsafe` stub deployed for every e2e chain (see ADR
+    /// 0017), so a test that enables rebalancing can wire
+    /// `[bot_gas_valuation] pyth_contract` at this address.
+    pub mock_pyth: Address,
 }
 
 impl BaseChain<()> {
@@ -287,6 +303,15 @@ impl BaseChain<()> {
 
         provider.anvil_set_balance(minter, hundred_eth).await?;
 
+        let mock_pyth = MockPyth::deploy(
+            &provider,
+            MOCK_PYTH_ETH_USD_PRICE,
+            MOCK_PYTH_ETH_USD_CONF,
+            MOCK_PYTH_ETH_USD_EXPO,
+        )
+        .await?;
+        let mock_pyth = *mock_pyth.address();
+
         Ok(BaseChain {
             anvil,
             provider,
@@ -301,6 +326,7 @@ impl BaseChain<()> {
             interpreter,
             store,
             equity_tokens: HashMap::new(),
+            mock_pyth,
         })
     }
 }

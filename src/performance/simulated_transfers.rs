@@ -44,6 +44,7 @@ use st0x_wrapper::{
     UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
 };
 
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
@@ -1048,6 +1049,7 @@ pub async fn seed_simulated_equity_redemption_history(
                 unwrap_block,
                 day,
             )),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())

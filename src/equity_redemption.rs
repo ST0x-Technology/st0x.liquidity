@@ -66,7 +66,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
@@ -78,6 +78,10 @@ use st0x_tokenization::TokenizationRequestId;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::WrapperError;
 
+use crate::bot_gas::{
+    BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
+    RecordBotGasReceiptCost,
+};
 use crate::rebalancing::equity::EquityTransferServices;
 
 /// Our tokenized equity tokens use 18 decimals.
@@ -248,6 +252,12 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to reconcile without an operator-supplied reason.
     #[error("Cannot reconcile: reason is required")]
     ReconcileReasonRequired,
+    /// Enqueueing the bot-gas receipt cost recording job failed after a
+    /// vault withdraw / unwrap confirmation succeeded (ADR 0017). See
+    /// [`BotGasEnqueueFailure`] for why the payload is a rendered `String`
+    /// rather than a typed source.
+    #[error(transparent)]
+    BotGasEnqueueFailed(#[from] BotGasEnqueueFailure),
 }
 
 #[derive(Debug, Clone)]
@@ -2140,6 +2150,15 @@ impl EquityRedemption {
                 let recipient = services.wrapper.owner();
                 let actual_wrapped_amount =
                     actual_withdrawn_amount_from_receipt(&receipt, *token, recipient)?;
+
+                enqueue_bot_gas_cost(
+                    &services.bot_gas_enqueuer,
+                    *tx_hash,
+                    BotGasOperationCategory::VaultWithdraw,
+                    symbol.clone(),
+                )
+                .await?;
+
                 Ok(vec![WithdrawnFromRaindex {
                     symbol: symbol.clone(),
                     quantity: *quantity,
@@ -2279,6 +2298,14 @@ impl EquityRedemption {
                             }
                         })?;
 
+                enqueue_bot_gas_cost(
+                    &services.bot_gas_enqueuer,
+                    *unwrap_tx_hash,
+                    BotGasOperationCategory::Unwrap,
+                    symbol.clone(),
+                )
+                .await?;
+
                 Ok(vec![TokensUnwrapped {
                     quantity: Some(quantity),
                     underlying_token,
@@ -2368,11 +2395,39 @@ impl EquityRedemption {
                 match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
                     .await
                 {
-                    Ok(redemption_tx) => Ok(vec![TokensSent {
-                        redemption_wallet,
-                        redemption_tx,
-                        sent_at: override_at.unwrap_or_else(Utc::now),
-                    }]),
+                    Ok(redemption_tx) => {
+                        // Unlike the VaultWithdraw/Unwrap enqueue sites (which follow an
+                        // idempotent `confirm_tx`/`confirm_unwrap` receipt lookup, so
+                        // retrying the enqueue on resume is safe), `send_for_redemption`
+                        // above is itself the non-idempotent onchain transfer. If the
+                        // enqueue failed and we propagated the error here, no `TokensSent`
+                        // event would be written, the aggregate would stay in
+                        // `SendPending`, and the crash-recovery resume loop would
+                        // re-invoke `SendTokens`, sending the underlying tokens a second
+                        // time. So the enqueue here is best-effort: losing one gas-cost
+                        // record is strictly better than double-sending assets.
+                        if let Err(error) = enqueue_bot_gas_cost(
+                            &services.bot_gas_enqueuer,
+                            redemption_tx,
+                            BotGasOperationCategory::WalletTransfer,
+                            symbol.clone(),
+                        )
+                        .await
+                        {
+                            error!(
+                                target: "rebalance",
+                                ?error, %redemption_tx, %symbol,
+                                "Failed to enqueue bot-gas receipt cost for redemption send; \
+                                 recording TokensSent anyway to avoid re-sending tokens"
+                            );
+                        }
+
+                        Ok(vec![TokensSent {
+                            redemption_wallet,
+                            redemption_tx,
+                            sent_at: override_at.unwrap_or_else(Utc::now),
+                        }])
+                    }
                     Err(error) => {
                         warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
                         Ok(vec![TransferFailed {
@@ -2796,6 +2851,22 @@ fn node_sync_failed_from_evm(required_block: u64, error: &EvmError) -> EquityRed
     }
 }
 
+/// Enqueues bot-gas cost recording for a confirmed redemption tx (vault
+/// withdraw, unwrap, or wallet transfer, always on Base). See ADR 0017.
+async fn enqueue_bot_gas_cost(
+    enqueuer: &BotGasReceiptCostEnqueuer,
+    tx_hash: TxHash,
+    category: BotGasOperationCategory,
+    symbol: Symbol,
+) -> Result<(), EquityRedemptionError> {
+    enqueuer
+        .enqueue(RecordBotGasReceiptCost::for_base_tx(
+            tx_hash, category, symbol,
+        ))
+        .await
+        .map_err(|error| BotGasEnqueueFailure::from_queue_push_error(tx_hash, &error).into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2826,6 +2897,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
 
@@ -3376,6 +3448,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -3440,6 +3513,59 @@ mod tests {
         );
     }
 
+    /// Acceptance criterion: a bot-gas enqueue failure at `SendTokens` must
+    /// NOT prevent `TokensSent` -- unlike the VaultWithdraw/Unwrap enqueue
+    /// sites (which follow an idempotent confirm and are safe to fail-fast
+    /// on), `send_for_redemption` is a non-idempotent onchain transfer of
+    /// real tokens, so a hard failure here would leave the aggregate in
+    /// `SendPending` and the crash-recovery resume loop would re-invoke
+    /// `SendTokens`, sending the underlying tokens a second time.
+    #[tokio::test]
+    async fn send_tokens_enqueue_failure_does_not_block_tokens_sent() {
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        apalis_pool.close().await;
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+        };
+
+        let underlying_token = Address::random();
+        let send_pending = EquityRedemption::SendPending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            token: Address::random(),
+            underlying_token,
+            raindex_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: TxHash::random(),
+            unwrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
+            unwrap_block: Some(1),
+            withdrawn_at: Utc::now(),
+            unwrapped_at: Utc::now(),
+        };
+
+        // Despite the enqueuer's pool being closed (every enqueue fails),
+        // SendTokens must still produce TokensSent -- proving the enqueue
+        // failure was swallowed (logged) rather than propagated, which would
+        // otherwise leave the aggregate stuck in SendPending for the
+        // crash-recovery resume loop to blindly re-send from.
+        let events = send_pending
+            .transition(EquityRedemptionCommand::SendTokens, &services)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(events[0], EquityRedemptionEvent::TokensSent { .. }),
+            "expected TokensSent despite the enqueue failure, got: {:?}",
+            events[0]
+        );
+    }
+
     #[tokio::test]
     async fn confirm_withdraw_records_actual_transfer_amount_from_receipt() {
         let requested_amount = U256::from(37_143_292_455_000_000_000_u128);
@@ -3450,6 +3576,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("partial-withdraw");
@@ -3498,6 +3625,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("unwrap-partial-withdraw");
@@ -3557,6 +3685,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("missing-withdraw-transfer");
@@ -3612,6 +3741,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("no-block-number");
@@ -4084,6 +4214,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4151,6 +4282,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4218,6 +4350,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_unwrap()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         // UnwrapTokens is now pure (emits UnwrapPending).
@@ -4244,6 +4377,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_lookup()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         // UnwrapTokens now emits UnwrapSubmitted (no lookup yet).
@@ -5306,6 +5440,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: mock_tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -5359,6 +5494,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: mock_tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -5409,6 +5545,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().failing_wait_for_block()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)
@@ -5453,6 +5590,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: mock_wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let token = Address::ZERO;
@@ -5502,6 +5640,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: mock_wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let token = Address::ZERO;
@@ -5555,6 +5694,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_wait_for_block()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)

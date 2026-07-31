@@ -52,6 +52,8 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequestStatus};
 
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::rebalancing::equity::EquityTransferServices;
 
 /// Errors that can occur during tokenized equity mint operations.
@@ -2295,6 +2297,7 @@ mod tests {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
 
@@ -2814,6 +2817,7 @@ mod tests {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         });
         let id = issuer_request_id("ISS001");
 

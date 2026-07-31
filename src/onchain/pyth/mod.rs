@@ -53,10 +53,13 @@ pub enum PythError {
 }
 
 /// Reads the Pyth price for `feed_id` as stored on the Base Pyth contract at
-/// `block_number`, via a historic `getPriceUnsafe` call.
+/// `block`, via a historic `getPriceUnsafe` call. `block` is a [`BlockId`]
+/// rather than a bare block number so a caller can pin the read at a block
+/// HASH instead of a height -- reorg-safe across a block-height replay (see
+/// `crate::bot_gas::valuation` for why that distinction matters there).
 ///
 /// `getPriceUnsafe` never reverts on staleness; it returns the feed's stored
-/// state as of the END of `block_number`. This matches what the order observed
+/// state as of the END of `block`. This matches what the order observed
 /// at its block unless a Pyth update for this feed landed in the same block
 /// after the trade transaction — a rare case that yields a slightly newer
 /// reference price. The value feeds analytics only and does not influence the
@@ -64,21 +67,28 @@ pub enum PythError {
 /// end-of-block approximation is acceptable. Note this read currently runs
 /// synchronously on the trade-conversion path, so a slow RPC adds hedge
 /// latency; moving enrichment off the pre-hedge path is a tracked follow-up.
-pub async fn extract_pyth_price<P>(
+pub async fn extract_pyth_price_at<P>(
     provider: &P,
+    pyth_contract: Address,
     feed_id: B256,
-    block_number: u64,
+    block: BlockId,
 ) -> Result<Price, PythError>
 where
     P: Provider,
 {
-    debug!(target: "hedge", %feed_id, block_number, "Reading Pyth price via getPriceUnsafe");
+    debug!(
+        target: "hedge",
+        %pyth_contract,
+        %feed_id,
+        ?block,
+        "Reading Pyth price via getPriceUnsafe"
+    );
 
-    let pyth = IPyth::new(BASE_PYTH_CONTRACT_ADDRESS, provider);
+    let pyth = IPyth::new(pyth_contract, provider);
 
     let price = pyth
         .getPriceUnsafe(feed_id)
-        .block(BlockId::number(block_number))
+        .block(block)
         .call()
         .await
         .map_err(|error| PythError::Rpc(Box::new(error)))?;
@@ -147,7 +157,7 @@ fn price_to_float(price: &Price) -> Result<Float, FloatError> {
 #[cfg(test)]
 mod tests {
     use alloy::hex;
-    use alloy::primitives::{Bytes, b256};
+    use alloy::primitives::{Bytes, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::SolCall;
@@ -187,9 +197,14 @@ mod tests {
 
         let feed_id = b256!("0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245");
 
-        let result = extract_pyth_price(&provider, feed_id, 47_198_127)
-            .await
-            .unwrap();
+        let result = extract_pyth_price_at(
+            &provider,
+            BASE_PYTH_CONTRACT_ADDRESS,
+            feed_id,
+            BlockId::number(47_198_127),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.price, 15_445_005);
         assert_eq!(result.conf, 21_005);
@@ -233,9 +248,14 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_http(server.base_url().parse().unwrap());
 
-        let result = extract_pyth_price(&provider, feed_id, block_number)
-            .await
-            .unwrap();
+        let result = extract_pyth_price_at(
+            &provider,
+            BASE_PYTH_CONTRACT_ADDRESS,
+            feed_id,
+            BlockId::number(block_number),
+        )
+        .await
+        .unwrap();
 
         rpc_mock.assert_async().await;
         assert_eq!(result.price, 15_445_005);
@@ -244,13 +264,57 @@ mod tests {
         assert_eq!(result.publishTime, U256::from(1_781_166_017u64));
     }
 
+    /// The contract address is parameterized (not hardcoded to
+    /// `BASE_PYTH_CONTRACT_ADDRESS`) so bot-gas valuation can point at a
+    /// configured Pyth deployment. The mock only responds when the target
+    /// address matches, proving the parameter is actually forwarded.
+    #[tokio::test]
+    async fn extract_pyth_price_forwards_configured_contract_address() {
+        let price = Price {
+            price: 15_445_005,
+            conf: 21_005,
+            expo: -5,
+            publishTime: U256::from(1_781_166_017u64),
+        };
+        let feed_id = b256!("0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245");
+        let custom_contract = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+
+        let server = MockServer::start_async().await;
+        let rpc_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .body_includes(alloy::hex::encode_prefixed(custom_contract));
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": encode_price_return(&price).to_string(),
+                }));
+            })
+            .await;
+
+        let provider = ProviderBuilder::new().connect_http(server.base_url().parse().unwrap());
+
+        let result = extract_pyth_price_at(&provider, custom_contract, feed_id, BlockId::number(1))
+            .await
+            .unwrap();
+
+        rpc_mock.assert_async().await;
+        assert_eq!(result.price, 15_445_005);
+    }
+
     #[tokio::test]
     async fn extract_pyth_price_propagates_rpc_error() {
         let asserter = Asserter::new();
         asserter.push_failure_msg("eth_call boom");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = extract_pyth_price(&provider, B256::random(), 1).await;
+        let result = extract_pyth_price_at(
+            &provider,
+            BASE_PYTH_CONTRACT_ADDRESS,
+            B256::random(),
+            BlockId::number(1),
+        )
+        .await;
 
         assert!(matches!(result, Err(PythError::Rpc(_))));
     }

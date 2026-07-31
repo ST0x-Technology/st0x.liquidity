@@ -25,6 +25,9 @@ use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
+use crate::bot_gas::{
+    BotGasChain, BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost,
+};
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
@@ -198,6 +201,11 @@ pub(crate) struct CrossVenueCashTransfer<Chain: Wallet, B = CctpBridge<Chain, Ch
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
     required_confirmations: u64,
+    /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
+    /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
+    /// Defaults to `Disabled`; production wiring opts in via
+    /// [`Self::with_bot_gas_enqueuer`].
+    bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 }
 
 enum AttestationPollOutcome {
@@ -272,7 +280,48 @@ impl<
             vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             required_confirmations: settlement.required_confirmations,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
+    }
+
+    /// Opts this transfer into bot-gas cost recording. Called at the
+    /// production wiring site only; CLI and test construction leave the
+    /// `Disabled` default from [`Self::new`].
+    pub(crate) fn with_bot_gas_enqueuer(mut self, enqueuer: BotGasReceiptCostEnqueuer) -> Self {
+        self.bot_gas_enqueuer = enqueuer;
+        self
+    }
+
+    /// Enqueues bot-gas cost recording for a confirmed USDC-path tx. USDC
+    /// paths carry no symbol.
+    ///
+    /// Most call sites invoke this BEFORE the CQRS command that advances the
+    /// aggregate past the state whose resume path re-enters that call site:
+    /// a failed enqueue then leaves the aggregate un-advanced, so the
+    /// caller's retry re-attempts both the enqueue and the state advance.
+    /// `deposit_to_vault` is the one exception -- it must send
+    /// `InitiateDeposit` (persisting the deposit hash) before confirming and
+    /// enqueueing, or a crash during confirmation could re-submit a second
+    /// deposit on resume. There the invariant is preserved differently: the
+    /// `DepositInitiated` resume arm repeats this same enqueue call after its
+    /// own `confirm_tx`, since no resume path re-enters `deposit_to_vault`
+    /// itself once past that state (see that resume arm's comment).
+    async fn enqueue_bot_gas_cost(
+        &self,
+        chain: BotGasChain,
+        tx_hash: TxHash,
+        category: BotGasOperationCategory,
+    ) -> Result<(), UsdcTransferError> {
+        self.bot_gas_enqueuer
+            .enqueue(RecordBotGasReceiptCost {
+                chain,
+                tx_hash,
+                category,
+                symbol: None,
+                redrive_attempts: 0,
+            })
+            .await
+            .map_err(UsdcTransferError::BotGasEnqueue)
     }
 
     fn attestation_retry_deadline_at(
@@ -917,7 +966,24 @@ impl<
                     return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
                 };
                 match self.raindex.confirm_tx(deposit_tx).await {
-                    Ok(()) => self.confirm_deposit(id).await,
+                    Ok(()) => {
+                        // `deposit_to_vault`'s fresh path enqueues the `VaultDeposit`
+                        // bot-gas job right after this same `confirm_tx` call, before
+                        // ever reaching `DepositConfirmed`. A crash between
+                        // `InitiateDeposit` and that enqueue lands here, and no
+                        // resume path re-enters `deposit_to_vault` once past
+                        // `DepositInitiated` -- so the enqueue must be repeated here
+                        // too, or the cost fact is lost permanently once
+                        // `confirm_deposit` advances the aggregate to its terminal
+                        // state.
+                        self.enqueue_bot_gas_cost(
+                            BotGasChain::Base,
+                            deposit_tx,
+                            BotGasOperationCategory::VaultDeposit,
+                        )
+                        .await?;
+                        self.confirm_deposit(id).await
+                    }
                     // A dropped tx (gone from the mempool, will never mine) is a
                     // terminal failure -- distinct from a still-pending tx that
                     // confirm_tx merely couldn't confirm yet. Without this, a
@@ -1466,15 +1532,7 @@ impl<
 
             info!(target: "rebalance", mint_tx = %mint_receipt.tx, %amount_received, "Adopting already-submitted CCTP mint on resume");
 
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::ConfirmBridging {
-                        mint_tx: mint_receipt.tx,
-                        amount_received,
-                        fee_collected: u256_to_usdc(mint_receipt.fee)?,
-                    },
-                )
+            self.record_cctp_mint(id, BridgeDirection::EthereumToBase, mint_receipt)
                 .await?;
 
             return self
@@ -1965,6 +2023,32 @@ impl<
             }
         };
 
+        self.record_cctp_mint(id, BridgeDirection::EthereumToBase, mint_receipt)
+            .await
+    }
+
+    /// Records a confirmed CCTP mint (fresh or adopted from a resume scan):
+    /// sends `ConfirmBridging` and enqueues bot-gas cost recording for the
+    /// mint tx. The mint lands on the destination chain of `direction`.
+    async fn record_cctp_mint(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        mint_receipt: MintReceipt,
+    ) -> Result<MintReceipt, UsdcTransferError> {
+        // Enqueue BEFORE `ConfirmBridging` (see `enqueue_bot_gas_cost`'s doc
+        // for why the ordering matters here).
+        let mint_chain = match direction {
+            BridgeDirection::EthereumToBase => BotGasChain::Base,
+            BridgeDirection::BaseToEthereum => BotGasChain::Ethereum,
+        };
+        self.enqueue_bot_gas_cost(
+            mint_chain,
+            mint_receipt.tx,
+            BotGasOperationCategory::CctpMint,
+        )
+        .await?;
+
         self.cqrs
             .send(
                 id,
@@ -2032,6 +2116,13 @@ impl<
         // `FailDeposit`: the deposit may still confirm, and the `DepositInitiated`
         // resume arm re-checks it. Propagate so apalis retries from there.
         self.raindex.confirm_tx(deposit_tx).await?;
+
+        self.enqueue_bot_gas_cost(
+            BotGasChain::Base,
+            deposit_tx,
+            BotGasOperationCategory::VaultDeposit,
+        )
+        .await?;
 
         info!(target: "rebalance", %deposit_tx, "Vault deposit submitted, recorded, and confirmed");
         Ok(())
@@ -2707,22 +2798,15 @@ impl<
             })?
         {
             let amount_received = u256_to_usdc(mint_receipt.amount)?;
+            let mint_tx = mint_receipt.tx;
 
-            info!(target: "rebalance", mint_tx = %mint_receipt.tx, %amount_received, "Adopting already-submitted CCTP mint on resume");
+            info!(target: "rebalance", %mint_tx, %amount_received, "Adopting already-submitted CCTP mint on resume");
 
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::ConfirmBridging {
-                        mint_tx: mint_receipt.tx,
-                        amount_received,
-                        fee_collected: u256_to_usdc(mint_receipt.fee)?,
-                    },
-                )
+            self.record_cctp_mint(id, mint_direction, mint_receipt)
                 .await?;
 
             return self
-                .continue_from_bridged_resume(id, amount_received, mint_receipt.tx)
+                .continue_from_bridged_resume(id, amount_received, mint_tx)
                 .await;
         }
 
@@ -2886,6 +2970,12 @@ impl<
             .send_usdc_on_ethereum(deposit_address, amount_u256)
             .await
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+        self.enqueue_bot_gas_cost(
+            BotGasChain::Ethereum,
+            send_tx,
+            BotGasOperationCategory::WalletTransfer,
+        )
+        .await?;
 
         info!(target: "rebalance", %id, %send_tx, %deposit_address, %amount_received, "Sent minted USDC to Alpaca deposit address");
         Ok(send_tx)
@@ -2932,6 +3022,12 @@ impl<
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?
         {
             info!(target: "rebalance", %id, %existing_tx, %deposit_address, "Adopting already-submitted USDC deposit transfer to Alpaca on resume");
+            self.enqueue_bot_gas_cost(
+                BotGasChain::Ethereum,
+                existing_tx,
+                BotGasOperationCategory::WalletTransfer,
+            )
+            .await?;
             return Ok(existing_tx);
         }
 
@@ -2940,6 +3036,12 @@ impl<
             .send_usdc_on_ethereum(deposit_address, amount_u256)
             .await
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+        self.enqueue_bot_gas_cost(
+            BotGasChain::Ethereum,
+            send_tx,
+            BotGasOperationCategory::WalletTransfer,
+        )
+        .await?;
 
         info!(target: "rebalance", %id, %send_tx, %deposit_address, %amount_received, "Sent minted USDC to Alpaca deposit address");
         Ok(send_tx)
@@ -3001,34 +3103,15 @@ impl<
             // operator reconciliation -- never burn more on Base than was actually
             // withdrawn.
             if withdrawn != amount_u256 {
-                warn!(target: "rebalance", %existing_tx, %withdrawn, requested = %amount_u256,
-                    "Adopted withdrawal realized a different amount than requested; failing for reconciliation");
-                self.cqrs
-                    .send(
+                return self
+                    .fail_adopted_withdrawal_mismatch(
                         id,
-                        UsdcRebalanceCommand::Initiate {
-                            direction: RebalanceDirection::BaseToAlpaca,
-                            amount,
-                            withdrawal: TransferRef::OnchainTx(existing_tx),
-                        },
+                        amount,
+                        amount_u256,
+                        existing_tx,
+                        withdrawn,
                     )
-                    .await?;
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailWithdrawal {
-                            reason: format!(
-                                "adopted withdrawal {existing_tx} realized {withdrawn}, \
-                                 requested {amount_u256}"
-                            ),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::AdoptedWithdrawalAmountMismatch {
-                    id: id.clone(),
-                    withdrawn,
-                    requested: amount_u256,
-                });
+                    .await;
             }
 
             info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
@@ -3043,6 +3126,64 @@ impl<
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
     }
 
+    /// Handles an adopted withdrawal that realized a different amount than
+    /// requested (vault under-funded -> partial fill): records the withdrawal's
+    /// bot-gas cost, fails the transfer for operator reconciliation, and
+    /// returns `AdoptedWithdrawalAmountMismatch`. Never re-withdraws or burns
+    /// more on Base than was actually withdrawn.
+    async fn fail_adopted_withdrawal_mismatch(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        requested: U256,
+        existing_tx: TxHash,
+        withdrawn: U256,
+    ) -> Result<(), UsdcTransferError> {
+        warn!(target: "rebalance", %existing_tx, %withdrawn, %requested,
+            "Adopted withdrawal realized a different amount than requested; failing for reconciliation");
+        // Enqueue BEFORE `Initiate`/`FailWithdrawal` below, same as
+        // `record_vault_withdrawal`: the withdrawal happened on-chain
+        // regardless of the mismatch, so its gas cost is still owed a
+        // record, and the aggregate has not advanced past
+        // `WithdrawalSubmitting` yet, so propagating with `?` is safe --
+        // apalis redrives `resume_withdrawal_submitting`, which re-scans the
+        // same adopted withdrawal, re-attempts this enqueue, and (once it
+        // succeeds) proceeds to genuinely fail the transfer for
+        // reconciliation below.
+        self.enqueue_bot_gas_cost(
+            BotGasChain::Base,
+            existing_tx,
+            BotGasOperationCategory::VaultWithdraw,
+        )
+        .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(existing_tx),
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: format!(
+                        "adopted withdrawal {existing_tx} realized {withdrawn}, \
+                         requested {requested}"
+                    ),
+                },
+            )
+            .await?;
+        Err(UsdcTransferError::AdoptedWithdrawalAmountMismatch {
+            id: id.clone(),
+            withdrawn,
+            requested,
+        })
+    }
+
     /// Records the submitted withdrawal transaction and confirms it. The vault
     /// withdrawal waits for block inclusion, so confirmation is immediate.
     async fn record_vault_withdrawal(
@@ -3051,6 +3192,15 @@ impl<
         amount: Usdc,
         withdraw_tx: TxHash,
     ) -> Result<(), UsdcTransferError> {
+        // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
+        // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
+        self.enqueue_bot_gas_cost(
+            BotGasChain::Base,
+            withdraw_tx,
+            BotGasOperationCategory::VaultWithdraw,
+        )
+        .await?;
+
         self.cqrs
             .send(
                 id,
@@ -3102,7 +3252,8 @@ impl<
                 self.market_maker_wallet,
             )
             .await?;
-        self.record_cctp_burn(id, burn_receipt).await
+        self.record_cctp_burn(id, BridgeDirection::BaseToEthereum, burn_receipt)
+            .await
     }
 
     /// Resumes a transfer stalled at `BridgingSubmitting`: scans the chain for an
@@ -3133,7 +3284,9 @@ impl<
             .check_pending_burn(id, BridgeDirection::BaseToEthereum, amount, pending_burn_tx)
             .await?
         {
-            return self.record_cctp_burn(id, adopted).await;
+            return self
+                .record_cctp_burn(id, BridgeDirection::BaseToEthereum, adopted)
+                .await;
         }
 
         // `check_pending_burn` returned `Ok(None)`: scan for an already-mined burn to
@@ -3200,7 +3353,8 @@ impl<
             }
         };
 
-        self.record_cctp_burn(id, burn_receipt).await
+        self.record_cctp_burn(id, BridgeDirection::BaseToEthereum, burn_receipt)
+            .await
     }
 
     /// Two-phase CCTP burn that records the broadcast tx hash BEFORE awaiting its
@@ -3543,8 +3697,22 @@ impl<
     async fn record_cctp_burn(
         &self,
         id: &UsdcRebalanceId,
+        direction: BridgeDirection,
         burn_receipt: BurnReceipt,
     ) -> Result<BurnReceipt, UsdcTransferError> {
+        // Enqueue BEFORE `InitiateBridging` (see `enqueue_bot_gas_cost`'s doc
+        // for why the ordering matters here).
+        let burn_chain = match direction {
+            BridgeDirection::BaseToEthereum => BotGasChain::Base,
+            BridgeDirection::EthereumToBase => BotGasChain::Ethereum,
+        };
+        self.enqueue_bot_gas_cost(
+            burn_chain,
+            burn_receipt.tx,
+            BotGasOperationCategory::CctpBurn,
+        )
+        .await?;
+
         self.cqrs
             .send(
                 id,
@@ -3605,7 +3773,8 @@ impl<
                 self.market_maker_wallet,
             )
             .await?;
-        self.record_cctp_burn(id, burn_receipt).await
+        self.record_cctp_burn(id, BridgeDirection::EthereumToBase, burn_receipt)
+            .await
     }
 
     /// Resumes a transfer stalled at `BridgingSubmitting` (AlpacaToBase direction):
@@ -3632,7 +3801,9 @@ impl<
             .check_pending_burn(id, BridgeDirection::EthereumToBase, amount, pending_burn_tx)
             .await?
         {
-            return self.record_cctp_burn(id, adopted).await;
+            return self
+                .record_cctp_burn(id, BridgeDirection::EthereumToBase, adopted)
+                .await;
         }
 
         // Scan-EMPTY action: reburn only for a recorded-burn revert (`Some`, no funds
@@ -3702,7 +3873,8 @@ impl<
             }
         };
 
-        self.record_cctp_burn(id, burn_receipt).await
+        self.record_cctp_burn(id, BridgeDirection::EthereumToBase, burn_receipt)
+            .await
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
@@ -3782,24 +3954,8 @@ impl<
             }
         };
 
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: mint_receipt.tx,
-                    amount_received: u256_to_usdc(mint_receipt.amount)?,
-                    fee_collected: u256_to_usdc(mint_receipt.fee)?,
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance",
-            mint_tx = %mint_receipt.tx,
-            amount = %mint_receipt.amount,
-            fee = %mint_receipt.fee,
-            "CCTP mint on Ethereum executed"
-        );
-        Ok(mint_receipt)
+        self.record_cctp_mint(id, BridgeDirection::BaseToEthereum, mint_receipt)
+            .await
     }
 
     /// Polls Alpaca for the deposit identified by the USDC `send_tx` (the
@@ -3923,7 +4079,7 @@ fn conversion_amounts_from_order(
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, address, b256, fixed_bytes};
+    use alloy::primitives::{B256, Bytes, address, b256, fixed_bytes};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
@@ -3955,6 +4111,7 @@ mod tests {
     use st0x_raindex::{RaindexContracts, RaindexService};
 
     use super::*;
+    use crate::bot_gas::pending_bot_gas_jobs;
     use crate::telemetry::TelemetrySender;
     use crate::test_utils::{TestAnvilInstance, spawn_anvil, spawn_anvil_pair};
     use crate::usdc_rebalance::{
@@ -3971,6 +4128,12 @@ mod tests {
     struct MockBridge {
         submit_call_count: AtomicUsize,
         confirm_call_count: AtomicUsize,
+        // `unimplemented!()` is the default for `send_usdc_on_ethereum`, same as
+        // every other unused method on this mock -- so a test that unexpectedly
+        // walks into that path still panics loudly. Only
+        // `send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job` opts in via
+        // `with_send_usdc_tx`.
+        send_usdc_tx: Option<TxHash>,
     }
 
     impl MockBridge {
@@ -3978,7 +4141,13 @@ mod tests {
             Self {
                 submit_call_count: AtomicUsize::new(0),
                 confirm_call_count: AtomicUsize::new(0),
+                send_usdc_tx: None,
             }
+        }
+
+        fn with_send_usdc_tx(mut self, tx_hash: TxHash) -> Self {
+            self.send_usdc_tx = Some(tx_hash);
+            self
         }
     }
 
@@ -4116,7 +4285,11 @@ mod tests {
             _to: Address,
             _amount: U256,
         ) -> Result<TxHash, CctpError> {
-            unimplemented!("MockBridge: send_usdc_on_ethereum not used in this test")
+            let Some(tx_hash) = self.send_usdc_tx else {
+                unimplemented!("MockBridge: send_usdc_on_ethereum not used in this test")
+            };
+
+            Ok(tx_hash)
         }
 
         async fn find_recent_usdc_transfer(
@@ -12662,6 +12835,541 @@ mod tests {
             matches!(state, UsdcRebalance::Attested { .. }),
             "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
         );
+    }
+
+    /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)
+    /// `RaindexService` -- required for the `Chain` type parameter even
+    /// though none of these bot-gas convergence tests call into it -- and an
+    /// `Enabled` bot-gas enqueuer backed by a fresh apalis pool. Callers supply
+    /// their own `MockBridge` so only the test that actually sends USDC on
+    /// Ethereum opts into a canned response (see `MockBridge::with_send_usdc_tx`);
+    /// every other caller keeps the default `unimplemented!()` guard.
+    async fn manager_with_bot_gas_queue<Chain: Wallet + Clone>(
+        cqrs: Arc<Store<UsdcRebalance>>,
+        wallet: Chain,
+        bridge: MockBridge,
+    ) -> (
+        CrossVenueCashTransfer<Chain, MockBridge>,
+        apalis_sqlite::SqlitePool,
+        MockServer,
+    ) {
+        let (_apalis_only_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            recipient,
+        );
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(bridge),
+            Arc::new(vault_service),
+            cqrs,
+            recipient,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        )
+        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+
+        (manager, apalis_pool, server)
+    }
+
+    /// Acceptance criterion: a confirmed CCTP burn enqueues
+    /// exactly one `CctpBurn` bot-gas job, chained to the burn (source) side
+    /// of the direction.
+    #[tokio::test]
+    async fn record_cctp_burn_enqueues_bot_gas_job_on_burn_side_chain() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        let burn_tx =
+            fixed_bytes!("0xcccc000000000000000000000000000000000000000000000000000000000001");
+
+        manager
+            .record_cctp_burn(
+                &id,
+                BridgeDirection::EthereumToBase,
+                BurnReceipt {
+                    tx: burn_tx,
+                    amount: usdc_to_u256(amount).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::CctpBurn);
+        assert_eq!(
+            jobs[0].chain,
+            BotGasChain::Ethereum,
+            "EthereumToBase burns on Ethereum (the source chain)"
+        );
+        assert_eq!(jobs[0].tx_hash, burn_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// Acceptance criterion: a confirmed CCTP mint enqueues
+    /// exactly one `CctpMint` bot-gas job, chained to the destination side
+    /// of the direction.
+    #[tokio::test]
+    async fn record_cctp_mint_enqueues_bot_gas_job_on_destination_chain() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_attested_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        let mint_tx =
+            fixed_bytes!("0xcccc111111111111111111111111111111111111111111111111111111111111");
+
+        manager
+            .record_cctp_mint(
+                &id,
+                BridgeDirection::EthereumToBase,
+                MintReceipt {
+                    tx: mint_tx,
+                    amount: usdc_to_u256(amount).unwrap(),
+                    fee: U256::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::CctpMint);
+        assert_eq!(
+            jobs[0].chain,
+            BotGasChain::Base,
+            "EthereumToBase mints on Base (the destination chain)"
+        );
+        assert_eq!(jobs[0].tx_hash, mint_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// An enqueue failure for a confirmed CCTP mint propagates as a hard
+    /// error (fail fast) and leaves the aggregate un-advanced (enqueue runs
+    /// BEFORE `ConfirmBridging`), so the caller's retry re-attempts both.
+    #[tokio::test]
+    async fn record_cctp_mint_enqueue_failure_propagates() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_attested_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let cqrs_for_assertion = Arc::clone(&cqrs);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        apalis_pool.close().await;
+        let mint_tx =
+            fixed_bytes!("0xcccc222222222222222222222222222222222222222222222222222222222222");
+
+        let error = manager
+            .record_cctp_mint(
+                &id,
+                BridgeDirection::EthereumToBase,
+                MintReceipt {
+                    tx: mint_tx,
+                    amount: usdc_to_u256(amount).unwrap(),
+                    fee: U256::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
+
+        let state = cqrs_for_assertion
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "aggregate must remain in Attested (un-advanced) so the retry re-attempts \
+             ConfirmBridging; got: {state:?}"
+        );
+    }
+
+    /// Acceptance criterion: an enqueue failure for a confirmed
+    /// CCTP burn propagates as a hard error (fail fast), not swallowed, and
+    /// leaves the aggregate un-advanced (enqueue runs BEFORE
+    /// `InitiateBridging`) so the caller's retry re-attempts both.
+    #[tokio::test]
+    async fn record_cctp_burn_enqueue_failure_propagates() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let cqrs_for_assertion = Arc::clone(&cqrs);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        apalis_pool.close().await;
+        let burn_tx =
+            fixed_bytes!("0xcccc000000000000000000000000000000000000000000000000000000000002");
+
+        let error = manager
+            .record_cctp_burn(
+                &id,
+                BridgeDirection::EthereumToBase,
+                BurnReceipt {
+                    tx: burn_tx,
+                    amount: usdc_to_u256(amount).unwrap(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
+
+        let state = cqrs_for_assertion
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingSubmitting { .. }),
+            "aggregate must remain in BridgingSubmitting (un-advanced) so the retry \
+             re-attempts InitiateBridging; got: {state:?}"
+        );
+    }
+
+    /// A confirmed vault withdrawal enqueues exactly one `VaultWithdraw`
+    /// bot-gas job on Base.
+    #[tokio::test]
+    async fn record_vault_withdrawal_enqueues_bot_gas_job() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        let withdraw_tx =
+            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000001");
+
+        manager
+            .record_vault_withdrawal(&id, amount, withdraw_tx)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
+        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].tx_hash, withdraw_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// An enqueue failure for a confirmed vault withdrawal propagates as a
+    /// hard error (fail fast) and leaves the aggregate un-advanced (enqueue
+    /// runs BEFORE `Initiate`), so the caller's retry re-attempts both.
+    #[tokio::test]
+    async fn record_vault_withdrawal_enqueue_failure_propagates() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let cqrs_for_assertion = Arc::clone(&cqrs);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        apalis_pool.close().await;
+        let withdraw_tx =
+            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000002");
+
+        let error = manager
+            .record_vault_withdrawal(&id, amount, withdraw_tx)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
+
+        let state = cqrs_for_assertion
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::WithdrawalSubmitting { .. }),
+            "aggregate must remain in WithdrawalSubmitting (un-advanced) so the retry \
+             re-attempts Initiate; got: {state:?}"
+        );
+    }
+
+    /// An adopted withdrawal that realized a different amount than requested
+    /// still enqueues its `VaultWithdraw` bot-gas job (the withdrawal happened
+    /// on-chain regardless of the mismatch) before failing the transfer for
+    /// operator reconciliation.
+    #[tokio::test]
+    async fn fail_adopted_withdrawal_mismatch_enqueues_bot_gas_job() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let requested = usdc("2");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: requested,
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, MockBridge::new()).await;
+        let existing_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000001");
+        let requested_u256 = usdc_to_u256(requested).unwrap();
+        let withdrawn_u256 = usdc_to_u256(usdc("1")).unwrap();
+
+        let error = manager
+            .fail_adopted_withdrawal_mismatch(
+                &id,
+                requested,
+                requested_u256,
+                existing_tx,
+                withdrawn_u256,
+            )
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::AdoptedWithdrawalAmountMismatch {
+            withdrawn,
+            requested: requested_in_error,
+            ..
+        } = error
+        else {
+            panic!("expected AdoptedWithdrawalAmountMismatch, got: {error:?}");
+        };
+        assert_eq!(withdrawn, withdrawn_u256);
+        assert_eq!(requested_in_error, requested_u256);
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the adopted withdrawal's gas cost must still be recorded"
+        );
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
+        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].tx_hash, existing_tx);
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::WithdrawalFailed { .. }),
+            "the transfer must be failed for operator reconciliation; got: {state:?}"
+        );
+    }
+
+    /// An enqueue failure while failing an adopted withdrawal for
+    /// reconciliation must propagate (redrive), not be swallowed --
+    /// SPEC.md documents `EquityRedemption::SendTokens` as the ONE call site
+    /// that swallows instead of retrying. Mirrors
+    /// `record_vault_withdrawal_enqueue_failure_propagates`: the enqueue runs
+    /// BEFORE `Initiate`/`FailWithdrawal`, so the aggregate stays un-advanced
+    /// and a retry safely re-attempts both.
+    #[tokio::test]
+    async fn fail_adopted_withdrawal_mismatch_enqueue_failure_propagates() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let requested = usdc("2");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: requested,
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let cqrs_for_assertion = Arc::clone(&cqrs);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        apalis_pool.close().await;
+        let existing_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000002");
+        let requested_u256 = usdc_to_u256(requested).unwrap();
+        let withdrawn_u256 = usdc_to_u256(usdc("1")).unwrap();
+
+        let error = manager
+            .fail_adopted_withdrawal_mismatch(
+                &id,
+                requested,
+                requested_u256,
+                existing_tx,
+                withdrawn_u256,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
+
+        let state = cqrs_for_assertion
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::WithdrawalSubmitting { .. }),
+            "aggregate must remain in WithdrawalSubmitting (un-advanced) so the retry \
+             re-attempts Initiate/FailWithdrawal; got: {state:?}"
+        );
+    }
+
+    /// Acceptance criterion: sending minted USDC to Alpaca's
+    /// deposit address enqueues exactly one `WalletTransfer` bot-gas job on
+    /// Ethereum.
+    #[tokio::test]
+    async fn send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, server) = manager_with_bot_gas_queue(
+            cqrs,
+            wallet,
+            MockBridge::new().with_send_usdc_tx(fixed_bytes!(
+                "0xdddd000000000000000000000000000000000000000000000000000000000001"
+            )),
+        )
+        .await;
+
+        let deposit_address = address!("0x3333333333333333333333333333333333333333");
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets")
+                .query_param("asset", "USDC")
+                .query_param("network", "ethereum");
+            then.status(200).json_body(json!({
+                "asset_id": "usdc-asset-id",
+                "address": deposit_address.to_string(),
+                "created_at": "2026-01-01T00:00:00Z",
+            }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx = manager.send_alpaca_deposit(&id, usdc("1")).await.unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::WalletTransfer);
+        assert_eq!(jobs[0].chain, BotGasChain::Ethereum);
+        assert_eq!(jobs[0].tx_hash, send_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// Acceptance criterion: resuming an Alpaca->Base transfer stalled at
+    /// `DepositInitiated` re-enqueues the `VaultDeposit` bot-gas job (mirroring
+    /// what `deposit_to_vault`'s fresh path does), rather than silently losing
+    /// the cost fact for a deposit whose enqueue never ran before the crash.
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_deposit_initiated_enqueues_vault_deposit_bot_gas_job() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+
+        // A real, mined tx on the same chain the manager's Raindex service reads
+        // from -- `confirm_tx` only checks that the hash has a confirmed receipt,
+        // so any mined tx (not necessarily a real vault deposit call) exercises
+        // the same code path a real deposit confirmation would.
+        let deposit_tx = wallet
+            .send(wallet.address(), Bytes::new(), "test deposit tx")
+            .await
+            .unwrap()
+            .transaction_hash;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_deposit_initiated_alpaca_to_base(&cqrs, &id, amount, deposit_tx).await;
+
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+
+        manager.resume_alpaca_to_base(&id, amount).await.unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultDeposit);
+        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].tx_hash, deposit_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }
 
     /// CORRECTION C: when `pending_burn_tx` is set and `burn_status` reports the

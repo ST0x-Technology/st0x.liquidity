@@ -102,6 +102,15 @@ address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 # Alpaca's issuer wallet — ERC-20 transfers for redemption go here.
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+# ETH/USD valuation source for bot-gas cost recording (ADR 0017). Required
+# whenever [rebalancing] is configured -- bot-gas cost recording only runs on
+# rebalancing paths (vault deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC
+# transfer). Both values are public (not secrets): the Pyth oracle contract on
+# Base, and its ETH/USD price feed id.
+[bot_gas_valuation]
+pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
+eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+
 # Optional — only needed for automatic rebalancing.
 # Without this section the bot runs in Standalone mode (hedging only).
 [rebalancing]

@@ -538,6 +538,109 @@ migration files in `migrations/`.
   the current feed per symbol and is refreshed if the order migrates.
 - Trade processing continues normally even if price enrichment is skipped
 
+#### Bot-Paid Gas Cost Recording
+
+- After each bot-signed on-chain transaction confirms successfully -- vault
+  deposit, vault withdraw, wrap, unwrap, CCTP burn, CCTP mint, or the USDC
+  transfer to the Alpaca deposit address -- the confirming service enqueues a
+  durable `RecordBotGasReceiptCost` job identifying the chain, transaction hash,
+  operation category, and symbol (when known). A transaction that mines but
+  reverts is not recorded: the gas it consumed is a real cost, but capture of
+  reverted-transaction gas is a known, deliberately deferred gap (see "Known
+  gaps" below)
+- The recorded cost covers L2/L1 execution gas only
+  (`gas_used *
+  effective_gas_price` from the transaction receipt). On Base, an
+  OP-Stack chain, the sender also pays a separate L1 data-availability fee; that
+  fee is not read from the receipt and is not included in the recorded cost (see
+  "Known gaps" below)
+- A dedicated worker processes the job: it refetches the confirmed receipt,
+  verifies the bot wallet paid for it, reads the ETH/USD price from the Pyth
+  oracle on Base pinned to a block, and records one immutable cost fact (see
+  Pyth Price Extraction above for the block-pinning rationale; ETH/USD valuation
+  always reads the Base feed, pinned at the receipt's own block for Base
+  transactions and at the latest Base block for Ethereum transactions -- the
+  Ethereum-transaction pin is therefore not reproducible across two recording
+  attempts, see ADR 0017)
+- Recording is best-effort and asynchronous: a failure recording one receipt's
+  cost never blocks or slows trading. The job retries with backoff. A repeated
+  `Record` for the same chain and transaction hash is idempotent whenever the
+  receipt-derived immutable facts (payer, gas used, effective gas price, native
+  cost, operation category, symbol, occurred-at) still agree, even if the
+  derived USD valuation differs between attempts (persisted valuations
+  round-trip through a fixed decimal precision, and an Ethereum-transaction
+  valuation is pinned to a block that can move between attempts); a write that
+  disagrees on an immutable receipt fact is rejected as conflicting and the job
+  dead-letters for operator investigation
+- Enqueueing the job is fail-fast at the call site: if the durable queue write
+  itself fails, the triggering command handler returns the enqueue error rather
+  than silently losing it. What the caller does with that error depends on the
+  caller: the USDC cross-venue transfer jobs, the wrapped/unwrapped
+  equity-recovery jobs' orphan-deposit (and, for the unwrapped path,
+  orphan-wrap) confirmation steps, the equity mint/redemption transfer jobs, and
+  the startup `ResumeTokenizationAggregate` crash-recovery job all treat it as
+  non-terminal and delayed-redrive without consuming the apalis retry budget or
+  tripping the supervised worker's fail-stop circuit, so recording self-heals
+  once the queue write succeeds (ADR 0017 SS4). Every one of these callers
+  classifies and redrives through one shared mechanism
+  (`crate::bot_gas::redrive`) rather than each hand-rolling its own check, so a
+  new caller inherits the same behavior by construction. On the mint side this
+  redrive also bypasses the post-receipt recovery handoff: a bot-gas enqueue
+  failure during wrap confirmation is never misclassified as a wrap/deposit
+  failure that would hand a healthy mint off to `UnwrappedEquityRecovery`.
+  `EquityRedemption::SendTokens` is the one call site that swallows the enqueue
+  failure and logs-and-continues instead of retrying, because retrying the send
+  itself would risk sending tokens twice; that gas fact is then permanently lost
+  (see "Known gaps" below). The wrapped/unwrapped equity-recovery aggregates'
+  `DispatchToMint`/`DispatchToRedemption` handoff to a mint/redemption resume is
+  a second such swallowing site: a bot-gas enqueue failure there is folded into
+  the aggregate's normal `RecoveryFailed` event rather than redriven, because
+  `WrappedEquityRecoveryJob` (and, for consistency, its unwrapped twin) has no
+  resume arm for the `Detected` state a redrive would land back on -- redriving
+  would re-send `Detect`, which is rejected as `AlreadyInitialized`, stranding
+  the aggregate non-terminal and permanently blocking rebalancing for the symbol
+  (see "Known gaps" below). This differs from a downstream job's own execution
+  failures, which dead-letter without blocking the caller
+- The recording worker itself treats RPC-shaped receipt/block/valuation outcomes
+  as self-healing rather than a genuine failure: a receipt (or its block) not
+  yet visible to the RPC endpoint, or an outright RPC error fetching the
+  receipt, block, or ETH/USD price, delayed-redrives instead of consuming the
+  retry budget -- bounded to 20 attempts (10 minutes at the 30s redrive delay),
+  past which the fact dead-letters loudly rather than looping forever. A CCTP
+  mint whose payer does not match the bot wallet is skipped rather than
+  dead-lettered -- CCTP V2's `receiveMessage` is permissionless, so an adopted
+  mint (crash recovery, or a resume that finds an already-landed mint) can
+  legitimately have been submitted and paid for by a relayer. A non-bot payer on
+  any other operation category remains a dead-lettered invariant violation
+- Token approvals, CLI-initiated on-chain operations (manual vault withdraw,
+  manual CCTP ops), and order-management transactions are outside this scope:
+  approvals and order management never surface a transaction hash to the
+  recording call sites, and CLI operations run in a separate binary without the
+  server's job queue
+- Known gaps (deliberately deferred, tracked as follow-up work rather than
+  blocking this feature): gas paid on reverted-but-mined transactions is not
+  recorded, Base's L1 data-availability fee is not included in the recorded
+  cost, `EquityRedemption::SendTokens`'s enqueue failure is swallowed (logged
+  and not retried, to avoid re-sending tokens) so that one send's gas cost is
+  permanently lost rather than dead-lettered for recovery, a mint's
+  vault-deposit crash-recovery path (the narrow window between broadcasting the
+  deposit tx and durably persisting `SubmitVaultDeposit`) can resume with an
+  unrecoverable `TxHash::ZERO` sentinel, in which case that deposit's gas cost
+  is permanently lost (logged loudly, not silently) rather than recorded, and
+  the wrapped/unwrapped equity-recovery aggregates' `DispatchToMint`/
+  `DispatchToRedemption` handoff swallows a bot-gas enqueue failure into
+  `RecoveryFailed` (permanently losing that mint/redemption-resume gas fact)
+  rather than redriving it, because `WrappedEquityRecoveryJob` has no resume arm
+  for the `Detected` state a redrive would land back on -- redriving would
+  re-send `Detect`, rejected as `AlreadyInitialized`, stranding the aggregate
+  non-terminal. `UnwrappedEquityRecoveryJob` already resumes safely from
+  `Detected` (`resume_from_detected`), but its aggregate folds the failure the
+  same way for consistency with its wrapped twin pending the fix below. The
+  proper fix is to add a `Detected` resume arm to `WrappedEquityRecoveryJob`
+  mirroring `UnwrappedEquityRecoveryJob::resume_from_detected`, after which both
+  aggregates can safely redrive this handoff again -- so `/pnl`'s bot-gas line
+  is a lower bound on actual gas spend, not an exact figure
+
 #### Reporting and Analysis
 
 - Calculate profit/loss for each trade pair using actual executed amounts
@@ -548,8 +651,9 @@ migration files in `migrations/`.
 - Apply the report's `asOfRowid` boundary to bot-gas events exactly as it is
   applied to other CQRS facts, so later receipt ingestion cannot change a
   historical report
-- Treat an identical receipt-cost retry as idempotent and reject conflicting
-  facts for the same chain and transaction hash
+- Treat a repeated receipt-cost retry as idempotent when its immutable receipt
+  facts agree with what is already recorded, and reject conflicting facts for
+  the same chain and transaction hash
 - Track inventory positions across both venues
 - Push aggregated metrics to external logging system using structured logging
 - Identify unprofitable trades for strategy optimization

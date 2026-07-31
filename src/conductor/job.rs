@@ -479,6 +479,7 @@ pub enum JobKind {
     ResumeTokenizationAggregate,
     DashboardTradeDelivery,
     PortfolioSnapshot,
+    RecordBotGasReceiptCost,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -522,6 +523,7 @@ pub struct FailureInjector {
     resume_tokenization_aggregate: Arc<Mutex<InjectionState>>,
     dashboard_trade_delivery: Arc<Mutex<InjectionState>>,
     portfolio_snapshot: Arc<Mutex<InjectionState>>,
+    record_bot_gas_receipt_cost: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -563,6 +565,7 @@ impl FailureInjector {
             resume_tokenization_aggregate: Arc::new(Mutex::new(InjectionState::Idle)),
             dashboard_trade_delivery: Arc::new(Mutex::new(InjectionState::Idle)),
             portfolio_snapshot: Arc::new(Mutex::new(InjectionState::Idle)),
+            record_bot_gas_receipt_cost: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -616,6 +619,7 @@ impl FailureInjector {
             JobKind::ResumeTokenizationAggregate => &self.resume_tokenization_aggregate,
             JobKind::DashboardTradeDelivery => &self.dashboard_trade_delivery,
             JobKind::PortfolioSnapshot => &self.portfolio_snapshot,
+            JobKind::RecordBotGasReceiptCost => &self.record_bot_gas_receipt_cost,
         };
 
         match mutex.lock() {

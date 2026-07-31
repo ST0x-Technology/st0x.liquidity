@@ -39,7 +39,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use st0x_event_sorcery::{SendError, Store};
+use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
@@ -47,6 +47,9 @@ use super::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCommand, UnwrappedEquityRecoveryError,
     UnwrappedEquityRecoveryId,
 };
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
+use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
@@ -75,8 +78,13 @@ pub(crate) struct UnwrappedEquityRecoveryCtx {
 }
 
 /// Why a single recovery job attempt failed. Errors propagate up through
-/// apalis; service-call failures inside the aggregate's command handlers
-/// are recorded as `RecoveryFailed` events and don't surface here.
+/// apalis; most service-call failures inside the aggregate's command
+/// handlers are recorded as `RecoveryFailed` events and don't surface here.
+/// The one exception is a bot-gas enqueue failure
+/// (`UnwrappedEquityRecoveryError::BotGasEnqueueFailed`), which the
+/// aggregate deliberately propagates so it reaches `perform`'s
+/// `redrive_on_bot_gas_failure` call instead of permanently failing the
+/// recovery over a best-effort accounting write.
 #[derive(Debug, Error)]
 pub(crate) enum UnwrappedEquityRecoveryJobError {
     #[error("recovery aggregate error: {0}")]
@@ -283,7 +291,17 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
                 }
                 Ok(())
             }
-            Err(other) => Err(other),
+            // Bot-gas cost recording is best-effort (see
+            // `BotGasReceiptCostEnqueuer`'s doc, ADR 0017 SS4): the shared
+            // `redrive_on_bot_gas_failure` mechanism redrives rather than
+            // consuming the apalis retry budget. The confirm step it follows
+            // already succeeded and the aggregate has not advanced past it,
+            // so redriving the same command is safe. The guard is left to
+            // drop normally (not released) so the slot is restored/removed
+            // exactly as any other retryable failure would.
+            Err(other) => {
+                redrive_on_bot_gas_failure(self, &ctx.queue, ctx.reschedule_interval, other).await
+            }
         }
     }
 }
@@ -498,6 +516,27 @@ fn is_business_validation_error(error: &UnwrappedEquityRecoveryJobError) -> bool
         | UnwrappedEquityRecoveryJobError::ActiveRedemptionAggregate(_)
         | UnwrappedEquityRecoveryJobError::Reschedule(_)
         | UnwrappedEquityRecoveryJobError::NoBalanceSkip { .. } => false,
+    }
+}
+
+impl BotGasFailureClassifier for UnwrappedEquityRecoveryJobError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Aggregate(AggregateError::UserError(LifecycleError::Apply(
+                UnwrappedEquityRecoveryError::BotGasEnqueueFailed(_),
+            )))
+            | Self::Domain(UnwrappedEquityRecoveryError::BotGasEnqueueFailed(_)) => true,
+            Self::Aggregate(_)
+            | Self::Domain(_)
+            | Self::ActiveMintQuantityMismatch { .. }
+            | Self::ActiveRedemptionQuantityMismatch { .. }
+            | Self::ActiveMintMissing { .. }
+            | Self::ActiveRedemptionMissing { .. }
+            | Self::ActiveMintAggregate(_)
+            | Self::ActiveRedemptionAggregate(_)
+            | Self::Reschedule(_)
+            | Self::NoBalanceSkip { .. } => false,
+        }
     }
 }
 
@@ -750,6 +789,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
@@ -770,6 +810,7 @@ mod tests {
                 wrapper,
                 transfer,
                 wallet: Address::random(),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             },
         ));
         let (sender, _receiver) = broadcast::channel(16);
@@ -823,6 +864,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
@@ -843,6 +885,7 @@ mod tests {
                 wrapper,
                 transfer,
                 wallet: Address::random(),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             },
         ));
 
@@ -904,6 +947,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
@@ -924,6 +968,7 @@ mod tests {
                 wrapper,
                 transfer,
                 wallet: Address::random(),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             },
         ));
 
@@ -1972,6 +2017,132 @@ mod tests {
         assert_eq!(
             vault_deposit_tx_hash, seeded_deposit_tx,
             "the resumed run must confirm the persisted deposit tx, not submit a second deposit",
+        );
+    }
+
+    /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
+    /// failure on `ConfirmOrphanWrap` must delayed-redrive the job rather
+    /// than propagate terminally -- otherwise a bookkeeping write can consume
+    /// the apalis retry budget and open this supervised worker's fail-stop
+    /// circuit. `confirm_wrap` already succeeded on-chain and the aggregate
+    /// has not advanced past `OrphanWrapSubmitted`, so redriving is safe: the
+    /// resumed attempt dispatches straight to `resume_from_confirm_wrap`,
+    /// never resending `SubmitOrphanWrap`.
+    #[tokio::test]
+    async fn confirm_orphan_wrap_bot_gas_enqueue_failure_redrives_without_terminal_error() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let equity_in_progress = HashMap::new();
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let closed_apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        closed_apalis_pool.close().await;
+        let bot_gas_queue =
+            crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&closed_apalis_pool);
+
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let transfer_services = EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            raindex.clone(),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            wrapper.clone(),
+            Address::random(),
+            mint_store.clone(),
+            redemption_store.clone(),
+        ));
+        // The store's bot-gas enqueuer targets the CLOSED pool so
+        // `ConfirmOrphanWrap`'s enqueue fails with a genuine `QueuePushError`.
+        // `SubmitOrphanWrap` (used to seed state below) never calls the
+        // enqueuer, so seeding is unaffected.
+        let store = Arc::new(test_store(
+            pool,
+            UnwrappedEquityRecoveryServices {
+                raindex,
+                vault_lookup: Arc::new(mock_vault_lookup()),
+                wrapper,
+                transfer,
+                wallet: Address::random(),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue),
+            },
+        ));
+        let (sender, _receiver) = broadcast::channel(16);
+        let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)));
+        let inventory = Arc::new(BroadcastingInventory::new(view, sender));
+
+        let ctx = UnwrappedEquityRecoveryCtx {
+            inventory,
+            store: store.clone(),
+            mint_store,
+            redemption_store,
+            equity_in_progress: Arc::new(RwLock::new(equity_in_progress)),
+            queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
+            reschedule_interval: Duration::from_secs(1),
+        };
+        let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+
+        store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::Detect {
+                    symbol: symbol.clone(),
+                    shares: FractionalShares::new(float!(5)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovery_id,
+                UnwrappedEquityRecoveryCommand::SubmitOrphanWrap,
+            )
+            .await
+            .unwrap();
+        let seeded = store.load(&recovery_id).await.unwrap();
+        assert!(
+            matches!(
+                seeded,
+                Some(UnwrappedEquityRecovery::OrphanWrapSubmitted { .. })
+            ),
+            "seeding should land in OrphanWrapSubmitted, got {seeded:?}",
+        );
+
+        let job = UnwrappedEquityRecoveryJob {
+            symbol: symbol.clone(),
+            recovery_id: recovery_id.clone(),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("a bot-gas enqueue failure must not fail the recovery job terminally");
+
+        let state = store.load(&recovery_id).await.unwrap();
+        assert!(
+            matches!(
+                state,
+                Some(UnwrappedEquityRecovery::OrphanWrapSubmitted { .. })
+            ),
+            "the aggregate must remain un-advanced (ConfirmOrphanWrap did not commit), \
+             got {state:?}",
+        );
+
+        let (rescheduled,): (i64,) =
+            sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rescheduled, 1,
+            "a bot-gas enqueue failure must re-enqueue a delayed replacement job",
         );
     }
 }

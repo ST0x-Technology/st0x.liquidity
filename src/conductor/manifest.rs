@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, RetryOnBusy, Store, StoreBuilder};
 
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
@@ -248,6 +250,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let frameworks = manifest.build(pool, services).await.unwrap();
@@ -311,6 +314,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let built = manifest.build(pool, services).await.unwrap();
 
@@ -431,6 +435,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let built = manifest.build(pool.clone(), services).await.unwrap();
 

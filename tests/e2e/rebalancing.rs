@@ -76,6 +76,148 @@ struct StoredSnapshot {
     payload: String,
 }
 
+/// Verifies the recorded facts of `BotGasReceiptCostEvent::Recorded` events
+/// on Base, not just that the expected number of events landed: each
+/// expected `operation_category` (e.g. `"wrap"`, `"vault_deposit"`) must
+/// appear with `chain == "base"`, a well-formed non-zero `tx_hash`, and a
+/// strictly positive `usd_cost` -- otherwise the ledger could silently
+/// record a zero-value or wrong-chain cost fact while the raw event count
+/// still passed.
+async fn assert_bot_gas_receipt_costs_recorded(
+    db_path: &std::path::Path,
+    expected_categories: &[&str],
+) -> anyhow::Result<()> {
+    let pool = crate::poll::connect_db(db_path).await?;
+    let events: Vec<StoredEvent> = crate::poll::fetch_events_by_type(&pool, "BotGasReceiptCost")
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "BotGasReceiptCostEvent::Recorded")
+        .collect();
+    pool.close().await;
+
+    assert_eq!(
+        events.len(),
+        expected_categories.len(),
+        "expected exactly {} recorded bot-gas cost facts, got: {events:?}",
+        expected_categories.len()
+    );
+
+    let mut recorded_categories: Vec<String> = Vec::new();
+    for event in &events {
+        let cost = &event.payload["Recorded"]["cost"];
+
+        assert_eq!(
+            cost["chain"].as_str(),
+            Some("base"),
+            "bot-gas cost fact must be recorded on Base, got: {cost:?}"
+        );
+
+        let tx_hash = cost["tx_hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bot-gas cost fact missing tx_hash: {cost:?}"));
+        assert!(
+            tx_hash.starts_with("0x") && tx_hash != format!("0x{}", "0".repeat(64)),
+            "bot-gas cost fact must carry a well-formed non-zero tx_hash, got: {tx_hash}"
+        );
+
+        let usd_cost: f64 = cost["usd_cost"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bot-gas cost fact missing usd_cost: {cost:?}"))
+            .parse()
+            .unwrap_or_else(|error| panic!("usd_cost must parse as a decimal: {error}"));
+        assert!(
+            usd_cost > 0.0,
+            "bot-gas cost fact's usd_cost must be strictly positive, got: {usd_cost}"
+        );
+
+        let category = cost["operation_category"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bot-gas cost fact missing operation_category: {cost:?}"))
+            .to_owned();
+        recorded_categories.push(category);
+    }
+
+    recorded_categories.sort_unstable();
+    let mut expected_sorted: Vec<String> = expected_categories
+        .iter()
+        .map(|category| (*category).to_owned())
+        .collect();
+    expected_sorted.sort_unstable();
+    assert_eq!(
+        recorded_categories, expected_sorted,
+        "unexpected set of recorded bot-gas operation categories"
+    );
+
+    Ok(())
+}
+
+/// USDC-path counterpart to `assert_bot_gas_receipt_costs_recorded`: unlike
+/// every equity/vault path (Base-only), a USDC AlpacaToBase/BaseToAlpaca
+/// rebalance is the only flow that exercises `BotGasChain::Ethereum` (the
+/// CCTP burn and the Alpaca-deposit wallet transfer), so the reorg-safe
+/// receipt/block/valuation pipeline needs proving on BOTH chains against
+/// real anvil providers, not just via `Asserter` unit tests. Asserts at
+/// least one well-formed, positively-valued recorded cost fact per chain,
+/// rather than pinning an exact category set: which categories land on which
+/// chain depends on whether CCTP adopts an already-relayed mint, so a strict
+/// count would be flaky.
+async fn assert_bot_gas_receipt_costs_recorded_on_both_chains(
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pool = crate::poll::connect_db(db_path).await?;
+    let events: Vec<StoredEvent> = crate::poll::fetch_events_by_type(&pool, "BotGasReceiptCost")
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "BotGasReceiptCostEvent::Recorded")
+        .collect();
+    pool.close().await;
+
+    assert!(
+        !events.is_empty(),
+        "expected at least one recorded bot-gas cost fact for the USDC rebalance"
+    );
+
+    let mut chains_seen: Vec<String> = Vec::new();
+    for event in &events {
+        let cost = &event.payload["Recorded"]["cost"];
+
+        let chain = cost["chain"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bot-gas cost fact missing chain: {cost:?}"))
+            .to_owned();
+
+        let tx_hash = cost["tx_hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bot-gas cost fact missing tx_hash: {cost:?}"));
+        assert!(
+            tx_hash.starts_with("0x") && tx_hash != format!("0x{}", "0".repeat(64)),
+            "bot-gas cost fact must carry a well-formed non-zero tx_hash, got: {tx_hash}"
+        );
+
+        let usd_cost: f64 = cost["usd_cost"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bot-gas cost fact missing usd_cost: {cost:?}"))
+            .parse()
+            .unwrap_or_else(|error| panic!("usd_cost must parse as a decimal: {error}"));
+        assert!(
+            usd_cost > 0.0,
+            "bot-gas cost fact's usd_cost must be strictly positive, got: {usd_cost}"
+        );
+
+        chains_seen.push(chain);
+    }
+
+    for expected_chain in ["base", "ethereum"] {
+        assert!(
+            chains_seen.iter().any(|chain| chain == expected_chain),
+            "expected at least one recorded bot-gas cost fact on chain \
+             {expected_chain:?}, got chains: {chains_seen:?}"
+        );
+    }
+
+    Ok(())
+}
+
 async fn latest_inventory_snapshot(
     pool: &sqlx::SqlitePool,
 ) -> anyhow::Result<Option<StoredSnapshot>> {
@@ -447,6 +589,20 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         Duration::from_secs(120),
     )
     .await;
+
+    // ADR 0017: the mint's wrap and vault-deposit confirmations
+    // each enqueue a one-shot `RecordBotGasReceiptCost` job; wait for both to
+    // drain into recorded cost facts before asserting the rest of the flow.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "BotGasReceiptCostEvent::Recorded",
+        2,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    assert_bot_gas_receipt_costs_recorded(&infra.db_path, &["wrap", "vault_deposit"]).await?;
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
@@ -1028,6 +1184,22 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 
     assert_ethereum_usdc_event_exists(&infra.db_path).await?;
     assert_base_wallet_usdc_event_exists(&infra.db_path).await?;
+
+    // ADR 0017: each of the CCTP burn/mint and USDC wallet-transfer
+    // confirmations enqueues a one-shot `RecordBotGasReceiptCost` job; wait
+    // for both to drain into recorded cost facts before asserting on them --
+    // otherwise a single unsynchronized read below only proves the jobs were
+    // enqueued (via `DepositConfirmed` above), not that they completed.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "BotGasReceiptCostEvent::Recorded",
+        2,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    assert_bot_gas_receipt_costs_recorded_on_both_chains(&infra.db_path).await?;
 
     bot.abort();
     Ok(())

@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
 
+use crate::bot_gas::BotGasReceiptCost;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::snapshot::InventorySnapshot;
 use crate::offchain::order::OffchainOrder;
@@ -188,6 +189,7 @@ async fn run_replay_checks(pool: &SqlitePool) -> Vec<AggregateReplayReport> {
         check_replay::<EquityRedemption>(pool).await,
         check_replay::<WrappedEquityRecovery>(pool).await,
         check_replay::<UnwrappedEquityRecovery>(pool).await,
+        check_replay::<BotGasReceiptCost>(pool).await,
     ]
 }
 
@@ -439,7 +441,7 @@ mod tests {
 
         let reports = run_replay_checks(&pool).await;
 
-        assert_eq!(reports.len(), 10);
+        assert_eq!(reports.len(), 11);
         for report in &reports {
             assert_eq!(report.total, 0, "{}", report.aggregate_type);
             assert!(report.failures.is_empty(), "{}", report.aggregate_type);
@@ -490,7 +492,7 @@ mod tests {
         assert_eq!(bytes_before, bytes_after, "source database was mutated");
 
         assert!(!report.has_failures());
-        assert_eq!(report.replay_reports.len(), 10);
+        assert_eq!(report.replay_reports.len(), 11);
         assert_eq!(find_report(&report.replay_reports, "Position").total, 1);
     }
 

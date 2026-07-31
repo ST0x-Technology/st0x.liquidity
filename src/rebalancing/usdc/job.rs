@@ -16,6 +16,7 @@
 //! `WithdrawalSubmitting`/`BridgingSubmitting`), keeps the guard latched so
 //! automation does not re-arm a fresh transfer on top of a partial one.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ use st0x_finance::Usdc;
 use super::UsdcTransferError;
 use super::manager::CrossVenueCashTransfer;
 use crate::alerts::Notifier;
+use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::usdc_rebalance::UsdcRebalanceId;
 
@@ -253,6 +255,43 @@ where
     job_queue.push_with_delay(redriven_job, redrive_delay).await
 }
 
+/// Intercepts a bot-gas enqueue failure before either direction's
+/// domain-specific error arms run.
+///
+/// Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
+/// doc, ADR 0017 SS4), so the failure is redriven through the shared mechanism
+/// rather than consuming the apalis retry budget or opening the fail-stop
+/// circuit. Whether the enqueue site runs before or after its
+/// aggregate-advancing command (see `CrossVenueCashTransfer::enqueue_bot_gas_cost`'s
+/// doc), the burn/withdraw/send resume paths scan-and-adopt rather than
+/// re-executing the on-chain step, so redriving is safe either way.
+///
+/// `Break` carries the value the caller must return as-is; `Continue` carries
+/// the untouched result for the caller's remaining arms.
+async fn intercept_bot_gas_enqueue_failure<Ctx, TaskJob>(
+    job: &TaskJob,
+    job_queue: &JobQueue<TaskJob>,
+    result: Result<(), UsdcTransferError>,
+) -> ControlFlow<Result<(), TaskJob::Error>, Result<(), UsdcTransferError>>
+where
+    Ctx: Send + Sync + 'static,
+    TaskJob: Job<Ctx> + Clone + Sync + Unpin,
+    TaskJob::Error: From<UsdcTransferError> + BotGasFailureClassifier + std::fmt::Display,
+{
+    match result {
+        Err(UsdcTransferError::BotGasEnqueue(push_error)) => ControlFlow::Break(
+            redrive_on_bot_gas_failure(
+                job,
+                job_queue,
+                SETTLEMENT_REDRIVE_DELAY,
+                TaskJob::Error::from(UsdcTransferError::BotGasEnqueue(push_error)),
+            )
+            .await,
+        ),
+        other => ControlFlow::Continue(other),
+    }
+}
+
 /// Apalis queue type for [`TransferUsdcToHedging`].
 pub(crate) type TransferUsdcToHedgingJobQueue = JobQueue<TransferUsdcToHedging>;
 
@@ -346,6 +385,17 @@ pub(crate) enum TransferUsdcToHedgingJobError {
     Enqueue(#[from] QueuePushError),
 }
 
+impl BotGasFailureClassifier for TransferUsdcToHedgingJobError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
+            Self::BurnRevertLimitReached { .. }
+            | Self::TimeoutLimitReached { .. }
+            | Self::Enqueue(_) => false,
+        }
+    }
+}
+
 /// Apalis job payload. The `id` is generated at enqueue time so retries
 /// resume the same aggregate. `revert_redrive_attempts` is a durable counter
 /// so the redrive bound is preserved across restarts.
@@ -395,6 +445,11 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // repeated timeouts (e.g., a permanently hung RPC) eventually surface
             // for operator review.
             return self.handle_hedging_timeout_redrive(ctx).await;
+        };
+
+        let result = match intercept_bot_gas_enqueue_failure(self, &ctx.job_queue, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
         };
 
         match result {
@@ -867,6 +922,15 @@ pub(crate) enum TransferUsdcToMarketMakingJobError {
     Enqueue(#[from] QueuePushError),
 }
 
+impl BotGasFailureClassifier for TransferUsdcToMarketMakingJobError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
+            Self::BurnRevertLimitReached { .. } | Self::Enqueue(_) => false,
+        }
+    }
+}
+
 /// Apalis job payload for the Alpaca->Base direction. The `id` is generated
 /// at enqueue time so retries resume the same aggregate. `revert_redrive_attempts`
 /// is a durable counter so the redrive bound is preserved across restarts.
@@ -917,6 +981,11 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             .resume_alpaca_to_base(&self.id, self.amount)
             .await;
 
+        let result = match intercept_bot_gas_enqueue_failure(self, &ctx.job_queue, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
+
         match result {
             Ok(()) => {}
             Err(UsdcTransferError::AttestationTimedOut { id }) => {
@@ -942,47 +1011,35 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             // SETTLEMENT_REDRIVE_DELAY and return Ok so this attempt completes
             // cleanly; the delayed job resumes once settlement is likely complete.
             Err(
-                ref settlement_err @ (UsdcTransferError::WithdrawalTxUnderconfirmed {
-                    ref id, ..
-                }
-                | UsdcTransferError::WalletUsdcInsufficient { ref id, .. }
-                | UsdcTransferError::SettlementCheckTransient { ref id, .. }),
+                ref settlement_err @ UsdcTransferError::WithdrawalTxUnderconfirmed { ref id, .. },
             ) => {
-                let reason = match settlement_err {
-                    UsdcTransferError::WithdrawalTxUnderconfirmed { .. } => {
-                        "withdrawal tx not yet sufficiently confirmed"
-                    }
-                    UsdcTransferError::WalletUsdcInsufficient { .. } => {
-                        "market-maker wallet has insufficient USDC (withdrawal not yet settled)"
-                    }
-                    UsdcTransferError::SettlementCheckTransient { .. } => {
-                        "settlement-phase RPC check failed transiently"
-                    }
-                    // The outer or-pattern matches only the three variants above.
-                    // This arm is unreachable; it exists only to satisfy exhaustiveness.
-                    _ => unreachable!("outer or-pattern limits to settlement variants"),
-                };
-                // `settlement_err` is logged in full (not just the generic
-                // `reason` string) so an operator watching this redrive sees
-                // the underlying cause.
-                //
-                // A post-burn CCTP mint recovery whose outcome could not be
-                // determined is a DIFFERENT, dedicated variant --
-                // `UsdcTransferError::MintRecoveryInconclusive` (see the arm
-                // below) -- not wrapped in this one, so it gets its own
-                // deadline-based operator alert instead of redriving here
-                // silently forever.
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    delay = ?SETTLEMENT_REDRIVE_DELAY,
-                    ?settlement_err,
-                    "Rescheduling Alpaca->Base USDC transfer: {reason}"
-                );
-                let mut job_queue = ctx.job_queue.clone();
-                job_queue
-                    .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
-                    .await?;
+                self.handle_settlement_wait_redrive(
+                    ctx,
+                    settlement_err,
+                    id,
+                    "withdrawal tx not yet sufficiently confirmed",
+                )
+                .await?;
+            }
+            Err(ref settlement_err @ UsdcTransferError::WalletUsdcInsufficient { ref id, .. }) => {
+                self.handle_settlement_wait_redrive(
+                    ctx,
+                    settlement_err,
+                    id,
+                    "market-maker wallet has insufficient USDC (withdrawal not yet settled)",
+                )
+                .await?;
+            }
+            Err(
+                ref settlement_err @ UsdcTransferError::SettlementCheckTransient { ref id, .. },
+            ) => {
+                self.handle_settlement_wait_redrive(
+                    ctx,
+                    settlement_err,
+                    id,
+                    "settlement-phase RPC check failed transiently",
+                )
+                .await?;
             }
             // Post-burn CCTP mint recovery inconclusive: the nonce state is
             // unknown or the mint receipt could not be reconstructed (see
@@ -1172,6 +1229,41 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 }
 
 impl TransferUsdcToMarketMaking {
+    /// `reason` is supplied by the caller, where the concrete settlement
+    /// variant is already known statically. Re-deriving it here from the
+    /// widened `&UsdcTransferError` would need an `unreachable!` fallback that
+    /// a future variant added to the caller's or-pattern could turn into a
+    /// worker-killing panic.
+    async fn handle_settlement_wait_redrive(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        settlement_err: &UsdcTransferError,
+        id: &UsdcRebalanceId,
+        reason: &'static str,
+    ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        // `settlement_err` is logged in full (not just the generic
+        // `reason` string) so an operator watching this redrive sees
+        // the underlying cause.
+        //
+        // A post-burn CCTP mint recovery whose outcome could not be
+        // determined is a DIFFERENT, dedicated variant --
+        // `UsdcTransferError::MintRecoveryInconclusive` -- not wrapped in
+        // this one, so it gets its own deadline-based operator alert
+        // instead of redriving here silently forever.
+        warn!(
+            target: "rebalance",
+            %id,
+            delay = ?SETTLEMENT_REDRIVE_DELAY,
+            ?settlement_err,
+            "Rescheduling Alpaca->Base USDC transfer: {reason}"
+        );
+        let mut job_queue = ctx.job_queue.clone();
+        job_queue
+            .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
+            .await?;
+        Ok(())
+    }
+
     async fn handle_withdrawal_poll_inconclusive(
         &self,
         ctx: &TransferUsdcToMarketMakingCtx,
@@ -1373,6 +1465,85 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, NoopNotifier};
     use crate::test_utils::setup_test_apalis_pool;
+
+    /// Builds a `QueuePushError` without touching a pool. The classification
+    /// under test depends only on the variant shape, not on the underlying
+    /// sqlx failure.
+    fn queue_push_error() -> QueuePushError {
+        QueuePushError(apalis_core::backend::TaskSinkError::PushError(
+            sqlx_apalis::Error::PoolClosed,
+        ))
+    }
+
+    fn rebalance_id() -> UsdcRebalanceId {
+        UsdcRebalanceId(Uuid::new_v4())
+    }
+
+    /// The classification gates whether a failure bypasses the apalis retry
+    /// budget and the fail-stop circuit, so each variant is asserted directly
+    /// rather than only transitively through `perform`.
+    #[test]
+    fn hedging_job_error_classifies_only_wrapped_bot_gas_enqueue_failures() {
+        assert!(
+            TransferUsdcToHedgingJobError::Transfer(UsdcTransferError::BotGasEnqueue(
+                queue_push_error()
+            ))
+            .is_bot_gas_enqueue_failure(),
+            "a wrapped BotGasEnqueue must redrive instead of consuming retry budget"
+        );
+
+        let id = rebalance_id();
+        assert!(
+            !TransferUsdcToHedgingJobError::Transfer(UsdcTransferError::AttestationTimedOut { id })
+                .is_bot_gas_enqueue_failure(),
+            "a non-bot-gas transfer error must not be classified as a bot-gas failure"
+        );
+        assert!(
+            !TransferUsdcToHedgingJobError::BurnRevertLimitReached { id: rebalance_id() }
+                .is_bot_gas_enqueue_failure(),
+            "burn-revert exhaustion is operator-actionable, not best-effort bookkeeping"
+        );
+        assert!(
+            !TransferUsdcToHedgingJobError::TimeoutLimitReached { id: rebalance_id() }
+                .is_bot_gas_enqueue_failure(),
+            "timeout exhaustion is operator-actionable, not best-effort bookkeeping"
+        );
+        assert!(
+            !TransferUsdcToHedgingJobError::Enqueue(queue_push_error())
+                .is_bot_gas_enqueue_failure(),
+            "a failure re-enqueueing the transfer job itself is not a bot-gas failure"
+        );
+    }
+
+    #[test]
+    fn market_making_job_error_classifies_only_wrapped_bot_gas_enqueue_failures() {
+        assert!(
+            TransferUsdcToMarketMakingJobError::Transfer(UsdcTransferError::BotGasEnqueue(
+                queue_push_error()
+            ))
+            .is_bot_gas_enqueue_failure(),
+            "a wrapped BotGasEnqueue must redrive instead of consuming retry budget"
+        );
+
+        let id = rebalance_id();
+        assert!(
+            !TransferUsdcToMarketMakingJobError::Transfer(UsdcTransferError::AttestationTimedOut {
+                id
+            })
+            .is_bot_gas_enqueue_failure(),
+            "a non-bot-gas transfer error must not be classified as a bot-gas failure"
+        );
+        assert!(
+            !TransferUsdcToMarketMakingJobError::BurnRevertLimitReached { id: rebalance_id() }
+                .is_bot_gas_enqueue_failure(),
+            "burn-revert exhaustion is operator-actionable, not best-effort bookkeeping"
+        );
+        assert!(
+            !TransferUsdcToMarketMakingJobError::Enqueue(queue_push_error())
+                .is_bot_gas_enqueue_failure(),
+            "a failure re-enqueueing the transfer job itself is not a bot-gas failure"
+        );
+    }
 
     #[test]
     fn withdrawal_poll_deadline_elapsed_includes_exact_boundary() {
@@ -3095,6 +3266,168 @@ mod tests {
         assert_eq!(
             rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
             "SettlementCheckTransient must not consume the revert-redrive budget"
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Stub for `UsdcTransferError::BotGasEnqueue` on the Alpaca->Base
+    /// (market-making) direction. Wraps a genuine `QueuePushError` produced
+    /// by pushing to a closed pool -- a real push failure, not a synthesized
+    /// enum variant -- so the test exercises the same error shape production
+    /// code hits.
+    struct BotGasEnqueueFailureAlpacaToBase(TransferUsdcToMarketMakingJobQueue);
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for BotGasEnqueueFailureAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            let mut queue = self.0.clone();
+            let error = queue
+                .push(TransferUsdcToMarketMaking {
+                    id: id.clone(),
+                    amount,
+                    revert_redrive_attempts: 0,
+                })
+                .await
+                .expect_err("push to a closed pool must fail");
+            Err(UsdcTransferError::BotGasEnqueue(error))
+        }
+    }
+
+    /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
+    /// failure must delayed-redrive like `SettlementCheckTransient`, not fall
+    /// into the generic terminal arm -- otherwise a bookkeeping write can
+    /// consume the apalis retry budget and open this supervised worker's
+    /// fail-stop circuit.
+    #[tokio::test]
+    async fn market_making_job_reschedules_bot_gas_enqueue_failure() {
+        let pool = setup_queue_pool().await;
+        let closed_pool = setup_queue_pool().await;
+        closed_pool.close().await;
+        let closed_queue = TransferUsdcToMarketMakingJobQueue::new(&closed_pool);
+        let ctx = market_making_ctx(
+            Arc::new(BotGasEnqueueFailureAlpacaToBase(closed_queue)),
+            &pool,
+        );
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx)
+            .await
+            .expect("a bot-gas enqueue failure must not fail the job terminally");
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "a bot-gas enqueue failure must re-enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
+            "a bot-gas enqueue failure must not consume the revert-redrive budget"
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Stub for `UsdcTransferError::BotGasEnqueue` on the Base->Alpaca
+    /// (hedging) direction. Same real-`QueuePushError` approach as
+    /// `BotGasEnqueueFailureAlpacaToBase`.
+    struct BotGasEnqueueFailureBaseToAlpaca(TransferUsdcToHedgingJobQueue);
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for BotGasEnqueueFailureBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            let mut queue = self.0.clone();
+            let error = queue
+                .push(TransferUsdcToHedging {
+                    id: id.clone(),
+                    amount,
+                    revert_redrive_attempts: 0,
+                })
+                .await
+                .expect_err("push to a closed pool must fail");
+            Err(UsdcTransferError::BotGasEnqueue(error))
+        }
+    }
+
+    /// Acceptance criterion (ADR 0017 SS4), hedging direction: a bot-gas
+    /// receipt cost enqueue failure must delayed-redrive without consuming
+    /// the apalis retry budget or firing a terminal alert.
+    #[tokio::test]
+    async fn hedging_job_reschedules_bot_gas_enqueue_failure() {
+        let pool = setup_queue_pool().await;
+        let closed_pool = setup_queue_pool().await;
+        closed_pool.close().await;
+        let closed_queue = TransferUsdcToHedgingJobQueue::new(&closed_pool);
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(BotGasEnqueueFailureBaseToAlpaca(closed_queue)),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a bot-gas enqueue failure must not fail the job terminally");
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            1,
+            "a bot-gas enqueue failure must re-enqueue a delayed replacement job"
+        );
+        assert_eq!(
+            notifier.messages().len(),
+            0,
+            "a bot-gas enqueue failure is a best-effort accounting write and must not fire a \
+             terminal alert (which would page the operator and open the circuit)"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
+            "a bot-gas enqueue failure must not consume the revert-redrive budget"
         );
         assert!(
             run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5

@@ -291,8 +291,19 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .assets(assets)
         .issuance(st0x_config::test_issuance_status_ctx(issuance_base_url))
         .redemption_wallet(redemption_wallet)
+        .bot_gas_valuation(mock_bot_gas_valuation(chain.mock_pyth))
         .call()?;
     Ok(ctx)
+}
+
+/// `[bot_gas_valuation]` pointed at the e2e chain's `MockPyth` stub
+/// (ADR 0017). The feed id is arbitrary -- `MockPyth` returns the
+/// same fixed price for any id.
+pub(crate) fn mock_bot_gas_valuation(pyth_contract: Address) -> st0x_hedge::BotGasValuationConfig {
+    st0x_hedge::BotGasValuationConfig {
+        pyth_contract,
+        eth_usd_feed_id: B256::repeat_byte(0xab),
+    }
 }
 
 /// Builds a `Ctx` with USDC rebalancing enabled and both chain endpoints.
@@ -386,6 +397,7 @@ where
         })
         .inventory_poll_interval(15)
         .redemption_wallet(Address::random())
+        .bot_gas_valuation(mock_bot_gas_valuation(base_chain.mock_pyth))
         .call()
         .map_err(Into::into)
 }

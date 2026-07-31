@@ -30,6 +30,7 @@ use st0x_execution::{
 use st0x_finance::{Usdc, UsdcConversionError};
 use st0x_raindex::RaindexError;
 
+use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 
 #[derive(Debug, Error)]
@@ -40,6 +41,16 @@ pub(crate) enum UsdcTransferError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] Box<CctpError>),
+    /// Constructed only at the bot-gas enqueue site
+    /// (`CrossVenueCashTransfer::enqueue_bot_gas_cost`), deliberately NOT via
+    /// `#[from]`: the job layer treats this variant as best-effort bookkeeping
+    /// (`Ok(())` plus an unbounded, budget-free redrive with no operator
+    /// notifier), so a blanket conversion would let any unrelated queue-push
+    /// failure in this module classify the same way and loop silently instead
+    /// of paging. Mirrors `MintError::BotGasEnqueue` in
+    /// [`crate::rebalancing::equity`].
+    #[error("Failed to enqueue bot-gas receipt cost recording: {0}")]
+    BotGasEnqueue(crate::conductor::job::QueuePushError),
     /// Emitted by the two-phase burn path (`burn_recording_pending`) when the
     /// burn fails with a revert-class error: EVM execution reverts and pre-flight
     /// rejections that produce no on-chain state change. Safe to redrive via the
@@ -323,6 +334,50 @@ pub(crate) enum UsdcTransferError {
         id: UsdcRebalanceId,
         burn_tx: TxHash,
     },
+}
+
+impl BotGasFailureClassifier for UsdcTransferError {
+    fn is_bot_gas_enqueue_failure(&self) -> bool {
+        match self {
+            Self::BotGasEnqueue(_) => true,
+            Self::AlpacaWallet(_)
+            | Self::AlpacaBrokerApi(_)
+            | Self::Cctp(_)
+            | Self::BurnRevert(_)
+            | Self::Vault(_)
+            | Self::InsufficientVaultLiquidity { .. }
+            | Self::Aggregate(_)
+            | Self::WithdrawalFailed { .. }
+            | Self::DepositFailed { .. }
+            | Self::UsdcConversion(_)
+            | Self::Float(_)
+            | Self::InvalidShares(_)
+            | Self::NotPositive(_)
+            | Self::MissingFilledQuantity { .. }
+            | Self::MissingFilledAveragePrice { .. }
+            | Self::ResumeIndeterminateConversion { .. }
+            | Self::ResumeWithoutMintScanBound { .. }
+            | Self::AttestationTimedOut { .. }
+            | Self::AttestationRetryDeadlineElapsed { .. }
+            | Self::WithdrawalPollInconclusive { .. }
+            | Self::AttestationRetryDeadlineOverflow { .. }
+            | Self::AttestationNonceMismatch { .. }
+            | Self::PreviouslyFailedAggregate { .. }
+            | Self::DepositRefMustBeOnchain { .. }
+            | Self::ResumeDirectionMismatch { .. }
+            | Self::AdoptedWithdrawalAmountMismatch { .. }
+            | Self::WithdrawalRefMustBeAlpacaId { .. }
+            | Self::WalletUsdcInsufficient { .. }
+            | Self::WalletUsdcAmbientBalance { .. }
+            | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::SettlementCheckTransient { .. }
+            | Self::MintRecoveryInconclusive { .. }
+            | Self::BurnRecordTaskFailed { .. }
+            | Self::BurnRecordFailed { .. }
+            | Self::BurnSubmitInconclusive { .. }
+            | Self::BurnTxDropped { .. } => false,
+        }
+    }
 }
 
 impl From<SendError<UsdcRebalance>> for UsdcTransferError {
