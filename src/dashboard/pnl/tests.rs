@@ -15,9 +15,10 @@ use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, Pn
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
 use super::state::{CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow, Venue};
 use super::{
-    ATTRIBUTION_WARNING, BASELINE_WARNING, COST_WARNING, build_pnl_report,
-    validate_pnl_snapshot_rowid,
+    ATTRIBUTION_WARNING, BASELINE_WARNING, CAPITAL_AVAILABLE_NOTE, CAPITAL_UNAVAILABLE_NOTE,
+    COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING, build_pnl_report, validate_pnl_snapshot_rowid,
 };
+use crate::portfolio_snapshot::EtDayRange;
 
 fn event(rowid: i64, symbol: &str, event_type: &str, payload: Value) -> PositionEventRow {
     PositionEventRow {
@@ -188,6 +189,54 @@ fn query_normalizes_zero_limit_to_one() {
     };
 
     assert_eq!(query.normalized_limit(), 1);
+}
+
+#[test]
+fn et_day_range_returns_both_bounds_open_when_neither_set() {
+    let query = PnlQuery::default();
+
+    assert_eq!(query.et_day_range().unwrap(), EtDayRange::default());
+}
+
+#[test]
+fn et_day_range_returns_inclusive_bounds_when_both_set() {
+    let query = PnlQuery {
+        from_date: Some("2026-05-10".to_owned()),
+        to_date: Some("2026-05-15".to_owned()),
+        ..PnlQuery::default()
+    };
+
+    assert_eq!(
+        query.et_day_range().unwrap(),
+        EtDayRange {
+            from: Some(NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()),
+            to: Some(NaiveDate::from_ymd_opt(2026, 5, 15).unwrap()),
+        }
+    );
+}
+
+#[test]
+fn et_day_range_leaves_upper_bound_open_when_only_from_date_set() {
+    let query = PnlQuery {
+        from_date: Some("2026-05-10".to_owned()),
+        ..PnlQuery::default()
+    };
+
+    let EtDayRange { from, to } = query.et_day_range().unwrap();
+    assert_eq!(from, Some(NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()));
+    assert_eq!(to, None);
+}
+
+#[test]
+fn et_day_range_leaves_lower_bound_open_when_only_to_date_set() {
+    let query = PnlQuery {
+        to_date: Some("2026-05-15".to_owned()),
+        ..PnlQuery::default()
+    };
+
+    let EtDayRange { from, to } = query.et_day_range().unwrap();
+    assert_eq!(from, None);
+    assert_eq!(to, Some(NaiveDate::from_ymd_opt(2026, 5, 15).unwrap()));
 }
 
 #[test]
@@ -541,6 +590,7 @@ fn report_with_result(
             COST_WARNING.to_owned(),
         ],
     )
+    .map(|(response, _net_realized_pnl_usd)| response)
 }
 
 async fn pnl_test_pool(
@@ -576,6 +626,25 @@ async fn pnl_test_pool_with_costs(
         .execute(&pool)
         .await
         .unwrap();
+    // Empty by default: build_pnl_report's capital computation reads this
+    // table unconditionally, so it must exist even when a test doesn't
+    // seed any snapshot rows (capital is then omitted with a warning).
+    sqlx::query(
+        "CREATE TABLE portfolio_snapshot ( \
+           et_day TEXT NOT NULL, \
+           captured_at TEXT NOT NULL, \
+           location TEXT NOT NULL, \
+           asset TEXT NOT NULL, \
+           available_balance TEXT NOT NULL, \
+           inflight_balance TEXT NOT NULL, \
+           usd_mark TEXT, \
+           mark_captured_at TEXT, \
+           PRIMARY KEY (et_day, location, asset) \
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     for row in events {
         sqlx::query(
@@ -630,6 +699,7 @@ fn report_result(events: Vec<PositionEventRow>) -> Result<PnlResponse, PnlError>
             COST_WARNING.to_owned(),
         ],
     )
+    .map(|(response, _net_realized_pnl_usd)| response)
 }
 
 fn report(events: Vec<PositionEventRow>) -> PnlResponse {
@@ -2453,4 +2523,207 @@ fn summarizes_offchain_origin_diagnostics_without_raw_per_fill_warnings() {
     );
     assert_eq!(report.summary.total_pnl_usd, "0");
     assert_eq!(report.summary.open_long_shares, "1");
+}
+
+async fn insert_portfolio_snapshot_row(
+    pool: &SqlitePool,
+    et_day: &str,
+    location: &str,
+    asset: &str,
+    available: &str,
+    usd_mark: Option<&str>,
+    mark_captured_at: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO portfolio_snapshot \
+         (et_day, captured_at, location, asset, available_balance, inflight_balance, \
+          usd_mark, mark_captured_at) \
+         VALUES (?, ?, ?, ?, ?, '0', ?, ?)",
+    )
+    .bind(et_day)
+    .bind(format!("{et_day}T04:05:00+00:00"))
+    .bind(location)
+    .bind(asset)
+    .bind(available)
+    .bind(usd_mark)
+    .bind(mark_captured_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn build_pnl_report_populates_capital_when_snapshots_exist() {
+    let pool = pnl_test_pool(Vec::new(), position_rows()).await;
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-15",
+        "market_making",
+        "USDC",
+        "1000",
+        Some("1"),
+        Some("2026-05-15T04:05:00+00:00"),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new()).await.unwrap();
+
+    assert_eq!(
+        report.capital.average_deployed_capital_usd,
+        Some("1000".to_owned())
+    );
+    assert_eq!(report.capital.annualized_return_pct, None);
+    assert_eq!(report.capital.sample_days, 1);
+    assert_eq!(report.capital.coverage_days, Some(1));
+    assert_eq!(
+        report.capital.first_snapshot_day,
+        Some("2026-05-15".to_owned())
+    );
+    assert!(report.warnings.contains(&CAPITAL_AVAILABLE_NOTE.to_owned()));
+    assert!(CAPITAL_AVAILABLE_NOTE.contains("annualized return on capital is computed only when"));
+    assert!(
+        !report
+            .warnings
+            .contains(&CAPITAL_UNAVAILABLE_NOTE.to_owned())
+    );
+}
+
+#[tokio::test]
+async fn build_pnl_report_omits_capital_with_warning_when_no_snapshots_exist() {
+    let pool = pnl_test_pool(Vec::new(), position_rows()).await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new()).await.unwrap();
+
+    assert_eq!(report.capital.average_deployed_capital_usd, None);
+    assert_eq!(report.capital.annualized_return_pct, None);
+    assert_eq!(report.capital.sample_days, 0);
+    assert!(
+        report
+            .warnings
+            .contains(&CAPITAL_UNAVAILABLE_NOTE.to_owned())
+    );
+    assert!(!report.warnings.contains(&CAPITAL_AVAILABLE_NOTE.to_owned()));
+    assert!(report.warnings.contains(&BASELINE_WARNING.to_owned()));
+}
+
+#[tokio::test]
+async fn build_pnl_report_symbol_filtered_query_omits_capital_with_warning() {
+    let pool = pnl_test_pool(Vec::new(), position_rows()).await;
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-15",
+        "market_making",
+        "USDC",
+        "1000",
+        Some("1"),
+        Some("2026-05-15T04:05:00+00:00"),
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            symbol: Some("RKLB".to_owned()),
+            ..query()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.capital.average_deployed_capital_usd, None);
+    assert!(
+        report
+            .warnings
+            .contains(&SYMBOL_FILTERED_CAPITAL_WARNING.to_owned())
+    );
+    assert!(
+        report
+            .warnings
+            .contains(&CAPITAL_UNAVAILABLE_NOTE.to_owned())
+    );
+}
+
+/// An empty/whitespace-only `symbol=` param is treated as "no filter" by
+/// `PnlQuery::symbol_filter`, so capital must stay whole-portfolio rather than
+/// being suppressed as if a real symbol filter were present.
+#[tokio::test]
+async fn build_pnl_report_empty_symbol_param_preserves_capital() {
+    let pool = pnl_test_pool(Vec::new(), position_rows()).await;
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-15",
+        "market_making",
+        "USDC",
+        "1000",
+        Some("1"),
+        Some("2026-05-15T04:05:00+00:00"),
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            symbol: Some("   ".to_owned()),
+            ..query()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.capital.average_deployed_capital_usd,
+        Some("1000".to_owned())
+    );
+    assert!(
+        !report
+            .warnings
+            .contains(&SYMBOL_FILTERED_CAPITAL_WARNING.to_owned())
+    );
+}
+
+#[tokio::test]
+async fn build_pnl_report_as_of_rowid_non_current_omits_capital_with_warning() {
+    let pool = pnl_test_pool(
+        vec![
+            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+        ],
+        position_rows(),
+    )
+    .await;
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-15",
+        "market_making",
+        "USDC",
+        "1000",
+        Some("1"),
+        Some("2026-05-15T04:05:00+00:00"),
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            as_of_rowid: Some(1),
+            ..query()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    // Capital is never watermarked to as_of_rowid. A historical rowid cannot
+    // yield a historical capital figure, so both fields stay None rather than
+    // silently substituting the live snapshot table's current capital.
+    assert_eq!(report.capital.average_deployed_capital_usd, None);
+    assert_eq!(report.capital.annualized_return_pct, None);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("not a historical view as of rowid 1") })
+    );
 }
