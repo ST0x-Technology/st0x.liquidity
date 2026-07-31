@@ -274,6 +274,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                         &order_id,
                         OffchainOrderCommand::MarkFailed {
                             error: error.clone(),
+                            filled_shares: None,
                             failed_at,
                         },
                     )

@@ -35,6 +35,7 @@ pub(crate) enum TradeProtocol {
     #[default]
     LegacyFills,
     TerminalOutcomesV1,
+    TerminalOutcomesV2,
 }
 
 impl TradeProtocol {
@@ -44,7 +45,7 @@ impl TradeProtocol {
                 TradeOutcome::Filled => true,
                 TradeOutcome::Failed { .. } => false,
             },
-            Self::TerminalOutcomesV1 => match trade.outcome {
+            Self::TerminalOutcomesV1 | Self::TerminalOutcomesV2 => match trade.outcome {
                 TradeOutcome::Filled | TradeOutcome::Failed { .. } => true,
             },
         }
@@ -60,7 +61,7 @@ impl TradeProtocol {
                 | Statement::InventorySnapshot(_)
                 | Statement::TransferUpdate(_) => true,
             },
-            Self::TerminalOutcomesV1 => match statement {
+            Self::TerminalOutcomesV1 | Self::TerminalOutcomesV2 => match statement {
                 Statement::TradeFill(_) => false,
                 Statement::CurrentState(_)
                 | Statement::TradeUpdate(_)
@@ -93,8 +94,46 @@ enum SendOutcome {
     SocketClosed,
 }
 
-async fn send_json(sink: &mut SplitSink<WebSocket, Message>, value: &Statement) -> SendOutcome {
-    let json = match serde_json::to_string(value) {
+fn serialize_statement(
+    statement: &Statement,
+    trade_protocol: TradeProtocol,
+) -> Result<String, serde_json::Error> {
+    match trade_protocol {
+        TradeProtocol::LegacyFills | TradeProtocol::TerminalOutcomesV2 => {
+            return serde_json::to_string(statement);
+        }
+        TradeProtocol::TerminalOutcomesV1 => {}
+    }
+
+    let mut wire = serde_json::to_value(statement)?;
+    match statement {
+        Statement::CurrentState(state) => {
+            wire["data"]["trades"] = serde_json::Value::Array(
+                state
+                    .trades
+                    .iter()
+                    .map(|trade| serde_json::to_value(trade.terminal_outcomes_v1()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Statement::TradeUpdate(trade) => {
+            wire["data"] = serde_json::to_value(trade.terminal_outcomes_v1())?;
+        }
+        Statement::TradeFill(_)
+        | Statement::PositionUpdate(_)
+        | Statement::InventorySnapshot(_)
+        | Statement::TransferUpdate(_) => {}
+    }
+
+    serde_json::to_string(&wire)
+}
+
+async fn send_json(
+    sink: &mut SplitSink<WebSocket, Message>,
+    value: &Statement,
+    trade_protocol: TradeProtocol,
+) -> SendOutcome {
+    let json = match serialize_statement(value, trade_protocol) {
         Ok(serialized) => serialized,
         Err(error) => {
             warn!(target: "dashboard", %error, "Failed to serialize message");
@@ -173,7 +212,7 @@ async fn send_initial_state(
         warnings,
     }));
 
-    match send_json(sink, &initial).await {
+    match send_json(sink, &initial, trade_protocol).await {
         SendOutcome::Sent => {
             info!(target: "dashboard", "Sent initial state to dashboard client");
             true
@@ -194,7 +233,7 @@ async fn stream_broadcasts(
                     continue;
                 }
                 trace!(target: "dashboard", ?msg, "Broadcasting to dashboard client");
-                match send_json(sink, &msg).await {
+                match send_json(sink, &msg, trade_protocol).await {
                     SendOutcome::Sent => {}
                     SendOutcome::SerializeFailed | SendOutcome::SocketClosed => break,
                 }
@@ -386,7 +425,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::net::TcpListener;
-    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::{WebSocketStream, connect_async};
 
     use st0x_config::{EquityAssetConfig, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
@@ -435,6 +474,8 @@ mod tests {
         assert!(!TradeProtocol::LegacyFills.includes_statement(&trade_update));
         assert!(TradeProtocol::TerminalOutcomesV1.includes_statement(&trade_update));
         assert!(!TradeProtocol::TerminalOutcomesV1.includes_statement(&legacy_fill));
+        assert!(TradeProtocol::TerminalOutcomesV2.includes_statement(&trade_update));
+        assert!(!TradeProtocol::TerminalOutcomesV2.includes_statement(&legacy_fill));
     }
 
     fn empty_settings() -> st0x_dto::Settings {
@@ -661,6 +702,25 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Reads the next WebSocket message and parses it as JSON. The
+    /// next-unwrap-unwrap-into_text-unwrap-from_str-unwrap chain is repeated
+    /// for every client in every protocol test, so keep it in one place.
+    async fn next_json<Stream>(client: &mut WebSocketStream<Stream>) -> serde_json::Value
+    where
+        Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let message = client.next().await.unwrap().unwrap().into_text().unwrap();
+        serde_json::from_str(&message).unwrap()
+    }
+
+    fn assert_terminal_outcomes_v1_failure(trade: &serde_json::Value) {
+        assert_eq!(trade["outcome"]["status"], "failed");
+        assert!(trade["outcome"].get("acceptedShares").is_none());
+        assert_eq!(trade["outcome"]["filledShares"], "0");
+        assert_eq!(trade["outcome"]["remainingShares"], "1");
+        assert_eq!(trade["outcome"]["excessShares"], "0");
+    }
+
     #[tokio::test]
     async fn websocket_initial_state_includes_failed_counter_trades() {
         let state = create_test_state().await;
@@ -734,36 +794,38 @@ mod tests {
         let mut server = start_test_server_with_state(state).await;
         let legacy_url = format!("ws://127.0.0.1:{}/api/ws", server.port);
         let (mut legacy_client, _) = connect_async(&legacy_url).await.unwrap();
-        let legacy_message = legacy_client
-            .next()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap();
-        let legacy_state: serde_json::Value = serde_json::from_str(&legacy_message).unwrap();
+        let legacy_state = next_json(&mut legacy_client).await;
         assert_eq!(legacy_state["data"]["trades"].as_array().unwrap().len(), 1);
         let legacy_trade = &legacy_state["data"]["trades"][0];
         assert_eq!(legacy_trade["id"], filled_id.to_string());
         assert!(legacy_trade["filledAt"].as_str().is_some());
         assert_eq!(legacy_trade["outcome"]["status"], "filled");
 
-        let url = format!(
+        let v1_url = format!(
             "ws://127.0.0.1:{}/api/ws?trade_protocol=terminal_outcomes_v1",
             server.port
         );
+        let (mut v1_client, _) = connect_async(&v1_url).await.unwrap();
+        let v1_state = next_json(&mut v1_client).await;
+        let v1_trade = &v1_state["data"]["trades"][0];
+        assert_terminal_outcomes_v1_failure(v1_trade);
+
+        let url = format!(
+            "ws://127.0.0.1:{}/api/ws?trade_protocol=terminal_outcomes_v2",
+            server.port
+        );
         let (mut client, _) = connect_async(&url).await.unwrap();
-        let message = client.next().await.unwrap().unwrap().into_text().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+        let parsed = next_json(&mut client).await;
         let trade = &parsed["data"]["trades"][0];
 
         assert_eq!(trade["id"], id.to_string());
         assert!(trade["occurredAt"].as_str().is_some());
         assert_eq!(trade["outcome"]["status"], "failed");
         assert_eq!(trade["outcome"]["error"], "asset is not tradable");
-        assert_eq!(trade["outcome"]["filledShares"], "0");
-        assert_eq!(trade["outcome"]["remainingShares"], "1");
-        assert_eq!(trade["outcome"]["excessShares"], "0");
+        assert_eq!(trade["outcome"]["acceptedShares"], serde_json::Value::Null);
+        assert_eq!(trade["outcome"]["filledShares"], serde_json::Value::Null);
+        assert_eq!(trade["outcome"]["remainingShares"], serde_json::Value::Null);
+        assert_eq!(trade["outcome"]["excessShares"], serde_json::Value::Null);
 
         let live_trade = Trade {
             id: "live-fill".to_string(),
@@ -783,27 +845,59 @@ mod tests {
             .send(Statement::TradeFill(live_trade.legacy_fill().unwrap()))
             .unwrap();
 
-        let legacy_live: serde_json::Value = serde_json::from_str(
-            &legacy_client
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_text()
-                .unwrap(),
-        )
-        .unwrap();
+        let legacy_live = next_json(&mut legacy_client).await;
         assert_eq!(legacy_live["type"], "trade_fill");
         assert_eq!(legacy_live["data"]["id"], "live-fill");
         assert!(legacy_live["data"]["filledAt"].as_str().is_some());
         assert!(legacy_live["data"].get("outcome").is_none());
 
-        let canonical_live: serde_json::Value =
-            serde_json::from_str(&client.next().await.unwrap().unwrap().into_text().unwrap())
-                .unwrap();
+        let canonical_live = next_json(&mut client).await;
         assert_eq!(canonical_live["type"], "trade_update");
         assert_eq!(canonical_live["data"]["id"], "live-fill");
         assert_eq!(canonical_live["data"]["outcome"]["status"], "filled");
+
+        let v1_live_fill = next_json(&mut v1_client).await;
+        assert_eq!(v1_live_fill["data"]["outcome"]["status"], "filled");
+
+        let failed_live_trade = Trade {
+            id: "live-failure".to_string(),
+            occurred_at: chrono::Utc::now(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Sell,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            outcome: TradeOutcome::Failed {
+                error: "broker rejected order".to_string(),
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+        };
+        server
+            .event_sender
+            .send(Statement::TradeUpdate(failed_live_trade))
+            .unwrap();
+
+        let canonical_live_failure = next_json(&mut client).await;
+        assert_eq!(canonical_live_failure["type"], "trade_update");
+        assert_eq!(canonical_live_failure["data"]["id"], "live-failure");
+        assert_eq!(
+            canonical_live_failure["data"]["outcome"],
+            serde_json::json!({
+                "status": "failed",
+                "error": "broker rejected order",
+                "acceptedShares": null,
+                "filledShares": null,
+                "remainingShares": null,
+                "excessShares": null
+            })
+        );
+
+        let v1_live_failure = next_json(&mut v1_client).await;
+        assert_eq!(v1_live_failure["type"], "trade_update");
+        assert_eq!(v1_live_failure["data"]["id"], "live-failure");
+        assert_terminal_outcomes_v1_failure(&v1_live_failure["data"]);
 
         server.shutdown().await;
     }

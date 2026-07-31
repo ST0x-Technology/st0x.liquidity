@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import type { LegacyTrade } from '$lib/api/LegacyTrade'
 import type { Trade } from '$lib/api/Trade'
 import {
   mergeTradeHistory,
+  normalizeTrade,
   tradeFailureReason,
   tradeFailureShares,
   tradeOutcomeClass,
@@ -21,6 +23,7 @@ describe('trade outcome presentation', () => {
     const outcome = {
       status: 'failed',
       error: 'asset is not tradable',
+      acceptedShares: '1',
       filledShares: '0.25',
       remainingShares: '0.75',
       excessShares: '0'
@@ -30,10 +33,66 @@ describe('trade outcome presentation', () => {
     expect(tradeOutcomeClass(outcome)).toBe('text-destructive')
     expect(tradeFailureReason(outcome)).toBe('asset is not tradable')
     expect(tradeFailureShares(outcome)).toEqual({
+      accepted: '1',
       filled: '0.25',
       remaining: '0.75',
       excess: '0'
     })
+  })
+
+  it('reports unknown fill provenance as all-null rather than zero', () => {
+    const outcome = {
+      status: 'failed',
+      error: 'asset is not tradable',
+      acceptedShares: null,
+      filledShares: null,
+      remainingShares: null,
+      excessShares: null
+    } as const
+
+    expect(tradeFailureShares(outcome)).toEqual({
+      accepted: null,
+      filled: null,
+      remaining: null,
+      excess: null
+    })
+  })
+})
+
+describe('legacy trade normalization', () => {
+  it('maps a legacy fill onto a filled outcome keyed by its fill time', () => {
+    const legacy: LegacyTrade = {
+      id: 'legacy-fill',
+      filledAt: '2026-01-01T00:00:00Z',
+      venue: 'alpaca',
+      direction: 'buy',
+      symbol: 'SPCX',
+      shares: '1.5'
+    }
+
+    expect(normalizeTrade(legacy)).toEqual({
+      id: 'legacy-fill',
+      occurredAt: '2026-01-01T00:00:00Z',
+      venue: 'alpaca',
+      direction: 'buy',
+      symbol: 'SPCX',
+      shares: '1.5',
+      outcome: { status: 'filled' }
+    })
+  })
+
+  it('passes a canonical trade through unchanged', () => {
+    const trade: Trade = {
+      id: 'canonical-fill',
+      occurredAt: '2026-01-01T00:00:00Z',
+      venue: 'raindex',
+      direction: 'sell',
+      symbol: 'SPCX',
+      shares: '2',
+      outcome: { status: 'filled' }
+    }
+
+    expect(normalizeTrade(trade)).toBe(trade)
   })
 })
 
@@ -55,6 +114,7 @@ describe('live trade history', () => {
       outcome: {
         status: 'failed',
         error: 'broker rejected remainder',
+        acceptedShares: '1',
         filledShares: '0.25',
         remainingShares: '0.75',
         excessShares: '0'

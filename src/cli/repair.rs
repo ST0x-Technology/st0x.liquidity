@@ -321,6 +321,7 @@ async fn fail_offchain_order_aggregate<W: Write>(
             &offchain_order_id,
             OffchainOrderCommand::MarkFailed {
                 error: reason,
+                filled_shares: None,
                 failed_at: chrono::Utc::now(),
             },
         )
@@ -888,6 +889,7 @@ mod tests {
             &failed_id,
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it".to_string(),
+                filled_shares: None,
                 failed_at: chrono::Utc::now(),
             },
             repair_order_placer(),
@@ -977,6 +979,7 @@ mod tests {
             &order_id,
             OffchainOrderCommand::MarkFailed {
                 error: "bot failed it concurrently".to_string(),
+                filled_shares: None,
                 failed_at: chrono::Utc::now(),
             },
             repair_order_placer(),
@@ -1029,6 +1032,7 @@ mod tests {
             &order_id,
             OffchainOrderCommand::MarkFailed {
                 error: "pre-failed".to_string(),
+                filled_shares: None,
                 failed_at: chrono::Utc::now(),
             },
             repair_order_placer(),

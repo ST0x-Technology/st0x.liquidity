@@ -829,6 +829,7 @@ mod tests {
     fn offchain_order_failed(failed_offset: i64) -> OffchainOrderEvent {
         OffchainOrderEvent::Failed {
             error: "rejected".to_string(),
+            filled_shares: None,
             failed_at: timestamp(failed_offset),
         }
     }
@@ -1221,6 +1222,7 @@ mod tests {
                 FailureEventType::OffchainOrderFailed,
                 OffchainOrderEvent::Failed {
                     error: "rejected".to_string(),
+                    filled_shares: None,
                     failed_at: timestamp(0),
                 }
                 .event_type(),
@@ -1397,6 +1399,7 @@ mod tests {
         // offchain_order_failure
         let (event_type, _) = offchain_order_failure(&OffchainOrderEvent::Failed {
             error: "rejected".to_string(),
+            filled_shares: None,
             failed_at: timestamp(0),
         })
         .unwrap();
@@ -1405,6 +1408,7 @@ mod tests {
             event_type.as_str(),
             OffchainOrderEvent::Failed {
                 error: "rejected".to_string(),
+                filled_shares: None,
                 failed_at: timestamp(0),
             }
             .event_type()

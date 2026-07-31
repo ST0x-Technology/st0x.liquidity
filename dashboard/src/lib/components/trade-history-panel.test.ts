@@ -31,6 +31,7 @@ const failedTrade = (id: string, overrides: Partial<Trade> = {}): Trade => ({
   outcome: {
     status: 'failed',
     error: 'broker rejected remainder',
+    acceptedShares: '1',
     filledShares: '0.25',
     remainingShares: '0.75',
     excessShares: '0'
@@ -74,11 +75,17 @@ const setupTestWebSocket = () => {
   }
 }
 
-const tradeResponse = (entries: Array<Trade | LegacyTrade>, total: number, hasMore = false): Response =>
+const tradeResponse = (
+  entries: Array<Trade | LegacyTrade>,
+  total: number,
+  hasMore = false
+): Response =>
   new Response(JSON.stringify({ entries, total, hasMore }), {
     status: 200,
     headers: { 'content-type': 'application/json' }
   })
+
+const mountedPanels: ReturnType<typeof mount>[] = []
 
 const mountPanel = () => {
   const queryClient = new QueryClient({
@@ -90,12 +97,21 @@ const mountPanel = () => {
     target,
     props: { client: queryClient }
   })
+  mountedPanels.push(component)
 
   return { queryClient, target, component }
 }
 
 describe('TradeHistoryPanel', () => {
-  afterEach(() => {
+  // Unmount here rather than at the end of each test body: a failed assertion
+  // would skip an inline unmount and leak a live component, whose polling
+  // interval then fires against the next test's mocks.
+  afterEach(async () => {
+    while (mountedPanels.length > 0) {
+      const component = mountedPanels.pop()
+      if (component) await unmount(component)
+    }
+
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
@@ -109,9 +125,12 @@ describe('TradeHistoryPanel', () => {
       symbol: 'TSLA',
       shares: '2'
     }
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(tradeResponse([legacyTrade], 1))))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(tradeResponse([legacyTrade], 1)))
+    )
 
-    const { target, component } = mountPanel()
+    const { target } = mountPanel()
 
     await vi.waitFor(() => {
       expect(target.textContent).toContain('TSLA')
@@ -119,7 +138,142 @@ describe('TradeHistoryPanel', () => {
       expect(target.textContent).toContain('1 of 1')
     })
 
-    await unmount(component)
+    target.remove()
+  })
+
+  it('retries trade history with v1 when the previous backend rejects v2', async () => {
+    const fetchMock = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(new Response(null, { status: 400 }))
+      .mockResolvedValueOnce(tradeResponse([staleTrade], 1))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+
+    await vi.waitFor(() => expect(target.textContent).toContain('1 of 1'))
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
+      expect.any(Object)
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('trade_protocol=terminal_outcomes_v1'),
+      expect.any(Object)
+    )
+
+    target.remove()
+  })
+
+  it('labels a fallback v1 failure quantity without claiming request provenance', async () => {
+    const fetchMock = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(new Response(null, { status: 400 }))
+      .mockResolvedValueOnce(tradeResponse([failedTrade('v1-failure')], 1))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+
+    await vi.waitFor(() => expect(target.textContent).toContain('1 of 1'))
+    const quantityTooltip = Array.from(target.querySelectorAll('button')).find((button) =>
+      button.getAttribute('aria-label')?.startsWith('Order quantity.') === true
+    )
+    expect(quantityTooltip).toBeDefined()
+    expect(quantityTooltip?.getAttribute('aria-label')).not.toContain('Requested quantity')
+
+    target.remove()
+  })
+
+  it('re-probes v2 on the next refresh after a v1 fallback', async () => {
+    let poll: (() => void) | undefined
+    vi.spyOn(globalThis, 'setInterval').mockImplementation((handler) => {
+      poll = handler as () => void
+      return {} as ReturnType<typeof setInterval>
+    })
+    const fetchMock = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(new Response(null, { status: 400 }))
+      .mockResolvedValueOnce(tradeResponse([failedTrade('v1-failure')], 1))
+      .mockResolvedValueOnce(
+        tradeResponse(
+          [
+            failedTrade('v2-failure', {
+              symbol: 'UPGRADED',
+              outcome: {
+                status: 'failed',
+                error: 'broker rejected remainder',
+                acceptedShares: '0.5',
+                filledShares: '0.25',
+                remainingShares: '0.25',
+                excessShares: '0'
+              }
+            })
+          ],
+          1
+        )
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    poll?.()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
+      expect.any(Object)
+    )
+    await vi.waitFor(() => expect(target.textContent).toContain('UPGRADED'))
+
+    target.remove()
+  })
+
+  it('retries each concurrent v2 history request independently', async () => {
+    let poll: (() => void) | undefined
+    vi.spyOn(globalThis, 'setInterval').mockImplementation((handler) => {
+      poll = handler as () => void
+      return {} as ReturnType<typeof setInterval>
+    })
+    const pendingRequests: Array<{
+      url: string
+      resolve: (response: Response) => void
+    }> = []
+    const fetchMock = vi.fn<(url: string) => Promise<Response>>(
+      (url) =>
+        new Promise<Response>((resolve) => {
+          pendingRequests.push({ url, resolve })
+        })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+    await vi.waitFor(() => expect(pendingRequests).toHaveLength(1))
+
+    poll?.()
+    await vi.waitFor(() => expect(pendingRequests).toHaveLength(2))
+
+    expect(pendingRequests[0]?.url).toContain('trade_protocol=terminal_outcomes_v2')
+    expect(pendingRequests[1]?.url).toContain('trade_protocol=terminal_outcomes_v2')
+
+    pendingRequests[0]?.resolve(new Response(null, { status: 400 }))
+    await vi.waitFor(() => expect(pendingRequests).toHaveLength(3))
+    expect(pendingRequests[2]?.url).toContain('trade_protocol=terminal_outcomes_v1')
+    pendingRequests[2]?.resolve(tradeResponse([staleTrade], 1))
+
+    pendingRequests[1]?.resolve(new Response(null, { status: 400 }))
+    await vi.waitFor(() => expect(pendingRequests).toHaveLength(4))
+    expect(pendingRequests[3]?.url).toContain('trade_protocol=terminal_outcomes_v1')
+    pendingRequests[3]?.resolve(
+      tradeResponse([failedTrade('current-request', { symbol: 'CURR' })], 1)
+    )
+
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('CURR')
+      expect(target.textContent).toContain('1 of 1')
+    })
+
     target.remove()
   })
 
@@ -134,6 +288,7 @@ describe('TradeHistoryPanel', () => {
               outcome: {
                 status: 'failed',
                 error: 'initial broker failure',
+                acceptedShares: '1',
                 filledShares: '0',
                 remainingShares: '1',
                 excessShares: '0'
@@ -147,7 +302,7 @@ describe('TradeHistoryPanel', () => {
     )
     vi.stubGlobal('fetch', fetchMock)
 
-    const { queryClient, target, component } = mountPanel()
+    const { queryClient, target } = mountPanel()
 
     await vi.waitFor(() => {
       expect(target.textContent).toContain('initial broker failure')
@@ -163,6 +318,7 @@ describe('TradeHistoryPanel', () => {
         outcome: {
           status: 'failed',
           error: 'broker overfilled before rejecting',
+          acceptedShares: '0.5',
           filledShares: '1',
           remainingShares: '0',
           excessShares: '0.5'
@@ -184,13 +340,12 @@ describe('TradeHistoryPanel', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('limit=100'), expect.any(Object))
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('trade_protocol=terminal_outcomes_v1'),
+      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
       expect.any(Object)
     )
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
     connection.disconnect()
-    await unmount(component)
     target.remove()
   })
 
@@ -206,7 +361,7 @@ describe('TradeHistoryPanel', () => {
       .mockReturnValueOnce(refreshResponse)
     vi.stubGlobal('fetch', fetchMock)
 
-    const { queryClient, target, component } = mountPanel()
+    const { queryClient, target } = mountPanel()
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 150'))
 
     const connection = createWebSocket('ws://localhost/api/ws', queryClient)
@@ -238,7 +393,6 @@ describe('TradeHistoryPanel', () => {
     })
 
     connection.disconnect()
-    await unmount(component)
     target.remove()
   })
 
@@ -250,7 +404,7 @@ describe('TradeHistoryPanel', () => {
       .mockResolvedValueOnce(tradeResponse([failedTrade('live-1'), staleTrade], 2, false))
     vi.stubGlobal('fetch', fetchMock)
 
-    const { queryClient, target, component } = mountPanel()
+    const { queryClient, target } = mountPanel()
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 3'))
 
     const connection = createWebSocket('ws://localhost/api/ws', queryClient)
@@ -271,7 +425,6 @@ describe('TradeHistoryPanel', () => {
     })
 
     connection.disconnect()
-    await unmount(component)
     target.remove()
   })
 
@@ -293,7 +446,7 @@ describe('TradeHistoryPanel', () => {
       .mockResolvedValueOnce(invalidResponse)
     vi.stubGlobal('fetch', fetchMock)
 
-    const { target, component } = mountPanel()
+    const { target } = mountPanel()
     await vi.waitFor(() => {
       expect(target.textContent).toContain('SPCX')
       expect(target.textContent).toContain('1 of 1')
@@ -313,7 +466,6 @@ describe('TradeHistoryPanel', () => {
       expect(target.textContent).toContain('1 of 1')
     })
 
-    await unmount(component)
     target.remove()
   })
 
@@ -325,7 +477,7 @@ describe('TradeHistoryPanel', () => {
       .mockResolvedValueOnce(tradeResponse([failedTrade('older-trade')], 201, true))
     vi.stubGlobal('fetch', fetchMock)
 
-    const { target, component } = mountPanel()
+    const { target } = mountPanel()
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 201'))
 
     const findLoadMore = (): HTMLButtonElement | undefined =>
@@ -349,7 +501,6 @@ describe('TradeHistoryPanel', () => {
     expect(requestedUrls[1]).toContain('offset=100')
     expect(requestedUrls[2]).toContain('offset=100')
 
-    await unmount(component)
     target.remove()
   })
 
@@ -371,7 +522,7 @@ describe('TradeHistoryPanel', () => {
       )
     vi.stubGlobal('fetch', fetchMock)
 
-    const { target, component } = mountPanel()
+    const { target } = mountPanel()
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 201'))
 
     const loadMore = [...target.querySelectorAll('button')].find(
@@ -386,7 +537,6 @@ describe('TradeHistoryPanel', () => {
     resolveOlder?.(tradeResponse([failedTrade('older-trade')], 201, true))
     await vi.waitFor(() => expect(target.textContent).toContain('2 of 201'))
 
-    await unmount(component)
     target.remove()
   })
 
@@ -403,7 +553,7 @@ describe('TradeHistoryPanel', () => {
       )
     vi.stubGlobal('fetch', fetchMock)
 
-    const { target, component } = mountPanel()
+    const { target } = mountPanel()
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 150'))
 
     const loadMore = [...target.querySelectorAll('button')].find(
@@ -450,7 +600,6 @@ describe('TradeHistoryPanel', () => {
       expect(target.textContent).not.toContain('Load older trades')
     })
 
-    await unmount(component)
     target.remove()
   })
 })

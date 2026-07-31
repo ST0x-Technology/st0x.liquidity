@@ -69,13 +69,17 @@ const parseDecimal = (
 
   const valid =
     decimal.value.isFinite() &&
-    (minimum === 'positive'
-      ? decimal.value.greaterThan(0)
-      : decimal.value.greaterThanOrEqualTo(0))
+    (minimum === 'positive' ? decimal.value.greaterThan(0) : decimal.value.greaterThanOrEqualTo(0))
   if (valid) return parsed
 
   return invalid(path, `a ${minimum} decimal string`)
 }
+
+const parseNullableDecimal = (
+  value: unknown,
+  path: string,
+  minimum: 'positive' | 'non-negative'
+): string | null => (value === null ? null : parseDecimal(value, path, minimum))
 
 const daysInMonth = (year: number, month: number): number => {
   if (month === 2) {
@@ -126,24 +130,99 @@ const parseOutcome = (value: unknown, path: string): TradeOutcome => {
   if (outcome['status'] === 'filled') return { status: 'filled' }
   if (outcome['status'] !== 'failed') return invalid(statusPath, 'a known terminal outcome')
 
-  return {
-    status: 'failed',
-    error: parseString(outcome['error'], fieldPath(path, 'error')),
-    filledShares: parseDecimal(
+  const hasAcceptedShares = 'acceptedShares' in outcome
+  const acceptedShares = parseNullableDecimal(
+    outcome['acceptedShares'] ?? null,
+    fieldPath(path, 'acceptedShares'),
+    'positive'
+  )
+  // terminal_outcomes_v1 originally omitted acceptedShares and derived these
+  // quantities from the request. It also split overfills between filledShares
+  // and excessShares, so reconstruct the complete observed fill and discard
+  // request-derived values that are not broker evidence. v1 synthesized zero
+  // when no fill evidence existed, so only a positive legacy total proves an
+  // actual broker fill.
+  const normalizeV1 = (): {
+    filledShares: string | null
+    remainingShares: null
+    excessShares: null
+  } => {
+    const filled = parseDecimal(
       outcome['filledShares'],
       fieldPath(path, 'filledShares'),
       'non-negative'
-    ),
-    remainingShares: parseDecimal(
-      outcome['remainingShares'],
-      fieldPath(path, 'remainingShares'),
-      'non-negative'
-    ),
-    excessShares: parseDecimal(
+    )
+    // Presence-only: the request-derived remainder is discarded, but a v1
+    // payload without it is malformed.
+    parseDecimal(outcome['remainingShares'], fieldPath(path, 'remainingShares'), 'non-negative')
+    const excess = parseDecimal(
       outcome['excessShares'],
       fieldPath(path, 'excessShares'),
       'non-negative'
     )
+    const completeFill = new Decimal(filled).plus(excess)
+
+    return {
+      filledShares: completeFill.isZero() ? null : completeFill.toString(),
+      remainingShares: null,
+      excessShares: null
+    }
+  }
+
+  const { filledShares, remainingShares, excessShares } = hasAcceptedShares
+    ? {
+        filledShares: parseNullableDecimal(
+          outcome['filledShares'],
+          fieldPath(path, 'filledShares'),
+          'non-negative'
+        ),
+        remainingShares: parseNullableDecimal(
+          outcome['remainingShares'],
+          fieldPath(path, 'remainingShares'),
+          'non-negative'
+        ),
+        excessShares: parseNullableDecimal(
+          outcome['excessShares'],
+          fieldPath(path, 'excessShares'),
+          'non-negative'
+        )
+      }
+    : normalizeV1()
+
+  if (acceptedShares === null || filledShares === null) {
+    if (remainingShares !== null) {
+      return invalid(fieldPath(path, 'remainingShares'), 'null when fill provenance is incomplete')
+    }
+    if (excessShares !== null) {
+      return invalid(fieldPath(path, 'excessShares'), 'null when fill provenance is incomplete')
+    }
+  } else {
+    if (remainingShares === null) {
+      return invalid(fieldPath(path, 'remainingShares'), 'a derived non-negative decimal string')
+    }
+    if (excessShares === null) {
+      return invalid(fieldPath(path, 'excessShares'), 'a derived non-negative decimal string')
+    }
+
+    const accepted = new Decimal(acceptedShares)
+    const filled = new Decimal(filledShares)
+    const expectedRemaining = Decimal.max(accepted.minus(filled), 0)
+    const expectedExcess = Decimal.max(filled.minus(accepted), 0)
+    if (!new Decimal(remainingShares).equals(expectedRemaining)) {
+      return invalid(fieldPath(path, 'remainingShares'), 'the accepted quantity minus the fill')
+    }
+    if (!new Decimal(excessShares).equals(expectedExcess)) {
+      return invalid(fieldPath(path, 'excessShares'), 'the fill beyond the accepted quantity')
+    }
+  }
+
+  return {
+    status: 'failed',
+    error: parseString(outcome['error'], fieldPath(path, 'error')),
+    acceptedShares,
+    filledShares,
+    remainingShares,
+    excessShares
   }
 }
 

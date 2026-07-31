@@ -12,6 +12,8 @@
 
   const failureReason = $derived(tradeFailureReason(outcome))
   const failureShares = $derived(tradeFailureShares(outcome))
+  const quantity = (value: string | null): string =>
+    value === null ? 'unknown' : formatDecimal(value, 9)
 </script>
 
 <div class="font-medium {tradeOutcomeClass(outcome)}">
@@ -27,12 +29,12 @@
 {/if}
 {#if failureShares !== null}
   <div class="text-muted-foreground">
-    Filled {formatDecimal(failureShares.filled, 9)} · Unfilled {formatDecimal(
-      failureShares.remaining,
-      9
-    )}
+    Accepted {quantity(failureShares.accepted)} · Filled {quantity(failureShares.filled)}
+    {#if failureShares.remaining !== null}
+      · Unfilled {formatDecimal(failureShares.remaining, 9)}
+    {/if}
   </div>
-  {#if !decimalIsZero(failureShares.excess)}
+  {#if failureShares.excess !== null && !decimalIsZero(failureShares.excess)}
     <div class="text-destructive">
       Excess fill {formatDecimal(failureShares.excess, 9)}
     </div>

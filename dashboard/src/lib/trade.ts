@@ -40,10 +40,16 @@ export const tradeFailureReason = (outcome: TradeOutcome): string | null =>
 
 export const tradeFailureShares = (
   outcome: TradeOutcome
-): { filled: string; remaining: string; excess: string } | null =>
+): {
+  accepted: string | null
+  filled: string | null
+  remaining: string | null
+  excess: string | null
+} | null =>
   matchOutcome(outcome, {
     filled: () => null,
-    failed: ({ filledShares, remainingShares, excessShares }) => ({
+    failed: ({ acceptedShares, filledShares, remainingShares, excessShares }) => ({
+      accepted: acceptedShares,
       filled: filledShares,
       remaining: remainingShares,
       excess: excessShares
@@ -109,7 +115,16 @@ const compareRfc3339Timestamps = (left: string, right: string): number => {
     )
   }
 
-  return Date.parse(left) - Date.parse(right)
+  // Fall back to whole-millisecond parsing. An unparseable timestamp yields
+  // NaN, and returning NaN from a comparator makes the sort order undefined,
+  // so treat an unparseable side as equal-or-older explicitly.
+  const leftMillis = Date.parse(left)
+  const rightMillis = Date.parse(right)
+  if (Number.isNaN(leftMillis) && Number.isNaN(rightMillis)) return 0
+  if (Number.isNaN(leftMillis)) return -1
+  if (Number.isNaN(rightMillis)) return 1
+
+  return leftMillis - rightMillis
 }
 
 const compareTradeIds = (left: Trade, right: Trade): number => {

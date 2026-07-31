@@ -173,8 +173,14 @@ impl PollOrderStatus {
             } => {
                 self.record_partial_fill(ctx, symbol, shares_filled, Some(avg_price), failed_at)
                     .await?;
-                self.enqueue_rejection(ctx, symbol, error_reason, Some(failed_at))
-                    .await
+                self.enqueue_rejection(
+                    ctx,
+                    symbol,
+                    error_reason,
+                    Some(shares_filled),
+                    Some(failed_at),
+                )
+                .await
             }
 
             // Broker-*terminal* Failed with a positive fill it never priced.
@@ -205,10 +211,11 @@ impl PollOrderStatus {
 
             Failed {
                 error_reason,
+                shares_filled,
                 failed_at,
                 ..
             } => {
-                self.enqueue_rejection(ctx, symbol, error_reason, Some(failed_at))
+                self.enqueue_rejection(ctx, symbol, error_reason, shares_filled, Some(failed_at))
                     .await
             }
 
@@ -426,6 +433,10 @@ impl PollOrderStatus {
         Ok(())
     }
 
+    /// `broker_filled_shares` is the broker-reported cumulative fill quantity
+    /// for this rejection; `None` when the rejection carries no persisted fill
+    /// evidence.
+    ///
     /// `broker_failed_at` is the broker-reported failure time when this
     /// rejection stems from a broker `Failed` state; `None` when no broker
     /// timestamp exists for the rejection (the job then stamps its own
@@ -435,6 +446,7 @@ impl PollOrderStatus {
         ctx: &PollOrderStatusCtx<E>,
         symbol: &Symbol,
         error_reason: Option<String>,
+        broker_filled_shares: Option<FractionalShares>,
         broker_failed_at: Option<DateTime<Utc>>,
     ) -> Result<(), JobError>
     where
@@ -455,6 +467,7 @@ impl PollOrderStatus {
             .push(HandleOrderRejection {
                 offchain_order_id: self.offchain_order_id,
                 error: error_message,
+                broker_filled_shares,
                 broker_failed_at,
             })
             .await?;
@@ -534,6 +547,7 @@ impl PollOrderStatus {
                     ctx,
                     symbol,
                     Some("Broker reported Cancelled before local cancellation request".to_string()),
+                    None,
                     None,
                 )
                 .await
@@ -2147,6 +2161,7 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: "broker rejected".to_string(),
+                    filled_shares: None,
                     failed_at: Utc::now(),
                 },
             )

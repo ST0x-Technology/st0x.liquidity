@@ -19,6 +19,7 @@ describe('TradeOutcome', () => {
         outcome: {
           status: 'failed',
           error: 'broker rejected remainder',
+          acceptedShares: '1',
           filledShares: '0.25',
           remainingShares: '0.75',
           excessShares: '0'
@@ -28,6 +29,7 @@ describe('TradeOutcome', () => {
 
     expect(body).toContain('Failed')
     expect(body).toContain('broker rejected remainder')
+    expect(body).toContain('Accepted 1')
     expect(body).toContain('Filled 0.25')
     expect(body).toContain('Unfilled 0.75')
   })
@@ -38,6 +40,7 @@ describe('TradeOutcome', () => {
         outcome: {
           status: 'failed',
           error: 'broker rejected remainder',
+          acceptedShares: '1',
           filledShares: '0.0004',
           remainingShares: '0.9996',
           excessShares: '0'
@@ -55,6 +58,7 @@ describe('TradeOutcome', () => {
         outcome: {
           status: 'failed',
           error: 'broker overfilled before rejecting',
+          acceptedShares: '0.5',
           filledShares: '1',
           remainingShares: '0',
           excessShares: '0.5'
@@ -65,5 +69,24 @@ describe('TradeOutcome', () => {
     expect(body).toContain('Filled 1')
     expect(body).toContain('Unfilled 0')
     expect(body).toContain('Excess fill 0.5')
+  })
+
+  it('renders missing provenance as unknown instead of zero', () => {
+    const { body } = render(TradeOutcome, {
+      props: {
+        outcome: {
+          status: 'failed',
+          error: 'placement failed before acceptance',
+          acceptedShares: null,
+          filledShares: null,
+          remainingShares: null,
+          excessShares: null
+        }
+      }
+    })
+
+    expect(body).toContain('Accepted unknown')
+    expect(body).toContain('Filled unknown')
+    expect(body).not.toContain('Unfilled 0')
   })
 })
