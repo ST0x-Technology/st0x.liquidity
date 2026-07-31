@@ -357,6 +357,7 @@ where
             BrokerCtx::DryRun => st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         },
         close_flatten_policy,
+        poll_interval,
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
@@ -374,6 +375,7 @@ where
         pool: context.pool.clone(),
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
         close_flatten_policy,
+        poll_interval,
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
@@ -401,6 +403,7 @@ where
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
+        poll_interval,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();

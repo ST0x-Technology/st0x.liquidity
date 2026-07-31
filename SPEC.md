@@ -4106,6 +4106,17 @@ All work managed by the Conductor falls into one of these categories:
 | Position check       | ~60s     | Reconcile accumulated positions (safety net)         |
 | Executor maintenance | ~15m     | Refresh broker metadata, check asset availability    |
 
+`Position check`'s per-tick recovery re-enqueue is a no-op for any order that
+already has a live `Order status poll` chain; it only arms polling for an order
+that has none. The same guard covers every other point that would otherwise push
+an `Order status poll` job for an order still awaiting a broker response -- a
+new placement, per-fill reconciliation against a still-open order, the hedge
+job's own retry path, and the hedge job's post-placement routing (shared by
+fresh placement and that retry path's `Pending` re-drive) -- so at most one live
+poll chain exists per order regardless of which path pushed it. A `Running` poll
+row and its delayed `Pending` successor may temporarily coexist within that one
+chain.
+
 **Lifecycle workflows** (stepped, durable, future):
 
 | Workflow           | Steps                                                                                  |

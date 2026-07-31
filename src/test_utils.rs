@@ -13,6 +13,7 @@ use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
+use std::time::Duration;
 
 use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
@@ -22,6 +23,14 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
 
 const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
+
+/// Shared `order_polling_interval`-equivalent for tests that need a
+/// realistic-but-arbitrary poll interval (e.g. to derive a staleness bound or
+/// populate a `*Ctx.poll_interval` field). A single source of truth avoids the
+/// silent-drift risk of multiple modules each defining their own copy of the
+/// same value under a "matches such-and-such module" comment that nothing
+/// enforces.
+pub(crate) const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 static ANVIL_PERMITS: LazyLock<(Mutex<usize>, Condvar)> =
     LazyLock::new(|| (Mutex::new(0), Condvar::new()));
