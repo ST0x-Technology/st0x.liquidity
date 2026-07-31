@@ -5,7 +5,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use ts_rs::TS;
 
-use st0x_finance::{FractionalShares, NonNegative, Symbol};
+use st0x_finance::{FractionalShares, NonNegative, Positive, Symbol};
 
 /// Where a trade was executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -160,7 +160,7 @@ pub struct Trade {
     /// accepted. Failed outcomes split this order quantity into filled and
     /// remaining portions in [`TradeOutcome::Failed`].
     #[ts(type = "string")]
-    pub shares: FractionalShares,
+    pub shares: Positive<FractionalShares>,
     pub outcome: TradeOutcome,
 }
 
@@ -197,7 +197,7 @@ pub struct LegacyTrade {
     #[ts(type = "string")]
     pub symbol: Symbol,
     #[ts(type = "string")]
-    pub shares: FractionalShares,
+    pub shares: Positive<FractionalShares>,
 }
 
 impl Trade {
@@ -258,6 +258,10 @@ mod tests {
 
     use super::*;
 
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        Positive::new(FractionalShares::from_str(value).unwrap()).unwrap()
+    }
+
     #[test]
     fn direction_from_str_accepts_both_wire_forms() {
         assert_eq!(Direction::from_str("BUY").unwrap(), Direction::Buy);
@@ -280,7 +284,7 @@ mod tests {
             venue: TradingVenue::Alpaca,
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: FractionalShares::new(float!(5.5)),
+            shares: positive_shares("5.5"),
             outcome: TradeOutcome::Filled,
         };
         let json = serde_json::to_value(&trade).expect("serialization should succeed");
@@ -302,7 +306,7 @@ mod tests {
             venue: TradingVenue::Alpaca,
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: FractionalShares::new(float!(5.5)),
+            shares: positive_shares("5.5"),
             outcome: TradeOutcome::Filled,
         };
 
@@ -319,6 +323,30 @@ mod tests {
     }
 
     #[test]
+    fn trade_deserialization_rejects_non_positive_total_quantity() {
+        let valid = json!({
+            "id": "order-1",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "AAPL",
+            "shares": "1",
+            "outcome": { "status": "filled" }
+        });
+
+        for invalid_shares in ["0", "-1"] {
+            let mut invalid = valid.clone();
+            invalid["shares"] = json!(invalid_shares);
+
+            let error = serde_json::from_value::<Trade>(invalid).unwrap_err();
+            assert!(
+                error.to_string().contains("value must be positive"),
+                "unexpected error for {invalid_shares}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn failed_trade_serializes_error() {
         let trade = Trade {
             id: "failed-order-id".to_string(),
@@ -326,7 +354,7 @@ mod tests {
             venue: TradingVenue::Alpaca,
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
-            shares: FractionalShares::new(float!(1)),
+            shares: positive_shares("1"),
             outcome: TradeOutcome::Failed {
                 error: "asset is not tradable".to_string(),
                 filled_shares: NonNegative::new(FractionalShares::new(float!(0.25))).unwrap(),
@@ -362,7 +390,7 @@ mod tests {
             venue: TradingVenue::Raindex,
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(float!(1)),
+            shares: positive_shares("1"),
             outcome: TradeOutcome::Filled,
         };
         let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -394,7 +422,7 @@ mod tests {
             venue: TradingVenue::Alpaca,
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(float!(1)),
+            shares: positive_shares("1"),
             outcome: TradeOutcome::Filled,
         };
         let mut trades = vec![
