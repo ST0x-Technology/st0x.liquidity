@@ -868,7 +868,6 @@ impl Reactor for Broadcaster {
 #[cfg(test)]
 mod tests {
     use apalis::prelude::Monitor;
-    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -877,7 +876,7 @@ mod tests {
 
     use super::*;
     use crate::conductor::job::{
-        FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, build_supervised_worker, build_worker_inner,
+        FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
     use crate::dashboard::trade_loader::load_trades;
     use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
@@ -1044,12 +1043,8 @@ mod tests {
     fn spawn_delivery_worker(
         queue: DashboardTradeDeliveryJobQueue,
         ctx: Arc<DashboardTradeDeliveryCtx>,
-        failure_notify: Arc<tokio::sync::Notify>,
+        failure_notify: Arc<TerminalFailureSignal>,
     ) -> tokio::task::JoinHandle<()> {
-        let fail_stop = CircuitBreakerConfig::default()
-            .with_failure_threshold(1)
-            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-
         tokio::spawn(async move {
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
@@ -1059,7 +1054,6 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
-                        fail_stop.clone(),
                         failure_notify.clone(),
                         FailureInjector::new(),
                     )
@@ -1622,8 +1616,11 @@ mod tests {
         let ctx = Arc::new(DashboardTradeDeliveryCtx::new(sender, pool));
         enqueue_test_delivery(&mut queue, &ctx, test_trade()).await;
         ctx.fail_next(1);
-        let monitor =
-            spawn_delivery_worker(queue, ctx.clone(), Arc::new(tokio::sync::Notify::new()));
+        let monitor = spawn_delivery_worker(
+            queue,
+            ctx.clone(),
+            Arc::new(TerminalFailureSignal::default()),
+        );
 
         tokio::time::timeout(Duration::from_secs(10), async {
             while !ctx.store.is_delivered("terminal-trade-1").await.unwrap() {
@@ -1663,7 +1660,7 @@ mod tests {
         let monitor = spawn_delivery_worker(
             delivery.queue,
             delivery.ctx,
-            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(TerminalFailureSignal::default()),
         );
         let statement = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
             .await
@@ -1737,7 +1734,7 @@ mod tests {
         let ctx = Arc::new(DashboardTradeDeliveryCtx::new(sender, pool));
         enqueue_test_delivery(&mut queue, &ctx, test_trade()).await;
         ctx.fail_next(usize::MAX);
-        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
         let terminal_failure = failure_notify.notified();
         let monitor = spawn_delivery_worker(queue, ctx, failure_notify.clone());
 

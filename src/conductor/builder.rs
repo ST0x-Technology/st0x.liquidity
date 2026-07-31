@@ -3,7 +3,6 @@
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use apalis::prelude::Monitor;
-use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -27,7 +26,7 @@ use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
 use super::job::{
-    FAIL_STOP_RECOVERY_TIMEOUT, build_best_effort_worker, build_supervised_worker,
+    TerminalFailureInfo, TerminalFailureSignal, build_best_effort_worker, build_supervised_worker,
     build_worker_inner,
 };
 use super::monitor::executor_maintenance::ExecutorMaintenance;
@@ -214,6 +213,7 @@ pub(crate) fn spawn<Prov, Exec>(
     record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
     job_cleanup: JoinHandle<()>,
     telemetry_writer: JoinHandle<()>,
+    worker_failure_notifier: Arc<dyn Notifier>,
 ) -> Result<Conductor, chrono::OutOfRangeError>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
@@ -518,6 +518,7 @@ where
         telemetry_writer,
         shutdown_token: context.shutdown_token,
         apalis_shutdown_token: apalis_shutdown_token_for_struct,
+        worker_failure_notifier,
     })
 }
 
@@ -666,7 +667,7 @@ where
         let failure_injector_for_resume_tokenization = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_record_bot_gas_receipt_cost = failure_injector.clone();
-        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
         let failure_notify_for_dashboard_trade_delivery = failure_notify.clone();
@@ -683,23 +684,6 @@ where
         let failure_notify_for_transfer_usdc_to_market_making = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
-        let fail_stop = CircuitBreakerConfig::default()
-            .with_failure_threshold(1)
-            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-        let fail_stop_for_hedge = fail_stop.clone();
-        let fail_stop_for_backfill = fail_stop.clone();
-        let fail_stop_for_dashboard_trade_delivery = fail_stop.clone();
-        let fail_stop_for_poll = fail_stop.clone();
-        let fail_stop_for_reconcile = fail_stop.clone();
-        let fail_stop_for_rejection = fail_stop.clone();
-        let fail_stop_for_equity_rebalancing_check = fail_stop.clone();
-        let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
-        let fail_stop_for_seed_vault_registry = fail_stop.clone();
-        let fail_stop_for_wrapped_equity_recovery = fail_stop.clone();
-        let fail_stop_for_unwrapped_equity_recovery = fail_stop.clone();
-        let fail_stop_for_check_positions = fail_stop.clone();
-        let fail_stop_for_transfer_usdc_to_hedging = fail_stop.clone();
-        let fail_stop_for_transfer_usdc_to_market_making = fail_stop.clone();
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
         tokio::spawn(async move {
@@ -711,7 +695,6 @@ where
                         index,
                         job_queue.clone(),
                         accountant_ctx.clone(),
-                        fail_stop.clone(),
                         failure_notify.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector.clone(),
@@ -723,7 +706,6 @@ where
                         index,
                         dashboard_trade_delivery_queue.clone(),
                         dashboard_trade_delivery_ctx.clone(),
-                        fail_stop_for_dashboard_trade_delivery.clone(),
                         failure_notify_for_dashboard_trade_delivery.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_dashboard_trade_delivery.clone(),
@@ -735,7 +717,6 @@ where
                         index,
                         hedge_queue.clone(),
                         hedge_ctx.clone(),
-                        fail_stop_for_hedge.clone(),
                         failure_notify_for_hedge.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_hedge.clone(),
@@ -747,7 +728,6 @@ where
                         index,
                         backfill_queue.clone(),
                         accountant_ctx_for_backfill.clone(),
-                        fail_stop_for_backfill.clone(),
                         failure_notify_for_backfill.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_backfill.clone(),
@@ -759,7 +739,6 @@ where
                         index,
                         poll_status_queue.clone(),
                         poll_status_ctx.clone(),
-                        fail_stop_for_poll.clone(),
                         failure_notify_for_poll.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_poll.clone(),
@@ -771,7 +750,6 @@ where
                         index,
                         reconcile_queue.clone(),
                         reconcile_ctx.clone(),
-                        fail_stop_for_reconcile.clone(),
                         failure_notify_for_reconcile.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_reconcile.clone(),
@@ -783,7 +761,6 @@ where
                         index,
                         rejection_queue.clone(),
                         rejection_ctx.clone(),
-                        fail_stop_for_rejection.clone(),
                         failure_notify_for_rejection.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_rejection.clone(),
@@ -795,7 +772,6 @@ where
                         index,
                         seed_vault_registry_queue.clone(),
                         seed_vault_registry_ctx.clone(),
-                        fail_stop_for_seed_vault_registry.clone(),
                         failure_notify_for_seed_vault_registry.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_seed_vault_registry.clone(),
@@ -807,7 +783,6 @@ where
                         index,
                         check_positions_queue.clone(),
                         check_positions_ctx.clone(),
-                        fail_stop_for_check_positions.clone(),
                         failure_notify_for_check_positions.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_check_positions.clone(),
@@ -841,7 +816,6 @@ where
                             index,
                             equity_queue.clone(),
                             equity_service.clone(),
-                            fail_stop_for_equity_rebalancing_check.clone(),
                             failure_notify_for_equity_rebalancing_check.clone(),
                             #[cfg(any(test, feature = "test-support"))]
                             failure_injector_for_equity_rebalancing_check.clone(),
@@ -853,7 +827,6 @@ where
                             index,
                             usdc_queue.clone(),
                             usdc_service.clone(),
-                            fail_stop_for_usdc_rebalancing_check.clone(),
                             failure_notify_for_usdc_rebalancing_check.clone(),
                             #[cfg(any(test, feature = "test-support"))]
                             failure_injector_for_usdc_rebalancing_check.clone(),
@@ -867,7 +840,6 @@ where
                 apalis_monitor,
                 wrapped_equity_recovery_ctx,
                 wrapped_equity_recovery_queue,
-                FailStopCircuit(fail_stop_for_wrapped_equity_recovery),
                 failure_notify_for_wrapped_equity_recovery,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_wrapped_equity_recovery,
@@ -877,7 +849,6 @@ where
                 apalis_monitor,
                 unwrapped_equity_recovery_ctx,
                 unwrapped_equity_recovery_queue,
-                FailStopCircuit(fail_stop_for_unwrapped_equity_recovery),
                 failure_notify_for_unwrapped_equity_recovery,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_unwrapped_equity_recovery,
@@ -887,7 +858,6 @@ where
                 apalis_monitor,
                 transfer_usdc_to_hedging_ctx,
                 transfer_usdc_to_hedging_queue,
-                FailStopCircuit(fail_stop_for_transfer_usdc_to_hedging),
                 failure_notify_for_transfer_usdc_to_hedging,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_usdc_to_hedging,
@@ -897,7 +867,6 @@ where
                 apalis_monitor,
                 transfer_usdc_to_market_making_ctx,
                 transfer_usdc_to_market_making_queue,
-                FailStopCircuit(fail_stop_for_transfer_usdc_to_market_making),
                 failure_notify_for_transfer_usdc_to_market_making,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_usdc_to_market_making,
@@ -949,12 +918,27 @@ where
 
             tokio::select! {
                 biased;
-                // During drain, suppress terminal job failures — let remaining
-                // workers finish instead of short-circuiting the drain.
-                () = failure_notify_for_select.notified(),
+                // `select!` evaluates this precondition ONCE, when the select
+                // is entered at monitor-task startup -- it is not re-checked
+                // on each wakeup. It therefore only disarms this branch in
+                // the edge case where shutdown was already requested before
+                // the monitor task's first poll. A terminal failure landing
+                // during a later drain window still fires this branch,
+                // aborting the drain; `wait_for_completion`'s drain branch
+                // alerts on exactly that path, so the failure surfaces
+                // rather than being suppressed.
+                TerminalFailureInfo {
+                    worker,
+                    context,
+                    source,
+                } = failure_notify_for_select.notified(),
                     if !is_draining.is_cancelled() =>
                 {
-                    Err(MonitorTaskError::TerminalJobFailure)
+                    Err(MonitorTaskError::TerminalJobFailure {
+                        worker,
+                        context,
+                        source,
+                    })
                 }
                 result = apalis_monitor.run_with_signal(shutdown_signal) => match result {
                     Ok(()) => Ok(()),
@@ -998,14 +982,6 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     }
 }
 
-/// A circuit-breaker config for a FAIL-STOP worker (threshold 1, ~1yr timeout):
-/// a single terminal failure opens the circuit and latches the worker idle,
-/// tripping the conductor-wide fail-stop. A distinct type from
-/// [`BestEffortCircuit`] so the two policies cannot be cross-assigned at a
-/// worker-registration site -- passing the wrong one would be a compile error
-/// rather than a silent freeze.
-struct FailStopCircuit(CircuitBreakerConfig);
-
 /// Conditionally registers the wrapped-equity recovery worker against the
 /// apalis monitor. Extracted because this is the only `Option`-gated worker
 /// registration and inlining the let-else + debug log keeps
@@ -1014,8 +990,7 @@ fn register_wrapped_equity_recovery_worker(
     monitor: Monitor,
     recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     recovery_queue: WrappedEquityRecoveryJobQueue,
-    FailStopCircuit(fail_stop): FailStopCircuit,
-    failure_notify: Arc<tokio::sync::Notify>,
+    failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(recovery_ctx) = recovery_ctx else {
@@ -1032,7 +1007,6 @@ fn register_wrapped_equity_recovery_worker(
             index,
             recovery_queue.clone(),
             recovery_ctx.clone(),
-            fail_stop.clone(),
             failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
@@ -1046,8 +1020,7 @@ fn register_unwrapped_equity_recovery_worker(
     monitor: Monitor,
     recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
     recovery_queue: UnwrappedEquityRecoveryJobQueue,
-    FailStopCircuit(fail_stop): FailStopCircuit,
-    failure_notify: Arc<tokio::sync::Notify>,
+    failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(recovery_ctx) = recovery_ctx else {
@@ -1064,7 +1037,6 @@ fn register_unwrapped_equity_recovery_worker(
             index,
             recovery_queue.clone(),
             recovery_ctx.clone(),
-            fail_stop.clone(),
             failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
@@ -1080,8 +1052,7 @@ fn register_transfer_usdc_to_hedging_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     transfer_queue: TransferUsdcToHedgingJobQueue,
-    FailStopCircuit(fail_stop): FailStopCircuit,
-    failure_notify: Arc<tokio::sync::Notify>,
+    failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1098,7 +1069,6 @@ fn register_transfer_usdc_to_hedging_worker(
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
-            fail_stop.clone(),
             failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
@@ -1112,8 +1082,7 @@ fn register_transfer_usdc_to_market_making_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_queue: TransferUsdcToMarketMakingJobQueue,
-    FailStopCircuit(fail_stop): FailStopCircuit,
-    failure_notify: Arc<tokio::sync::Notify>,
+    failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1130,7 +1099,6 @@ fn register_transfer_usdc_to_market_making_worker(
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
-            fail_stop.clone(),
             failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),

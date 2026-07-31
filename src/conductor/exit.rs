@@ -4,14 +4,21 @@
 //! [`ConductorExit::handle`] turns that into either `Ok(())` for clean shutdown
 //! or an error explaining what went wrong.
 
+use apalis_core::error::BoxDynError;
+use std::sync::Arc;
 use task_supervisor::SupervisorError;
 use tokio::task::JoinError;
 use tracing::{error, info};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MonitorTaskError {
-    #[error("Apalis worker failed after retries")]
-    TerminalJobFailure,
+    #[error("Apalis worker failed after retries: {worker}: {context}")]
+    TerminalJobFailure {
+        worker: String,
+        context: &'static str,
+        #[source]
+        source: Arc<BoxDynError>,
+    },
     #[error("Apalis monitor exited unexpectedly")]
     UnexpectedExit {
         #[source]
@@ -131,11 +138,16 @@ mod tests {
 
     #[tokio::test]
     async fn monitor_inner_terminal_job_failure_returns_monitor_variant() {
+        let source: BoxDynError = "boom".into();
         assert!(matches!(
-            ConductorExit::Monitor(Ok(Err(MonitorTaskError::TerminalJobFailure)))
-                .handle()
-                .unwrap_err(),
-            ConductorExitError::Monitor(MonitorTaskError::TerminalJobFailure)
+            ConductorExit::Monitor(Ok(Err(MonitorTaskError::TerminalJobFailure {
+                worker: "test-worker-0".to_string(),
+                context: "terminal failure",
+                source: Arc::new(source),
+            })))
+            .handle()
+            .unwrap_err(),
+            ConductorExitError::Monitor(MonitorTaskError::TerminalJobFailure { .. })
         ));
     }
 

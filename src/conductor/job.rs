@@ -9,6 +9,7 @@ use apalis::layers::retry::backoff::Backoff;
 use apalis::prelude::{Attempt, Data, TaskBuilder, TaskSink};
 use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
+use apalis_core::error::BoxDynError;
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
 use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
@@ -23,12 +24,6 @@ use tracing::{debug, error, warn};
 
 use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
-
-/// Recovery timeout for the fail-stop circuit breaker. Effectively
-/// infinite for any plausible bot uptime; chosen to be finite so
-/// `last_failure + recovery_timeout` cannot overflow if apalis
-/// changes its check from `elapsed() >=` to addition.
-pub(crate) const FAIL_STOP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 
 /// Deterministic exponential backoff for the apalis retry layer.
 /// Doubles the delay each attempt up to `max`, with no jitter (unnecessary
@@ -134,7 +129,7 @@ pub(crate) struct BackpressureDecision {
     /// self-contained terminal event (a loud `error!` log, then `Ok(())`)
     /// rather than propagating the original `Err` into the shared
     /// supervised on-event path, so a persistently-429ing item cannot
-    /// re-open the circuit breaker RAI-1495 already knows how to latch.
+    /// reach `on_terminal_failure`'s `ctx.stop()` and halt the worker.
     pub(crate) exhausted: bool,
 }
 
@@ -545,14 +540,12 @@ macro_rules! build_worker_inner {
         $index:expr,
         $queue:expr,
         $ctx:expr,
-        $circuit:expr,
         $on_event:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
         use ::apalis::layers::WorkerBuilderExt;
         use ::apalis::layers::retry::RetryPolicy;
         use ::apalis::prelude::WorkerBuilder;
-        use ::apalis_core::worker::ext::circuit_breaker::CircuitBreaker;
         use ::apalis_core::worker::ext::event_listener::EventListenerExt;
 
         let builder = WorkerBuilder::new(format!(
@@ -576,7 +569,6 @@ macro_rules! build_worker_inner {
                 RetryPolicy::retries(3)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
-            .break_circuit_with($circuit)
             .on_event($on_event)
             .build($crate::conductor::job::work::<$ctx_type, $job>)
     }};
@@ -588,8 +580,14 @@ pub(crate) use build_worker_inner;
 ///
 /// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
 /// types and the macro expands to a fully-wired worker (queue backend,
-/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
-/// `.build(work::<Ctx, Job>)`).
+/// retry policy, terminal-failure notifier, `.build(work::<Ctx, Job>)`).
+///
+/// Deliberately installs no Apalis circuit-breaker layer -- see
+/// [`build_best_effort_worker!`]'s doc comment for why: an open circuit can
+/// return `Poll::Pending` from `poll_ready` without scheduling a wakeup,
+/// permanently latching a single-concurrency worker idle with no log and no
+/// stop (RAI-1495). `on_terminal_failure`'s `ctx.stop()`, fired the instant
+/// `RetryPolicy` exhausts, is the sole halt mechanism.
 ///
 /// A macro because `.build()` returns a deeply-nested
 /// `Worker<Args, Ctx, Backend, Svc, Middleware>` whose `Svc` and
@@ -602,7 +600,6 @@ macro_rules! build_supervised_worker {
         $index:expr,
         $queue:expr,
         $ctx:expr,
-        $fail_stop:expr,
         $failure_notify:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
@@ -611,7 +608,6 @@ macro_rules! build_supervised_worker {
             $index,
             $queue,
             $ctx,
-            $fail_stop,
             $crate::conductor::job::on_terminal_failure(
                 $failure_notify,
                 <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
@@ -938,17 +934,105 @@ where
     })
 }
 
+/// Worker name, static failure context, and the original apalis error for a
+/// supervised worker's terminal failure (retries exhausted), captured for the
+/// async exit path (`Conductor::wait_for_completion`) to alert an operator on
+/// before the process returns a non-zero exit code. `source` is the same
+/// `Arc` apalis handed to `on_terminal_failure` (cheap to clone), not a
+/// flattened string, so `MonitorTaskError::TerminalJobFailure`'s `#[source]`
+/// chain -- and therefore anyhow's "Caused by:" rendering -- still reaches the
+/// underlying error. The error is also logged in full via `error!()` at the
+/// point of failure; this is the same error carried forward, not a
+/// replacement for the structured log.
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalFailureInfo {
+    pub(crate) worker: String,
+    pub(crate) context: &'static str,
+    pub(crate) source: Arc<BoxDynError>,
+}
+
+/// Wakes the apalis monitor's `tokio::select!` on a supervised worker's
+/// terminal failure and carries the [`TerminalFailureInfo`] the async exit
+/// path needs to alert on. Threaded through every `build_supervised_worker!`
+/// call site as a single `Arc` clone -- the same shape as the plain
+/// `tokio::sync::Notify` it replaces, so no call site needs an extra clone.
+///
+/// All supervised workers share one signal, so two different workers can
+/// fail terminally close together. `info` resolves that race first-writer-
+/// wins via `OnceLock::set`: whichever `record_and_notify` call lands first
+/// is the info every reader ever observes, atomically -- never a torn or
+/// mixed combination of two failures. The later failure's own `ctx.stop()`
+/// and `error!()` log still happen regardless; only its entry in the alert
+/// is superseded.
+///
+/// `info` is always recorded before `notify_waiters()` fires, so a waiter that
+/// wakes always has the info available. [`notified`](Self::notified) returns it
+/// directly rather than leaving the caller to re-read an `Option` it cannot
+/// meaningfully handle as `None`.
+#[derive(Default)]
+pub(crate) struct TerminalFailureSignal {
+    notify: tokio::sync::Notify,
+    info: std::sync::OnceLock<TerminalFailureInfo>,
+}
+
+impl TerminalFailureSignal {
+    /// Resolves with the recorded failure once any supervised worker sharing
+    /// this signal fails terminally, whether that failure happened before or
+    /// after this call.
+    ///
+    /// `Notify::notify_waiters` wakes only the waiters registered at that
+    /// instant and stores no permit, so a failure recorded before the monitor
+    /// reaches its `select!` would otherwise be lost -- the same missed-wakeup
+    /// shape RAI-1495 is about. Registering the `Notified` future via
+    /// `enable()` *before* reading `info` closes that window in both
+    /// directions: a failure landing before `enable()` is caught by the
+    /// `Some` check below, and one landing after is caught by the registered
+    /// waiter.
+    ///
+    /// The loop re-registers rather than unwrapping after the await:
+    /// `record_and_notify` writes `info` before waking, so the first wakeup
+    /// carries it, but expressing that as a loop keeps the "signalled with no
+    /// info" state unrepresentable without a panicking `expect`.
+    pub(crate) async fn notified(&self) -> TerminalFailureInfo {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(info) = self.info.get() {
+                return info.clone();
+            }
+
+            notified.await;
+        }
+    }
+
+    fn record_and_notify(&self, info: TerminalFailureInfo) {
+        // `OnceLock::set` is a first-writer-wins compare-and-set: on a race
+        // between two workers, the losing `Err(_)` is intentionally dropped
+        // (see the doc comment above), but every worker still notifies so no
+        // failure's fail-stop is ever lost.
+        let _ = self.info.set(info);
+        self.notify.notify_waiters();
+    }
+}
+
 /// On-event handler shared by every supervised worker: when apalis
-/// reports a terminal job failure (retries exhausted), notify the
-/// monitor task and stop the worker.
+/// reports a terminal job failure (retries exhausted), record the failure
+/// info, notify the monitor task, and stop the worker.
 pub(crate) fn on_terminal_failure(
-    failure_notify: Arc<tokio::sync::Notify>,
+    failure_signal: Arc<TerminalFailureSignal>,
     error_msg: &'static str,
 ) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
     move |ctx, event| {
         if let Event::Error(err) = event {
-            error!(%err, worker = %ctx.name(), "{error_msg}");
-            failure_notify.notify_waiters();
+            let worker = ctx.name().clone();
+            error!(%err, worker = %worker, "{error_msg}");
+            failure_signal.record_and_notify(TerminalFailureInfo {
+                worker,
+                context: error_msg,
+                source: Arc::clone(err),
+            });
             let _ = ctx.stop();
         }
     }
@@ -978,7 +1062,6 @@ pub(crate) fn on_terminal_failure_log_only(
 #[cfg(test)]
 mod tests {
     use apalis::prelude::{Monitor, Status};
-    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1521,6 +1604,14 @@ mod tests {
 
     /// A job that fails after all retries must halt further processing --
     /// the worker must not pick up the next job with stale state.
+    ///
+    /// Note: this test's single failing job halts via `on_terminal_failure`
+    /// at `RetryPolicy`'s own exhaustion (attempt 4 of `retries(3)`), well
+    /// below the vendored circuit breaker's hardcoded `failure_count >= 5`
+    /// open threshold that used to sit in this path -- so this test passed
+    /// even before RAI-1495's fix and never exercised the removed layer. See
+    /// [`supervised_worker_fail_stops_past_the_vendored_circuit_breakers_hardcoded_threshold`]
+    /// for the regression test that does.
     #[tokio::test]
     async fn job_failure_after_retries_halts_processing() {
         let apalis_pool = setup_test_apalis_pool().await;
@@ -1529,7 +1620,7 @@ mod tests {
         queue.push(TestJob { should_fail: true }).await.unwrap();
         let mut push_queue = queue.clone();
 
-        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
         let failing_job_started = Arc::new(tokio::sync::Notify::new());
         let ctx = Arc::new(TestCtx {
             success_count: AtomicUsize::new(0),
@@ -1537,10 +1628,6 @@ mod tests {
             failing_job_started: failing_job_started.clone(),
         });
         let ctx_for_assert = ctx.clone();
-
-        let fail_stop = CircuitBreakerConfig::default()
-            .with_failure_threshold(1)
-            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
 
         let failing_job_started_wait = failing_job_started.notified();
 
@@ -1554,7 +1641,6 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
-                        fail_stop.clone(),
                         failure_notify.clone(),
                         FailureInjector::new(),
                     )
@@ -1598,7 +1684,7 @@ mod tests {
 
     async fn wait_for_fail_stop_without_processing_sibling(
         apalis_pool: &apalis_sqlite::SqlitePool,
-        failure_notify: &Arc<tokio::sync::Notify>,
+        failure_notify: &Arc<TerminalFailureSignal>,
         monitor_handle: tokio::task::JoinHandle<()>,
     ) {
         let terminal = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1619,7 +1705,7 @@ mod tests {
                 }
 
                 tokio::select! {
-                    () = failure_notify.notified() => {
+                    _ = failure_notify.notified() => {
                         // Terminal failure fired stop; give the monitor a moment to exit.
                         for _ in 0..100 {
                             if monitor_handle.is_finished() {
@@ -1645,6 +1731,134 @@ mod tests {
             .await
             .expect("Monitor should exit within 5s after terminal job failure");
         join_result.expect("Monitor task should not panic");
+    }
+
+    /// Regression test for RAI-1495: a supervised worker driven through many
+    /// more consecutive failures than the vendored circuit breaker's
+    /// hardcoded `failure_count >= 5` open threshold
+    /// (`CircuitBreakerService::call`, apalis-core 1.0.0-rc.9) must still
+    /// reach a terminal, observable fail-stop -- not latch silently idle.
+    /// `retries(12)` (13 attempts total) with a fast fixed backoff (not
+    /// `RETRY_BACKOFF`, to keep the test fast) comfortably crosses that
+    /// threshold. Uses a raw `WorkerBuilder` (not `build_supervised_worker!`,
+    /// which hardcodes `retries(3)`) so the retry budget can be pushed past
+    /// the vendored threshold; `job_failure_after_retries_halts_processing`
+    /// above remains the macro-path guard for the real production wiring.
+    ///
+    /// What this proves: after RAI-1495's fix (no circuit-breaker layer at
+    /// all on supervised workers), no in-process circuit-breaker-shaped
+    /// mechanism can latch a worker regardless of accumulated failure count
+    /// -- the terminal failure signal fires deterministically, asserted via
+    /// `failure_notify.notified()` resolving and the captured
+    /// [`TerminalFailureInfo`], not merely "no latch observed within a
+    /// timeout" (a weaker, non-deterministic check that would also pass if
+    /// the worker were simply slow).
+    ///
+    /// What this does NOT prove: it does not exercise the full
+    /// systemd-restart loop (out of process, untestable at this layer), and
+    /// it does not cover a `Job::perform()` future that itself never
+    /// resolves -- a distinct, pre-existing failure class this issue does
+    /// not claim to fix.
+    #[tokio::test]
+    async fn supervised_worker_fail_stops_past_the_vendored_circuit_breakers_hardcoded_threshold() {
+        use apalis::layers::WorkerBuilderExt;
+        use apalis::layers::retry::RetryPolicy;
+        use apalis::prelude::WorkerBuilder;
+        use apalis_core::worker::ext::event_listener::EventListenerExt;
+        use apalis_sqlite::TaskBuilderExt;
+
+        const FAST_BACKOFF: ExponentialBackoff =
+            ExponentialBackoff::new(Duration::from_millis(1), Duration::from_millis(5));
+        const RETRIES_PAST_HARDCODED_CIRCUIT_THRESHOLD: usize = 12;
+
+        let apalis_pool = setup_test_apalis_pool().await;
+        let queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
+
+        // A plain `queue.push(...)` defaults to apalis's own `SqlContext`
+        // max_attempts of 5 -- coincidentally the same number as the
+        // vendored circuit breaker's hardcoded open threshold, and well
+        // below the 13 attempts this test needs to exercise. Push with an
+        // explicit higher `max_attempts` so the storage layer's own cap
+        // cannot truncate the retry budget before `RetryPolicy` does.
+        let scheduled = TaskBuilder::<TestJob, apalis_sqlite::SqliteContext, _>::new(TestJob {
+            should_fail: true,
+        })
+        .max_attempts(
+            u32::try_from(RETRIES_PAST_HARDCODED_CIRCUIT_THRESHOLD).expect("fits u32") + 1,
+        )
+        .build();
+        TaskSink::push_task(&mut queue.clone().into_storage(), scheduled)
+            .await
+            .unwrap();
+
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
+        let ctx = Arc::new(TestCtx {
+            success_count: AtomicUsize::new(0),
+            success_notify: Arc::new(tokio::sync::Notify::new()),
+            failing_job_started: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let monitor_handle = tokio::spawn({
+            let failure_notify = failure_notify.clone();
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    WorkerBuilder::new(format!("stress-test-worker-{index}"))
+                        .backend(queue.clone().into_storage())
+                        .data(ctx.clone())
+                        .data(FailureInjector::new())
+                        .data(JobKind::OrderFill)
+                        .concurrency(1)
+                        .retry(
+                            RetryPolicy::retries(RETRIES_PAST_HARDCODED_CIRCUIT_THRESHOLD)
+                                .with_backoff(FAST_BACKOFF),
+                        )
+                        .on_event(on_terminal_failure(
+                            failure_notify.clone(),
+                            "stress test terminal failure",
+                        ))
+                        .build(work::<TestCtx, TestJob>)
+                });
+
+            async move {
+                let _ = monitor.run().await;
+            }
+        });
+
+        let info = tokio::time::timeout(Duration::from_secs(10), failure_notify.notified())
+            .await
+            .expect(
+                "terminal failure must fire deterministically past 13 attempts, \
+                 not latch silently",
+            );
+
+        let attempts =
+            sqlx_apalis::query_scalar::<_, i64>("SELECT attempts FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TestJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert!(
+            attempts > i64::try_from(RETRIES_PAST_HARDCODED_CIRCUIT_THRESHOLD).expect("fits i64"),
+            "job should have exhausted all {} attempts before fail-stop fired; attempts={attempts}",
+            RETRIES_PAST_HARDCODED_CIRCUIT_THRESHOLD + 1,
+        );
+
+        assert_eq!(
+            info.context, "stress test terminal failure",
+            "the recorded failure info must carry the exact static context",
+        );
+        assert_eq!(
+            info.source.to_string(),
+            "test-job(should_fail=true): test job deliberately failed",
+            "the recorded failure info must carry the original apalis error, not a flattened \
+             string",
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+            .await
+            .expect("Monitor should exit within 5s after terminal job failure")
+            .expect("Monitor task should not panic");
     }
 
     async fn insert_job(
@@ -1938,6 +2152,134 @@ mod tests {
             status_of(&apalis_pool, "other").await,
             "Running",
             "another queue's in-flight row is untouched",
+        );
+    }
+
+    /// Regression test for the concurrent-terminal-failure race: two
+    /// different supervised workers sharing one `TerminalFailureSignal` both
+    /// fail terminally at the same time. The recorded info must be a
+    /// consistent `(worker, context, source)` triple from exactly ONE of the
+    /// two failures -- never a torn/mixed combination -- and the fail-stop
+    /// signal must still fire regardless of which one wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_terminal_failures_record_a_consistent_pair_from_one_of_them() {
+        let signal = Arc::new(TerminalFailureSignal::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let source_a: Arc<BoxDynError> = Arc::new("failure-a".into());
+        let source_b: Arc<BoxDynError> = Arc::new("failure-b".into());
+
+        let task_a = tokio::spawn({
+            let signal = signal.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                signal.record_and_notify(TerminalFailureInfo {
+                    worker: "worker-a".to_string(),
+                    context: "context-a",
+                    source: source_a,
+                });
+            }
+        });
+        let task_b = tokio::spawn({
+            let signal = signal.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                signal.record_and_notify(TerminalFailureInfo {
+                    worker: "worker-b".to_string(),
+                    context: "context-b",
+                    source: source_b,
+                });
+            }
+        });
+
+        let info = tokio::time::timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("fail-stop must fire even when two workers fail terminally at once");
+        task_a.await.unwrap();
+        task_b.await.unwrap();
+
+        // Either winner is an acceptable, genuinely equivalent outcome here
+        // (first-writer-wins is explicitly non-deterministic by design) --
+        // what must never happen is a mix of the two, e.g. worker-a paired
+        // with context-b.
+        let consistent_with_a = info.worker == "worker-a"
+            && info.context == "context-a"
+            && info.source.to_string() == "failure-a";
+        let consistent_with_b = info.worker == "worker-b"
+            && info.context == "context-b"
+            && info.source.to_string() == "failure-b";
+        assert!(
+            consistent_with_a || consistent_with_b,
+            "recorded info must be a consistent (worker, context, source) triple from exactly \
+             one failure, got worker={} context={} source={}",
+            info.worker,
+            info.context,
+            info.source,
+        );
+    }
+
+    /// Regression guard for RAI-1495: no test can drive a macro-path worker
+    /// past the vendored circuit breaker's hardcoded `failure_count >= 5`
+    /// threshold without an explicit `max_attempts` override the production
+    /// macro never applies (see
+    /// `supervised_worker_fail_stops_past_the_vendored_circuit_breakers_hardcoded_threshold`'s
+    /// doc comment), so no runtime test would go red if a future change
+    /// reinstalled the breaker inside `build_worker_inner!`. That behavioral
+    /// test remains the real guarantee that the breaker cannot latch a
+    /// worker idle; this test is a cheap, deliberately non-behavioral
+    /// structural backstop layered on top of it, catching a reinstalled
+    /// breaker even before a behavioral test would need to exercise it.
+    ///
+    /// Scoped to only the `build_worker_inner!` definition (extracted from
+    /// this file's own source between its `macro_rules!` header and its
+    /// `pub(crate) use` re-export) -- the actual worker-builder path this
+    /// guard claims to cover -- rather than the whole `src/` tree, so an
+    /// unrelated file mentioning either identifier (e.g. in a string
+    /// literal or doc comment about this very regression) cannot fail the
+    /// build, and so this guard cannot miss a reinstalled breaker that
+    /// lands anywhere inside the macro body.
+    ///
+    /// The forbidden identifiers below are built via `.concat()` rather than
+    /// written as string literals so this test's own source does not contain
+    /// a literal match for what it searches for.
+    ///
+    /// Matches the macro's raw source text, comments included. The macro body
+    /// is a 40-line declarative expansion that carries no comments of its own,
+    /// so there is nothing for a comment-aware pass to disambiguate. If a
+    /// future comment inside the body needs to name either identifier while
+    /// explaining why not to reinstall it, refer to it indirectly (or split it
+    /// the way this test's own patterns are split) rather than reintroducing a
+    /// comment stripper here.
+    #[test]
+    fn build_worker_inner_never_reinstalls_the_vendored_circuit_breaker() {
+        let forbidden_identifiers = [
+            ["break_circuit", "_with("].concat(),
+            ["CircuitBreaker", "Config"].concat(),
+        ];
+
+        let file_source = include_str!("job.rs");
+        let macro_start = file_source
+            .find("macro_rules! build_worker_inner {")
+            .expect("build_worker_inner! macro definition must exist in this file");
+        let macro_and_after = &file_source[macro_start..];
+        let macro_end = macro_and_after
+            .find("pub(crate) use build_worker_inner;")
+            .expect("build_worker_inner! definition must be followed by its pub(crate) use");
+        let macro_text = &macro_and_after[..macro_end];
+
+        let offending_identifiers: Vec<&str> = forbidden_identifiers
+            .iter()
+            .filter(|identifier| macro_text.contains(identifier.as_str()))
+            .map(String::as_str)
+            .collect();
+
+        assert!(
+            offending_identifiers.is_empty(),
+            "production code must never reinstall apalis's circuit-breaker layer inside \
+             `build_worker_inner!` (RAI-1495 regression): found forbidden identifiers \
+             {offending_identifiers:?}",
         );
     }
 }

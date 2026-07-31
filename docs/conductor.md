@@ -226,13 +226,26 @@ lifecycle above, such a row is a live, immediately re-dispatchable chain head --
 `ack.sql` never reschedules `run_at` on a `Failed` ack, so `fetch_next.sql`
 picks it straight back up the moment a worker is free -- so counting it as live
 is what actually prevents recovery from forking a second chain alongside the one
-apalis is about to re-run. But a row stuck behind a latched worker (e.g. a
-circuit-breaker fault, RAI-1495) would otherwise sit `Failed` forever without a
-fresh `ack.sql` write, and `done_at` IS refreshed on every ack -- so bounding by
-`done_at > now - stale_after` (the same staleness bound as the
+apalis is about to re-run. But a row stuck behind a stalled worker process (e.g.
+the crashed-mid-restart window between a supervised fail-stop exit and systemd
+bringing the process back up -- the circuit-breaker latch that used to strand a
+worker indefinitely here, RAI-1495, no longer exists: supervised workers install
+no circuit breaker at all, so `on_terminal_failure` reliably fires and the
+process exits instead of latching) would otherwise sit `Failed` forever without
+a fresh `ack.sql` write, and `done_at` IS refreshed on every ack -- so bounding
+by `done_at > now - stale_after` (the same staleness bound as the
 `Queued`/`Running` arm below) gives both properties: a just-failed row counts as
 live, but one that has sat `Failed` past `stale_after` without a fresh ack stops
 suppressing recovery.
+
+The two predicates are separate and must not be collapsed. Apalis's own retry
+eligibility is `attempts < max_attempts` alone -- `fetch_next.sql` ignores
+`done_at` entirely, so a stale `Failed` row stays re-dispatchable as far as
+apalis is concerned. The `done_at` freshness bound is an app-level recovery
+guard layered on top, applied only to `Failed` rows, and it decides one thing
+only: whether this recovery pass treats the row as already-armed polling. A row
+excluded by staleness is not thereby dead to apalis; recovery just stops
+assuming apalis will get to it.
 
 The predicate also bounds the `Queued`/`Running` arm by staleness
 (`lock_at > now - stale_after`, `stale_after` a small multiple of the poll
@@ -305,11 +318,14 @@ order sharing this job type, not just the corrupt row's own.
 an Alpaca call inside `Job::perform()` -- including an HTTP 429 -- went through
 the unmodified `RetryPolicy::retries(3)` path. Three quick in-place retries
 exhaust in seconds against a sustained rate-limit condition, tripping the
-supervised circuit breaker and reproducing RAI-1492's "hedging silently stops"
-incident. Retrying _in place_ for longer (a naive fix) is worse: it would hold
-the job's `concurrency(1)` worker slot for the whole backoff window, blocking
-every other pending item behind it -- the same "one item monopolizes the worker"
-failure shape, just invisible instead of a visible circuit-breaker trip.
+then-installed supervised circuit breaker and reproducing RAI-1492's "hedging
+silently stops" incident (the breaker itself was removed by RAI-1495; see below
+-- this section describes RAI-1494's own reasoning at the time, which remains
+valid independent of that later change). Retrying _in place_ for longer (a naive
+fix) is worse: it would hold the job's `concurrency(1)` worker slot for the
+whole backoff window, blocking every other pending item behind it -- the same
+"one item monopolizes the worker" failure shape, just invisible instead of a
+loud fail-stop.
 
 **Mechanism**: a 429 is intercepted _before_ `perform()` returns `Err` at all.
 The job classifies the error, computes a delay, pushes a fresh copy of itself
@@ -317,11 +333,11 @@ onto its own queue after that delay via `push_with_delay`, and returns `Ok(())`.
 The row acks `Done` immediately and the worker is free on the very next poll
 tick to pick up any other pending item. The pushed successor is a brand-new
 `Pending` row apalis dispatches when its `run_at` arrives. Because the error
-never reaches `RetryPolicy`/`calculate_status`/the circuit breaker, a pure-429
-sequence can never produce apalis's `Event::Error` and can never open the
-circuit breaker -- RAI-1494 is fully decoupled from RAI-1495 (the
-circuit-breaker latch-with-no-wakeup bug) by construction, not by scoping
-discipline.
+never reaches `RetryPolicy`/`calculate_status`, a pure-429 sequence can never
+produce apalis's `Event::Error` and can never fail-stop the worker -- RAI-1494
+is fully decoupled from RAI-1495 (the circuit-breaker latch-with-no-wakeup bug,
+fixed by removing the breaker entirely -- see below) by construction, not by
+scoping discipline.
 
 **Shared building blocks** (`src/conductor/job.rs`, `crates/execution/src/`):
 
@@ -404,18 +420,18 @@ heartbeat timeout. Even the widest delay this mechanism produces
 
 **Terminal behavior at `BACKPRESSURE_RESCHEDULE_LIMIT` exhaustion depends on
 worker supervision.** For a job registered on a _supervised_ worker
-(`build_supervised_worker!`), propagating a bare `Err` at exhaustion would open
-the circuit breaker for a cause that is not a genuine bug -- reproducing the
-parent incident, just delayed by up to 500 reschedules instead of happening
-immediately. So a supervised job instead dead-letters at exhaustion: log a loud,
-distinct `error!` naming the item and the exhausted streak, then return
-`Ok(())`, so the row acks `Done` and the worker's shared circuit breaker never
-observes an `Event::Error` for this cause. A genuine _non-backpressure_ `Err` on
-these jobs is completely untouched by this decision and still fail-stops exactly
-as before. A best-effort-worker job (`build_best_effort_worker!`) is already
-log-only-and-continue on any terminal failure (RAI-1110), so exhaustion there
-needs no special case: the existing best-effort terminal handling already covers
-it.
+(`build_supervised_worker!`), propagating a bare `Err` at exhaustion would
+fail-stop the whole conductor for a cause that is not a genuine bug -- sustained
+rate-limiting is an expected, self-clearing condition, not the kind of fault the
+supervised fail-stop exists to catch. So a supervised job instead dead-letters
+at exhaustion: log a loud, distinct `error!` naming the item and the exhausted
+streak, then return `Ok(())`, so the row acks `Done` and
+`Event::Error`/`on_terminal_failure` never observe this cause at all. A genuine
+_non-backpressure_ `Err` on these jobs is completely untouched by this decision
+and still fail-stops exactly as before. A best-effort-worker job
+(`build_best_effort_worker!`) is already log-only-and-continue on any terminal
+failure (RAI-1110), so exhaustion there needs no special case: the existing
+best-effort terminal handling already covers it.
 
 **True retry vs. reschedule-then-backstop -- not every job's reschedule
 re-drives the Alpaca call.** Whether a reschedule's successor attempt actually
@@ -591,7 +607,6 @@ WorkerBuilder::new(name)
     .data(ctx)
     .concurrency(1)                                          // sequential processing
     .retry(RetryPolicy::retries(3).with_backoff(backoff))    // 1 + 3 = 4 attempts, with backoff
-    .break_circuit_with(fail_stop_config)                    // halt on terminal failure
     .on_event(|ctx, event| { ... })                          // observability + lifecycle
     .build(work::<MyCtx, MyJob>)
 ```
@@ -604,41 +619,132 @@ WorkerBuilder::new(name)
 - **`.retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF))`** — retries
   failed jobs (replaces backon in the handler). `retries(3)` = 4 total attempts.
   `RETRY_BACKOFF` is a deterministic exponential backoff (1s base, doubles each
-  attempt, capped at 30s) so transient failures (RPC blips, broker rate limits)
-  don't fast-fail into the circuit breaker. No jitter -- single-worker queues
-  don't thunder.
-- **`.break_circuit_with(config)`** — opens the circuit after
-  `failure_threshold` errors, returning `Poll::Pending` from `poll_ready` to
-  block new job pickup. Use `failure_threshold(1)` + very long
-  `recovery_timeout` for fail-stop. Do not install this layer on best-effort
-  workers: in apalis-core 1.0.0-rc.9, an open circuit can return `Poll::Pending`
-  without scheduling a wakeup, so a short `recovery_timeout` does not guarantee
-  the worker will resume.
+  attempt, capped at 30s) so transient failures (RPC blips, broker 5xx) get a
+  few spaced-out attempts before the job is treated as terminal. Classified
+  broker 429s never reach this layer at all -- they are intercepted before
+  `perform()` returns `Err` and rescheduled onto their own queue (see the
+  backpressure section above), so they neither consume the retry budget nor
+  reach `calculate_status`.
+- **No circuit breaker (RAI-1495).** Supervised workers do NOT install Apalis'
+  `CircuitBreakerService` layer -- neither does `build_best_effort_worker!`,
+  which never had one. Previously `build_supervised_worker!` did
+  (`.break_circuit_with(fail_stop_config)` between `.retry()` and
+  `.on_event()`), configured `failure_threshold(1)` + a ~1yr `recovery_timeout`
+  for fail-stop. This was removed: in apalis-core 1.0.0-rc.9,
+  `tower::retry::Retry` sits OUTER of the circuit breaker (the first
+  `.layer()`-style call added ends up outermost), so its `ResponseFuture` calls
+  the circuit's `poll_ready` between retry attempts. Once open, `poll_ready`
+  returns a bare `Poll::Pending` with **no waker registered at all** -- not
+  merely a long wait, but a future that is never polled again, ever. Because
+  that `Poll::Pending` sits inside the retry future, `work()`'s call never
+  resolves to `Err`, `Event::Error` is never emitted, and `on_terminal_failure`
+  (wired via `.on_event()`, listening for exactly that event) can never fire. A
+  single-concurrency worker latches idle forever with no log, no stop, no crash
+  -- `systemctl` still reports `active`. This is what happened to
+  `PollOrderStatus` on 2026-07-22 (RAI-1492): 3h25m of fully silent hedging
+  outage. Removing the breaker closes its own indefinite-Pending gate, the one
+  reachable at any point during ordinary retry exhaustion. `RetryPolicy`'s own
+  give-up decision depends only on attempt count, never on error content, so
+  once it exhausts there is no remaining layer that can defer or swallow the
+  resulting `Err` -- it reaches `on_terminal_failure` for every retry-
+  exhaustion cause, every time.
+
+  A second, narrower bare-`Poll::Pending`-with-no-waker gate remains outside
+  this fix's scope: `ReadinessService::poll_ready` (apalis-core, same shape of
+  bug) returns `Poll::Pending` -- again without registering a waker -- when
+  `ctx.is_shutting_down()` or `ctx.is_paused()` is true. This is
+  retry-reachable, not outside the retry loop -- `RetryPolicy` sits OUTER of
+  `ReadinessService` in this stack, so `tower::retry`'s
+  `ResponseFuture::Retrying` polls `ReadinessService::poll_ready` directly
+  between attempts, the identical delegation path described above for the
+  removed breaker. What differs from the breaker bug is _when_ it can trip: this
+  codebase never calls `.pause()` (grep confirms), so the only live trigger is
+  `is_shutting_down()`, true only during the conductor's own graceful-shutdown
+  sequence. A supervised job that is between retry attempts right as shutdown
+  fires can therefore still hang past that window with no waker -- a
+  shutdown-time hang, not a silent steady-state latch. Not closed by this
+  change; tracked as a follow-up in RAI-1524. The existing
+  `best_effort_worker_does_not_latch_on_single_terminal_failure` regression test
+  does not prove this window is safe -- it only proves a sibling job survives a
+  different job's terminal failure, never exercising shutdown or an in-flight
+  retry backoff.
 - **`.on_event()`** — fires on `Event::Error` (after retries exhaust),
-  `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging AND for
-  calling `ctx.stop()` on terminal failure. The circuit breaker alone only
-  pauses the worker (`Poll::Pending`); `ctx.stop()` is needed to actually make
-  the worker exit.
+  `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging, recording
+  the failure info for the alert path (see below), and calling `ctx.stop()` on
+  terminal failure -- now the SOLE halt mechanism for a supervised worker.
 
 ### Error propagation: handler failure -> bot shutdown
 
-1. `work()` returns `Err` -> retry layer retries
-2. Retries exhaust -> error reaches circuit breaker -> circuit opens
-3. Error becomes `Ok(Event::Error)` in apalis `poll_tasks`
-4. `on_event` catches `Event::Error`, fires the shared `failure_notify`
-   (`tokio::sync::Notify`), and calls `ctx.stop()`
-5. Worker exits cleanly (`Ok(())`)
-6. The spawned monitor task's biased `tokio::select!` observes the Notify and
-   returns `Err(MonitorTaskError::TerminalJobFailure)` immediately -- it does
-   not wait for `apalis_monitor.run()` to wind down. The conductor's
-   `wait_for_completion` sees the monitor task exit with that error and shuts
-   the bot down.
+1. `work()` returns `Err` -> retry layer retries (1s/2s/4s backoff)
+2. Retries exhaust -> `RetryPolicy` resolves to `Err` unconditionally -> this
+   becomes `Event::Error` in apalis `poll_tasks`
+3. `on_event` (`on_terminal_failure`) catches `Event::Error`, logs `error!()`,
+   records a `TerminalFailureInfo { worker, context, source }` -- `source` is
+   the same `Arc<BoxDynError>` apalis handed to the callback, not a flattened
+   string, so the original error's chain survives -- into the shared
+   `TerminalFailureSignal` (an `Arc`-wrapped `Notify` + `OnceLock<_>` threaded
+   through every `build_supervised_worker!` call site exactly like the plain
+   `Notify` it replaces), then calls `ctx.stop()`. The info is always recorded
+   before the `Notify` fires, so a waiter that wakes is guaranteed to see it.
+   `OnceLock::set` makes concurrent terminal failures from different workers
+   first-writer-wins: whichever lands first is the only info any reader ever
+   observes, atomically -- never a torn or mixed pair. Every worker still
+   notifies and stops regardless of which one wins.
+4. Worker exits cleanly (`Ok(())`)
+5. The spawned monitor task's biased `tokio::select!` observes the signal and
+   returns
+   `Err(MonitorTaskError::TerminalJobFailure { worker, context,
+   source })`
+   immediately -- it does not wait for `apalis_monitor.run()` to wind down.
+   `source` is `#[source]` on the error variant, so it is not rendered by
+   `Display`/`{}` but IS walked by anyhow's `{:?}` "Caused by:" chain.
+6. `Conductor::wait_for_completion` (the async exit path) sees this variant and
+   awaits sending an operator alert through `worker_failure_notifier`
+   (`Arc<dyn Notifier>`, `NoopNotifier` when `[alerts]` is unconfigured),
+   bounded by a short timeout so a slow/unreachable Telegram endpoint cannot
+   delay process exit -- then propagates the error, so the bot process exits
+   non-zero.
 
-**Critical:** the spawned monitor task must select on the shared Notify
-alongside `apalis_monitor.run()` and return the terminal error. Without the
-Notify branch, the conductor would only learn of the failure once apalis
-finished tearing down all workers; without returning the error, the conductor
-would never see the failure at all.
+**Critical:** the spawned monitor task must select on the shared signal
+alongside `apalis_monitor.run()` and return the terminal error. Without that
+branch, the conductor would only learn of the failure once apalis finished
+tearing down all workers; without returning the error, the conductor would never
+see the failure at all.
+
+**Why the alert is sent from the exit path, not from `on_event`.** `on_event` is
+a synchronous `Fn(&WorkerContext, &Event)` -- it cannot `.await` a Telegram HTTP
+call. Firing the alert as a detached `tokio::spawn` from inside that callback
+would race process teardown: `ctx.stop()` and the resulting process exit can
+complete before the spawned send does, silently dropping it in the common case.
+`wait_for_completion` is async and runs strictly before the process returns, so
+awaiting the alert there (with a bounded timeout) is what actually guarantees
+delivery-or-timeout instead of delivery-or-silently-lost.
+
+**Blast radius: this restores the existing fail-stop design; it does not invent
+universal self-recovery.** `on_terminal_failure`'s `ctx.stop()` + non-zero
+exit + systemd `Restart = "always"` / `RestartSec = 30` is not new behavior --
+it is the pre-existing fail-stop path the circuit breaker bug was silently
+suppressing. What changes is that it now actually fires. Two distinct outcomes
+follow, and only one of them is "self-heals":
+
+- **Transient cause** (an RPC blip, a momentary broker 5xx): the process exits,
+  systemd restarts it within 30s, and the worker resumes cleanly -- no operator
+  action needed. This is the "resumes by itself" case.
+- **Persistent cause** (poison job, sustained downstream outage): the single
+  poison row itself does not re-drive (`ack.sql` leaves an exhausted `Failed`
+  row alone; `requeue_orphaned` only touches `Running`/`Queued`), so one crash
+  is usually a clean restart. But several supervised jobs are re-seeded on every
+  boot (e.g. `PollOrderStatus` via `recover_submitted_offchain_orders`,
+  `CheckPositions`'s self-reschedule) -- against a genuinely persistent, non-429
+  failure (RAI-1494's reschedule only intercepts classified 429s), each boot
+  re-pushes a fresh row that fails again, producing a real crash-loop. systemd's
+  `StartLimitBurst`/`StartLimitIntervalSec` (see `nix/upgradeable-services.nix`)
+  eventually trips and leaves the unit fully dead -- loud and visible in
+  `systemctl status`/telemetry, but operator- required, and it takes every
+  supervised subsystem down together (hedging, fill detection, rebalancing), not
+  just the one worker that first failed. This is strictly better than the silent
+  single-subsystem latch it replaces, but it is not "always self-recovers" -- a
+  persistent fault ends in a visible dead unit, not a quiet resume.
 
 ### Monitor configuration
 
